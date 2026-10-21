@@ -708,34 +708,217 @@ fn display_basis_specified_partial_presentation_material_survives_thumbnail_evic
     specified_partial_survives_thumbnail_eviction(false);
 }
 
-#[test]
-fn display_basis_specified_full_spread_thumbnail_keeps_source_original_contract() {
-    let ctx = egui::Context::default();
-    let mut app = fixture();
+fn configure_specified_original(app: &mut App) {
     app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
-    app.settings.fullscreen_fit_no_upscale = true;
+    app.settings.fullscreen_fit_no_upscale = false;
     app.settings.fullscreen_fit_no_downscale = true;
+    app.settings.fullscreen_specified_scale = crate::settings::FullscreenSpecifiedScale {
+        width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+            crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+        ),
+        height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+            crate::settings::SpecifiedScaleAxis::LogicalPixels(100),
+        ),
+    };
+}
+
+fn install_uncropped_thumbnails(
+    app: &mut App,
+    ctx: &egui::Context,
+    canonical: [usize; 2],
+    raster: [usize; 2],
+    known_coverage: bool,
+) {
+    let coverage = if known_coverage {
+        SourceCoverage::Known(
+            EditPreviewGeometry::new(
+                CanonicalPageDimensions::new(canonical[0] as u32, canonical[1] as u32),
+                (raster[0] as u32, raster[1] as u32),
+                (0, 0, raster[0] as u32, raster[1] as u32),
+            )
+            .unwrap(),
+        )
+    } else {
+        SourceCoverage::FullSource
+    };
+    assert!(!coverage.is_partial());
     for idx in 0..2 {
         app.thumbnails[idx] = ThumbnailState::Loaded {
             tex: metadata_texture(
-                &ctx,
-                format!("full-spread-thumb-{idx}"),
-                image_metadata([80, 60]),
+                ctx,
+                format!("uncropped-specified-thumb-{idx}"),
+                image_metadata([60, 80]),
             ),
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
+            from_edit_preview: known_coverage,
             rendered_at_px: 80,
-            source_coverage: SourceCoverage::FullSource,
-            source_dims: Some((20000, 15000)),
+            source_coverage: coverage,
+            source_dims: Some((canonical[0] as u32, canonical[1] as u32)),
             layout_dims: None,
         };
-        app.record_page_dims_for_spread(idx, (20000, 15000));
+        app.record_page_dims_for_spread(idx, (canonical[0] as u32, canonical[1] as u32));
     }
-    for transform in draw_spread(&mut app, &ctx, egui::vec2(1200.0, 900.0)) {
-        let FullscreenFitInput::SpecifiedScale { basis, .. } = transform.fit_input else {
-            panic!("specified fit descriptor")
-        };
-        assert_eq!(basis.original_size, egui::vec2(20000.0, 15000.0));
-        close_physical_size(transform, [20000, 15000], 1.0);
+}
+
+fn assert_specified_raster_basis(input: FullscreenFitInput, raster: [usize; 2]) {
+    let FullscreenFitInput::SpecifiedScale { basis, .. } = input else {
+        panic!("specified fit descriptor")
+    };
+    assert_eq!(
+        basis.original_size,
+        egui::vec2(raster[0] as f32, raster[1] as f32),
+        "ordinary specified 100% follows the arriving pre-AI GPU raster"
+    );
+}
+
+#[test]
+fn display_basis_specified_uncropped_thumbnail_arrival_keeps_single_and_actual_pair_raster_original()
+ {
+    for (canonical, raster) in [([15000, 20000], [6144, 8192]), ([600, 800], [600, 800])] {
+        for ppp in [1.0, 1.25] {
+            for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+                for order in [[0, 1], [1, 0]] {
+                    for known_coverage in [false, true] {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(ppp);
+                        page_turn::install(&ctx);
+                        let mut app = fixture();
+                        app.spread_mode = mode;
+                        configure_specified_original(&mut app);
+                        install_uncropped_thumbnails(
+                            &mut app,
+                            &ctx,
+                            canonical,
+                            raster,
+                            known_coverage,
+                        );
+                        let viewport = egui::vec2(1200.0, 900.0) / ppp;
+                        specified_frame(&ctx, viewport, |_, _| {});
+                        let mut baseline = Vec::new();
+                        specified_frame(&ctx, viewport, |ui, ctx| {
+                            baseline = draw_specified_current(&mut app, ui, ctx, None);
+                        });
+                        assert_eq!(baseline.len(), if mode.is_spread() { 2 } else { 1 });
+                        for transform in &baseline {
+                            assert_specified_raster_basis(transform.fit_input, raster);
+                            close_physical_size(*transform, raster, ppp);
+                        }
+                        for idx in order {
+                            let _ = install_complete(
+                                &mut app, &ctx, idx, canonical, raster, raster, false,
+                            );
+                            specified_frame(&ctx, viewport, |ui, ctx| {
+                                let actual = draw_specified_current(&mut app, ui, ctx, None);
+                                assert_eq!(actual.len(), baseline.len());
+                                for (before, after) in baseline.iter().zip(actual) {
+                                    assert_specified_raster_basis(after.fit_input, raster);
+                                    close_physical_size(after, raster, ppp);
+                                    same_frame_and_common_pixel(*before, after, ppp);
+                                }
+                            });
+                        }
+                        // The no-material fallback must agree with actual Single/Pair
+                        // painting; rediscovering canonical source pixels is not 100%.
+                        for idx in 0..2 {
+                            assert_specified_raster_basis(
+                                app.fs_fit_input_for_idx(idx, FullscreenFitMode::SpecifiedScale)
+                                    .unwrap(),
+                                raster,
+                            );
+                            assert_eq!(
+                                app.fs_page_coordinate_source_size(idx),
+                                Some(egui::vec2(canonical[0] as f32, canonical[1] as f32)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn continuous_specified_rects(
+    app: &mut App,
+    ctx: &egui::Context,
+    viewport: egui::Vec2,
+    raster: [usize; 2],
+) -> Vec<(usize, egui::Rect)> {
+    for idx in 0..2 {
+        assert_specified_raster_basis(
+            app.fs_fit_input_for_idx(idx, FullscreenFitMode::SpecifiedScale)
+                .unwrap(),
+            raster,
+        );
+        assert_eq!(
+            app.vertical_reading_base_size(idx, viewport, true),
+            egui::vec2(raster[0] as f32, raster[1] as f32),
+            "continuous base geometry shares the ordinary raster basis"
+        );
+    }
+    let (units, current_pos) = app.continuous_reading_units_and_pos(0).unwrap();
+    assert_eq!(
+        units[current_pos].presentation.len(),
+        if app.spread_mode.is_spread() { 2 } else { 1 },
+    );
+    let (pages, _, _, _) = app
+        .continuous_reading_layout(
+            ctx,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, viewport),
+            &units,
+            current_pos,
+            true,
+        )
+        .unwrap();
+    assert!(!pages.is_empty());
+    pages
+        .into_iter()
+        .map(|page| {
+            let physical = page.rect.size() * ctx.pixels_per_point();
+            assert!(
+                (physical.x - raster[0] as f32).abs() <= 1.01
+                    && (physical.y - raster[1] as f32).abs() <= 1.01,
+                "continuous layout must retain raster 100%: {physical:?}, expected={raster:?}",
+            );
+            (page.idx(), page.rect)
+        })
+        .collect()
+}
+
+#[test]
+fn display_basis_specified_uncropped_thumbnail_arrival_keeps_continuous_base_and_layout_raster_original()
+ {
+    for (canonical, raster) in [([15000, 20000], [6144, 8192]), ([600, 800], [600, 800])] {
+        for ppp in [1.0, 1.25] {
+            for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+                for order in [[0, 1], [1, 0]] {
+                    for known_coverage in [false, true] {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(ppp);
+                        let mut app = fixture();
+                        app.spread_mode = mode;
+                        app.reading_flow = ReadingFlow::Vertical;
+                        configure_specified_original(&mut app);
+                        install_uncropped_thumbnails(
+                            &mut app,
+                            &ctx,
+                            canonical,
+                            raster,
+                            known_coverage,
+                        );
+                        let viewport = egui::vec2(1200.0, 900.0) / ppp;
+                        specified_frame(&ctx, viewport, |_, _| {});
+                        let baseline = continuous_specified_rects(&mut app, &ctx, viewport, raster);
+                        for idx in order {
+                            let _ = install_complete(
+                                &mut app, &ctx, idx, canonical, raster, raster, false,
+                            );
+                            let actual =
+                                continuous_specified_rects(&mut app, &ctx, viewport, raster);
+                            assert_eq!(actual, baseline, "raster arrival moves no continuous page");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

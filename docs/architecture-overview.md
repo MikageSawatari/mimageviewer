@@ -273,7 +273,10 @@ PDF の既知 page-box cache 値も preview の独立 nullable layout 列へ同�
 通常完成素材はGPU clamp後／AI後の実texture、部分代役は生成時のcrop前rasterを100%基準にし、
 `FullscreenFitInput::Raster` でcapture／replayへ保持する。crop samplerの丸めは幾何へ逆流させない。
 見開きの左右構成と指定方式の基準は共通のレイアウト寸法境界から選び、片側だけ crop の場合も
-通常 thumbnail の texel 数を外側の構成へ使わない。全面素材の単ページの従来 sizing は保ち、
+通常 thumbnail の texel 数を外側の構成へ使わない。既存4方式の全面素材の単ページ sizing は保つ。
+指定倍率の通常rasterだけは単ページ・見開き・連結読みで同じA/O resolverへ統一する。
+本画像未到着時の100%基準は生成由来のcrop前raster、またはproducer共通のGPU clamp予測値であり、
+thumbnail実寸やclamp前の正準座標寸法を流用しない。AI後もAI前raster基準を維持する。
 Unknown の旧行は一覧で保持する一方、現在 crop ありの
 fullscreen／通過／animation には共通 typed policy で使わない。詳細は
 [表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ)。

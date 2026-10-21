@@ -1467,6 +1467,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   捕捉済みdescriptorを優先し、thumbnail退去後にlive idxの寸法へ戻さない。
   frozen replayの指定値・倍率制限は既存の捕捉値を維持する。既存resourceの由来・fit保持を
   完成させる構造修正であり、述語・viewport生成・context lifecycleへの変更はない。
+- 最終P2追補: 全面thumbnailの指定倍率もproducerと同じGPU clamp予測を含む共通A/O resolverへ
+  統合する。単ページsnapshot／display-unit capture／連結snapshotはこの値を既存fit descriptorへ
+  捕捉し、保持素材の由来を維持する。新しいsnapshot状態や再同期を追加せず、述語・viewport・
+  context lifecycleは変更しない。通常rasterの3flow共通化は設計担当の最新方針に従う。
 
 ### 2026-10-21 §1.165 独立レビュー追補
 

@@ -31537,52 +31537,107 @@ impl App {
     }
 
     fn specified_fit_basis_for_idx(&self, idx: usize) -> Option<FullscreenFitBasis> {
+        self.specified_fit_basis_for_display(idx, None)
+    }
+
+    /// The display owner resolves specified A/O for every flow and material.
+    /// Coordinates stay canonical; an absent ordinary raster predicts the same
+    /// GPU-clamped dimensions as its producer instead of treating coordinates as O.
+    fn specified_fit_basis_for_display(
+        &self,
+        idx: usize,
+        resource: Option<&FullscreenPaintPayload>,
+    ) -> Option<FullscreenFitBasis> {
+        if let Some(FullscreenPaintPayload::PresentationMaterial(_)) = resource
+            && let Some(transform) = self.page_turn_held_transform(idx)
+            && let (FullscreenFitInput::SpecifiedScale { basis, .. }
+            | FullscreenFitInput::CanonicalPage { basis }) = transform.fit_input
+        {
+            // This owner also preserves RAW/PDF held bases after live metadata
+            // eviction. A capture must not become a fresh media-specific query.
+            return Some(basis);
+        }
         if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
             return self.pdf_specified_basis_for_idx(idx);
         }
-        let canonical = self.fs_page_layout_source_size(idx);
-        let original = if self.is_raw_page(idx) {
-            self.fs_page_coordinate_source_size(idx)
-        } else {
-            self.pre_ai_display_size_for_idx(idx)
-                .or_else(|| match self.fs_cache.get(&idx) {
-                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.size_vec2()),
-                    Some(FsCacheEntry::Animated {
-                        frames,
-                        current_frame,
-                        ..
-                    }) => frames.get(*current_frame).map(|(tex, _)| tex.size_vec2()),
-                    _ => self
-                        .fs_thumbnail_resource_for_display(idx)
-                        .ok()
-                        .filter(|resource| resource.source_coverage().is_partial())
-                        .map(|resource| resource.original_display_dimensions().as_vec2())
-                        .or_else(|| self.fs_page_coordinate_source_size(idx)),
-                })
-        }?;
-        // An edited canvas is the aspect owner before AI; enlarged outputs never
-        // replace it. RAW keeps the developed coordinate aspect.
-        let aspect = if self.pre_ai_display_size_for_idx(idx).is_some() && !self.is_raw_page(idx) {
-            original
-        } else {
-            canonical.unwrap_or(original)
+        if self.is_raw_page(idx) {
+            let original = self.fs_page_coordinate_source_size(idx)?;
+            return FullscreenFitBasis::new(
+                self.fs_page_layout_source_size(idx).unwrap_or(original),
+                original,
+            );
+        }
+        let pre_ai = self.pre_ai_display_size_for_idx(idx);
+        let resident = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => Some(tex.size_vec2()),
+            Some(FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            }) => frames.get(*current_frame).map(|(tex, _)| tex.size_vec2()),
+            _ => None,
         };
-        FullscreenFitBasis::new(aspect, original)
+        // Metadata-only consumers select the same partial preview as painting
+        // until a real source/pre-AI raster supersedes it.
+        let preview = if resource.is_none() && pre_ai.is_none() && resident.is_none() {
+            self.fs_thumbnail_resource_for_display(idx)
+                .ok()
+                .map(FullscreenPaintPayload::from)
+        } else {
+            None
+        };
+        let resource = resource.or(preview.as_ref());
+        if let Some(resource) = resource {
+            if resource.source_coverage().is_partial() {
+                let original = resource.original_display_dimensions().as_vec2();
+                let (w, h) = resource.source_coverage().coordinate_dims()?.as_tuple();
+                return FullscreenFitBasis::new(egui::vec2(w as f32, h as f32), original);
+            }
+        }
+        let original = pre_ai
+            .or(resident)
+            .or_else(|| {
+                self.fs_preview_original_dimensions(idx)
+                    .map(|dims| dims.as_vec2())
+            })
+            // Preserve displayability when no source dimensions have arrived
+            // at all. This is the existing selected-sampler policy, not a
+            // conversion of canonical coordinates into physical pixels.
+            .or_else(|| resource.map(|resource| resource.original_display_dimensions().as_vec2()))
+            .or_else(|| {
+                self.fs_thumbnail_resource_for_display(idx)
+                    .ok()
+                    .map(|resource| resource.original_display_dimensions().as_vec2())
+            })?;
+        // Whole ordinary materials share the same predicted/resident canvas
+        // aspect too. Cache arrival must not switch A from canonical rounding to
+        // raster rounding. Canonical source coordinates remain independent.
+        FullscreenFitBasis::new(original, original)
     }
 
     fn continuous_specified_fit_basis_for_idx(&self, idx: usize) -> Option<FullscreenFitBasis> {
-        let basis = self.specified_fit_basis_for_idx(idx)?;
-        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
-            return Some(basis);
-        }
-        // Continuous reading historically fits source-coordinate dimensions,
-        // even when the resident pre-AI texture was clamped for the GPU.
-        FullscreenFitBasis::new(
-            self.fs_page_layout_source_size(idx)
-                .unwrap_or(basis.aspect_size),
-            self.fs_page_coordinate_source_size(idx)
-                .unwrap_or(basis.original_size),
-        )
+        self.specified_fit_basis_for_display(idx, None)
+    }
+
+    /// A preview represents the forthcoming uncropped raster. Keep the producer's
+    /// stored dimensions when available; otherwise use its shared clamp function.
+    fn fs_preview_original_dimensions(
+        &self,
+        idx: usize,
+    ) -> Option<crate::page_dims::DisplayOriginalDimensions> {
+        self.fs_thumbnail_resource_for_display(idx)
+            .ok()
+            .and_then(|resource| resource.source_coverage().uncropped_raster_dimensions())
+            .or_else(|| {
+                self.fs_page_coordinate_source_size(idx).map(|source| {
+                    crate::canonical_image_loader::gpu_raster_dimensions(
+                        crate::page_dims::CanonicalPageDimensions::new(
+                            source.x as u32,
+                            source.y as u32,
+                        ),
+                    )
+                })
+            })
     }
 
     fn captured_fit_input_for_replay(&self, captured: FullscreenFitInput) -> FullscreenFitInput {
@@ -31602,9 +31657,8 @@ impl App {
         }
     }
 
-    /// A selected material keeps its own specified-scale basis after its producer
-    /// cache is evicted. Consumer-specific live-source policies are only consulted
-    /// when no material-owned basis exists.
+    /// A selected material keeps its specified-scale basis after its producer
+    /// cache is evicted; ordinary predictions share the same owner as idx inputs.
     fn fs_material_specified_fit_input(
         &self,
         idx: usize,
@@ -31614,21 +31668,7 @@ impl App {
         if mode != FullscreenFitMode::SpecifiedScale {
             return None;
         }
-        let basis = if resource.source_coverage().is_partial()
-            && self.fs_uses_raster_original_basis(idx)
-        {
-            let original = resource.original_display_dimensions().as_vec2();
-            let (w, h) = resource.source_coverage().coordinate_dims()?.as_tuple();
-            FullscreenFitBasis::new(egui::vec2(w as f32, h as f32), original)?
-        } else if matches!(resource, FullscreenPaintPayload::PresentationMaterial(_)) {
-            match self.page_turn_held_transform(idx)?.fit_input {
-                FullscreenFitInput::SpecifiedScale { basis, .. }
-                | FullscreenFitInput::CanonicalPage { basis } => basis,
-                FullscreenFitInput::Legacy(_) | FullscreenFitInput::Raster { .. } => return None,
-            }
-        } else {
-            return None;
-        };
+        let basis = self.specified_fit_basis_for_display(idx, Some(resource))?;
         // Retain A/O, but resolve the current policy. Frozen replay supplies its
         // complete captured descriptor directly instead of entering this resolver.
         Some(FullscreenFitInput::from_mode(
@@ -31645,16 +31685,10 @@ impl App {
         mode: FullscreenFitMode,
         resource: &FullscreenPaintPayload,
     ) -> Option<FullscreenFitInput> {
-        let input = self
-            .fs_material_specified_fit_input(idx, mode, resource)
-            .or_else(|| match resource {
-                FullscreenPaintPayload::NormalResource(resource) => {
-                    self.fs_fit_input_for_source_texture(idx, mode, resource.source_texture())
-                }
-                FullscreenPaintPayload::PresentationMaterial(_) => {
-                    self.fs_fit_input_for_idx(idx, mode)
-                }
-            })?;
+        if mode == FullscreenFitMode::SpecifiedScale {
+            return self.fs_material_specified_fit_input(idx, mode, resource);
+        }
+        let input = self.fs_fit_input_for_idx(idx, mode)?;
         Some(
             if self.fs_material_uses_raster_original_basis(
                 idx,
@@ -31683,72 +31717,6 @@ impl App {
         )
     }
 
-    fn fs_fit_input_for_source_texture(
-        &self,
-        idx: usize,
-        mode: FullscreenFitMode,
-        handle: &egui::TextureHandle,
-    ) -> Option<FullscreenFitInput> {
-        if mode != FullscreenFitMode::SpecifiedScale
-            || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
-            || self.continuous_reading_active_for_idx(idx)
-        {
-            let input = self.fs_fit_input_for_idx(idx, mode)?;
-            return Some(
-                if self.fs_material_uses_raster_original_basis(
-                    idx,
-                    handle.id(),
-                    self.fs_source_coverage_for_texture(idx, handle.id()),
-                ) {
-                    input.with_original_display_dimensions(
-                        self.fullscreen_paint_resource_for_texture(idx, handle.clone())
-                            .original_display_dimensions(),
-                    )
-                } else {
-                    input
-                },
-            );
-        }
-        let preserve_source = self.fs_page_layout_uses_source_size(idx, handle);
-        let resident_source = match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { tex, .. }) => tex.id() == handle.id(),
-            Some(FsCacheEntry::Animated { frames, .. }) => {
-                frames.iter().any(|(tex, _)| tex.id() == handle.id())
-            }
-            _ => false,
-        };
-        let thumbnail_source = matches!(self.thumbnails.get(idx), Some(ThumbnailState::Loaded { tex, .. }) if tex.id() == handle.id());
-        // Partial raster materials have already resolved A/O from the payload;
-        // this is the existing selected-source policy for ordinary full inputs.
-        let original = if preserve_source {
-            self.fs_page_coordinate_source_size(idx)?
-        } else if resident_source || thumbnail_source {
-            handle.size_vec2()
-        } else {
-            self.pre_ai_display_size_for_idx(idx)
-                .or_else(|| match self.fs_cache.get(&idx) {
-                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.size_vec2()),
-                    Some(FsCacheEntry::Animated {
-                        frames,
-                        current_frame,
-                        ..
-                    }) => frames.get(*current_frame).map(|(tex, _)| tex.size_vec2()),
-                    _ => None,
-                })?
-        };
-        let aspect = if preserve_source {
-            self.fs_page_layout_source_size(idx).unwrap_or(original)
-        } else {
-            original
-        };
-        Some(FullscreenFitInput::from_mode(
-            mode,
-            self.settings.fullscreen_specified_scale,
-            FullscreenFitBasis::new(aspect, original)?,
-            self.settings.fullscreen_specified_scale_max_tenths,
-        ))
-    }
-
     fn fs_fit_input_for_idx(
         &self,
         idx: usize,
@@ -31760,11 +31728,7 @@ impl App {
         Some(FullscreenFitInput::from_mode(
             mode,
             self.settings.fullscreen_specified_scale,
-            if self.continuous_reading_active_for_idx(idx) {
-                self.continuous_specified_fit_basis_for_idx(idx)?
-            } else {
-                self.specified_fit_basis_for_idx(idx)?
-            },
+            self.specified_fit_basis_for_idx(idx)?,
             self.settings.fullscreen_specified_scale_max_tenths,
         ))
     }
@@ -31817,17 +31781,8 @@ impl App {
         if thumbnail && !resource.source_coverage().is_partial() {
             // A spread thumbnail represents its whole page. Its neighbor must not
             // change position merely because this sampler has not arrived yet.
-            if let Some(raster) = resource.source_coverage().uncropped_raster_dimensions() {
+            if let Some(raster) = self.fs_preview_original_dimensions(idx) {
                 return raster.as_vec2();
-            }
-            if let Some(source) = self.fs_page_coordinate_source_size(idx) {
-                return crate::canonical_image_loader::gpu_raster_dimensions(
-                    crate::page_dims::CanonicalPageDimensions::new(
-                        source.x as u32,
-                        source.y as u32,
-                    ),
-                )
-                .as_vec2();
             }
         }
         original.as_vec2()
@@ -31839,12 +31794,7 @@ impl App {
         mode: FullscreenFitMode,
         resource: &FullscreenPaintPayload,
     ) -> Option<FullscreenFitInput> {
-        let input = if mode == FullscreenFitMode::SpecifiedScale {
-            self.fs_material_specified_fit_input(idx, mode, resource)
-                .or_else(|| self.fs_fit_input_for_idx(idx, mode))
-        } else {
-            self.fs_fit_input_for_payload(idx, mode, resource)
-        }?;
+        let input = self.fs_fit_input_for_payload(idx, mode, resource)?;
         Some(
             if self.fs_material_uses_raster_original_basis(
                 idx,
@@ -89151,7 +89101,7 @@ mod specified_scale_consumer_tests {
     }
 
     #[test]
-    fn specified_scale_ai_completion_preserves_paged_pre_ai_and_continuous_source_originals() {
+    fn specified_scale_ai_completion_preserves_shared_pre_ai_originals() {
         use crate::app::{FinalAiPending, FinalAiResult};
         use std::sync::atomic::AtomicBool;
         let ctx = egui::Context::default();
@@ -89187,7 +89137,9 @@ mod specified_scale_consumer_tests {
             .unwrap()
             .0[0]
             .rect;
-        assert_eq!(baseline_continuous.size(), egui::vec2(10001.0, 15000.0));
+        // Height 1000 requests more than 100% for this small pre-AI raster;
+        // the shared specified maximum caps it at 5x in every flow.
+        assert_eq!(baseline_continuous.size(), egui::vec2(200.0, 300.0));
         app.reading_flow = ReadingFlow::Paged;
         app.settings.fullscreen_fit_no_upscale = true;
         app.settings.fullscreen_fit_no_downscale = false;
@@ -89284,10 +89236,10 @@ mod specified_scale_consumer_tests {
         let (pages, _, _, _) = app
             .continuous_reading_layout(&ctx, rect, &units, 0, true)
             .unwrap();
-        close(pages[0].rect.height(), 15000.0);
+        close(pages[0].rect.height(), 300.0);
         assert_eq!(
             pages[0].rect, baseline_continuous,
-            "40x60 pre-AI rounding must not replace the canonical 10001x15000 aspect on AI arrival"
+            "160x240 AI output must not replace the shared 40x60 pre-AI fit basis"
         );
         let input = app
             .fs_fit_input_for_resource(
@@ -89299,7 +89251,11 @@ mod specified_scale_consumer_tests {
         let FullscreenFitInput::SpecifiedScale { basis, .. } = input else {
             panic!()
         };
-        assert_eq!(basis.original_size, egui::vec2(10001.0, 15000.0));
+        assert_eq!(basis.original_size, egui::vec2(40.0, 60.0));
+        assert_eq!(
+            app.fs_page_coordinate_source_size(0),
+            Some(egui::vec2(10001.0, 15000.0))
+        );
         app.fs_cache.remove(&0);
         app.fs_early_dims.insert(0, [10001, 15000]);
         let (evicted, _, _, _) = app
@@ -89470,6 +89426,33 @@ mod specified_scale_consumer_tests {
         ]
     }
 
+    fn install_specified_eviction_raster(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        dims: [u32; 2],
+    ) {
+        let pixels = Arc::new(egui::ColorImage::filled(
+            [dims[0] as usize, dims[1] as usize],
+            egui::Color32::WHITE,
+        ));
+        let tex = ctx.load_texture(
+            format!("specified-eviction-{idx}-{dims:?}"),
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels,
+                source_dims: Some([dims[0] as usize, dims[1] as usize]),
+                load_seq: 0,
+                animation: StaticAnimationState::Still,
+            },
+        );
+    }
+
     fn specified_eviction_fixture(
         ctx: &egui::Context,
         flow: ReadingFlow,
@@ -89516,6 +89499,23 @@ mod specified_scale_consumer_tests {
                 [0, 40].contains(idx)
             }
         });
+        // These tests exercise physical fit/trim, so their raster dimensions
+        // must match the originals under test. A tiny PDF fixture sampler with
+        // only source_dims changed would now test the 5x cap instead of trim.
+        let originals = app
+            .fs_cache
+            .iter()
+            .filter_map(|(&idx, entry)| match entry {
+                FsCacheEntry::Static {
+                    source_dims: Some([w, h]),
+                    ..
+                } => Some((idx, [*w as u32, *h as u32])),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (idx, dims) in originals {
+            install_specified_eviction_raster(&mut app, ctx, idx, dims);
+        }
         let units = if paired {
             (0..24)
                 .map(|pos| ContinuousReadingUnitSpec::pages(pos * 2, vec![pos * 2, pos * 2 + 1]))
@@ -89765,29 +89765,15 @@ mod specified_scale_consumer_tests {
                 [400, 100]
             };
             app.record_page_layout_dims_for_spread(0, (original[0], original[1]));
-            if let Some(FsCacheEntry::Static { source_dims, .. }) = app.fs_cache.get_mut(&0) {
-                *source_dims = Some([original[0] as usize, original[1] as usize]);
-            }
+            install_specified_eviction_raster(&mut app, &ctx, 0, original);
             // A mode change selects the current center unit. Its original must
             // be known; evicted off-screen units may still await normal reload.
             if matches!(change, Change::Split) {
                 app.record_page_layout_dims_for_spread(40, (400, 100));
-                if let Some(FsCacheEntry::Static { source_dims, .. }) = app.fs_cache.get_mut(&40) {
-                    *source_dims = Some([400, 100]);
-                }
+                install_specified_eviction_raster(&mut app, &ctx, 40, [400, 100]);
             }
             for idx in [39, 41] {
-                let Some(FsCacheEntry::Static { tex, pixels, .. }) = app.fs_cache.get(&40) else {
-                    panic!("fixture original");
-                };
-                let entry = FsCacheEntry::Static {
-                    tex: tex.clone(),
-                    pixels: pixels.clone(),
-                    source_dims: Some([200, 600]),
-                    load_seq: 0,
-                    animation: StaticAnimationState::Still,
-                };
-                app.fs_cache.insert(idx, entry);
+                install_specified_eviction_raster(&mut app, &ctx, idx, [200, 600]);
             }
             app.settings.fullscreen_specified_scale = if matches!(change, Change::ResizeDpi) {
                 FullscreenSpecifiedScale {
@@ -91908,7 +91894,7 @@ mod specified_scale_consumer_tests {
     }
 
     #[test]
-    fn specified_scale_thumbnail_and_passthrough_draw_use_the_existing_selected_source_policy() {
+    fn specified_scale_thumbnail_and_passthrough_draw_share_predicted_raster_original() {
         let ctx = egui::Context::default();
         let mut app = pdf_app(&ctx, 1);
         app.items[0] = GridItem::Image(app.tmp.path().join("thumbnail.png"));
@@ -91969,7 +91955,7 @@ mod specified_scale_consumer_tests {
             result.unwrap()
         };
         let ordinary = draw(&mut app, None, Some(&thumb));
-        close(ordinary.layout_full_image_rect.height(), 12.0);
+        close(ordinary.layout_full_image_rect.height(), 8192.0);
         #[cfg(windows)]
         {
             let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
@@ -91994,14 +91980,14 @@ mod specified_scale_consumer_tests {
                 .unwrap();
             close(
                 snapshot.height() * App::detached_snapshot_client_size(placement).y,
-                12.0,
+                8192.0,
             );
         }
         let passthrough = app.ensure_passthrough_rendition(&ctx, 0).unwrap();
         assert_ne!(passthrough.id(), thumb.id());
         let resource = FullscreenPaintResource::direct(passthrough);
         let rendered = draw(&mut app, Some(&resource), None);
-        close(rendered.layout_full_image_rect.height(), 15000.0);
+        close(rendered.layout_full_image_rect.height(), 8192.0);
         #[cfg(windows)]
         {
             let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
@@ -92026,7 +92012,7 @@ mod specified_scale_consumer_tests {
                 .unwrap();
             close(
                 snapshot.height() * App::detached_snapshot_client_size(placement).y,
-                15000.0,
+                8192.0,
             );
         }
         let captured = app
@@ -92039,7 +92025,7 @@ mod specified_scale_consumer_tests {
         let FullscreenFitInput::SpecifiedScale { basis, .. } = captured else {
             panic!()
         };
-        assert_eq!(basis.original_size, egui::vec2(10000.0, 15000.0));
+        assert_eq!(basis.original_size, egui::vec2(5461.0, 8192.0));
     }
 
     #[test]

@@ -742,7 +742,8 @@ processed の縦横比変更、指定方式の既存 A/O 基準は、それぞ�
 （例:600×800）の到着時に拡大していた。現在は代役もページ全体のraster寸法の枠へ置き、
 到着時に大きさが跳ばないようにする。7474e5cf1と同じ倍率契約へ戻した範囲は完成素材であり、
 読込中の代役まで完全に同じ表示へ戻したものではない。
-指定方式のAI前A/O、RAWのdeveloped寸法、PDF page-box、連結読みのsource基準は維持する。
+指定方式は通常rasterのAI前A/Oを単ページ・見開き・連結読みで共通に解決する。
+RAWのdeveloped寸法、PDF page-box、他4方式の連結読みのsource基準は維持する。
 通過renditionも部分素材なら同じ切り出し前rasterを使い、全面renditionの従来source基準は維持する。
 各ページ内の通常素材の contain／物理 pixel snapping は既存の規則を維持する。
 正準寸法とGPU clamp後寸法が異なる場合も、注釈・source座標を100%表示寸法で上書きしない。
@@ -2463,9 +2464,14 @@ valueは `PercentTenths` / `LogicalPixels`。OFF中も数値・単位を保持�
 単ページZはPage・制限なしを維持し、見開きZの照準は選択fitと実効gapを使う。
 
 `FullscreenFitInput` は旧方式と指定値・共通最大倍率snapshot＋`FullscreenFitBasis` を型で分ける。
-Aは取得済みcanonical aspect、OはAI前の物理原寸で、Aの長辺をOの画素長辺へ正規化する。
-AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け、派生textureやGPU clamp後の
-寸法から逆算しない。PDFは検証済みpage boxとcontent typeから、Vectorは長辺4096px、Rasterは
+Aは部分素材のcoverage座標aspect／RAWのdeveloped aspect／PDF page box、通常の全面rasterでは
+解決済みAI前rasterのaspectとする。OはAI前の物理原寸で、Aの長辺をOの画素長辺へ正規化する。
+通常全面素材はAも予測rasterと到着rasterで揃え、pre-AI cache登録だけで正準aspectから
+整数丸め済みaspectへ切り替えない。正準source座標とページ構成の寸法は独立して維持する。
+AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け、派生textureや
+AI出力寸法から逆算しない。通常thumbnailで本画像未到着なら、生成時のcrop前raster寸法を使い、
+それが無ければ正準寸法をproducerと共通の `gpu_raster_dimensions` へ渡してGPU raster寸法を予測する。
+正準座標寸法を物理100%へそのまま流用しない。PDFは検証済みpage boxとcontent typeから、Vectorは長辺4096px、Rasterは
 `min(4096, native_long_edge)` の固定Oを解く。既存source座標用のraster寸法は別用途のまま残す。
 
 `layout_full_image_rect` はこのA/Oから得るfull-page fit枠。実textureの整数丸めで縦横比が微妙に
@@ -2473,12 +2479,17 @@ AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け
 paint / hit / UV / source写像は実際のcontained textureを共有し、PDF需要・合成layout・captureの
 fit枠は安定したcanonical extentを使う。descriptorと枠はcapture時の値を保存し、frozen / holdover
 replayやnavigatorから現在の指定値・共通最大倍率や新しいraster寸法を後読みしない。
-単ページと見開きは `fs_material_specified_fit_input` で素材が所有するA/Oを先に解決する。
+単ページ・見開き・連結読みは `specified_fit_basis_for_display` でA/Oを解決する。
 部分素材はcoverageの正準座標寸法とcrop前raster、保持presentationは捕捉済みfit descriptorを
 使い、thumbnail退去後にidx探索の正準寸法へ100%基準を戻さない。見開き全体と各ページも
-同じ `fs_spread_fit_input` の結果を使う。素材がA/Oを持たない通常経路だけ、consumerごとの
-既存の寸法探索へ委ねる。連結読みの `continuous_specified_fit_basis_for_idx` は従来の
-source座標基準を維持し、この単ページ／見開きのraster基準へ置き換えない。
+同じ `fs_spread_fit_input` の結果を使う。通常thumbnail・素材なしのidx探索・連結読みの
+`continuous_specified_fit_basis_for_idx` も同じownerへ委ねる。
+§1.165最終P2追補（2026-10-22）の仕様差として、通常thumbnailの指定倍率は7474e5cf1の
+thumbnail実寸（例:60×80）へ戻さず、到着予定GPU raster（正準15000×20000なら6144×8192）を
+100%基準にする。指定倍率＋「縮小しない」でも到着時に枠・倍率が跳ばない。
+通常rasterの指定方式では連結読みのsource原寸例外も外し、到着後・AI前metadata・退去後まで
+同じraster基準を維持する。正準座標とページ構成、RAW／PDF、他4方式の連結規則は変更しない。
+source寸法自体がまだ不明な場合に限り、従来の選択済みsampler基準で代役の表示可能性を保つ。
 捕捉済みの `SpecifiedScale.max_tenths` をgeometryの再解決にも使い、live設定変更を混ぜない。
 
 見開きは既存高さ合わせと仮想slotを維持し、2枚＋gap全体をfitする。幅指定が極小なら表示だけ
