@@ -62473,7 +62473,7 @@ mod native_video_rating_key_tests {
             assert!(app.rating_session_generation_for_key(&key) > stale_generation);
 
             // A hydrate result started before the detached write must not win.
-            app.hydrate_ratings_from_xmp(vec![(target.clone(), 2, stale_generation)]);
+            hydrate_ratings_from_xmp(&mut app, vec![(target.clone(), 2, stale_generation)]);
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
             assert_eq!(app.rating_cache.get(&idx), Some(&4));
 
@@ -62487,7 +62487,7 @@ mod native_video_rating_key_tests {
 
             // Even a same-generation XMP result cannot resurrect an explicit
             // user clear while the writer catches up.
-            app.hydrate_ratings_from_xmp(vec![(target.clone(), 3, clear_generation)]);
+            hydrate_ratings_from_xmp(&mut app, vec![(target.clone(), 3, clear_generation)]);
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
             assert_eq!(app.rating_cache.get(&idx), Some(&0));
             app.remove_active_context_for_test();
@@ -62528,8 +62528,8 @@ mod native_video_rating_key_tests {
 
         // clear より前に開始した読み取りと、clear 後だが XMP writer 完了前に開始した読み取りの
         // どちらも、ユーザー最終値 0 を復活させてはならない。
-        app.hydrate_ratings_from_xmp(vec![(path.clone(), 4, pending_generation)]);
-        app.hydrate_ratings_from_xmp(vec![(path, 4, clear_generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path.clone(), 4, pending_generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 4, clear_generation)]);
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
         assert_eq!(app.rating_cache.get(&0), Some(&0));
@@ -62539,8 +62539,25 @@ mod native_video_rating_key_tests {
         .expect("detached context");
     }
 
+    fn hydrate_ratings_from_xmp(app: &mut App, reads: Vec<(PathBuf, u8, u64)>) {
+        let reads = reads
+            .into_iter()
+            .map(|(path, stars, rating_generation)| {
+                let key = crate::adjustment_db::normalize_path(&path);
+                crate::tag_prewarm::TagPrewarmResult {
+                    path,
+                    rating: Some(stars),
+                    rating_generation,
+                    ticket: app.rating_xmp_hydration.read_ticket(&key),
+                }
+            })
+            .collect();
+        app.hydrate_ratings_from_xmp(reads);
+    }
+
     fn settle_xmp_rating_hydration(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        app.poll_tag_prewarm_results();
         while app.rating_xmp_hydration.is_busy() {
             app.poll_tag_prewarm_results();
             assert!(
@@ -62549,6 +62566,148 @@ mod native_video_rating_key_tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    fn exercise_xmp_hydration_after_delete_purge(book_delete: bool) {
+        for completed_before_delete in [false, true] {
+            for delete_tree in [false, true] {
+                if book_delete && !delete_tree {
+                    continue;
+                }
+                let mut app = setup_app();
+                app.settings.write_rating_to_xmp = false;
+                let books = app.tmp.path().join("books");
+                let root = books.join("Book");
+                std::fs::create_dir_all(&root).unwrap();
+                let page = root.join("0001_page.png");
+                image::RgbaImage::new(1, 1).save(&page).unwrap();
+                let untouched = books.join("Book-other.png");
+                image::RgbaImage::new(1, 1).save(&untouched).unwrap();
+                app.settings.book_root = Some(books);
+                let key = crate::adjustment_db::normalize_path(&page);
+                let other_key = crate::adjustment_db::normalize_path(&untouched);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&other_key, 2, None)
+                    .unwrap();
+                let generation = app.rating_session_generation_for_key(&key);
+                assert_eq!(
+                    generation, 0,
+                    "late first reads must not rely on a generation mismatch after purge"
+                );
+                let untouched_ticket = app.rating_xmp_hydration.read_ticket(&other_key);
+                let target = if delete_tree {
+                    root.clone()
+                } else {
+                    page.clone()
+                };
+                app.install_new_items(
+                    vec![
+                        if delete_tree {
+                            GridItem::Folder(target.clone())
+                        } else {
+                            GridItem::Image(target.clone())
+                        },
+                        GridItem::Image(untouched.clone()),
+                    ],
+                    vec![None, None],
+                );
+                app.rebuild_visible_indices();
+                // This accepted read has not returned yet. A deletion must also
+                // prevent it from creating a fresh import after the purge.
+                let late_read = crate::tag_prewarm::TagPrewarmResult {
+                    path: page.clone(),
+                    rating: Some(5),
+                    rating_generation: generation,
+                    ticket: app.rating_xmp_hydration.read_ticket(&key),
+                };
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let (completed_tx, completed_rx) = mpsc::channel();
+                app.rating_xmp_hydration.hold_next_import_for_test(
+                    crate::tag_prewarm::HydrationTestHook {
+                        entered: entered_tx,
+                        release: release_rx,
+                        completed: completed_tx,
+                    },
+                );
+                hydrate_ratings_from_xmp(&mut app, vec![(page.clone(), 4, generation)]);
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                if completed_before_delete {
+                    release_tx.send(()).unwrap();
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+                }
+                let ctx = egui::Context::default();
+                if book_delete {
+                    app.start_book_delete(&ctx, "Book".into());
+                    assert!(app.book_structural_op.is_some());
+                } else {
+                    app.start_delete_files(&ctx, vec![target.clone()]);
+                    assert!(app.delete_pending.is_some());
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while app.book_structural_op.is_some() || app.delete_pending.is_some() {
+                    app.poll_book_structural_op(&ctx);
+                    app.poll_delete_pending();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "delete must finish while the cancelled import is held"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(!target.exists());
+                assert!(!untouched_ticket.load(std::sync::atomic::Ordering::Acquire));
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+                assert!(!app.rating_session_writes.contains_key(&key));
+                if !completed_before_delete {
+                    release_tx.send(()).unwrap();
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                // Reuse the physical path before the old replies are adopted:
+                // the old image's stars must not attach to this new image.
+                std::fs::create_dir_all(&root).unwrap();
+                image::RgbaImage::new(1, 1).save(&page).unwrap();
+                let parked = app.build_window_context_for_test(1272301, |owner| {
+                    owner.tag_prewarm_pending = Some(
+                        crate::tag_prewarm::TagPrewarmPending::from_results_for_test(vec![
+                            late_read,
+                        ]),
+                    );
+                });
+                app.with_owner_viewer_context(parked, |owner| owner.poll_tag_prewarm_results())
+                    .unwrap();
+                app.poll_tag_prewarm_results();
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+                assert!(!app.rating_session_writes.contains_key(&key));
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&other_key), 2);
+                assert!(untouched.exists());
+                assert!(!app.rating_xmp_hydration.is_busy());
+                // A new read at the reused path has a new ticket and remains
+                // functional; deletion is not a persistent path blacklist.
+                hydrate_ratings_from_xmp(&mut app, vec![(page, 3, 0)]);
+                settle_xmp_rating_hydration(&mut app);
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
+                assert_eq!(app.rating_session_value_for_key(&key), Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn xmp_hydration_cannot_restore_rating_after_normal_delete_purge() {
+        exercise_xmp_hydration_after_delete_purge(false);
+    }
+
+    #[test]
+    fn xmp_hydration_cannot_restore_rating_after_book_delete_purge() {
+        exercise_xmp_hydration_after_delete_purge(true);
     }
 
     #[test]
@@ -62573,7 +62732,7 @@ mod native_video_rating_key_tests {
                     completed: completed_tx,
                 },
             );
-            app.hydrate_ratings_from_xmp(vec![(path, 4, 0)]);
+            hydrate_ratings_from_xmp(&mut app, vec![(path, 4, 0)]);
             entered_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
@@ -62614,7 +62773,7 @@ mod native_video_rating_key_tests {
             .set_user_rating(&key, 5, None)
             .unwrap();
         let writes = crate::rating_db::RATING_WRITES.sample();
-        app.hydrate_ratings_from_xmp(vec![(path, 2, 0)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 2, 0)]);
         settle_xmp_rating_hydration(&mut app);
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
         assert_eq!(
@@ -62636,7 +62795,7 @@ mod native_video_rating_key_tests {
         app.rating_cache.insert(0, 0);
         let generation = app.rating_session_generation_for_key(&key);
 
-        app.hydrate_ratings_from_xmp(vec![(path, 3, generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 3, generation)]);
         settle_xmp_rating_hydration(&mut app);
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);

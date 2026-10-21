@@ -141,6 +141,8 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
+        let keys = scan.candidate_keys().collect::<HashSet<_>>();
+        self.invalidate_xmp_rating_reads(|key| keys.contains(key));
         self.metadata_cleanup_result = None;
         self.metadata_cleanup_pending = Some(crate::metadata_cleanup::spawn_delete(
             crate::data_dir::get(),

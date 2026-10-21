@@ -297,6 +297,9 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return false;
         }
+        if let crate::books::BookOpIntent::Delete { path } = &intent {
+            self.invalidate_xmp_rating_reads_for_removed_paths(std::slice::from_ref(path));
+        }
         self.book_structural_op = Some(BookStructuralOp {
             phase: Phase::Requested {
                 name,
@@ -1066,6 +1069,7 @@ mod tests {
                         path: page.clone(),
                         rating: Some(3),
                         rating_generation: 0,
+                        ticket: owner.rating_xmp_hydration.read_ticket(&key),
                     },
                 ]),
             );

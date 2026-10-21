@@ -46148,6 +46148,32 @@ impl App {
         self.purge_current_context_metadata_for_removed_paths(removed);
     }
 
+    /// Invalidate accepted XMP reads, imports and queued publications before a
+    /// purge. User rating writes and deletion use the same App-owned tickets.
+    pub(crate) fn invalidate_xmp_rating_reads(&mut self, matches_key: impl Fn(&str) -> bool) {
+        self.rating_xmp_hydration.invalidate_matching(&matches_key);
+        for owner in self.viewer_context_ids() {
+            self.with_owner_viewer_context(owner, |app| {
+                let queued = std::mem::take(&mut app.tag_prewarm_queued);
+                app.tag_prewarm_queued = queued
+                    .into_iter()
+                    .filter(|idx| {
+                        app.items
+                            .get(*idx)
+                            .and_then(tag_item_path)
+                            .is_none_or(|path| {
+                                !matches_key(&crate::adjustment_db::normalize_path(path))
+                            })
+                    })
+                    .collect();
+            });
+        }
+    }
+
+    fn invalidate_xmp_rating_reads_for_removed_paths(&mut self, removed: &[PathBuf]) {
+        self.invalidate_xmp_rating_reads(removed_path_key_matcher(removed));
+    }
+
     /// Path-keyed application state follows the durable deletion, independently of
     /// the accepted rows/pixels retained by a reader or Snapshot.
     fn purge_shared_metadata_for_removed_paths(
@@ -48629,6 +48655,10 @@ impl App {
                     self.settings
                         .video_watched_to_end
                         .retain(|key| !removed_key(key));
+                    if !report.removed_paths.is_empty() {
+                        self.invalidate_xmp_rating_reads_for_removed_paths(&report.removed_paths);
+                        self.purge_shared_metadata_for_removed_paths(&report.removed_paths, &[]);
+                    }
                     self.reload_book_resume_meters();
                     self.apply_content_identity_store_mutations(report.store_mutations);
                     crate::logger::log(format!(
@@ -48694,6 +48724,7 @@ impl App {
         self.delete_purge_retry_after = None;
         self.delete_purge_retry_pending = Some(crate::metadata_cleanup::spawn_delete_purge_retry(
             self.rename_migration_data_dir(),
+            self.rating_xmp_hydration.pending_tickets(),
         ));
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -48719,6 +48750,7 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
+        self.invalidate_xmp_rating_reads_for_removed_paths(&paths);
         self.release_viewer_surfaces_for_removed_paths(ctx, &paths, "delete_target_path");
         // 削除中に items を差し替える恐れのある in-flight pending を停止。poll_delete_pending
         // は path で現 items に引き直すので世代一致は厳密には不要だが、余計な再描画・
@@ -74325,12 +74357,22 @@ impl App {
         }
         // 削除進行中は新規 XMP プリウォームを停止。削除予定パスを worker が読もうとすると
         // File::open が失敗して無駄なキャッシュ汚染や redundant log になる。
-        if self.delete_pending.is_some() {
+        if self.delete_pending.is_some()
+            || self.delete_purge_retry_pending.is_some()
+            || self
+                .metadata_cleanup_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(pending.task, crate::metadata_cleanup::CleanupTask::Delete)
+                })
+            || self.book_append_undo_in_progress()
+        {
             return;
         }
-        let Some(pending) = self.tag_prewarm_pending.as_ref() else {
+        if self.tag_prewarm_pending.is_none() {
             return;
-        };
+        }
+        self.rating_xmp_hydration.prune_finished_reads();
         let targets = if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
             if self.details_tag_prewarm_indices.is_empty() {
                 self.current_grid_order()
@@ -74381,7 +74423,13 @@ impl App {
             }
             self.tag_prewarm_queued.insert(idx);
             let key = crate::adjustment_db::normalize_path(p);
-            pending.push_job(p.clone(), self.rating_session_generation_for_key(&key));
+            let path = p.clone();
+            let generation = self.rating_session_generation_for_key(&key);
+            let ticket = self.rating_xmp_hydration.read_ticket(&key);
+            self.tag_prewarm_pending
+                .as_ref()
+                .unwrap()
+                .push_job(path, generation, ticket);
         }
     }
 
@@ -74398,8 +74446,8 @@ impl App {
                             &mut tag_perf_section,
                             crate::perf::stall::PollPart::TagPrewarm,
                         );
-                        if let Some(stars) = res.rating.filter(|stars| *stars > 0) {
-                            rating_hydrations.push((res.path, stars, res.rating_generation));
+                        if res.rating.is_some_and(|stars| stars > 0) {
+                            rating_hydrations.push(res);
                         }
                         pending.on_result_drained();
                     }
@@ -74421,7 +74469,7 @@ impl App {
     /// Keep the existing path generation authoritative. Pending cancellation
     /// tickets protect the subsequent DB write against user clears without
     /// publishing an attempted write as a successful rating generation.
-    fn hydrate_ratings_from_xmp(&mut self, hydrations: Vec<(PathBuf, u8, u64)>) {
+    fn hydrate_ratings_from_xmp(&mut self, hydrations: Vec<crate::tag_prewarm::TagPrewarmResult>) {
         if hydrations.is_empty() {
             return;
         }
@@ -74429,22 +74477,27 @@ impl App {
             return;
         };
         let mut target = HashMap::with_capacity(hydrations.len());
-        for (path, stars, generation) in hydrations {
-            target.insert(
-                crate::adjustment_db::normalize_path(&path),
-                (path, stars, generation),
-            );
+        for read in hydrations {
+            if read.ticket.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            target.insert(crate::adjustment_db::normalize_path(&read.path), read);
         }
-        for (key, (path, stars, generation)) in target {
+        for (key, read) in target {
+            let Some(stars) = read.rating else {
+                continue;
+            };
+            let generation = read.rating_generation;
             if stars == 0 || !self.xmp_rating_generation_is_current(&key, generation) {
                 continue;
             }
             if let Err(error) = self.rating_xmp_hydration.submit(
                 db_path.clone(),
-                path,
+                read.path,
                 key.clone(),
                 stars,
                 generation,
+                read.ticket,
             ) {
                 crate::logger::log(format!(
                     "[RATING] hydration submit failed key={key:?}: {error}"

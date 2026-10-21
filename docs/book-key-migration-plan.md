@@ -898,3 +898,95 @@ retained の取消・再入場・maintenance の既存回帰は削らず、`spre
 
 選択 nextest と focused の件数には重複がある。D2c は決定済み・対応済みで、今回の範囲に未解決事項はない。
 指定により build-dev・本体起動・commit は行っていない。全件 gate は設計担当へ引き継ぐ。
+
+### 8.9 XMP ★ import と削除 purge の競合 (2026-10-21)
+
+設計担当が `0aef092b6` で実行した `test-lib-full.ps1` は 14,028 件成功。
+その後の独立レビュー第2回で、XMP import が通常削除の purge 後に旧 path の★を復活させる P2 が出た。
+
+原因の判定: **読込結果と削除 purge の競合自体は worker 化前から存在した**。
+`a6a0b3a49^` の `poll_tag_prewarm_results` は、未消費の結果をそのまま同期
+`get_many` / `set_imported_rating` に渡していた。通常削除の開始は新規 enqueue を止めるだけで
+受付済み reader を失効しない。削除 worker の purge 後、削除完了を UI が採用して reader を
+再準備する前に結果を消費すると、行がないことを未評価として再登録できた。削除後は session 台帳も
+消すため、rating 世代だけでは遅い結果を除外できない。
+worker 化でこれに加わったのが、context reader の取消後も App 所有の DB job / 未採用完了が残る経路である。
+今回 App が import の所有者になった境界で両方を修正する。
+
+採った方法は、**既存の明示評価・クリア用の取消票を読込受付まで延長し、purge 前に失効する**こと。
+新しい世代・path blacklist・pending owner・待機状態は追加しない。
+`XmpRatingHydration` の同じ票を `PrewarmJob` → `TagPrewarmResult` → DB job → UI 完了が保持し、
+遅い読込から submit するときも票を作り直さない。対象は従来の purge と同じ exact / `/` / `::` 境界。
+受付済み票の import 数で有効な DB job と完了採用を数え、取消済み job は静止待ちから外す。
+未取消の job は従来どおり UI 採用まで待つ。
+
+SQLite の `BEGIN IMMEDIATE` 内で票を検査する既存実装を維持する。
+import が先に writer を取得・検査した場合はその commit 後に purge が消し、purge が先なら
+後続 import は取消票で書き込まない。UI でも同じ票を検査し、session 台帳へ再公開しない。
+同じ名前の新しい読込は新しい票を取得できるため、削除・取消の失敗や同名 path の再利用を永続的に拒否しない。
+対象の queued index だけを解除し、無関係な読込・採用済み reader は取り消さない。
+
+| purge の入口 | 取消の境界 |
+| --- | --- |
+| 通常削除 | `start_delete_files` の受付後、viewer release / worker spawn 前 |
+| 本の削除 | `request_book_structural_op` の Delete 受付後、Requested の作成前 |
+| 本への追加 Undo | 既存 writer 判定・teardown 後の再確認が通った後、Undo worker の開始前。すでに受付済みの DB import は既存 writer 条件でも順序付けられ、残る読込票も同じ scope 取消を受ける |
+| 明示メタデータ整理 | scan の candidate key だけを、既存 delete worker の開始前に失効。新規 read は Delete task 中だけ停止し、読み取り専用の Scan task 中は従来どおり進める |
+| 既存の削除 purge journal 再実行 | UI は受付済み票の snapshot だけを worker に渡す。worker が既存 journal を読んで孤児と確認した scope だけ、purge 前に同じ票を失効。空 journal・現存 path・無関係な prefix は取り消さない。完了採用では対象の shared metadata / session 台帳を purge し、queued index も解除する |
+
+上記以外の `content_identity` 内の purge 呼出しはテスト内であり、製品の追加入口ではない。
+再実行方式・障害分類・回復手順は追加しない。DB 処理は既存 worker のままで UI 同期 I/O を足さない。
+
+追加した回帰テスト:
+
+- `xmp_hydration_cannot_restore_rating_after_normal_delete_purge`: 実際の通常削除 handler / worker / purge / UI 採用を通す。単一画像とフォルダの両方を扱う。
+- `xmp_hydration_cannot_restore_rating_after_book_delete_purge`: 本削除の構造 owner と実 worker / purge を通す。
+- 上の二つは import の DB 前停止・完了後 UI 未採用の両方で、purge 完了後に旧完了と遅い読込を消費しても DB 行と session 台帳が復活しないことを確認する。初回読込の世代 0 を使い、purge 後の世代不一致だけでは除外できない経路を検査する。同名 path を作り直してから旧結果を渡し、無関係な sibling の★と読込票を維持し、新しい票では新しい★を取り込めることも確認する。
+- `delete_purge_retry_invalidates_only_confirmed_orphan_xmp_tickets`: 空 journal と現存 path の票を維持し、実際に purge する root・子 path・archive entry だけを失効する。
+- 既存 clear 回帰は取消済み完了を必ず一度 poll するよう fixture の settle を調整し、旧完了を消費しても clear を守る検査を維持する。
+
+検証結果（今回の未コミット差分、通常 feature / dev・test profile）:
+
+- 全 build / test に `MSBUILDDISABLENODEREUSE=1` と `CARGO_BUILD_JOBS=1` を指定。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: exit 0。既存の lib 264 / ort 1 警告で増加なし。
+  最終ログは `target/xmp-purge-check.stderr.log`。lib test も既存の 135 警告で増加なし。
+- 最初の新規 3 テストの nextest は 3 件成功。その後、初回読込の世代 0 と無関係な票の保持を fixture で明示した。
+  この強化版で関連 159 件が成功し、さらに Scan task を停止対象から外した最終版でも、下記の関連 159 件が成功した。
+- `cargo nextest run -p mimageviewer --lib -E <下記選択式>`: 159 件成功、失敗 0、exit 0。
+  新規 3 件、既存 clear・parked XMP・D2c、および `spread_shift_owner_tests` 全 34 件を実行済みと JUnit で照合した。
+  `section1373_metadata_database_cold_and_warm_per_file_benchmark` は 127.329 秒の slow 表示で成功。
+  ログは `target/xmp-purge-related.stderr.log`、JUnit は `target/xmp-purge-related.junit.xml`。
+- `scripts/test-focused.ps1 -Path <下表6パス>`: 6 run / 65 件成功、失敗 0、exit 0。
+  ログは `target/xmp-purge-focused.stdout.log`。各 JUnit は `target/test-focused/runs/` の
+  `20261021T144911516Z-ec6ed7a7` から `20261021T144932471Z-e893f908` まで。
+  App 本体の新規回帰は上記の明示 nextest で直接実行し、focused は下表のモジュールを明示した。
+- `cargo fmt`（引数なし、workspace 全体）、`cargo fmt --check`、`git diff --check`: 成功。
+- `python scripts/check_ui_glyphs.py`: 成功、dangerous glyph 0。利用者向け UI 文言の追加はない。
+- 独立コードレビュー（`gpt-6.1-sol` / `xhigh`）は最終境界を ACCEPT、追加 P1/P2 なし。
+
+| focused の明示パス | 成功件数 |
+| --- | ---: |
+| `src/tag_prewarm.rs` | 3 |
+| `src/rating_db.rs` | 13 |
+| `src/metadata_cleanup.rs` | 13 |
+| `src/app/book_structural_op.rs` | 14 |
+| `src/app/book_append_undo.rs` | 5 |
+| `src/delete_worker.rs` | 17 |
+
+選択式:
+
+```text
+test(/book_structure/) | test(/book_rename/) |
+test(~app::spread_shift_owner_tests::) |
+test(/metadata_transfer_tests/) | test(/bookmark_hint_uses_composed/) |
+test(/remote_zip_and_pdf_bookmark/) | test(/remote_bookmark_lists_preserve_hidden_anchor/) |
+test(~app::tests::native_video_rating_key_tests::) |
+test(/rating_hydration/) | test(/xmp_hydration/) | test(/tag_prewarm/) |
+test(/rename_migration_waits/) | test(/book_resume_meter_rename/) |
+test(/visibility_in_book_pc_projects_nested_archive_provenance_and_legacy_notice/) |
+test(~metadata_cleanup::) | test(~delete_worker::) | test(~book_append_undo::) |
+test(~rating_db::)
+```
+
+159 件と focused 65 件には重複がある。今回の範囲に未解決事項はない。
+build-dev・本体起動・commit は行っていない。全件 gate の再実行は設計担当へ引き継ぐ。

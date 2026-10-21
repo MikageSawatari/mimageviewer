@@ -166,6 +166,7 @@ impl App {
             return true;
         }
         self.cancel_book_append_readonly_refresh();
+        self.invalidate_xmp_rating_reads_for_removed_paths(&paths);
         self.book_append_undo_receipt = None;
         let intent = crate::books::BookOpIntent::UndoAppend {
             receipt: receipt.clone(),

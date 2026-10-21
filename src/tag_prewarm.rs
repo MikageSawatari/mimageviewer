@@ -34,11 +34,19 @@ use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, unbounded};
 #[derive(Default)]
 pub(crate) struct XmpRatingHydration {
     worker: Option<HydrationWorker>,
-    tickets: HashMap<String, Arc<AtomicBool>>,
-    in_flight: usize,
+    tickets: HashMap<String, HydrationTicket>,
     #[cfg(test)]
     next_test_hook: Option<HydrationTestHook>,
 }
+
+struct HydrationTicket {
+    cancelled: Arc<AtomicBool>,
+    imports: usize,
+}
+
+/// The same pending tickets may be invalidated by a purge worker after it has
+/// resolved its existing journal scopes. This snapshot owns no new requests.
+pub(crate) type XmpRatingTickets = Vec<(String, Arc<AtomicBool>)>;
 
 #[cfg(test)]
 pub(crate) struct HydrationTestHook {
@@ -88,14 +96,57 @@ impl XmpRatingHydration {
     pub(crate) fn is_busy(&self) -> bool {
         // Receiving the worker result is insufficient: UI adoption must also
         // complete before the next pure busy query can report quiescence.
-        self.in_flight > 0
+        self.tickets
+            .values()
+            .any(|ticket| ticket.imports > 0 && !ticket.cancelled.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn read_ticket(&mut self, key: &str) -> Arc<AtomicBool> {
+        let ticket = self
+            .tickets
+            .entry(key.to_owned())
+            .or_insert_with(|| HydrationTicket {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                imports: 0,
+            });
+        if ticket.cancelled.load(Ordering::Acquire) {
+            *ticket = HydrationTicket {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                imports: 0,
+            };
+        }
+        Arc::clone(&ticket.cancelled)
+    }
+
+    /// Reclaim map-only tickets left by a cancelled context reader or a read
+    /// without an XMP rating. Called once before accepting a visible batch.
+    pub(crate) fn prune_finished_reads(&mut self) {
+        self.tickets
+            .retain(|_, ticket| Arc::strong_count(&ticket.cancelled) > 1);
+    }
+
+    pub(crate) fn pending_tickets(&self) -> XmpRatingTickets {
+        self.tickets
+            .iter()
+            .map(|(key, ticket)| (key.clone(), Arc::clone(&ticket.cancelled)))
+            .collect()
+    }
+
+    pub(crate) fn invalidate_matching(&mut self, matches: impl Fn(&str) -> bool) {
+        self.tickets.retain(|key, ticket| {
+            if !matches(key) {
+                return true;
+            }
+            ticket.cancelled.store(true, Ordering::Release);
+            false
+        });
     }
 
     /// Called before a user-originated SQLite write, including explicit clear.
     /// This is only a pending request ticket, not another rating generation.
     pub(crate) fn invalidate_for_user_write(&mut self, key: &str) {
         if let Some(ticket) = self.tickets.remove(key) {
-            ticket.store(true, Ordering::Release);
+            ticket.cancelled.store(true, Ordering::Release);
         }
     }
 
@@ -106,7 +157,11 @@ impl XmpRatingHydration {
         key: String,
         stars: u8,
         generation: u64,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<(), String> {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if self.worker.is_none() {
             let (tx, job_rx) = mpsc::channel::<HydrationJob>();
             let (result_tx, rx) = mpsc::channel();
@@ -151,11 +206,11 @@ impl XmpRatingHydration {
                 .map_err(|error| error.to_string())?;
             self.worker = Some(HydrationWorker { tx, rx });
         }
-        let cancelled = Arc::clone(
-            self.tickets
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false))),
-        );
+        let ticket = self
+            .tickets
+            .get_mut(&key)
+            .expect("XMP read owns its import ticket");
+        debug_assert!(Arc::ptr_eq(&ticket.cancelled, &cancelled));
         self.worker
             .as_ref()
             .unwrap()
@@ -171,15 +226,20 @@ impl XmpRatingHydration {
                 test_hook: self.next_test_hook.take(),
             })
             .map_err(|error| error.to_string())?;
-        self.in_flight += 1;
+        ticket.imports += 1;
         Ok(())
     }
 
     pub(crate) fn try_recv(&mut self) -> Option<XmpRatingHydrationResult> {
         let result = self.worker.as_ref()?.rx.try_recv().ok()?;
-        self.in_flight -= 1;
+        if let Some(ticket) = self.tickets.get_mut(&result.key)
+            && Arc::ptr_eq(&ticket.cancelled, &result.cancelled)
+        {
+            ticket.imports -= 1;
+        }
         if self.tickets.get(&result.key).is_some_and(|ticket| {
-            Arc::ptr_eq(ticket, &result.cancelled) && Arc::strong_count(ticket) == 2
+            Arc::ptr_eq(&ticket.cancelled, &result.cancelled)
+                && Arc::strong_count(&ticket.cancelled) == 2
         }) {
             self.tickets.remove(&result.key);
         }
@@ -226,11 +286,12 @@ impl TagPrewarmPending {
     /// 重複チェックは UI 側 (`tag_prewarm_queued` HashSet) で済ませる想定。
     /// worker は XMP パケットから xmp:Rating を抽出して `TagPrewarmResult::rating` に
     /// 載せて返す (「rating を読まないジョブ」は存在しない — 読まないなら push しない)。
-    pub(crate) fn push_job(&self, path: PathBuf, rating_generation: u64) {
+    pub(crate) fn push_job(&self, path: PathBuf, rating_generation: u64, ticket: Arc<AtomicBool>) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _ = self.job_tx.send(PrewarmJob {
             path,
             rating_generation,
+            ticket,
         });
     }
 
@@ -250,6 +311,7 @@ struct PrewarmJob {
     path: PathBuf,
     /// XMP 読み取りを投入した時点の App-global path rating 世代。
     rating_generation: u64,
+    ticket: Arc<AtomicBool>,
 }
 
 /// 1 ファイル分のプリフェッチ結果。
@@ -258,6 +320,7 @@ pub(crate) struct TagPrewarmResult {
     pub path: PathBuf,
     pub rating: Option<u8>,
     pub rating_generation: u64,
+    pub ticket: Arc<AtomicBool>,
 }
 
 /// worker スレッドを起動する。フォルダ切替時に 1 回呼ぶ。
@@ -311,7 +374,9 @@ fn run_worker(
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let rating = read_xmp_rating(&job.path);
+                let rating = (!job.ticket.load(Ordering::Acquire))
+                    .then(|| read_xmp_rating(&job.path))
+                    .flatten();
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
@@ -320,6 +385,7 @@ fn run_worker(
                         path: job.path,
                         rating,
                         rating_generation: job.rating_generation,
+                        ticket: job.ticket,
                     })
                     .is_err()
                 {
@@ -341,7 +407,11 @@ mod tests {
     #[test]
     fn returns_empty_rating_for_nonexistent_path() {
         let pending = spawn();
-        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"), 7);
+        pending.push_job(
+            PathBuf::from("Z:/does/not/exist.jpg"),
+            7,
+            Arc::new(AtomicBool::new(false)),
+        );
         let start = Instant::now();
         loop {
             match pending.rx.try_recv() {
@@ -368,7 +438,11 @@ mod tests {
         let pending = spawn();
         assert!(!pending.is_busy(), "初期状態は idle");
 
-        pending.push_job(PathBuf::from("Z:/nope/a.jpg"), 0);
+        pending.push_job(
+            PathBuf::from("Z:/nope/a.jpg"),
+            0,
+            Arc::new(AtomicBool::new(false)),
+        );
         assert!(pending.is_busy(), "push 直後は busy");
 
         // worker が送ってくるのを受け取り、on_result_drained で in_flight を戻す
@@ -396,7 +470,11 @@ mod tests {
     fn cancel_stops_worker_loop() {
         let pending = spawn();
         for i in 0..1000 {
-            pending.push_job(PathBuf::from(format!("Z:/nope/{i}.jpg")), 0);
+            pending.push_job(
+                PathBuf::from(format!("Z:/nope/{i}.jpg")),
+                0,
+                Arc::new(AtomicBool::new(false)),
+            );
         }
         pending.cancel();
         drop(pending);

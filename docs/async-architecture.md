@@ -391,7 +391,11 @@ D2c（同計画 §3.10）の未採用 open は、全 context の既存 source/na
 静止の `book_structural_writers_busy` は副作用を持たない。UI frame の明示 poll が parked を含む
 受理済み XMP 読込結果を回収し、App 共通の `XmpRatingHydration` worker へ DB 処理を渡す。
 未評価行だけを transaction で補充し、明示評価・クリアとの競合は path ごとの取消票と既存の
-rating 世代で照合する。DB 完了だけでなく UI 採用まで静止条件に含める。
+rating 世代で照合する。同じ取消票を XMP 読込受付から DB 完了・UI 採用まで持ち、
+通常削除・本削除・追加 Undo・明示整理は purge 前に対象票を失効する。
+削除 purge journal の再実行は受付済み票の snapshot を worker へ渡し、既存の孤児判定後に対象だけを失効する。
+遅い読込は新しい票で再投入せず、取消済み import は DB transaction 内・UI 採用の両方で無作用となる。
+有効な import は DB 完了だけでなく UI 採用まで静止条件に含める。
 汎用改名・sidecar 復元は従来の狭い writer 条件を維持し、この新しい DB writer だけを追加する。
 
 既存の製本 worker が FS 確定後に EPUB 範囲 → shift → composition の保守 lease を取り、
