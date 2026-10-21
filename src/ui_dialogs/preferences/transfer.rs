@@ -1286,6 +1286,7 @@ mod tests {
                             ctx.request_repaint();
                             return;
                         }
+                        app.note_main_chrome_pointer_block_transition(ctx);
                         app.render_menubar(root_ui);
                         app.render_toolbar(root_ui);
                         app.show_settings_restore_dialog(ctx);
@@ -1315,6 +1316,10 @@ mod tests {
             assert_eq!(
                 harness.state().modal_dialog_block_reason(),
                 Some("settings_restore")
+            );
+            assert!(
+                harness.query_by_label(&label).is_none(),
+                "modal admission closes the already open settings menu"
             );
             // Click the actual menu header and toolbar through the production
             // preferences modal, with no transfer-specific guards in either handler.
@@ -1353,6 +1358,11 @@ mod tests {
             harness.get_by_label("評価↓").click();
             harness.run();
             assert_eq!(harness.state().settings.sort_order, SortOrder::RatingDesc);
+            // Production sanitizes pointer input during hydration; this harness must settle it first.
+            harness
+                .state_mut()
+                .finish_page_identity_preparation_for_test();
+            harness.run();
             harness.hover_at(menu_header_pos);
             for pressed in [true, false] {
                 harness.event(egui::Event::PointerButton {

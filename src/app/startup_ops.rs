@@ -1260,7 +1260,7 @@ impl App {
                     resolution.kind,
                 );
             return match self
-                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                     openable,
                     auto_fullscreen,
                     owner.open_request_owner(),
@@ -1268,6 +1268,7 @@ impl App {
                     None,
                     super::StartupListIntent::container_open(auto_fullscreen),
                     navigation,
+                    MainListRequestStage::Continuation,
                 ) {
                 FolderOpenOutcome::Loaded
                 | FolderOpenOutcome::Classifying
@@ -1419,7 +1420,7 @@ impl App {
             crate::folder_tree::OpenablePathKind::File => OpenPathKind::File,
         });
         let outcome = self
-            .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+            .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                 openable,
                 auto_fullscreen,
                 owner.open_request_owner(),
@@ -1431,6 +1432,7 @@ impl App {
                     super::StartupListIntent::container_open(auto_fullscreen)
                 },
                 navigation,
+                MainListRequestStage::Continuation,
             );
         if let Some(scan) = scan {
             scan.finish(
@@ -2587,6 +2589,158 @@ mod tests {
                 assert!(cancel.load(Ordering::Relaxed));
             }
         }
+    }
+
+    #[test]
+    fn section1285_classification_handoffs_preserve_later_activation() {
+        for continuation in ["direct", "scan", "navigation", "physical"] {
+            let mut app = setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let target = app.tmp.path().join("directory.epub");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("page.jpg"), b"image").unwrap();
+            let earlier = app.tmp.path().join("earlier");
+            let (_earlier_tx, earlier_cancel) =
+                section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &earlier);
+            let next = match continuation {
+                "direct" => ClassifiedOpenContinuation::Direct {
+                    auto_fullscreen: false,
+                    owner: OpenRequestOwner::Navigation,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                "scan" => ClassifiedOpenContinuation::DirectScan {
+                    pre_scan: None,
+                    owner: OpenRequestOwner::Navigation,
+                    grid_effects: None,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                "navigation" => ClassifiedOpenContinuation::DirectNavigation {
+                    pre_scan: None,
+                    owner: OpenRequestOwner::Navigation,
+                    pane_epub_restore: None,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                "physical" => ClassifiedOpenContinuation::Physical {
+                    intent: PhysicalHistoryIntent::Navigation {
+                        replay: None,
+                        auto_fullscreen: false,
+                    },
+                    dfs_continuation: None,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                _ => unreachable!(),
+            };
+            assert!(matches!(
+                app.start_open_path_classification(target.clone(), next),
+                OpenAdmission::Accepted
+            ));
+            assert!(earlier_cancel.load(Ordering::Relaxed));
+            let mut candidate = app
+                .top_level_grid_view
+                .take_open_path_classification()
+                .unwrap();
+            let (classified_tx, classified_rx) = mpsc::channel();
+            candidate.rx = classified_rx;
+            app.top_level_grid_view
+                .set_open_path_classification(Some(candidate));
+            let later = app.tmp.path().join("later-activation");
+            let (_later_tx, later_cancel) =
+                section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &later);
+            classified_tx
+                .send(Ok(ClassifiedOpenPath {
+                    rar_volume_proof: None,
+                    kind: OpenPathKind::Directory,
+                    folder_scan: Some(
+                        folder_scan::scan_directory_with_convertible_archives(
+                            &target, false, false, false,
+                        )
+                        .unwrap(),
+                    ),
+                }))
+                .unwrap();
+            app.poll_open_path_classification(&egui::Context::default());
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            app.finish_history_restore_preparation_for_test();
+            assert_eq!(app.current_folder.as_ref(), Some(&target), "{continuation}");
+            assert!(!later_cancel.load(Ordering::Relaxed), "{continuation}");
+            assert_eq!(
+                app.startup_open_path_resolve_pending
+                    .as_ref()
+                    .unwrap()
+                    .requested
+                    .as_path(),
+                later.as_path(),
+                "{continuation}"
+            );
+        }
+    }
+
+    #[test]
+    fn section1285_explicit_zip_level_moves_retire_unresolved_main_opens() {
+        for activation in [false, true] {
+            for operation in ["enter", "back", "dfs"] {
+                let mut app = setup_app_for_test();
+                app.active_quick_folder_slot = None;
+                let book = app.tmp.path().join("levels.zip");
+                let entries = ["cover.jpg", "chapter/a.jpg", "chapter/b.jpg"]
+                    .into_iter()
+                    .map(|name| crate::zip_loader::ZipImageEntry {
+                        entry_name: name.into(),
+                        uncompressed_size: 0,
+                        mtime: 0,
+                        container_ancestry: Vec::new(),
+                    })
+                    .collect();
+                app.current_folder = Some(book.clone());
+                let mut nav = crate::zip_tree::ZipNavState::new(Arc::new(
+                    crate::zip_tree::ZipTree::build(book, entries),
+                ));
+                if operation == "back" {
+                    nav.enter("chapter/");
+                }
+                app.zip_nav = Some(nav);
+                let stale = app.tmp.path().join("stale-resolve");
+                std::fs::create_dir(&stale).unwrap();
+                let owner = if activation {
+                    StartupOpenPathOwner::Activation
+                } else {
+                    StartupOpenPathOwner::InitialStartup
+                };
+                let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
+                tx.send(section1285_result(&stale)).unwrap();
+                match operation {
+                    "enter" => app.zip_nav_enter("chapter/"),
+                    "back" => assert!(app.zip_nav_back()),
+                    "dfs" => assert!(app.zip_nav_handle_ctrl_updown(true)),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    cancel.load(Ordering::Relaxed),
+                    "{operation}, activation={activation}"
+                );
+                assert!(app.startup_open_path_resolve_pending.is_none());
+                let level = app.zip_nav.as_ref().unwrap().current().to_vec();
+                let generation = app.items_generation;
+                app.poll_startup_open_path_resolve(&egui::Context::default());
+                assert_eq!(app.zip_nav.as_ref().unwrap().current(), level);
+                assert_eq!(app.items_generation, generation);
+            }
+        }
+    }
+
+    #[test]
+    fn section1285_zip_root_back_without_a_move_keeps_unresolved_open() {
+        let mut app = setup_app_for_test();
+        let book = app.tmp.path().join("root.zip");
+        app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
+            crate::zip_tree::ZipTree::build(book, Vec::new()),
+        )));
+        let target = app.tmp.path().join("activation");
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &target);
+        assert!(!app.zip_nav_back());
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_some());
     }
 
     #[test]

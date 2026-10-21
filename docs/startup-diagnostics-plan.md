@@ -587,6 +587,24 @@ synthetic 履歴 replay、DFS 開始、固定一覧の固定/解除は直接 ins
 検索結果の遅延採用と同一覧の再投影は新規要求にしない。完了時の pending take と、activation
 拒否時だけ held resolver を戻す既存順序は変更しない。新しい owner / pending / 待機は追加しない。
 
+受付と非同期の段階移行を共用する open 経路は、引数の `MainListRequestStage` で区別する。
+`StartupListIntent` は元要求の復元契約なので、完了時にも ExplicitList を持つことがあり、
+それだけで新しい受付と判定しない。分類→物理/Smart/Collection、DFS→物理、pane scan→open、
+起動 resolve→loader は Continuation とし、後から受理された resolve を退役させない。
+サブ展開の scan→prepare と policy 変更による再 scan も同じ要求の継続である。
+ZIP の Enter/ダブルクリック/BS/DFS は成功した移動の受付で退役し、階層の再投影では退役しない。
+
+既知の別件（master `4db8a8874` から存在、§1.285 の範囲外、未対応）:
+先行する `BookmarkRow` 分類 A の完了が、後発 Activation B の resolver を置換し得る
+（`src/app.rs:28331` → `src/app.rs:51411` → `src/app/startup_ops.rs:327`）。
+OtherArchive（RAR 等）は PDF/EPUB の composition qualification 待ちを通らない。
+また、先行要求の `cancel_conflicting_bookmark_open_for_navigation` が、後発 Bookmark resolver /
+activation-held 鎖を取り消し得る（`src/app/startup_ops.rs:1029` → `src/app/startup_ops.rs:1083` →
+`src/app/startup_ops.rs:1146` / `src/app/startup_ops.rs:1162`）。
+どちらも「起動系要求の受理が先行中のメイン要求をどう扱うか」という別の設計であり、今回は実装しない。
+修正案は、起動系要求の受理も同じ受付境界で先行中のメイン要求を退役させるか、resolver の保管先を
+単一から owner ごとにするかの2案。どちらを採るかは未決定で、現挙動を固定するテストも追加しない。
+
 admission 待ち以外のパス解決/scan全体はモーダルにしない。モーダルを無期限に保つと本目標と矛盾し、
 遅い share が別フォルダへ移る操作まで止める。代わりに既存 navigation の取消・単一採用を使う。
 変換・パスワード・保存は既存モーダルのままで、今回その内部の interleaving を増やさない。

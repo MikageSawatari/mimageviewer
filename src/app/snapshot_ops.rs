@@ -2427,7 +2427,7 @@ impl App {
             // Transfer the scan's proof to the existing prepared Physical owner. Its adoption
             // validates the source BEFORE fullscreen preparation dismisses a snapshot.
             self.snapshot_internal_nav = true;
-            let started = self.start_physical_history_transition_classified(
+            let started = self.start_physical_history_transition_classified_at_stage(
                 super::PhysicalHistoryIntent::RequiredFullscreen {
                     target,
                     history_trigger,
@@ -2439,6 +2439,7 @@ impl App {
                 super::StartupListIntent::PageContinuation,
                 navigation,
                 Some(scan),
+                super::MainListRequestStage::Continuation,
             );
             if started {
                 self.poll_collection_history_transition(ctx);

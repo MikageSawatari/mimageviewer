@@ -1826,6 +1826,16 @@ impl App {
             HashSet::new(),
             self.copied_destination_source_proof(),
         );
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Subfolder),
+            navigation.as_ref().is_some_and(|adoption| {
+                matches!(
+                    adoption.navigation.history,
+                    MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
+                )
+            }),
+        );
+        self.cancel_pending_folder_nav();
         self.start_subfolder_expansion_scan_roots_owned(root, roots, navigation);
     }
 
@@ -1849,17 +1859,9 @@ impl App {
         navigation: Option<SubfolderExpansionAdoption>,
     ) {
         let roots = normalize_expansion_roots(&root, roots);
-        self.retire_replaced_main_list_requests_with_startup_intent(
-            Some(super::MainListRequestOwner::Subfolder),
-            navigation.as_ref().is_some_and(|adoption| {
-                matches!(
-                    adoption.navigation.history,
-                    MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
-                )
-            }),
-        );
+        // Policy changes can restart an accepted scan. Its retained history operation does
+        // not make that continuation a new navigation which may retire newer requests.
         self.cancel_subfolder_expansion_pending();
-        self.cancel_pending_folder_nav();
         self.subfolder_expansion_progress = Some(SubfolderExpansionProgress::default());
         self.subfolder_expansion_diag = None;
         let options = SubfolderExpansionOptions::from(&self.settings);
@@ -2232,15 +2234,8 @@ impl App {
             );
             return;
         }
-        self.retire_replaced_main_list_requests_with_startup_intent(
-            Some(super::MainListRequestOwner::Subfolder),
-            navigation.as_ref().is_some_and(|adoption| {
-                matches!(
-                    adoption.navigation.history,
-                    MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
-                )
-            }),
-        );
+        // Scan completion, confirmation and reprepare keep the original accepted owner.
+        // Only the input admission may retire competing navigation requests.
         if let Some(pending) = self.subfolder_expansion_install_pending.take() {
             pending.cancel();
         }
@@ -2454,6 +2449,17 @@ impl App {
         let removed_paths = state
             .map(|state| state.removed_paths.clone())
             .unwrap_or_else(|| self.subfolder_expansion_removed_paths.clone());
+        if snapshot.is_none() && root.is_none() {
+            return false;
+        }
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Subfolder),
+            matches!(
+                navigation.history,
+                MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
+            ),
+        );
+        self.cancel_pending_folder_nav();
         let owned = Some(SubfolderExpansionAdoption {
             navigation,
             removed_paths,
@@ -3015,6 +3021,107 @@ fn remove_paths_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1285_subfolder_scan_handoff_preserves_later_activation() {
+        for restart_scan in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let root = app.tmp.path().join("expansion");
+            std::fs::create_dir(&root).unwrap();
+            app.current_folder = Some(root.clone());
+            let initial = app.tmp.path().join("initial");
+            let (initial_tx, initial_cancel) = section1285_pending_resolver(
+                &mut app,
+                StartupOpenPathOwner::InitialStartup,
+                initial,
+            );
+
+            // A is accepted before B. Acceptance retires the old resolver exactly once.
+            app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
+            assert!(initial_cancel.load(Ordering::Relaxed));
+            assert!(initial_tx.send(section1285_resolver_result(&root)).is_err());
+            let activation = app.tmp.path().join("later-activation");
+            let (activation_tx, activation_cancel) = section1285_pending_resolver(
+                &mut app,
+                StartupOpenPathOwner::Activation,
+                activation.clone(),
+            );
+
+            // Publish A's scan deterministically after B starts resolving. A policy change
+            // exercises the scan restart through the same accepted navigation owner.
+            let (scan_tx, scan_rx) = mpsc::channel();
+            app.subfolder_expansion_pending.as_mut().unwrap().rx = scan_rx;
+            let file_type_visibility = app.settings.file_type_visibility.clone();
+            if restart_scan {
+                app.settings
+                    .file_type_visibility
+                    .excluded_extensions
+                    .insert("png".into());
+            }
+            scan_tx
+                .send(SubfolderExpansionEvent::Done(SubfolderExpansionResult {
+                    file_type_visibility,
+                    root: root.clone(),
+                    roots: vec![root],
+                    scan_filter: Default::default(),
+                    entries: Vec::new(),
+                    video_thumb_overrides: HashMap::new(),
+                    diag: Default::default(),
+                }))
+                .unwrap();
+            app.poll_subfolder_expansion(&egui::Context::default());
+
+            assert!(!activation_cancel.load(Ordering::Relaxed));
+            let pending = app.startup_open_path_resolve_pending.as_ref().unwrap();
+            assert_eq!(pending.requested.as_path(), activation.as_path());
+            assert!(matches!(pending.owner, StartupOpenPathOwner::Activation));
+            assert!(Arc::ptr_eq(&pending.cancel, &activation_cancel));
+            assert!(
+                activation_tx
+                    .send(section1285_resolver_result(&activation))
+                    .is_ok()
+            );
+            if restart_scan {
+                assert!(app.subfolder_expansion_pending.is_some());
+            } else {
+                assert!(app.subfolder_expansion_install_pending.is_some());
+            }
+            app.cancel_subfolder_expansion_pending();
+        }
+    }
+
+    fn section1285_pending_resolver(
+        app: &mut App,
+        owner: StartupOpenPathOwner,
+        requested: PathBuf,
+    ) -> (mpsc::Sender<StartupOpenPathResolveResult>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(requested).unwrap(),
+            owner,
+            navigation: None,
+            cancel: Arc::clone(&cancel),
+            rx,
+            started_at: Instant::now(),
+            toast_shown: false,
+            held_resolve_for_activation_admission: None,
+            diagnostic: None,
+        });
+        (tx, cancel)
+    }
+
+    fn section1285_resolver_result(requested: &Path) -> StartupOpenPathResolveResult {
+        StartupOpenPathResolveResult {
+            requested: requested.to_path_buf(),
+            resolved: None,
+            rar_volume_proof: None,
+            bookmark_relative_page_openable: None,
+            elapsed_ms: 1.0,
+            direct_media: None,
+        }
+    }
 
     #[test]
     fn g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return() {

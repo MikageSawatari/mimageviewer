@@ -1304,6 +1304,14 @@ pub(super) enum MainListRequestOwner {
     Subfolder,
 }
 
+/// Only request acceptance may supersede an unresolved startup/activation target.
+/// Format handoffs retain native cleanup and list intent; this argument is never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MainListRequestStage {
+    Admission,
+    Continuation,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MainHistoryOperation {
     Direct(DirectNavigationPurpose),
@@ -25511,12 +25519,13 @@ impl App {
                         dfs_continuation: None,
                         restore_intent
                     },
-                    navigation
+                    navigation,
+                    MainListRequestStage::Admission,
                 ),
                 OpenAdmission::Accepted
             );
         }
-        self.start_physical_history_transition_classified(
+        self.start_physical_history_transition_classified_at_stage(
             intent,
             path,
             None,
@@ -25524,6 +25533,7 @@ impl App {
             restore_intent,
             navigation,
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -26846,7 +26856,7 @@ impl App {
                 self.capture_physical_open_navigation(&owner, &folder),
             )
         {
-            if !self.start_physical_history_transition_classified(
+            if !self.start_physical_history_transition_classified_at_stage(
                 intent,
                 folder,
                 None,
@@ -26854,6 +26864,7 @@ impl App {
                 restore_intent,
                 navigation,
                 None,
+                MainListRequestStage::Admission,
             ) {
                 self.select_after_load = previous_hint;
             }
@@ -27980,6 +27991,19 @@ impl App {
         path: PathBuf,
         continuation: ClassifiedOpenContinuation,
     ) -> OpenAdmission {
+        self.start_open_path_classification_at_stage(
+            path,
+            continuation,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    fn start_open_path_classification_at_stage(
+        &mut self,
+        path: PathBuf,
+        continuation: ClassifiedOpenContinuation,
+        stage: MainListRequestStage,
+    ) -> OpenAdmission {
         if !Self::path_needs_open_classification(&path) {
             return OpenAdmission::NotApplicable;
         }
@@ -27993,13 +28017,26 @@ impl App {
             Ok(source) => source,
             Err(reason) => return OpenAdmission::Refused(reason.into()),
         };
-        self.start_open_path_classification_owned(candidate_source, continuation)
+        self.start_open_path_classification_owned_at_stage(candidate_source, continuation, stage)
     }
 
     fn start_open_path_classification_owned(
         &mut self,
         candidate_source: crate::pdf_loader::LeasedEpubPath,
         continuation: ClassifiedOpenContinuation,
+    ) -> OpenAdmission {
+        self.start_open_path_classification_owned_at_stage(
+            candidate_source,
+            continuation,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    fn start_open_path_classification_owned_at_stage(
+        &mut self,
+        candidate_source: crate::pdf_loader::LeasedEpubPath,
+        continuation: ClassifiedOpenContinuation,
+        stage: MainListRequestStage,
     ) -> OpenAdmission {
         let proof = match &continuation {
             ClassifiedOpenContinuation::Direct { owner, .. }
@@ -28038,6 +28075,7 @@ impl App {
             candidate_source,
             continuation,
             navigation,
+            stage,
         )
     }
 
@@ -28046,6 +28084,7 @@ impl App {
         path: PathBuf,
         continuation: ClassifiedOpenContinuation,
         navigation: MainListNavigation,
+        stage: MainListRequestStage,
     ) -> OpenAdmission {
         let candidate_source = match crate::pdf_loader::LeasedEpubPath::try_new(path) {
             Ok(owner) => owner,
@@ -28055,6 +28094,7 @@ impl App {
             candidate_source,
             continuation,
             Some(navigation),
+            stage,
         )
     }
 
@@ -28063,6 +28103,7 @@ impl App {
         candidate_source: crate::pdf_loader::LeasedEpubPath,
         continuation: ClassifiedOpenContinuation,
         navigation: Option<MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> OpenAdmission {
         if self.document_open_modal_admission_blocked() {
             return OpenAdmission::Refused(OpenAdmissionRefusal::DocumentOpenBusy);
@@ -28150,7 +28191,7 @@ impl App {
             };
             self.retire_replaced_main_list_requests_with_startup_intent(
                 Some(MainListRequestOwner::Classification),
-                explicit_request,
+                explicit_request && stage == MainListRequestStage::Admission,
             );
         }
         let candidate = OpenPathClassification {
@@ -28284,6 +28325,7 @@ impl App {
                     pane_epub_restore,
                     Some(kind),
                     restore_intent.clone(),
+                    MainListRequestStage::Continuation,
                 );
             }
             ClassifiedOpenContinuation::BookmarkRow(row) => {
@@ -28334,6 +28376,7 @@ impl App {
                     folder_scan.take(),
                     restore_intent.clone(),
                     candidate.navigation.take(),
+                    MainListRequestStage::Continuation,
                 ) {
                     crate::logger::log("classified smart grid open: request not adopted");
                 }
@@ -28349,7 +28392,7 @@ impl App {
                     _ => None,
                 };
                 let outcome = self
-                    .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                    .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                         path,
                         auto_fullscreen,
                         owner,
@@ -28357,7 +28400,8 @@ impl App {
                         folder_scan.take(),
                         restore_intent.clone(),
                         candidate.navigation.take(),
-                    );
+            MainListRequestStage::Continuation,
+        );
                 if matches!(outcome, FolderOpenOutcome::Loaded)
                     && !self.main_folder_history_available()
                     && let Some(bookmark) = bookmark_owner.as_ref()
@@ -28385,7 +28429,7 @@ impl App {
                     .then(|| folder_scan.take().or(pre_scan))
                     .flatten();
                 let outcome = self
-                    .load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                    .load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
                         path,
                         pre_scan,
                         owner,
@@ -28393,7 +28437,8 @@ impl App {
                         Some(kind),
                         restore_intent.clone(),
                         candidate.navigation.take(),
-                    );
+            MainListRequestStage::Continuation,
+        );
                 if matches!(outcome, FolderOpenOutcome::Loaded)
                     && !self.main_folder_history_available()
                     && let Some(bookmark) = bookmark_owner.as_ref()
@@ -28414,7 +28459,7 @@ impl App {
             } => {
                 // A stale history head is intentionally discarded; lease refusal is reported
                 // by the classified transition before it returns false.
-                if !self.start_physical_history_transition_classified(
+                if !self.start_physical_history_transition_classified_at_stage(
                     intent,
                     path,
                     dfs_continuation,
@@ -28425,6 +28470,7 @@ impl App {
                         .take()
                         .expect("physical classification owns its navigation"),
                     folder_scan.take(),
+                    MainListRequestStage::Continuation,
                 ) {
                     crate::logger::log("classified physical history: request not adopted");
                 }
@@ -28445,6 +28491,7 @@ impl App {
                         .navigation
                         .take()
                         .expect("collection classification owns navigation"),
+                    MainListRequestStage::Continuation,
                 ) {
                     crate::logger::log("classified collection history: request not adopted");
                 }
@@ -28580,6 +28627,28 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) {
+        self.open_direct_navigation_target_at_stage(
+            path,
+            pre_scan,
+            owner,
+            navigation,
+            pane_epub_restore,
+            restore_intent,
+            MainListRequestStage::Admission,
+        );
+    }
+
+    fn open_direct_navigation_target_at_stage(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+        navigation: Option<MainListNavigation>,
+        pane_epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+
+        restore_intent: crate::app::StartupListIntent,
+        stage: MainListRequestStage,
+    ) {
         // Favorites and other direct inputs bypass the _owned load admissions below.
         // Normalize the accepted copy before classification; keep saved records intact.
         let path = crate::path_key::normalize_input_path(&path);
@@ -28591,9 +28660,14 @@ impl App {
                 pane_epub_restore,
             };
             let admission = if let Some(navigation) = navigation {
-                self.start_open_path_classification_with_navigation(path, continuation, navigation)
+                self.start_open_path_classification_with_navigation(
+                    path,
+                    continuation,
+                    navigation,
+                    stage,
+                )
             } else {
-                self.start_open_path_classification(path, continuation)
+                self.start_open_path_classification_at_stage(path, continuation, stage)
             };
             match admission {
                 OpenAdmission::Accepted => {}
@@ -28614,6 +28688,7 @@ impl App {
             pane_epub_restore,
             None,
             restore_intent.clone(),
+            stage,
         );
     }
 
@@ -28626,6 +28701,7 @@ impl App {
         pane_epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
         classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
+        stage: MainListRequestStage,
     ) {
         let navigation = navigation.or_else(|| {
             self.main_folder_history_available().then(|| {
@@ -28637,7 +28713,7 @@ impl App {
         });
         let outcome = match pre_scan {
             Some(scan) => self
-                .load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                .load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
                     path.clone(),
                     Some(scan),
                     owner,
@@ -28645,9 +28721,10 @@ impl App {
                     classified_kind,
                     restore_intent.clone(),
                     navigation,
-                ),
+            stage,
+        ),
             None => self
-                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                     path.clone(),
                     false,
                     owner,
@@ -28655,7 +28732,8 @@ impl App {
                     None,
                     restore_intent.clone(),
                     navigation,
-                ),
+            stage,
+        ),
         };
         self.finish_pane_open_restore(
             pane_epub_restore,
@@ -28713,18 +28791,21 @@ impl App {
             FolderNavRoute::FullFeature(path) => path,
         };
         if path.is_file() && crate::folder_tree::is_convertible_archive_path(&path) {
-            self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_stage(
                 path,
                 false,
                 OpenRequestOwner::Navigation,
                 restore_intent.clone(),
+                MainListRequestStage::Continuation,
             )
         } else {
-            self.load_folder_with_scan_owned_outcome(
+            self.load_folder_with_scan_owned_outcome_and_effects_at_stage(
                 path,
                 pre_scan,
                 OpenRequestOwner::Navigation,
+                None,
                 restore_intent.clone(),
+                MainListRequestStage::Continuation,
             )
         }
     }
@@ -28789,6 +28870,24 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_stage(
+            path,
+            auto_fullscreen,
+            owner,
+            restore_intent,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    pub(crate) fn load_folder_or_convert_archive_with_auto_fullscreen_owned_at_stage(
+        &mut self,
+        path: PathBuf,
+        auto_fullscreen: bool,
+        owner: OpenRequestOwner,
+
+        restore_intent: crate::app::StartupListIntent,
+        stage: MainListRequestStage,
+    ) -> FolderOpenOutcome {
         let path = crate::path_key::normalize_input_path(&path);
         if restore_intent.captures_list_departure() {
             self.capture_main_list_restore_cursor();
@@ -28808,7 +28907,7 @@ impl App {
             return FolderOpenOutcome::Loaded;
         }
         if Self::path_needs_open_classification(&path) {
-            return match self.start_open_path_classification(
+            return match self.start_open_path_classification_at_stage(
                 path.clone(),
                 ClassifiedOpenContinuation::Direct {
                     auto_fullscreen,
@@ -28816,6 +28915,7 @@ impl App {
 
                     restore_intent: restore_intent.clone(),
                 },
+                stage,
             ) {
                 OpenAdmission::Accepted => FolderOpenOutcome::Classifying,
                 OpenAdmission::Refused(reason) => {
@@ -28827,13 +28927,15 @@ impl App {
                 }
             };
         }
-        self.load_folder_or_convert_archive_with_auto_fullscreen_classified(
+        self.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
             path,
             auto_fullscreen,
             owner,
             None,
             None,
             restore_intent.clone(),
+            None,
+            stage,
         )
     }
 
@@ -28846,7 +28948,7 @@ impl App {
         pre_scan: Option<ScannedDir>,
         restore_intent: StartupListIntent,
     ) -> FolderOpenOutcome {
-        self.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+        self.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
             path,
             auto_fullscreen,
             owner,
@@ -28854,6 +28956,7 @@ impl App {
             pre_scan,
             restore_intent,
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -28882,6 +28985,30 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<MainListNavigation>,
+    ) -> FolderOpenOutcome {
+        self.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
+            path,
+            auto_fullscreen,
+            owner,
+            classified_kind,
+            pre_scan,
+            restore_intent,
+            navigation,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    fn load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
+        &mut self,
+        path: PathBuf,
+        auto_fullscreen: bool,
+        owner: OpenRequestOwner,
+        classified_kind: Option<OpenPathKind>,
+        pre_scan: Option<ScannedDir>,
+
+        restore_intent: crate::app::StartupListIntent,
+        navigation: Option<MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> FolderOpenOutcome {
         let visibility_source = self.physical_open_visibility_source(&path);
         // Direct media opens keep their released behavior; container/page targets use the list policy.
@@ -28946,6 +29073,7 @@ impl App {
                         pre_scan,
                         restore_intent.clone(),
                         navigation,
+                        stage,
                     ) {
                         FolderOpenOutcome::Loaded
                     } else {
@@ -28962,6 +29090,7 @@ impl App {
                         None,
                         restore_intent.clone(),
                         navigation,
+                        stage,
                     )
                     .is_ok()
                 {
@@ -28981,10 +29110,11 @@ impl App {
                 &path,
                 &owner,
                 restore_intent.replaces_deferred_startup_open(),
+                stage,
             ) {
                 return FolderOpenOutcome::Ignored;
             }
-            return if self.start_physical_history_transition_classified(
+            return if self.start_physical_history_transition_classified_at_stage(
                 intent,
                 path,
                 None,
@@ -28992,6 +29122,7 @@ impl App {
                 restore_intent,
                 navigation,
                 pre_scan,
+                stage,
             ) {
                 FolderOpenOutcome::ConversionDialogOpened
             } else {
@@ -29004,6 +29135,7 @@ impl App {
             &path,
             &owner,
             restore_intent.replaces_deferred_startup_open(),
+            stage,
         ) {
             return FolderOpenOutcome::Ignored;
         }
@@ -29095,6 +29227,7 @@ impl App {
             classified_kind,
             restore_intent.clone(),
             navigation,
+            stage,
         )
     }
 
@@ -29175,6 +29308,26 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        self.load_folder_with_scan_owned_outcome_and_effects_at_stage(
+            path,
+            pre_scan,
+            owner,
+            grid_effects,
+            restore_intent,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    fn load_folder_with_scan_owned_outcome_and_effects_at_stage(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+        grid_effects: Option<GridVirtualOpenEffects>,
+
+        restore_intent: crate::app::StartupListIntent,
+        stage: MainListRequestStage,
+    ) -> FolderOpenOutcome {
         if restore_intent
             .book_append_refresh()
             .is_some_and(|refresh| !self.book_append_refresh_is_current(refresh))
@@ -29201,17 +29354,19 @@ impl App {
             return FolderOpenOutcome::Ignored;
         }
         if pre_scan.is_some() {
-            return self.load_folder_with_scan_owned_outcome_and_effects_classified(
+            return self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
                 path,
                 pre_scan,
                 owner,
                 grid_effects,
                 Some(OpenPathKind::Directory),
                 restore_intent.clone(),
-            );
+            None,
+            stage,
+        );
         }
         if Self::path_needs_open_classification(&path) {
-            return match self.start_open_path_classification(
+            return match self.start_open_path_classification_at_stage(
                 path,
                 ClassifiedOpenContinuation::DirectScan {
                     pre_scan,
@@ -29220,6 +29375,7 @@ impl App {
 
                     restore_intent: restore_intent.clone(),
                 },
+                stage,
             ) {
                 OpenAdmission::Accepted => FolderOpenOutcome::Classifying,
                 OpenAdmission::Refused(reason) => {
@@ -29231,13 +29387,15 @@ impl App {
                 }
             };
         }
-        self.load_folder_with_scan_owned_outcome_and_effects_classified(
+        self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
             path,
             pre_scan,
             owner,
             grid_effects,
             None,
             restore_intent.clone(),
+            None,
+            stage,
         )
     }
 
@@ -29250,7 +29408,7 @@ impl App {
         classified_kind: Option<OpenPathKind>,
         restore_intent: StartupListIntent,
     ) -> FolderOpenOutcome {
-        self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+        self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
             path,
             pre_scan,
             owner,
@@ -29258,6 +29416,7 @@ impl App {
             classified_kind,
             restore_intent,
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -29270,6 +29429,29 @@ impl App {
         classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<MainListNavigation>,
+    ) -> FolderOpenOutcome {
+        self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
+            path,
+            pre_scan,
+            owner,
+            grid_effects,
+            classified_kind,
+            restore_intent,
+            navigation,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    fn load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+        grid_effects: Option<GridVirtualOpenEffects>,
+        classified_kind: Option<OpenPathKind>,
+        restore_intent: crate::app::StartupListIntent,
+        navigation: Option<MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> FolderOpenOutcome {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
@@ -29296,6 +29478,7 @@ impl App {
                     None,
                     restore_intent.clone(),
                     navigation,
+                    stage,
                 )
                 .is_ok()
             {
@@ -29308,6 +29491,7 @@ impl App {
             &path,
             &owner,
             restore_intent.replaces_deferred_startup_open(),
+            stage,
         ) {
             return FolderOpenOutcome::Ignored;
         }
@@ -29320,6 +29504,7 @@ impl App {
             classified_kind,
             restore_intent.clone(),
             navigation,
+            stage,
         )
     }
 
@@ -29373,7 +29558,12 @@ impl App {
     /// dispatcher. Same-folder reloads remain exempt in
     /// `cancel_archive_convert_for_navigation_to`.
     fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
-        self.claim_open_request_owner_with_startup_intent(path, owner, true)
+        self.claim_open_request_owner_with_startup_intent(
+            path,
+            owner,
+            true,
+            MainListRequestStage::Admission,
+        )
     }
 
     fn claim_open_request_owner_with_startup_intent(
@@ -29381,6 +29571,7 @@ impl App {
         path: &Path,
         owner: &OpenRequestOwner,
         explicit_request: bool,
+        stage: MainListRequestStage,
     ) -> bool {
         // A document dialog owns its entire open until its typed retry/cancel continuation.
         // This must precede the cancellations below, including detached and bookmark owners.
@@ -29444,7 +29635,9 @@ impl App {
                             path.display()
                         ));
                     }
-                    self.cancel_unresolved_open_for_navigation(explicit_request);
+                    self.cancel_unresolved_open_for_navigation(
+                        explicit_request && stage == MainListRequestStage::Admission,
+                    );
                     self.cancel_conflicting_bookmark_open_for_navigation(path);
                 }
                 true
@@ -29874,6 +30067,7 @@ impl App {
         classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> FolderOpenOutcome {
         let detached_physical = self.navigation_scope.is_detached_physical();
         if classified_kind != Some(OpenPathKind::Directory)
@@ -29895,7 +30089,7 @@ impl App {
             && let Some(intent) = Self::physical_open_intent(&owner, self.pending_auto_fs_open)
         {
             self.pending_auto_fs_open = false;
-            return if self.start_physical_history_transition_classified(
+            return if self.start_physical_history_transition_classified_at_stage(
                 intent,
                 path,
                 None,
@@ -29903,6 +30097,7 @@ impl App {
                 restore_intent,
                 navigation,
                 None,
+                stage,
             ) {
                 FolderOpenOutcome::Loaded
             } else {
@@ -33612,6 +33807,7 @@ impl App {
                     return_to,
                 },
                 navigation,
+                MainListRequestStage::Admission,
             ) {
                 OpenAdmission::Accepted => true,
                 OpenAdmission::Refused(reason) => {
@@ -33624,7 +33820,12 @@ impl App {
             };
         }
         self.start_collection_history_transition_classified(
-            target, intent, return_to, None, navigation,
+            target,
+            intent,
+            return_to,
+            None,
+            navigation,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -33635,6 +33836,7 @@ impl App {
         return_to: Option<top_level_grid_view::TopLevelGridOrigin>,
         classified_kind: Option<OpenPathKind>,
         navigation: MainListNavigation,
+        stage: MainListRequestStage,
     ) -> bool {
         let root = match &target {
             FolderNavHistoryTarget::Collection(root) => root.clone(),
@@ -33695,7 +33897,10 @@ impl App {
         {
             pending.cancel();
         }
-        self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Physical));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(MainListRequestOwner::Physical),
+            stage == MainListRequestStage::Admission,
+        );
         let transition = CollectionHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
@@ -33912,6 +34117,24 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
+        self.start_physical_history_transition_with_dfs_at_stage(
+            intent,
+            path,
+            dfs_continuation,
+            restore_intent,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    fn start_physical_history_transition_with_dfs_at_stage(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+
+        restore_intent: crate::app::StartupListIntent,
+        stage: MainListRequestStage,
+    ) -> bool {
         let path = crate::path_key::normalize_input_path(&path);
         let restore_intent = if matches!(intent, PhysicalHistoryIntent::RequiredFullscreen { .. })
             || dfs_continuation
@@ -33948,6 +34171,7 @@ impl App {
                     restore_intent: restore_intent.clone(),
                 },
                 navigation,
+                stage,
             ) {
                 OpenAdmission::Accepted => true,
                 OpenAdmission::Refused(reason) => {
@@ -33959,7 +34183,7 @@ impl App {
                 }
             };
         }
-        self.start_physical_history_transition_classified(
+        self.start_physical_history_transition_classified_at_stage(
             intent,
             path,
             dfs_continuation,
@@ -33967,6 +34191,7 @@ impl App {
             restore_intent.clone(),
             navigation,
             None,
+            stage,
         )
     }
 
@@ -33979,6 +34204,29 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
         navigation: MainListNavigation,
         folder_scan: Option<ScannedDir>,
+    ) -> bool {
+        self.start_physical_history_transition_classified_at_stage(
+            intent,
+            path,
+            dfs_continuation,
+            classified_kind,
+            restore_intent,
+            navigation,
+            folder_scan,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    fn start_physical_history_transition_classified_at_stage(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+        classified_kind: Option<OpenPathKind>,
+        restore_intent: crate::app::StartupListIntent,
+        navigation: MainListNavigation,
+        folder_scan: Option<ScannedDir>,
+        stage: MainListRequestStage,
     ) -> bool {
         if !self.main_list_navigation_is_current(&navigation) {
             return false;
@@ -34022,6 +34270,7 @@ impl App {
             navigation,
             dfs_continuation,
             restore_intent,
+            stage,
         )
     }
 
@@ -34076,6 +34325,7 @@ impl App {
             navigation,
             dfs_continuation,
             restore_intent,
+            MainListRequestStage::Continuation,
         )
     }
 
@@ -34089,6 +34339,7 @@ impl App {
         navigation: MainListNavigation,
         dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
         restore_intent: StartupListIntent,
+        stage: MainListRequestStage,
     ) -> bool {
         if path
             .extension()
@@ -34116,7 +34367,8 @@ impl App {
         }
         self.retire_replaced_main_list_requests_with_startup_intent(
             Some(MainListRequestOwner::Physical),
-            restore_intent.replaces_deferred_startup_open(),
+            restore_intent.replaces_deferred_startup_open()
+                && stage == MainListRequestStage::Admission,
         );
         let request = PhysicalHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
@@ -38336,6 +38588,7 @@ impl App {
             return;
         };
         nav.enter(dir_prefix);
+        self.accept_zip_level_navigation();
         self.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
     }
 
@@ -38357,6 +38610,7 @@ impl App {
             }
             left
         };
+        self.accept_zip_level_navigation();
         self.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         let target = self.items.iter().position(|it| match it {
             GridItem::ZipDir { dir_prefix, .. } => {
@@ -38397,14 +38651,18 @@ impl App {
             .map(|n| n.dfs_step(forward, sort))
             .unwrap_or(false);
         if moved {
-            if self.main_folder_history_available() {
-                // ZIP traversal installs rows directly, without a physical-open admission.
-                self.cancel_unresolved_open_for_navigation(true);
-            }
+            self.accept_zip_level_navigation();
             self.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
             true
         } else {
             false
+        }
+    }
+
+    fn accept_zip_level_navigation(&mut self) {
+        if self.main_folder_history_available() {
+            // ZIP traversal installs rows directly, without a physical-open admission.
+            self.cancel_unresolved_open_for_navigation(true);
         }
     }
 
@@ -57350,7 +57608,7 @@ impl App {
             // Restore it if an unexpected load refusal leaves the root mounted.
             let previous_hint = self.select_after_load.take();
             if matches!(
-                self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
                     path,
                     Some(scan),
                     OpenRequestOwner::Navigation,
@@ -57358,7 +57616,8 @@ impl App {
                     Some(OpenPathKind::Directory),
                     crate::app::StartupListIntent::ExplicitList,
                     navigation,
-                ),
+            MainListRequestStage::Continuation,
+        ),
                 FolderOpenOutcome::Loaded
             ) {
                 if native_selection {
@@ -57369,7 +57628,7 @@ impl App {
             }
         } else {
             if matches!(
-                self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
                     path,
                     Some(scan),
                     OpenRequestOwner::Navigation,
@@ -57377,7 +57636,8 @@ impl App {
                     Some(OpenPathKind::Directory),
                     StartupListIntent::ExplicitList,
                     navigation,
-                ),
+            MainListRequestStage::Continuation,
+        ),
                 FolderOpenOutcome::Loaded
             ) {
                 if native_selection {
@@ -57912,7 +58172,7 @@ impl App {
                             matches!(item, GridItem::Folder(folder)
                                 if crate::folder_tree::path_eq(folder, &ready.path))
                         });
-                        match self.begin_smart_physical_navigation(
+                        match self.begin_smart_physical_navigation_with_navigation(
                             ready.path.clone(),
                             smart_folder::SmartChildKind::Folder,
                             image_book,
@@ -57923,6 +58183,8 @@ impl App {
                             } else {
                                 StartupListIntent::ExplicitList
                             },
+                            ready.navigation.clone(),
+                            MainListRequestStage::Admission,
                         ) {
                             Ok(()) => return None,
                             Err(Some(scan)) => scan,
@@ -58064,6 +58326,7 @@ impl App {
                     Some(OpenPathKind::Directory),
                     crate::app::StartupListIntent::PreservePresentation,
                     None,
+                    MainListRequestStage::Continuation,
                 ),
                 FolderOpenOutcome::Loaded
             );
@@ -58647,7 +58910,7 @@ impl App {
                             self.favsearch.nav_stack.clear();
                             // One accepted reading request owns both physical position adoption
                             // and reopening, for folders as well as asynchronously prepared books.
-                            if self.start_physical_history_transition_with_dfs(
+                            if self.start_physical_history_transition_with_dfs_at_stage(
                                 PhysicalHistoryIntent::Navigation {
                                     replay: None,
                                     auto_fullscreen: false,
@@ -58665,6 +58928,7 @@ impl App {
                                     fullscreen: true,
                                 }),
                                 restore_intent.clone(),
+                                MainListRequestStage::Continuation,
                             ) {
                                 emit_end(apply_t0, apply_seq, apply_mode_tag, "history_preflight");
                                 return;
@@ -58849,8 +59113,13 @@ impl App {
             };
             let owner = OpenRequestOwner::Navigation;
             let staged = self.snapshot_scope_allows_open(&path, &owner)
-                && self.claim_open_request_owner(&path, &owner)
-                && self.start_physical_history_transition_with_dfs(
+                && self.claim_open_request_owner_with_startup_intent(
+                    &path,
+                    &owner,
+                    true,
+                    MainListRequestStage::Continuation,
+                )
+                && self.start_physical_history_transition_with_dfs_at_stage(
                     PhysicalHistoryIntent::Navigation {
                         replay: None,
                         auto_fullscreen: false,
@@ -58858,6 +59127,7 @@ impl App {
                     path,
                     Some(continuation),
                     restore_intent.clone(),
+                    MainListRequestStage::Continuation,
                 );
             if !staged {
                 self.clear_pending_folder_nav_steps();
@@ -59051,7 +59321,7 @@ impl App {
                             self.favsearch.nav_stack.clear();
                             // One accepted reading request owns both physical position adoption
                             // and reopening, for folders as well as asynchronously prepared books.
-                            if self.start_physical_history_transition_with_dfs(
+                            if self.start_physical_history_transition_with_dfs_at_stage(
                                 PhysicalHistoryIntent::Navigation {
                                     replay: None,
                                     auto_fullscreen: false,
@@ -59069,6 +59339,7 @@ impl App {
                                     fullscreen: true,
                                 }),
                                 restore_intent.clone(),
+                                MainListRequestStage::Continuation,
                             ) {
                                 emit_end(apply_t0, apply_seq, apply_mode_tag, "history_preflight");
                                 return;

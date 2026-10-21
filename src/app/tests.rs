@@ -28127,6 +28127,8 @@ mod phase_c_folder_nav_history_tests {
         let book = parent.join("book.zip");
         write_1328_zip(&book);
         env.load_folder(parent.clone());
+        // Production sanitizes pointer input during hydration; this harness must settle it first.
+        env.finish_page_identity_preparation_for_test();
         env.address = book.to_string_lossy().into_owned();
         env.settings.show_toolbar_folder_tree_button = false;
         env.settings.show_toolbar_effetune = false;
@@ -28156,6 +28158,7 @@ mod phase_c_folder_nav_history_tests {
                 }
                 let mut app = render.borrow_mut();
                 app.update_ime_state(ctx);
+                app.note_main_chrome_pointer_block_transition(ctx);
                 if let Some(nav) = app.render_toolbar(root_ui).1 {
                     let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
                         panic!("address Enter must produce Direct navigation");
