@@ -361,7 +361,8 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   smoke 側は起動フォルダの確定を待ってから開くよう回避済み (`scripts/ui-smoke/rating-sort-collection.rhai`)。
 - 規模 / 優先度: Small / P3。
 - **残る同型（別件、未対応）**: master `4db8a8874` からある BookmarkRow 分類完了による後発 Activation resolver の置換と、
-  `cancel_conflicting_bookmark_open_for_navigation` による後発 Bookmark resolver / activation-held 鎖の取消は §1.285 の範囲外。
+  `cancel_conflicting_bookmark_open_for_navigation` による後発 Bookmark resolver / activation-held 鎖の取消、
+  混在フォルダ (GridFolderCandidate) の走査中に受理した後発 activation を、その main 復帰の受付が取り消す経路は §1.285 の範囲外。
   修正案は、起動系要求の受理も同じ受付境界で先行中のメイン要求を退役させるか、resolver の保管先を owner ごとにするかの2案（未決定）。
   経路は [起動診断計画](startup-diagnostics-plan.md) §6.2 に記録。今回の実装・挙動固定テストは追加しない。
 

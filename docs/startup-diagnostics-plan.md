@@ -639,6 +639,9 @@ OtherArchive（RAR 等）は PDF/EPUB の composition qualification 待ちを通
 また、先行要求の `cancel_conflicting_bookmark_open_for_navigation` が、後発 Bookmark resolver /
 activation-held 鎖を取り消し得る（`src/app/startup_ops.rs:1029` → `src/app/startup_ops.rs:1083` →
 `src/app/startup_ops.rs:1146` / `src/app/startup_ops.rs:1162`）。
+混在フォルダ（GridFolderCandidate）A の走査中に Activation B を受理し、B の解決前に A が main 復帰すると、
+A の main 受付が後発の B を退役させる（`src/app.rs:58171`）。master では同じ地点の通常 load の
+`claim_open_request_owner` が B を取り消しており、挙動は同じ（独立レビュー 3 回目の指摘、2026-10-21）。
 どちらも「起動系要求の受理が先行中のメイン要求をどう扱うか」という別の設計であり、今回は実装しない。
 修正案は、起動系要求の受理も同じ受付境界で先行中のメイン要求を退役させるか、resolver の保管先を
 単一から owner ごとにするかの2案。どちらを採るかは未決定で、現挙動を固定するテストも追加しない。
