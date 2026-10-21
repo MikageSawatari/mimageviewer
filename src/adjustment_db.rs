@@ -616,15 +616,9 @@ mod tests {
 
     #[test]
     fn db_page_params_roundtrip() {
-        // 2026-05-17: 旧版は `AdjustmentDb::open()` を使っていたが、これは内部で
-        // `data_dir::get()` 経由で APPDATA に DB を作るため、`cfg(test)` の
-        // `data_dir::default()` panic ガードに当たる。`open_at` で temp path に
-        // 明示開きに変更 (= 同 module の `db_favorite_params_roundtrip_and_prune` と同方式)。
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer_page_params_test_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        // プロセス共有の既定 sandbox に依存せず、テストが所有する DB を明示的に開く。
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("test.db");
         let db = AdjustmentDb::open_at(&tmp).unwrap();
         let page = "c:/test/folder/page001.jpg";
         // クリーンな状態を保証
@@ -646,17 +640,12 @@ mod tests {
         // 明示削除すれば消える
         db.remove_page_params(page).unwrap();
         assert!(db.get_page_params(page).is_none());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn db_load_page_param_keys_returns_all_page_params() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer_page_param_keys_test_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("test.db");
         let db = AdjustmentDb::open_at(&tmp).unwrap();
 
         let plain = "c:/test/plain.jpg";
@@ -670,8 +659,6 @@ mod tests {
         let keys = db.load_page_param_keys();
         assert!(keys.contains(ai));
         assert!(keys.contains(plain));
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -690,11 +677,8 @@ mod tests {
 
     #[test]
     fn db_favorite_params_roundtrip_and_prune() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer_fav_params_test_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("test.db");
         let db = AdjustmentDb::open_at(&tmp).unwrap();
 
         let a = Uuid::new_v4();
@@ -724,8 +708,6 @@ mod tests {
         // 明示削除
         db.remove_favorite_params(b).unwrap();
         assert!(db.load_all_favorite_params().is_empty());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

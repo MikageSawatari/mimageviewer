@@ -471,6 +471,7 @@ regex = "1"
 mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
+libc = "0.2"
 tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
 tempfile = "3"
 eframe = { version = "0.37.0", features = ["miv-test-script-window-witness"] }

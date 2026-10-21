@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, process::Command};
 
 fn assert_final_result(output: &std::process::Output, status: &str, exit_code: i32) {
     assert_eq!(
@@ -50,14 +46,8 @@ fn argument_error_has_one_final_result() {
 
 #[test]
 fn missing_input_has_one_final_result_and_no_output() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "epub-pdf-progress-test-{}-{nonce}",
-        std::process::id()
-    ));
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
     let input = root.join("missing.epub");
     let out = root.join("out.pdf.part");
     let report = root.join("report.json");
@@ -74,21 +64,12 @@ fn missing_input_has_one_final_result_and_no_output() {
         .unwrap();
     assert_final_result(&output, "invalid", 3);
     assert!(!out.exists());
-    if root.exists() {
-        fs::remove_dir_all(&root).unwrap();
-    }
 }
 
 #[test]
 fn unsafe_user_data_path_is_invalid_and_has_final_result() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "epub-pdf-unsafe-path-test-{}-{nonce}",
-        std::process::id()
-    ));
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
     let out = root.join("out.pdf.part");
     let output = Command::new(binary())
         .arg("convert")
@@ -103,22 +84,13 @@ fn unsafe_user_data_path_is_invalid_and_has_final_result() {
         .unwrap();
     assert_final_result(&output, "invalid", 3);
     assert!(!out.exists());
-    if root.exists() {
-        fs::remove_dir_all(&root).unwrap();
-    }
 }
 
 #[cfg(debug_assertions)]
 #[test]
 fn panic_after_user_data_creation_cleans_folder_and_reports_once() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "epub-pdf-panic-test-{}-{nonce}",
-        std::process::id()
-    ));
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
     let user_data = root.join("user-data");
     let out = root.join("out.pdf.part");
     let output = Command::new(binary())
@@ -136,21 +108,12 @@ fn panic_after_user_data_creation_cleans_folder_and_reports_once() {
     assert_final_result(&output, "render_failed", 5);
     assert!(!user_data.exists());
     assert!(!out.exists());
-    if root.exists() {
-        fs::remove_dir_all(root).unwrap();
-    }
 }
 
 #[test]
 fn preexisting_empty_user_data_folder_is_invalid_and_preserved() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "epub-pdf-existing-data-test-{}-{nonce}",
-        std::process::id()
-    ));
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
     let user_data = root.join("user-data");
     fs::create_dir_all(&user_data).unwrap();
     let output = Command::new(binary())
@@ -166,7 +129,6 @@ fn preexisting_empty_user_data_folder_is_invalid_and_preserved() {
         .unwrap();
     assert_final_result(&output, "invalid", 3);
     assert!(user_data.is_dir());
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

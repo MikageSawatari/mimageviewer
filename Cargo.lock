@@ -4163,6 +4163,7 @@ dependencies = [
  "gilrs",
  "image",
  "kamadak-exif",
+ "libc",
  "libraw-sys",
  "local-adjust-core",
  "log",

@@ -87,9 +87,9 @@ pub fn test_override_lock() -> std::sync::MutexGuard<'static, ()> {
 /// 軽量な data_dir override 用 RAII ガード (test only)。`settings_db` を触らない
 /// テスト (e.g. `archive_cache::cache_zip_path_uses_basename`) から呼ぶ。
 ///
-/// 2026-05-17 事故ガード対応 (`data_dir::default()` の `cfg(test)` panic) を回避するため、
-/// `data_dir::get()` を呼ぶ全ての unit test は入り口でこのガードを取って TEST_OVERRIDE
-/// を設定すること。Drop で override 解除 + lock 解放。
+/// 既定のテスト sandbox はプロセス共通なので、テスト単位で隔離したい場合は
+/// 入り口でこのガードを取って TEST_OVERRIDE を設定すること。
+/// Drop で override 解除 + 一時領域削除 + lock 解放。
 ///
 /// `settings_db` の `DataDirOverrideGuard` (= GLOBAL_DB / SAVE_SUPPRESSED もリセット)
 /// と違って **TEST_OVERRIDE と lock しか触らない** ので、settings DB を使うテストには
@@ -244,18 +244,14 @@ fn default() -> PathBuf {
     //   - 本物の %APPDATA% を絶対に触らない (= 汚染ゼロ)
     //   - panic で test を片っ端から落とさない (= log_diag のような副次的な
     //     get() 呼び出しを許容)
-    //   - sandbox 内で何が書かれてもプロセス終了時に自動消滅
+    //   - 乱数名で PID 再利用から隔離し、通常終了時に sandbox の削除を試みる
+    //     (残存 worker / SQLite 接続による削除失敗や異常終了は許容する)
     //
     // 厳格に書き忘れを検出したい場合は、test 側で明示的に `TestDataDirGuard` または
     // `DataDirOverrideGuard` を取って override をセットすること。
     #[cfg(test)]
     {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "mimageviewer-cfg-test-sandbox-{}",
-            std::process::id()
-        ));
-        p
+        test_sandbox()
     }
     // portable: 既定の data_dir は exe と同じ場所の `data/` サブディレクトリ。
     // これにより `data_dir::init()` を呼ぶ前に `get()` が呼ばれても (= worker など)
@@ -267,6 +263,41 @@ fn default() -> PathBuf {
     #[cfg(all(not(test), not(feature = "portable")))]
     {
         flavor_default()
+    }
+}
+
+// static は終了時に Drop されないため、プロセス共有の所有者を atexit で取り出す。
+// thread-local の所有では、呼出スレッド終了後も使う worker を保護できない。
+#[cfg(test)]
+static TEST_SANDBOX: OnceLock<Mutex<Option<tempfile::TempDir>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_sandbox() -> PathBuf {
+    TEST_SANDBOX
+        .get_or_init(|| {
+            let directory = tempfile::Builder::new()
+                .prefix("mimageviewer-cfg-test-sandbox-")
+                .tempdir()
+                .expect("create process test sandbox");
+            // SAFETY: callback は引数・借用を持たず、プロセス終了まで有効。
+            assert_eq!(unsafe { libc::atexit(cleanup_test_sandbox) }, 0);
+            Mutex::new(Some(directory))
+        })
+        .lock()
+        .expect("test sandbox owner")
+        .as_ref()
+        .expect("test sandbox is live")
+        .path()
+        .to_path_buf()
+}
+
+#[cfg(test)]
+extern "C" fn cleanup_test_sandbox() {
+    // 終了中に worker を待たない。取得できない場合や削除失敗は best effort で諦める。
+    if let Some(owner) = TEST_SANDBOX.get() {
+        if let Ok(mut directory) = owner.try_lock() {
+            drop(directory.take());
+        }
     }
 }
 
@@ -484,6 +515,57 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_sandbox_is_unique_and_cleaned_at_process_exit() {
+        const REPORT: &str = "MIV_TEST_DATA_DIR_SANDBOX_REPORT";
+        if let Some(report) = std::env::var_os(REPORT) {
+            // 最初の呼出スレッドの終了では sandbox を削除しない。
+            let path = std::thread::spawn(get).join().unwrap();
+            assert!(path.is_dir());
+            assert!(
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("mimageviewer-cfg-test-sandbox-")
+            );
+            assert_eq!(default(), path);
+            assert_eq!(get(), path);
+            assert_eq!(std::thread::spawn(get).join().unwrap(), path);
+            {
+                let override_guard = TestDataDirGuard::new();
+                assert_eq!(get(), override_guard.path());
+                assert_ne!(get(), path);
+                assert_eq!(default(), path);
+            }
+            assert_eq!(get(), path);
+            std::fs::write(path.join("owned.txt"), b"sandbox content").unwrap();
+            std::fs::write(report, path.to_str().unwrap()).unwrap();
+            return;
+        }
+
+        // 製品ではなく同じ unit-test executable を通常終了させ、CRT hook まで検査する。
+        let reports = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let report = reports.path().join(format!("sandbox-{index}.txt"));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "data_dir::tests::default_sandbox_is_unique_and_cleaned_at_process_exit",
+                    "--nocapture",
+                ])
+                .env(REPORT, &report)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let path = PathBuf::from(std::fs::read_to_string(report).unwrap());
+            assert!(!path.exists(), "sandbox survived normal exit: {path:?}");
+            paths.push(path);
+        }
+        assert_ne!(paths[0], paths[1]);
+    }
 
     #[test]
     fn unc_detection_accepts_standard_and_verbatim_paths() {

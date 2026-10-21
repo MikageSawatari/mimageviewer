@@ -53,6 +53,12 @@ Windowsのクラッシュダイアログだけをそのプロセスで抑え、�
 テストの非ゼロ終了は失敗のままとし、自動再試行や期待値変更は行わない。
 スクリプトの回帰確認は `scripts/test-release-build-safety.ps1` を参照する。
 
+### テスト用一時領域
+
+PID だけの固定名を使わず、原則 `tempfile::TempDir` をテストの接続・worker より長く所有する。
+プロセス共有の既定 data_dir だけは終了フックで回収する。
+所有・終了順と PID 使用箇所の監査記録は [テスト用一時領域](test-tempdir-ownership.md) を参照。
+
 ### 長い経過時間を扱う collection テスト
 
 Windows の `Instant` は起動直後に大きな時間を引くと underflow するため、過去の

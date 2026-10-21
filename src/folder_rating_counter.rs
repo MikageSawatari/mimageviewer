@@ -49,6 +49,9 @@ pub struct CountBatch {
 pub struct FolderRatingCounterHandle {
     cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<CountBatch>,
+    // テストの一時 DB を削除する前に接続を閉じる。本番 UI の Drop は待機しない。
+    #[cfg(test)]
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FolderRatingCounterHandle {
@@ -60,6 +63,10 @@ impl FolderRatingCounterHandle {
 impl Drop for FolderRatingCounterHandle {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -75,12 +82,17 @@ pub fn spawn_for_folder(db_path: PathBuf, folder_key: String) -> FolderRatingCou
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_w = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
-    let _ = std::thread::Builder::new()
+    let _worker = std::thread::Builder::new()
         .name("folder-rating-counter".into())
         .spawn(move || {
             run_worker(&db_path, &folder_key, &cancel_w, &tx);
         });
-    FolderRatingCounterHandle { cancel, rx }
+    FolderRatingCounterHandle {
+        cancel,
+        rx,
+        #[cfg(test)]
+        worker: _worker.ok(),
+    }
 }
 
 /// `folder_key/...` を LIKE の prefix パターンにする。
@@ -277,12 +289,8 @@ mod tests {
     #[test]
     fn worker_end_to_end_via_in_memory_db() {
         // 一時ファイルに rating.db を作り、worker を走らせて集計が期待通りになることを確認。
-        use std::io::Write;
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer-folder-rating-test-{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("rating.db");
         {
             let conn = Connection::open(&tmp).unwrap();
             conn.execute_batch(
@@ -333,14 +341,8 @@ mod tests {
         assert!(!totals.contains_key("c:/root/direct.jpg"));
         // otherroot 配下は LIKE prefix で弾かれる
         assert!(!totals.keys().any(|k| k.starts_with("c:/otherroot")));
-        // ファイルを writer.drop だけでは残るので明示削除
+        // finished 送信直後にも接続は生き得る。Drop 内の test-only join 後に削除する。
         drop(h);
-        // 少し待って sqlite が close するのを待ってから削除
-        std::thread::sleep(Duration::from_millis(50));
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
-        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-        // clippy lint を黙らせるため一度 writer handle を使う
-        let _ = std::io::stdout().write_all(b"");
+        temp.close().expect("worker closed its SQLite connection");
     }
 }
