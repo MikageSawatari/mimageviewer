@@ -7,6 +7,24 @@
 最初の停止時点では試作製品コードを作業ツリーから撤去し、実worker受理を通る再現テストを残した。
 以下の確定範囲で実装を再開した。Unknownの判断関数・永続schemaは変更しない。
 
+## b2401092f 再レビュー追補
+
+PDFのKnown全域収録も、旧実装は全体coordinate寸法をlegacy参照に使用していた。
+部分収録だけを扱った受理条件を `coordinate_dims()` の有無へ置き換え、有効なKnown全体で
+同じ契約を受理する。座標のないFullSourceは既存のsampler参照のままとする。
+到着回帰へcropなしの全域boundsを追加し、既存の部分boundsと合わせ36条件
+（Original／Page／指定倍率、DPI 1／1.25、縮小しないON／OFF）で枠・共通画素位置を比較する。
+
+他の部分判定も76eeab77bと比較した。RAW受理は既に全Knownのcoordinate寸法を使う。
+通常画像／ZIPは全Knownの座標・crop前rasterを受理したうえで、Singleのsampler表示、
+Specifiedのaspect、通過素材のlegacy射影を既存契約で選ぶ。共通sampler既定値やGPU密度の
+部分判定も同じ契約であり、PDFのsource-layout参照条件へ一律変更しない。
+この追補の変更ファイルはapp.rs、display_basis_tests.rs、本書、display-pipeline.md、
+architecture-overview.md。前回検証ログはb2401092f以前の記録である。
+今回の関連nextestは63件成功（`target/material-r10-focused.log`）、UI snapshotは195件成功・
+PNG更新なし（`target/material-r10-ui-snapshot.log`）。後続gateは `target/material-r10-lib-full.log`、
+`target/material-r10-core-check.log`、`target/material-r10-fmt-check.log`、`target/material-r10-build-dev.log` に記録する。
+
 ## 586f5799e 完成レビュー追補
 
 P1／P2はいずれもコードで確認した。素材所有の境界は維持し、受理時に従来の契約を確定する。
@@ -28,6 +46,7 @@ P1／P2はいずれもコードで確認した。素材所有の境界は維持�
 | 通常thumbnail、旧行source寸法なし | P2を修正。指定倍率も受理samplerを使い、通常描画・ページ送りに利用 |
 | 通常source Static／Animated | own samplerで受理。canonical寸法が無くても表示可能 |
 | PDF Known部分coverage | P1を修正。全体coordinate参照寸法とpage-box layoutを分離して保持 |
+| PDF Known全域coverage（b2401092f再レビュー追補） | cropなしの編集previewも同じ全体coordinate参照を受理。is_partial条件を撤去し、Original／Page／指定倍率の到着前後を比較 |
 | PDF FullSource／metadata未確定 | legacy canvasを維持。指定倍率のcontent type／layout必須条件は76eeab77bから同じ |
 | RAW、worker寸法あり／Known coverage | developed canvasを受理。既存gate通過後に表示可能 |
 | RAW、旧行source寸法なし | 追加停止を修正。thumbnailとRawInfo→previewの両到着順でdeveloped基準を受理 |
@@ -133,7 +152,7 @@ descriptorに固定するのは不変の寸法・由来だけとする。現在�
 描画側はview/fit方式に対応する受理値を選択するだけとする。
 legacy source-layoutはlayout単位と、単ページでそのaspectを正規化する受理rasterの
 参照寸法を `LegacySourceLayoutBasis` に保持する。後者をlive座標寸法から引き直さない。
-PDFのKnown部分thumbnailはcoverageの全体座標寸法、FullSourceはown samplerの参照寸法を
+PDFの有効なKnown thumbnailは全域収録でもcoverageの全体座標寸法、FullSourceはown samplerの参照寸法を
 受理して保持し、page-box metadataの再受理でも維持する。
 source／派生PDFは自身のsource rasterを受理する。見開き・連結のlayout単位は従来どおりである。
 

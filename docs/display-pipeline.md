@@ -764,10 +764,21 @@ frame stateの通常素材・thumbnail／通過代役、Native不採用時の描
 不正寸法や、従来から表示に必要なPDF／RAW metadataの未確定は、互換行の寸法省略と区別する。
 RAW／PDF／連結のlegacy source-layoutは `LegacySourceLayoutBasis` にlayout単位と
 受理rasterの参照寸法を別々に持つ。単ページのaspect正規化もこの参照寸法を使い、
-cache退去後の座標寸法やsamplerへ戻らない。PDFのKnown部分素材は、従来のPDF契約に従って
+cache退去後の座標寸法やsamplerへ戻らない。PDFの有効なKnown素材は全域収録でも、従来のPDF契約に従って
 coverageの全体座標寸法をlegacy参照寸法として受理し、page-box layout単位とは分離する。
 FullSource thumbnailの参照寸法は従来どおりown samplerとする。PDF thumbnailのmetadata再受理では
 page-boxと指定A/Oを更新し、同じ素材のlegacy参照寸法は保持する。
+
+受理条件の棚卸し（`76eeab77b`との比較）:
+
+| 素材 | legacy参照寸法・受理条件 |
+| --- | --- |
+| PDF Known部分収録 | coverageの全体coordinate寸法。page-box layout単位とは別に保持 |
+| PDF Known全域収録（cropなしの注釈・局所編集preview） | 部分判定をせず、同じ全体coordinate寸法を保持。Original／Page／指定倍率で本画像採用前後を比較 |
+| PDF FullSource（座標なし） | 従来のown sampler参照を維持 |
+| RAW Known | 全域／部分ともcoordinate寸法を受理。worker寸法・RawInfoも既存の受理境界で扱う |
+| 通常画像／ZIP | 全域／部分とも座標・crop前rasterを受理。残る部分判定はsampler表示／部分素材aspect等の既存の方式別契約に限る |
+
 RAWの旧catalog行に寸法が無い場合は、受理済みRawInfoのdeveloped寸法をthumbnail受理時に採用する。
 thumbnailが先に届いた場合も、RawInfo／previewの実受理境界でlive descriptorを再受理する。
 PDF／RAWでdescriptorが変わったページの依存通過素材だけを退役し、保持済みcaptureと兄弟ページは維持する。

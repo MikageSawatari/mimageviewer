@@ -1918,7 +1918,7 @@ fn display_basis_pdf_noninteger_page_box_keeps_accepted_sampler_reference_after_
 }
 
 #[test]
-fn display_basis_pdf_partial_worker_thumbnail_and_real_raster_arrival_keep_single_frame() {
+fn display_basis_pdf_known_worker_thumbnail_and_real_raster_arrival_keep_single_frame() {
     use crate::app::{
         FsLoadPurpose, FsNormalLoadPurpose, FsPendingValue, OriginalMaterialEntry,
         PdfRerenderRequestProbe, PollPrefetchOrigin,
@@ -1937,6 +1937,9 @@ fn display_basis_pdf_partial_worker_thumbnail_and_real_raster_arrival_keep_singl
             (79, 102, 158, 204),
             [31, 40],
         ),
+        // A crop-free edit preview still carries Known full-source coordinates.
+        // Annotations/local edits do not turn it into an ordinary FullSource row.
+        ([600, 800], (600_000, 800_000), (0, 0, 600, 800), [60, 80]),
     ] {
         for ppp in [1.0, 1.25] {
             for mode in [
@@ -1952,7 +1955,7 @@ fn display_basis_pdf_partial_worker_thumbnail_and_real_raster_arrival_keep_singl
                     // dispatch so this synthetic path cannot race a missing-file
                     // Failed result against the successful raster below.
                     let pdf_rerender = PdfRerenderRequestProbe::start();
-                    let pdf_path = app.tmp.path().join("partial-pdf-arrival.pdf");
+                    let pdf_path = app.tmp.path().join("known-pdf-arrival.pdf");
                     let content_type = crate::pdf_loader::PdfPageContentType::Raster {
                         w: source[0],
                         h: source[1],
@@ -1988,6 +1991,21 @@ fn display_basis_pdf_partial_worker_thumbnail_and_real_raster_arrival_keep_singl
                         sampler,
                         Some(page_box),
                     );
+                    let accepted = app.fs_thumbnail_resource_for_display(0).unwrap();
+                    let crate::material_display_basis::MaterialLegacyBasis::SourceLayout { basis } =
+                        accepted
+                            .display_basis()
+                            .legacy(crate::material_display_basis::MaterialDisplayView::Single)
+                    else {
+                        panic!("Known PDF previews retain their page-box layout contract");
+                    };
+                    assert_eq!(
+                        basis.reference_size,
+                        egui::vec2(source[0] as f32, source[1] as f32)
+                    );
+                    if !coverage.is_partial() {
+                        assert!(!app.export_crop_pages.contains(&0));
+                    }
                     let viewport = egui::vec2(1200.0, 900.0) / ppp;
                     specified_frame(&ctx, viewport, |_, _| {});
                     // The normal source worker is already in flight while its

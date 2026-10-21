@@ -22094,14 +22094,16 @@ impl App {
             };
             return Self::accept_pdf_display_basis(
                 sampler,
-                if coverage.is_partial() {
-                    // PDF legacy normalization used the full coordinate raster,
-                    // independently of page-box units and the cropped sampler.
-                    let (width, height) = coverage.coordinate_dims().unwrap().as_tuple();
-                    egui::vec2(width as f32, height as f32)
-                } else {
-                    egui::vec2(sampler[0] as f32, sampler[1] as f32)
-                },
+                // Every valid Known PDF preview retains its full coordinate
+                // reference, including uncropped edits. FullSource has only its
+                // sampler reference; page-box units remain independent of both.
+                coverage
+                    .coordinate_dims()
+                    .map(|dims| {
+                        let (width, height) = dims.as_tuple();
+                        egui::vec2(width as f32, height as f32)
+                    })
+                    .unwrap_or_else(|| egui::vec2(sampler[0] as f32, sampler[1] as f32)),
                 layout_dims.or(accepted.map(|metadata| metadata.layout_dims)),
                 content_type,
             );
