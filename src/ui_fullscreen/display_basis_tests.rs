@@ -417,3 +417,325 @@ fn display_basis_uncropped_ai_keeps_released_completed_texture_original_and_limi
  {
     released_completed_material_basis(true);
 }
+
+fn specified_frame(
+    ctx: &egui::Context,
+    viewport: egui::Vec2,
+    mut run: impl FnMut(&mut egui::Ui, &egui::Context),
+) {
+    crate::test_ui::headless_paint_output(ctx.run_pass(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+            ..Default::default()
+        },
+        |ctx| {
+            ctx.root_ui(|root| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| run(ui, ctx));
+            });
+        },
+    ));
+}
+
+fn draw_specified_current(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    single_payload: Option<&FullscreenPaintPayload>,
+) -> Vec<DisplayedImageTransform> {
+    let anchor = app.fullscreen_idx.unwrap();
+    let decision = app.fs_page_turn_decision_for_frame(ctx, anchor);
+    let composition = app.spread_display_composition_for_anchor(anchor);
+    let pages = composition.pages_in_screen_order(app.spread_mode);
+    match pages.as_slice() {
+        [page] => {
+            let selected = app.resolve_fs_processed_texture(ctx, page.idx, false);
+            let resource = single_payload
+                .cloned()
+                .or_else(|| app.fullscreen_paint_payload_for_page(page.idx, selected, false));
+            let thumbnail = app.fs_thumbnail_texture_for_display(page.idx);
+            let content_bbox = app.view_trim_single_content_bbox(page.idx);
+            let mut sources = FsNavigatorTextureSources::default();
+            app.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Single);
+            let transform = app
+                .draw_fs_image_with_receipt(
+                    ui,
+                    ui.max_rect(),
+                    page.idx,
+                    app.fs_page_coordinate_source_size(page.idx),
+                    FsPageLayoutSource::CurrentItem,
+                    None,
+                    None,
+                    composition.singleton_placement(),
+                    resource.as_ref(),
+                    thumbnail.as_ref(),
+                    false,
+                    false,
+                    false,
+                    app.rotation_cache
+                        .get(&page.idx)
+                        .copied()
+                        .unwrap_or(crate::rotation_db::Rotation::None),
+                    None,
+                    0.0,
+                    &FsBgStyle::Solid(egui::Color32::WHITE),
+                    "",
+                    false,
+                    FullscreenFitMode::SpecifiedScale,
+                    app.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+                    content_bbox,
+                    Some(&mut sources),
+                    true,
+                )
+                .expect("accepted partial page remains drawable");
+            app.fullscreen_page_layout.push_occurrence(transform, *page);
+        }
+        [left, right] => {
+            app.draw_fs_spread_with_submission(
+                ui,
+                ctx,
+                ui.max_rect(),
+                left.idx,
+                right.idx,
+                false,
+                decision,
+                None,
+                StillSeekGeometry::bar_only(),
+                true,
+                Some(&composition),
+            );
+        }
+        _ => panic!("test draws one ordinary Single or Pair"),
+    }
+    pages
+        .iter()
+        .map(|page| {
+            app.fullscreen_page_layout
+                .page_by_idx(page.idx)
+                .expect("selected page submitted")
+                .transform
+        })
+        .collect()
+}
+
+fn specified_partial_survives_thumbnail_eviction(evict_before_prepare: bool) {
+    for ppp in [1.0, 1.25] {
+        let modes = if evict_before_prepare {
+            vec![SpreadMode::Single, SpreadMode::Ltr]
+        } else {
+            vec![SpreadMode::Single]
+        };
+        for mode in modes {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            page_turn::install(&ctx);
+            let mut app = fixture();
+            for idx in 2..4 {
+                let path = app.tmp.path().join(format!("outgoing-{idx}.png"));
+                app.items.push(GridItem::Image(path));
+                app.visible_indices.push(idx);
+                app.details_order.push(idx);
+                app.thumbnails.push(ThumbnailState::Pending);
+                let _ =
+                    install_complete(&mut app, &ctx, idx, [80, 120], [80, 120], [80, 120], false);
+            }
+            app.spread_mode = mode;
+            app.settings.page_turn_animation_enabled = evict_before_prepare;
+            app.settings.page_turn_animation_duration_ms = 600;
+            app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+            app.settings.fullscreen_fit_no_downscale = true;
+            app.settings.fullscreen_specified_scale = crate::settings::FullscreenSpecifiedScale {
+                width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    crate::settings::SpecifiedScaleAxis::LogicalPixels(100),
+                ),
+            };
+            let coverage = SourceCoverage::Known(
+                EditPreviewGeometry::new(
+                    CanonicalPageDimensions::new(20000, 15000),
+                    (8192, 6144),
+                    (2048, 1536, 4096, 3072),
+                )
+                .unwrap(),
+            );
+            for idx in 0..2 {
+                let texture = metadata_texture(
+                    &ctx,
+                    format!("held-partial-{idx}"),
+                    image_metadata([512, 384]),
+                );
+                app.thumbnails[idx] = ThumbnailState::Loaded {
+                    tex: texture,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                    from_edit_preview: true,
+                    rendered_at_px: 512,
+                    source_coverage: coverage,
+                    source_dims: Some((4096, 3072)),
+                    layout_dims: None,
+                };
+                app.record_page_dims_for_spread(idx, (20000, 15000));
+                if mode.is_spread() {
+                    // The ordinary builder pairs portrait pages. Rotate this landscape
+                    // source through its real saved-rotation route without changing A/O.
+                    app.rotation_cache
+                        .insert(idx, crate::rotation_db::Rotation::Cw90);
+                }
+            }
+            let viewport = egui::vec2(20000.0, 10000.0) / ppp;
+            // Apply the requested pixels-per-point and viewport before measuring.
+            // egui otherwise uses its default first-pass viewport at fractional DPI.
+            specified_frame(&ctx, viewport, |_, _| {});
+            let physical_size = if mode.is_spread() {
+                [6144, 8192]
+            } else {
+                [8192, 6144]
+            };
+            let mut baseline = Vec::new();
+            specified_frame(&ctx, viewport, |ui, ctx| {
+                baseline = draw_specified_current(&mut app, ui, ctx, None);
+            });
+            assert_eq!(baseline.len(), if mode.is_spread() { 2 } else { 1 });
+            for transform in &baseline {
+                close_physical_size(*transform, physical_size, ppp);
+            }
+            if !evict_before_prepare {
+                // Capture through the production material owner, then submit that
+                // actual Direct presentation payload through ordinary Single drawing.
+                // Geometry preservation does not require a large curl to pass its
+                // independent mesh-error/visibility admission rules.
+                let resource = app.fs_thumbnail_resource_for_display(0).unwrap();
+                let retained = FullscreenPaintPayload::PresentationMaterial(
+                    resource.capture_presentation(&ctx),
+                );
+                app.thumbnails[..2].fill(ThumbnailState::Evicted);
+                specified_frame(&ctx, viewport, |ui, ctx| {
+                    let actual = draw_specified_current(&mut app, ui, ctx, Some(&retained));
+                    for (before, after) in baseline.iter().zip(actual) {
+                        same_frame_and_common_pixel(*before, after, ppp);
+                        close_physical_size(after, physical_size, ppp);
+                        let FullscreenFitInput::SpecifiedScale { basis, .. } = after.fit_input
+                        else {
+                            panic!("specified presentation descriptor")
+                        };
+                        assert_eq!(basis.original_size, egui::vec2(8192.0, 6144.0));
+                    }
+                });
+                continue;
+            }
+            let captured_pair = mode.is_spread().then(|| {
+                app.capture_fs_display_unit_with_rendition_for_pair(
+                    None,
+                    0,
+                    SpreadPair::Double { left: 0, right: 1 },
+                )
+                .expect("capture the actual selected pair before thumbnail eviction")
+            });
+            app.fullscreen_idx = Some(2);
+            specified_frame(&ctx, viewport, |ui, ctx| {
+                draw_specified_current(&mut app, ui, ctx, None);
+            });
+            specified_frame(&ctx, viewport, |ui, ctx| {
+                let operation = page_turn::ViewerOperationId::Pad {
+                    batch: page_turn::next_operation_batch(),
+                    ordinal: 0,
+                };
+                app.page_turn_external_operation(
+                    ctx,
+                    operation,
+                    page_turn::OperationPhase::Press,
+                    "specified-basis-eviction",
+                );
+                app.offer_page_turn_with_operation(ctx, 0, false, Some(operation));
+                for idx in 0..baseline.len() {
+                    assert!(matches!(
+                        app.page_turn_held_resource(idx),
+                        Some(FullscreenPaintPayload::NormalResource(_))
+                    ));
+                }
+                if evict_before_prepare {
+                    app.thumbnails[..2].fill(ThumbnailState::Evicted);
+                }
+                app.fullscreen_idx = Some(0);
+                let actual = draw_specified_current(&mut app, ui, ctx, None);
+                for (before, after) in baseline.iter().zip(actual) {
+                    same_frame_and_common_pixel(*before, after, ppp);
+                    let FullscreenFitInput::SpecifiedScale { basis, .. } = after.fit_input else {
+                        panic!("specified fit descriptor")
+                    };
+                    assert_eq!(basis.original_size, egui::vec2(8192.0, 6144.0));
+                }
+            });
+            if evict_before_prepare {
+                // Offered NormalResource is sufficient to reproduce the live bug.
+                // A large untrimmed unit may correctly fall back to a canonical flat
+                // instead of starting a curl. Its captured pair must still replay.
+                if let Some(captured_pair) = &captured_pair {
+                    specified_frame(&ctx, viewport, |ui, ctx| {
+                        app.draw_fs_display_unit_holdover(ui, ctx, ui.max_rect(), captured_pair);
+                        for (idx, before) in baseline.iter().enumerate() {
+                            let after = app
+                                .fullscreen_page_layout
+                                .page_by_idx(idx)
+                                .expect("captured pair replay submits both pages")
+                                .transform;
+                            same_frame_and_common_pixel(*before, after, ppp);
+                            close_physical_size(after, physical_size, ppp);
+                            let FullscreenFitInput::SpecifiedScale { basis, .. } = after.fit_input
+                            else {
+                                panic!("captured specified descriptor")
+                            };
+                            assert_eq!(basis.original_size, egui::vec2(8192.0, 6144.0));
+                        }
+                    });
+                }
+                continue;
+            }
+        }
+    }
+}
+
+#[test]
+fn display_basis_specified_partial_normal_resource_survives_thumbnail_eviction() {
+    specified_partial_survives_thumbnail_eviction(true);
+}
+
+#[test]
+fn display_basis_specified_partial_presentation_material_survives_thumbnail_eviction() {
+    specified_partial_survives_thumbnail_eviction(false);
+}
+
+#[test]
+fn display_basis_specified_full_spread_thumbnail_keeps_source_original_contract() {
+    let ctx = egui::Context::default();
+    let mut app = fixture();
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+    app.settings.fullscreen_fit_no_upscale = true;
+    app.settings.fullscreen_fit_no_downscale = true;
+    for idx in 0..2 {
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: metadata_texture(
+                &ctx,
+                format!("full-spread-thumb-{idx}"),
+                image_metadata([80, 60]),
+            ),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            rendered_at_px: 80,
+            source_coverage: SourceCoverage::FullSource,
+            source_dims: Some((20000, 15000)),
+            layout_dims: None,
+        };
+        app.record_page_dims_for_spread(idx, (20000, 15000));
+    }
+    for transform in draw_spread(&mut app, &ctx, egui::vec2(1200.0, 900.0)) {
+        let FullscreenFitInput::SpecifiedScale { basis, .. } = transform.fit_input else {
+            panic!("specified fit descriptor")
+        };
+        assert_eq!(basis.original_size, egui::vec2(20000.0, 15000.0));
+        close_physical_size(transform, [20000, 15000], 1.0);
+    }
+}

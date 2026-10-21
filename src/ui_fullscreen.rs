@@ -12764,10 +12764,10 @@ impl App {
             .map(|(width, height)| egui::vec2(width, height));
         let layout_size = self.fs_spread_page_layout_size(idx, &texture.clone().into());
         let post_filter = self.fullscreen_paint_post_filter(&texture);
-        let fit_input = self.fs_fit_input_for_resource(
+        let fit_input = self.fs_fit_input_for_payload(
             idx,
             self.effective_fullscreen_fit_mode(),
-            texture.source_texture(),
+            &texture.clone().into(),
         )?;
         let trace_key = self.perf_item_key(idx);
         let trace_load_seq = self
@@ -31602,51 +31602,59 @@ impl App {
         }
     }
 
+    /// A selected material keeps its own specified-scale basis after its producer
+    /// cache is evicted. Consumer-specific live-source policies are only consulted
+    /// when no material-owned basis exists.
+    fn fs_material_specified_fit_input(
+        &self,
+        idx: usize,
+        mode: FullscreenFitMode,
+        resource: &FullscreenPaintPayload,
+    ) -> Option<FullscreenFitInput> {
+        if mode != FullscreenFitMode::SpecifiedScale {
+            return None;
+        }
+        let basis = if resource.source_coverage().is_partial()
+            && self.fs_uses_raster_original_basis(idx)
+        {
+            let original = resource.original_display_dimensions().as_vec2();
+            let (w, h) = resource.source_coverage().coordinate_dims()?.as_tuple();
+            FullscreenFitBasis::new(egui::vec2(w as f32, h as f32), original)?
+        } else if matches!(resource, FullscreenPaintPayload::PresentationMaterial(_)) {
+            match self.page_turn_held_transform(idx)?.fit_input {
+                FullscreenFitInput::SpecifiedScale { basis, .. }
+                | FullscreenFitInput::CanonicalPage { basis } => basis,
+                FullscreenFitInput::Legacy(_) | FullscreenFitInput::Raster { .. } => return None,
+            }
+        } else {
+            return None;
+        };
+        // Retain A/O, but resolve the current policy. Frozen replay supplies its
+        // complete captured descriptor directly instead of entering this resolver.
+        Some(FullscreenFitInput::from_mode(
+            mode,
+            self.settings.fullscreen_specified_scale,
+            basis,
+            self.settings.fullscreen_specified_scale_max_tenths,
+        ))
+    }
+
     fn fs_fit_input_for_payload(
         &self,
         idx: usize,
         mode: FullscreenFitMode,
         resource: &FullscreenPaintPayload,
     ) -> Option<FullscreenFitInput> {
-        if mode == FullscreenFitMode::SpecifiedScale
-            && resource.source_coverage().is_partial()
-            && self.fs_uses_raster_original_basis(idx)
-        {
-            let original = resource.original_display_dimensions().as_vec2();
-            return Some(FullscreenFitInput::from_mode(
-                mode,
-                self.settings.fullscreen_specified_scale,
-                FullscreenFitBasis::new(
-                    self.fs_page_layout_source_size(idx).unwrap_or(original),
-                    original,
-                )?,
-                self.settings.fullscreen_specified_scale_max_tenths,
-            ));
-        }
-        let input = match resource {
-            FullscreenPaintPayload::NormalResource(resource) => {
-                self.fs_fit_input_for_resource(idx, mode, resource.source_texture())
-            }
-            FullscreenPaintPayload::PresentationMaterial(_) => {
-                self.fs_fit_input_for_idx(idx, mode).or_else(|| {
-                    // Only the source basis is frozen. Current fit policy must still reach
-                    // binding so a user view change cannot reuse an incompatible ROI.
-                    let basis = match self.page_turn_held_transform(idx)?.fit_input {
-                        FullscreenFitInput::SpecifiedScale { basis, .. }
-                        | FullscreenFitInput::CanonicalPage { basis } => basis,
-                        FullscreenFitInput::Legacy(_) | FullscreenFitInput::Raster { .. } => {
-                            return None;
-                        }
-                    };
-                    Some(FullscreenFitInput::from_mode(
-                        mode,
-                        self.settings.fullscreen_specified_scale,
-                        basis,
-                        self.settings.fullscreen_specified_scale_max_tenths,
-                    ))
-                })
-            }
-        }?;
+        let input = self
+            .fs_material_specified_fit_input(idx, mode, resource)
+            .or_else(|| match resource {
+                FullscreenPaintPayload::NormalResource(resource) => {
+                    self.fs_fit_input_for_source_texture(idx, mode, resource.source_texture())
+                }
+                FullscreenPaintPayload::PresentationMaterial(_) => {
+                    self.fs_fit_input_for_idx(idx, mode)
+                }
+            })?;
         Some(
             if self.fs_material_uses_raster_original_basis(
                 idx,
@@ -31661,6 +31669,21 @@ impl App {
     }
 
     fn fs_fit_input_for_resource(
+        &self,
+        idx: usize,
+        mode: FullscreenFitMode,
+        handle: &egui::TextureHandle,
+    ) -> Option<FullscreenFitInput> {
+        self.fs_fit_input_for_payload(
+            idx,
+            mode,
+            &self
+                .fullscreen_paint_resource_for_texture(idx, handle.clone())
+                .into(),
+        )
+    }
+
+    fn fs_fit_input_for_source_texture(
         &self,
         idx: usize,
         mode: FullscreenFitMode,
@@ -31695,20 +31718,10 @@ impl App {
             _ => false,
         };
         let thumbnail_source = matches!(self.thumbnails.get(idx), Some(ThumbnailState::Loaded { tex, .. }) if tex.id() == handle.id());
-        let partial_raster = self.fs_uses_raster_original_basis(idx)
-            && self
-                .fs_source_coverage_for_texture(idx, handle.id())
-                .is_partial();
-        let original = if preserve_source && !partial_raster {
+        // Partial raster materials have already resolved A/O from the payload;
+        // this is the existing selected-source policy for ordinary full inputs.
+        let original = if preserve_source {
             self.fs_page_coordinate_source_size(idx)?
-        } else if (thumbnail_source || self.is_passthrough_rendition_texture(handle))
-            && self
-                .fs_source_coverage_for_texture(idx, handle.id())
-                .is_partial()
-        {
-            self.fullscreen_paint_resource_for_texture(idx, handle.clone())
-                .original_display_dimensions()
-                .as_vec2()
         } else if resident_source || thumbnail_source {
             handle.size_vec2()
         } else {
@@ -31827,7 +31840,8 @@ impl App {
         resource: &FullscreenPaintPayload,
     ) -> Option<FullscreenFitInput> {
         let input = if mode == FullscreenFitMode::SpecifiedScale {
-            self.fs_fit_input_for_idx(idx, mode)
+            self.fs_material_specified_fit_input(idx, mode, resource)
+                .or_else(|| self.fs_fit_input_for_idx(idx, mode))
         } else {
             self.fs_fit_input_for_payload(idx, mode, resource)
         }?;
@@ -49746,12 +49760,34 @@ impl App {
             ),
         );
         let (left_size, right_size) = if fit_mode == FullscreenFitMode::SpecifiedScale {
-            let left_basis = display_override
-                .map(|(left, _)| left.fit_input)
-                .or_else(|| self.fs_fit_input_for_idx(left_idx, fit_mode));
-            let right_basis = display_override
-                .map(|(_, right)| right.fit_input)
-                .or_else(|| self.fs_fit_input_for_idx(right_idx, fit_mode));
+            // The unit and each page use the same selected-material resolver.
+            // In particular a retained partial material must not rediscover O
+            // through the thumbnail cache after that cache has been evicted.
+            let selected_fit =
+                |idx,
+                 captured: Option<&FsDisplayUnitHoldoverPage>,
+                 resource: Option<&FullscreenPaintPayload>| {
+                    captured.map(|page| page.fit_input).or_else(|| {
+                        match resource.cloned().or_else(|| {
+                            self.fs_thumbnail_resource_for_display(idx)
+                                .ok()
+                                .map(Into::into)
+                        }) {
+                            Some(resource) => self.fs_spread_fit_input(idx, fit_mode, &resource),
+                            None => self.fs_fit_input_for_idx(idx, fit_mode),
+                        }
+                    })
+                };
+            let left_basis = selected_fit(
+                left_idx,
+                display_override.map(|(left, _)| left),
+                left_display_tex.as_ref(),
+            );
+            let right_basis = selected_fit(
+                right_idx,
+                display_override.map(|(_, right)| right),
+                right_display_tex.as_ref(),
+            );
             (
                 left_basis.map(|input| {
                     rotated_display_size(fit_input_layout_size(input, egui::Vec2::ZERO), left_rot)

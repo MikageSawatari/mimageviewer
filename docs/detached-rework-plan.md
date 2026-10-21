@@ -1462,6 +1462,11 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   GPU clamp後の普通素材を正準座標の大きさへ戻さず、部分代役と本画像で同じ100%になる。
   AI完成時の実出力texture基準、RAW／PDF／連結読みの既存規則は維持する。
 - resourceとfitの値の保持を直す範囲であり、detached述語・viewport lifecycleは変更しない。
+- 指定倍率の再レビュー追補: 単ページsnapshot／display-unit captureと見開きの指定fitは、
+  同じ素材所有A/O resolverを通す。部分素材はcoverageの正準寸法とcrop前raster、保持presentationは
+  捕捉済みdescriptorを優先し、thumbnail退去後にlive idxの寸法へ戻さない。
+  frozen replayの指定値・倍率制限は既存の捕捉値を維持する。既存resourceの由来・fit保持を
+  完成させる構造修正であり、述語・viewport生成・context lifecycleへの変更はない。
 
 ### 2026-10-21 §1.165 独立レビュー追補
 
