@@ -1455,6 +1455,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-22 §1.165 100%表示基準の分離
+
+- 正準座標寸法と100%表示寸法を別型にし、既存fit descriptorに後者を保持する。
+  passive snapshot／保持unit／white companion／再描画も捕捉時のdescriptorを使うため、
+  GPU clamp後の普通素材を正準座標の大きさへ戻さず、部分代役と本画像で同じ100%になる。
+  AI完成時の実出力texture基準、RAW／PDF／連結読みの既存規則は維持する。
+- resourceとfitの値の保持を直す範囲であり、detached述語・viewport lifecycleは変更しない。
+
 ### 2026-10-21 §1.165 独立レビュー追補
 
 - P1 の幾何修正に伴い、passive snapshot の連結／単ページ／見開き prepare は通常描画と同じ

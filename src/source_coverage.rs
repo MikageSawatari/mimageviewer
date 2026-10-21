@@ -4,7 +4,7 @@
 //! dimensions are deliberately absent: canonical coordinates and the producer raster have distinct
 //! sizes, and only the latter determines the exact floor/ceil crop boundaries.
 
-use crate::page_dims::CanonicalPageDimensions;
+use crate::page_dims::{CanonicalPageDimensions, DisplayOriginalDimensions};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +118,19 @@ impl SourceCoverage {
             _ => None,
         }
     }
+
+    /// The producer's uncropped raster, independent of canonical coordinates.
+    /// Ordinary Image/ZIP previews are captured after GPU clamp and before
+    /// final AI. AI completion retains its existing actual-texture 100% policy.
+    pub fn uncropped_raster_dimensions(self) -> Option<DisplayOriginalDimensions> {
+        match self {
+            Self::Known(geometry) if geometry.is_valid() => Some(DisplayOriginalDimensions::new(
+                geometry.raster_dims.0,
+                geometry.raster_dims.1,
+            )),
+            _ => None,
+        }
+    }
 }
 
 fn serialize_coordinate_dims<S: serde::Serializer>(
@@ -164,6 +177,10 @@ mod tests {
         assert_eq!(coverage.resolve_for_display(false), Ok(coverage));
         assert_eq!(coverage.coordinate_dims().unwrap().as_tuple(), (6000, 4000));
         assert_eq!(
+            coverage.uncropped_raster_dimensions().unwrap().as_tuple(),
+            (1200, 800)
+        );
+        assert_eq!(
             coverage.source_uv_rect(),
             Some(egui::Rect::from_min_max(
                 egui::pos2(100.0 / 1200.0, 50.0 / 800.0),
@@ -189,5 +206,10 @@ mod tests {
         assert!(SourceCoverage::Known(partial).is_partial());
         assert!(!SourceCoverage::FullSource.is_partial());
         assert!(!SourceCoverage::Unknown.is_partial());
+        assert_eq!(
+            SourceCoverage::FullSource.uncropped_raster_dimensions(),
+            None
+        );
+        assert_eq!(SourceCoverage::Unknown.uncropped_raster_dimensions(), None);
     }
 }

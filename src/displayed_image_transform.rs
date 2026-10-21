@@ -293,6 +293,17 @@ impl DisplayedImageGeometry {
             }
             FullscreenFitInput::Legacy(FullscreenFitMode::SpecifiedScale) => return None,
             FullscreenFitInput::Legacy(_) => rotated_size(input.texture_size, input.rotation),
+            FullscreenFitInput::Raster {
+                mode: FullscreenFitMode::SpecifiedScale,
+                ..
+            } => return None,
+            FullscreenFitInput::Raster { original, .. } => {
+                let original = original.as_vec2();
+                if !size_is_valid(original) {
+                    return None;
+                }
+                rotated_size(original, input.rotation)
+            }
         };
         let fit_bbox = effective_bbox(input.free_rotation_rad, input.content_bbox)
             .map(|bbox| rotate_bbox_to_display(bbox, input.rotation));
@@ -410,7 +421,9 @@ impl DisplayedImageGeometry {
                 }
                 resolved.scale
             }
-            FullscreenFitInput::Legacy(_) => input.fit_scale_limits.apply(fit_scale),
+            FullscreenFitInput::Legacy(_) | FullscreenFitInput::Raster { .. } => {
+                input.fit_scale_limits.apply(fit_scale)
+            }
             FullscreenFitInput::CanonicalPage { .. } => fit_scale,
         };
         let (total_scale, base_center) = match input.placement.zoom_pan() {
@@ -440,7 +453,9 @@ impl DisplayedImageGeometry {
         let full_image_rect = egui::Rect::from_center_size(center, display_size * total_scale);
         if matches!(
             input.fit_mode,
-            FullscreenFitInput::SpecifiedScale { .. } | FullscreenFitInput::CanonicalPage { .. }
+            FullscreenFitInput::SpecifiedScale { .. }
+                | FullscreenFitInput::CanonicalPage { .. }
+                | FullscreenFitInput::Raster { .. }
         ) {
             Self::from_layout_rect(input, full_image_rect)
         } else {
@@ -1399,6 +1414,7 @@ impl ResolvedZTransform {
         let display_size = rotated_size(
             match input.image.fit_mode {
                 FullscreenFitInput::CanonicalPage { basis } => basis.normalized_original_size(),
+                FullscreenFitInput::Raster { original, .. } => original.as_vec2(),
                 _ => input.image.texture_size,
             },
             input.image.rotation,
@@ -2147,6 +2163,62 @@ mod tests {
         FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS, SpecifiedScaleAxis,
         SpecifiedScaleAxisSetting,
     };
+
+    #[test]
+    fn raster_fit_retains_gpu_original_basis_separate_from_canonical_coordinates_and_sampler() {
+        let original = crate::page_dims::DisplayOriginalDimensions::new(8192, 6144);
+        for mode in [
+            FullscreenFitMode::Page,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+            FullscreenFitMode::Original,
+        ] {
+            for ppp in [1.25, 1.375, 1.5] {
+                for (no_upscale, no_downscale) in [(false, false), (true, false), (false, true)] {
+                    for rotation in [
+                        Rotation::None,
+                        Rotation::Cw90,
+                        Rotation::Cw180,
+                        Rotation::Cw270,
+                    ] {
+                        let mut value = input(mode, rotation, None);
+                        value.source_size = egui::vec2(20000.0, 15000.0);
+                        value.texture_size = original.as_vec2();
+                        value.pixels_per_point = ppp;
+                        value.fit_scale_limits = FullscreenFitScaleLimits {
+                            no_upscale,
+                            no_downscale,
+                            pixels_per_point: ppp,
+                        };
+                        let expected = DisplayedImageTransform::resolve(value).unwrap();
+                        value.texture_size = egui::vec2(4096.0, 3072.0);
+                        value.fit_mode = value.fit_mode.with_original_display_dimensions(original);
+                        let held = DisplayedImageTransform::resolve(value).unwrap();
+                        rect_close(held.full_image_rect, expected.full_image_rect);
+                        rect_close(held.paint_rect, expected.paint_rect);
+                        assert_eq!(held.source_size, egui::vec2(20000.0, 15000.0));
+                        assert_eq!(held.texture_size, egui::vec2(4096.0, 3072.0));
+                        assert_eq!(held.fit_input.original_display_dimensions(), Some(original));
+                        pos_close(
+                            held.source_to_screen(egui::pos2(12345.0, 6789.0)),
+                            expected.source_to_screen(egui::pos2(12345.0, 6789.0)),
+                        );
+                        if mode == FullscreenFitMode::Original && !no_upscale && !no_downscale {
+                            let size = rotated_size(original.as_vec2(), rotation);
+                            close(
+                                held.full_image_rect.width() * ppp,
+                                physical_pixel_extent(size.x, 1.35) as f32,
+                            );
+                            close(
+                                held.full_image_rect.height() * ppp,
+                                physical_pixel_extent(size.y, 1.35) as f32,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn coverage_quad_retains_full_fit_and_source_mapping_for_every_display_mode() {

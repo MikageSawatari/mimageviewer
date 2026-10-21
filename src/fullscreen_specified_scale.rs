@@ -2,6 +2,7 @@
 use eframe::egui;
 
 use crate::displayed_image_transform::{FullscreenFitScaleLimits, physical_pixel_scale};
+use crate::page_dims::DisplayOriginalDimensions;
 use crate::pdf_loader::{PDF_ORIGINAL_RENDER_MIN_LONG_PX, PdfPageContentType};
 use crate::settings::{
     FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS, FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
@@ -51,6 +52,12 @@ impl FullscreenFitBasis {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FullscreenFitInput {
     Legacy(FullscreenFitMode),
+    /// Ordinary image/ZIP display raster's 100% basis, retained with captures.
+    /// Canonical annotation coordinates and the current sampler stay separate.
+    Raster {
+        mode: FullscreenFitMode,
+        original: DisplayOriginalDimensions,
+    },
     /// Single-page Z uses unrestricted Page fit, retaining canonical aspect.
     CanonicalPage {
         basis: FullscreenFitBasis,
@@ -65,6 +72,36 @@ pub(crate) enum FullscreenFitInput {
 impl FullscreenFitInput {
     pub(crate) const fn legacy(mode: FullscreenFitMode) -> Self {
         Self::Legacy(mode)
+    }
+
+    pub(crate) const fn with_original_display_dimensions(
+        self,
+        original: DisplayOriginalDimensions,
+    ) -> Self {
+        match self {
+            Self::Legacy(
+                mode @ (FullscreenFitMode::Page
+                | FullscreenFitMode::Width
+                | FullscreenFitMode::Height
+                | FullscreenFitMode::Original),
+            )
+            | Self::Raster {
+                mode:
+                    mode @ (FullscreenFitMode::Page
+                    | FullscreenFitMode::Width
+                    | FullscreenFitMode::Height
+                    | FullscreenFitMode::Original),
+                ..
+            } => Self::Raster { mode, original },
+            _ => self,
+        }
+    }
+
+    pub(crate) const fn original_display_dimensions(self) -> Option<DisplayOriginalDimensions> {
+        match self {
+            Self::Raster { original, .. } => Some(original),
+            _ => None,
+        }
     }
 
     pub(crate) const fn from_mode(
@@ -89,12 +126,16 @@ impl FullscreenFitInput {
                 Self::CanonicalPage { basis }
             }
             Self::Legacy(_) => Self::Legacy(FullscreenFitMode::Page),
+            Self::Raster { original, .. } => Self::Raster {
+                mode: FullscreenFitMode::Page,
+                original,
+            },
         }
     }
 
     pub(crate) const fn mode(self) -> FullscreenFitMode {
         match self {
-            Self::Legacy(mode) => mode,
+            Self::Legacy(mode) | Self::Raster { mode, .. } => mode,
             Self::CanonicalPage { .. } => FullscreenFitMode::Page,
             Self::SpecifiedScale { .. } => FullscreenFitMode::SpecifiedScale,
         }
@@ -190,6 +231,54 @@ mod tests {
     use crate::settings::{
         FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS, SpecifiedScaleAxisSetting,
     };
+
+    #[test]
+    fn raster_fit_keeps_typed_original_basis_through_capture_policy_and_single_page_z() {
+        let original = DisplayOriginalDimensions::new(8192, 6144);
+        for mode in [
+            FullscreenFitMode::Page,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+            FullscreenFitMode::Original,
+        ] {
+            let fit = FullscreenFitInput::legacy(mode).with_original_display_dimensions(original);
+            assert_eq!(fit.mode(), mode);
+            assert_eq!(fit.original_display_dimensions(), Some(original));
+            assert_eq!(
+                fit.for_single_page_z(),
+                FullscreenFitInput::Raster {
+                    mode: FullscreenFitMode::Page,
+                    original
+                }
+            );
+            assert_eq!(
+                fit.for_single_page_z().for_single_page_z(),
+                fit.for_single_page_z()
+            );
+            let replacement = DisplayOriginalDimensions::new(4000, 3000);
+            assert_eq!(
+                fit.with_original_display_dimensions(replacement)
+                    .original_display_dimensions(),
+                Some(replacement)
+            );
+        }
+        let basis =
+            FullscreenFitBasis::new(egui::vec2(600000.0, 800000.0), egui::vec2(3072.0, 4096.0))
+                .unwrap();
+        for fit in [
+            FullscreenFitInput::SpecifiedScale {
+                size: FullscreenSpecifiedScale::default(),
+                basis,
+                max_tenths: 127,
+            },
+            FullscreenFitInput::CanonicalPage { basis },
+            FullscreenFitInput::legacy(FullscreenFitMode::SpecifiedScale),
+            FullscreenFitInput::legacy(FullscreenFitMode::MarginFit),
+        ] {
+            assert_eq!(fit.with_original_display_dimensions(original), fit);
+            assert_eq!(fit.original_display_dimensions(), None);
+        }
+    }
 
     fn close(actual: f32, expected: f32) {
         assert!(

@@ -468,14 +468,19 @@ impl App {
             // selection is invented when the ordinary source has not arrived.
             resource.source_generation().ok_or(Missing::Material)?;
             let fit = if occurrences.len() == 2 {
-                self.fs_fit_input_for_idx(idx, mode)
+                self.fs_spread_fit_input(idx, mode, &resource.clone().into())
             } else {
                 self.fs_fit_input_for_resource(idx, mode, resource.source_texture())
             }
             .ok_or(Missing::FitBasis)?;
+            let layout = if occurrences.len() == 2 {
+                Some(self.fs_spread_page_layout_size(idx, &resource.clone().into()))
+            } else {
+                self.fs_page_layout_source_size(idx)
+            };
             resources.push(resource);
             inputs.push((rotation, fit));
-            layouts.push(self.fs_page_layout_source_size(idx));
+            layouts.push(layout);
         }
         let legacy_auto = matches!(
             self.settings.fullscreen_fit_mode,

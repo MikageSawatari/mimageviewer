@@ -17,6 +17,7 @@ use crate::{
     displayed_image_transform::{
         VisibleRegionRequest, physical_pixel_extent, physical_scale_is_near_integer,
     },
+    page_dims::DisplayOriginalDimensions,
     source_coverage::SourceCoverage,
 };
 use crate::{
@@ -155,13 +156,16 @@ where
 }
 
 /// A partial preview's rounded sampler dimensions carry sampling density, not
-/// the page aspect. Its canonical dimensions own the full-image geometry.
-fn full_source_geometry_size(size: egui::Vec2, coverage: SourceCoverage) -> egui::Vec2 {
+/// the 100% display basis. Preserve the producer's uncropped normal raster;
+/// canonical annotation coordinates may be larger than the GPU-clamped raster.
+fn original_display_dimensions(
+    size: [usize; 2],
+    coverage: SourceCoverage,
+) -> DisplayOriginalDimensions {
     if coverage.is_partial() {
-        let (width, height) = coverage.coordinate_dims().unwrap().as_tuple();
-        egui::vec2(width as f32, height as f32)
+        coverage.uncropped_raster_dimensions().unwrap()
     } else {
-        size
+        DisplayOriginalDimensions::new(size[0] as u32, size[1] as u32)
     }
 }
 
@@ -366,10 +370,15 @@ impl FullscreenPaintResource {
         self
     }
 
-    /// Full-image geometry basis, independent of a partial sampler's rounded
-    /// raster dimensions. PDF layout dimensions remain a separate input.
+    /// Full-image display basis, independent of a partial sampler's rounded
+    /// dimensions and canonical annotation coordinates. PDF layout and RAW
+    /// display policies remain separate inputs at their existing owners.
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
     pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
-        full_source_geometry_size(self.size_vec2(), self.source_coverage())
+        self.original_display_dimensions().as_vec2()
     }
 
     pub(crate) fn anime_upscale_source_dimensions(
@@ -762,8 +771,12 @@ impl FullscreenPresentationResource {
         self.coverage
     }
 
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
     pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
-        full_source_geometry_size(self.size_vec2(), self.coverage)
+        self.original_display_dimensions().as_vec2()
     }
 
     pub(crate) fn anime_upscale_source_dimensions(
@@ -1002,8 +1015,12 @@ impl FullscreenPaintPayload {
         }
     }
 
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
     pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
-        full_source_geometry_size(self.size_vec2(), self.source_coverage())
+        self.original_display_dimensions().as_vec2()
     }
 
     pub(crate) fn anime_upscale_source_dimensions(
@@ -1553,7 +1570,9 @@ fn covered_sampler_request(
     }
     let source_extent = egui::vec2(source_size[0] as f32, source_size[1] as f32);
     let material_extent =
-        full_source_geometry_size(source_extent, coverage) * coverage.source_uv_rect()?.size();
+        original_display_dimensions([source_size[0] as usize, source_size[1] as usize], coverage)
+            .as_vec2()
+            * coverage.source_uv_rect()?.size();
     // Sampling density can differ on each axis after integer thumbnail resize.
     // It affects output texels/filter choice, never fit, contain or page aspect.
     let sampler_scale = material_extent / source_extent * logical_scale;
@@ -3646,7 +3665,11 @@ mod tests {
             FullscreenPaintSourceGeneration { items: 4, input: 7 },
         )
         .with_source_coverage(coverage);
-        assert!((resource.full_source_size_vec2() - egui::vec2(1200.0, 800.0)).length() < 0.001);
+        assert_eq!(
+            resource.original_display_dimensions().as_tuple(),
+            (600, 400)
+        );
+        assert!((resource.full_source_size_vec2() - egui::vec2(600.0, 400.0)).length() < 0.001);
         let native_roi = egui::Rect::from_min_max(egui::pos2(0.125, 0.25), egui::pos2(0.875, 0.75));
         let native = test_native_resource_with_region(resource.clone(), [120, 60], native_roi);
         for resource in [
@@ -3659,11 +3682,19 @@ mod tests {
             let captured = resource.capture_presentation(&ctx);
             assert_eq!(captured.source_coverage(), coverage);
             assert_eq!(
+                captured.original_display_dimensions(),
+                resource.original_display_dimensions()
+            );
+            assert_eq!(
                 captured.full_source_size_vec2(),
                 resource.full_source_size_vec2()
             );
             let payload = FullscreenPaintPayload::PresentationMaterial(captured);
             assert_eq!(payload.source_coverage(), coverage);
+            assert_eq!(
+                payload.original_display_dimensions(),
+                resource.original_display_dimensions()
+            );
             assert_eq!(
                 payload.capture_presentation(&ctx).source_coverage(),
                 coverage
@@ -3701,6 +3732,107 @@ mod tests {
             target_size: [100, 100],
         };
         assert!(sampler_visible_region(coverage, Some(outside)).is_none());
+    }
+
+    #[test]
+    fn source_coverage_original_basis_uses_uncropped_gpu_raster_and_keeps_coordinate_units_separate()
+     {
+        let ctx = egui::Context::default();
+        let coordinate_dims = crate::page_dims::CanonicalPageDimensions::new(20000, 15000);
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                coordinate_dims,
+                (8192, 6144),
+                (3840, 0, 256, 6144),
+            )
+            .unwrap(),
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            metadata_only_texture(&ctx, [11, 256], egui::TextureOptions::LINEAR),
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(coverage.coordinate_dims(), Some(coordinate_dims));
+        assert_eq!(
+            resource.original_display_dimensions(),
+            DisplayOriginalDimensions::new(8192, 6144)
+        );
+        assert_eq!(resource.full_source_size_vec2(), egui::vec2(8192.0, 6144.0));
+        let raw = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [8192, 6144],
+            egui::TextureOptions::LINEAR,
+        ));
+        assert_eq!(
+            resource.original_display_dimensions(),
+            raw.original_display_dimensions()
+        );
+        // Native density must use the same uncropped raster basis: the source
+        // coordinate dimensions would incorrectly request an upscale here.
+        let key = resource_lanczos_key(
+            &resource,
+            0.032,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [10, 245]);
+        let native = test_native_resource(resource.clone(), [10, 245]);
+        assert_eq!(
+            native.original_resampleable().original_display_dimensions(),
+            resource.original_display_dimensions()
+        );
+        assert_eq!(
+            native
+                .capture_presentation(&ctx)
+                .original_display_dimensions(),
+            resource.original_display_dimensions()
+        );
+    }
+
+    #[test]
+    fn source_coverage_full_source_and_uncropped_known_keep_actual_texture_original_basis_after_ai()
+    {
+        let ctx = egui::Context::default();
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1000, 750),
+                (1000, 750),
+                (0, 0, 1000, 750),
+            )
+            .unwrap(),
+        );
+        let ordinary = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [128, 96],
+            egui::TextureOptions::LINEAR,
+        ))
+        .with_source_coverage(coverage);
+        assert_eq!(ordinary.original_display_dimensions().as_tuple(), (128, 96));
+        assert_eq!(ordinary.full_source_size_vec2(), egui::vec2(128.0, 96.0));
+        let after_ai = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [4000, 3000],
+            egui::TextureOptions::LINEAR,
+        ));
+        assert_eq!(
+            after_ai.original_display_dimensions().as_tuple(),
+            (4000, 3000)
+        );
+        assert_eq!(
+            after_ai
+                .capture_presentation(&ctx)
+                .original_display_dimensions(),
+            after_ai.original_display_dimensions()
+        );
     }
 
     #[test]

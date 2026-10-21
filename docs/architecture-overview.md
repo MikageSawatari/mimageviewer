@@ -265,11 +265,13 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 
 §1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）は crop 済みの編集 preview を
 部分素材として扱う。収録範囲は生成時の実整数 pixel bounds から求めて preview と同時保存し、
-現在 crop から復元しない。一覧は crop 後の比率を使い、部分素材のページ構成・fit・座標基準には
+現在 crop から復元しない。一覧は crop 後の比率を使い、部分素材のページ構成・座標基準には
 crop 前の正規寸法を供給する。正規座標の元寸法、実 raster 寸法、PDF page-box の layout 寸法は別物である。
 PDF の既知 page-box cache 値も preview の独立 nullable layout 列へ同時保存し、preview hit から
 復元する。旧行／通常画像は `None`。layout のための追加 PDF IPC や preview の待機を加えない。
-部分素材の全体幾何には生成時の正規寸法を使い、整数丸め後の sampler 密度を逆流させない。
+正準座標の `CanonicalPageDimensions` と100%表示の `DisplayOriginalDimensions` を分ける。
+通常完成素材はGPU clamp後／AI後の実texture、部分代役は生成時のcrop前rasterを100%基準にし、
+`FullscreenFitInput::Raster` でcapture／replayへ保持する。crop samplerの丸めは幾何へ逆流させない。
 見開きの左右構成と指定方式の基準は共通のレイアウト寸法境界から選び、片側だけ crop の場合も
 通常 thumbnail の texel 数を外側の構成へ使わない。全面素材の単ページの従来 sizing は保ち、
 Unknown の旧行は一覧で保持する一方、現在 crop ありの

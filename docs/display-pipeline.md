@@ -717,8 +717,11 @@ letterbox canvas は別の DComp owner が現在の余白色を描き、音声�
 #### 2.1.1 crop 済み代役の全体寸法と収録範囲（§1.165 B1、実装・自動検証済み・独立完成レビュー／実機未確認）
 
 一覧のアスペクト比は従来どおり crop 後の `source_dims` を使う。部分編集 preview のページ構成
-（見開き・横長分割）、canonical 枠、fit／contain、Original／指定方式の基準には crop 前の
-正規寸法を供給する。`SourceCoverage::is_partial()` は実画素境界から派生させ、収録範囲が
+（見開き・横長分割）と注釈座標には crop 前の正準座標寸法を供給する。
+100%表示の基準は独立した `DisplayOriginalDimensions` で表す。通常完成素材は選択中の実
+texture 寸法（GPU clamp 後／AI 適用後）、部分代役は生成時の crop 前 `raster_dims` を使う。
+正準20000×15000／GPU raster8192×6144の場合も、代役と本画像の100%は8192×6144で一致する。
+`SourceCoverage::is_partial()` は実画素境界から派生させ、収録範囲が
 全体の素材（新生成 no-crop Known を含む）の単ページの従来 Original／thumbnail sizing は維持する。
 `poll_thumbnails` の寸法記録と Loaded を直接参照する fallback の双方でこの区別を保ち、
 texture 退去後も `PageDimsCache` に crop 後寸法を再登録しない。PDF page-box、RAW の許可 gate、
@@ -730,12 +733,18 @@ processed の縦横比変更、指定方式の既存 A/O 基準は、それぞ�
 `content_bbox`／左右分割は表示要求であり、coverage は自由回転時も失われない素材の由来である。
 単ページ・見開き左右・連結読みは全画像 transform を先に解き、その全体枠へ部分素材だけを配置する。
 見開き gap や連結読みの extent を、crop 後 quad の外接矩形で縮めない。
-見開き全体の左右寸法と指定方式の基準は、両側とも `fs_page_layout_source_size`／
-`fs_fit_input_for_idx` の供給境界で選ぶ。部分素材側の正規寸法と通常 thumbnail 側の実 texel
-寸法を混ぜず、片側だけ到着した場合や保持 unit の再描画でも同じ構成を使う。
+見開き全体の左右寸法と100%基準は `fs_spread_page_layout_size`／`fs_spread_fit_input` の
+供給境界で選ぶ。通常完成素材は7474e5cf1の実texture基準、部分代役は切り出し前raster、
+通常thumbnailはページ全体を代表するGPU raster寸法で構成する。後者の8192 clamp計算は
+実producerの `gpu_raster_dimensions` と共有し、UIで元画像を読み直さない。
+指定方式のAI前A/O、RAWのdeveloped寸法、PDF page-box、連結読みのsource基準は維持する。
+通過renditionも部分素材なら同じ切り出し前rasterを使い、全面renditionの従来source基準は維持する。
 各ページ内の通常素材の contain／物理 pixel snapping は既存の規則を維持する。
+正準寸法とGPU clamp後寸法が異なる場合も、注釈・source座標を100%表示寸法で上書きしない。
 
-部分素材の `full_source_size_vec2` は生成時 `coordinate_dims` を幾何の基準として返す。
+部分素材の `full_source_size_vec2` は型付き100%基準を返し、`coordinate_dims` と混ぜない。
+`FullscreenFitInput::Raster` がOriginal／Page／Width／Heightと倍率制限の100%基準を
+capture／replay／Zへ保持する。AI完成後は従来どおり実出力textureの100%へ再配置する。
 丸め後の texture 寸法を coverage の幅・高さで個別に割って全体寸法を逆算しない。
 native resampler は別に保持する実 texel 寸法と coverage から軸別の sampling 密度を求め、
 共有 geometry が返す交差範囲と物理出力寸法を使う。細い crop の縮小丸めも全画像の aspect や
