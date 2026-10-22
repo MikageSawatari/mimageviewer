@@ -5913,21 +5913,34 @@ pub(crate) struct LocalAdjustBrushDeferredRender {
     pub(crate) last_input_at: std::time::Instant,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+pub(crate) struct ExportCropDragSnapshot {
+    pub(crate) owner: PageEditOwner,
+    pub(crate) press_frame: u64,
+    pub(crate) idx: usize,
+    pub(crate) image_size: [usize; 2],
+    pub(crate) settings: Option<crate::export_crop::CropSettings>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ExportCropDrag {
     pub(crate) handle: crate::export_crop::CropHandle,
     pub(crate) base: crate::export_crop::CropRect,
+    pub(crate) before: ExportCropDragSnapshot,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct SnsSplitDrag {
     pub(crate) handle: crate::export_crop::CropHandle,
     pub(crate) base: crate::sns_split::SnsSplitLayout,
+    pub(crate) owner: PageEditOwner,
+    pub(crate) press_frame: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ExportCropCreateDrag {
     pub(crate) start: [f32; 2],
+    pub(crate) before: ExportCropDragSnapshot,
 }
 
 fn run_local_adjust_render(
@@ -8929,7 +8942,7 @@ pub(crate) fn animation_expansion_progress_visible(
 /// Identity belongs to the same owner as cancellation and result reception.
 /// A Critical request covers Normal demand; the reverse requires one replacement.
 #[derive(Debug, PartialEq, Eq)]
-struct PdfRerenderIdentity {
+pub struct PdfRerenderIdentity {
     source: String,
     target_px: u32,
     priority: bool,
@@ -42041,11 +42054,10 @@ impl App {
         // **文書を捨てる前に確定する。**メモリにしか無い編集はここで消える。
         self.fold_local_adjust_edit_state();
         self.export_crop_mode = false;
-        self.export_crop_drag = None;
-        self.export_crop_create_drag = None;
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.export_crop_spread_ctx = None;
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.sns_split = None;
-        self.sns_split_drag = None;
         self.sns_split_spread_ctx = None;
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
@@ -42816,6 +42828,8 @@ impl App {
 
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+            self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
             // Retire this context's old request namespace, including unadopted images.
             // Old notifications must not reserve indices in the successor generation.
             self.requested.clear();
@@ -42932,6 +42946,8 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         refresh_container_metadata: bool,
     ) {
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         debug_assert_eq!(items.len(), image_metas.len());
         self.retire_bookmark_browser_build_for_current_context();
         if !self.navigation_scope.is_detached_physical() {
@@ -45030,11 +45046,10 @@ impl App {
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches();
         self.export_crop_mode = false;
-        self.export_crop_drag = None;
-        self.export_crop_create_drag = None;
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.export_crop_spread_ctx = None;
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.sns_split = None;
-        self.sns_split_drag = None;
         self.sns_split_spread_ctx = None;
         self.cancel_all_local_adjust_pending();
         self.local_adjust_lut_pending = None;
@@ -45131,6 +45146,8 @@ impl App {
     /// regular open は `ViewerContextId`、残る 3 種は legacy owner=None が mounted 所有を表す
     /// (review-v2.3.0 追補3: 角度A-1)。
     pub(crate) fn clear_page_edit_state(&mut self) {
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.page_edit_reconcile_pending = None;
         self.page_edit_snapshot = None;
         self.adjustment_page_params.clear();
@@ -45162,6 +45179,8 @@ impl App {
         &mut self,
         prepared: page_edit_snapshot::StablePageEditProjection,
     ) {
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.page_edit_reconcile_pending = None;
         let page_edit_snapshot::StablePageEditProjection {
             snapshot,
@@ -45967,6 +45986,8 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.remove_smart_folder_rating_masks(sorted_desc_idxs);
         let previous_items_generation = self.items_generation;
         let cursor_removed = self
@@ -77858,6 +77879,9 @@ impl App {
     }
 
     fn request_pdf_rerender_at_target(&mut self, idx: usize, target_px: u32, priority: bool) {
+        if self.pdf_rerender_failed_for_target(idx, target_px) {
+            return;
+        }
         // Viewport display demand joins the original owner; it must not replace its continuation.
         if self
             .fs_pending
@@ -78040,6 +78064,58 @@ impl App {
                 }
             }
         });
+    }
+
+    fn pdf_rerender_failed_for_target(&self, idx: usize, target_px: u32) -> bool {
+        let Some(FsCacheEntry::Static {
+            pdf_rerender_failures,
+            ..
+        }) = self.fs_cache.get(&idx)
+        else {
+            return false;
+        };
+        pdf_rerender_failures.iter().any(|failure| {
+            failure.target_px == target_px
+                && self.metadata_cache_key(idx).as_deref() == Some(failure.source.as_str())
+        })
+    }
+
+    /// Move the failed request identity to the pixels that remain on screen.
+    /// Stale failures are consumed without mutating the new source. Otherwise the return
+    /// value says whether an existing raster consumed the terminal (false keeps initial failure).
+    /// No source reload, derived-cache invalidation or automatic retry follows this terminal.
+    fn consume_failed_pdf_rerender(
+        &mut self,
+        idx: usize,
+        generation: u64,
+        identity: PdfRerenderIdentity,
+    ) -> bool {
+        if !self.fs_cache.accepts_generation(idx, generation)
+            || self.metadata_cache_key(idx).as_deref() != Some(identity.source.as_str())
+        {
+            return true;
+        }
+        let Some(FsCacheEntry::Static {
+            pdf_rerender_failures,
+            ..
+        }) = self.fs_cache.get_mut(&idx)
+        else {
+            return false;
+        };
+        let already_reported = pdf_rerender_failures.iter().any(|previous| {
+            previous.source == identity.source && previous.target_px == identity.target_px
+        });
+        let target_px = identity.target_px;
+        if !already_reported {
+            pdf_rerender_failures.push(identity);
+            crate::logger::log(format!(
+                "[PDF] Rerender failed idx={idx} target_px={target_px}; retaining current raster"
+            ));
+            self.show_feedback_warning(
+                "PDFの再描画に失敗しました。現在の画像を表示します".to_owned(),
+            );
+        }
+        true
     }
 
     /// 先読みウィンドウを更新する。
@@ -79665,6 +79741,7 @@ impl App {
             self.ai_upscale_cache.insert(
                 key,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex: handle,
                     pixels,
@@ -80808,6 +80885,9 @@ impl App {
     }
 
     fn snapshot_edit_preview_close_update(&mut self, idx: usize) -> Option<EditPreviewCloseUpdate> {
+        // Every close/page/tool/park preview must capture committed crop, never a live draft.
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
             return None;
         }
@@ -81908,6 +81988,8 @@ impl App {
         settings: Option<crate::export_crop::CropSettings>,
         image_size: [usize; 2],
     ) {
+        // A panel/auto-crop/other persisted edit supersedes a canvas gesture.
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         let key = match self.page_path_key(idx) {
             Some(key) => key,
             None => return,
@@ -88425,6 +88507,14 @@ impl App {
         if gate_in_flight && self.fs_pending.contains_key(&idx) {
             return false;
         }
+        let native_target = crate::pdf_loader::zoom_render_long_edge(
+            native_w.max(native_h),
+            1.0,
+            Some(native_w.max(native_h)),
+        );
+        if self.pdf_rerender_failed_for_target(idx, native_target) {
+            return false;
+        }
         crate::ai::upscale::pdf_render_differs_from_native_ai_target(
             native_w,
             native_h,
@@ -89147,7 +89237,7 @@ impl App {
             .unwrap_or_default();
     }
 
-    fn set_page_key_presence(
+    pub(crate) fn set_page_key_presence(
         keys: &mut std::collections::BTreeSet<String>,
         key: &str,
         present: bool,
@@ -90791,6 +90881,7 @@ impl App {
         self.adjustment_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: adjusted_pixels,
@@ -92641,11 +92732,10 @@ impl App {
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
         self.export_crop_mode = false;
-        self.export_crop_drag = None;
-        self.export_crop_create_drag = None;
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.export_crop_spread_ctx = None;
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
         self.sns_split = None;
-        self.sns_split_drag = None;
         self.sns_split_spread_ctx = None;
         self.fs_loupe_locked = false;
         self.fold_local_adjust_edit_state();
@@ -93035,6 +93125,7 @@ impl App {
             mark_poll_prefetch_perf(prefetch_perf, PollPrefetchPerfStage::ApplySyncAdjustment);
         }
         let entry = FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: self.current_pdf_page_metadata_snapshot(key),
             tex: handle,
             pixels,
@@ -93686,6 +93777,11 @@ impl App {
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
         for (key, purpose) in disconnected {
             if let Some(mut pending) = self.fs_pending.remove(&key) {
+                if !pending.ticket.cancel_token().load(Ordering::Relaxed)
+                    && let Some(identity) = pending.pdf_rerender.take()
+                {
+                    self.consume_failed_pdf_rerender(key, self.items_generation, identity);
+                }
                 if matches!(purpose, FsLoadPurpose::Original { .. })
                     && !pending.ticket.cancel_token().load(Ordering::Relaxed)
                 {
@@ -93713,12 +93809,20 @@ impl App {
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
         // backlog に積まれた時点で fs_cache に載る手前の最終中継点として扱う。
-        for (key, _, _, _, _, _) in &completed {
-            if let Some(mut pending) = self.fs_pending.remove(key) {
-                pending.disarm_ticket();
-            }
+        completed.retain(|(key, result, _, generation, _, _)| {
             self.fs_early_dims.remove(key);
-        }
+            if let Some(mut pending) = self.fs_pending.remove(key) {
+                let canceled = pending.ticket.cancel_token().load(Ordering::Relaxed);
+                pending.disarm_ticket();
+                if matches!(result, FsLoadResult::Failed)
+                    && let Some(identity) = pending.pdf_rerender.take()
+                    && (canceled || self.consume_failed_pdf_rerender(*key, *generation, identity))
+                {
+                    return false;
+                }
+            }
+            true
+        });
         // 既存 backlog の重複エントリ (同 idx で再ロードされたケース) は新しい方で置換。
         // **非 fullscreen の StaticPanorama は backlog に積む前に Static にダウングレード**
         // (Codex P1 第 9、2026-05): `high_res` (~200-800 MB) は LRU 1 でどうせ
@@ -94119,6 +94223,7 @@ impl App {
                         );
                     }
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
                         pdf_metadata: None,
                         tex: handle,
                         pixels,

@@ -3397,6 +3397,7 @@ mod tests {
         app.fs_cache.insert(
             1,
             crate::app::FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: pixels.clone(),

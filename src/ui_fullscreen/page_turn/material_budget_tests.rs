@@ -53,6 +53,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex: texture.clone(),
                     pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),

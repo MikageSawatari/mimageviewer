@@ -251,6 +251,7 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels,

@@ -412,6 +412,7 @@ fn material_demand_revision_native_pdf_ai_target_precedes_fit_size_rejection() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: texture,
             pixels,

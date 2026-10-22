@@ -37,6 +37,7 @@ fn sources(ctx: &egui::Context, dims: [usize; 2]) -> crate::app::AppTestEnvForTe
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(
                     format!("front-popup-source-{idx}"),

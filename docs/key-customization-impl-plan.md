@@ -1,5 +1,10 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、
+ドラッグが無ければ従来どおりモードを終了する。消しゴム / 補正レイヤーと同じモード内の取消優先であり、
+キー割当や新しい KeyAction は追加しない。通常 release（窓外で離した OS level の確認を含む）の確定と
+取消の二終端を既存 editor 所有者で扱う。詳細は `preset-and-adjustment.md` の crop 節。
+
 2026-10-17 §1.394: `ClearVideoMediaMemory` / `ClearBookResumePositions` を Global / Press、
 既定キーなしで追加。既存の常に最前面と同じ各入力受付から、保存済み位置の管理処理へ渡す。
 環境設定と消去対象を共通化し、動画は live のみ変更、本は既存 writer の非同期 clear を使う。

@@ -343,6 +343,7 @@ fn release_matches_baseline(edit: PointerEdit, reindex: bool) {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex,
             pixels,

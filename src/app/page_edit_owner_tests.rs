@@ -1005,6 +1005,7 @@ fn ready_lut_keeps_original_page_target_after_switching_editor_document() {
     app.fs_cache.insert(
         1,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: ctx.load_texture(
                 "lut-switch-ready",
@@ -1150,6 +1151,7 @@ fn exact_reader_swap_aligns_edit_session_with_second_same_key_slot() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex,
             pixels: pixels.clone(),

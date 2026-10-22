@@ -144,6 +144,7 @@ fn prefetch_revision_single_paint_and_metadata_harvest_keep_one_topology() {
     app.fs_cache.insert(
         current,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: texture,
             pixels,

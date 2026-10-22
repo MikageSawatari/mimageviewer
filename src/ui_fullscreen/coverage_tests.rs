@@ -159,6 +159,7 @@ fn crop_coverage_thin_integer_rounded_preview_keeps_frame_and_shared_pixels_acro
                     app.fs_cache.insert(
                         0,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: None,
                             tex: raw.clone(),
                             pixels: pixels.clone(),
@@ -230,6 +231,7 @@ fn crop_coverage_single_arrival_and_eviction_keep_whole_frame_and_source_mapping
                     app.fs_cache.insert(
                         0,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: None,
                             tex: raw.clone(),
                             pixels,
@@ -522,6 +524,7 @@ fn crop_coverage_spread_both_arrival_orders_keep_page_frames_and_gap() {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: pixels.clone(),

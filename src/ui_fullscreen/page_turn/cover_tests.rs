@@ -62,6 +62,7 @@ fn book(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels: Arc::new(image),
@@ -622,6 +623,7 @@ fn page_turn_supplemented_landscape_and_forced_last_preserve_builder_roles() {
                     app.fs_cache.insert(
                         10,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: None,
                             tex,
                             pixels: Arc::new(image),

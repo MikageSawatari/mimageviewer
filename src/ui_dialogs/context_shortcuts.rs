@@ -186,7 +186,7 @@ const CROP_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
     FixedShortcutRow {
         keys: "Esc",
-        description: "切り取りモードを終了する",
+        description: "ドラッグを取り消す。ドラッグ中でなければ切り取りモードを終了する",
     },
     FixedShortcutRow {
         keys: "ドラッグ",
@@ -205,7 +205,7 @@ const SNS_SPLIT_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
     FixedShortcutRow {
         keys: "Esc",
-        description: "SNS 分割モードを終了する",
+        description: "ドラッグを取り消す。ドラッグ中でなければSNS 分割モードを終了する",
     },
     FixedShortcutRow {
         keys: "ドラッグ",

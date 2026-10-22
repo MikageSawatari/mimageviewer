@@ -523,6 +523,7 @@ pub(super) fn active_owner(app: &mut App, ctx: &egui::Context, window: u64) -> V
             owner.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels,

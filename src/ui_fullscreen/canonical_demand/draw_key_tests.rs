@@ -195,6 +195,7 @@ fn ready_pdf_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEn
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
                     layout_dims: (600_000, 850_000),
                     content_type: crate::pdf_loader::PdfPageContentType::Vector,

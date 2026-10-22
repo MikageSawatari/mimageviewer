@@ -166,6 +166,7 @@ fn install_complete(
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: source_texture.clone(),
             pixels: source_pixels.clone(),

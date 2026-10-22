@@ -7442,6 +7442,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: landscape_tex,
             pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
@@ -7642,6 +7643,7 @@ fn spread_dimension_discovery_rebuilds_only_for_landscape() {
     app.fs_cache.insert(
         5,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: ctx.load_texture(
                 "spread_cache_fs_landscape",
@@ -35024,6 +35026,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR),
                 pixels: std::sync::Arc::new(pixels),
@@ -47415,6 +47418,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_spread_left",
@@ -47430,6 +47434,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_spread_right",
@@ -47842,6 +47847,7 @@ mod favorite_adjustment_defaults_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: std::sync::Arc::new(px),
@@ -47943,6 +47949,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: new_tex,
                 pixels: std::sync::Arc::new(egui::ColorImage::new(
@@ -48010,6 +48017,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 7], egui::Color32::WHITE)),
@@ -48190,6 +48198,7 @@ mod favorite_adjustment_defaults_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: std::sync::Arc::new(px),
@@ -48249,6 +48258,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_visible_spread_left",
@@ -48264,6 +48274,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_visible_spread_right",
@@ -48354,6 +48365,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_source_dir_reset",
@@ -48708,6 +48720,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_pdf_source_dir",
@@ -48786,6 +48799,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
@@ -51786,6 +51800,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw_tex,
                 pixels: raw_pixels,
@@ -51833,6 +51848,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw_tex,
                 pixels: std::sync::Arc::new(raw),
@@ -51851,6 +51867,7 @@ mod favorite_adjustment_defaults_tests {
         app.ai_upscale_cache.insert(
             (idx, erase_bg),
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ai_tex,
                 pixels: std::sync::Arc::new(ai),
@@ -53066,6 +53083,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels: Arc::clone(&pixels),
@@ -53483,6 +53501,7 @@ mod pipeline_cache_refactor_tests {
             app.adjustment_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex: texture,
                     pixels: Arc::new(image),
@@ -53711,6 +53730,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: Arc::clone(&pixels),
@@ -54608,6 +54628,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw,
                 pixels: raw_pixels,
@@ -54649,6 +54670,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -55464,6 +55486,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
@@ -55574,6 +55597,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw_texture,
                 pixels: Arc::clone(&raw_pixels),
@@ -55867,6 +55891,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             square,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -57693,6 +57718,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -57750,6 +57776,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -57764,6 +57791,234 @@ mod pipeline_cache_refactor_tests {
             fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
         });
         idx
+    }
+
+    #[test]
+    fn pdf_rerender_failure_keeps_static_and_retires_identical_demand() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [80, 120],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        app.fullscreen_idx = Some(idx);
+        let original = match app.fs_cache.get(&idx).unwrap() {
+            FsCacheEntry::Static { pixels, .. } => Arc::clone(pixels),
+            _ => unreachable!(),
+        };
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let requests = probe.take_requests();
+        assert_eq!(requests.len(), 1);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(
+            matches!(app.fs_cache.get(&idx), Some(FsCacheEntry::Static { pixels, .. })
+            if Arc::ptr_eq(pixels, &original)),
+            "rerender failure must preserve the displayed Static"
+        );
+        assert!(
+            app.fs_feedback_toast.take().is_some(),
+            "a retained failed enhancement must notify once"
+        );
+        for _ in 0..3 {
+            app.ensure_pdf_display_resolution(idx, None);
+            app.request_pdf_rerender_at_target(idx, requests[0].1, false);
+        }
+        assert!(
+            probe.take_requests().is_empty(),
+            "failed source/target must not retry"
+        );
+        assert!(app.fs_feedback_toast.is_none());
+        app.request_pdf_rerender_at_target(idx, requests[0].1 + 1000, true);
+        assert_eq!(probe.take_requests(), vec![(idx, requests[0].1 + 1000)]);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        for target in [requests[0].1, requests[0].1 + 1000] {
+            app.request_pdf_rerender_at_target(idx, target, true);
+        }
+        assert!(
+            probe.take_requests().is_empty(),
+            "alternating failed targets must not form a loop"
+        );
+        if let GridItem::PdfPage { pdf_path, .. } = &mut app.items[idx] {
+            *pdf_path = PathBuf::from("C:/books/replacement.pdf");
+        }
+        app.request_pdf_rerender_at_target(idx, requests[0].1, true);
+        assert_eq!(probe.take_requests(), vec![(idx, requests[0].1)]);
+    }
+
+    #[test]
+    fn pdf_rerender_failure_without_static_keeps_initial_load_failure() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [80, 120],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        app.fs_cache.remove(&idx);
+        let probe = PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender_at_target(idx, 1600, true);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(matches!(app.fs_cache.get(&idx), Some(FsCacheEntry::Failed)));
+    }
+
+    #[test]
+    fn pdf_rerender_failure_from_old_source_or_canceled_owner_does_not_poison_static() {
+        for source_changed in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = seed_pdf_resolution_static(
+                &mut app,
+                &ctx,
+                [80, 120],
+                crate::pdf_loader::PdfPageContentType::Vector,
+            );
+            let probe = PdfRerenderRequestProbe::start();
+            app.request_pdf_rerender_at_target(idx, 1600, true);
+            assert_eq!(probe.take_requests(), vec![(idx, 1600)]);
+            if source_changed {
+                if let GridItem::PdfPage { pdf_path, .. } = &mut app.items[idx] {
+                    *pdf_path = PathBuf::from("C:/books/replaced-during-render.pdf");
+                }
+            } else {
+                app.fs_pending.get(&idx).unwrap().cancel();
+            }
+            probe.send_pending(idx, FsLoadResult::Failed);
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            assert!(
+                matches!(app.fs_cache.get(&idx), Some(FsCacheEntry::Static { pdf_rerender_failures, .. })
+                if pdf_rerender_failures.is_empty()),
+                "an obsolete failure must leave both pixels and failure facts untouched"
+            );
+            assert!(app.fs_feedback_toast.is_none());
+            app.request_pdf_rerender_at_target(idx, 1600, true);
+            assert_eq!(
+                probe.take_requests(),
+                vec![(idx, 1600)],
+                "fresh live demand must remain admissible"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_rerender_failure_finishes_native_ai_wait_without_retries() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [80, 120],
+            crate::pdf_loader::PdfPageContentType::Raster { w: 1600, h: 2400 },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some(
+            crate::ai::ModelKind::UpscaleRealEsrGeneralV3
+                .as_str()
+                .into(),
+        );
+        app.settings.ai_upscale_size_limit =
+            Some(crate::ai::upscale::AiProcessSizeLimit::square(4096));
+        assert!(app.display_should_defer_final_ai(idx));
+        let probe = PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender(idx, 1.0, true);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(!app.display_should_defer_final_ai(idx));
+        assert!(!app.pdf_prefetch_should_defer_ai(idx));
+        assert!(!app.should_native_rerender_pdf_for_ai(idx));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn crop_drag_context_mount_is_read_only_and_park_cancels_before_stashing() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        let main_idx = push_image(&mut app, "C:/crop/main.jpg");
+        app.fullscreen_idx = Some(main_idx);
+        let main = app.viewer_context_main();
+        let owner = app.build_active_context_for_test(Some(42), DetachedSource::Image, |app| {
+            let idx = push_image(app, "C:/crop/owner.jpg");
+            app.fullscreen_idx = Some(idx);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            app.detached_viewer_independent_active = true;
+            app.set_detached_window_binding_for_test(Some(42));
+            let pixels = Arc::new(egui::ColorImage::filled([100, 100], egui::Color32::WHITE));
+            let tex =
+                ctx.load_texture("crop-park", (*pixels).clone(), egui::TextureOptions::LINEAR);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
+                    tex,
+                    pixels,
+                    source_dims: Some([100, 100]),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        });
+        let (owner_idx, key) = app
+            .with_viewer_context_state(owner, |mounted| {
+                let idx = mounted.fullscreen_idx.unwrap();
+                mounted.export_crop_mode = true;
+                let before = ExportCropDragSnapshot {
+                    owner: mounted.capture_page_edit_owner(idx).unwrap(),
+                    press_frame: ctx.cumulative_frame_nr(),
+                    idx,
+                    image_size: [100, 100],
+                    settings: None,
+                };
+                mounted.export_crop_create_drag = Some(ExportCropCreateDrag {
+                    start: [10.0, 10.0],
+                    before,
+                });
+                mounted.set_export_crop_for_idx_memory_only(
+                    idx,
+                    Some(crate::export_crop::CropSettings::authored(
+                        crate::export_crop::CropRect {
+                            min_x: 10.0,
+                            min_y: 10.0,
+                            max_x: 80.0,
+                            max_y: 80.0,
+                        },
+                        crate::export_crop::CropAspectMode::Free,
+                        [100, 100],
+                    )),
+                    [100, 100],
+                );
+                assert!(mounted.export_crop_page_settings.contains_key(&idx));
+                let key = mounted.page_path_key(idx).unwrap();
+                mounted
+                    .with_viewer_context_state(main, |sibling| {
+                        sibling.cache_current_edit_preview_if_ready();
+                        assert!(sibling.export_crop_page_settings.is_empty());
+                        assert!(
+                            sibling.export_crop_create_drag.is_some(),
+                            "a sibling preview must not consume the editor"
+                        );
+                    })
+                    .unwrap();
+                assert!(mounted.export_crop_page_settings.contains_key(&idx));
+                (idx, key)
+            })
+            .unwrap();
+        assert!(app.pause_current_active_viewer_context(&ctx));
+        assert!(app.export_crop_create_drag.is_none());
+        app.with_viewer_context_state(owner, |mounted| {
+            assert!(!mounted.export_crop_page_settings.contains_key(&owner_idx));
+            assert!(!mounted.export_crop_pages.contains(&owner_idx));
+            assert_eq!(mounted.export_crop_db.as_ref().unwrap().get(&key), None);
+        })
+        .unwrap();
     }
 
     fn assert_pdf_rerender_probe_completion_releases_scheduler(via_poll: bool) {
@@ -58206,6 +58461,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             resident_idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: resident_tex,
                 pixels: Arc::clone(&resident_pixels),
@@ -58951,6 +59207,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -59069,6 +59326,7 @@ mod pipeline_cache_refactor_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex: texture,
                     pixels,
@@ -60421,6 +60679,7 @@ mod pipeline_cache_refactor_tests {
         app.ai_upscale_cache.insert(
             (0, 0),
             crate::fs_animation::FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
@@ -60655,6 +60914,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             target,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: target_texture,
                 pixels: Arc::clone(&target_pixels),
@@ -61701,6 +61961,7 @@ mod pipeline_display_edit_split_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: Arc::clone(&pixels),
@@ -61844,6 +62105,7 @@ mod pipeline_display_edit_split_tests {
         app.ai_upscale_cache.insert(
             (idx, ai_bg),
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ai_tex,
                 pixels: Arc::new(ai),
@@ -62034,6 +62296,7 @@ mod edit_materialize_worker_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
@@ -62080,6 +62343,7 @@ mod edit_materialize_worker_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
@@ -67405,6 +67669,7 @@ mod still_window_mode_key_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
@@ -80527,6 +80792,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
@@ -80587,6 +80853,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
@@ -80644,6 +80911,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(pixels),
@@ -81257,6 +81525,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
@@ -81667,6 +81936,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
@@ -81738,6 +82008,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
@@ -81826,6 +82097,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: None,
                             tex,
                             pixels: std::sync::Arc::new(pixels),
@@ -81914,6 +82186,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
@@ -82191,6 +82464,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.sns_split_drag = Some(SnsSplitDrag {
                 handle: crate::export_crop::CropHandle::SouthEast,
                 base: sns_layout,
+                owner: app.capture_page_edit_owner(idx).unwrap(),
+                press_frame: 0,
             });
             app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
                 saved_mode: crate::settings::SpreadMode::Ltr,
@@ -87850,6 +88125,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(image),
@@ -92141,6 +92417,7 @@ mod ai_upscale_livelock_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: dummy_tex.clone(),
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
@@ -92213,6 +92490,7 @@ mod ai_upscale_livelock_tests {
             egui::TextureOptions::LINEAR,
         );
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex,
             pixels: std::sync::Arc::new(egui::ColorImage::filled([w, h], egui::Color32::WHITE)),
@@ -105712,6 +105990,7 @@ mod sns_split_p2_transition_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
@@ -105735,6 +106014,8 @@ mod sns_split_p2_transition_tests {
         app.sns_split_drag = Some(SnsSplitDrag {
             handle: crate::export_crop::CropHandle::SouthEast,
             base: layout,
+            owner: app.capture_page_edit_owner(current_idx).unwrap(),
+            press_frame: 0,
         });
         app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
             saved_mode: crate::settings::SpreadMode::Ltr,

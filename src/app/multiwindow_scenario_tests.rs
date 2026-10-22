@@ -737,6 +737,7 @@ fn configure_active_still_pages(
     app.fs_cache.insert(
         page,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: texture,
             pixels: Arc::new(pixels),

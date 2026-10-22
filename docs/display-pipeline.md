@@ -826,8 +826,10 @@ SNS 分割パネルのプレビューも、各分割枠を全画像座標へ戻�
 - **利用者決定（2026-10-22）**: 旧行（Unknown）＋現在 crop ありは全画面の代役に使わない現行の扱いを維持する。
   そのページを新版で編集し直せば coverage 付きの行に置き換わって解消するので、「現在の crop から推測して使う」案は採らない。
   判断は `App::resolve_preview_coverage_for_display` の 1 か所。
-- 別件（未修正）: crop ドラッグ中に Escape を押すと `reset_export_crop_mode` が保存も復元もせず、DB とメモリの crop が食い違ったまま
-  残る経路がある（独立レビュー担当の source inspection、実機再現なし）。
+- crop ドラッグ中の Escape の別件は、2026-10-22 の追補で開始前の `Option<CropSettings>` を復元する。
+  修正前の handler-level テストで、DB は元の値のまま、メモリだけ新しい crop が残る失敗を確認した。
+  ドラッグだけ取り消してモードを維持し、次の Escape で終了する。取り消しは保存や preview 失効を発行せず、
+  close / ページ移動 / ツール切替の preview snapshot より前に完了する。詳細は [crop の所有と終了](preset-and-adjustment.md#crop-ドラッグの所有と終了2026-10-22)。
 
 frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
 現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
@@ -1060,6 +1062,18 @@ source (`metadata_cache_key`)・要求長辺・PDF pool の priority lane を所
 完了・取消・close・世代破棄で pending が消えれば identity も消える。別の要求表は持たない。
 `fs_pdf_rerender_demand` は完了後も zoom/指定倍率の需要を記憶するため維持する。
 
+2026-10-22 追補: 再レンダの失敗は、pending を回収する境界で、そのページの既存
+`FsCacheEntry::Static.pdf_rerender_failures` へ要求 identity（source / target / lane）を移す。
+画素・texture・派生 cache・input 世代を維持し、失敗結果を upload backlog の `Failed` へ流さない。
+全 producer が同じ入口で source / target の失敗事実を照合するため、fit と AI 等で失敗 target が
+交互に出ても同じ組を再要求しない。priority の昇格も失敗した組の再要求理由にはしない。
+異なる source / target は要求でき、新しい raster の採用・cache 退去でその画に属する失敗記録も終わる。
+Static が無い初回の失敗は従来どおり `Failed`。未取消の再レンダ worker の切断も既存画を保持する。
+取消済み ticket や source が更新された旧要求の失敗は、現在の画の失敗事実へ採用せず破棄する。
+native 再レンダが失敗した場合は AI の再レンダ待ちも終え、保持した raster で既存の AI 経路を続ける。
+まれな失敗は割り切り（ログ + `show_feedback_warning` による通知）。同じ組への通知は一度だけ。
+画が残るだけでは品質更新の失敗に気付けないため通知し、再試行時間窓・回数・新しい要求表は作らない。
+
 cache の長辺は通常どおり要求の 90〜110% で照合する。ただし極端に細長いページでは、
 既存の比率精度 0.05% を満たす整数寸法が要求長辺の 90% 未満になることがある
 （page box 比 1:160、要求 256px → 1×160px）。不足判定時だけ、worker と共有する
@@ -1077,9 +1091,9 @@ PDF 表示準備を modal にすると閲覧・ページ移動を妨げるため
 進行中を取り消し、PDFium のレンダが一度も完了しなかった（利用者の 2026-08 のログ）。
 ClaudeCode の隔離環境での操作では、合成 8 ページ PDF を全画面で幅フィット・先頭 / 末尾ジャンプ・ページ送りして、
 再レンダ要求がそれぞれ約 0.2 秒で 1 回ずつ完了し、取消は 0 回だった（§1.165 の構造変更後のビルドでも同じ）。
-別件（未修正）: 再レンダ失敗（`FsLoadResult::Failed`）を採用すると、表示中の Static が Failed に置き換わり
-見えていた画を失い得る（実装担当の source inspection、実行時の観測なし）。
-まれな失敗は既定の割り切り方針とし、今回 recovery 機構は追加しない。
+再レンダ失敗で Static が Failed に置き換わる別件は、2026-10-22 の追補で上記の保持と失敗記録へ変更した。
+source inspection の所見に加え、修正前の状態遷移テストで Static を失う失敗を確認した。
+実アプリで失敗を起こした観測はない。再試行や多段の recovery 機構は追加しない。
 
 WebP は `ANIM` chunk の背景色を `WebPDecoder::set_background_color` に渡してから
 展開する。`image-webp` は dispose-to-background の処理を持つが、背景色未設定のままだと

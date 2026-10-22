@@ -869,6 +869,7 @@ fn separated_hidden_candidates_stay_excluded_during_the_same_viewport_episode() 
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -1109,6 +1110,7 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
                                 layout_dims: (40_000, 60_000),
                                 content_type: crate::pdf_loader::PdfPageContentType::Vector,
@@ -1281,6 +1283,7 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.fs_cache.insert(
                         1,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
                                 layout_dims: (40_000, 60_000),
                                 content_type: crate::pdf_loader::PdfPageContentType::Vector,
@@ -1527,6 +1530,7 @@ fn same_generation_reader_order_change_retires_hidden_position_ranges() {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -1637,6 +1641,7 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
                         pdf_metadata: None,
                         tex,
                         pixels,
@@ -1807,6 +1812,7 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,

@@ -1605,6 +1605,7 @@ fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
             owner.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: Arc::new(image),
