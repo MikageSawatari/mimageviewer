@@ -682,10 +682,7 @@ fn paint_seams(
 }
 
 impl App {
-    pub(crate) fn finish_sns_split_drag(
-        &mut self,
-        finish: crate::ui_crop::OverlayDragFinish,
-    ) -> bool {
+    pub(crate) fn finish_sns_split_drag(&mut self, end: crate::ui_crop::OverlayDragEnd) -> bool {
         let Some(drag) = self.sns_split_drag.as_ref() else {
             return false;
         };
@@ -693,7 +690,7 @@ impl App {
             return false;
         }
         let drag = self.sns_split_drag.take().unwrap();
-        if finish == crate::ui_crop::OverlayDragFinish::Cancel
+        if end.finish() == crate::ui_crop::OverlayDragFinish::Cancel
             && drag.owner.items_generation == self.items_generation
         {
             self.sns_split = Some(drag.base);
@@ -707,17 +704,17 @@ impl App {
         front: &crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         if let Some(drag) = self.sns_split_drag.as_ref() {
-            let finish = if self
+            let end = if self
                 .fullscreen_idx
                 .is_none_or(|idx| !drag.owner.slots.contains(&idx))
                 || drag.owner.items_generation != self.items_generation
             {
-                Some(crate::ui_crop::OverlayDragFinish::Cancel)
+                Some(crate::ui_crop::OverlayDragEnd::OwnerChanged)
             } else {
-                crate::ui_crop::overlay_drag_finish(ctx, front, drag.press_frame)
+                crate::ui_crop::overlay_drag_end(ctx, front, drag.press_frame)
             };
-            if let Some(finish) = finish {
-                self.finish_sns_split_drag(finish);
+            if let Some(end) = end {
+                self.finish_sns_split_drag(end);
             }
         }
     }
@@ -773,13 +770,21 @@ impl App {
             self.sns_split_spread_ctx = Some(pivot);
             self.enter_page_edit_single_view(target_idx);
         }
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.sns_split = Some(layout);
         Ok(())
     }
 
     pub(crate) fn reset_sns_split_mode(&mut self) {
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.leave_sns_split_mode(crate::ui_crop::OverlayDragEnd::ModeExit);
+    }
+
+    pub(crate) fn complete_sns_split_mode(&mut self) {
+        self.leave_sns_split_mode(crate::ui_crop::OverlayDragEnd::Execute);
+    }
+
+    fn leave_sns_split_mode(&mut self, end: crate::ui_crop::OverlayDragEnd) {
+        self.finish_sns_split_drag(end);
         self.cancel_original_material_entry_intents(None);
         self.sns_split = None;
         let pivot = self.sns_split_spread_ctx.take();
@@ -812,7 +817,7 @@ impl App {
             return action;
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            if !self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel) {
+            if !self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Escape) {
                 self.reset_sns_split_mode();
             }
             return action;
@@ -830,7 +835,7 @@ impl App {
     }
 
     fn execute_sns_split_export(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Execute);
         let Some(layout) = self.sns_split else {
             return false;
         };
@@ -1150,7 +1155,7 @@ impl App {
             self.settings.sns_split_count = layout.count;
             self.settings.sns_split_seam_permille = layout.seam_permille;
             self.settings.sns_split_frame_ratio = Some(frame_ratio.stable_key().to_string());
-            self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+            self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::SettingsChanged);
             self.sns_split = Some(layout);
         }
         if persist_settings {
@@ -1354,7 +1359,7 @@ impl App {
         }
 
         if primary_released {
-            self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Commit);
+            self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Released);
         }
 
         if !used
@@ -1375,6 +1380,7 @@ mod tests {
 
     #[test]
     fn sns_split_drag_terminal_routes_restore_or_commit_the_whole_layout() {
+        let _key_input_guard = crate::key_input::lock_test_input();
         for route in [
             "release",
             "missing_release",
@@ -1383,6 +1389,9 @@ mod tests {
             "right",
             "panel",
             "reset",
+            "execute_shortcut",
+            "execute_button",
+            "execute_unready",
         ] {
             let mut app = crate::app::setup_app_for_test();
             let path = app.tmp.path().join("sns-drag.jpg");
@@ -1404,6 +1413,20 @@ mod tests {
             };
             app.sns_split = Some(base);
             let ctx = egui::Context::default();
+            app.keymap = crate::keymap::Keymap::from_ini_str("[SnsSplit]\nSnsSplitExecute = F13\n");
+            let image = egui::ColorImage::filled(size, egui::Color32::WHITE);
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Static {
+                    pdf_metadata: None,
+                    pdf_rerender_failures: Vec::new(),
+                    tex: ctx.load_texture("sns-execute", image.clone(), Default::default()),
+                    pixels: std::sync::Arc::new(image),
+                    source_dims: Some(size),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
             let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
             let transform = DisplayedImageTransform::resolve(
                 crate::displayed_image_transform::DisplayedImageTransformInput {
@@ -1519,11 +1542,42 @@ mod tests {
                         .drop_without_applying_deltas();
                 }
                 "reset" => app.reset_sns_split_mode(),
+                "execute_shortcut" => {
+                    ctx.begin_pass(egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key: egui::Key::F13,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    });
+                    assert!(ctx.input(|input| input.pointer.primary_down()));
+                    app.keyboard_owner_for_pass(&ctx);
+                    app.handle_sns_split_keys(&ctx, 0);
+                    let _ = ctx.end_pass().drop_without_applying_deltas();
+                }
+                "execute_button" => {
+                    assert!(ctx.input(|input| input.pointer.primary_down()));
+                    assert!(app.execute_sns_split_export(&ctx, 0));
+                }
+                "execute_unready" => {
+                    app.fs_early_dims.insert(0, size);
+                    app.fs_cache.clear();
+                    assert!(!app.execute_sns_split_export(&ctx, 0));
+                    assert!(app.export_dialog.is_none());
+                }
                 _ => unreachable!(),
             }
+            if matches!(route, "execute_shortcut" | "execute_button") {
+                let dialog = app.export_dialog.as_ref().expect("export dialog must open");
+                assert_eq!(dialog.sns_split_frames, draft.frames(), "route={route}");
+                assert_eq!(dialog.sns_split_source_size, Some(size));
+            }
             let expected = match route {
-                "release" | "missing_release" | "panel" => Some(draft),
-                "reset" => None,
+                "release" | "missing_release" | "panel" | "execute_unready" => Some(draft),
+                "reset" | "execute_shortcut" | "execute_button" => None,
                 _ => Some(base),
             };
             assert_eq!(app.sns_split, expected, "route={route}");

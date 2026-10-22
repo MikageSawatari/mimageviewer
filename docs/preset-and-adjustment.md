@@ -790,30 +790,31 @@ AI を無駄に再実行してしまう)。
 
 `ExportCropDrag` / `ExportCropCreateDrag` は、開始時の正確な `Option<CropSettings>`（crop なしも含む）、
 その authoring 寸法、対象 idx と既存 `PageEditOwner` を持つ。表示中にスケールした設定を元の設定の代用にしない。
-終了は `OverlayDragFinish::Commit` / `Cancel` の二つだけで、`finish_export_crop_drag` へ通す。
-
-| 終了のきっかけ | 終端と保存 |
-| --- | --- |
-| 左ボタンを離す（パネル上も含む） | 確定。現在値を既存 DB / sidecar / preview 無効化経路へ一度だけ渡す |
-| 窓外で離して release が届かない | focus を保持していれば、現在の OS ボタン level が上がった事実、または次の新しい primary press で前のドラッグを同じ確定へ通す。時間窓・再試行を使わない |
-| ドラッグ中の Escape | 取り消し。メモリ・存在集合・prepared 投影を開始前に戻し、DB / sidecar / preview へ書かずモードを維持する |
-| フォーカス喪失・右ボタンの押下・前面 UI への入力所有移譲 | 取り消し。通常 release と同じフレームでも取り消しを優先する |
-| ページ移動・close・別ツール / 補正モード・360 への切替・再入場 | 取り消し。preview snapshot より先に戻す。モードの終了や pivot の復帰は既存経路を使う |
-| items の入替・削除 / 並べ直し | 取り消しを既存の入替 / remap より先に行う。別世代の同じ idx へ元の値を復元しない |
-| 別 context の一時 mount | 所有者を維持する。兄弟 context の preview / 終了処理ではドラッグを消費しない。恒久的な park / close は既存の foreground editor 終了を使う |
-| F12 | 編集中は既存の overlay edit policy で受け付けない。detached の述語 / viewport 経路は変更しない |
+終了理由を `OverlayDragEnd` にまとめ、その `finish()` の match だけで
+`OverlayDragFinish::Commit` / `Cancel` の二つへ分類する。操作ごとの一覧は
+[keymap-spec.md の終了操作表](keymap-spec.md#crop--sns-枠ドラッグの終了操作)を参照。
+確定は現在値を既存 DB / sidecar / preview 無効化経路へ一度だけ渡す。
+取り消しはメモリ・存在集合・prepared 投影を開始前へ戻し、DB / sidecar / preview へ書かない。
+preview snapshot や items の入替 / remap より先に取り消し、別世代の同じ idx へ復元しない。
+別 context の一時 mount は終了ではなく、兄弟の preview / 終了処理ではドラッグを消費しない。
+F12 は既存の overlay edit policy で受け付けず、detached の述語 / viewport 経路は変更しない。
 
 操作中の Escape をモード終了より先に扱うのは、消しゴムの多角形 / 選択解除と補正レイヤーの編集中操作解除に合わせるため。
 開始 frame 番号も drag に捕捉し、同じ press を layout の複数 pass で処理した場合と次の press とを区別する。
 これは操作 identity の照合であり、時間窓や「一定時間待つ」判定ではない。
 物理ボタンの確認は Windows の左右ボタン入替に従う。タッチ継続中は物理マウスの up を
 タッチの終了とみなさず、egui の logical primary / touch 終了を使う。
-ドラッグが無い Escape は従来どおりモードを終了する。Ctrl+E やパネルの終了も未確定ドラッグを取り消してから進む。
+ドラッグが無い Escape は従来どおりモードを終了する。パネルの終了は未確定ドラッグを取り消す。
+一方、`CropExecute`（既定 Ctrl+E）は `execute_export_crop` から現在のドラッグを先に確定・保存し、
+取消を伴う `reset_export_crop_mode` を経由せずにモードを終了して書き出す。
 設計の簡素化として、既存 foreground editor の終了と preview 境界に集約した。短いマウス操作を modal にして
 閲覧や既存の切替を制限する案は採らず、終了理由ごとの bool / pending / 別の保存 owner は足さない。
 
 SNS 分割も `SnsSplitDrag.base` の全 layout と `PageEditOwner` を保持し、同じ二つの終端へ通す。
 ドラッグ中の Escape は枠だけ戻してモードを維持する。枠をパネル上へ運んでも継続し、release で確定する。
+`SnsSplitExecute` とパネルの書き出しボタンは、共通の実行関数で現在のドラッグを先に確定してから枠列を採取する。
+出力準備成功時は `complete_sns_split_mode` で確定終了し、取消の `reset_sns_split_mode` を経由しない。
+出力準備が失敗したときは確定済みの現在の枠でモードを維持する。
 SNS の枠 geometry は元々セッション内だけであり crop と同じ DB 不一致は無いが、以前は入力拒否時に drag だけ
 消して途中の layout が残る穴があったため、同じ終了所有へそろえた。
 

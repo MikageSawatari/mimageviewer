@@ -55135,7 +55135,7 @@ impl App {
         // ここより前の失敗では one-shot の layout / 見開き pivot を保持する。
         // source・編集 snapshot と枠の検証が揃った時だけ SNS モードを確定終了する。
         if sns_split_export {
-            self.reset_sns_split_mode();
+            self.complete_sns_split_mode();
         }
         self.export_dialog = Some(crate::export_dialog::ExportDialogState {
             source: target.source,

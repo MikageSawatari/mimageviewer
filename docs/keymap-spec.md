@@ -849,7 +849,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | 入力 | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | 切り取りモードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いの操作は別枠で表示する |
-| <kbd>Ctrl</kbd>+<kbd>E</kbd> | 切り取りを確定し、現在の表示結果を別ファイルへエクスポートする |
+| <kbd>Ctrl</kbd>+<kbd>E</kbd> | ドラッグ中も現在の切り取り範囲を先に確定・保存し、現在の表示結果を別ファイルへエクスポートする。Action: `CropExecute` |
 | <kbd>Esc</kbd> | ドラッグ中は開始前の切り取り設定（crop なしも含む）へ戻し、保存せずドラッグだけを取り消す。モードは維持する。ドラッグしていなければ切り取りモードを終了する固定操作 |
 | <kbd>Ctrl</kbd>+左ドラッグ | 既存の切り取り枠やハンドル上からでも、新しい切り取り範囲を作成する。Action: `CropForceCreateHold`。既定は <kbd>Ctrl</kbd> で、操作カスタマイズから変更・無効化できる |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン。`CropSpacePan` と `CropForceCreateHold` を同時に押した場合もパンを優先する。開始後に修飾キーを押す、または離しても、同じ左ドラッグを切り取り操作へ切り替えない |
@@ -862,12 +862,35 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | 入力 | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | SNS 分割モードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts` |
-| パネルの「分割して書き出す」 | エクスポートダイアログへ進む。画像が小さく選択枚数を配置できない間は無効 |
+| パネルの「分割して書き出す」 | ドラッグ中も現在の枠配置を先に確定して、エクスポートダイアログへ進む。画像が小さく選択枚数を配置できない間は無効 |
 | `SnsSplitExecute` の利用者割り当て | パネルボタンと同じ書き出しを実行する。標準キーはなく、操作カスタマイズで割り当てられる |
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | 通常の `FsExport`。SNS 分割中は書き出さず、パネルの「分割して書き出す」を案内する |
 | <kbd>Esc</kbd> | ドラッグ中は開始前の枠配置へ戻し、ドラッグだけを取り消す。モードは維持する。ドラッグしていなければ SNS 分割モードを終了する固定操作 |
 | マウスドラッグ | 枠全体を移動するか、四隅・辺のハンドルで比率を保って拡大縮小する。辺なら反対辺、角なら反対角を固定する |
 | マウスホイール / <kbd>Ctrl</kbd>+マウスホイール | 画像上ではズーム。パネル上ではスクロールまたはズーム |
+
+### crop / SNS 枠ドラッグの終了操作
+
+終了理由は `ui_crop::OverlayDragEnd`、確定／取消の対応はその `finish()` の match を正本にする。
+終端は引き続き `OverlayDragFinish::{Commit, Cancel}` の二つだけ。
+
+| 操作・境界 | 終了理由 | 終端 |
+|---|---|---|
+| primary release、focus を保持した窓外 release の物理ボタン up、欠落 release 後の次の press | `Released` | 確定 |
+| `CropExecute`、`SnsSplitExecute`、SNS パネルの「分割して書き出す」、出力準備成功後のモード完了 | `Execute` | 現在値を先に確定して使う |
+| ドラッグ中の Escape | `Escape` | 取り消してモードを維持 |
+| パネルの終了、ページ移動、close、別ツール／補正モード、再入場、preview snapshot、恒久的な park | `ModeExit` | 取り消して既存の終了・切替を続ける |
+| items／編集投影の入替、削除、世代・対象ページの変更 | `OwnerChanged` | 取り消し。別 owner へ復元しない |
+| フォーカス喪失 | `FocusLost` | 取り消し |
+| 右ボタン押下 | `SecondaryPress` | 取り消し |
+| 前面 UI への primary 入力所有移譲 | `FrontUiClaim` | 取り消し |
+| パネルの数値・比率・自動 crop、SNS の枚数・比率等の明示設定変更 | `SettingsChanged` | 旧ドラッグを取り消して明示設定を採用 |
+
+crop の確定は現在の範囲を既存 DB／sidecar 保存経路へ一度だけ渡す。SNS の枠配置は従来どおり
+セッション内の値で、確定した現在の枠列を export snapshot へ渡す。出力準備が失敗しても確定を取り消さない。
+実行入口と取消を伴うモード終了入口を分け、書き出しを取消経路へ通さない。
+別 context の一時 mount は終了操作ではなく、所有者を維持する。F12 は既存の overlay edit policy で受け付けない。
+SNS 中の通常 `FsExport` は案内だけを表示し、枠の確定・取消やモード終了を行わない。
 
 ## テキスト注釈モード
 

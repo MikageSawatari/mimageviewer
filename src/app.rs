@@ -42054,9 +42054,9 @@ impl App {
         // **文書を捨てる前に確定する。**メモリにしか無い編集はここで消える。
         self.fold_local_adjust_edit_state();
         self.export_crop_mode = false;
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.export_crop_spread_ctx = None;
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.sns_split = None;
         self.sns_split_spread_ctx = None;
         self.local_adjust_page_layers.clear();
@@ -42828,8 +42828,8 @@ impl App {
 
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
-            self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
-            self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+            self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
+            self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
             // Retire this context's old request namespace, including unadopted images.
             // Old notifications must not reserve indices in the successor generation.
             self.requested.clear();
@@ -42946,8 +42946,8 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         refresh_container_metadata: bool,
     ) {
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         debug_assert_eq!(items.len(), image_metas.len());
         self.retire_bookmark_browser_build_for_current_context();
         if !self.navigation_scope.is_detached_physical() {
@@ -45046,9 +45046,9 @@ impl App {
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches();
         self.export_crop_mode = false;
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.export_crop_spread_ctx = None;
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.sns_split = None;
         self.sns_split_spread_ctx = None;
         self.cancel_all_local_adjust_pending();
@@ -45146,8 +45146,8 @@ impl App {
     /// regular open は `ViewerContextId`、残る 3 種は legacy owner=None が mounted 所有を表す
     /// (review-v2.3.0 追補3: 角度A-1)。
     pub(crate) fn clear_page_edit_state(&mut self) {
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.page_edit_reconcile_pending = None;
         self.page_edit_snapshot = None;
         self.adjustment_page_params.clear();
@@ -45179,8 +45179,8 @@ impl App {
         &mut self,
         prepared: page_edit_snapshot::StablePageEditProjection,
     ) {
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.page_edit_reconcile_pending = None;
         let page_edit_snapshot::StablePageEditProjection {
             snapshot,
@@ -45986,8 +45986,8 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.remove_smart_folder_rating_masks(sorted_desc_idxs);
         let previous_items_generation = self.items_generation;
         let cursor_removed = self
@@ -80886,8 +80886,8 @@ impl App {
 
     fn snapshot_edit_preview_close_update(&mut self, idx: usize) -> Option<EditPreviewCloseUpdate> {
         // Every close/page/tool/park preview must capture committed crop, never a live draft.
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
             return None;
         }
@@ -81989,7 +81989,7 @@ impl App {
         image_size: [usize; 2],
     ) {
         // A panel/auto-crop/other persisted edit supersedes a canvas gesture.
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::SettingsChanged);
         let key = match self.page_path_key(idx) {
             Some(key) => key,
             None => return,
@@ -92732,9 +92732,9 @@ impl App {
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
         self.export_crop_mode = false;
-        self.finish_export_crop_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.export_crop_spread_ctx = None;
-        self.finish_sns_split_drag(crate::ui_crop::OverlayDragFinish::Cancel);
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.sns_split = None;
         self.sns_split_spread_ctx = None;
         self.fs_loupe_locked = false;

@@ -3,43 +3,75 @@ use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::export_crop::{CropAspectMode, CropHandle, CropRect, CropSettings};
 use crate::keymap::KeyAction;
 
-/// A gesture has precisely two terminals. A released button commits it; interruptions cancel it.
+/// A gesture has precisely two terminals; end reasons choose one in a single policy below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayDragFinish {
     Commit,
     Cancel,
 }
 
-pub(crate) fn overlay_drag_finish(
+/// All crop/SNS gesture end operations. Do not infer execution semantics from mode cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayDragEnd {
+    Released,
+    Execute,
+    Escape,
+    ModeExit,
+    OwnerChanged,
+    FocusLost,
+    SecondaryPress,
+    FrontUiClaim,
+    SettingsChanged,
+}
+
+impl OverlayDragEnd {
+    pub(crate) fn finish(self) -> OverlayDragFinish {
+        match self {
+            Self::Released | Self::Execute => OverlayDragFinish::Commit,
+            Self::Escape
+            | Self::ModeExit
+            | Self::OwnerChanged
+            | Self::FocusLost
+            | Self::SecondaryPress
+            | Self::FrontUiClaim
+            | Self::SettingsChanged => OverlayDragFinish::Cancel,
+        }
+    }
+}
+
+pub(crate) fn overlay_drag_end(
     ctx: &egui::Context,
     front: &crate::ui_fullscreen::FsFrontPointerFrameInput,
     press_frame: u64,
-) -> Option<OverlayDragFinish> {
-    let (cancel, released, down) = ctx.input(|i| {
-        (
-            !i.focused
-                || i.viewport().focused == Some(false)
-                || i.events
-                    .iter()
-                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
-                || i.pointer.secondary_pressed()
-                || front.owns(egui::PointerButton::Primary)
-                || front.owns_release(egui::PointerButton::Primary),
-            i.pointer.primary_released() && !front.owns_release(egui::PointerButton::Primary),
-            i.pointer.primary_down(),
-        )
+) -> Option<OverlayDragEnd> {
+    let interruption = ctx.input(|i| {
+        if !i.focused
+            || i.viewport().focused == Some(false)
+            || i.events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        {
+            Some(OverlayDragEnd::FocusLost)
+        } else if i.pointer.secondary_pressed() {
+            Some(OverlayDragEnd::SecondaryPress)
+        } else if front.owns(egui::PointerButton::Primary)
+            || front.owns_release(egui::PointerButton::Primary)
+        {
+            Some(OverlayDragEnd::FrontUiClaim)
+        } else {
+            None
+        }
     });
-    if cancel {
-        Some(OverlayDragFinish::Cancel)
-    } else if released
-        || ctx.input(|i| i.pointer.primary_pressed()) && ctx.cumulative_frame_nr() != press_frame
-    {
-        Some(OverlayDragFinish::Commit)
-    } else if !down || !overlay_primary_physically_down(ctx) {
-        Some(OverlayDragFinish::Commit)
-    } else {
-        None
+    if interruption.is_some() {
+        return interruption;
     }
+    let frame = ctx.cumulative_frame_nr();
+    let released = ctx.input(|i| {
+        i.pointer.primary_released()
+            || i.pointer.primary_pressed() && frame != press_frame
+            || !i.pointer.primary_down()
+    }) || !overlay_primary_physically_down(ctx);
+    released.then_some(OverlayDragEnd::Released)
 }
 
 fn overlay_primary_physically_down(ctx: &egui::Context) -> bool {
@@ -299,7 +331,7 @@ impl App {
         })
     }
 
-    pub(crate) fn finish_export_crop_drag(&mut self, finish: OverlayDragFinish) -> bool {
+    pub(crate) fn finish_export_crop_drag(&mut self, end: OverlayDragEnd) -> bool {
         let Some(before) = self.export_crop_drag_snapshot() else {
             return false;
         };
@@ -316,7 +348,7 @@ impl App {
         if before.owner.items_generation != self.items_generation {
             return true;
         }
-        match finish {
+        match end.finish() {
             OverlayDragFinish::Commit => {
                 let settings = self.export_crop_for_idx(before.idx, before.image_size);
                 self.set_export_crop_for_idx(before.idx, settings, before.image_size);
@@ -355,16 +387,15 @@ impl App {
         front: &crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         if let Some(before) = self.export_crop_drag_snapshot() {
-            let finish = if !self.export_crop_mode
-                || before.idx != idx
-                || before.owner.items_generation != self.items_generation
-            {
-                Some(OverlayDragFinish::Cancel)
+            let end = if !self.export_crop_mode {
+                Some(OverlayDragEnd::ModeExit)
+            } else if before.idx != idx || before.owner.items_generation != self.items_generation {
+                Some(OverlayDragEnd::OwnerChanged)
             } else {
-                overlay_drag_finish(ctx, front, before.press_frame)
+                overlay_drag_end(ctx, front, before.press_frame)
             };
-            if let Some(finish) = finish {
-                self.finish_export_crop_drag(finish);
+            if let Some(end) = end {
+                self.finish_export_crop_drag(end);
             }
         }
     }
@@ -379,7 +410,7 @@ impl App {
     /// Single ページへ pivot し、退場時に spread 状態を復元する。crop は表示 overlay
     /// のみで重い合成が無いため、post_filter バイパスや base cache 準備は行わない。
     pub(crate) fn enter_export_crop_mode(&mut self, fs_idx: usize) {
-        self.finish_export_crop_drag(OverlayDragFinish::Cancel);
+        self.finish_export_crop_drag(OverlayDragEnd::ModeExit);
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
         if !self.raw_edit_target_entry_allowed(target_idx) {
             return;
@@ -394,7 +425,16 @@ impl App {
 
     /// 未確定のドラッグを取り消し、モードを終了して spread を復元する。
     pub(crate) fn reset_export_crop_mode(&mut self) {
-        self.finish_export_crop_drag(OverlayDragFinish::Cancel);
+        self.leave_export_crop_mode(OverlayDragEnd::ModeExit);
+    }
+
+    fn execute_export_crop(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        self.leave_export_crop_mode(OverlayDragEnd::Execute);
+        self.open_export_dialog_for_current(ctx, fs_idx);
+    }
+
+    fn leave_export_crop_mode(&mut self, end: OverlayDragEnd) {
+        self.finish_export_crop_drag(end);
         self.cancel_original_material_entry_intents(None);
         self.export_crop_mode = false;
         let pivot = self.export_crop_spread_ctx.take();
@@ -422,15 +462,14 @@ impl App {
             return action;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            if !self.finish_export_crop_drag(OverlayDragFinish::Cancel) {
+            if !self.finish_export_crop_drag(OverlayDragEnd::Escape) {
                 self.reset_export_crop_mode();
             }
             return action;
         }
         self.service_export_crop_drag(ctx, fs_idx, &Default::default());
         if self.keymap.consume_action(ctx, KeyAction::CropExecute) {
-            self.reset_export_crop_mode();
-            self.open_export_dialog_for_current(ctx, fs_idx);
+            self.execute_export_crop(ctx, fs_idx);
         }
         action
     }
@@ -974,7 +1013,7 @@ impl App {
         }
 
         if primary_released {
-            self.finish_export_crop_drag(OverlayDragFinish::Commit);
+            self.finish_export_crop_drag(OverlayDragEnd::Released);
         }
 
         if !used && let Some(pos) = hover_pos {
@@ -1596,9 +1635,62 @@ mod tests {
     }
 
     #[test]
+    fn crop_execute_held_drag_exports_and_persists_current_settings() {
+        let _key_input_guard = crate::key_input::lock_test_input();
+        for (existing, create) in [(false, true), (true, true), (true, false)] {
+            let (mut app, ctx, _, initial, draft) = start_test_crop_drag(existing, create);
+            let key = app.page_path_key(0).unwrap();
+            let image = egui::ColorImage::filled([100, 100], egui::Color32::WHITE);
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Static {
+                    pdf_metadata: None,
+                    pdf_rerender_failures: Vec::new(),
+                    tex: ctx.load_texture("crop-execute", image.clone(), Default::default()),
+                    pixels: std::sync::Arc::new(image),
+                    source_dims: Some([100, 100]),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), initial);
+            ctx.begin_pass(egui::RawInput {
+                events: vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                    egui::Event::Key {
+                        key: egui::Key::E,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::CTRL,
+                    },
+                ],
+                ..Default::default()
+            });
+            assert!(ctx.input(|input| input.pointer.primary_down()));
+            app.keyboard_owner_for_pass(&ctx);
+            app.handle_export_crop_keys(&ctx, 0);
+            let _ = ctx.end_pass().drop_without_applying_deltas();
+            assert_eq!(
+                app.export_crop_db.as_ref().unwrap().get(&key),
+                Some(draft),
+                "execute must persist the held drag, including creation from no crop"
+            );
+            assert_eq!(app.export_crop_page_settings.get(&0), Some(&draft));
+            assert!(!app.export_crop_mode);
+            assert!(app.export_crop_drag.is_none() && app.export_crop_create_drag.is_none());
+            let dialog = app.export_dialog.as_ref().expect("export dialog must open");
+            let crate::export_dialog::ExportComposite::Single(page) = &dialog.composite else {
+                panic!("single-page export expected");
+            };
+            assert_eq!(page.edits.export_crop, Some(draft));
+        }
+    }
+
+    #[test]
     fn crop_drag_cancel_restores_original_authoring_dimensions() {
         let (mut app, ctx, _, initial, _) = start_test_crop_drag(true, false);
-        app.finish_export_crop_drag(OverlayDragFinish::Cancel);
+        app.finish_export_crop_drag(OverlayDragEnd::Escape);
         let original = initial.unwrap().scaled_to([200, 200]);
         app.set_export_crop_for_idx(0, Some(original), [200, 200]);
         let before = app
@@ -1749,7 +1841,7 @@ mod tests {
             "an active touch must keep the logical primary drag"
         );
         assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), initial);
-        app.finish_export_crop_drag(OverlayDragFinish::Cancel);
+        app.finish_export_crop_drag(OverlayDragEnd::Escape);
         assert_eq!(app.export_crop_for_idx(0, size), initial);
         assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), initial);
     }
