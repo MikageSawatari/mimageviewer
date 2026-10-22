@@ -2284,6 +2284,14 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
 // アイテムナビゲーション
 // -----------------------------------------------------------------------
 
+/// One-based still-image position shared by the HUD and bookmark hints.
+pub(crate) fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
+    image_indices
+        .iter()
+        .position(|&image_idx| image_idx == idx)
+        .map(|pos| pos + 1)
+}
+
 /// `display_order` の中から、連結読み・ページジャンプ・スライドショーで使う
 /// 静止画ページ (通常画像 + ZIP 画像 + PDF ページ) の item index を返す。
 ///

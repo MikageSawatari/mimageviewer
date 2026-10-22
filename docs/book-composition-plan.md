@@ -7,6 +7,9 @@ B1は独立設計レビューACCEPT後にコミット済み。B2は`aeb55914d`�
 2026-10-11の「次々回」は履歴。旧保存unitsの移行処理は不要。
 
 現行契約は§1・§2.1/§2.2・§3〜§12・§13のB段階・§14の追記（Q25/Q26の設計担当決定を含む）。
+2026-10-21 の製本操作に関する追補は [本のキー移行計画 §3.10](book-key-migration-plan.md#310-実装中に決めた-2-点-2026-10-21設計担当) を正本とする。
+本操作で別本へ移したページの order・hidden・override は各 service の transaction 内で元本から外し、移動先へ移さない。
+通常の scope 外移動で Missing 参照を保つ契約は維持する。別窓・Snapshot の既存表示状態も保持する。
 §2の従来調査表、§7.4、§13のG0〜G5・G0照合記録は旧方式の調査・実装・検証履歴として保持する。
 その固定Pair/Single、組変更確認、組ごとの手動補助指定、初期組の凍結、全pairing拒否はBの実装指示ではない。
 旧R6 ACCEPTは旧方式の設計に対するもの。B1のACCEPTとB2の実装検証・実機確認は区別する。
@@ -653,6 +656,13 @@ Bでも永続位置は実ページidentity。組番号・units内offset・白紙
 HUD/meterのordinalは構成後の可視列から別に算出する。rawに構成後indexを入れると、
 旧版書込trigger・generic key移行でidentityが失効した場合に元列の別画像へ着地してしまう。
 在メモリdedupの表示idxと、writerへ渡す互換raw値を混同しない。
+新規しおりの `page_index_hint` はresumeの互換raw値と分け、保存時点の構成後の可視読み順位置
+(0始まり) を `ui_helpers::image_reading_position` で求める。子container・hidden・白紙は数えない。
+PCは現在のreader order、Remoteはworkerで検証した自身の構成投影を入力にする。
+既存しおりのhintは書き直さず、移動先は引き続き実ページidentityで解く。
+これは `book-key-migration-plan.md` §5による意図的な契約更新であり、旧G3のraw hint検査を
+`bookmark_hint_uses_composed_reading_position_and_composed_detail_order_is_locked` に改名した。
+再開rawの意味は変えず、読み順の表示番号と混同していた旧期待値だけを置き換える。
 派生組の左右や白紙からanchorを逆算せず、共通builderのNavigation anchorの実ページidentityを保存する。
 実ページ数/ordinalの分母は可視実ページ、白紙/添えた表紙の再出現/子containerを含めない。
 historyはこのordinalを表示し、再入場は通常container open + resume resolution。
@@ -1289,6 +1299,11 @@ detached述語/viewportに触る前にはClaudeCodeと独立Codexレビューで
 
 coreのContainerEngine workerが共通pure projectionで構成順/hidden/指定を解決し、
 通常本と同じ返却範囲の入力からPageGroupを生成する。全本の表示unit/寸法を持つPreparedBookを要求しない。
+しおり保存のhintと読書履歴のordinal/分母も同じpure projectionの可視実ページ列から求める。
+ZIPの検証済みtreeと既存raw source、PDFの既存page countを使い、寸法取得や再列挙は追加しない。
+resume用の `page_index` は構成前の正規列位置を維持し、hidden targetは保存受付で拒否する。
+`remote_zip_and_pdf_bookmark_saves_use_composed_visible_order_and_keep_raw_resume` は
+ZIP (子folderあり) / PDFのorder変更とhiddenを保存要求→UI writer→DB読戻しで検査する。
 Webは返されたentries/PageGroupを表示し、
 構成のorder/hidden/overrideや自動組を自前で再現しない。実addressは元root+entry/物理PDF・EPUBページ番号のまま。
 Bookには `has_composition`、revision/accepted layout identity、構成の実効bindingを追加する。

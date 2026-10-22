@@ -19416,12 +19416,7 @@ fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Opt
     }
 }
 
-pub(crate) fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
-    image_indices
-        .iter()
-        .position(|&image_idx| image_idx == idx)
-        .map(|pos| pos + 1)
-}
+pub(crate) use crate::ui_helpers::image_reading_position;
 
 fn paint_panel_callout_chrome(
     ui: &egui::Ui,

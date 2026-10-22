@@ -2257,6 +2257,9 @@ impl App {
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
         child_ui.set_clip_rect(content_rect);
+        if self.book_structural_op.is_some() {
+            child_ui.disable();
+        }
         apply_metadata_panel_dark_widget_style(&mut child_ui);
         child_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::vertical()
@@ -2391,7 +2394,8 @@ impl App {
         // ページ行とコンテナ行を並べて表示できる。
         let container_rating = self.current_metadata_panel_container_rating();
         let mut set_container_rating: Option<u8> = None;
-        let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
+        let tag_picker_enter_pressed =
+            self.book_structural_op.is_none() && self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
         if self.fullscreen_tag_picker_open && tag_picker_escape_pressed {
             self.fullscreen_tag_picker_open = false;
@@ -2404,6 +2408,9 @@ impl App {
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
         child_ui.set_clip_rect(content_rect);
+        if self.book_structural_op.is_some() {
+            child_ui.disable();
+        }
         apply_metadata_panel_dark_widget_style(&mut child_ui);
         // Metadata values often contain long CJK text, URLs, and hashes. Use a
         // solid scrollbar here so egui reserves a real gutter instead of
@@ -2796,6 +2803,9 @@ impl App {
     /// 適切な `ui` (ダークスタイル + スクロール可) を渡す。IME (改名/ピッカー入力の Enter/
     /// Escape) は `dialog_*_pressed` 経由で画像パネルと同一の扱い。
     pub(crate) fn draw_music_tag_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.book_structural_op.is_some() {
+            ui.disable();
+        }
         // タグ行 (単一 audio target) + カタログ + ピン留めタグ + 可視選択肢を集める
         // (draw_metadata_panel_inner と同じ構築)。
         let tag_rows = self.collect_fullscreen_tag_panel_rows();
@@ -2847,7 +2857,8 @@ impl App {
         let mut clicked_tag: Option<(String, Vec<TagTarget>)> = None;
         let mut set_tag: Option<(String, bool, Vec<TagTarget>)> = None;
         let mut searched_tag: Option<String> = None;
-        let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
+        let tag_picker_enter_pressed =
+            self.book_structural_op.is_none() && self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
         if self.fullscreen_tag_picker_open && tag_picker_escape_pressed {
             self.fullscreen_tag_picker_open = false;

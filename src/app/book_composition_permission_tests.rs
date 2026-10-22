@@ -3,6 +3,88 @@
 use super::*;
 
 #[test]
+fn book_structure_waits_for_open_permission_but_not_passive_display_reads_or_adopted_episode() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let admit = |app: &mut App| {
+        app.request_book_structural_op(
+            &ctx,
+            "permission-admission-test",
+            crate::books::BookOpIntent::SourceMutation,
+            super::super::book_structural_op::Completion::Manager,
+            || Err("test terminal".into()),
+        )
+    };
+    let candidate = CandidatePage {
+        identity: crate::book_resume_db::PageIdentity::Document {
+            container: "C:/book.pdf".into(),
+            page_num: 0,
+        },
+        physical_archive: None,
+        raw_tree: None,
+    };
+    let context_id = app.spread_shift_context_id().serial();
+    let items_generation = app.items_generation;
+    app.book_composition_permission
+        .bind(context_id, items_generation);
+    let correlation = app
+        .book_composition_permission
+        .correlation(occurrence(0), &candidate);
+    let (_tx, rx) = mpsc::channel();
+    app.book_composition_permission.occurrences.insert(
+        occurrence(0),
+        OccurrencePermission::Checking {
+            correlation,
+            candidate,
+            receiver: rx,
+        },
+    );
+    assert!(app.book_composition_permission.pending());
+    assert!(
+        admit(&mut app),
+        "passive reads do not own an unadopted open"
+    );
+    app.book_structural_op = None;
+    let intent = OpenIntent {
+        context_id: app.spread_shift_context_id().serial(),
+        items_generation: app.items_generation,
+        idx: 0,
+        history_trigger: HistoryTrigger::UserChosen,
+        materialization: FsOpenMaterialization::Eager,
+        contract: FsPageLoadContract::Sequential,
+        purpose: BookTargetPurpose::Explicit,
+        route: BookTargetRoute::FullscreenOpen(FsMetadataBoundary::Manual),
+        navigation_origin: Vec::new(),
+    };
+    app.book_composition_permission.open = OpenPermission::Checking {
+        intent: intent.clone(),
+        candidates: Vec::new(),
+    };
+    assert!(!admit(&mut app));
+    assert!(matches!(
+        app.book_composition_permission.open,
+        OpenPermission::Checking { .. }
+    ));
+    app.book_composition_permission.open = OpenPermission::Ready {
+        intent: intent.clone(),
+        candidates: Vec::new(),
+    };
+    assert!(!admit(&mut app), "buffered replies still require adoption");
+    assert!(matches!(
+        app.book_composition_permission.open,
+        OpenPermission::Ready { .. }
+    ));
+    app.book_composition_permission.open = OpenPermission::Resuming {
+        intent,
+        candidates: Vec::new(),
+    };
+    assert!(
+        admit(&mut app),
+        "an adopted navigation episode may retain its proof"
+    );
+}
+
+#[test]
 fn d3_permission_direct_landing_adopts_before_its_first_lookup() {
     let ctx = egui::Context::default();
     let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(

@@ -311,6 +311,19 @@ impl PartialEq for ViewerPresentationPermission {
     }
 }
 impl ViewerPresentationPermission {
+    /// An accepted open/navigation continuation, rather than passive permission
+    /// reads for occurrences that are already displayed.
+    pub(super) fn open_pending(&self) -> bool {
+        matches!(
+            self.open,
+            OpenPermission::AwaitingProjection { .. }
+                | OpenPermission::Checking { .. }
+                | OpenPermission::Ready { .. }
+                | OpenPermission::IdentityChecking { .. }
+                | OpenPermission::ContinueDfs(_)
+        )
+    }
+
     pub(crate) fn pending(&self) -> bool {
         matches!(
             self.open,

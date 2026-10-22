@@ -458,6 +458,12 @@ impl App {
     /// 利用不可ならエラートーストを表示して `false` を返す。
     /// 呼び出し側は `false` のとき capture / submit を一切スキップすること。
     fn precheck_tag_write_available(&mut self, op_label: &str) -> bool {
+        // Only request admission uses this precheck; worker result adoption and
+        // its follow-up content-identity records must remain runnable.
+        if self.book_structural_op.is_some() {
+            self.show_feedback_warning("製本処理中です".into());
+            return false;
+        }
         self.ensure_tag_write_handle();
         if self.tag_write_handle.is_none() {
             crate::logger::log(format!(

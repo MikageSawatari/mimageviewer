@@ -210,8 +210,13 @@ enum Mutation {
 }
 
 enum MaintenanceAction {
-    PagePaths(Vec<(PathBuf, PathBuf)>),
-    RenameBookRoot { source: String, target: String },
+    PagePaths(Vec<(PathBuf, PathBuf)>, store::OutsideScopePolicy),
+    RenameBookRoot {
+        source: String,
+        target: String,
+        collision: crate::rename_key_migration::PathMigrationCollision,
+    },
+    #[cfg(test)]
     PurgeBookRoot(String),
 }
 
@@ -579,16 +584,47 @@ impl SpreadShiftService {
         &self,
         mappings: Vec<(PathBuf, PathBuf)>,
     ) -> Result<(), String> {
-        self.maintain(MaintenanceAction::PagePaths(mappings))
+        self.maintain(MaintenanceAction::PagePaths(
+            mappings,
+            store::OutsideScopePolicy::PreserveMissing,
+        ))
     }
 
+    /// Book transfers must remove references to pages that leave their source scope
+    /// before another page can reuse the vacated name.
+    pub(crate) fn migrate_book_page_paths(
+        &self,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), String> {
+        self.maintain(MaintenanceAction::PagePaths(
+            mappings,
+            store::OutsideScopePolicy::RemoveMovedOutside,
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn rename_book_root(&self, source: &Path, target: &Path) -> Result<(), String> {
+        self.rename_book_root_with_collision(
+            source,
+            target,
+            crate::rename_key_migration::PathMigrationCollision::DestinationWins,
+        )
+    }
+
+    pub(crate) fn rename_book_root_with_collision(
+        &self,
+        source: &Path,
+        target: &Path,
+        collision: crate::rename_key_migration::PathMigrationCollision,
+    ) -> Result<(), String> {
         self.maintain(MaintenanceAction::RenameBookRoot {
             source: BookScopeKey::folder(source)?.storage_key(),
             target: BookScopeKey::folder(target)?.storage_key(),
+            collision,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn purge_book_root(&self, root: &Path) -> Result<(), String> {
         self.maintain(MaintenanceAction::PurgeBookRoot(
             BookScopeKey::folder(root)?.storage_key(),
@@ -597,10 +633,12 @@ impl SpreadShiftService {
 
     fn maintain(&self, action: MaintenanceAction) -> Result<(), String> {
         let mut admission = self.shared.admission.lock().unwrap();
-        let root_operation = matches!(
-            &action,
-            MaintenanceAction::RenameBookRoot { .. } | MaintenanceAction::PurgeBookRoot(_)
-        );
+        let root_operation = match &action {
+            MaintenanceAction::RenameBookRoot { .. } => true,
+            #[cfg(test)]
+            MaintenanceAction::PurgeBookRoot(_) => true,
+            MaintenanceAction::PagePaths(..) => false,
+        };
         let defer = root_operation
             && matches!(
                 admission.mode,
@@ -1184,17 +1222,30 @@ fn run_worker(
                 // Page mapping reuses an external primitive only after closing its connection.
                 let mut hints = MaintenanceHints::default();
                 let result = match action {
-                    MaintenanceAction::PagePaths(mappings) => {
+                    MaintenanceAction::PagePaths(mappings, outside_scope) => {
                         drop(connection.take());
-                        store::migrate_page_paths_at(&data_dir, &mappings).map(|_| ())
+                        store::migrate_page_paths_with_policy_at(
+                            &data_dir,
+                            &mappings,
+                            outside_scope,
+                        )
+                        .map(|_| ())
                     }
-                    MaintenanceAction::RenameBookRoot { source, target } => {
+                    MaintenanceAction::RenameBookRoot {
+                        source,
+                        target,
+                        collision,
+                    } => {
                         hints.add_root(source.clone());
                         hints.add_root(target.clone());
                         connection.as_mut().map_or(Ok(()), |connection| {
-                            store::rename_book_root(connection, &source, &target).map(|_| ())
+                            store::rename_book_root_with_collision(
+                                connection, &source, &target, collision,
+                            )
+                            .map(|_| ())
                         })
                     }
+                    #[cfg(test)]
                     MaintenanceAction::PurgeBookRoot(root) => {
                         hints.add_root(root.clone());
                         connection.as_mut().map_or(Ok(()), |connection| {
@@ -1741,6 +1792,50 @@ mod tests {
         );
         assert_eq!(read(&service, old_chapter, cutoff).row, None);
         assert_eq!(read(&service, new_chapter, cutoff).row, None);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn root_rename_source_priority_is_carried_through_the_fifo_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let source = scope();
+        // scope() owns chapter within book.zip: a root rename retains that
+        // scope suffix, so the actual collision is destination.zip/chapter.
+        let destination = BookScopeKey::new("C:/books/destination.zip", "chapter").unwrap();
+        service
+            .set_shift(source.clone(), anchor(1), operation(1))
+            .unwrap();
+        let saved = service
+            .set_shift(destination.clone(), anchor(8), operation(2))
+            .unwrap();
+        assert_eq!(read(&service, source.clone(), saved).row, Some(anchor(1)));
+        assert_eq!(
+            read(&service, destination.clone(), saved).row,
+            Some(anchor(8))
+        );
+        service
+            .rename_book_root_with_collision(
+                &source.logical_root,
+                &destination.logical_root,
+                crate::rename_key_migration::PathMigrationCollision::SourceWins,
+            )
+            .unwrap();
+        assert_eq!(
+            read(&service, destination.clone(), service.watermarks().admitted).row,
+            Some(anchor(1))
+        );
+        service
+            .rename_book_root_with_collision(
+                &source.logical_root,
+                &destination.logical_root,
+                crate::rename_key_migration::PathMigrationCollision::SourceWins,
+            )
+            .unwrap();
+        assert_eq!(
+            read(&service, destination, service.watermarks().admitted).row,
+            None
+        );
         owner.shutdown_and_join();
     }
 
@@ -2296,6 +2391,113 @@ mod tests {
         assert_eq!(reply.maintenance_epoch, 1);
         assert_eq!(reply.completed_through, cutoff);
         assert_eq!(reply.status, Ok(()));
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn book_page_transfer_request_clears_departed_anchor_before_name_reuse() {
+        for existing_destination in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+            let source = BookScopeKey::folder("C:/books/source").unwrap();
+            let destination = BookScopeKey::folder("C:/books/destination").unwrap();
+            let saved = service
+                .set_shift(
+                    source.clone(),
+                    SpreadShiftPageRef::RelativePath("0001_same.jpg".into()),
+                    operation(1),
+                )
+                .unwrap();
+            assert!(read(&service, source.clone(), saved).status.is_ok());
+            if existing_destination {
+                let saved = service
+                    .set_shift(
+                        destination.clone(),
+                        SpreadShiftPageRef::RelativePath("existing.jpg".into()),
+                        operation(2),
+                    )
+                    .unwrap();
+                assert!(read(&service, destination.clone(), saved).status.is_ok());
+            }
+            let before_destination =
+                read(&service, destination.clone(), service.watermarks().admitted);
+            service.drain_changed_scope_keys();
+            let paused = service.pause_for_test();
+            service
+                .migrate_book_page_paths(vec![
+                    (
+                        "C:/books/source/0001_same.jpg".into(),
+                        "C:/books/destination/0001_same.jpg".into(),
+                    ),
+                    (
+                        "C:/books/source/0002_same.jpg".into(),
+                        "C:/books/source/0001_same.jpg".into(),
+                    ),
+                ])
+                .unwrap();
+            let cutoff = service.watermarks().admitted;
+            let result = service.read_after(source.clone(), cutoff);
+            assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            paused.send(()).unwrap();
+            let result = result.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(result.status, Ok(()));
+            assert_eq!(result.completed_through, cutoff);
+            assert_eq!(result.row, None);
+            assert_eq!(
+                read(&service, destination, cutoff).row,
+                before_destination.row
+            );
+            assert_eq!(
+                service.drain_changed_scope_keys(),
+                vec![source.storage_key()]
+            );
+            assert!(service.drain_errors().is_empty());
+            owner.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn book_page_reorder_request_maps_once_and_generic_move_keeps_missing_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let folder = BookScopeKey::folder("C:/books/source").unwrap();
+        let saved = service
+            .set_shift(
+                folder.clone(),
+                SpreadShiftPageRef::RelativePath("A.jpg".into()),
+                operation(1),
+            )
+            .unwrap();
+        assert!(read(&service, folder.clone(), saved).status.is_ok());
+        service
+            .migrate_book_page_paths(vec![
+                (
+                    "C:/books/source/A.jpg".into(),
+                    "C:/books/source/B.jpg".into(),
+                ),
+                (
+                    "C:/books/source/B.jpg".into(),
+                    "C:/books/source/A.jpg".into(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(
+            read(&service, folder.clone(), service.watermarks().admitted).row,
+            Some(SpreadShiftPageRef::RelativePath("B.jpg".into()))
+        );
+        service
+            .migrate_page_paths(vec![(
+                "C:/books/source/B.jpg".into(),
+                "C:/books/other/B.jpg".into(),
+            )])
+            .unwrap();
+        let result = read(&service, folder, service.watermarks().admitted);
+        assert_eq!(result.status, Ok(()));
+        assert_eq!(
+            result.row,
+            Some(SpreadShiftPageRef::RelativePath("B.jpg".into()))
+        );
+        assert!(service.drain_errors().is_empty());
         owner.shutdown_and_join();
     }
 }

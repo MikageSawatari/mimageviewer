@@ -2272,6 +2272,13 @@ struct ValidatedPageContext {
     bookmark_supported: bool,
 }
 
+#[derive(Clone, Copy)]
+enum PageContextOrder {
+    /// Read-only bookmark lists validate their anchor without consuming composition.
+    Canonical,
+    VisibleReading,
+}
+
 struct PreparedZipBookmarkList {
     resolved: ResolvedPath,
     tree: crate::zip_tree::ZipTree,
@@ -3521,7 +3528,7 @@ impl ContainerEngine {
                         "このページは本のブックマーク対象ではありません",
                     ));
                 }
-                *page_index = validated.page_index;
+                *page_index = validated.page_number.saturating_sub(1);
                 Ok(())
             }
             RemoteWriteRequest::GetItemState {
@@ -3533,7 +3540,7 @@ impl ContainerEngine {
                 self.validate_rating_page(address, catalog_admission)?;
                 let validated =
                     self.validate_page_context(address, context_address, catalog_admission)?;
-                *page_index = validated.page_index;
+                *page_index = validated.page_number.saturating_sub(1);
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
             }
@@ -3543,9 +3550,13 @@ impl ContainerEngine {
                 page_index,
                 bookmark_supported,
             } => {
-                let validated =
-                    self.validate_page_context(address, context_address, catalog_admission)?;
-                *page_index = validated.page_index;
+                let validated = self.validate_page_context_with_order(
+                    address,
+                    context_address,
+                    catalog_admission,
+                    PageContextOrder::Canonical,
+                )?;
+                *page_index = validated.page_number.saturating_sub(1);
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
             }
@@ -3898,8 +3909,13 @@ impl ContainerEngine {
         let validation_tree =
             crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries.clone())
                 .project(&policy);
-        let validated =
-            self.validate_zip_page_in_tree(&validation_tree, &requested_prefix, entry_name)?;
+        let validated = self.validate_zip_page_in_tree(
+            &resolved,
+            &validation_tree,
+            &requested_prefix,
+            entry_name,
+            PageContextOrder::Canonical,
+        )?;
         *page_index = validated.page_index;
         *bookmark_supported = validated.bookmark_supported;
 
@@ -3989,14 +4005,33 @@ impl ContainerEngine {
         context_address: &RemoteAddress,
         catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
+        self.validate_page_context_with_order(
+            address,
+            context_address,
+            catalog_admission,
+            PageContextOrder::VisibleReading,
+        )
+    }
+
+    fn validate_page_context_with_order(
+        &self,
+        address: &RemoteAddress,
+        context_address: &RemoteAddress,
+        catalog_admission: crate::catalog::CatalogAdmission,
+        order: PageContextOrder,
+    ) -> Result<ValidatedPageContext, RemoteWriteError> {
         match &address.subresource {
             RemoteSubresource::File => self.validate_folder_page(address, context_address),
             RemoteSubresource::ZipEntry { entry_name } => {
-                self.validate_zip_page(address, context_address, entry_name)
+                self.validate_zip_page(address, context_address, entry_name, order)
             }
-            RemoteSubresource::PdfPage { page_number } => {
-                self.validate_pdf_page(address, context_address, *page_number, catalog_admission)
-            }
+            RemoteSubresource::PdfPage { page_number } => self.validate_pdf_page(
+                address,
+                context_address,
+                *page_number,
+                catalog_admission,
+                order,
+            ),
             RemoteSubresource::ZipDirectory { .. } => Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::Unsupported,
                 "コンテナ自体はページではありません",
@@ -4050,11 +4085,11 @@ impl ContainerEngine {
                     "画像フォルダ内のページが見つかりません",
                 )
             })?;
-        let page_number = items[..=index]
-            .iter()
-            .filter(|item| item.has_page_data())
-            .count();
-        let page_count = items.iter().filter(|item| item.has_page_data()).count();
+        let reader_order = (0..items.len()).collect::<Vec<_>>();
+        let image_indices = crate::ui_helpers::still_image_display_indices(&items, &reader_order);
+        let page_number = crate::ui_helpers::image_reading_position(&image_indices, index)
+            .expect("validated image is in the reading order");
+        let page_count = image_indices.len();
         validated_context(
             index,
             page_count,
@@ -4189,13 +4224,14 @@ impl ContainerEngine {
         address: &RemoteAddress,
         context_address: &RemoteAddress,
         entry_name: &str,
+        order: PageContextOrder,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
         let (resolved, requested_prefix, enumeration) =
             self.enumerate_zip_page_context(address, context_address)?;
         let policy = self.settings_for_listing()?.file_type_visibility;
-        let tree =
-            crate::zip_tree::ZipTree::build(resolved.logical, enumeration.entries).project(&policy);
-        self.validate_zip_page_in_tree(&tree, &requested_prefix, entry_name)
+        let tree = crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries)
+            .project(&policy);
+        self.validate_zip_page_in_tree(&resolved, &tree, &requested_prefix, entry_name, order)
     }
 
     fn enumerate_zip_page_context(
@@ -4244,9 +4280,11 @@ impl ContainerEngine {
 
     fn validate_zip_page_in_tree(
         &self,
+        resolved: &ResolvedPath,
         tree: &crate::zip_tree::ZipTree,
         requested_prefix: &str,
         entry_name: &str,
+        order: PageContextOrder,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
         let requested_segments = zip_prefix_segments(&requested_prefix);
         if tree.node_at(&requested_segments).is_none() {
@@ -4280,12 +4318,58 @@ impl ContainerEngine {
                     "ZIP 内のページが見つかりません",
                 )
             })?;
-        let image_position = items[..=index]
-            .iter()
-            .filter(|item| item.has_page_data())
-            .count()
-            .saturating_sub(1);
-        let image_count = items.iter().filter(|item| item.has_page_data()).count();
+        let projection = if matches!(order, PageContextOrder::Canonical) {
+            None
+        } else {
+            let scope =
+                crate::book_scope::BookScopeKey::archive(&resolved.logical, &effective_segments)
+                    .map_err(|error| {
+                        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, error)
+                    })?;
+            self.remote_book_projection(
+                resolved,
+                scope.clone(),
+                crate::book_composition::PageDomain::ArchiveLevel {
+                    prefix: scope.level_prefix.clone(),
+                },
+                || {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(raw_index, item)| match item {
+                            crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
+                                Some(crate::book_composition::CanonicalRawPage {
+                                    page:
+                                        crate::book_composition::CompositionPageRef::ArchiveEntry {
+                                            entry_name: entry_name.clone(),
+                                        },
+                                    raw_index,
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                },
+                items.len(),
+                Some(tree.raw_source()),
+            )
+            .map_err(remote_write_error_from_media)?
+        };
+        // Keep the canonical row index for resume, but count bookmark/history
+        // positions in the same visible composition order as Remote enumeration.
+        let reader_order = projection.map_or_else(
+            || (0..items.len()).collect::<Vec<_>>(),
+            |projection| projection.output_to_input,
+        );
+        let image_indices = crate::ui_helpers::still_image_display_indices(&items, &reader_order);
+        let image_position =
+            crate::ui_helpers::image_reading_position(&image_indices, index).ok_or_else(|| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::Unsupported,
+                    "本の構成で非表示に設定されています",
+                )
+            })? - 1;
+        let image_count = image_indices.len();
         validated_context(
             index,
             image_count,
@@ -4306,6 +4390,7 @@ impl ContainerEngine {
         context_address: &RemoteAddress,
         page_number: u32,
         catalog_admission: crate::catalog::CatalogAdmission,
+        order: PageContextOrder,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
         if !matches!(context_address.subresource, RemoteSubresource::File) {
             return Err(RemoteWriteError::new(
@@ -4332,7 +4417,52 @@ impl ContainerEngine {
             .pdf_page_count(&resolved, &metadata, catalog_admission)
             .map_err(remote_write_error_from_media)?;
         validate_page_number(page_number, page_count).map_err(remote_write_error_from_media)?;
-        validated_context(page_number as usize, page_count as usize, true, true, true)
+        if matches!(order, PageContextOrder::Canonical) {
+            return validated_context(page_number as usize, page_count as usize, true, true, true);
+        }
+        let scope = crate::book_scope::BookScopeKey::document(&resolved.logical)
+            .map_err(|error| RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, error))?;
+        let projection = self
+            .remote_book_projection(
+                &resolved,
+                scope,
+                crate::book_composition::PageDomain::Document,
+                || {
+                    (0..page_count)
+                        .map(|page_num| crate::book_composition::CanonicalRawPage {
+                            page: crate::book_composition::CompositionPageRef::PdfPage { page_num },
+                            raw_index: page_num as usize,
+                        })
+                        .collect()
+                },
+                page_count as usize,
+                None,
+            )
+            .map_err(remote_write_error_from_media)?;
+        let Some(projection) = projection else {
+            return validated_context(page_number as usize, page_count as usize, true, true, true);
+        };
+        let reading_position = crate::ui_helpers::image_reading_position(
+            &projection.output_to_input,
+            page_number as usize,
+        )
+        .ok_or_else(|| {
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "本の構成で非表示に設定されています",
+            )
+        })?;
+        validated_context(
+            page_number as usize,
+            projection.output_to_input.len(),
+            true,
+            true,
+            true,
+        )
+        .map(|mut context| {
+            context.page_number = u32::try_from(reading_position).unwrap_or(u32::MAX);
+            context
+        })
     }
 
     #[cfg(test)]
@@ -17196,6 +17326,358 @@ pub(super) mod tests {
             crate::adjustment_db::normalize_path(std::path::Path::new(&address.path)),
             crate::adjustment_db::normalize_path(&pc_path)
         );
+    }
+
+    #[test]
+    fn zip_bookmark_hint_uses_verified_image_reading_order_with_subfolders() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("book.zip");
+        write_remote_ai_test_zip(
+            &zip,
+            &[
+                ("d1/a.jpg", b"a"),
+                ("d2/b.jpg", b"b"),
+                ("p1.jpg", b"1"),
+                ("p2.jpg", b"2"),
+                ("p3.jpg", b"3"),
+            ],
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let context = RemoteAddress::file(zip.to_string_lossy().into_owned());
+        let page = zip_entry_address(&context, "p1.jpg");
+        let mut request = RemoteWriteRequest::SetBookmark {
+            address: page,
+            context_address: context,
+            page_index: 999,
+            bookmarked: true,
+        };
+        engine.validate_write_request(&mut request).unwrap();
+        assert!(matches!(
+            request,
+            RemoteWriteRequest::SetBookmark { page_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn remote_zip_and_pdf_bookmark_saves_use_composed_visible_order_and_keep_raw_resume() {
+        use super::super::session::{SessionHandle, UiWriteOutcome};
+        use crate::book_bookmarks::PageIdentity;
+        use crate::book_composition::*;
+
+        for archive in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app
+                .tmp
+                .path()
+                .join(if archive { "hint.zip" } else { "hint.pdf" });
+            if archive {
+                write_remote_ai_test_zip(
+                    &root,
+                    &[
+                        ("d1/a.jpg", b"a"),
+                        ("d2/b.jpg", b"b"),
+                        ("p0.jpg", b"0"),
+                        ("p1.jpg", b"1"),
+                        ("p2.jpg", b"2"),
+                        ("p3.jpg", b"3"),
+                    ],
+                );
+            } else {
+                std::fs::write(&root, minimal_remote_pdf_pages(72, 144, 4)).unwrap();
+            }
+            let _backend =
+                (!archive).then(|| crate::pdf_loader::RemotePdfTestBackend::for_path(&root));
+            let scope = if archive {
+                crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap()
+            } else {
+                crate::book_scope::BookScopeKey::document(&root).unwrap()
+            };
+            let domain = if archive {
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                }
+            } else {
+                PageDomain::Document
+            };
+            let page_ref = |page_num| {
+                if archive {
+                    CompositionPageRef::ArchiveEntry {
+                        entry_name: format!("p{page_num}.jpg"),
+                    }
+                } else {
+                    CompositionPageRef::PdfPage { page_num }
+                }
+            };
+            let mut record =
+                BookComposition::new(ReadingDirection::Rtl, [2, 1, 3, 0].map(page_ref).to_vec());
+            record.hidden_pages.push(page_ref(1));
+            let (service, owner) = BookCompositionService::spawn_at(
+                app.tmp.path().join(if archive {
+                    "zip-composition"
+                } else {
+                    "pdf-composition"
+                }),
+                None,
+            )
+            .unwrap();
+            service
+                .save(scope, domain, record)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            app.install_book_composition_runtime(service);
+            let session = SessionHandle::new();
+            app.set_remote_session_handle(session.clone());
+            let acquired = session.acquire(mimageviewer_ipc::SessionAcquireRequest {
+                client_id: "bookmark-hint-test".into(),
+                peer: mimageviewer_ipc::SessionPeerInfo {
+                    connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                    device_name: None,
+                },
+            });
+            assert_eq!(acquired.status, mimageviewer_ipc::SessionStatus::Active);
+            assert!(session.finish_acquire(session.snapshot().generation));
+            let remote_owner = session.owner_for_test("bookmark-hint-test");
+            let mut engine = ContainerEngine::new(app.settings.clone());
+            engine.session = Some(session.clone());
+            let context = RemoteAddress::file(root.to_string_lossy().into_owned());
+            let address_for = |page_number| {
+                if archive {
+                    zip_entry_address(&context, &format!("p{page_number}.jpg"))
+                } else {
+                    RemoteAddress {
+                        path: context.path.clone(),
+                        subresource: RemoteSubresource::PdfPage { page_number },
+                    }
+                }
+            };
+            for (hint, physical_page) in [2, 3, 0].into_iter().enumerate() {
+                let address = address_for(physical_page);
+                let mut progress = RemoteWriteRequest::RecordReadingProgress {
+                    address: address.clone(),
+                    context_address: context.clone(),
+                    page_index: 999,
+                    page_number: 999,
+                    page_count: 999,
+                    record_resume: false,
+                    record_history: false,
+                };
+                engine.validate_write_request(&mut progress).unwrap();
+                assert!(
+                    matches!(progress, RemoteWriteRequest::RecordReadingProgress {
+                    page_index,
+                    page_number,
+                    page_count: 3,
+                    record_resume: true,
+                    ..
+                } if page_index == physical_page + if archive { 2 } else { 0 }
+                    && page_number == hint as u32 + 1)
+                );
+
+                let mut request = RemoteWriteRequest::SetBookmark {
+                    address,
+                    context_address: context.clone(),
+                    page_index: 999,
+                    bookmarked: true,
+                };
+                engine.validate_write_request(&mut request).unwrap();
+                assert!(
+                    matches!(request, RemoteWriteRequest::SetBookmark { page_index, .. }
+                    if page_index == hint as u32)
+                );
+                let admission = engine.composition_write_admission(&request).unwrap();
+                let operation = session
+                    .begin_operation(&remote_owner, "bookmark-hint".into())
+                    .unwrap();
+                let producer = session.clone();
+                let worker = std::thread::spawn(move || {
+                    producer.submit_write_with_composition(request, operation, admission)
+                });
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !worker.is_finished() {
+                    app.service_remote_session(&egui::Context::default());
+                    app.poll_book_bookmarks();
+                    assert!(Instant::now() < deadline, "bookmark save did not finish");
+                    std::thread::yield_now();
+                }
+                assert!(matches!(
+                    worker.join().unwrap(),
+                    UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                ));
+            }
+            let rows = crate::book_bookmarks::load_for_container_from_disk_readonly(&root).unwrap();
+            assert_eq!(rows.len(), 3);
+            for (hint, physical_page) in [2, 3, 0].into_iter().enumerate() {
+                let identity = if archive {
+                    PageIdentity::ArchiveEntry(format!("p{physical_page}.jpg"))
+                } else {
+                    PageIdentity::PdfPage(physical_page)
+                };
+                let saved = rows
+                    .iter()
+                    .find(|row| row.page_identity == identity)
+                    .unwrap();
+                assert_eq!(saved.page_index_hint, hint);
+            }
+            let mut hidden = RemoteWriteRequest::SetBookmark {
+                address: address_for(1),
+                context_address: context,
+                page_index: 999,
+                bookmarked: true,
+            };
+            assert_eq!(
+                engine.validate_write_request(&mut hidden).unwrap_err().code,
+                RemoteWriteErrorCode::Unsupported
+            );
+            owner.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn remote_bookmark_lists_preserve_hidden_anchor_and_ignore_composition_read_errors() {
+        use crate::book_bookmarks::{
+            BookBookmarkEvent, BookBookmarkService, BookContainerKind, NewBookBookmark,
+            PageIdentity,
+        };
+        use crate::book_composition::*;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        for archive in [true, false] {
+            let root = temp
+                .path()
+                .join(if archive { "list.zip" } else { "list.pdf" });
+            if archive {
+                write_remote_ai_test_zip(&root, &[("p0.jpg", b"0"), ("p1.jpg", b"1")]);
+            } else {
+                std::fs::write(&root, minimal_remote_pdf_pages(72, 144, 2)).unwrap();
+            }
+            let _backend =
+                (!archive).then(|| crate::pdf_loader::RemotePdfTestBackend::for_path(&root));
+            let scope = if archive {
+                crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap()
+            } else {
+                crate::book_scope::BookScopeKey::document(&root).unwrap()
+            };
+            let domain = if archive {
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                }
+            } else {
+                PageDomain::Document
+            };
+            let page_ref = |page_num| {
+                if archive {
+                    CompositionPageRef::ArchiveEntry {
+                        entry_name: format!("p{page_num}.jpg"),
+                    }
+                } else {
+                    CompositionPageRef::PdfPage { page_num }
+                }
+            };
+            let identity = if archive {
+                PageIdentity::ArchiveEntry("p1.jpg".into())
+            } else {
+                PageIdentity::PdfPage(1)
+            };
+            let bookmarks = BookBookmarkService::spawn().unwrap();
+            bookmarks.add(
+                1,
+                NewBookBookmark {
+                    container_path: root.clone(),
+                    container_kind: if archive {
+                        BookContainerKind::Zip
+                    } else {
+                        BookContainerKind::Pdf
+                    },
+                    page_identity: identity,
+                    page_index_hint: 99,
+                },
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match bookmarks.try_recv() {
+                    Ok(BookBookmarkEvent::Added { result: Ok(_), .. }) => break,
+                    Ok(event) => panic!("unexpected bookmark event: {event:?}"),
+                    Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                        std::thread::yield_now()
+                    }
+                    Err(error) => panic!("bookmark fixture was not saved: {error}"),
+                }
+            }
+            let context = RemoteAddress::file(root.to_string_lossy().into_owned());
+            let hidden_anchor = if archive {
+                zip_entry_address(&context, "p1.jpg")
+            } else {
+                RemoteAddress {
+                    path: context.path.clone(),
+                    subresource: RemoteSubresource::PdfPage { page_number: 1 },
+                }
+            };
+            for unreadable in [false, true] {
+                let data = temp
+                    .path()
+                    .join(format!("composition-{archive}-{unreadable}"));
+                std::fs::create_dir(&data).unwrap();
+                if unreadable {
+                    std::fs::write(data.join("book_composition.db"), b"invalid database").unwrap();
+                }
+                let (service, owner) = BookCompositionService::spawn_at(data, None).unwrap();
+                if unreadable {
+                    assert!(
+                        service
+                            .prepare(scope.clone(), domain.clone())
+                            .recv()
+                            .unwrap()
+                            .status
+                            .is_err()
+                    );
+                    assert!(service.snapshot().status.is_err());
+                } else {
+                    let mut record =
+                        BookComposition::new(ReadingDirection::Ltr, [1, 0].map(page_ref).to_vec());
+                    record.hidden_pages.push(page_ref(1));
+                    service
+                        .save(scope.clone(), domain.clone(), record)
+                        .recv()
+                        .unwrap()
+                        .status
+                        .unwrap();
+                }
+                let session = super::super::session::SessionHandle::new();
+                session.install_book_composition_service(Some(service));
+                let mut engine = ContainerEngine::new(Default::default());
+                engine.session = Some(session);
+                let mut request = RemoteWriteRequest::ListBookBookmarks {
+                    address: hidden_anchor.clone(),
+                    context_address: context.clone(),
+                    page_index: 999,
+                    bookmark_supported: false,
+                };
+                let RemoteWriteResponse::Success(result) = engine.book_bookmarks(&mut request)
+                else {
+                    panic!(
+                        "read-only list consumed composition: archive={archive} unreadable={unreadable}"
+                    );
+                };
+                let list = result.book_bookmarks.unwrap();
+                assert!(list.supported);
+                assert_eq!(list.rows.len(), 1);
+                assert_eq!(list.rows[0].page_index_hint, 99);
+                let target = list.rows[0].target.as_ref().unwrap();
+                assert_eq!(target.address, hidden_anchor);
+                assert_eq!(target.item_index, 1);
+                assert!(matches!(
+                    request,
+                    RemoteWriteRequest::ListBookBookmarks {
+                        page_index: 1,
+                        bookmark_supported: true,
+                        ..
+                    }
+                ));
+                owner.shutdown_and_join();
+            }
+        }
     }
 
     #[test]

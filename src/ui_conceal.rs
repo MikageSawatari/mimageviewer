@@ -620,6 +620,9 @@ impl App {
         ctx: &egui::Context,
         _fs_idx: usize,
     ) -> FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = FsKeyAction {
             page_transition: Default::default(),
             close: false,
@@ -1323,6 +1326,9 @@ impl App {
         transform: &DisplayedImageTransform,
         overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
@@ -2259,6 +2265,7 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() { ui.disable(); }
                 // 1. sink を widget より前に登録 (egui の hit test 後勝ちルール対策)
                 ui.interact(
                     sink_rect,

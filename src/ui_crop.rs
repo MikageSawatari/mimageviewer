@@ -243,6 +243,9 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = crate::ui_fullscreen::FsKeyAction {
             page_transition: Default::default(),
             close: false,
@@ -288,6 +291,9 @@ impl App {
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -656,6 +662,9 @@ impl App {
         force_create_held: bool,
         front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
+        if self.book_structural_op.is_some() {
+            return false;
+        }
         let (primary_pressed, primary_down, primary_released, press_origin, hover_pos, total_delta) =
             ui.input(|i| {
                 (

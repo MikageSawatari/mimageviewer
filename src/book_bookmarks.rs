@@ -159,6 +159,9 @@ pub struct BookBookmark {
 
 #[derive(Clone, Debug)]
 pub enum BookBookmarkEvent {
+    MigrationJournalRecovered {
+        affected_operations: usize,
+    },
     Added {
         request_id: u64,
         result: Result<(BookBookmark, bool), String>,
@@ -327,7 +330,12 @@ impl BookBookmarkService {
                         return;
                     }
                 };
-                db.recover_path_migration_journal();
+                let affected_operations = db.recover_path_migration_journal();
+                if affected_operations > 0 {
+                    let _ = event_tx.send(BookBookmarkEvent::MigrationJournalRecovered {
+                        affected_operations,
+                    });
+                }
                 while let Ok(request) = request_rx.recv() {
                     let event = match request {
                         BookBookmarkRequest::FolderZip(
@@ -907,7 +915,7 @@ impl BookBookmarkDb {
         Ok(targets.len())
     }
 
-    fn recover_path_migration_journal(&mut self) {
+    fn recover_path_migration_journal(&mut self) -> usize {
         let pending = (|| -> Result<Vec<PathMigrationJournalEntry>, rusqlite::Error> {
             let mut stmt = self.conn.prepare(
                 "SELECT job_id, mappings_json, operation_json, phase, next_step
@@ -932,9 +940,10 @@ impl BookBookmarkDb {
                 crate::logger::log(format!(
                     "book bookmark migration journal read failed: {error}"
                 ));
-                return;
+                return 0;
             }
         };
+        let mut affected_operations = 0;
         for entry in pending {
             let job_id = entry.job_id.as_str();
             if path_migration_is_active(job_id) {
@@ -964,6 +973,7 @@ impl BookBookmarkDb {
                     }
                 }
                 MIGRATION_PHASE_APPLYING => {
+                    affected_operations += 1;
                     let Some(plan) = self.parse_filesystem_plan(&entry) else {
                         continue;
                     };
@@ -1030,6 +1040,7 @@ impl BookBookmarkDb {
                     }
                 }
                 MIGRATION_PHASE_FILESYSTEM_COMMITTED => {
+                    affected_operations += 1;
                     self.finish_recovered_journal(job_id, &entry.mappings_json);
                 }
                 phase => {
@@ -1042,6 +1053,12 @@ impl BookBookmarkDb {
                 }
             }
         }
+        if affected_operations > 0 {
+            crate::logger::log(format!(
+                "book bookmark migration startup recovery affected_operations={affected_operations}"
+            ));
+        }
+        affected_operations
     }
 
     fn parse_filesystem_plan(
@@ -1186,7 +1203,7 @@ fn migration_target(
                 page_identity =
                     PageIdentity::RelativePath(new_relative.to_string_lossy().replace('\\', "/"));
             }
-            if bookmark.container_kind == BookContainerKind::CompiledBook {
+            if bookmark.container_kind == BookContainerKind::CompiledBook && !container_changed {
                 page_index_hint = compiled_page_index(&mapped_page).unwrap_or(page_index_hint);
             }
         }
@@ -1350,12 +1367,12 @@ pub(crate) fn new_path_migration_job_id() -> String {
 /// Persist the complete deterministic filesystem plan while it is still in the
 /// no-op `prepared` phase. The caller must durably transition to `applying`
 /// before executing the first step.
-pub(crate) fn prepare_path_migration(
+pub(crate) fn prepare_path_migration_writer_at(
+    path: &Path,
     job_id: &str,
     mappings: &[(PathBuf, PathBuf)],
     plan: &crate::book_fs_journal::BookFsOperationPlan,
 ) -> Result<Option<PathMigrationJournalWriter>, String> {
-    let path = db_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -2484,6 +2501,132 @@ mod tests {
         assert_eq!(row.page_index_hint, 2);
     }
 
+    #[test]
+    fn compiled_folder_rename_preserves_reading_hint_and_missing_identity() {
+        let mut db = open_in_memory();
+        let old = PathBuf::from("C:/Books/old");
+        let new = PathBuf::from("C:/Books/new");
+        db.add(&NewBookBookmark {
+            container_path: old.clone(),
+            container_kind: BookContainerKind::CompiledBook,
+            page_identity: PageIdentity::RelativePath("0007_missing.jpg".into()),
+            page_index_hint: 1,
+        })
+        .unwrap();
+        db.migrate_paths(&[(old, new.clone())]).unwrap();
+        let row = db.list_all().unwrap().pop().unwrap();
+        assert_eq!(row.container_path, new);
+        assert_eq!(
+            row.page_identity,
+            PageIdentity::RelativePath("0007_missing.jpg".into())
+        );
+        assert_eq!(row.page_index_hint, 1);
+    }
+
+    #[test]
+    fn folder_rename_journal_recovery_preserves_missing_pages_and_reports_once() {
+        for phase in [
+            MIGRATION_PHASE_APPLYING,
+            MIGRATION_PHASE_FILESYSTEM_COMMITTED,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("book_bookmarks.db");
+            let old = temp.path().join("old");
+            let new = temp.path().join("new");
+            std::fs::create_dir(&old).unwrap();
+            let db = BookBookmarkDb::open_at(&db_path).unwrap();
+            db.add(&NewBookBookmark {
+                container_path: old.clone(),
+                container_kind: BookContainerKind::CompiledBook,
+                page_identity: PageIdentity::RelativePath("0007_missing.jpg".into()),
+                page_index_hint: 1,
+            })
+            .unwrap();
+            drop(db);
+            let mappings = vec![(old.clone(), new.clone())];
+            let plan = single_rename_plan(&old, &new);
+            prepare_path_migration_at(&db_path, "folder-rename", &mappings, &plan).unwrap();
+            let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
+            restarted
+                .transition_journal_phase(
+                    "folder-rename",
+                    MIGRATION_PHASE_PREPARED,
+                    MIGRATION_PHASE_APPLYING,
+                    0,
+                    None,
+                )
+                .unwrap();
+            if phase == MIGRATION_PHASE_FILESYSTEM_COMMITTED {
+                std::fs::rename(&old, &new).unwrap();
+                restarted
+                    .transition_journal_phase(
+                        "folder-rename",
+                        MIGRATION_PHASE_APPLYING,
+                        MIGRATION_PHASE_FILESYSTEM_COMMITTED,
+                        plan.len(),
+                        None,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(restarted.recover_path_migration_journal(), 1);
+            let row = restarted.list_all().unwrap().pop().unwrap();
+            assert_eq!(row.container_path, new);
+            assert_eq!(row.page_index_hint, 1);
+            assert_eq!(
+                row.page_identity,
+                PageIdentity::RelativePath("0007_missing.jpg".into())
+            );
+            assert_eq!(restarted.recover_path_migration_journal(), 0);
+            assert_eq!(journal_count(&restarted.conn), 0);
+        }
+    }
+
+    #[test]
+    fn legacy_page_rename_journal_is_recovered_and_folder_mapping_matches_legacy_ancestor_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("book_bookmarks.db");
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        std::fs::create_dir(&old).unwrap();
+        let page = "0007_page.jpg";
+        std::fs::write(old.join(page), b"page").unwrap();
+        let db = BookBookmarkDb::open_at(&db_path).unwrap();
+        add_compiled_bookmark(&db, &old, page, "legacy");
+        drop(db);
+        // The old journal format enumerated physical pages, even for a root rename.
+        prepare_path_migration_at(
+            &db_path,
+            "legacy",
+            &[(old.join(page), new.join(page))],
+            &single_rename_plan(&old, &new),
+        )
+        .unwrap();
+        let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
+        restarted
+            .transition_journal_phase(
+                "legacy",
+                MIGRATION_PHASE_PREPARED,
+                MIGRATION_PHASE_APPLYING,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(restarted.recover_path_migration_journal(), 1);
+        let row = restarted.list_all().unwrap().pop().unwrap();
+        assert_eq!(row.container_path, new);
+        assert_eq!(row.page_identity, PageIdentity::RelativePath(page.into()));
+        // New one-pair JSON is readable by the released ancestor-matching algorithm.
+        let wire = serde_json::to_string(&vec![(old.clone(), new.clone())]).unwrap();
+        let legacy_mappings: Vec<(PathBuf, PathBuf)> = serde_json::from_str(&wire).unwrap();
+        let source = old.join(page);
+        let (from, to) = legacy_mappings
+            .iter()
+            .find(|(from, _)| source.ancestors().any(|ancestor| ancestor == from))
+            .unwrap();
+        let legacy_destination = to.join(source.strip_prefix(from).unwrap());
+        assert_eq!(legacy_destination, new.join(page));
+    }
+
     fn journal_count(conn: &rusqlite::Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM book_bookmark_path_migrations",
@@ -2606,7 +2749,7 @@ mod tests {
         drop(journal); // crash after filesystem, before phase/DB commit
 
         let mut restarted = BookBookmarkDb::open_at(&db_path).unwrap();
-        restarted.recover_path_migration_journal();
+        assert_eq!(restarted.recover_path_migration_journal(), 1);
         let row = restarted.list_all().unwrap().pop().unwrap();
         assert_eq!(
             row.page_identity,
@@ -2616,7 +2759,7 @@ mod tests {
         assert!(new_page.exists());
         assert_eq!(journal_count(&restarted.conn), 0);
 
-        restarted.recover_path_migration_journal();
+        assert_eq!(restarted.recover_path_migration_journal(), 0);
         assert_eq!(restarted.list_all().unwrap(), vec![row]);
         assert_eq!(journal_count(&restarted.conn), 0);
     }

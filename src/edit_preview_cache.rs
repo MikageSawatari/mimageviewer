@@ -879,6 +879,144 @@ impl EditPreviewCacheDb {
     }
 }
 
+/// Book-key migration owns both SQLite rows and their hashed file directories.
+/// The caller has quiesced the preview service. Files and keys are evacuated first so
+/// permutations never overwrite a sibling's preview. Failures are reported without replay.
+pub(crate) fn migrate_book_paths_at(
+    data_dir: &Path,
+    moves: &[(String, String)],
+    copies: &[(String, String)],
+) -> Result<usize, String> {
+    let path = data_dir.join("edit_preview_cache.db");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let root = data_dir.join("edit_preview_cache");
+    let mut conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    let _write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let keys = preview_book_keys(&tx)?;
+    let staged = keys
+        .into_iter()
+        .filter_map(|key| {
+            crate::rename_key_migration::rewrite_book_key(&key, moves)
+                .map(|destination| (key, destination))
+        })
+        .enumerate()
+        .map(|(index, (key, destination))| {
+            (
+                key,
+                destination,
+                crate::rename_key_migration::book_migration_temporary_key(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut changed = 0;
+    for (old, _, temporary) in &staged {
+        changed += relocate_book_preview_row(&tx, &root, old, temporary)?;
+    }
+    // Clear complete destination scopes even when there was no source row.
+    let destinations = moves
+        .iter()
+        .chain(copies)
+        .map(|(_, new)| (new.clone(), new.clone()))
+        .collect::<Vec<_>>();
+    for key in preview_book_keys(&tx)? {
+        if crate::rename_key_migration::rewrite_book_key(&key, &destinations).is_some() {
+            changed += delete_book_preview_row(&tx, &root, &key)?;
+        }
+    }
+    for (_, destination, temporary) in &staged {
+        changed += relocate_book_preview_row(&tx, &root, temporary, destination)?;
+    }
+    // Preview rows are intentionally never duplicated by a book-page copy.
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+fn preview_book_keys(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>, String> {
+    let mut statement = tx
+        .prepare("SELECT item_key FROM edit_previews")
+        .map_err(|e| e.to_string())?;
+    statement
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+fn delete_book_preview_row(
+    tx: &rusqlite::Transaction<'_>,
+    root: &Path,
+    key: &str,
+) -> Result<usize, String> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT cached_path, annotation_layers_json FROM edit_previews WHERE item_key = ?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some((cached, layers)) = row {
+        let directory = cache_dir_for_item(root, key);
+        for path in cache_paths(&cached, &layers) {
+            let path = Path::new(&path);
+            if path.parent() == Some(directory.as_path()) {
+                remove_file_and_empty_parents(root, path);
+            }
+        }
+    }
+    tx.execute("DELETE FROM edit_previews WHERE item_key = ?1", [key])
+        .map_err(|e| e.to_string())
+}
+
+fn relocate_book_preview_row(
+    tx: &rusqlite::Transaction<'_>,
+    root: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<usize, String> {
+    let (cached, layers): (String, String) = tx
+        .query_row(
+            "SELECT cached_path, annotation_layers_json FROM edit_previews WHERE item_key = ?1",
+            [source],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let layers: Vec<CachedAnnotationLayerRecord> =
+        serde_json::from_str(&layers).map_err(|e| e.to_string())?;
+    let (files, new_cached, new_layers) =
+        restored_preview_copy_layout(root, source, destination, Path::new(&cached), &layers)
+            .ok_or_else(|| format!("invalid book preview file ownership: {source}"))?;
+    // Validate the full source set before moving the first file.
+    for (old, _) in &files {
+        if !std::fs::metadata(old).map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("book preview is not a file: {}", old.display()));
+        }
+    }
+    std::fs::create_dir_all(cache_dir_for_item(root, destination)).map_err(|e| e.to_string())?;
+    for (old, new) in &files {
+        if new.exists() {
+            std::fs::remove_file(new).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(old, new)
+            .map_err(|e| format!("move {} -> {}: {e}", old.display(), new.display()))?;
+    }
+    let old_directory = cache_dir_for_item(root, source);
+    let _ = std::fs::remove_dir(&old_directory);
+    if let Some(parent) = old_directory.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    let json = serde_json::to_string(&new_layers).map_err(|e| e.to_string())?;
+    tx.execute("UPDATE edit_previews SET item_key = ?1, cached_path = ?2, annotation_layers_json = ?3 WHERE item_key = ?4",
+        params![destination, new_cached.to_string_lossy(), json, source]).map_err(|e| e.to_string())
+}
+
 /// Give a content-identity restore copy its own WebP files and rewrite the copied row to them.
 ///
 /// This is deliberately a post-copy fixup: the generic SQLite copier remains schema-agnostic,
@@ -1895,6 +2033,126 @@ mod tests {
             "transparent black must not darken the straight red channel: {r}"
         );
         assert_eq!([g, b], [0, 0]);
+    }
+
+    #[test]
+    fn book_preview_swap_preserves_owned_files_resave_delete_and_restore_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("edit_preview_cache.db");
+        let db = EditPreviewCacheDb::open_at(&path).unwrap();
+        let a = crate::path_key::normalize_keep_drive(&temp.path().join("book/0001_same.png"));
+        let b = crate::path_key::normalize_keep_drive(&temp.path().join("book/0002_same.png"));
+        save_preview_with_one_layer(&db, &a, 20);
+        save_preview_with_one_layer(&db, &b, 80);
+        let a_bytes = preview_row_paths(&db, &a)
+            .unwrap()
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect::<Vec<_>>();
+        let b_bytes = preview_row_paths(&db, &b)
+            .unwrap()
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect::<Vec<_>>();
+        migrate_book_paths_at(
+            temp.path(),
+            &[(a.clone(), b.clone()), (b.clone(), a.clone())],
+            &[],
+        )
+        .unwrap();
+        for (key, expected) in [(&a, &b_bytes), (&b, &a_bytes)] {
+            let files = preview_row_paths(&db, key).unwrap();
+            assert!(
+                files
+                    .iter()
+                    .all(|p| p.parent() == Some(cache_dir_for_item(&db.root, key).as_path()))
+            );
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|p| std::fs::read(p).unwrap())
+                    .collect::<Vec<_>>(),
+                *expected
+            );
+            assert_eq!(
+                db.load(key, 10, 20, 2048).unwrap().annotation_layers.len(),
+                1
+            );
+        }
+        let count: usize = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM edit_previews WHERE item_key LIKE '__miv_book_migration_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        save_preview_with_one_layer(&db, &a, 130);
+        let b_paths = preview_row_paths(&db, &b).unwrap();
+        assert_eq!(
+            b_paths
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect::<Vec<_>>(),
+            a_bytes
+        );
+        assert!(db.delete(&a));
+        assert!(b_paths.iter().all(|p| p.is_file()));
+        let destination = temp.path().join("restored.png");
+        let report = crate::rename_key_migration::copy_stores_at(
+            temp.path(),
+            &[crate::rename_key_migration::StoreCopyPathMapping::exact(
+                Path::new(&b),
+                &destination,
+            )],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let destination_key = crate::path_key::normalize_keep_drive(&destination);
+        let destination_paths = preview_row_paths(&db, &destination_key).unwrap();
+        assert_eq!(
+            destination_paths
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect::<Vec<_>>(),
+            a_bytes
+        );
+        assert!(db.delete(&b));
+        assert!(destination_paths.iter().all(|p| p.is_file()));
+    }
+
+    #[test]
+    fn book_preview_clears_missing_source_destinations_and_copy_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = EditPreviewCacheDb::open_at(&temp.path().join("edit_preview_cache.db")).unwrap();
+        let stale = "c:/book/stale.png".to_string();
+        let copied = "c:/other/copied.png".to_string();
+        let source = "c:/book/source.png".to_string();
+        for key in [&stale, &copied, &source] {
+            save_preview_with_one_layer(&db, key, 40);
+        }
+        let removed = preview_row_paths(&db, &stale)
+            .unwrap()
+            .into_iter()
+            .chain(preview_row_paths(&db, &copied).unwrap())
+            .collect::<Vec<_>>();
+        migrate_book_paths_at(
+            temp.path(),
+            &[("c:/book/missing.png".into(), stale.clone())],
+            &[(source.clone(), copied.clone())],
+        )
+        .unwrap();
+        assert!(preview_row_paths(&db, &stale).is_none());
+        assert!(preview_row_paths(&db, &copied).is_none());
+        assert!(removed.iter().all(|p| !p.exists()));
+        assert!(
+            preview_row_paths(&db, &source)
+                .unwrap()
+                .iter()
+                .all(|p| p.is_file())
+        );
     }
 
     #[test]

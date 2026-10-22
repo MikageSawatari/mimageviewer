@@ -3,6 +3,7 @@
 
 use super::tests::phase_c_support::{AppTestEnv, setup_app};
 use super::*;
+use crate::ui_fullscreen::SpreadPair;
 use crate::undo_stack::UndoEntry;
 use crossbeam_channel::{Receiver, Sender};
 use local_adjust_core::{LocalAdjustmentLayer, LocalAdjustmentLayers, LocalEffect, LocalMask};
@@ -1956,4 +1957,241 @@ fn foreign_delete_completion_preserves_same_key_active_draft_and_its_volatile() 
         );
     })
     .unwrap();
+}
+
+fn hold_book_structure(
+    app: &mut App,
+) -> std::sync::mpsc::Sender<Result<crate::books::BookOpResult, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.book_structural_op = Some(book_structural_op::BookStructuralOp::running_for_test(
+        rx,
+        crate::books::BookOpIntent::SourceMutation,
+        book_structural_op::Completion::Manager,
+    ));
+    tx
+}
+
+#[test]
+fn book_structure_rejects_new_local_adjustment_tag_and_trim_input() {
+    let (mut app, _) = pages(&["structural-input"]);
+    let before = app.local_adjust_page_layers[&0].clone();
+    let original = app.effective_params(0).clone();
+    let mut changed = original.clone();
+    changed.brightness = 30.0;
+    app.view_trim_page_overrides
+        .insert(0, crate::view_trim::ViewTrimPageOverride::default());
+    let _worker = hold_book_structure(&mut app);
+    assert!(!app.begin_local_page_edit(0));
+    assert!(!app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.125, 0.0));
+    assert_eq!(app.local_adjust_page_layers[&0], before);
+    app.apply_adjustment_panel_edit_frame(
+        0,
+        AdjustScopeSelection::Page,
+        original.clone(),
+        changed,
+        true,
+        true,
+        false,
+    );
+    assert_eq!(app.effective_params(0), &original);
+    assert!(app.adjustment_drag_session.is_none());
+    app.request_tag_add_for_selection("blocked", ActionSurface::Viewer);
+    assert!(
+        app.tag_write_handle
+            .as_ref()
+            .is_none_or(|worker| !worker.has_unconsumed_batch())
+    );
+    app.remove_view_trim_page_overrides_for_spread(0, SpreadPair::Single);
+    assert!(app.view_trim_page_overrides.contains_key(&0));
+}
+
+#[test]
+fn book_structure_keeps_accepted_lut_and_segmentation_completion_saves() {
+    for segmentation in [false, true] {
+        let (mut app, _) = pages(&["structural-completion"]);
+        let target = app.page_adjustment_target_for_idx(0).unwrap();
+        let mut initial = lut_document("accepted");
+        if segmentation {
+            Arc::make_mut(&mut initial)[0].mask = LocalMask::Subject(
+                local_adjust_core::SubjectMask::from_raster(local_adjust_core::RasterMask {
+                    width: 1,
+                    height: 1,
+                    alpha: vec![0.0].into(),
+                }),
+            );
+        }
+        app.set_local_adjust_layers_for_target(&target, initial.clone());
+        app.finish_local_adjust_writes();
+        let mut expected = initial.clone();
+        if segmentation {
+            assert!(app.begin_local_page_edit(0));
+            let owner = app.capture_page_edit_owner(0).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.local_adjust_segmentation_pending = Some(LocalAdjustSegmentationPending {
+                owner,
+                fs_idx: 0,
+                layer_idx: 0,
+                document: initial,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            });
+            let _worker = hold_book_structure(&mut app);
+            let mask = local_adjust_core::RasterMask {
+                width: 1,
+                height: 1,
+                alpha: vec![1.0].into(),
+            };
+            Arc::make_mut(&mut expected)[0].mask =
+                LocalMask::Subject(local_adjust_core::SubjectMask::from_raster(mask.clone()));
+            tx.send(Ok(LocalAdjustGeneratedMask::Subject(mask)))
+                .unwrap();
+            app.poll_all_page_edit_producers(&egui::Context::default());
+        } else {
+            let tx = pending_lut(&mut app, 0);
+            let _worker = hold_book_structure(&mut app);
+            let lut = ready_lut("accepted result");
+            Arc::make_mut(&mut expected)[0].effect = LocalEffect::CubeLut(lut.clone());
+            tx.send(Ok(lut)).unwrap();
+            app.poll_all_page_edit_producers(&egui::Context::default());
+        }
+        assert!(!app.has_page_edit_producers());
+        app.finish_local_adjust_writes();
+        assert_saved(&app, &target, &expected);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn book_structure_requested_waits_for_mounted_and_parked_generated_edits_to_save() {
+    enum GeneratedReply {
+        Lut(std::sync::mpsc::Sender<Result<local_adjust_core::CubeLutParams, String>>),
+        Subject(std::sync::mpsc::Sender<Result<LocalAdjustGeneratedMask, String>>),
+    }
+    for parked in [false, true] {
+        for segmentation in [false, true] {
+            let (mut app, paths) = pages(&["structural-current", "structural-producer"]);
+            let target = app.page_adjustment_target_for_idx(1).unwrap();
+            let mut initial = lut_document("accepted before structure request");
+            let mask = local_adjust_core::RasterMask {
+                width: 1,
+                height: 1,
+                alpha: vec![1.0].into(),
+            };
+            if segmentation {
+                Arc::make_mut(&mut initial)[0].mask = LocalMask::Subject(
+                    local_adjust_core::SubjectMask::from_raster(local_adjust_core::RasterMask {
+                        width: 1,
+                        height: 1,
+                        alpha: vec![0.0].into(),
+                    }),
+                );
+            }
+            let mut expected = initial.clone();
+            let lut = ready_lut("accepted generated result");
+            if segmentation {
+                Arc::make_mut(&mut expected)[0].mask =
+                    LocalMask::Subject(local_adjust_core::SubjectMask::from_raster(mask.clone()));
+            } else {
+                Arc::make_mut(&mut expected)[0].effect = LocalEffect::CubeLut(lut.clone());
+            }
+            app.set_local_adjust_layers_for_target(&target, initial.clone());
+            app.finish_local_adjust_writes();
+            let mut generated_reply = None;
+            let mut prepare_producer = |owner: &mut App| {
+                install(owner, &paths[1..], std::slice::from_ref(&initial));
+                generated_reply = Some(if segmentation {
+                    assert!(owner.begin_local_page_edit(0));
+                    let captured = owner.capture_page_edit_owner(0).unwrap();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    owner.local_adjust_segmentation_pending =
+                        Some(LocalAdjustSegmentationPending {
+                            owner: captured,
+                            fs_idx: 0,
+                            layer_idx: 0,
+                            document: initial.clone(),
+                            cancel: Arc::new(AtomicBool::new(false)),
+                            rx,
+                        });
+                    GeneratedReply::Subject(tx)
+                } else {
+                    GeneratedReply::Lut(pending_lut(owner, 0))
+                });
+            };
+            if parked {
+                app.build_window_context_for_test(137230, prepare_producer);
+                install(
+                    &mut app,
+                    &paths[..1],
+                    &[document("unchanged mounted reader")],
+                );
+            } else {
+                prepare_producer(&mut app);
+            }
+            let mut pause = WritePause::next(&mut app);
+            app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+            let ctx = egui::Context::default();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            assert!(app.request_book_structural_op(
+                &ctx,
+                "book-structure-generated-edit-test",
+                crate::books::BookOpIntent::SourceMutation,
+                book_structural_op::Completion::Manager,
+                move || {
+                    started_tx.send(()).unwrap();
+                    Ok(crate::books::BookOpResult::List(Vec::new()))
+                },
+            ));
+            app.poll_book_structural_op(&ctx);
+            assert!(matches!(
+                started_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert!(app.has_page_edit_producers());
+            match generated_reply.unwrap() {
+                GeneratedReply::Lut(tx) => tx.send(Ok(lut)).unwrap(),
+                GeneratedReply::Subject(tx) => tx
+                    .send(Ok(LocalAdjustGeneratedMask::Subject(mask)))
+                    .unwrap(),
+            }
+            app.poll_book_structural_op(&ctx);
+            pause.wait();
+            assert!(!app.has_page_edit_producers());
+            assert!(matches!(
+                started_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert_saved(&app, &target, &initial);
+            pause.release();
+            app.finish_local_adjust_writes();
+            assert_saved(&app, &target, &expected);
+            // No structural polling occurred after the write completed: the closure
+            // must still be waiting for adoption and the next quiescence check.
+            assert!(matches!(
+                started_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                app.poll_local_adjust_write_results();
+                app.poll_book_structural_op(&ctx);
+                match started_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "saved producer must release Requested: parked={parked} segmentation={segmentation}"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("structural worker did not start: {error}"),
+                }
+            }
+            assert_saved(&app, &target, &expected);
+            while app.book_structural_op.is_some() {
+                app.poll_book_structural_op(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    }
 }
