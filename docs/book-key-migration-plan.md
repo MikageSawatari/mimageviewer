@@ -1024,3 +1024,7 @@ build-dev・本体起動・commit は行っていない。全件 gate の再実�
   - 観察 (今回の変更とは別): 開いている本を削除した後、一覧に旧ページの行が残った (★表示は消えた)。削除後の
     再読込要求 (`pending_reload`) はコード上変更前と同じなので以前からの挙動とみているが、master のビルドでは未確認。
   - §1.244: 再現しない (§0)。
+- master への取り込み (2026-10-22、利用者の指示、e0d096601。PDF 表示 124dc4828 の後): 本体 lib 全件を 3 回。
+  1 回目・2 回目はそれぞれ別の 1 件だけが失敗 (`mutation_refresh_import_pin_snapshot_retires_only_superseded_materialization_owners`
+  = 1 フレーム 3 ms の時間予算に依存するテスト、`video::tests::real_demux_seek_failure_retires_selection_base` = 今回変更なしの
+  動画コード)。どちらも単独再実行と他の回では成功。3 回目は **14,126 件すべて成功**。
