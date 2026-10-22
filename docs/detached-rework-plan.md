@@ -1455,6 +1455,99 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-22 §1.165 selectorから受理素材の表示基準を保持する
+
+- 設計担当と独立レビュー担当の合意に従い、通常thumbnailの選択から保持・再描画まで、
+  handleと不変の `MaterialDisplayBasis` を一体で運ぶ。producer選択はResource、
+  保持presentation選択はPayloadとして分け、保持素材からhandleだけを取り出して再構成しない。
+- passive単ページ／見開き／連結snapshot captureと既存holdover、ViewerContextBundleの
+  消しゴム下地保持へdescriptorを通す。capture時のfit設定snapshotは既存責務のまま残し、
+  素材の基準をlive idx・texture IDから再探索しない。context間で共有するtextureでも
+  素材属性は各ownerの値を保持する。
+- legacy source-layoutのlayout単位と受理raster参照寸法もfit descriptorへ値で捕捉する。
+  passive replayでlive source寸法へ戻さず、PDF page-boxと物理pixelの区別を維持する。
+- これは素材と由来の保持を完成させる構造修正であり、detached述語、viewport生成・登録、
+  lifecycle、focus、host/runtimeの所有・切替条件は変更しない。同期I/O、待機、retry、
+  再同期mapや追加repaintを導入しない。全方式の倍率契約の統一も行わない。
+
+### 2026-10-22 §1.165 100%表示基準の分離
+
+- 正準座標寸法と100%表示寸法を別型にし、既存fit descriptorに後者を保持する。
+  passive snapshot／保持unit／white companion／再描画も捕捉時のdescriptorを使うため、
+  GPU clamp後の普通素材を正準座標の大きさへ戻さず、部分代役と本画像で同じ100%になる。
+  AI完成時の実出力texture基準、RAW／PDF／連結読みの既存規則は維持する。
+- resourceとfitの値の保持を直す範囲であり、detached述語・viewport lifecycleは変更しない。
+- 指定倍率の再レビュー追補: 単ページsnapshot／display-unit captureと見開きの指定fitは、
+  同じ素材所有A/O resolverを通す。部分素材はcoverageの正準寸法とcrop前raster、保持presentationは
+  捕捉済みdescriptorを優先し、thumbnail退去後にlive idxの寸法へ戻さない。
+  frozen replayの指定値・倍率制限は既存の捕捉値を維持する。既存resourceの由来・fit保持を
+  完成させる構造修正であり、述語・viewport生成・context lifecycleへの変更はない。
+- 最終P2追補: 全面thumbnailの指定倍率もproducerと同じGPU clamp予測を含む共通A/O resolverへ
+  統合する。単ページsnapshot／display-unit capture／連結snapshotはこの値を既存fit descriptorへ
+  捕捉し、保持素材の由来を維持する。新しいsnapshot状態や再同期を追加せず、述語・viewport・
+  context lifecycleは変更しない。通常rasterの3flow共通化は設計担当の最新方針に従う。
+
+### 2026-10-21 §1.165 独立レビュー追補
+
+- P1 の幾何修正に伴い、passive snapshot の連結／単ページ／見開き prepare は通常描画と同じ
+  resource の coverage を含む可視範囲要求を使う。部分素材の正規寸法と整数 sampler 密度を分け、
+  captured pair の指定 fit 基準も live pair と同じページ寸法境界に合わせる。
+  capture 済みの由来・素材を正しく再提出する変更で、述語・viewport lifecycle は変更しない。
+- P2 は preview DB の加法 migration と worker の生成物照合に閉じ、context 所有／失効規則を変更しない。
+  P3 は実入力 handler から部分素材／空交差の描画提出・出力採用・ready 通知・次ページ確定を通す
+  headless 回帰を追加する。Unknown の利用方針は既存の一か所の判定を維持する。
+
+### 2026-10-21 §1.165 B1: crop 済み代役の生成由来を素材と一緒に保持する（実装・自動検証済み・独立完成レビュー／実機未確認）
+
+- 合意: 利用者から提示された ClaudeCode の採択方針と独立設計レビュー
+  `design1165-out.md`／`design1165-r2-out.md` の合意に基づく。passive detached の capture／
+  再描画へ素材の収録範囲を通す変更は「素材と由来を保持する構造修正であり、症状パッチではない」
+  という双方の判断を採用する。生成時 metadata の同時永続化、native ROI と coverage の区別、
+  全ページ下地と部分素材の分離を B1 の範囲に含める。これは事前設計への合意であり、独立完成
+  レビューや実機受入れの証拠にはしない。
+- 触れる範囲: `source_coverage.rs`／`edit_preview_cache.rs` の生成・永続化、thumbnail 応答と
+  context-owned Loaded／寸法 cache、既存 `FullscreenPaintResource`／
+  `FullscreenPresentationResource`／paint payload、`displayed_image_transform.rs` の共有
+  `source_region_texture_quad`、`ui_fullscreen.rs` の snapshot capture／保持／再描画と補助表示、
+  `ui_fullscreen/page_turn.rs`／`page_turn_animation.rs` の canonical material。
+  active detached は通常描画と同じ resource を使い、passive は捕捉した素材と generation-time
+  coverage を一緒に保持する。capture 後の thumbnail 退去・置換や同じ idx の別 context から
+  位置を推定しない。navigator／ルーペ／パノラマ navigator／SNS 分割プレビューと保持素材復元も同じ契約へつなぐ。
+  active snapshot の単ページ幾何も捕捉済み resource を受け取り、裸の texture から現行 cache を再探索しない。
+- 所有・幾何: 一覧の比率は crop 後、部分素材の構成／fit の基準は crop 前。正規座標、生成 raster、
+  PDF layout 寸法を分け、実 `pixel_bounds` の floor／ceil 結果を preview の WebP 参照と同時保存する。
+  PDF page-box cache の既知 layout も独立 nullable 列へ同時保存・復元し、preview hit のための
+  追加 IPC／待機を作らない。通常画像／旧行の layout は `None` を保持する。
+  coverage は表示 trim／split の要求や native ROI と別に保持し、全画像 transform 上へ部分画像を
+  配置する。紙めくりは全ページ下地と `PartialTexture` の domain を分け、交差なしでもページ
+  occurrence／receipt を失わない。現在 crop の値から保存素材の収録範囲を再構成しない。
+- §2 との整合: runtime／binding／live dispatch の detached 述語、HWND 同定、viewport 生成、
+  placement／focus／z-order、mount／park／promote の lifecycle は変更しない。素材・由来を
+  既存 resource owner へ載せる簡素化を選び、新しい detached flag、idx 別 metadata map、
+  全 context reset、失効同期の待機、時間窓／retry を追加しない。まれな保存失敗は既定方針で割り切る。
+- 互換・範囲外: released v6 preview は nullable geometry の加法 migration で行と WebP を保持する。
+  旧 Unknown は一覧で使い、現在 crop ありの代役には共通 typed policy の理由付きで使わない。
+  新生成の geometry は現在 crop と独立している。設計レビューが指摘した
+  `reset_export_crop_mode` の Escape 時の確定／取消問題は別件として報告に留め、今回変更しない。
+- 検証: focused 回帰119件成功（`target/coverage-focused-r3.log`）。producer/DB、worker受理、
+  回転・fit・trim/split、左右到着順、退去・保持、context隔離、native ROI、部分素材のanimation、
+  navigator/SNS previewを含む。AI到着の幾何試験は拡大素材を渡す契約検査であり、実AI workerの
+  実行証拠にはしない。lib全件の成功台帳は `target/test-lib-full/`、UI snapshot／core check／
+  確認用buildの実行結果は最終引き継ぎへ記載する。workspace全gateの前提であるrelease内包用
+  core／remote／EPUB workerの3本はこのworktreeに未配置。独立完成レビュー・実機操作は未実施。
+  最初のlib全件は14,013成功／2失敗。通常素材のnative ROI出力を補助表示へ選んだ2件であり、
+  coverage付きの全画像入力をnavigator／SNSへ共通供給する修正後、関連focused194件は成功した
+  （`target/coverage-focused-r4.log`）。最終lib gateはこの修正を含むソースで再実行し、
+  14,015成功／失敗0／既存skip63（471.074秒）。台帳は
+  `target/test-lib-full/8014b5fc01e022d5b69b827cd2b7061a4c6d008b2c045a78e9757fe7d4085ca6.json`、
+  ソース識別子は `8c916412509518b424f036cd5d2b5b3d661a118b3f3c8e027a8339c08217e615`。
+  UI snapshotも195件成功、基準PNG変更なし（`target/coverage-ui-snapshot.log`）。
+  最終core check、`cargo fmt --check`、UI glyph検査（0件）、`git diff --check`成功。
+  `build-dev.ps1 -PreserveRuntime`は通常featureでcore／remote／EPUB workerを生成し、VCRT検査も成功
+  （`target/coverage-build-dev.log`）。製品起動・独立完成レビュー・実機確認・コミットは未実施。
+  検証完了後は本記録を含む文書だけを更新し、Rustソース／snapshot PNGは変更していないため、
+  上記結果を引き継ぐ（文書追記だけを理由に同じテストを再実行しない）。
+
 ### 2026-10-20 §1.384: 別ウィンドウの配置を物理座標で 1 か所が持つ
 
 - 発端: 倍率の違うモニター (150% / 100%) で、別ウィンドウの動画が 1.5 倍の座標 (画面外) に作られた (利用者の実機報告 2026-10-15)。

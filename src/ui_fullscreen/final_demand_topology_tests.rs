@@ -60,6 +60,7 @@ fn seed(app: &mut App, ctx: &egui::Context, mode: SpreadMode, mixed: bool) {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([80, 120]),

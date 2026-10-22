@@ -222,18 +222,19 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
         app.edit_result_cache.retain(|key, _| key.idx < target);
         for idx in target..target + if mode.is_spread() { 2 } else { 1 } {
             app.fs_cache.remove(&idx);
-            app.thumbnails[idx] = ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails[idx] = ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     format!("input-resident-thumb-{idx}"),
                     egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                rendered_at_px: 12,
-                source_dims: Some((80, 120)),
-                layout_dims: None,
-            };
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                12,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((80, 120)),
+                None,
+            );
         }
     }
 
@@ -1604,6 +1605,7 @@ fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
             owner.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: Arc::new(image),
                     source_dims: Some([80, 120]),

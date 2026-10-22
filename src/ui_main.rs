@@ -4860,19 +4860,20 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 pixels.push(color);
             }
         }
-        ThumbnailState::Loaded {
-            tex: crate::ui_helpers::load_snapshot_texture(
+        ThumbnailState::loaded_raster(
+            crate::ui_helpers::load_snapshot_texture(
                 ctx,
                 "cut-item-appearance-snapshot",
                 egui::ColorImage::new(size, pixels),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 160,
-            source_dims: Some((1920, 1200)),
-            layout_dims: None,
-        }
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            160,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1920, 1200)),
+            None,
+        )
     }
 
     fn draw_thumbnail_sample(
@@ -21406,16 +21407,17 @@ mod selection_info_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        ThumbnailState::Loaded {
+        ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 128,
             },
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_dims: Some(dims),
-            layout_dims: None,
-        }
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some(dims),
+            None,
+        )
     }
 
     #[test]

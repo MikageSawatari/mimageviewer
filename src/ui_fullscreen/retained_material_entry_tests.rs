@@ -221,18 +221,19 @@ fn final_only_page(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
     let item_count = app.items.len();
     app.thumbnails
         .resize_with(item_count, || ThumbnailState::Pending);
-    app.thumbnails[0] = ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    app.thumbnails[0] = ThumbnailState::loaded_raster(
+        ctx.load_texture(
             "retained-entry-thumbnail",
             egui::ColorImage::filled([160, 240], egui::Color32::GRAY),
             egui::TextureOptions::LINEAR,
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        rendered_at_px: 240,
-        source_dims: Some((160, 240)),
-        layout_dims: Some((600_000, 900_000)),
-    };
+        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        240,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((160, 240)),
+        Some((600_000, 900_000)),
+    );
     app.page_dims_cache
         .record(generation, 0, PagePixelDimensions::Thumbnail((160, 240)));
     evict_pair_cpu(&mut app);
@@ -537,10 +538,7 @@ fn seed_current_erase_stage(app: &mut App, ctx: &egui::Context) -> Arc<egui::Col
     );
     app.erase_result_cache.insert(
         key,
-        crate::app::EraseResultCacheEntry {
-            pixels: Arc::clone(&pixels),
-            texture,
-        },
+        crate::app::EraseResultCacheEntry::raster(Arc::clone(&pixels), texture),
     );
     app.mask_pages.insert(0);
     pixels
@@ -633,6 +631,7 @@ fn retained_material_entry_original_completion_resumes_the_requested_erase_entry
     assert_eq!(base.size, [4, 6]);
     assert!(
         base.pixels
+            .pixels
             .iter()
             .all(|&pixel| pixel == egui::Color32::GREEN)
     );

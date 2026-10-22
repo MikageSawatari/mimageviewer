@@ -1532,14 +1532,15 @@ mod tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             Default::default(),
         );
-        let cached = crate::grid_item::ThumbnailState::Loaded {
-            tex: texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: true,
-            rendered_at_px: 1,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-        };
+        let cached = crate::grid_item::ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            true,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        );
         app.thumbnails = vec![cached.clone(), cached.clone()];
         app.with_window_context_for_test(sibling, |viewer| {
             viewer.thumbnails = vec![cached.clone()];

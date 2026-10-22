@@ -124,6 +124,7 @@ pub mod file_type_visibility;
 mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
+mod material_display_basis;
 pub mod metadata_transfer;
 mod page_turn_animation;
 #[cfg(windows)]
@@ -254,6 +255,7 @@ pub mod reading_history_db;
 pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]
 mod settings_override;
+pub mod source_coverage;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
 mod vram_budget;

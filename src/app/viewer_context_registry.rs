@@ -1871,7 +1871,7 @@ pub(in crate::app) struct ViewerContextBundle {
     adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
     erase_preview_cache: std::collections::HashMap<usize, ErasePreviewCacheEntry>,
-    erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    erase_base_cache: std::collections::HashMap<usize, super::EraseBaseSource>,
     conceal_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
     comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
@@ -7395,18 +7395,19 @@ mod tests {
                 GridItem::Image(PathBuf::from(format!("{prefix}/failed.jpg"))),
                 GridItem::Video(PathBuf::from(format!("{prefix}/loaded.mp4"))),
             ];
-            let pixels = ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            let pixels = ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     prefix,
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some((13, 17)),
-                layout_dims: None,
-            };
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((13, 17)),
+                None,
+            );
             owner.thumbnails = vec![
                 ThumbnailState::NoArt,
                 ThumbnailState::Failed,
@@ -9228,6 +9229,66 @@ mod tests {
         assert_eq!(parked.fs_zoom, 1.7);
         assert_eq!(app.mounted_viewer_context_id(), mounted);
         assert_eq!(app.fs_zoom, 1.7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_rerender_identity_moves_with_pending_and_does_not_cancel_sibling() {
+        use std::sync::{Arc, atomic::Ordering};
+        let mut app = crate::app::setup_app_for_test();
+        let main_path = app.tmp.path().join("main-rerender.pdf");
+        let other_path = app.tmp.path().join("other-rerender.pdf");
+        app.items.push(GridItem::PdfPage {
+            pdf_path: main_path,
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+        });
+        let probe = crate::app::PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender_at_target(0, 1702, true);
+        let main = Arc::clone(&app.fs_pending.get(&0).unwrap().cancel);
+        let main_source = app.metadata_cache_key(0).unwrap();
+        let mut parked = ViewerContextBundle::empty();
+        parked.items.push(GridItem::PdfPage {
+            pdf_path: other_path,
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+        });
+        app.swap_viewer_context_bundle(&mut parked);
+        app.request_pdf_rerender_at_target(0, 1702, true);
+        let other = Arc::clone(&app.fs_pending.get(&0).unwrap().cancel);
+        let other_source = app.metadata_cache_key(0).unwrap();
+        assert_ne!(main_source, other_source);
+        app.swap_viewer_context_bundle(&mut parked);
+        for _ in 0..8 {
+            app.request_pdf_rerender_at_target(0, 1702, true);
+        }
+        assert_eq!(probe.take_requests(), vec![(0, 1702), (0, 1702)]);
+        assert_eq!(
+            app.fs_pending
+                .get(&0)
+                .unwrap()
+                .pdf_rerender
+                .as_ref()
+                .unwrap()
+                .source,
+            main_source
+        );
+        assert_eq!(
+            parked
+                .fs_pending
+                .get(&0)
+                .unwrap()
+                .pdf_rerender
+                .as_ref()
+                .unwrap()
+                .source,
+            other_source
+        );
+        assert!(!main.load(Ordering::Relaxed));
+        assert!(!other.load(Ordering::Relaxed));
+        drop(parked);
+        assert!(other.load(Ordering::Relaxed));
+        assert!(!main.load(Ordering::Relaxed));
     }
 
     #[cfg(windows)]

@@ -929,6 +929,7 @@ fn landscape_sources(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     format!("overflow-landscape-{idx}"),
                     (*pixels).clone(),

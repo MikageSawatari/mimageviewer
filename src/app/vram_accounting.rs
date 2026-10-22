@@ -510,6 +510,7 @@ mod tests {
     fn static_entry(texture: egui::TextureHandle) -> FsCacheEntry {
         let size = texture.size();
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: texture,
             pixels: Arc::new(egui::ColorImage::filled(size, egui::Color32::WHITE)),
             source_dims: Some(size),
@@ -543,11 +544,11 @@ mod tests {
             owner.adjustment_cache.insert(0, static_entry(source));
             owner.conceal_cache.insert(
                 0,
-                ConcealCacheEntry {
-                    pixels: Arc::new(egui::ColorImage::filled([8, 8], egui::Color32::WHITE)),
-                    texture: derived,
-                    generation: 7,
-                },
+                ConcealCacheEntry::raster(
+                    Arc::new(egui::ColorImage::filled([8, 8], egui::Color32::WHITE)),
+                    derived,
+                    7,
+                ),
             );
         });
         // No presentation lease is registered: all resident evidence is normal ownership.
@@ -606,10 +607,10 @@ mod tests {
         let b = app.build_window_context_for_test(27104, |owner| {
             owner.erase_preview_cache.insert(
                 0,
-                ErasePreviewCacheEntry {
-                    pixels: Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
-                    texture: preview,
-                },
+                ErasePreviewCacheEntry::raster(
+                    Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
+                    preview,
+                ),
             );
             owner.analysis_overlay_cache = Some((overlay, 255, None, 1.0, egui::Vec2::ZERO, 0));
             owner.analysis_sv_cache = Some((1.0, egui::Vec2::ZERO, 0, sv));
@@ -636,13 +637,16 @@ mod tests {
         let ctx = egui::Context::default();
         let saved = texture(&ctx, "snapshot-saved-thumb", [3, 2], false);
         let list = texture(&ctx, "snapshot-list-thumb", [5, 2], false);
-        let loaded = |tex| ThumbnailState::Loaded {
-            tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: false,
-            rendered_at_px: 5,
-            source_dims: None,
-            layout_dims: None,
+        let loaded = |tex| {
+            ThumbnailState::loaded_raster(
+                tex,
+                crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                false,
+                5,
+                crate::source_coverage::SourceCoverage::FullSource,
+                None,
+                None,
+            )
         };
         let b = app.build_window_context_for_test(27105, |owner| {
             owner.thumbnails = vec![loaded(saved.clone())];
@@ -697,14 +701,15 @@ mod tests {
         let thumb = texture(&ctx, "parked-thumbnail", [3, 2], false);
         let adjusted = texture(&ctx, "parked-adjusted-thumbnail", [2, 2], false);
         let b = app.build_window_context_for_test(27103, |owner| {
-            owner.thumbnails = vec![ThumbnailState::Loaded {
-                tex: thumb,
-                origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-                from_edit_preview: false,
-                rendered_at_px: 3,
-                source_dims: None,
-                layout_dims: None,
-            }];
+            owner.thumbnails = vec![ThumbnailState::loaded_raster(
+                thumb,
+                crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                false,
+                3,
+                crate::source_coverage::SourceCoverage::FullSource,
+                None,
+                None,
+            )];
             owner.thumb_adjust_tex.insert(0, adjusted);
         });
         let snapshot = app.vram_accounting_snapshot();

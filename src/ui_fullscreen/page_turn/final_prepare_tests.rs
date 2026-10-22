@@ -255,11 +255,9 @@ fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage
     pages
         .iter()
         .map(|page| {
-            let texture = page.resource.source_texture().unwrap().clone();
-            let source = app.fullscreen_paint_resource_for_texture(page.occurrence.idx, texture);
-            let visible = page
-                .transform
-                .visible_region_request(page.painter.clip_rect())
+            let source = super::prepare_boundary_tests::normal_source_for_page(app, page);
+            let visible = source
+                .visible_region_request(&page.transform, page.painter.clip_rect())
                 .unwrap();
             let scale = page.transform.total_scale * page.transform.pixels_per_point;
             let resource = if scale < 1.0 {
@@ -612,6 +610,7 @@ fn d3_2_frozen_sync_miss_and_quality_publication_progress_without_rewriting_cano
             app.fs_cache.insert(
                 1,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some([160, 240]),
@@ -686,6 +685,7 @@ fn seed_window_owner(app: &mut App, ctx: &egui::Context) {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([80, 120]),

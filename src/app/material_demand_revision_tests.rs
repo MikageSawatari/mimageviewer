@@ -336,7 +336,7 @@ fn material_demand_revision_ready_local_stage_and_inactive_layers_need_no_origin
             );
             let key = app.current_local_adjust_key(0);
             app.local_adjust_cache
-                .insert(key, LocalAdjustCacheEntry { pixels, texture });
+                .insert(key, LocalAdjustCacheEntry::raster(pixels, texture));
         }
         app.settings.ai_feature_mode = crate::settings::AiFeatureMode::Disabled;
         app.settings.global_preset.upscale_model = None;
@@ -412,6 +412,7 @@ fn material_demand_revision_native_pdf_ai_target_precedes_fit_size_rejection() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([1200, 1800]),

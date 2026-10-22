@@ -3,19 +3,35 @@ use super::*;
 use crate::gpu_lanczos::{FullscreenPaintPayload, FullscreenPaintResource};
 use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, frame, ready_app};
 
+pub(super) fn normal_source_for_page(
+    app: &App,
+    page: &PreparedPagedPage,
+) -> FullscreenPaintResource {
+    let resource = match &page.resource {
+        FullscreenPaintPayload::NormalResource(resource) => resource.clone(),
+        FullscreenPaintPayload::PresentationMaterial(_) => app
+            .resolve_fs_display_material(page.occurrence.idx, false)
+            .expect("the ordinary template's producer is still resident"),
+    };
+    assert_eq!(
+        resource.source_texture_id(),
+        page.resource.source_texture_id()
+    );
+    assert_eq!(
+        resource.display_basis(),
+        page.resource.display_basis(),
+        "the Native fixture must retain the selected producer's accepted basis"
+    );
+    resource
+}
+
 fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage> {
     pages
         .iter()
         .map(|page| {
-            let texture = page
-                .resource
-                .source_texture()
-                .expect("ordinary template owns its source")
-                .clone();
-            let source = app.fullscreen_paint_resource_for_texture(page.occurrence.idx, texture);
-            let visible = page
-                .transform
-                .visible_region_request(page.painter.clip_rect())
+            let source = normal_source_for_page(app, page);
+            let visible = source
+                .visible_region_request(&page.transform, page.painter.clip_rect())
                 .expect("visible page");
             let physical_scale = page.transform.total_scale * page.transform.pixels_per_point;
             let resource = if physical_scale < 1.0 {
@@ -92,6 +108,7 @@ fn start_native_turn_with_source_size(
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some(size),
@@ -181,14 +198,14 @@ fn publish_quality(
                 .retain(|cached, _| cached.edit_key.idx != idx);
             app.final_composite_cache.insert(
                 key,
-                crate::app::FinalCompositeEntry {
-                    texture_options: egui::TextureOptions::LINEAR,
-                    canonical_dims: None,
-                    source_size: size,
+                crate::app::FinalCompositeEntry::raster(
+                    None,
+                    size,
                     pixels,
-                    texture: texture.clone(),
-                    complete: true,
-                },
+                    texture.clone(),
+                    egui::TextureOptions::LINEAR,
+                    true,
+                ),
             );
             texture.id()
         })
@@ -340,13 +357,11 @@ fn changed_presentation_view_and_filter_reenter_ordinary_prepare() {
         }
         frame(&ctx, |ui, _| {
             let old = &held[0];
-            let texture = app
-                .current_final_composite_texture(old.occurrence.idx)
+            let resource = app
+                .current_final_composite_material(old.occurrence.idx)
                 .unwrap();
-            assert_eq!(texture.id(), published[0]);
-            let payload: FullscreenPaintPayload = app
-                .fullscreen_paint_resource_for_texture(old.occurrence.idx, texture)
-                .into();
+            assert_eq!(resource.source_texture_id(), published[0]);
+            let payload: FullscreenPaintPayload = resource.into();
             let transform = changed_transform(&old.transform, payload.size_vec2(), change);
             let painter = ui
                 .painter()
@@ -464,14 +479,15 @@ fn original_preview_nonfinal_and_faithful_spread_never_reuse_frozen_native() {
                         (*pixels).clone(),
                         egui::TextureOptions::LINEAR,
                     );
-                    app.thumbnails[idx] = ThumbnailState::Loaded {
-                        tex: texture,
-                        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                        from_edit_preview: false,
-                        rendered_at_px: 12,
-                        source_dims: Some((80, 120)),
-                        layout_dims: None,
-                    };
+                    app.thumbnails[idx] = ThumbnailState::loaded_raster(
+                        texture,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                        false,
+                        12,
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        Some((80, 120)),
+                        None,
+                    );
                     app.thumb_pixels.insert(idx, pixels);
                     app.ensure_passthrough_rendition(&ctx, idx)
                         .expect("resident faithful rendition")
@@ -595,14 +611,15 @@ fn install_allowed_thumbnails(
                 egui::TextureOptions::LINEAR,
             );
             let id = texture.id();
-            app.thumbnails[idx] = ThumbnailState::Loaded {
-                tex: texture,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                rendered_at_px: 12,
-                source_dims: Some((80, 120)),
-                layout_dims: None,
-            };
+            app.thumbnails[idx] = ThumbnailState::loaded_raster(
+                texture,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                12,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((80, 120)),
+                None,
+            );
             assert_eq!(app.fs_thumbnail_texture_for_display(idx).unwrap().id(), id);
             id
         })
@@ -637,9 +654,9 @@ fn draw_with_absent_source(
         );
     }
     let idx = held[0].occurrence.idx;
-    let ordinary = app.resolve_fs_processed_texture(ctx, idx, original_preview_active);
+    let ordinary = app.resolve_fs_processed_material(ctx, idx, original_preview_active);
     let payload = app.fullscreen_paint_payload_for_page(idx, ordinary, original_preview_active);
-    let thumbnail = app.fs_thumbnail_texture_for_display(idx);
+    let thumbnail = app.fs_thumbnail_resource_for_display(idx).ok();
     let source_size = app
         .known_page_dims_for_idx(idx)
         .map(|(w, h)| egui::vec2(w as f32, h as f32));

@@ -17,6 +17,9 @@ use crate::{
     displayed_image_transform::{
         VisibleRegionRequest, physical_pixel_extent, physical_scale_is_near_integer,
     },
+    material_display_basis::MaterialDisplayBasis,
+    page_dims::DisplayOriginalDimensions,
+    source_coverage::SourceCoverage,
 };
 use crate::{
     gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler, STILL_IMAGE_ANIME4K_VARIANT},
@@ -153,7 +156,67 @@ where
     ));
 }
 
-/// One typed resource shared by live, continuous, holdover, and detached routes.
+/// A partial preview's rounded sampler dimensions carry sampling density, not
+/// the 100% display basis. Preserve the producer's uncropped normal raster;
+/// canonical annotation coordinates may be larger than the GPU-clamped raster.
+fn original_display_dimensions(
+    size: [usize; 2],
+    coverage: SourceCoverage,
+) -> DisplayOriginalDimensions {
+    if coverage.is_partial() {
+        coverage.uncropped_raster_dimensions().unwrap()
+    } else {
+        DisplayOriginalDimensions::new(size[0] as u32, size[1] as u32)
+    }
+}
+
+/// Geometry requests are expressed in full-source coordinates, whereas a
+/// native resampler reads the immutable sampler allocation. Quantize only
+/// after intersecting with the actual material, using that material's texels.
+fn sampler_visible_region(
+    coverage: SourceCoverage,
+    request: Option<VisibleRegionRequest>,
+) -> Option<VisibleRegionRequest> {
+    let request = request?;
+    let coverage = coverage.source_uv_rect()?;
+    if coverage == egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)) {
+        return Some(request);
+    }
+    let intersection = coverage.intersect(request.source_uv_rect);
+    if !intersection.is_finite() || intersection.width() <= 0.0 || intersection.height() <= 0.0 {
+        return None;
+    }
+    let source_uv_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            (intersection.min.x - coverage.min.x) / coverage.width(),
+            (intersection.min.y - coverage.min.y) / coverage.height(),
+        ),
+        egui::pos2(
+            (intersection.max.x - coverage.min.x) / coverage.width(),
+            (intersection.max.y - coverage.min.y) / coverage.height(),
+        ),
+    );
+    let target_size = if intersection == request.source_uv_rect {
+        request.target_size
+    } else {
+        // Compatibility for callers without the coverage-aware geometry
+        // request. Ordinary paint prepares the already intersected pair.
+        [
+            (request.target_size[0] as f32 * intersection.width() / request.source_uv_rect.width())
+                .round()
+                .max(1.0) as u32,
+            (request.target_size[1] as f32 * intersection.height()
+                / request.source_uv_rect.height())
+            .round()
+            .max(1.0) as u32,
+        ]
+    };
+    Some(VisibleRegionRequest {
+        source_uv_rect,
+        target_size,
+    })
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TestPaintProvenance {
@@ -167,6 +230,8 @@ pub(crate) struct TestPaintProvenance {
 pub(crate) enum FullscreenPaintResource {
     Direct {
         source: egui::TextureHandle,
+        coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -176,6 +241,8 @@ pub(crate) enum FullscreenPaintResource {
         source_id: FullscreenPaintSourceId,
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
+        coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -187,6 +254,8 @@ pub(crate) enum FullscreenPaintResource {
         generation: FullscreenPaintSourceGeneration,
         smoothing_percent: u32,
         output: Arc<LanczosOutput>,
+        coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -224,6 +293,8 @@ impl FullscreenPaintResource {
             source_id: self.source_id(),
             generation: self.source_generation(),
             material,
+            coverage: self.source_coverage(),
+            display_basis: self.display_basis(),
             #[cfg(test)]
             test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
@@ -232,8 +303,12 @@ impl FullscreenPaintResource {
     }
 
     pub(crate) fn direct(source: egui::TextureHandle) -> Self {
+        let display_basis =
+            MaterialDisplayBasis::from_sampler(source.size(), SourceCoverage::FullSource);
         Self::Direct {
             source,
+            coverage: SourceCoverage::FullSource,
+            display_basis,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
@@ -266,10 +341,14 @@ impl FullscreenPaintResource {
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
     ) -> Self {
+        let display_basis =
+            MaterialDisplayBasis::from_sampler(source.size(), SourceCoverage::FullSource);
         Self::Resampleable {
             source_id,
             source,
             generation,
+            coverage: SourceCoverage::FullSource,
+            display_basis,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
@@ -282,6 +361,136 @@ impl FullscreenPaintResource {
             Self::Direct { source, .. }
             | Self::Resampleable { source, .. }
             | Self::Lanczos { source, .. } => source,
+        }
+    }
+
+    pub(crate) fn source_coverage(&self) -> SourceCoverage {
+        match self {
+            Self::Direct { coverage, .. }
+            | Self::Resampleable { coverage, .. }
+            | Self::Lanczos { coverage, .. } => *coverage,
+        }
+    }
+
+    /// Coverage is sampling metadata; changing it never re-resolves accepted fit values.
+    /// Initial partial-material acceptance supplies its basis with `with_display_basis`.
+    pub(crate) fn with_source_coverage(mut self, value: SourceCoverage) -> Self {
+        match &mut self {
+            Self::Direct { coverage, .. }
+            | Self::Resampleable { coverage, .. }
+            | Self::Lanczos { coverage, .. } => *coverage = value,
+        }
+        self
+    }
+
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        match self {
+            Self::Direct { display_basis, .. }
+            | Self::Resampleable { display_basis, .. }
+            | Self::Lanczos { display_basis, .. } => *display_basis,
+        }
+    }
+
+    pub(crate) fn with_display_basis(mut self, value: MaterialDisplayBasis) -> Self {
+        match &mut self {
+            Self::Direct { display_basis, .. }
+            | Self::Resampleable { display_basis, .. }
+            | Self::Lanczos { display_basis, .. } => *display_basis = value,
+        }
+        self
+    }
+
+    /// Full-image display basis, independent of a partial sampler's rounded
+    /// dimensions and canonical annotation coordinates. PDF layout and RAW
+    /// display policies remain separate inputs at their existing owners.
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
+    pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
+        self.original_display_dimensions().as_vec2()
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
+    }
+
+    pub(crate) fn paint_geometry(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            geometry.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_source_region(
+        &self,
+        painter: &egui::Painter,
+        full_image_rect: egui::Rect,
+        rotation: crate::rotation_db::Rotation,
+        free_rotation_rad: f32,
+        requested_source_rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            crate::displayed_image_transform::paint_source_coverage_texture(
+                painter,
+                self.paint_texture_id(),
+                full_image_rect,
+                rotation,
+                free_rotation_rad,
+                coverage,
+                requested_source_rect,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    pub(crate) fn paint_texture(
+        &self,
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            transform.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
         }
     }
 
@@ -464,7 +673,9 @@ impl FullscreenPaintResource {
                 ..
             } => {
                 let original =
-                    Self::resampleable_for_source(*source_id, source.clone(), *generation);
+                    Self::resampleable_for_source(*source_id, source.clone(), *generation)
+                        .with_source_coverage(self.source_coverage())
+                        .with_display_basis(self.display_basis());
                 #[cfg(test)]
                 let original = if let Some(proof) = self.test_paint_provenance().cloned() {
                     original.with_test_paint_provenance(proof)
@@ -489,6 +700,8 @@ impl FullscreenPaintResource {
             generation,
             smoothing_percent,
             output,
+            coverage: self.source_coverage(),
+            display_basis: self.display_basis(),
             #[cfg(test)]
             test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
@@ -568,6 +781,8 @@ pub(crate) struct FullscreenPresentationResource {
     source_id: Option<FullscreenPaintSourceId>,
     generation: Option<FullscreenPaintSourceGeneration>,
     material: PresentationMaterial,
+    coverage: SourceCoverage,
+    display_basis: MaterialDisplayBasis,
     #[cfg(test)]
     test_paint_provenance: Option<TestPaintProvenance>,
     #[cfg(all(windows, feature = "test-script"))]
@@ -585,6 +800,104 @@ enum PresentationMaterial {
 }
 
 impl FullscreenPresentationResource {
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        self.display_basis
+    }
+
+    pub(crate) fn source_coverage(&self) -> SourceCoverage {
+        self.coverage
+    }
+
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
+    pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
+        self.original_display_dimensions().as_vec2()
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
+    }
+
+    pub(crate) fn paint_geometry(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            geometry.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_source_region(
+        &self,
+        painter: &egui::Painter,
+        full_image_rect: egui::Rect,
+        rotation: crate::rotation_db::Rotation,
+        free_rotation_rad: f32,
+        requested_source_rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            crate::displayed_image_transform::paint_source_coverage_texture(
+                painter,
+                self.paint_texture_id(),
+                full_image_rect,
+                rotation,
+                free_rotation_rad,
+                coverage,
+                requested_source_rect,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    pub(crate) fn paint_texture(
+        &self,
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.coverage.source_uv_rect() {
+            transform.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
     /// Reuse only the native allocation ordinary preparation would request for
     /// this held source. A newly published source is deliberately not an input.
     pub(crate) fn matches_prepare(
@@ -602,7 +915,7 @@ impl FullscreenPresentationResource {
         let (Some(source_id), Some(generation)) = (self.source_id, self.generation) else {
             return false;
         };
-        let Some(key) = requested_lanczos_key(
+        let Some(key) = requested_covered_lanczos_key(
             source_id,
             self.source_texture_id,
             generation,
@@ -610,6 +923,7 @@ impl FullscreenPresentationResource {
             logical_scale,
             pixels_per_point,
             visible_region,
+            self.coverage,
             post_filter,
             smoothing_percent,
             anime_source_limit,
@@ -731,6 +1045,107 @@ impl From<FullscreenPaintResource> for FullscreenPaintPayload {
 }
 
 impl FullscreenPaintPayload {
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        match self {
+            Self::NormalResource(resource) => resource.display_basis(),
+            Self::PresentationMaterial(resource) => resource.display_basis(),
+        }
+    }
+
+    pub(crate) fn source_coverage(&self) -> SourceCoverage {
+        match self {
+            Self::NormalResource(resource) => resource.source_coverage(),
+            Self::PresentationMaterial(resource) => resource.source_coverage(),
+        }
+    }
+
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
+    pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
+        self.original_display_dimensions().as_vec2()
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
+    }
+
+    pub(crate) fn paint_geometry(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            geometry.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_source_region(
+        &self,
+        painter: &egui::Painter,
+        full_image_rect: egui::Rect,
+        rotation: crate::rotation_db::Rotation,
+        free_rotation_rad: f32,
+        requested_source_rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            crate::displayed_image_transform::paint_source_coverage_texture(
+                painter,
+                self.paint_texture_id(),
+                full_image_rect,
+                rotation,
+                free_rotation_rad,
+                coverage,
+                requested_source_rect,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    pub(crate) fn paint_texture(
+        &self,
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        match self {
+            Self::NormalResource(resource) => resource.paint_texture(transform, painter, tint),
+            Self::PresentationMaterial(resource) => {
+                resource.paint_texture(transform, painter, tint)
+            }
+        }
+    }
     pub(crate) fn capture_presentation(
         &self,
         ctx: &egui::Context,
@@ -1051,7 +1466,7 @@ fn resource_lanczos_key(
     anime_source_limit: AnimeUpscaleSourceLimit,
 ) -> Option<LanczosCacheKey> {
     let (source_id, source, generation) = resource.resampleable_parts()?;
-    requested_lanczos_key(
+    requested_covered_lanczos_key(
         source_id,
         source.id(),
         generation,
@@ -1059,6 +1474,7 @@ fn resource_lanczos_key(
         logical_scale,
         pixels_per_point,
         visible_region,
+        resource.source_coverage(),
         post_filter,
         smoothing_percent,
         anime_source_limit,
@@ -1136,6 +1552,133 @@ fn record_native_lookup(
 }
 
 /// Pure request identity shared by ordinary preparation and held native reuse.
+#[allow(clippy::too_many_arguments)]
+fn requested_covered_lanczos_key(
+    source_id: FullscreenPaintSourceId,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
+    source_size: [u32; 2],
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    coverage: SourceCoverage,
+    post_filter: PostFilter,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
+    let (scale_branch, target_size, source_region) = covered_sampler_request(
+        source_size,
+        logical_scale,
+        pixels_per_point,
+        visible_region,
+        coverage,
+        post_filter,
+    )?;
+    finish_requested_lanczos_key(
+        source_id,
+        source_texture_id,
+        generation,
+        source_size,
+        scale_branch,
+        target_size,
+        source_region,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+fn covered_sampler_request(
+    source_size: [u32; 2],
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    coverage: SourceCoverage,
+    post_filter: PostFilter,
+) -> Option<(FullscreenPaintScaleBranch, [u32; 2], LanczosSourceRegionKey)> {
+    if !coverage.is_partial() {
+        let scale_branch =
+            fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
+        if !scale_branch.uses_resampler() {
+            return None;
+        }
+        let (target, region) = target_and_source_region_for_branch(
+            source_size,
+            physical_scale(logical_scale, pixels_per_point),
+            scale_branch,
+            visible_region,
+        )?;
+        return Some((scale_branch, target, region));
+    }
+    if source_size.contains(&0) || !logical_scale.is_finite() || logical_scale <= 0.0 {
+        return None;
+    }
+    let source_extent = egui::vec2(source_size[0] as f32, source_size[1] as f32);
+    let material_extent =
+        original_display_dimensions([source_size[0] as usize, source_size[1] as usize], coverage)
+            .as_vec2()
+            * coverage.source_uv_rect()?.size();
+    // Sampling density can differ on each axis after integer thumbnail resize.
+    // It affects output texels/filter choice, never fit, contain or page aspect.
+    let sampler_scale = material_extent / source_extent * logical_scale;
+    let branch_x = fullscreen_paint_scale_branch(sampler_scale.x, pixels_per_point, post_filter);
+    let branch_y = fullscreen_paint_scale_branch(sampler_scale.y, pixels_per_point, post_filter);
+    let scale_branch = if branch_x == FullscreenPaintScaleBranch::OriginalOneToOne
+        && branch_y == FullscreenPaintScaleBranch::OriginalOneToOne
+    {
+        FullscreenPaintScaleBranch::OriginalOneToOne
+    } else if physical_scale(sampler_scale.max_elem(), pixels_per_point) <= 1.0 + 1.0e-4 {
+        FullscreenPaintScaleBranch::DownscaleLanczos
+    } else {
+        fullscreen_paint_scale_branch(sampler_scale.max_elem(), pixels_per_point, post_filter)
+    };
+    if !scale_branch.uses_resampler() {
+        return None;
+    }
+    let (target_size, source_region) =
+        if scale_branch == FullscreenPaintScaleBranch::DownscaleLanczos {
+            let scale = physical_scale(logical_scale, pixels_per_point);
+            (
+                [
+                    physical_pixel_extent(material_extent.x, scale).min(source_size[0]),
+                    physical_pixel_extent(material_extent.y, scale).min(source_size[1]),
+                ],
+                LanczosSourceRegionKey::Full,
+            )
+        } else {
+            target_and_source_region_for_branch(
+                source_size,
+                1.0,
+                scale_branch,
+                sampler_visible_region(coverage, visible_region),
+            )?
+        };
+    Some((scale_branch, target_size, source_region))
+}
+
+fn anime_material_source_dimensions(
+    source_size: [usize; 2],
+    coverage: SourceCoverage,
+    geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+    pixels_per_point: f32,
+) -> Option<[u32; 2]> {
+    let source_size = [source_size[0] as u32, source_size[1] as u32];
+    let request = geometry
+        .visible_region_request_for_coverage(geometry.viewport_rect, coverage.source_uv_rect()?);
+    let (branch, _, region) = covered_sampler_request(
+        source_size,
+        geometry.total_scale,
+        pixels_per_point,
+        request,
+        coverage,
+        PostFilter::UpscaleAnime,
+    )?;
+    if branch != FullscreenPaintScaleBranch::UpscaleAnime {
+        return None;
+    }
+    anime_source_region_dimensions(source_size, region.visible_rect()?)
+}
+
+/// Full-source requests retain the established sampler sizing contract.
 fn requested_lanczos_key(
     source_id: FullscreenPaintSourceId,
     source_texture_id: egui::TextureId,
@@ -1158,6 +1701,31 @@ fn requested_lanczos_key(
         scale_branch,
         visible_region,
     )?;
+    finish_requested_lanczos_key(
+        source_id,
+        source_texture_id,
+        generation,
+        source_size,
+        scale_branch,
+        target_size,
+        source_region,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_requested_lanczos_key(
+    source_id: FullscreenPaintSourceId,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
+    source_size: [u32; 2],
+    scale_branch: FullscreenPaintScaleBranch,
+    target_size: [u32; 2],
+    source_region: LanczosSourceRegionKey,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
     let scale_branch = scale_branch_with_anime_source_limit(
         scale_branch,
         source_size,
@@ -1531,16 +2099,10 @@ impl GpuLanczosCache {
         let smoothing_percent =
             crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
         self.sync_smoothing_percent(smoothing_percent);
-        let scale_branch =
-            fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
-        if resource.resampleable_parts().is_none() || !scale_branch.uses_resampler() {
+        if resource.resampleable_parts().is_none() {
             record_native_lookup(render_state, resource, None, "not_needed");
             return (resource.original_resampleable(), None);
         }
-        let Some(render_state) = render_state else {
-            record_native_lookup(None, resource, None, "no_renderer");
-            return (resource.original_resampleable(), None);
-        };
         let (source_id, source, generation) = resource.resampleable_parts().unwrap();
         let source_size = [source.size()[0] as u32, source.size()[1] as u32];
         let Some(key) = resource_lanczos_key(
@@ -1552,7 +2114,11 @@ impl GpuLanczosCache {
             smoothing_percent,
             anime_source_limit,
         ) else {
-            record_native_lookup(Some(render_state), resource, None, "not_needed");
+            record_native_lookup(render_state, resource, None, "not_needed");
+            return (resource.original_resampleable(), None);
+        };
+        let Some(render_state) = render_state else {
+            record_native_lookup(None, resource, None, "no_renderer");
             return (resource.original_resampleable(), None);
         };
         let fallback_source = LanczosFallbackSourceKey {
@@ -3119,6 +3685,459 @@ mod tests {
             FullscreenPaintScaleBranch::OriginalOneToOne
         );
         assert!(physical_scale_is_near_integer(0.5, 2.0));
+    }
+
+    #[test]
+    fn display_basis_survives_native_capture_payload_and_original_reconstruction() {
+        use crate::{
+            fullscreen_specified_scale::FullscreenFitBasis,
+            material_display_basis::{MaterialDisplayView, MaterialLegacyBasis},
+        };
+
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "display-basis-resource",
+            egui::ColorImage::filled([60, 80], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let partial = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(15000, 20000),
+                (6143, 8192),
+                (1000, 500, 3000, 6000),
+            )
+            .unwrap(),
+        );
+        let whole_basis = MaterialDisplayBasis::new(
+            MaterialLegacyBasis::Raster {
+                layout_size: egui::vec2(60.0, 80.0),
+                original: DisplayOriginalDimensions::new(60, 80),
+            },
+            MaterialLegacyBasis::Raster {
+                layout_size: egui::vec2(6144.0, 8192.0),
+                original: DisplayOriginalDimensions::new(6144, 8192),
+            },
+            MaterialLegacyBasis::SourceLayout {
+                basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                    layout_size: egui::vec2(15000.0, 20000.0),
+                    reference_size: egui::vec2(15000.0, 20000.0),
+                },
+            },
+            Ok(
+                FullscreenFitBasis::new(egui::vec2(6144.0, 8192.0), egui::vec2(6144.0, 8192.0))
+                    .unwrap(),
+            ),
+        );
+        for (coverage, basis) in [
+            (SourceCoverage::FullSource, whole_basis),
+            (
+                partial,
+                MaterialDisplayBasis::from_sampler(texture.size(), partial),
+            ),
+        ] {
+            let direct = FullscreenPaintResource::direct(texture.clone())
+                .with_source_coverage(coverage)
+                .with_display_basis(basis);
+            let original = FullscreenPaintResource::resampleable(
+                2,
+                texture.clone(),
+                FullscreenPaintSourceGeneration { items: 4, input: 7 },
+            )
+            .with_source_coverage(coverage)
+            .with_display_basis(basis);
+            let native = test_native_resource(original.clone(), [30, 40]);
+            for resource in [
+                direct,
+                original,
+                native.clone(),
+                native.original_resampleable(),
+            ] {
+                assert_eq!(resource.display_basis(), basis);
+                let payload = FullscreenPaintPayload::NormalResource(resource.clone());
+                assert_eq!(payload.display_basis(), basis);
+                let captured = payload.capture_presentation(&ctx);
+                assert_eq!(captured.display_basis(), basis);
+                let held = FullscreenPaintPayload::PresentationMaterial(captured);
+                assert_eq!(held.display_basis(), basis);
+                assert_eq!(held.capture_presentation(&ctx).display_basis(), basis);
+                for view in [
+                    MaterialDisplayView::Single,
+                    MaterialDisplayView::Spread,
+                    MaterialDisplayView::Continuous,
+                ] {
+                    assert_eq!(held.display_basis().legacy(view), basis.legacy(view));
+                }
+                assert_eq!(held.display_basis().specified(), basis.specified());
+                assert_eq!(
+                    resource
+                        .with_source_coverage(SourceCoverage::Unknown)
+                        .display_basis(),
+                    basis,
+                    "coverage changes must never reinterpret an accepted fit descriptor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_coverage_survives_native_capture_payload_and_original_fallback() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "coverage-resource",
+            egui::ColorImage::filled([80, 60], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1200, 800),
+                (600, 400),
+                (100, 50, 400, 300),
+            )
+            .unwrap(),
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            2,
+            texture.clone(),
+            FullscreenPaintSourceGeneration { items: 4, input: 7 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(
+            resource.original_display_dimensions().as_tuple(),
+            (600, 400)
+        );
+        assert!((resource.full_source_size_vec2() - egui::vec2(600.0, 400.0)).length() < 0.001);
+        let native_roi = egui::Rect::from_min_max(egui::pos2(0.125, 0.25), egui::pos2(0.875, 0.75));
+        let native = test_native_resource_with_region(resource.clone(), [120, 60], native_roi);
+        for resource in [
+            resource,
+            native.clone(),
+            native.original_resampleable(),
+            FullscreenPaintResource::direct(texture).with_source_coverage(coverage),
+        ] {
+            assert_eq!(resource.source_coverage(), coverage);
+            let captured = resource.capture_presentation(&ctx);
+            assert_eq!(captured.source_coverage(), coverage);
+            assert_eq!(
+                captured.original_display_dimensions(),
+                resource.original_display_dimensions()
+            );
+            assert_eq!(
+                captured.full_source_size_vec2(),
+                resource.full_source_size_vec2()
+            );
+            let payload = FullscreenPaintPayload::PresentationMaterial(captured);
+            assert_eq!(payload.source_coverage(), coverage);
+            assert_eq!(
+                payload.original_display_dimensions(),
+                resource.original_display_dimensions()
+            );
+            assert_eq!(
+                payload.capture_presentation(&ctx).source_coverage(),
+                coverage
+            );
+        }
+        assert_eq!(
+            native.visible_source_uv_rect(),
+            Some(native_roi),
+            "native ROI remains sampler-local"
+        );
+    }
+
+    #[test]
+    fn source_coverage_native_request_uses_sampler_coordinates_and_physical_material_extent() {
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1200, 800),
+                (600, 400),
+                (150, 100, 300, 200),
+            )
+            .unwrap(),
+        );
+        let request = VisibleRegionRequest {
+            source_uv_rect: egui::Rect::from_min_max(egui::pos2(0.5, 0.25), egui::pos2(0.75, 0.75)),
+            target_size: [375, 500],
+        };
+        let sampler = sampler_visible_region(coverage, Some(request)).unwrap();
+        assert_eq!(
+            sampler.source_uv_rect,
+            egui::Rect::from_min_max(egui::pos2(0.5, 0.0), egui::pos2(1.0, 1.0))
+        );
+        assert_eq!(sampler.target_size, [375, 500]);
+        let outside = VisibleRegionRequest {
+            source_uv_rect: egui::Rect::from_min_max(egui::pos2(0.9, 0.0), egui::pos2(1.0, 1.0)),
+            target_size: [100, 100],
+        };
+        assert!(sampler_visible_region(coverage, Some(outside)).is_none());
+    }
+
+    #[test]
+    fn source_coverage_original_basis_uses_uncropped_gpu_raster_and_keeps_coordinate_units_separate()
+     {
+        let ctx = egui::Context::default();
+        let coordinate_dims = crate::page_dims::CanonicalPageDimensions::new(20000, 15000);
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                coordinate_dims,
+                (8192, 6144),
+                (3840, 0, 256, 6144),
+            )
+            .unwrap(),
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            metadata_only_texture(&ctx, [11, 256], egui::TextureOptions::LINEAR),
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(coverage.coordinate_dims(), Some(coordinate_dims));
+        assert_eq!(
+            resource.original_display_dimensions(),
+            DisplayOriginalDimensions::new(8192, 6144)
+        );
+        assert_eq!(resource.full_source_size_vec2(), egui::vec2(8192.0, 6144.0));
+        let raw = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [8192, 6144],
+            egui::TextureOptions::LINEAR,
+        ));
+        assert_eq!(
+            resource.original_display_dimensions(),
+            raw.original_display_dimensions()
+        );
+        // Native density must use the same uncropped raster basis: the source
+        // coordinate dimensions would incorrectly request an upscale here.
+        let key = resource_lanczos_key(
+            &resource,
+            0.032,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [10, 245]);
+        let native = test_native_resource(resource.clone(), [10, 245]);
+        assert_eq!(
+            native.original_resampleable().original_display_dimensions(),
+            resource.original_display_dimensions()
+        );
+        assert_eq!(
+            native
+                .capture_presentation(&ctx)
+                .original_display_dimensions(),
+            resource.original_display_dimensions()
+        );
+    }
+
+    #[test]
+    fn source_coverage_full_source_and_uncropped_known_keep_actual_texture_original_basis_after_ai()
+    {
+        let ctx = egui::Context::default();
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1000, 750),
+                (1000, 750),
+                (0, 0, 1000, 750),
+            )
+            .unwrap(),
+        );
+        let ordinary = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [128, 96],
+            egui::TextureOptions::LINEAR,
+        ))
+        .with_source_coverage(coverage);
+        assert_eq!(ordinary.original_display_dimensions().as_tuple(), (128, 96));
+        assert_eq!(ordinary.full_source_size_vec2(), egui::vec2(128.0, 96.0));
+        let after_ai = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [4000, 3000],
+            egui::TextureOptions::LINEAR,
+        ));
+        assert_eq!(
+            after_ai.original_display_dimensions().as_tuple(),
+            (4000, 3000)
+        );
+        assert_eq!(
+            after_ai
+                .capture_presentation(&ctx)
+                .original_display_dimensions(),
+            after_ai.original_display_dimensions()
+        );
+    }
+
+    #[test]
+    fn source_coverage_thin_rounded_sampler_keeps_canonical_aspect_and_native_pixel_density_separate()
+     {
+        let ctx = egui::Context::default();
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(800, 600),
+                (800, 600),
+                (390, 0, 20, 600),
+            )
+            .unwrap(),
+        );
+        let source = ctx.load_texture(
+            "thin-rounded",
+            egui::ColorImage::filled([9, 256], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            source,
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(resource.full_source_size_vec2(), egui::vec2(800.0, 600.0));
+        assert_eq!(resource.size(), [9, 256]);
+        // At 0.4 physical px per canonical px the rounded 9x256 sampler
+        // downsamples to 8x240, even though scalar 0.4 is not its texel scale.
+        let key = resource_lanczos_key(
+            &resource,
+            0.32,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [8, 240]);
+        assert_eq!(key.source_region, LanczosSourceRegionKey::Full);
+        // At this boundary the height is 1:1 while the rounded narrow axis
+        // still shrinks. The maximum axis alone must not bypass resampling.
+        let key = resource_lanczos_key(
+            &resource,
+            (256.0 / 600.0) / 1.25,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [8, 256]);
+        // Height crosses into upscale first, while width remains below 1:1.
+        // Output dimensions remain the geometry-owned pair for both axes.
+        let mixed_request = VisibleRegionRequest {
+            source_uv_rect: coverage.source_uv_rect().unwrap(),
+            target_size: [9, 264],
+        };
+        let mixed = resource_lanczos_key(
+            &resource,
+            0.44 / 1.25,
+            1.25,
+            Some(mixed_request),
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.scale_branch,
+            FullscreenPaintScaleBranch::UpscaleLanczos
+        );
+        assert_eq!(mixed.target_size, [9, 264]);
+        assert!(work_plan_for_key([9, 256], mixed).is_ok());
+        for ppp in [1.25, 1.375, 1.5] {
+            let geometry = crate::displayed_image_transform::DisplayedImageGeometry::resolve(
+                crate::displayed_image_transform::DisplayedImageGeometryInput {
+                    viewport_rect: egui::Rect::from_min_size(
+                        egui::pos2(13.0, 17.0),
+                        egui::vec2(1003.0, 747.0),
+                    ),
+                    source_size: egui::vec2(800.0, 600.0),
+                    texture_size: resource.full_source_size_vec2(),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    pixels_per_point: ppp,
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                },
+            )
+            .unwrap();
+            let request = resource
+                .visible_region_request(&geometry, geometry.viewport_rect)
+                .unwrap();
+            assert_eq!(
+                resource.anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256]),
+                "Anime budget uses the actual sampler, not the 800x600 geometry basis"
+            );
+            let held = resource.capture_presentation(&ctx);
+            assert_eq!(
+                held.anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256])
+            );
+            assert_eq!(
+                FullscreenPaintPayload::PresentationMaterial(held)
+                    .anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256])
+            );
+            let key = resource_lanczos_key(
+                &resource,
+                geometry.total_scale,
+                ppp,
+                Some(request),
+                PostFilter::None,
+                25,
+                AnimeUpscaleSourceLimit::default(),
+            )
+            .unwrap();
+            assert_eq!(key.scale_branch, FullscreenPaintScaleBranch::UpscaleLanczos);
+            assert_eq!(
+                key.target_size, request.target_size,
+                "native output uses the geometry-owned physical span"
+            );
+            assert_eq!(
+                key.source_region.visible_rect().unwrap(),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+            );
+            let native = resource.with_lanczos(
+                Arc::new(LanczosOutput {
+                    texture_id_lease: NativeTextureIdLease {
+                        texture_id: egui::TextureId::User(900_000),
+                        releaser: Arc::new(CountingReleaser(AtomicUsize::new(0))),
+                    },
+                    key,
+                    _texture: None,
+                }),
+                key.smoothing_percent,
+            );
+            assert!(
+                native.capture_presentation(&ctx).matches_prepare(
+                    geometry.total_scale,
+                    ppp,
+                    Some(request),
+                    PostFilter::None,
+                    25,
+                    AnimeUpscaleSourceLimit::default()
+                ),
+                "native capture and normal preparation must use the same sampling density"
+            );
+        }
     }
 
     #[test]

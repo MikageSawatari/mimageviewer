@@ -31,6 +31,31 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 
 ## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）
 
+§1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）は編集 preview の既存 worker が
+切り出し前 raster と実 `pixel_bounds` から生成由来を作り、WebP 参照と同じ DB upsert で保存する。
+released v6 の nullable coverage migration では旧行を保持する。crop DB の更新と preview Delete
+の間を新しい待機や共有 transaction で同期させず、preview 自身の generation-time metadata を
+thumbnail 応答／CPU 下地／既存 paint・presentation resource に継承する。
+PDF page-box は既知の cache 値を coverage と独立の nullable layout 列へ同時保存し、preview hit
+から復元する。通常画像／旧行は `None`。早期 preview のために追加の PDF IPC／待機は入れない。
+読み込み側は現在 crop から範囲を再構成せず、旧 Unknown の表示可否だけを共通 typed policy で解く。
+metadata は nullable `metadata_content_hash` により対応する WebP 生成物へ束縛する。
+worker は cached_path の hash が不一致／束縛なしなら Unknown／layout None として読み、
+旧 writer が新列を残して画像を上書きしても古い由来を採用しない。UI thread に I/O を追加しない。
+thumbnailのworker受理では、source寸法・coverageと共通GPU clamp規則から不変の表示基準を
+確定しLoadedへ保持する。派生workerのpending／結果、CPU下地、通過素材も実入力ownerの
+`MaterialDisplayBasis` を継承する。selectorは素材のまま返し、保持後の退去でidxから寸法を
+引き直さない。現在cropのUnknown利用許可は選択時に判定し、受理値へ固定しない。
+旧catalog行の通常thumbnailでsource寸法が省略されている場合は、指定倍率も既存のsampler契約で
+受理する。RAW旧行は受理済みRawInfoを使い、thumbnail先着時もRawInfo／preview受理境界で
+live descriptorを再受理する。PDFと共通のpublish処理で、その変更に依存する通過素材だけを退役する。
+
+snapshot capture・保持・再描画も同じ resource と由来を保持する。mount／park／promote の所有移譲、
+context の要求世代／取消／channel、兄弟 context の cache は既存 owner のままである。
+追加の idx map、全 context reset、失効 ACK 待機、専用 worker は作らない。まれな DB／保存失敗は
+既定の割り切り（ログ＋既存通知・単純な作り直し）とする。幾何・互換契約は
+[表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ) を参照。
+
 画像producerと通常GPU prepareの実行配置は従来どおりで、演出用workerや待機queueを作らない。
 安定viewでは既存bindと共有するview比較と通常cache keyでNativeの需要一致を確認して出力を再利用する。
 品質publication後の新sourceのresampleは従来どおりthaw後に始め、view/key変更時は通常prepareへ進む。
@@ -1196,6 +1221,13 @@ permit を保持する。cancel だけで枠を返さないため、取消済み
 通常の先読みは context の有限な prefetch window、直接シークは後述の latest-only、
 順送りは既存の typed navigation sequence の受理境界で増加を止める。同じ idx の重複は
 `fs_pending` の map key で合流する。
+
+PDF 再レンダは同じ idx でも解像度が変わるため、`FsPendingValue::pdf_rerender` に
+source key・target_px・PDF pool priority を載せる。`request_pdf_rerender_at_target` が
+同じ source/target の生きた要求へ合流し、Critical が Normal 需要も満たす。
+Normal → Critical は一度だけ置き換える。異なる source/target と取消済み ticket は置き換える。
+identity の寿命は receiver / ticket と同じで、viewer bundle の交換にも一緒に付いていく。
+snapshot の既存 cancel / 再ロードでも古い identity は残らない。第二の index や時間窓は作らない。
 
 Normal の先読みが表示対象になった場合は同じ ticket を High に昇格し、待機順だけを変える。
 順送りは `Sequential` として受理済み target を supersede せず、シークバー / Home / End 等の

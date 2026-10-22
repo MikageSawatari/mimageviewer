@@ -1162,18 +1162,19 @@ fn send_activation_open_path(app: &App, path: PathBuf) {
 }
 
 fn mutation_refresh_loaded_thumb(ctx: &egui::Context) -> ThumbnailState {
-    ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    ThumbnailState::loaded_raster(
+        ctx.load_texture(
             "pin-refresh-test",
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             Default::default(),
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        rendered_at_px: 1,
-        source_dims: None,
-        layout_dims: None,
-    }
+        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        1,
+        crate::source_coverage::SourceCoverage::FullSource,
+        None,
+        None,
+    )
 }
 
 // Manual terminal fixtures use the same worker preparation as production, with a captured owner.
@@ -4890,19 +4891,22 @@ fn metadata_import_keeps_unaffected_thumb_adjustment() {
         GridItem::Image("C:/pics/import-untouched.jpg".into()),
     ];
     app.thumbnails = (0..2)
-        .map(|idx| ThumbnailState::Loaded {
-            tex: ctx.load_texture(
-                format!("import_original_{idx}"),
-                egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
-                egui::TextureOptions::LINEAR,
-            ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                evaluated_display_px: 1,
-            },
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
+        .map(|idx| {
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
+                    format!("import_original_{idx}"),
+                    egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
+                    egui::TextureOptions::LINEAR,
+                ),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1, 1)),
+                None,
+            )
         })
         .collect();
     for idx in 0..2 {
@@ -6179,6 +6183,8 @@ fn phase_a_seed_shared_preview() -> (phase_c_support::AppTestEnv, PathBuf, Strin
         1,
         5,
         None,
+        crate::page_dims::CanonicalPageDimensions::new(2, 2),
+        None,
         Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
         None,
         None,
@@ -6285,10 +6291,10 @@ fn phase_a_missing_comic_fonts_close_preserves_shared_preview() {
     let edit_key = app.current_edit_result_key(0);
     app.edit_result_cache.insert(
         edit_key,
-        EditResultEntry {
-            pixels: Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
-            texture: None,
-        },
+        EditResultEntry::raster(
+            Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
+            None,
+        ),
     );
     assert!(matches!(
         app.snapshot_edit_preview_close_update(0),
@@ -7413,16 +7419,17 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
             if idx == 0 {
                 ThumbnailState::Pending
             } else {
-                ThumbnailState::Loaded {
-                    tex: portrait_tex.clone(),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                ThumbnailState::loaded_raster(
+                    portrait_tex.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 2,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 2,
-                    source_dims: Some((900, 1400)),
-                    layout_dims: None,
-                }
+                    false,
+                    2,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((900, 1400)),
+                    None,
+                )
             }
         })
         .collect();
@@ -7435,6 +7442,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: landscape_tex,
             pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
             source_dims: Some([1800, 1100]),
@@ -7486,15 +7494,18 @@ fn spread_units_rebuild_only_when_saved_rotation_changes_landscape_state() {
         egui::TextureOptions::LINEAR,
     );
     app.thumbnails = (0..app.items.len())
-        .map(|_| ThumbnailState::Loaded {
-            tex: portrait_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                evaluated_display_px: 2,
-            },
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_dims: Some((600, 900)),
-            layout_dims: None,
+        .map(|_| {
+            ThumbnailState::loaded_raster(
+                portrait_tex.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 2,
+                },
+                false,
+                2,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((600, 900)),
+                None,
+            )
         })
         .collect();
     let nav = (0..app.items.len()).collect::<Vec<_>>();
@@ -7631,6 +7642,7 @@ fn spread_dimension_discovery_rebuilds_only_for_landscape() {
     app.fs_cache.insert(
         5,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: ctx.load_texture(
                 "spread_cache_fs_landscape",
                 egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
@@ -10799,13 +10811,16 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
         egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
         egui::TextureOptions::LINEAR,
     );
-    let loaded = || ThumbnailState::Loaded {
-        tex: texture.clone(),
-        origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-        from_edit_preview: true,
-        rendered_at_px: 64,
-        source_dims: Some((1, 1)),
-        layout_dims: None,
+    let loaded = || {
+        ThumbnailState::loaded_raster(
+            texture.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            true,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        )
     };
     let prepare_context = |bundle: &mut App, path: &str| {
         bundle.items = vec![GridItem::Image(PathBuf::from(path))];
@@ -22231,14 +22246,15 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(old.clone());
         app.install_new_items(vec![GridItem::Image(old.join("page.png"))], vec![None]);
         app.visible_indices = vec![0];
-        app.thumbnails[0] = crate::grid_item::ThumbnailState::Loaded {
-            tex: texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_dims: None,
-            layout_dims: None,
-        };
+        app.thumbnails[0] = crate::grid_item::ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        );
         app.fullscreen_idx = Some(0);
         app.fs_viewport_shown = true;
         let path = app
@@ -30665,16 +30681,17 @@ mod phase_c_drill_nav_tests {
             let pixels = Arc::new(image.clone());
             let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
             (
-                ThumbnailState::Loaded {
+                ThumbnailState::loaded_raster(
                     tex,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 64,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 64,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                },
+                    false,
+                    64,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((1, 1)),
+                    None,
+                ),
                 pixels,
             )
         }
@@ -30780,20 +30797,21 @@ mod phase_c_drill_nav_tests {
         // 編集プレビュー由来は identity でも下地 + 注釈で組み直す。
         app.thumb_edit_preview_layers
             .insert(0, std::sync::Arc::new(Vec::new()));
-        app.thumbnails[0] = ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        app.thumbnails[0] = ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "edit_preview_original",
                 egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
                 egui::TextureOptions::LINEAR,
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 2,
             },
-            from_edit_preview: true,
-            rendered_at_px: 2,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-        };
+            true,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 2)),
+            None,
+        );
         app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(
             app.thumb_adjust_tex.contains_key(&0),
@@ -30814,20 +30832,21 @@ mod phase_c_drill_nav_tests {
         app.settings.global_preset.brightness = 20.0;
         app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(app.thumb_adjust_tex.is_empty());
-        app.thumbnails[0] = ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        app.thumbnails[0] = ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "tray_restored_original",
                 egui::ColorImage::filled([2, 2], egui::Color32::GRAY),
                 egui::TextureOptions::LINEAR,
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 2,
             },
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-        };
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 2)),
+            None,
+        );
         app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(app.thumb_adjust_tex.contains_key(&0));
     }
@@ -30903,15 +30922,18 @@ mod phase_c_drill_nav_tests {
                 egui::TextureOptions::LINEAR,
             );
             app.thumbnails = (0..cells)
-                .map(|_| ThumbnailState::Loaded {
-                    tex: original_tex.clone(),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                        evaluated_display_px: side as u32,
-                    },
-                    from_edit_preview: false,
-                    rendered_at_px: side as u32,
-                    source_dims: Some((side as u32, side as u32)),
-                    layout_dims: None,
+                .map(|_| {
+                    ThumbnailState::loaded_raster(
+                        original_tex.clone(),
+                        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                            evaluated_display_px: side as u32,
+                        },
+                        false,
+                        side as u32,
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        Some((side as u32, side as u32)),
+                        None,
+                    )
                 })
                 .collect();
             app.thumb_pixels.clear();
@@ -35002,6 +35024,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR),
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some(size),
@@ -35028,11 +35051,7 @@ mod favorite_adjustment_defaults_tests {
         let texture = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels,
-                texture,
-                generation: app.conceal_generation,
-            },
+            ConcealCacheEntry::raster(pixels, texture, app.conceal_generation),
         );
     }
 
@@ -35051,7 +35070,7 @@ mod favorite_adjustment_defaults_tests {
                 input_gen: 0,
                 mask_gen: 0,
             },
-            EraseResultCacheEntry { pixels, texture },
+            EraseResultCacheEntry::raster(pixels, texture),
         );
     }
 
@@ -35067,10 +35086,7 @@ mod favorite_adjustment_defaults_tests {
         let key = app.current_erase_result_key(idx);
         app.erase_result_cache.insert(
             key,
-            EraseResultCacheEntry {
-                pixels: std::sync::Arc::clone(&pixels),
-                texture,
-            },
+            EraseResultCacheEntry::raster(std::sync::Arc::clone(&pixels), texture),
         );
         pixels
     }
@@ -35997,18 +36013,18 @@ mod favorite_adjustment_defaults_tests {
         insert_stale_conceal_cache(&mut app, &ctx, idx_a, "erase_conceal_stale");
         app.erase_base_cache.insert(
             idx_a,
-            std::sync::Arc::new(egui::ColorImage::new(
+            crate::app::EraseBaseSource::raster(std::sync::Arc::new(egui::ColorImage::new(
                 [1, 1],
                 vec![egui::Color32::LIGHT_BLUE],
-            )),
+            ))),
         );
         app.erase_base_tex_cache.insert(
             idx_a,
-            ctx.load_texture(
+            crate::gpu_lanczos::FullscreenPaintResource::direct(ctx.load_texture(
                 "erase_base_tex_stale",
                 egui::ColorImage::new([1, 1], vec![egui::Color32::LIGHT_BLUE]),
                 egui::TextureOptions::LINEAR,
-            ),
+            )),
         );
 
         app.delete_erase_masks_from_selection();
@@ -38104,14 +38120,15 @@ mod favorite_adjustment_defaults_tests {
         );
         app.items.push(GridItem::Image(PathBuf::from("c:/p/a.jpg")));
         app.image_metas.push(Some((10, 20)));
-        app.thumbnails.push(ThumbnailState::Loaded {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: true,
-            rendered_at_px: 64,
-            source_dims: Some((4000, 3000)),
-            layout_dims: None,
-        });
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            true,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((4000, 3000)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -38199,14 +38216,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([64, 64], egui::Color32::LIGHT_BLUE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails.push(ThumbnailState::Loaded {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((1920, 1080)),
-            layout_dims: None,
-        });
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1920, 1080)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -38276,14 +38294,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([64, 64], egui::Color32::LIGHT_BLUE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails.push(ThumbnailState::Loaded {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((4000, 3000)),
-            layout_dims: None,
-        });
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((4000, 3000)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -38336,14 +38355,15 @@ mod favorite_adjustment_defaults_tests {
         );
         app.items.push(GridItem::Image(image_path.clone()));
         app.image_metas.push(Some((10, 20)));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: cached_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 496,
-            source_dims: Some((884, 444)),
-            layout_dims: None,
-        });
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            cached_texture,
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            496,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((884, 444)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -38653,16 +38673,17 @@ mod favorite_adjustment_defaults_tests {
         app.items
             .push(GridItem::Image(PathBuf::from(r"c:\pics\wide.png")));
         app.image_metas.push(Some((10, 20)));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: initial_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            initial_texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 400,
             },
-            from_edit_preview: false,
-            rendered_at_px: 400,
-            source_dims: Some((884, 444)),
-            layout_dims: None,
-        });
+            false,
+            400,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((884, 444)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -39576,20 +39597,21 @@ mod favorite_adjustment_defaults_tests {
             label: &str,
             source_dims: (u32, u32),
         ) -> ThumbnailState {
-            ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     label,
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some(source_dims),
-                layout_dims: None,
-            }
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some(source_dims),
+                None,
+            )
         }
 
         let ctx = egui::Context::default();
@@ -39641,20 +39663,21 @@ mod favorite_adjustment_defaults_tests {
             label: &str,
             source_dims: (u32, u32),
         ) -> ThumbnailState {
-            ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     label,
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some(source_dims),
-                layout_dims: None,
-            }
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some(source_dims),
+                None,
+            )
         }
 
         let ctx = egui::Context::default();
@@ -39942,16 +39965,17 @@ mod favorite_adjustment_defaults_tests {
             name: &str,
             source_dims: (u32, u32),
         ) -> ThumbnailState {
-            ThumbnailState::Loaded {
-                tex: ctx.load_texture(name, egui::ColorImage::example(), Default::default()),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(name, egui::ColorImage::example(), Default::default()),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some(source_dims),
-                layout_dims: None,
-            }
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some(source_dims),
+                None,
+            )
         }
 
         let ctx = egui::Context::default();
@@ -40051,20 +40075,21 @@ mod favorite_adjustment_defaults_tests {
                 .push(GridItem::Image(std::path::PathBuf::from(format!(
                     "c:/rtl/{k}.jpg"
                 ))));
-            app.thumbnails.push(ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails.push(ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     &format!("split-rtl-{k}"),
                     egui::ColorImage::example(),
                     Default::default(),
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some((1600, 900)),
-                layout_dims: None,
-            });
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1600, 900)),
+                None,
+            ));
         }
         app.visible_indices = (0..2).collect();
         app.viewer_navigation_caches.invalidate();
@@ -40106,20 +40131,21 @@ mod favorite_adjustment_defaults_tests {
                 .push(GridItem::Image(std::path::PathBuf::from(format!(
                     "c:/free/{k}.jpg"
                 ))));
-            app.thumbnails.push(ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails.push(ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     &format!("split-free-{k}"),
                     egui::ColorImage::example(),
                     Default::default(),
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some((1600, 900)),
-                layout_dims: None,
-            });
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1600, 900)),
+                None,
+            ));
         }
         app.visible_indices = (0..2).collect();
         app.viewer_navigation_caches.invalidate();
@@ -44458,14 +44484,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[0] = ThumbnailState::Loaded {
-            tex: texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: None,
-            layout_dims: None,
-        };
+        app.thumbnails[0] = ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        );
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
             state: crate::app::ConvertedArchiveSourceState::CachedZip {
@@ -45404,15 +45431,18 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        let loaded = || ThumbnailState::Loaded {
-            tex: tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                evaluated_display_px: 1,
-            },
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
+        let loaded = || {
+            ThumbnailState::loaded_raster(
+                tex.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1, 1)),
+                None,
+            )
         };
         app.thumbnails = vec![loaded(), loaded()];
         app.requested.insert(0, false);
@@ -47264,14 +47294,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             Default::default(),
         );
-        app.thumbnails[idx] = ThumbnailState::Loaded {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: true,
-            rendered_at_px: 128,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-        };
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            true,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        );
         let preview_key = "c:/test/outer.zip::book/page1.jpg".to_owned();
         app.thumb_edit_preview_keys.insert(idx, preview_key.clone());
 
@@ -47384,6 +47415,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_spread_left",
                     left_pixels.clone(),
@@ -47398,6 +47430,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_spread_right",
                     right_pixels.clone(),
@@ -47809,6 +47842,7 @@ mod favorite_adjustment_defaults_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: std::sync::Arc::new(px),
                     source_dims: None,
@@ -47909,6 +47943,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: new_tex,
                 pixels: std::sync::Arc::new(egui::ColorImage::new(
                     [1, 1],
@@ -47936,16 +47971,17 @@ mod favorite_adjustment_defaults_tests {
             egui::TextureOptions::LINEAR,
         );
         let texture_id = texture.id();
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 3)),
-            layout_dims: None,
-        };
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 3)),
+            None,
+        );
         app.visible_indices = vec![idx];
         app.spread_mode = crate::settings::SpreadMode::Single;
 
@@ -47974,6 +48010,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 7], egui::Color32::WHITE)),
                 source_dims: Some([400, 700]),
@@ -48012,7 +48049,15 @@ mod favorite_adjustment_defaults_tests {
             crate::rotation_db::Rotation::Cw90,
             "holdover geometry must be the capture-time old-item geometry"
         );
-        assert_eq!(held.pages[0].layout_size, egui::vec2(400.0, 700.0));
+        assert_eq!(held.pages[0].layout_size, egui::vec2(4.0, 7.0));
+        assert_eq!(
+            held.pages[0]
+                .fit_input
+                .original_display_dimensions()
+                .map(|basis| basis.as_tuple()),
+            Some((4, 7)),
+            "100% must retain the old texture's display basis after index reuse"
+        );
         assert_eq!(held.pages[0].source_size, Some(egui::vec2(400.0, 700.0)));
     }
 
@@ -48034,26 +48079,28 @@ mod favorite_adjustment_defaults_tests {
         );
         let first_texture_id = first_texture.id();
         let second_texture_id = second_texture.id();
-        app.thumbnails[first] = ThumbnailState::Loaded {
-            tex: first_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[first] = ThumbnailState::loaded_raster(
+            first_texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 3)),
-            layout_dims: None,
-        };
-        app.thumbnails[second] = ThumbnailState::Loaded {
-            tex: second_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 3)),
+            None,
+        );
+        app.thumbnails[second] = ThumbnailState::loaded_raster(
+            second_texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 3)),
-            layout_dims: None,
-        };
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 3)),
+            None,
+        );
         app.visible_indices = vec![first, second];
         app.viewer_navigation_caches.invalidate();
 
@@ -48143,6 +48190,7 @@ mod favorite_adjustment_defaults_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: std::sync::Arc::new(px),
                     source_dims: None,
@@ -48201,6 +48249,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_visible_spread_left",
                     left_pixels.clone(),
@@ -48215,6 +48264,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_visible_spread_right",
                     right_pixels.clone(),
@@ -48304,6 +48354,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_source_dir_reset",
                     pixels.clone(),
@@ -48657,6 +48708,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_pdf_source_dir",
                     pixels.clone(),
@@ -48734,6 +48786,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: None,
@@ -48801,10 +48854,7 @@ mod favorite_adjustment_defaults_tests {
         );
         app.erase_preview_cache.insert(
             idx,
-            ErasePreviewCacheEntry {
-                pixels: std::sync::Arc::clone(&preview_pixels),
-                texture: preview_tex,
-            },
+            ErasePreviewCacheEntry::raster(std::sync::Arc::clone(&preview_pixels), preview_tex),
         );
 
         app.execute_erase_inpaint(&ctx, idx);
@@ -48851,6 +48901,9 @@ mod favorite_adjustment_defaults_tests {
         app.erase_inpaint_pending.insert(
             key,
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx,
                 items_generation,
                 path_key,
@@ -48905,6 +48958,9 @@ mod favorite_adjustment_defaults_tests {
         app.erase_inpaint_pending.insert(
             key,
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx,
                 items_generation,
                 path_key,
@@ -49506,20 +49562,21 @@ mod favorite_adjustment_defaults_tests {
         let mut app = setup_app();
         app.idle_upgrade_cache_bypass_ineligible.insert(7);
         let ctx = egui::Context::default();
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "idle-quality-context",
                 egui::ColorImage::filled([247, 124], egui::Color32::LIGHT_BLUE),
                 egui::TextureOptions::LINEAR,
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 374,
             },
-            from_edit_preview: false,
-            rendered_at_px: 247,
-            source_dims: Some((884, 444)),
-            layout_dims: None,
-        });
+            false,
+            247,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((884, 444)),
+            None,
+        ));
 
         let original = app.stash_mounted_and_start_fresh("test_idle_upgrade_context");
         app.idle_upgrade_cache_bypass_ineligible.insert(99);
@@ -50251,16 +50308,17 @@ mod favorite_adjustment_defaults_tests {
 
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/book/02.7z")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: old_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            old_tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        });
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.fullscreen_idx = Some(0);
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
@@ -50301,16 +50359,17 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails = vec![ThumbnailState::Loaded {
-            tex: new_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails = vec![ThumbnailState::loaded_raster(
+            new_tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        }];
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )];
         assert!(
             app.fs_nav_holdover_for_draw().is_none(),
             "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
@@ -50341,16 +50400,17 @@ mod favorite_adjustment_defaults_tests {
             Some(FsHoldover::FolderNavigation(None))
         ));
 
-        app.thumbnails = vec![ThumbnailState::Loaded {
-            tex: new_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails = vec![ThumbnailState::loaded_raster(
+            new_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        }];
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )];
         app.poll_fs_nav_lock(&ctx);
         assert!(!app.fs_nav_is_locked());
         assert!(app.fs_holdover_tex.is_none());
@@ -50729,26 +50789,28 @@ mod favorite_adjustment_defaults_tests {
 
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: image_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            image_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 1,
             },
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: None,
-            layout_dims: None,
-        });
+            false,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.items
             .push(GridItem::Video(std::path::PathBuf::from("c:/p/b.mp4")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: video_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: None,
-            layout_dims: None,
-        });
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            video_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
 
         app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
@@ -50773,19 +50835,22 @@ mod favorite_adjustment_defaults_tests {
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/p/{idx}.jpg"))))
             .collect();
         app.thumbnails = (0..3)
-            .map(|idx| ThumbnailState::Loaded {
-                tex: ctx.load_texture(
-                    format!("incremental-evict-{idx}"),
-                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
-                    egui::TextureOptions::LINEAR,
-                ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                    evaluated_display_px: 1,
-                },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: None,
-                layout_dims: None,
+            .map(|idx| {
+                ThumbnailState::loaded_raster(
+                    ctx.load_texture(
+                        format!("incremental-evict-{idx}"),
+                        egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 1,
+                    },
+                    false,
+                    1,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    None,
+                    None,
+                )
             })
             .collect();
 
@@ -50811,19 +50876,22 @@ mod favorite_adjustment_defaults_tests {
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/p/{idx}.jpg"))))
             .collect();
         app.thumbnails = (0..3)
-            .map(|idx| ThumbnailState::Loaded {
-                tex: ctx.load_texture(
-                    format!("generation-evict-{idx}"),
-                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
-                    egui::TextureOptions::LINEAR,
-                ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                    evaluated_display_px: 1,
-                },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: None,
-                layout_dims: None,
+            .map(|idx| {
+                ThumbnailState::loaded_raster(
+                    ctx.load_texture(
+                        format!("generation-evict-{idx}"),
+                        egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 1,
+                    },
+                    false,
+                    1,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    None,
+                    None,
+                )
             })
             .collect();
         app.keep_set = std::collections::HashSet::from([1]);
@@ -51268,16 +51336,17 @@ mod favorite_adjustment_defaults_tests {
         // 初期: items_generation = 0、idx 0 が「現在表示中ページ」 (Loaded 済) として置く。
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: dummy_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            dummy_tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        });
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.fullscreen_idx = Some(0);
         // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
         let lock_gen = app.items_generation;
@@ -51433,6 +51502,9 @@ mod favorite_adjustment_defaults_tests {
             let (_tx, rx) = std::sync::mpsc::channel::<crate::ui_erase::EraseInpaintResult>();
             let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx,
                 items_generation: 0,
                 path_key: None,
@@ -51714,6 +51786,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: raw_tex,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -51721,8 +51794,10 @@ mod favorite_adjustment_defaults_tests {
                 animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
-        app.erase_base_cache
-            .insert(idx, std::sync::Arc::new(stale_adjusted));
+        app.erase_base_cache.insert(
+            idx,
+            crate::app::EraseBaseSource::raster(std::sync::Arc::new(stale_adjusted)),
+        );
 
         app.enter_erase_mode(idx);
 
@@ -51731,7 +51806,7 @@ mod favorite_adjustment_defaults_tests {
             .get(&idx)
             .expect("erase base should be recreated");
         assert_eq!(
-            base.pixels[0],
+            base.pixels.pixels[0],
             egui::Color32::from_rgb(10, 20, 30),
             "stale adjusted erase_base_cache must be overwritten by raw fs_cache"
         );
@@ -51758,6 +51833,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: raw_tex,
                 pixels: std::sync::Arc::new(raw),
                 source_dims: Some([1, 1]),
@@ -51775,6 +51851,7 @@ mod favorite_adjustment_defaults_tests {
         app.ai_upscale_cache.insert(
             (idx, erase_bg),
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ai_tex,
                 pixels: std::sync::Arc::new(ai),
                 source_dims: None,
@@ -52043,16 +52120,17 @@ mod favorite_adjustment_defaults_tests {
             let pixels = Arc::new(image.clone());
             let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
             (
-                ThumbnailState::Loaded {
+                ThumbnailState::loaded_raster(
                     tex,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 64,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 64,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                },
+                    false,
+                    64,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((1, 1)),
+                    None,
+                ),
                 pixels,
             )
         }
@@ -52988,6 +53066,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: texture,
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([2, 1]),
@@ -53048,23 +53127,20 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: edit_pixels,
-                texture: Some(edit_texture),
-            },
+            EditResultEntry::raster(edit_pixels, Some(edit_texture)),
         );
         let pixels = Arc::new(egui::ColorImage::new([4, 2], vec![color; 8]));
         let texture = ctx.load_texture(label, (*pixels).clone(), egui::TextureOptions::LINEAR);
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: pixels.size,
-                pixels: Arc::clone(&pixels),
+            FinalCompositeEntry::raster(
+                None,
+                pixels.size,
+                Arc::clone(&pixels),
                 texture,
-                complete: true,
-            },
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
         pixels
     }
@@ -53177,10 +53253,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&pixels),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::clone(&pixels), Some(edit_tex)),
         );
 
         let final_key = FinalCompositeKey {
@@ -53195,14 +53268,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: pixels.size,
+            FinalCompositeEntry::raster(
+                None,
+                pixels.size,
                 pixels,
-                texture: final_tex,
-                complete: true,
-            },
+                final_tex,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
         app.final_ai_cache.insert(
             FinalAiKey {
@@ -53236,16 +53309,17 @@ mod pipeline_cache_refactor_tests {
             egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[3] = ThumbnailState::Loaded {
-            tex: landscape,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[3] = ThumbnailState::loaded_raster(
+            landscape,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 1)),
-            layout_dims: None,
-        };
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 1)),
+            None,
+        );
 
         app.spread_mode = crate::settings::SpreadMode::LtrCover;
         assert_eq!(app.fs_display_unit_page_indices(0), vec![0]);
@@ -53332,13 +53406,8 @@ mod pipeline_cache_refactor_tests {
         let key = app.current_local_adjust_key(idx);
         let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(20, 30, 40)]);
         let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
-        app.local_adjust_cache.insert(
-            key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(image),
-                texture,
-            },
-        );
+        app.local_adjust_cache
+            .insert(key, LocalAdjustCacheEntry::raster(Arc::new(image), texture));
         key
     }
 
@@ -53366,7 +53435,7 @@ mod pipeline_cache_refactor_tests {
         let erase_key = app.current_erase_result_key(idx);
         let (pixels, texture) = make_entry("erase");
         app.erase_result_cache
-            .insert(erase_key, EraseResultCacheEntry { pixels, texture });
+            .insert(erase_key, EraseResultCacheEntry::raster(pixels, texture));
 
         let local_key = insert_local_adjust_cache(app, ctx, idx, &format!("{label}_local"));
 
@@ -53376,7 +53445,7 @@ mod pipeline_cache_refactor_tests {
         };
         let (pixels, texture) = make_entry("bypass");
         app.local_adjust_layer_bypass_cache
-            .insert(bypass_key, LocalAdjustCacheEntry { pixels, texture });
+            .insert(bypass_key, LocalAdjustCacheEntry::raster(pixels, texture));
 
         let prefix_key = LocalAdjustPrefixPreviewKey {
             result_key: local_key,
@@ -53384,16 +53453,12 @@ mod pipeline_cache_refactor_tests {
         };
         let (pixels, texture) = make_entry("prefix");
         app.local_adjust_prefix_preview_cache
-            .insert(prefix_key, LocalAdjustCacheEntry { pixels, texture });
+            .insert(prefix_key, LocalAdjustCacheEntry::raster(pixels, texture));
 
         let (pixels, texture) = make_entry("conceal");
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels,
-                texture,
-                generation: app.conceal_generation,
-            },
+            ConcealCacheEntry::raster(pixels, texture, app.conceal_generation),
         );
 
         (erase_key, local_key, bypass_key, prefix_key)
@@ -53418,6 +53483,7 @@ mod pipeline_cache_refactor_tests {
             app.adjustment_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: texture,
                     pixels: Arc::new(image),
                     source_dims: None,
@@ -53645,6 +53711,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([1, 1]),
@@ -53690,10 +53757,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.erase_result_cache.insert(
             erase_key,
-            EraseResultCacheEntry {
-                pixels: Arc::new(erase_img),
-                texture: erase_tex,
-            },
+            EraseResultCacheEntry::raster(Arc::new(erase_img), erase_tex),
         );
 
         // local_adjust_cache
@@ -53709,11 +53773,7 @@ mod pipeline_cache_refactor_tests {
         let conceal_generation = app.conceal_generation;
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels: Arc::new(conceal_img),
-                texture: conceal_tex,
-                generation: conceal_generation,
-            },
+            ConcealCacheEntry::raster(Arc::new(conceal_img), conceal_tex, conceal_generation),
         );
 
         // edit_result_cache + final_composite_cache + final_ai_cache
@@ -54000,10 +54060,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&edit_pixels),
-                texture: Some(edit_texture),
-            },
+            EditResultEntry::raster(Arc::clone(&edit_pixels), Some(edit_texture)),
         );
 
         let mut params = crate::adjustment::AdjustParams::default();
@@ -54026,14 +54083,14 @@ mod pipeline_cache_refactor_tests {
         let provisional_id = provisional.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: edit_pixels.size,
-                pixels: Arc::clone(&provisional_pixels),
-                texture: provisional,
-                complete: false,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                edit_pixels.size,
+                Arc::clone(&provisional_pixels),
+                provisional,
+                egui::TextureOptions::LINEAR,
+                false,
+            ),
         );
         let entry_count = app.final_composite_cache.len();
 
@@ -54102,6 +54159,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: edit_pixels.size,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -54180,14 +54238,14 @@ mod pipeline_cache_refactor_tests {
         let cached_id = cached_texture.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: cached_pixels.size,
-                pixels: cached_pixels,
-                texture: cached_texture,
-                complete: false,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                cached_pixels.size,
+                cached_pixels,
+                cached_texture,
+                egui::TextureOptions::LINEAR,
+                false,
+            ),
         );
 
         let spawned = app.start_final_effect_worker(
@@ -54211,6 +54269,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: source.size,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -54272,14 +54331,14 @@ mod pipeline_cache_refactor_tests {
         let provisional_id = provisional.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: provisional_pixels.size,
-                pixels: Arc::clone(&provisional_pixels),
-                texture: provisional,
-                complete: false,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                provisional_pixels.size,
+                Arc::clone(&provisional_pixels),
+                provisional,
+                egui::TextureOptions::LINEAR,
+                false,
+            ),
         );
         // This regression exercises the display-only holdover, not the colorize worker timing.
         // Keep an exact-key result pending so a fast 1x1 worker cannot land between the
@@ -54292,6 +54351,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -54345,14 +54405,14 @@ mod pipeline_cache_refactor_tests {
         let complete_id = complete.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: complete_pixels.size,
-                pixels: complete_pixels,
-                texture: complete,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                complete_pixels.size,
+                complete_pixels,
+                complete,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         let displayed = app
@@ -54424,6 +54484,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -54471,6 +54532,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -54546,6 +54608,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: raw,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -54569,13 +54632,8 @@ mod pipeline_cache_refactor_tests {
         image: egui::ColorImage,
     ) -> EditResultKey {
         let edit_key = dummy_edit_key(app, idx);
-        app.edit_result_cache.insert(
-            edit_key,
-            EditResultEntry {
-                pixels: Arc::new(image),
-                texture: None,
-            },
-        );
+        app.edit_result_cache
+            .insert(edit_key, EditResultEntry::raster(Arc::new(image), None));
         edit_key
     }
 
@@ -54591,6 +54649,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: None,
@@ -55361,14 +55420,8 @@ mod pipeline_cache_refactor_tests {
         for (idx, label) in [(current, "conceal_current"), (other, "conceal_other")] {
             let pixels = Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::BLACK));
             let texture = ctx.load_texture(label, (*pixels).clone(), Default::default());
-            app.conceal_cache.insert(
-                idx,
-                ConcealCacheEntry {
-                    pixels,
-                    texture,
-                    generation,
-                },
-            );
+            app.conceal_cache
+                .insert(idx, ConcealCacheEntry::raster(pixels, texture, generation));
         }
 
         app.bump_conceal_generation();
@@ -55411,6 +55464,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
                 source_dims: Some([2, 2]),
@@ -55520,6 +55574,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: Arc::clone(&raw_pixels),
                 source_dims: Some([1, 1]),
@@ -55812,6 +55867,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             square,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: texture,
                 pixels,
                 source_dims: Some([1, 1]),
@@ -56395,17 +56451,11 @@ mod pipeline_cache_refactor_tests {
         );
         app.local_adjust_layer_bypass_cache.insert(
             bypass_key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(bypass_image),
-                texture: bypass_tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::new(bypass_image), bypass_tex),
         );
         app.local_adjust_prefix_preview_cache.insert(
             prefix_key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(prefix_image),
-                texture: prefix_tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::new(prefix_image), prefix_tex),
         );
 
         // 両方とも独立に lookup できる
@@ -56589,10 +56639,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.local_adjust_layer_bypass_cache.insert(
             bypass_key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(bypass_image),
-                texture: bypass_tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::new(bypass_image), bypass_tex),
         );
 
         // 両方とも生き残っていること
@@ -56758,13 +56805,8 @@ mod pipeline_cache_refactor_tests {
         let key = app.current_local_adjust_layer_bypass_key(idx, 1);
         let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let tex = ctx.load_texture("bypass-guard-cache", img.clone(), Default::default());
-        app.local_adjust_layer_bypass_cache.insert(
-            key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(img),
-                texture: tex,
-            },
-        );
+        app.local_adjust_layer_bypass_cache
+            .insert(key, LocalAdjustCacheEntry::raster(Arc::new(img), tex));
 
         assert!(
             app.local_adjust_layer_bypass_pending.is_none(),
@@ -56894,13 +56936,8 @@ mod pipeline_cache_refactor_tests {
         let key = app.current_local_adjust_prefix_preview_key(idx, 1);
         let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let tex = ctx.load_texture("prefix-guard-cache", img.clone(), Default::default());
-        app.local_adjust_prefix_preview_cache.insert(
-            key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(img),
-                texture: tex,
-            },
-        );
+        app.local_adjust_prefix_preview_cache
+            .insert(key, LocalAdjustCacheEntry::raster(Arc::new(img), tex));
 
         assert!(
             app.local_adjust_prefix_preview_pending.is_none(),
@@ -57059,11 +57096,7 @@ mod pipeline_cache_refactor_tests {
         let conceal_generation = app.conceal_generation;
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels: Arc::clone(&conceal_pixels),
-                texture: conceal_tex,
-                generation: conceal_generation,
-            },
+            ConcealCacheEntry::raster(Arc::clone(&conceal_pixels), conceal_tex, conceal_generation),
         );
         app.conceal_pages.insert(idx);
 
@@ -57651,6 +57684,419 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn pdf_display_resolution_keeps_identical_inflight_request() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, r"C:\books\display-resolution.pdf", 0);
+        let pixels = Arc::new(egui::ColorImage::filled([786, 1179], egui::Color32::WHITE));
+        let tex = ctx.load_texture("small-pdf", (*pixels).clone(), egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_metadata: None,
+                tex,
+                pixels,
+                source_dims: Some([786, 1179]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget {
+            width_px: 1400,
+            height_px: 1547,
+            fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+        });
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let cancel = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "first frame must be live"
+        );
+        app.ensure_pdf_display_resolution(idx, None);
+        let requests = probe.take_requests();
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "identical second frame cancelled the first in-flight request; requests={requests:?}"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(Arc::ptr_eq(
+            &cancel,
+            &app.fs_pending.get(&idx).unwrap().cancel
+        ));
+    }
+
+    fn seed_pdf_resolution_static(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: [usize; 2],
+        content_type: crate::pdf_loader::PdfPageContentType,
+    ) -> usize {
+        ctx.input_mut(|input| input.max_texture_side = 8192);
+        let idx = push_pdf_page(app, r"C:\books\resolution.pdf", 0);
+        if let GridItem::PdfPage {
+            content_type: stored,
+            ..
+        } = &mut app.items[idx]
+        {
+            *stored = Some(content_type);
+        }
+        let pixels = Arc::new(egui::ColorImage::filled(size, egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            "pdf-resolution",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_metadata: None,
+                tex,
+                pixels,
+                source_dims: Some(size),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget {
+            width_px: 1400,
+            height_px: 1547,
+            fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+        });
+        idx
+    }
+
+    fn assert_pdf_rerender_probe_completion_releases_scheduler(via_poll: bool) {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let cancel = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert_eq!(app.fs_page_load_scheduler.stats().waiting, 1);
+        let result = FsLoadResult::StaticPdf {
+            ci: egui::ColorImage::filled([120, 180], egui::Color32::WHITE),
+            source_dims: [120, 180],
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 400.0,
+                height: 600.0,
+            },
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+        };
+        if via_poll {
+            probe.send_pending(idx, result);
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        } else {
+            let generation = app.items_generation;
+            assert!(probe.complete(&mut app, generation, idx, result));
+        }
+        assert!(app.fs_pending.is_empty());
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.fs_page_load_scheduler.stats(),
+            crate::fs_page_load_scheduler::FsPageLoadSchedulerStats::default(),
+            "a completed probe must leave no scheduler request behind"
+        );
+        // Check real admission at both priorities, after proving that acquire cannot block.
+        for priority in [FsPageLoadPriority::High, FsPageLoadPriority::Normal] {
+            let mut ticket = app.fs_page_load_scheduler.request(
+                app.fs_page_load_context_serial(),
+                idx,
+                priority,
+                FsPageLoadContract::Sequential,
+                None,
+                0,
+            );
+            let permit = ticket.waiter().acquire_cancellable().unwrap();
+            assert_eq!(app.fs_page_load_scheduler.stats().running, 1);
+            ticket.disarm();
+            drop(permit);
+            assert_eq!(
+                app.fs_page_load_scheduler.stats(),
+                crate::fs_page_load_scheduler::FsPageLoadSchedulerStats::default()
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_rerender_probe_complete_releases_scheduler_for_next_load() {
+        assert_pdf_rerender_probe_completion_releases_scheduler(false);
+    }
+
+    #[test]
+    fn pdf_rerender_probe_poll_releases_scheduler_for_next_load() {
+        assert_pdf_rerender_probe_completion_releases_scheduler(true);
+    }
+
+    #[test]
+    fn pdf_rerender_identity_is_shared_by_fit_zoom_and_absolute_demand() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender(idx, 1.0, false);
+        let normal = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert!(!normal.load(Ordering::Relaxed));
+        app.ensure_pdf_display_resolution(idx, None);
+        assert!(
+            normal.load(Ordering::Relaxed),
+            "Critical replaces Normal once"
+        );
+        let critical = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        for _ in 0..8 {
+            app.ensure_pdf_display_resolution(idx, None);
+            app.request_pdf_rerender(idx, 1.0, false);
+            app.request_pdf_absolute_demand(idx, 1547.0, false);
+        }
+        assert!(!critical.load(Ordering::Relaxed));
+        assert_eq!(probe.take_requests(), vec![(idx, 1702), (idx, 1702)]);
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(critical.load(Ordering::Relaxed));
+        let zoomed = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(!zoomed.load(Ordering::Relaxed));
+        assert_eq!(probe.take_requests(), vec![(idx, 3404)]);
+
+        // A different PDF page can occupy the same index and require the same target.
+        if let GridItem::PdfPage { page_num, .. } = &mut app.items[idx] {
+            *page_num = 1;
+        }
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(zoomed.load(Ordering::Relaxed));
+        let replacement = app.fs_pending.get(&idx).unwrap();
+        assert_eq!(
+            replacement.pdf_rerender.as_ref().unwrap().source,
+            app.metadata_cache_key(idx).unwrap()
+        );
+        let cancelled = Arc::clone(&replacement.cancel);
+        replacement.cancel();
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(
+            !app.fs_pending
+                .get(&idx)
+                .unwrap()
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+        assert_eq!(probe.take_requests(), vec![(idx, 3404), (idx, 3404)]);
+    }
+
+    #[test]
+    fn pdf_rerender_identity_retires_with_snapshot_cancel_and_close() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let first = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        let transfer = app.take_fs_page_for_snapshot(idx);
+        assert!(first.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+        app.restore_fs_page_from_snapshot(idx, transfer);
+        app.ensure_pdf_display_resolution(idx, None);
+        assert_eq!(probe.take_requests(), vec![(idx, 1702), (idx, 1702)]);
+        let second = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        app.fullscreen_idx = Some(idx);
+        app.close_fullscreen();
+        assert!(second.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+    }
+
+    #[test]
+    fn pdf_display_resolution_completion_converges_for_fit_trim_native_and_thin_pages() {
+        use crate::pdf_loader::{
+            PdfDisplayFitMode, PdfDisplayTarget, PdfPageContentType, PdfPageSizePoints,
+        };
+        for (initial, points, content_type, mode, viewport, bbox) in [
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Width,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(0.25, 0.25),
+                    egui::pos2(0.75, 0.75),
+                )),
+            ),
+            (
+                [100, 150],
+                (600.0, 900.0),
+                PdfPageContentType::Raster { w: 400, h: 600 },
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [1, 80],
+                (1.0, 160.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (10, 232),
+                None,
+            ),
+            (
+                [1, 1000],
+                (1.0, 5000.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (10, 10000),
+                None,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = seed_pdf_resolution_static(&mut app, &ctx, initial, content_type);
+            app.fs_pdf_display_target = Some(PdfDisplayTarget {
+                width_px: viewport.0,
+                height_px: viewport.1,
+                fit_mode: mode,
+            });
+            let points = PdfPageSizePoints {
+                width: points.0,
+                height: points.1,
+            };
+            let layout = points.catalog_layout_dims().unwrap();
+            app.record_page_layout_dims_for_spread(idx, layout);
+            let target = app
+                .pdf_display_render_long_edge_for_idx(idx, Some(content_type), bbox)
+                .unwrap();
+            let probe = PdfRerenderRequestProbe::start();
+            app.ensure_pdf_display_resolution(idx, bbox);
+            app.ensure_pdf_display_resolution(idx, bbox);
+            assert_eq!(
+                probe.take_requests(),
+                vec![(idx, target)],
+                "case={mode:?}/{content_type:?}/{layout:?}"
+            );
+            let dims = crate::pdf_loader::render_dimensions_for_layout(target, layout);
+            probe.send_pending(
+                idx,
+                FsLoadResult::StaticPdf {
+                    ci: egui::ColorImage::filled(
+                        [dims.0 as usize, dims.1 as usize],
+                        egui::Color32::WHITE,
+                    ),
+                    source_dims: [dims.0 as usize, dims.1 as usize],
+                    page_size_points: points,
+                    content_type,
+                },
+            );
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            assert!(app.fs_pending.is_empty());
+            let after = app
+                .pdf_display_render_long_edge_for_idx(idx, Some(content_type), bbox)
+                .unwrap();
+            assert!(
+                target.abs_diff(after) <= 1,
+                "target drift: {target} -> {after}; layout={layout:?}"
+            );
+            assert_eq!(
+                app.fs_page_load_state(idx),
+                FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache)
+            );
+            for _ in 0..8 {
+                app.ensure_pdf_display_resolution(idx, bbox);
+                app.request_pdf_rerender_at_target(idx, after, true);
+            }
+            assert!(
+                probe.take_requests().is_empty(),
+                "completed raster must satisfy target={after}, actual={dims:?}"
+            );
+            assert!(
+                app.lookup_retained_pdf_page_raster(idx, after, "test_completion")
+                    .is_some()
+            );
+            if (dims.0.max(dims.1) as f32) < after as f32 * 0.9 {
+                // A restored pixel cache must also converge after its layout projection was cleared.
+                app.page_dims_cache.clear();
+                assert!(app.current_pdf_page_metadata_snapshot(idx).is_none());
+                app.ensure_pdf_display_resolution(idx, bbox);
+                assert!(app.current_pdf_page_metadata_snapshot(idx).is_some());
+                assert!(app.fs_upload_backlog.is_empty());
+                assert!(probe.take_requests().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn fs_page_load_state_retained_pdf_empty_raster_final_ai_and_clear_are_equivalent() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let idx = push_pdf_page(&mut app, r"C:\books\retained-state.pdf", 0);
+        let other = push_pdf_page(&mut app, r"C:\books\other-state.pdf", 0);
+        let pixels = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::WHITE));
+        assert!(app.retained_pdf_page_cache.is_empty());
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        assert!(app.insert_retained_pdf_page_raster(idx, [4, 6], Arc::clone(&pixels)));
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        store_matching_pdf_final_ai(&mut app, idx, [4, 6], pixels);
+        assert_eq!(
+            app.fs_page_load_state(idx),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+        );
+        assert_eq!(app.fs_page_load_state(other), FsPageLoadState::NeedsLoad);
+        let image_idx = app.items.len();
+        app.items
+            .push(GridItem::Image(PathBuf::from(r"C:\books\ordinary.png")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        assert_eq!(
+            app.fs_page_load_state(image_idx),
+            FsPageLoadState::NeedsLoad
+        );
+        let model = app.settings.global_preset.upscale_model.take();
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        app.settings.global_preset.upscale_model = model;
+        assert!(app.fs_page_load_state(idx).is_display_ready());
+        app.clear_retained_pdf_page_cache("test_empty_fast_path");
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        app.fs_cache.insert(idx, FsCacheEntry::Failed);
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::LoadFailed);
+    }
+
+    #[test]
     fn fs_page_load_state_prevents_same_idx_same_params_reentry() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
@@ -57760,6 +58206,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             resident_idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: resident_tex,
                 pixels: Arc::clone(&resident_pixels),
                 source_dims: Some([2, 2]),
@@ -57806,6 +58253,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             effect_key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::clone(&effect_cancel),
@@ -57864,6 +58312,7 @@ mod pipeline_cache_refactor_tests {
             app.final_effect_pending.insert(
                 key,
                 FinalEffectPending {
+                    pdf_metadata: None,
                     canonical_dims: None,
                     source_size: [1, 1],
                     cancel: Arc::new(AtomicBool::new(false)),
@@ -58201,16 +58650,17 @@ mod pipeline_cache_refactor_tests {
             egui::TextureOptions::LINEAR,
         );
         let catalog_id = catalog.id();
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: catalog,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            catalog,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 2,
             },
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-        };
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 2)),
+            None,
+        );
         app.thumb_pixels.insert(idx, Arc::clone(&source));
 
         let identity = app
@@ -58260,16 +58710,17 @@ mod pipeline_cache_refactor_tests {
             color.as_ref().clone(),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: catalog,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            catalog,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 8,
             },
-            from_edit_preview: false,
-            rendered_at_px: 8,
-            source_dims: Some((800, 1201)),
-            layout_dims: None,
-        };
+            false,
+            8,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((800, 1201)),
+            None,
+        );
         app.thumb_pixels.insert(idx, Arc::clone(&color));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
 
@@ -58348,16 +58799,17 @@ mod pipeline_cache_refactor_tests {
             egui::TextureOptions::LINEAR,
         );
         let catalog_id = catalog.id();
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: catalog,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            catalog,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 8,
             },
-            from_edit_preview: false,
-            rendered_at_px: 8,
-            source_dims: Some((800, 1201)),
-            layout_dims: None,
-        };
+            false,
+            8,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((800, 1201)),
+            None,
+        );
         app.thumb_pixels.insert(idx, Arc::clone(&monochrome));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
         let params = app.effective_params(idx).clone();
@@ -58372,14 +58824,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: monochrome.size,
-                pixels: Arc::clone(&monochrome),
-                texture: final_texture,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                monochrome.size,
+                Arc::clone(&monochrome),
+                final_texture,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
         app.final_composite_cache
             .record_colorize_applied(final_key, false);
@@ -58499,6 +58951,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: texture,
                 pixels,
                 source_dims: Some([2, 2]),
@@ -58616,6 +59069,7 @@ mod pipeline_cache_refactor_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: texture,
                     pixels,
                     source_dims: Some([1, 1]),
@@ -59953,20 +60407,21 @@ mod pipeline_cache_refactor_tests {
                 params_hash: 0,
                 bg: 0,
             },
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: [1, 1],
-                pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
-                texture: tex.clone(),
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                [1, 1],
+                Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+                tex.clone(),
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         // 旧 AI 経路 (legacy cache) も無効化対象
         app.ai_upscale_cache.insert(
             (0, 0),
             crate::fs_animation::FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
                 source_dims: None,
@@ -60038,13 +60493,8 @@ mod pipeline_cache_refactor_tests {
             [8, 8],
             egui::Color32::from_gray(128),
         ));
-        app.edit_result_cache.insert(
-            edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&source),
-                texture: None,
-            },
-        );
+        app.edit_result_cache
+            .insert(edit_key, EditResultEntry::raster(Arc::clone(&source), None));
         let mut params = crate::adjustment::AdjustParams::default();
         params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
         app.adjustment_page_params.insert(target, params.clone());
@@ -60071,6 +60521,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: pending.source_size,
                 cancel: pending.cancel,
@@ -60112,13 +60563,8 @@ mod pipeline_cache_refactor_tests {
             [64, 64],
             egui::Color32::from_gray(128),
         ));
-        app.edit_result_cache.insert(
-            edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&source),
-                texture: None,
-            },
-        );
+        app.edit_result_cache
+            .insert(edit_key, EditResultEntry::raster(Arc::clone(&source), None));
         let mut params = crate::adjustment::AdjustParams::default();
         params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
         app.adjustment_page_params.insert(target, params.clone());
@@ -60186,14 +60632,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             current_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: current_pixels.size,
-                pixels: current_pixels,
-                texture: current_texture,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                current_pixels.size,
+                current_pixels,
+                current_texture,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         let target_edit_key = dummy_edit_key(&app, target);
@@ -60209,6 +60655,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             target,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: target_texture,
                 pixels: Arc::clone(&target_pixels),
                 source_dims: Some(target_pixels.size),
@@ -60218,10 +60665,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             target_edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&target_pixels),
-                texture: None,
-            },
+            EditResultEntry::raster(Arc::clone(&target_pixels), None),
         );
         let target_final_key =
             app.final_composite_key_for_pixels(target_edit_key, target_pixels.size, &params);
@@ -60236,14 +60680,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             target_final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: prefetched_pixels.size,
-                pixels: prefetched_pixels,
-                texture: prefetched_texture,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                prefetched_pixels.size,
+                prefetched_pixels,
+                prefetched_texture,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         app.open_fullscreen(target, crate::app::HistoryTrigger::UserChosen);
@@ -60306,10 +60750,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::new(edit_image),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::new(edit_image), Some(edit_tex)),
         );
 
         let mut params = crate::adjustment::AdjustParams::default();
@@ -60422,10 +60863,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::new(edit_image),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::new(edit_image), Some(edit_tex)),
         );
 
         let mut params = crate::adjustment::AdjustParams::default();
@@ -60760,10 +61198,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::new(edit_image),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::new(edit_image), Some(edit_tex)),
         );
 
         // ページ個別: シャープ 100 + アップスケール指定
@@ -61266,6 +61701,7 @@ mod pipeline_display_edit_split_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([1, 1]),
@@ -61302,14 +61738,14 @@ mod pipeline_display_edit_split_tests {
         let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
-                source_size: image.size,
-                pixels: Arc::new(image),
+            FinalCompositeEntry::raster(
+                None,
+                image.size,
+                Arc::new(image),
                 texture,
-                complete: true,
-            },
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
     }
 
@@ -61325,10 +61761,7 @@ mod pipeline_display_edit_split_tests {
         let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
         app.erase_result_cache.insert(
             app.current_erase_result_key(idx),
-            EraseResultCacheEntry {
-                pixels: Arc::clone(&pixels),
-                texture: tex,
-            },
+            EraseResultCacheEntry::raster(Arc::clone(&pixels), tex),
         );
         pixels
     }
@@ -61356,10 +61789,7 @@ mod pipeline_display_edit_split_tests {
         let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
         app.local_adjust_cache.insert(
             app.current_local_adjust_key(idx),
-            LocalAdjustCacheEntry {
-                pixels: Arc::clone(&pixels),
-                texture: tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::clone(&pixels), tex),
         );
         pixels
     }
@@ -61414,6 +61844,7 @@ mod pipeline_display_edit_split_tests {
         app.ai_upscale_cache.insert(
             (idx, ai_bg),
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: ai_tex,
                 pixels: Arc::new(ai),
                 source_dims: None,
@@ -61603,6 +62034,7 @@ mod edit_materialize_worker_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -61648,6 +62080,7 @@ mod edit_materialize_worker_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -66972,6 +67405,7 @@ mod still_window_mode_key_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some([2, 1]),
@@ -72548,6 +72982,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.comic_bake_pending.insert(
             0,
             ComicBakePending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::from_sampler(
+                    [1, 1],
+                    crate::source_coverage::SourceCoverage::FullSource,
+                ),
                 comic_gen: 1,
                 items_gen: app.items_generation,
                 base: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)),
@@ -72569,6 +73007,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 kind: crate::ui_erase::EraseInpaintKind::Commit,
             },
             crate::ui_erase::EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx: 0,
                 items_generation: app.items_generation,
                 path_key: None,
@@ -76234,16 +76675,17 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[image] = ThumbnailState::Loaded {
-            tex: img_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[image] = ThumbnailState::loaded_raster(
+            img_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 128,
             },
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-        };
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        );
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.set_detached_window_binding_for_test(Some(70));
@@ -76753,17 +77195,20 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let new_k = crate::adjustment_db::normalize_path(new);
         let target = push_image(&mut app, "D:/Comics/target.jpg");
         let unrelated = push_image(&mut app, "D:/Comics/unrelated.jpg");
-        let loaded = |name: &str| ThumbnailState::Loaded {
-            tex: ctx.load_texture(
-                name,
-                egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
-                egui::TextureOptions::LINEAR,
-            ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
+        let loaded = |name: &str| {
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
+                    name,
+                    egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
+                    egui::TextureOptions::LINEAR,
+                ),
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1, 1)),
+                None,
+            )
         };
         app.thumbnails[target] = loaded("rename_preview_target");
         app.thumbnails[unrelated] = loaded("rename_preview_unrelated");
@@ -80082,6 +80527,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([300, 900]),
@@ -80141,6 +80587,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
@@ -80197,6 +80644,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some(size),
@@ -80809,6 +81257,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([100, 200]),
@@ -81218,6 +81667,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
@@ -81288,6 +81738,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
@@ -81375,6 +81826,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_metadata: None,
                             tex,
                             pixels: std::sync::Arc::new(pixels),
                             source_dims: Some(dims),
@@ -81447,20 +81899,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
             app.thumbnails.insert(
                 idx,
-                ThumbnailState::Loaded {
-                    tex: tex.clone(),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                ThumbnailState::loaded_raster(
+                    tex.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 20,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 20,
-                    source_dims: Some((20, 20)),
-                    layout_dims: None,
-                },
+                    false,
+                    20,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((20, 20)),
+                    None,
+                ),
             );
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([20, 20]),
@@ -87377,11 +87831,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let texture_id = texture.id();
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels: std::sync::Arc::new(image),
-                texture,
-                generation: app.conceal_generation,
-            },
+            ConcealCacheEntry::raster(std::sync::Arc::new(image), texture, app.conceal_generation),
         );
         texture_id
     }
@@ -87400,6 +87850,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(image),
                 source_dims: Some(size),
@@ -91690,6 +92141,7 @@ mod ai_upscale_livelock_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex: dummy_tex.clone(),
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
                 source_dims: None,
@@ -91761,6 +92213,7 @@ mod ai_upscale_livelock_tests {
             egui::TextureOptions::LINEAR,
         );
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex,
             pixels: std::sync::Arc::new(egui::ColorImage::filled([w, h], egui::Color32::WHITE)),
             source_dims: None,
@@ -105259,6 +105712,7 @@ mod sns_split_p2_transition_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some(source_dims),
@@ -107178,14 +107632,15 @@ mod background_click_scroll_regression_tests {
             egui::ColorImage::filled(size, egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        harness.state_mut().app.thumbnails[0] = ThumbnailState::Loaded {
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: size[0].max(size[1]) as u32,
-            source_dims: None,
-            layout_dims: None,
-        };
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            size[0].max(size[1]) as u32,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        );
         harness.run_steps(6);
         assert!(
             harness.state().app.last_cell_h <= harness.state().app.last_viewport_h,

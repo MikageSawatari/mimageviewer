@@ -569,6 +569,7 @@ pub struct ThumbPixels {
     pub origin: ThumbLoadOrigin,
     pub from_edit_preview: bool,
     pub edit_preview_adjustment: Option<ThumbEditPreviewAdjustment>,
+    pub source_coverage: crate::source_coverage::SourceCoverage,
     pub source_dims: Option<(u32, u32)>,
     pub layout_dims: Option<(u32, u32)>,
 }
@@ -607,6 +608,11 @@ impl ThumbMsg {
                 origin,
                 from_edit_preview,
                 edit_preview_adjustment,
+                source_coverage: if from_edit_preview {
+                    crate::source_coverage::SourceCoverage::Unknown
+                } else {
+                    crate::source_coverage::SourceCoverage::FullSource
+                },
                 source_dims,
                 layout_dims,
             })
@@ -624,6 +630,20 @@ impl ThumbMsg {
 
     pub fn with_request_id(mut self, request_id: ThumbnailRequestId) -> Self {
         self.request_id = request_id;
+        self
+    }
+
+    /// Material metadata belongs to these pixels, never to the current crop settings.
+    pub fn with_source_coverage(
+        mut self,
+        coverage: crate::source_coverage::SourceCoverage,
+    ) -> Self {
+        match &mut self.payload {
+            ThumbMsgPayload::Pixels(pixels)
+            | ThumbMsgPayload::SourcePixels(pixels)
+            | ThumbMsgPayload::ProvisionalPixels(pixels) => pixels.source_coverage = coverage,
+            _ => panic!("source coverage requires thumbnail pixels"),
+        }
         self
     }
 
@@ -2416,6 +2436,7 @@ pub fn process_load_request(
                 origin: pixels.origin,
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some(pixels.source_dims),
                 layout_dims: None,
             }),
@@ -2699,12 +2720,13 @@ pub fn process_load_request(
                     annotation_layers: preview.annotation_layers,
                 }),
                 Some(preview.source_dims),
-                None,
+                preview.layout_dims,
                 false,
                 false,
                 req.input_seq,
                 req.items_gen,
             )
+            .with_source_coverage(preview.coverage)
             .with_request_id(req.request_id),
         );
         gen_done.fetch_add(1, Ordering::Relaxed);

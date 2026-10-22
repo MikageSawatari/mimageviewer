@@ -355,6 +355,7 @@ fn d3_4_legacy_computing_display_promotes_original_receiver_without_blocking() {
         app.final_effect_pending.insert(
             key,
             FinalEffectPending {
+                pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [80, 120],
                 cancel: cancel.clone(),
@@ -417,6 +418,7 @@ fn d3_4_incomplete_legacy_display_keeps_the_ordinary_quality_producer_path() {
                 app.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        pdf_metadata: None,
                         canonical_dims: None,
                         source_size: [80, 120],
                         cancel: Arc::new(AtomicBool::new(false)),
@@ -521,6 +523,7 @@ pub(super) fn active_owner(app: &mut App, ctx: &egui::Context, window: u64) -> V
             owner.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some([80, 120]),

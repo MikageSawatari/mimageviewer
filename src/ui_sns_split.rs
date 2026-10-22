@@ -1,6 +1,7 @@
 use crate::app::{App, SnsSplitDrag};
 use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::export_crop::{CropHandle, CropRect};
+use crate::gpu_lanczos::FullscreenPaintPayload;
 use crate::keymap::KeyAction;
 use crate::sns_split::{
     MAX_COUNT, MAX_SEAM_PERMILLE, MIN_COUNT, SnsFrameRatio, SnsSplitLayout, SnsTarget,
@@ -460,7 +461,7 @@ fn draw_sns_split_preview(
     ui: &mut egui::Ui,
     layout: SnsSplitLayout,
     image_size: [usize; 2],
-    texture: Option<&egui::TextureHandle>,
+    texture: Option<&FullscreenPaintPayload>,
 ) {
     let frames = layout.frames();
     let (bounds, _) = ui.allocate_exact_size(
@@ -478,7 +479,7 @@ fn draw_sns_split_preview(
 
     for (paint_rect, uv_rect) in paint_rects.into_iter().zip(uv_rects) {
         if let Some(texture) = texture {
-            painter.image(texture.id(), paint_rect, uv_rect, egui::Color32::WHITE);
+            paint_sns_split_preview_frame(&painter, texture, paint_rect, uv_rect);
         } else {
             painter.rect_filled(
                 paint_rect,
@@ -493,6 +494,31 @@ fn draw_sns_split_preview(
             );
         }
     }
+}
+
+fn paint_sns_split_preview_frame(
+    painter: &egui::Painter,
+    material: &FullscreenPaintPayload,
+    paint_rect: egui::Rect,
+    source_uv_rect: egui::Rect,
+) {
+    // Each preview frame is a window into the same full source. Reconstruct
+    // that frame before mapping the material's coverage; fitting the cropped
+    // sampler to this rectangle would move/stretch the available pixels.
+    let full_size = paint_rect.size() / source_uv_rect.size();
+    let full_rect = egui::Rect::from_min_size(
+        paint_rect.min - source_uv_rect.min.to_vec2() * full_size,
+        full_size,
+    );
+    material.paint_source_region(
+        painter,
+        full_rect,
+        crate::rotation_db::Rotation::None,
+        0.0,
+        source_uv_rect,
+        egui::Color32::WHITE,
+    );
+    material.retain_native_output_for_paint(painter);
 }
 
 fn sns_split_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
@@ -795,7 +821,7 @@ impl App {
         fs_idx: usize,
         full_rect: egui::Rect,
         image_size: Option<[usize; 2]>,
-        preview_texture: Option<&egui::TextureHandle>,
+        preview_texture: Option<&FullscreenPaintPayload>,
     ) {
         if self.sns_split.is_none() {
             return;
@@ -925,7 +951,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         image_size: [usize; 2],
-        preview_texture: Option<&egui::TextureHandle>,
+        preview_texture: Option<&FullscreenPaintPayload>,
     ) -> bool {
         let Some(mut layout) = self.sns_split else {
             return false;
@@ -1284,6 +1310,139 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_coverage_sns_preview_samples_partial_and_native_material_at_the_original_frame_position()
+     {
+        use crate::gpu_lanczos::{FullscreenPaintResource, FullscreenPaintSourceGeneration};
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "sns-coverage",
+            egui::ColorImage::filled([5, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let coverage = crate::source_coverage::SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1000, 800),
+                (1000, 800),
+                (250, 200, 500, 400),
+            )
+            .unwrap(),
+        );
+        let crop = FullscreenPaintResource::resampleable(
+            0,
+            texture.clone(),
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        let native = crate::gpu_lanczos::test_native_resource_with_region(
+            crop.clone(),
+            [10, 8],
+            egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75)),
+        );
+        let frame = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(200.0, 160.0));
+        let request = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(0.5, 1.0));
+        for (resource, expected, expected_uv) in [
+            (FullscreenPaintResource::direct(texture), frame, request),
+            (
+                crop,
+                egui::Rect::from_min_max(egui::pos2(120.0, 70.0), egui::pos2(220.0, 150.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(0.5, 1.0)),
+            ),
+            (
+                native,
+                egui::Rect::from_min_max(egui::pos2(170.0, 90.0), egui::pos2(220.0, 130.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(0.5, 1.0)),
+            ),
+        ] {
+            for material in [
+                FullscreenPaintPayload::from(resource.clone()),
+                FullscreenPaintPayload::PresentationMaterial(resource.capture_presentation(&ctx)),
+            ] {
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                    egui::RawInput::default(),
+                    |ctx| {
+                        paint_sns_split_preview_frame(
+                            &ctx.debug_painter(),
+                            &material,
+                            frame,
+                            request,
+                        );
+                    },
+                ));
+                let mesh = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Mesh(mesh)
+                            if mesh.texture_id == material.paint_texture_id() =>
+                        {
+                            Some(mesh)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let corners = |rect: egui::Rect| {
+                    [
+                        rect.left_top(),
+                        rect.right_top(),
+                        rect.right_bottom(),
+                        rect.left_bottom(),
+                    ]
+                };
+                assert_eq!(mesh.vertices.len(), 4);
+                for ((vertex, position), uv) in mesh
+                    .vertices
+                    .iter()
+                    .zip(corners(expected))
+                    .zip(corners(expected_uv))
+                {
+                    assert!(
+                        (vertex.pos - position).length() < 0.001,
+                        "crop pixels must keep their full-source position"
+                    );
+                    assert!(
+                        (vertex.uv - uv).length() < 0.00001,
+                        "UV is relative to the actual crop/native sampler"
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn crop_coverage_sns_preview_empty_frame_draws_no_material() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "sns-empty-coverage",
+            egui::ColorImage::filled([5, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let material: FullscreenPaintPayload =
+            crate::gpu_lanczos::FullscreenPaintResource::direct(texture)
+                .with_source_coverage(crate::source_coverage::SourceCoverage::Known(
+                    crate::source_coverage::EditPreviewGeometry::new(
+                        crate::page_dims::CanonicalPageDimensions::new(1000, 800),
+                        (1000, 800),
+                        (250, 200, 500, 400),
+                    )
+                    .unwrap(),
+                ))
+                .into();
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                paint_sns_split_preview_frame(
+                    &ctx.debug_painter(),
+                    &material,
+                    egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(200.0, 160.0)),
+                    egui::Rect::from_min_max(egui::pos2(0.8, 0.0), egui::pos2(1.0, 1.0)),
+                );
+            }));
+        assert!(output.shapes.iter().all(|shape| !matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == material.paint_texture_id())));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn the_panel_reaches_the_bottom_of_every_window_it_is_given() {
@@ -2208,6 +2367,7 @@ mod tests {
             app.fs_cache.insert(
                 idx,
                 crate::fs_animation::FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: texture,
                     pixels: std::sync::Arc::new(image),
                     source_dims: Some(image_size),

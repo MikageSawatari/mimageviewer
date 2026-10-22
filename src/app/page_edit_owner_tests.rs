@@ -1005,6 +1005,7 @@ fn ready_lut_keeps_original_page_target_after_switching_editor_document() {
     app.fs_cache.insert(
         1,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: ctx.load_texture(
                 "lut-switch-ready",
                 pixels.clone(),
@@ -1149,6 +1150,7 @@ fn exact_reader_swap_aligns_edit_session_with_second_same_key_slot() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex,
             pixels: pixels.clone(),
             source_dims: Some([1, 1]),
@@ -1568,30 +1570,32 @@ fn mounted_page_commit_refreshes_parked_container_representatives_before_they_mo
             owner.selected = None;
             owner.local_adjust_mode = false;
             owner.thumbnails = vec![
-                ThumbnailState::Loaded {
-                    tex: ctx.load_texture(
+                ThumbnailState::loaded_raster(
+                    ctx.load_texture(
                         format!("baked-container-{kind}"),
                         representative_pixels.as_ref().clone(),
                         Default::default(),
                     ),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 1,
                     },
-                    from_edit_preview: true,
-                    rendered_at_px: 1,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                },
-                ThumbnailState::Loaded {
-                    tex: unrelated_texture.clone(),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    true,
+                    1,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((1, 1)),
+                    None,
+                ),
+                ThumbnailState::loaded_raster(
+                    unrelated_texture.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 1,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 1,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                },
+                    false,
+                    1,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((1, 1)),
+                    None,
+                ),
             ];
             owner.thumb_pixels.insert(0, representative_pixels.clone());
             owner.thumb_pixels.insert(1, unrelated_pixels.clone());

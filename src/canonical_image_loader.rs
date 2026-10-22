@@ -14,6 +14,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use crate::page_dims::{CanonicalPageDimensions, DisplayOriginalDimensions};
+
 use crate::raw::{
     RawBrightness, RawDevelopExecutor, RawDevelopScale, RawDevelopSupport, RawError,
     RawOwnedSource, RawPreview, RawPreviewUnavailableReason, RawPriority, RawSource, raw_decoder,
@@ -887,15 +889,27 @@ pub fn dynamic_image_to_color_image(image: &image::DynamicImage) -> egui::ColorI
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
 
-/// worker thread 向け canonical 8192 clamp。上限内なら入力を clone せず返す。
-pub fn clamp_dynamic_for_gpu(image: image::DynamicImage) -> image::DynamicImage {
-    let (width, height) = (image.width(), image.height());
+/// Pure dimensions of the ordinary fullscreen raster after GPU clamping. This supplies the
+/// physical 100% basis before pixels arrive without confusing it with canonical coordinates.
+pub(crate) fn gpu_raster_dimensions(source: CanonicalPageDimensions) -> DisplayOriginalDimensions {
+    let (width, height) = source.as_tuple();
     if width <= CANONICAL_RASTER_MAX_LONG_EDGE && height <= CANONICAL_RASTER_MAX_LONG_EDGE {
-        return image;
+        return DisplayOriginalDimensions::new(width, height);
     }
     let scale = CANONICAL_RASTER_MAX_LONG_EDGE as f64 / width.max(height) as f64;
     let new_width = ((width as f64 * scale).round() as u32).max(1);
     let new_height = ((height as f64 * scale).round() as u32).max(1);
+    DisplayOriginalDimensions::new(new_width, new_height)
+}
+
+/// worker thread 向け canonical 8192 clamp。上限内なら入力を clone せず返す。
+pub fn clamp_dynamic_for_gpu(image: image::DynamicImage) -> image::DynamicImage {
+    let (width, height) = (image.width(), image.height());
+    let (new_width, new_height) =
+        gpu_raster_dimensions(CanonicalPageDimensions::new(width, height)).as_tuple();
+    if (width, height) == (new_width, new_height) {
+        return image;
+    }
     let started = std::time::Instant::now();
     let resized = crate::fast_resize::resize_dynamic_exact(
         &image,
@@ -1643,6 +1657,30 @@ mod tests {
         assert_eq!(raster.source_dims, [source_width as usize, 2]);
         assert_eq!(raster.pixels.size, expected_pixels.size);
         assert_eq!(raster.pixels.pixels, expected_pixels.pixels);
+    }
+
+    #[test]
+    fn gpu_raster_dimensions_preserves_the_rounded_8192_original_basis_without_pixels() {
+        for (source, expected) in [
+            ((20_000, 15_000), (8192, 6144)),
+            ((20_001, 14_999), (8192, 6143)),
+            ((14_999, 20_001), (6143, 8192)),
+            ((8193, 1), (8192, 1)),
+        ] {
+            let dimensions =
+                gpu_raster_dimensions(CanonicalPageDimensions::new(source.0, source.1));
+            assert_eq!(dimensions.as_tuple(), expected, "source={source:?}");
+        }
+    }
+
+    #[test]
+    fn gpu_raster_dimensions_keeps_sizes_within_the_gpu_limit_unchanged() {
+        for (width, height) in [(8192, 6143), (1, 8192), (701, 503), (1, 1)] {
+            assert_eq!(
+                gpu_raster_dimensions(CanonicalPageDimensions::new(width, height)).as_tuple(),
+                (width, height),
+            );
+        }
     }
 
     #[derive(Clone, Copy)]

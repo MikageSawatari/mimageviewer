@@ -53,6 +53,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: texture.clone(),
                     pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
                     source_dims: Some(source_size),
@@ -61,7 +62,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
                 },
             );
             page.resource = crate::gpu_lanczos::test_native_resource(
-                app.fullscreen_paint_resource_for_texture(idx, texture),
+                app.fixture_raster_paint_resource(idx, texture),
                 output_size,
             )
             .into();
@@ -222,18 +223,16 @@ fn demand_matched_native_materials_survive_eviction_through_real_next_frame_draw
             else {
                 panic!("ordinary adopted material");
             };
-            let source = material.source_texture().unwrap().clone();
-            source_ids.push(source.id());
-            let request = page
-                .transform
-                .visible_region_request(page.painter.clip_rect())
+            source_ids.push(material.source_texture_id());
+            let normal = super::prepare_boundary_tests::normal_source_for_page(&app, page);
+            let request = normal
+                .visible_region_request(&page.transform, page.painter.clip_rect())
                 .unwrap();
             assert!(page.transform.total_scale * page.transform.pixels_per_point > 1.0);
             assert_eq!(
                 app.effective_params(page.occurrence.idx).post_filter,
                 crate::adjustment::PostFilter::None
             );
-            let normal = app.fullscreen_paint_resource_for_texture(page.occurrence.idx, source);
             let native = crate::gpu_lanczos::test_native_resource_with_region(
                 normal,
                 request.target_size,

@@ -321,11 +321,15 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<FullscreenPaintResource> {
-        let texture = self.resident_final_prepare_texture(ctx, idx)?;
-        if self.resolve_fs_display_tex(idx, false)?.id() != texture.id() {
+        let resource = self.resident_final_prepare_material(ctx, idx)?;
+        if self
+            .resolve_fs_display_material(idx, false)?
+            .source_texture_id()
+            != resource.source_texture_id()
+        {
             return None;
         }
-        Some(self.fullscreen_paint_resource_for_texture(idx, texture))
+        Some(resource)
     }
 
     fn resident_canonical_trim(
@@ -467,12 +471,26 @@ impl App {
             // A thumbnail/direct surface is not Native input. No alternate
             // selection is invented when the ordinary source has not arrived.
             resource.source_generation().ok_or(Missing::Material)?;
-            let fit = self
-                .fs_fit_input_for_resource(idx, mode, resource.source_texture())
-                .ok_or(Missing::FitBasis)?;
+            let fit = if occurrences.len() == 2 {
+                self.fs_spread_fit_input(idx, mode, &resource.clone().into())
+            } else {
+                self.fs_fit_input_for_payload(idx, mode, &resource.clone().into())
+            }
+            .ok_or(Missing::FitBasis)?;
+            let layout = if occurrences.len() == 2 {
+                self.fs_spread_page_layout_size(idx, &resource.clone().into())
+            } else {
+                Self::fs_material_layout_size(
+                    &resource.clone().into(),
+                    self.fs_material_view(
+                        idx,
+                        crate::material_display_basis::MaterialDisplayView::Single,
+                    ),
+                )
+            };
             resources.push(resource);
             inputs.push((rotation, fit));
-            layouts.push(self.fs_page_layout_source_size(idx));
+            layouts.push(layout);
         }
         let legacy_auto = matches!(
             self.settings.fullscreen_fit_mode,
@@ -554,36 +572,30 @@ impl App {
                 pixels_per_point: view.pixels_per_point,
                 placement,
             };
-            let layout = self
-                .fs_page_layout_uses_source_id(next, resource.source_texture_id())
-                .then_some(layouts[0])
-                .flatten();
-            let transform = resolve_fs_image_transform(input, layout).ok_or(Missing::Geometry)?;
+            // The selected material already owns the Single projection for
+            // ordinary rasters, partial previews, RAW and PDF. Do not infer a
+            // second layout policy from its texture ID or current cache owners.
+            let transform =
+                resolve_fs_image_transform(input, layouts[0]).ok_or(Missing::Geometry)?;
             (
                 vec![transform],
                 single_clip_rect(view.base_clip, media, None, 0.0, content[0], mode, limits),
             )
         } else if occurrences.len() == 2 {
             let mut sizes = [egui::Vec2::ZERO; 2];
-            let pdf_layout_unit = occurrences.iter().any(|page| {
-                self.is_raw_page(page.idx)
-                    || matches!(self.items.get(page.idx), Some(GridItem::PdfPage { .. }))
-            });
             for i in 0..2 {
                 sizes[i] = if mode == FullscreenFitMode::SpecifiedScale {
                     rotated_display_size(
                         fit_input_layout_size(inputs[i].1, egui::Vec2::ZERO),
                         inputs[i].0,
                     )
-                } else if pdf_layout_unit {
+                } else {
                     passthrough_layout_display_size(
                         layouts[i],
                         Some(resources[i].size_vec2()),
                         inputs[i].0,
                     )
                     .ok_or(Missing::Geometry)?
-                } else {
-                    rotated_display_size(resources[i].size_vec2(), inputs[i].0)
                 };
             }
             let (geometry, fit) = spread_auto_layout(
@@ -612,13 +624,7 @@ impl App {
             for (i, rect) in [rects.left_rect, rects.right_rect].into_iter().enumerate() {
                 let idx = occurrences[i].idx;
                 let resource = &resources[i];
-                let use_layout = self
-                    .fs_page_layout_uses_source_id(idx, resource.source_texture_id())
-                    || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
-                let layout = use_layout
-                    .then_some(layouts[i])
-                    .flatten()
-                    .unwrap_or(resource.size_vec2());
+                let layout = layouts[i].unwrap_or(resource.size_vec2());
                 transforms.push(
                     spread_page_transform(
                         DisplayedImageTransformInput {
@@ -681,7 +687,7 @@ impl App {
                     source_generation: resource.source_generation().ok_or(Missing::Material)?,
                     transform,
                     clip_rect: clip,
-                    visible_region: transform.visible_region_request(clip),
+                    visible_region: resource.visible_region_request(&transform, clip),
                     post_filter: self.fullscreen_paint_post_filter(resource),
                     smoothing_percent: self.settings.downscale_smoothing_percent,
                     anime_source_limit: self.settings.anime_upscale_source_limit,

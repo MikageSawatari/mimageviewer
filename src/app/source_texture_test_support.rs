@@ -16,6 +16,7 @@ pub(crate) fn seed(app: &mut App, ctx: &egui::Context, idx: usize) -> egui::Text
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex,
             pixels,
             source_dims: Some([400, 600]),
