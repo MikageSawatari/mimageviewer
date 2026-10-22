@@ -306,7 +306,7 @@ lossless WebP として分離保存する。保存先は `<data_dir>/edit_previe
 `<data_dir>/edit_preview_cache.db` に保持し、crop 後の縦横寸法を一覧のアスペクト比として使う。
 元画像と各編集 DB は変更しない。
 
-§1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）では、生成時の収録範囲を
+§1.165 B1（2026-10-21、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）では、生成時の収録範囲を
 `source_coverage::EditPreviewGeometry` として preview 自身へ持たせる。座標空間は EXIF 適用後、
 保存回転・自由回転前。`coordinate_dims` は正規ページ座標の元寸法、`raster_dims` は実際に
 切り出す直前の raster 寸法、`pixel_bounds` はその raster に対する `CropRect::pixel_bounds`
@@ -716,7 +716,7 @@ visible-pages painter を使う。general keepalive / embedded deferred の canv
 ある場合だけ現在の余白色にし、unit の無い media transition は egui 側の黒を保つ。native 動画の
 letterbox canvas は別の DComp owner が現在の余白色を描き、音声系だけ黒を保つ。
 
-#### 2.1.1 crop 済み代役の全体寸法と収録範囲（§1.165 B1、実装・自動検証済み・独立完成レビュー／実機未確認）
+#### 2.1.1 crop 済み代役の全体寸法と収録範囲（§1.165 B1、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）
 
 一覧のアスペクト比は従来どおり crop 後の `source_dims` を使う。部分編集 preview のページ構成
 （見開き・横長分割）と注釈座標には crop 前の正準座標寸法を供給する。
@@ -815,6 +815,18 @@ passive detached の snapshot capture／保持／再描画、navigator、ルー�
 SNS 分割パネルのプレビューも、各分割枠を全画像座標へ戻して同じ resource の mapping を使う。
 シーク用の一覧素材プレビューは従来どおり crop 後の素材として扱う。
 この節は実装契約の記録であり、完了した自動検証／実 GPU 提示／実機の成功証拠ではない。
+
+検証と未決（2026-10-22、master 取り込み `124dc4828`。経緯の全文は取り込み前の backlog §1.165 = コミット `e5c9fc951`）:
+- 独立レビュー（Codex xhigh）最終判定は受入可（`629a7d85b..a43750fb8`）。`test-lib-full.ps1` 14,070 件成功、`ui_snapshot` 195 件成功。
+- ClaudeCode の隔離環境での操作（画面操作の許可なし。PostMessage のキー + 全画面の連続切り出し、8000×11000 の格子 PNG と
+  合成 8 ページ PDF、crop は `export_crop.db` へ直接記入）: 単ページ（Page / Original / 指定倍率 + 縮小しない）・見開き・縦連結・
+  crop 済み PDF の Original で、代役は全体枠の中の切り取り位置に出て、本画像到着の前後で切り取り範囲の画素位置が変わらず
+  外側が補われた。crop なしの巨大画像の代役も本画像と同じ位置・大きさ（ぼけのみ差）。
+- 未確認: AI アップスケール併用、回転・表示トリム・分割との組み合わせ、crop なしの編集済み PDF（自動テストのみ）。利用者の実機確認は未。
+- **利用者の判断待ち**: 旧行（Unknown）＋現在 crop ありを全画面の代役に使わない現行の扱い（上記）と、「現在の crop から推測して使う」案の
+  どちらにするか。切り替えは `App::resolve_preview_coverage_for_display` の 1 か所。
+- 別件（未修正）: crop ドラッグ中に Escape を押すと `reset_export_crop_mode` が保存も復元もせず、DB とメモリの crop が食い違ったまま
+  残る経路がある（独立レビュー担当の source inspection、実機再現なし）。
 
 frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
 現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
@@ -1058,6 +1070,14 @@ snapshot 等で layout 投影だけを失った細長いページも、保持 pi
 
 設計の簡素化として pending に合流し、別の「前フレームの需要」や時刻・再試行状態を足さない。
 PDF 表示準備を modal にすると閲覧・ページ移動を妨げるため採用しない。
+
+この合流は backlog §1.114 の修正（2026-10-21、`5392c03ac` + `5a7d3523e`、master 取り込み `124dc4828`）。
+修正前はページ全体 / 幅 / 高さフィットの `ensure_pdf_display_resolution` が毎フレーム同じ要求を出し直して
+進行中を取り消し、PDFium のレンダが一度も完了しなかった（利用者の 2026-08 のログ）。
+ClaudeCode の隔離環境での操作では、合成 8 ページ PDF を全画面で幅フィット・先頭 / 末尾ジャンプ・ページ送りして、
+再レンダ要求がそれぞれ約 0.2 秒で 1 回ずつ完了し、取消は 0 回だった（§1.165 の構造変更後のビルドでも同じ）。
+別件（未修正）: 再レンダ失敗（`FsLoadResult::Failed`）を採用すると、表示中の Static が Failed に置き換わり
+見えていた画を失い得る（実装担当の source inspection、実行時の観測なし）。
 まれな失敗は既定の割り切り方針とし、今回 recovery 機構は追加しない。
 
 WebP は `ANIM` chunk の背景色を `WebPDecoder::set_background_color` に渡してから
@@ -2764,7 +2784,7 @@ Known coverage は現在 crop から変更せず、CPU 下地から生成する 
 crop 後 texture で引き伸ばさない。これにより本画像到着時に既存内容の倍率・位置とページ枠を
 維持し、未収録だった外側が補われることを受入条件とする。代役が持たない crop 外画素の復元を
 到着前の要件にはしない。旧 Unknown＋現在 crop ありはこの代役を使えないため、本画像または
-既存の利用可能な代役を待つ互換上の制約が残る（実装・自動検証済み・独立完成レビュー／実機未確認）。
+既存の利用可能な代役を待つ互換上の制約が残る（実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）。
 renditionは下地の受理済み `MaterialDisplayBasis` も継承する。無加工時にcatalogと同じtextureを
 共有しても、通常thumbnailと通過素材の方式別契約はそれぞれの素材が保持する値を使う。
 生成後のselector・連結transition・ページ送り受付ではResourceのまま運び、保持済み素材から

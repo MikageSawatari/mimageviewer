@@ -1497,7 +1497,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   P3 は実入力 handler から部分素材／空交差の描画提出・出力採用・ready 通知・次ページ確定を通す
   headless 回帰を追加する。Unknown の利用方針は既存の一か所の判定を維持する。
 
-### 2026-10-21 §1.165 B1: crop 済み代役の生成由来を素材と一緒に保持する（実装・自動検証済み・独立完成レビュー／実機未確認）
+### 2026-10-21 §1.165 B1: crop 済み代役の生成由来を素材と一緒に保持する（実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）
 
 - 合意: 利用者から提示された ClaudeCode の採択方針と独立設計レビュー
   `design1165-out.md`／`design1165-r2-out.md` の合意に基づく。passive detached の capture／

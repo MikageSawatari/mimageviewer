@@ -31,7 +31,7 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 
 ## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）
 
-§1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）は編集 preview の既存 worker が
+§1.165 B1（2026-10-21、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）は編集 preview の既存 worker が
 切り出し前 raster と実 `pixel_bounds` から生成由来を作り、WebP 参照と同じ DB upsert で保存する。
 released v6 の nullable coverage migration では旧行を保持する。crop DB の更新と preview Delete
 の間を新しい待機や共有 transaction で同期させず、preview 自身の generation-time metadata を

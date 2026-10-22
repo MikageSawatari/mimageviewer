@@ -263,7 +263,7 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 
 ## 2. モジュールマップ
 
-§1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）は crop 済みの編集 preview を
+§1.165 B1（2026-10-21、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）は crop 済みの編集 preview を
 部分素材として扱う。収録範囲は生成時の実整数 pixel bounds から求めて preview と同時保存し、
 現在 crop から復元しない。一覧は crop 後の比率を使い、部分素材のページ構成・座標基準には
 crop 前の正規寸法を供給する。正規座標の元寸法、実 raster 寸法、PDF page-box の layout 寸法は別物である。
