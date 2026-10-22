@@ -38,6 +38,15 @@
 
 ## 1. 優先候補
 
+### 1.416 画像フォルダ ZIP 化のテストが `no such table: book_bookmarks` で一度だけ落ちる — §1.165 の作業中に遭遇 (2026-10-22)
+
+- 出典: §1.165 の実装担当 (Codex) が `test-lib-full.ps1` を回した 1 回目に、
+  `app::image_folder_zip_operation::tests::image_folder_zip_real_parent_scan_has_one_owner_with_watcher_and_suffix_directory` が
+  `no such table: book_bookmarks` で失敗した。同じテストの単独実行と全件の再実行では成功。§1.165 の変更とは無関係の経路。
+- 見立て (実装担当、未確認): テスト用 DB の schema 初期化と、別スレッドからの `book_bookmarks` 参照の順序の競合。失敗時の実行順は記録されていない。
+- 方針: 推測で待ちや再試行を足さない。まず再現の手段を作る (同テストの反復実行、`book_bookmarks` の schema 初期化を遅らせる注入など) ことから。
+- 規模 / 優先度: Small / P3 (製品の不具合ではないが、全件テストの再実行を招く)。
+
 ### 1.406 連動した別ウィンドウ中の検索受付と結果採用の所有を揃える — §1.386 の独立設計レビューで分離 (2026-10-19)
 
 - 利用者決定: §1.386 は理由表示だけとし、Ctrl+R の条件拡大と Ctrl+G の同型欠陥を本項へ分離する。今回は未修正。
