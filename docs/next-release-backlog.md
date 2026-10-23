@@ -38,6 +38,22 @@
 
 ## 1. 優先候補
 
+### 1.418 名前に拡張子を含む実フォルダを、本の分類が書庫 / 文書として扱う — §1.417 のコードレビューで発見 (2026-10-23)
+
+- 状態: **未着手**。コード調査 (Codex 独立レビュー、§1.417 第 1 回コードレビュー P2)。実行時の観測は未確認。
+- 現状 (コード確認): 開く処理は分類済みの種類 (`OpenPathKind::Directory`) で実フォルダ `book.zip` / `book.pdf` を
+  フォルダとして開くが、採用時の `ProjectionRecipe::for_physical()` (src/app/book_materialization.rs) と
+  `physical_page_order_locked()` (src/app.rs、Remote の src/remote_ipc/container.rs と共有) は名前の拡張子
+  (`is_paged_document_path` / `is_open_as_container`) で `Book(Archive)` / `Book(Document)` に分類する。
+  そのため、そのフォルダは「画像のみのフォルダを本として扱う」設定に関係なく本の既定 (見開き・ページ順固定) で開き得る。
+- §1.417 への影響: 本を優先する評価は、照合 (`zip_nav` / 文書ローダーの状態) で実フォルダを本として扱わず
+  「この本は評価できません」と通知して書かない。根本の分類が直れば、そのまま正しい対象に解決される。
+- 対応案: 列挙・preflight が確定した物理種別 (ディレクトリ / コンテナファイル) を recipe 採用と
+  `physical_page_order_locked` へ型で渡し、実フォルダを拡張子で書庫 / 文書に分類しない。採用時のファイル照会は足さない。
+  Remote の 3 か所も同じ値を使う。
+- 検証: 実フォルダ `x.zip` / `x.cbz` / `x.pdf` / `x.epub` / `x.rar` を、設定オン / オフで開いたときの recipe・見開きの既定・
+  Remote のページ順、本物の書庫 / 文書との区別。規模 / 優先度: Small〜Medium / P3。
+
 ### 1.417 レーティングに「本を優先」する操作を追加する — 5ch >>603 (2026-10-23)
 
 - 状態: **実装済み・独立レビュー前 (branch book-preferred-rating-1417)** (利用者決定 2026-10-23)。一覧で選択した本と、閲覧中の本全体を同じキーで評価できる操作を追加。設計は [本を優先するレーティング操作](book-preferred-rating-plan.md)。収録時期は未定。

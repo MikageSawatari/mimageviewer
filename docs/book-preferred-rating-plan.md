@@ -126,11 +126,20 @@ impl App {
 | scope | 一致の条件 |
 | --- | --- |
 | `Archive { logical_root, prefix }` | `zip_nav` があり、`zip_rating_root_path(...)` が `logical_root` と同じパス、かつ `nav.current() == prefix` |
-| `Document(logical)` | `zip_nav` が無く、物理導出の `source` が `logical` と同じパス |
+| `Document(logical)` | `zip_nav` が無く、物理導出の `source` が `logical` と同じパスで、かつ文書ローダーが作った状態 (採用済み items に `logical` の文書ページ行がある、または同等の context 所有の文書状態) と一致する |
 | `ImageFolder(p)` / `CompiledFolder(p)` | `zip_nav` が無く、`current_folder` が `p` と同じパスで合成パスでない |
 
 パス比較は既存の I/O なし比較 (`folder_tree::path_eq` 相当) を使う。不一致は採用の途中 (recipe と物理状態の
 世代がずれている瞬間) にだけ起こり得るはずで、そのときは書かずに `Unavailable` とする (§5)。
+
+### 3.4 名前に拡張子を含む実フォルダ (コードレビュー第 1 回 P2、§1.418)
+
+`ProjectionRecipe::for_physical()` と `physical_page_order_locked()` は、ソースが実フォルダでも名前の拡張子で
+`Archive` / `Document` に分類する (例: 実フォルダ `book.zip` / `book.pdf`)。これは §1.417 より前からある共有の
+分類境界の不具合で、見開きの既定・ページ順の固定・Remote の判定にも及ぶため、根本の修正は §1.418 として分ける。
+§1.417 では誤った書き込みを作らないことを保証する: `Archive` は `zip_nav` の有無で、`Document` は文書ローダーが
+作った状態との照合で、実フォルダを本として扱わず `Unavailable` (書かない・通知) にする。§1.418 で分類が直れば、
+これらのフォルダは `OrdinaryList` / `ImageFolder` になり、resolver の変更なしに正しい対象へ解決される。
 
 ## 4. 入力経路
 
