@@ -848,11 +848,25 @@ pub fn import_at<F>(
 where
     F: FnMut(TransferProgress),
 {
+    import_at_with_clock(data_dir, root, cancel, progress, std::time::Instant::now)
+}
+
+fn import_at_with_clock<F, C>(
+    data_dir: &Path,
+    root: &Path,
+    cancel: &AtomicBool,
+    progress: F,
+    batch_now: C,
+) -> Result<ImportSummary, TransferError>
+where
+    F: FnMut(TransferProgress),
+    C: Fn() -> std::time::Instant,
+{
     let started = std::time::Instant::now();
     if crate::perf::is_enabled() {
         crate::perf::event("metadata_import", "begin", None, 0, &[]);
     }
-    let result = import_at_batched(data_dir, root, cancel, progress);
+    let result = import_at_batched(data_dir, root, cancel, progress, batch_now);
     let outcome = match &result {
         Ok(summary) if summary.cancelled => "cancelled",
         Ok(summary) if summary.incomplete_error.is_some() || summary.failed_entries > 0 => {
@@ -885,14 +899,16 @@ where
     result
 }
 
-fn import_at_batched<F>(
+fn import_at_batched<F, C>(
     data_dir: &Path,
     root: &Path,
     cancel: &AtomicBool,
     mut progress: F,
+    batch_now: C,
 ) -> Result<ImportSummary, TransferError>
 where
     F: FnMut(TransferProgress),
+    C: Fn() -> std::time::Instant,
 {
     validate_root(root)?;
     let manifest_started = std::time::Instant::now();
@@ -936,7 +952,7 @@ where
     let mut batch_folder_pin_changes = 0usize;
     let mut batch_spread_shift_changes = SpreadShiftFamilyChanges::default();
     let mut batch_composition_changes = CompositionFamilyChanges::default();
-    let mut batch_started = std::time::Instant::now();
+    let mut batch_started = batch_now();
     let mut batch_active = false;
     let apply_started = std::time::Instant::now();
     let mut target_verify_ms = 0.0_f64;
@@ -979,7 +995,7 @@ where
                         }
                         begin_import_batch(&conn)?;
                         batch_active = true;
-                        batch_started = std::time::Instant::now();
+                        batch_started = batch_now();
                     }
                     let discovered_sidecar_sync = automatic_sidecar_sync_cached(
                         &mut automatic_sidecar_sync_cache,
@@ -1091,7 +1107,7 @@ where
             if batch_entries > 0
                 && (batch_entries >= IMPORT_TRANSACTION_BATCH_ENTRIES
                     || batch_bytes >= IMPORT_TRANSACTION_BATCH_BYTES
-                    || batch_started.elapsed() >= IMPORT_TRANSACTION_BATCH_TIME)
+                    || batch_now().duration_since(batch_started) >= IMPORT_TRANSACTION_BATCH_TIME)
             {
                 let commit_started = std::time::Instant::now();
                 commit_import_batch(&conn)?;
@@ -1144,7 +1160,7 @@ where
                 batch_applied = 0;
                 batch_video_pin_changes = 0;
                 batch_folder_pin_changes = 0;
-                batch_started = std::time::Instant::now();
+                batch_started = batch_now();
             }
             progress(TransferProgress {
                 phase: TransferPhase::Importing,
@@ -11369,6 +11385,26 @@ mod tests {
         );
     }
 
+    struct TestImportClock {
+        now: std::cell::Cell<std::time::Instant>,
+    }
+
+    impl TestImportClock {
+        fn new() -> Self {
+            Self {
+                now: std::cell::Cell::new(std::time::Instant::now()),
+            }
+        }
+
+        fn now(&self) -> std::time::Instant {
+            self.now.get()
+        }
+
+        fn advance(&self, duration: std::time::Duration) {
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
     #[test]
     fn import_uses_bounded_outer_transactions_instead_of_per_item_commits() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -11389,9 +11425,107 @@ mod tests {
         export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
         copy_sidecar_bundle(&source, &destination);
 
-        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        let clock = TestImportClock::new();
+        let summary = import_at_with_clock(
+            &destination_data,
+            &destination,
+            &cancel,
+            no_progress,
+            || clock.now(),
+        )
+        .unwrap();
         assert_eq!(summary.applied_entries, 601);
         assert_eq!(summary.transaction_batches, 3);
+    }
+
+    #[test]
+    fn import_time_boundary_commits_at_deadline_and_resets_for_next_batch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_rating(&source_data, &source, 4);
+        Connection::open(source_data.join("rating.db"))
+            .unwrap()
+            .execute("UPDATE ratings SET kind = 2", [])
+            .unwrap();
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"] {
+            fs::write(source.join(name), b"x").unwrap();
+            fs::write(destination.join(name), b"x").unwrap();
+            set_rating(&source_data, &source.join(name), 4);
+        }
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let clock = TestImportClock::new();
+        let mut seen = HashSet::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let summary = import_at_with_clock(
+            &destination_data,
+            &destination,
+            &cancel,
+            |progress| {
+                if progress.phase != TransferPhase::Importing {
+                    return;
+                }
+                let relative = progress.current_path.unwrap();
+                if !seen.insert(relative.clone()) {
+                    return; // The post-item callback repeats this path.
+                }
+                let path = if relative == "." {
+                    destination.clone()
+                } else {
+                    destination.join(relative)
+                };
+                match paths.len() {
+                    1 => clock.advance(
+                        IMPORT_TRANSACTION_BATCH_TIME - std::time::Duration::from_millis(1),
+                    ),
+                    2 => {
+                        assert_eq!(
+                            rating(&destination_data, &paths[0]),
+                            None,
+                            "499ms must leave the first batch uncommitted"
+                        );
+                        clock.advance(std::time::Duration::from_millis(1));
+                    }
+                    3 => {
+                        for previous in &paths {
+                            assert_eq!(
+                                rating(&destination_data, previous),
+                                Some(4),
+                                "500ms must publish the first three items"
+                            );
+                        }
+                    }
+                    4 => {
+                        clock.advance(
+                            IMPORT_TRANSACTION_BATCH_TIME - std::time::Duration::from_millis(1),
+                        );
+                        assert_eq!(
+                            rating(&destination_data, &paths[3]),
+                            None,
+                            "the next batch gets a fresh deadline"
+                        );
+                    }
+                    _ => {}
+                }
+                paths.push(path);
+            },
+            || clock.now(),
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 5);
+        assert_eq!(summary.applied_entries, 5);
+        assert_eq!(summary.transaction_batches, 2);
+        for path in paths {
+            assert_eq!(rating(&destination_data, &path), Some(4));
+        }
     }
 
     #[test]
@@ -11836,7 +11970,8 @@ mod tests {
         export_at(&source_data, &source, false, &export_cancel, no_progress).unwrap();
         copy_sidecar_bundle(&source, &destination);
         let import_cancel = AtomicBool::new(false);
-        let summary = import_at(
+        let clock = TestImportClock::new();
+        let summary = import_at_with_clock(
             &destination_data,
             &destination,
             &import_cancel,
@@ -11847,6 +11982,7 @@ mod tests {
                     import_cancel.store(true, Ordering::Relaxed);
                 }
             },
+            || clock.now(),
         )
         .unwrap();
 
