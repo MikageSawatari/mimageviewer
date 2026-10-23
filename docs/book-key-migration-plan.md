@@ -436,6 +436,11 @@ producer の棚卸しは次の所有者と、保存を生む結果の消費箇�
 | 補正・crop・mask・conceal・注釈・回転・pin | 同期 handler または上記の専用 writer から保存。新入力は共通 modal / grid / raw canvas / panel の入口で止め、保存関数には構造 owner の拒否を入れない |
 | 表示トリムの未保存値 | 全 context から既存 `PendingViewTrimTransfer` を取り、同じ構造 worker の FS 前に保存。保存完了までは元の dirty payload を保持し、FS 前の失敗では元 context に戻す |
 
+2026-10-23 crop/SNS 追補の取り込み: 未確定の枠ドラッグは `poll_book_structural_op` の冒頭で
+所有 context に戻して取り消す（`OverlayDragEnd::BookStructure`）。UI が modal で呼ばれなくても、FS 開始・
+結果採用より先に終了させる。crop の既存の要求受付拒否は維持し、SNS も構造 owner 中の新規入力を止める。
+開始時と入力 handler に取消しを分散しない。保存済み DB 値を変えず、受付済み非同期完了の保存経路は引き続き通す。
+
 静止述語は初回に汎用改名と共有したが、§8.7 の回帰修正で本の構造操作専用の
 `book_structural_writers_busy` に分けた。汎用改名・sidecar 復元の既存開始条件を広げない。
 上流 service・未消費結果を先に確認し、後続の内容同一性 recorder を最後に確認する。

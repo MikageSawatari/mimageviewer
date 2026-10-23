@@ -55130,7 +55130,7 @@ impl App {
         // ここより前の失敗では one-shot の layout / 見開き pivot を保持する。
         // source・編集 snapshot と枠の検証が揃った時だけ SNS モードを確定終了する。
         if sns_split_export {
-            self.reset_sns_split_mode();
+            self.complete_sns_split_mode();
         }
         self.export_dialog = Some(crate::export_dialog::ExportDialogState {
             source: target.source,
@@ -58962,6 +58962,7 @@ mod tests {
                             app.fs_cache.insert(
                                 0,
                                 FsCacheEntry::Static {
+                                    pdf_rerender_failures: Vec::new(),
                                     pdf_metadata: None,
                                     tex: textures[1].clone(),
                                     pixels: Arc::clone(&images[1]),
@@ -59442,6 +59443,7 @@ mod tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: tex.clone(),
                 pixels: std::sync::Arc::new(pixels),
@@ -61142,6 +61144,7 @@ mod tests {
                 app.fs_cache.insert(
                     idx,
                     crate::fs_animation::FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
                         pdf_metadata: None,
                         tex,
                         pixels: std::sync::Arc::new(image),
@@ -61227,6 +61230,7 @@ mod tests {
                 app.fs_cache.insert(
                     idx,
                     crate::fs_animation::FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
                         pdf_metadata: None,
                         tex,
                         pixels: std::sync::Arc::new(image),
@@ -61323,6 +61327,7 @@ mod tests {
                     app.fs_cache.insert(
                         idx,
                         crate::fs_animation::FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: None,
                             tex,
                             pixels: std::sync::Arc::new(image),
@@ -63173,6 +63178,7 @@ mod tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -65314,6 +65320,7 @@ mod tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: ready_texture,
                 pixels: ready_pixels,
@@ -65941,6 +65948,7 @@ mod tests {
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: None,
                             tex: texture,
                             pixels,
@@ -66058,6 +66066,7 @@ mod tests {
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
                         pdf_metadata: None,
                         tex: texture,
                         pixels,
@@ -66127,6 +66136,7 @@ mod tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -66183,6 +66193,7 @@ mod tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -68155,6 +68166,7 @@ mod tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -68758,6 +68770,7 @@ mod tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: raw.clone(),
                 pixels: pixels.clone(),
@@ -68904,6 +68917,7 @@ mod tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
                     layout_dims: (500, 1000),
                     content_type: crate::pdf_loader::PdfPageContentType::Vector,
@@ -69486,6 +69500,7 @@ mod tests {
         app.fs_cache.insert(
             fs_idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -70298,6 +70313,7 @@ mod tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -74971,6 +74987,7 @@ mod tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -80492,6 +80509,7 @@ mod tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(pixels),
@@ -80675,6 +80693,7 @@ mod tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels.clone()),
@@ -80714,6 +80733,7 @@ mod tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels.clone()),
@@ -83565,6 +83585,7 @@ mod tests {
                                 app.fs_cache.insert(
                                     idx,
                                     crate::fs_animation::FsCacheEntry::Static {
+                                        pdf_rerender_failures: Vec::new(),
                                         pdf_metadata: None,
                                         tex,
                                         pixels: std::sync::Arc::new(image),
@@ -85192,6 +85213,7 @@ mod tests {
         app.fs_cache.insert(
             fs_idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: texture,
                 pixels,
@@ -88194,6 +88216,7 @@ mod specified_scale_consumer_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
                         layout_dims: (600_000, 900_000),
                         content_type: PdfPageContentType::Vector,
@@ -88977,6 +89000,7 @@ mod specified_scale_consumer_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex: tex.clone(),
                 pixels: source,
@@ -89305,6 +89329,7 @@ mod specified_scale_consumer_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -89832,6 +89857,7 @@ mod specified_scale_consumer_tests {
             app.fs_cache.insert(
                 0,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels,
@@ -92125,6 +92151,7 @@ pub(crate) mod page_turn_submission_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: Arc::new(image),

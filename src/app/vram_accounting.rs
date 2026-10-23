@@ -510,6 +510,7 @@ mod tests {
     fn static_entry(texture: egui::TextureHandle) -> FsCacheEntry {
         let size = texture.size();
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: texture,
             pixels: Arc::new(egui::ColorImage::filled(size, egui::Color32::WHITE)),

@@ -487,6 +487,7 @@ fn install_embedded_update_scene(app: &mut App, ctx: &egui::Context, pages: &[Pa
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: texture,
             pixels,

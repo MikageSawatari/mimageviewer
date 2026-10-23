@@ -846,6 +846,7 @@ fn switch_fixture(ctx: &egui::Context, tool: PageEditTargetSwitchTool) -> AppTes
     app.fs_cache.insert(
         21,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: ctx.load_texture("switch_old", image.clone(), egui::TextureOptions::LINEAR),
             pixels: Arc::new(image),

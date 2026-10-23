@@ -337,6 +337,7 @@ fn page_turn_permission_service_vacant_composed_handler_starts_and_completes_bot
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
                         pdf_metadata: None,
                         tex,
                         pixels,

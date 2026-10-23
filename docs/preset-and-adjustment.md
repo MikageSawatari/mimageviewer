@@ -786,6 +786,56 @@ raster pixel geometry の分離・表示補正であり、再レンダ要求頻�
 (無効化すると crop ドラッグのたびに
 AI を無駄に再実行してしまう)。
 
+#### crop ドラッグの所有と終了（2026-10-22）
+
+`ExportCropDrag` / `ExportCropCreateDrag` は、開始時の正確な `Option<CropSettings>`（crop なしも含む）、
+その authoring 寸法、対象 idx と既存 `PageEditOwner` を持つ。表示中にスケールした設定を元の設定の代用にしない。
+終了理由を `OverlayDragEnd` にまとめ、その `finish()` の match だけで
+`OverlayDragFinish::Commit` / `Cancel` の二つへ分類する。操作ごとの一覧は
+[keymap-spec.md の終了操作表](keymap-spec.md#crop--sns-枠ドラッグの終了操作)を参照。
+確定は現在値を既存 DB / sidecar / preview 無効化経路へ一度だけ渡す。
+取り消しはメモリ・存在集合・prepared 投影を開始前へ戻し、DB / sidecar / preview へ書かない。
+preview snapshot や items の入替 / remap より先に取り消し、別世代の同じ idx へ復元しない。
+別 context の一時 mount は終了ではなく、兄弟の preview / 終了処理ではドラッグを消費しない。
+F12 は既存の overlay edit policy で受け付けず、detached の述語 / viewport 経路は変更しない。
+
+本の構造操作の開始は `OverlayDragEnd::BookStructure` → `Cancel` とする。
+`poll_book_structural_op` の冒頭で、既存の owner context mount API を使って crop／SNS のドラッグを取り消す。
+入力 handler 内や操作開始の各入口に取消しを分散せず、構造操作の単一 owner が、Requested の FS 開始前と
+Running の結果採用前の両方で終了を保証する。modal によりキー・パネルが呼ばれない場合も同じ扱いとなる。
+取消しは DB に書かず、操作が終わってもボタン保持・移動・release から古いドラッグを再開しない。
+入力側は構造 owner の存在中、キー・パネル・raw pointer を止め、poll 前の release も確定に変換しない。
+SNS に master の専用ガードは無かったが、構造操作中は全編集の新規受付を止める方針に合わせて同じ制限を適用した。
+crop ドラッグ中の構造操作要求を拒否する master の既存受付判定は維持する。取消しの対象は構造 owner が
+実際に存在するときの未確定ドラッグであり、拒否された要求や read-only の context mount では取り消さない。
+bool／pending は足さず、開始時取消しとの二重所有にもしていない。
+
+操作中の Escape をモード終了より先に扱うのは、消しゴムの多角形 / 選択解除と補正レイヤーの編集中操作解除に合わせるため。
+開始 frame 番号も drag に捕捉し、同じ press を layout の複数 pass で処理した場合と次の press とを区別する。
+これは操作 identity の照合であり、時間窓や「一定時間待つ」判定ではない。
+物理ボタンの確認は Windows の左右ボタン入替に従う。タッチ継続中は物理マウスの up を
+タッチの終了とみなさず、egui の logical primary / touch 終了を使う。
+ドラッグが無い Escape は従来どおりモードを終了する。パネルの終了は未確定ドラッグを取り消す。
+一方、`CropExecute`（既定 Ctrl+E）は `execute_export_crop` から現在のドラッグを先に確定・保存し、
+取消を伴う `reset_export_crop_mode` を経由せずにモードを終了して書き出す。
+設計の簡素化として、既存 foreground editor の終了と preview 境界に集約した。短いマウス操作を modal にして
+閲覧や既存の切替を制限する案は採らず、終了理由ごとの bool / pending / 別の保存 owner は足さない。
+
+SNS 分割も `SnsSplitDrag.base` の全 layout と `PageEditOwner` を保持し、同じ二つの終端へ通す。
+ドラッグ中の Escape は枠だけ戻してモードを維持する。枠をパネル上へ運んでも継続し、release で確定する。
+`SnsSplitExecute` とパネルの書き出しボタンは、共通の実行関数で現在のドラッグを先に確定してから枠列を採取する。
+出力準備成功時は `complete_sns_split_mode` で確定終了し、取消の `reset_sns_split_mode` を経由しない。
+出力準備が失敗したときは確定済みの現在の枠でモードを維持する。
+SNS の枠 geometry は元々セッション内だけであり crop と同じ DB 不一致は無いが、以前は入力拒否時に drag だけ
+消して途中の layout が残る穴があったため、同じ終了所有へそろえた。
+
+実アプリ確認（2026-10-23、`52b06df46` 相当の検証ビルド、ClaudeCode の隔離環境での操作。利用者の許可を得て
+実マウス入力で操作）: 3000×4000 画像で左上の角をドラッグして離すと X680 Y652 W2320 H3348 が `export_crop.db` に保存された。
+右辺をドラッグ中（W1178）に Escape を押すと W2320 に戻り、そのまま離しても変わらず、切り取りモードは残り、DB も不変だった。
+右辺をドラッグ中に Ctrl+E を押すと、書き出しダイアログの出力サイズが「そのまま (1179×3349)」で、DB も新しい右端へ保存された
+（ダイアログはキャンセルで閉じ、ファイルは書き出していない）。ドラッグしていないときの Escape では従来どおりモードを抜けた。
+SNS 分割、タッチ / ペン、リモートデスクトップ、ウィンドウ外で離す場合は自動テストのみ。
+
 ### 3.2 final pipeline の適用タイミング
 
 `App::ensure_final_composite_texture(ctx, idx)` が `edit_result_cache` を入力にして:

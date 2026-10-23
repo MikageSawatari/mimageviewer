@@ -531,6 +531,7 @@ impl RawPageStore {
                     started_at: page.develop_started_at,
                 };
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels: Arc::new(ci),
@@ -2125,6 +2126,7 @@ pub(crate) mod tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: Arc::new(pixels),
@@ -2186,6 +2188,7 @@ pub(crate) mod tests {
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
                             pdf_metadata: None,
                             tex: source.clone(),
                             pixels: Arc::clone(&raw),

@@ -31,6 +31,7 @@ pub(crate) fn pdf_book(ctx: &egui::Context) -> AppTestEnvForTest {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -456,6 +457,7 @@ fn paged_prefetch_reconcile_warm_and_poll_preserve_sibling_cache_and_channels() 
             owner.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels,

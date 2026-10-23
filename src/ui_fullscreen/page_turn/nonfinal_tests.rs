@@ -340,6 +340,7 @@ fn publish_larger_raster_and_final_for_idx(
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: texture,
             pixels,

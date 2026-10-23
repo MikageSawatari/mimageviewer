@@ -610,6 +610,7 @@ fn d3_2_frozen_sync_miss_and_quality_publication_progress_without_rewriting_cano
             app.fs_cache.insert(
                 1,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels,
@@ -685,6 +686,7 @@ fn seed_window_owner(app: &mut App, ctx: &egui::Context) {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,

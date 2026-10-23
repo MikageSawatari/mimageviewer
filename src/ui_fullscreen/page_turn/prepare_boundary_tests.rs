@@ -108,6 +108,7 @@ fn start_native_turn_with_source_size(
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels,

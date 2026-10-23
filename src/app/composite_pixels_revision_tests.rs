@@ -139,6 +139,7 @@ fn composite_pixels_revision_annotation_display_and_export_preserve_canonical_ba
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: raw,
@@ -266,6 +267,7 @@ fn composite_pixels_revision_animated_source_still_rejects_live_final_pixels() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex,
             pixels,

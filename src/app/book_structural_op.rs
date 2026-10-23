@@ -57,6 +57,19 @@ impl BookStructuralOp {
 }
 
 impl App {
+    #[cfg(test)]
+    pub(crate) fn hold_book_structure_for_test(
+        &mut self,
+    ) -> mpsc::Sender<Result<crate::books::BookOpResult, String>> {
+        let (tx, rx) = mpsc::channel();
+        self.book_structural_op = Some(BookStructuralOp::running_for_test(
+            rx,
+            crate::books::BookOpIntent::SourceMutation,
+            Completion::Manager,
+        ));
+        tx
+    }
+
     /// D2c: finish every accepted open before admitting a structural modal. The
     /// source path is deliberately irrelevant. Retained-session readoption and
     /// passive display/decoder reads are not new opens.
@@ -317,6 +330,14 @@ impl App {
     pub(crate) fn poll_book_structural_op(&mut self, ctx: &egui::Context) {
         if self.book_structural_op.is_none() {
             return;
+        }
+        // This owner retires unfinished gestures before either Requested can start FS work
+        // or Running can adopt a result. Modal input/panel skips must not strand a draft.
+        for owner in self.viewer_context_ids() {
+            self.with_owner_viewer_context(owner, |app| {
+                app.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::BookStructure);
+                app.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::BookStructure);
+            });
         }
         self.poll_all_page_edit_producers(ctx);
         // Accepted XMP reads remain owned even by parked viewers. Draining is an

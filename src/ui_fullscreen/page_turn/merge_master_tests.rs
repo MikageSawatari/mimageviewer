@@ -111,6 +111,7 @@ fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() 
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
                         pdf_metadata: None,
                         tex,
                         pixels: image,
@@ -1049,6 +1050,7 @@ fn saved_pdf_viewer(ctx: &egui::Context, book: &BookComposition) -> crate::app::
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels: image,
@@ -1113,6 +1115,7 @@ fn assert_saved_pdf_singleton_paint(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
                 pdf_metadata: None,
                 tex,
                 pixels,
@@ -1315,6 +1318,7 @@ fn page_turn_saved_coverless_boundary_remainder_actual_viewport_matrix() {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
                     pdf_metadata: None,
                     tex,
                     pixels,

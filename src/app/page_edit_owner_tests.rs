@@ -1006,6 +1006,7 @@ fn ready_lut_keeps_original_page_target_after_switching_editor_document() {
     app.fs_cache.insert(
         1,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: ctx.load_texture(
                 "lut-switch-ready",
@@ -1151,6 +1152,7 @@ fn exact_reader_swap_aligns_edit_session_with_second_same_key_slot() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex,
             pixels: pixels.clone(),
@@ -2003,6 +2005,89 @@ fn book_structure_rejects_new_local_adjustment_tag_and_trim_input() {
     );
     app.remove_view_trim_page_overrides_for_spread(0, SpreadPair::Single);
     assert!(app.view_trim_page_overrides.contains_key(&0));
+}
+
+#[cfg(windows)]
+#[test]
+fn book_structure_poll_cancels_crop_in_its_owner_without_restoring_into_sibling() {
+    use crate::export_crop::{CropAspectMode, CropRect, CropSettings};
+    let mut app = setup_app_for_test();
+    let main = app.projected_viewer_context_id();
+    let main_path = app.tmp.path().join("main-crop.jpg");
+    let sibling_path = app.tmp.path().join("sibling-crop.jpg");
+    app.items = vec![GridItem::Image(main_path)];
+    app.fullscreen_idx = Some(0);
+    let initial = CropSettings::authored(
+        CropRect {
+            min_x: 5.0,
+            min_y: 5.0,
+            max_x: 95.0,
+            max_y: 95.0,
+        },
+        CropAspectMode::Free,
+        [100, 100],
+    );
+    app.set_export_crop_for_idx(0, Some(initial), [100, 100]);
+    let sibling = app.build_window_context_for_test(1272416, |owner| {
+        owner.items = vec![GridItem::Image(sibling_path)];
+        owner.fullscreen_idx = Some(0);
+        owner.set_export_crop_for_idx(0, None, [100, 100]);
+    });
+    let page_owner = app.capture_page_edit_owner(0).unwrap();
+    assert_eq!(
+        app.export_crop_db
+            .as_ref()
+            .unwrap()
+            .get(&app.page_path_key(0).unwrap()),
+        Some(initial)
+    );
+    app.export_crop_mode = true;
+    app.export_crop_create_drag = Some(ExportCropCreateDrag {
+        start: [10.0, 10.0],
+        before: ExportCropDragSnapshot {
+            owner: page_owner,
+            press_frame: 0,
+            idx: 0,
+            image_size: [100, 100],
+            settings: Some(initial),
+        },
+    });
+    let draft = CropSettings::authored(
+        CropRect {
+            min_x: 10.0,
+            min_y: 10.0,
+            max_x: 70.0,
+            max_y: 80.0,
+        },
+        CropAspectMode::Free,
+        [100, 100],
+    );
+    app.set_export_crop_for_idx_memory_only(0, Some(draft), [100, 100]);
+    let _worker = app.hold_book_structure_for_test();
+    app.with_owner_viewer_context(sibling, |owner| {
+        owner.poll_book_structural_op(&egui::Context::default());
+        assert_eq!(owner.projected_viewer_context_id(), sibling);
+        assert!(owner.export_crop_page_settings.is_empty());
+        assert_eq!(
+            owner
+                .export_crop_db
+                .as_ref()
+                .unwrap()
+                .get(&owner.page_path_key(0).unwrap()),
+            None
+        );
+    })
+    .unwrap();
+    assert_eq!(app.projected_viewer_context_id(), main);
+    assert_eq!(app.export_crop_page_settings.get(&0), Some(&initial));
+    assert_eq!(
+        app.export_crop_db
+            .as_ref()
+            .unwrap()
+            .get(&app.page_path_key(0).unwrap()),
+        Some(initial)
+    );
+    assert!(app.export_crop_create_drag.is_none());
 }
 
 #[test]

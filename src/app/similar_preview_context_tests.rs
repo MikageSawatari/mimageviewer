@@ -62,6 +62,7 @@ fn seed_still_viewer(app: &mut App, ctx: &egui::Context, path: &str) -> usize {
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
             pdf_metadata: None,
             tex: texture,
             pixels,
