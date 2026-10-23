@@ -1,6 +1,6 @@
 # 本を優先するレーティング操作 (§1.417) 設計
 
-- 状態: 設計第 2 版 (2026-10-23、ClaudeCode)。第 1 版の独立レビュー (Codex gpt-6.1-sol / xhigh、
+- 状態: 設計第 2.1 版 (第 2 回レビュー P2・P3 反映)。設計第 2 版 (2026-10-23、ClaudeCode)。第 1 版の独立レビュー (Codex gpt-6.1-sol / xhigh、
   SID 01a166e6-c2f3-7ff0-b8cf-e4a4ce5721a1) は条件付き受入 (P1 なし・P2 1 件・P3 1 件)。第 2 版で P2
   (新経路から `is_dir()` を除く) と P3 (入れ子区分を `at_root()` に) を反映。レビュー担当は本変更が
   症状パッチではなく対象解決の所有境界を明示する構造的変更であり、detached 述語・viewport 経路を変えない
@@ -57,13 +57,13 @@
 | --- | --- | --- |
 | `Archive`、`zip_nav.at_root()` | `normalize(root)`。変換書庫 (RAR/7z/LZH 等) は root = 元書庫 (`archive_source_override`) | 親一覧の `ZipFile` / `ConvertibleArchive { path }` |
 | `Archive`、`!at_root()` (入れ子の本) | `book_container_key_from_segs(root, current_parent_zipdir_prefix)` (collapse で自動降下していても親セルの `ZipDir` と同じ合成キー) | 親階層の `ZipDir` セル |
+| `Document(logical)` | `normalize(logical)` (PDF / EPUB 等の元ファイル) | 親一覧の `PdfFile` / 変換元のセル |
+| `CompiledFolder(path)` | `normalize(path)`、kind = Folder | 本棚一覧の `Folder(path)` |
+| `ImageFolder(path)` | `normalize(path)`、kind = Folder | 親一覧の `Folder(path)` |
 
 注: `ZipNavState::new()` は初期ルートも collapse するので、`wrapper/01.jpg` だけの ZIP は `at_root()==true` かつ
 recipe の prefix が非空になる (設計レビュー P3)。区分は prefix の空/非空ではなく既存導出と同じ `at_root()` で行う。
 ZIP 内の PDF/EPUB を本として開く経路は現行コードに無い (書庫列挙が閲覧行を作らない) ので、対象外。
-| `Document(logical)` | `normalize(logical)` (PDF / EPUB 等の元ファイル) | 親一覧の `PdfFile` / 変換元のセル |
-| `CompiledFolder(path)` | `normalize(path)`、kind = Folder | 本棚一覧の `Folder(path)` |
-| `ImageFolder(path)` | `normalize(path)`、kind = Folder | 親一覧の `Folder(path)` |
 
 上の対応は「`BookScope` の値をそのままキーにしてよい」という意味ではない。キーは既存のコンテナ★と同じ
 **context の物理状態** (`zip_nav`・`archive_source_override`・`current_folder`) から導出し、`BookScope` とは
@@ -88,6 +88,10 @@ ZIP 内の PDF/EPUB を本として開く経路は現行コードに無い (書�
 - `write_container_rating_for_target_with_publication` の `showing_this_container` は、今
   `current_container_rating_target()` (metadata 生成で `is_dir()` を呼ぶ) を呼んでいる。これを検索中・合成パスの
   拒否 + `physical_container_rating_key()` の**キー比較だけ**にする (判定結果は同じで、ファイル照会が消える)。
+- 同様に、既存 `current_container_rating_key_and_source()` (`sync_current_context_rating_session_writes()` と
+  保存後の公開処理から呼ばれ、今は metadata 生成経由で `is_dir()` に到達する) も、従来の拒否条件
+  (検索中・合成パス) を保持したまま `physical_container_rating_key()` へ委譲し、metadata を作らない
+  (設計レビュー第 2 回 P2)。
 - 新しい所有者 `book_preferred_rating` (新規モジュール `src/app/book_preferred_rating.rs`):
 
 ```rust
