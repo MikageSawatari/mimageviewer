@@ -28767,7 +28767,11 @@ impl App {
             },
             _ => false,
         };
-        if navigation.is_some() && !detached_destination && self.main_folder_history_available() {
+        if navigation.is_some()
+            && !detached_destination
+            && !matches!(continuation, ClassifiedOpenContinuation::BookmarkRow(_))
+            && self.main_folder_history_available()
+        {
             let explicit_request = match &continuation {
                 ClassifiedOpenContinuation::DirectNavigation { restore_intent, .. }
                 | ClassifiedOpenContinuation::SmartGrid { restore_intent, .. }
@@ -51902,6 +51906,7 @@ impl App {
         if self.document_open_modal_admission_blocked() {
             return;
         }
+        self.admit_explicit_main_open_request();
         if let crate::bookmark_browser::BookmarkRowSource::Book(bookmark) = &row.source
             && Self::path_needs_open_classification(&bookmark.container_path)
         {
@@ -58266,8 +58271,12 @@ impl App {
             return;
         }
         // A pane click is an independent main-context open even before its worker scan finishes.
-        // Candidate, detached and fullscreen scans may target another viewer context; a refresh
-        // does not express a new open. Retire only the proven main-context pane intent here.
+        // A candidate has not chosen its viewer yet, but its explicit click already replaces
+        // unresolved startup opens. Main siblings wait until its destination is known.
+        #[cfg(windows)]
+        if matches!(purpose, FolderOpenScanPurpose::GridFolderCandidate { .. }) {
+            self.cancel_unresolved_open_for_navigation(true);
+        }
         let mut epub_restore = inherited_restore;
         if self.main_folder_history_available()
             && matches!(
@@ -58688,8 +58697,12 @@ impl App {
                         detached_lease,
                         "grid_folder_candidate_main_fallback",
                     );
-                    // The scan was only a candidate; this is its first main acceptance.
-                    self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Pane));
+                    // Startup admission happened at scan start. In particular, a provisional
+                    // snapshot activation received since then must survive this continuation.
+                    self.retire_replaced_main_list_requests_with_startup_intent(
+                        Some(MainListRequestOwner::Pane),
+                        false,
+                    );
                     let scan = if self.top_level_grid_view.smart_folder_session().is_some() {
                         let source_index = self.items.iter().position(|item| {
                             matches!(item, GridItem::Folder(folder)

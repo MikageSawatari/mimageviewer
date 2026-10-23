@@ -1455,6 +1455,20 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-23 §1.419 起動系の明示要求を受付順に揃える
+
+- 正本: `startup-diagnostics-plan.md` §6.2.2 第3版。設計担当 ClaudeCode と
+  Codex の独立設計レビューは、受付時点と既存 lease 指定の終端を揃える構造的修正であり、
+  guard・待機・repaint による症状パッチではないことに合意済み。
+- `app.rs::open_bookmark_browser_row` は detached 行きも main の共通受付を1回通す。
+  `GridFolderCandidate` は走査開始で未解決の起動要求を退役し、main 合流では再退役しない。
+  走査の取消は既存 `cancel_folder_pane_open` と対象 lease の loading shell 終了を使う。
+- `startup_ops.rs` は Activation としおりの受付を既存取消の合成へ集約する。
+  main 投影中の pending と process 共通 resolver / 変換だけが対象で、独立 detached context の
+  AwaitingPage / Media 待ちは総走査しない。snapshot 仮受付中の BookmarkRow 継続は既存 held に置く。
+  新しい detached 述語・状態・viewport 配送・placement 保存先は追加しない。
+- 自動検証と mutation の結果は正本 §6.2.2 の実装記録へ集約する。実アプリ検証は未実施。
+
 ### 2026-10-23 §1.417 本を優先するレーティング操作
 
 - 触れた範囲は画像閲覧と native 動画 / 音声のキー処理の既存レーティング節だけ。入力を受けた viewer context が
