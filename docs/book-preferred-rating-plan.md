@@ -1,6 +1,10 @@
 # 本を優先するレーティング操作 (§1.417) 設計
 
-- 状態: 設計第 1 版 (2026-10-23、ClaudeCode)。独立レビュー前。
+- 状態: 設計第 2 版 (2026-10-23、ClaudeCode)。第 1 版の独立レビュー (Codex gpt-6.1-sol / xhigh、
+  SID 01a166e6-c2f3-7ff0-b8cf-e4a4ce5721a1) は条件付き受入 (P1 なし・P2 1 件・P3 1 件)。第 2 版で P2
+  (新経路から `is_dir()` を除く) と P3 (入れ子区分を `at_root()` に) を反映。レビュー担当は本変更が
+  症状パッチではなく対象解決の所有境界を明示する構造的変更であり、detached 述語・viewport 経路を変えない
+  ことに同意した。
 - 起点: 5ch >>603。利用者決定 2026-10-23 (backlog §1.417 が要求の正本)。
 - 対象ブランチ / 作業ツリー: `book-preferred-rating-1417` / `G:\home\mimageviewer-bookrating`。
 - 未リリース判定: 新しい操作と ini 名を追加するだけで、既存の永続データ (rating.db・keymap.ini の既存行) の
@@ -51,8 +55,12 @@
 
 | `BookScope` | 本キー (= 親一覧のセルのキー) | 既存の対応 |
 | --- | --- | --- |
-| `Archive { logical_root, prefix: [] }` | `normalize(logical_root)`。変換書庫 (RAR/7z/LZH 等) は `logical_root` = 元書庫 | 親一覧の `ZipFile` / `ConvertibleArchive { path }` |
-| `Archive { logical_root, prefix: 非空 }` | `book_container_key_from_segs(root, current_parent_zipdir_prefix)` (collapse で自動降下していても親セルの `ZipDir` と同じ合成キー) | 親階層の `ZipDir` セル |
+| `Archive`、`zip_nav.at_root()` | `normalize(root)`。変換書庫 (RAR/7z/LZH 等) は root = 元書庫 (`archive_source_override`) | 親一覧の `ZipFile` / `ConvertibleArchive { path }` |
+| `Archive`、`!at_root()` (入れ子の本) | `book_container_key_from_segs(root, current_parent_zipdir_prefix)` (collapse で自動降下していても親セルの `ZipDir` と同じ合成キー) | 親階層の `ZipDir` セル |
+
+注: `ZipNavState::new()` は初期ルートも collapse するので、`wrapper/01.jpg` だけの ZIP は `at_root()==true` かつ
+recipe の prefix が非空になる (設計レビュー P3)。区分は prefix の空/非空ではなく既存導出と同じ `at_root()` で行う。
+ZIP 内の PDF/EPUB を本として開く経路は現行コードに無い (書庫列挙が閲覧行を作らない) ので、対象外。
 | `Document(logical)` | `normalize(logical)` (PDF / EPUB 等の元ファイル) | 親一覧の `PdfFile` / 変換元のセル |
 | `CompiledFolder(path)` | `normalize(path)`、kind = Folder | 本棚一覧の `Folder(path)` |
 | `ImageFolder(path)` | `normalize(path)`、kind = Folder | 親一覧の `Folder(path)` |
@@ -66,10 +74,20 @@
 
 - `ContainerRatingTarget { key: String, source: PathBuf, meta: RatingMeta }` を導入する
   (今のタプル `(String, PathBuf, RatingMeta)` を名前付きにする)。
-- 既存 `current_container_rating_target()` の本体のうち、検索中・合成パスの拒否**以外**の導出部分を
-  `physical_container_rating_target(&self) -> Option<ContainerRatingTarget>` に切り出す。
-  `current_container_rating_target()` は従来どおり `global_search.active` と合成パスで拒否してから
-  これを呼ぶ (Shift+F・アドレスバー★・メタデータパネル・リングの挙動は不変)。
+- 既存 `current_container_rating_target()` の本体のうち、検索中・合成パスの拒否**以外**の
+  **キーと source の導出**を、I/O なしの `physical_container_rating_key(&self) -> Option<PhysicalContainerKey>`
+  (`key`・`source`・入れ子なら `dir_prefix`) に切り出す。`current_container_rating_target()` は従来どおり
+  `global_search.active` と合成パスで拒否してからこれを呼び、metadata は従来どおり
+  `archive_rating_kind_for_path` (内部で `is_dir()` を呼ぶ既存処理) で作る。Shift+F・アドレスバー★・
+  メタデータパネル・リングの挙動は不変。
+- 新操作の metadata は**採用済み `BookScope` の種別から**作り、ファイル照会をしない (設計レビュー P2):
+  `ImageFolder` / `CompiledFolder` → `Folder`、`Document` → `PdfFile`、`Archive` で `at_root()` → 拡張子で
+  `ConvertibleArchive` (+ `archive_format`) か `ZipFile`、`Archive` で入れ子 → `ZipDir` (+ `dir_prefix` /
+  `zipdir_is_archive`、既存と同じ値)。拡張子判定は既存の `archive_format_for_rating_path` /
+  `is_zip_extension` を使う (I/O なし)。
+- `write_container_rating_for_target_with_publication` の `showing_this_container` は、今
+  `current_container_rating_target()` (metadata 生成で `is_dir()` を呼ぶ) を呼んでいる。これを検索中・合成パスの
+  拒否 + `physical_container_rating_key()` の**キー比較だけ**にする (判定結果は同じで、ファイル照会が消える)。
 - 新しい所有者 `book_preferred_rating` (新規モジュール `src/app/book_preferred_rating.rs`):
 
 ```rust
@@ -92,8 +110,8 @@ impl App {
 `resolve_book_preferred_viewer_target` は I/O をしない純粋な読み取りで、判定は次だけ:
 
 1. `self.projection_recipe` が `Book(scope)` でなければ `ViewerItem`。
-2. `physical_container_rating_target()` を求め、§3.3 で `scope` と照合する。一致すれば `Book(target)`、
-   求められない / 一致しなければ `Unavailable(理由)`。
+2. `physical_container_rating_key()` を求め、§3.3 で `scope` と照合する。一致すれば scope 由来の metadata を
+   付けて `Book(target)`、求められない / 一致しなければ `Unavailable(理由)`。
 
 `global_search.active` は見ない。検索結果から物理の本を開いた状態 (recipe = `Book`) でも、
 その本の物理状態から本キーが決まる。検索結果一覧そのもの・検索結果から開いた画像
@@ -191,13 +209,18 @@ showing=false となり、表示キャッシュ (`current_folder_rating_cache`) 
 - resolver (純粋): `OrdinaryList` / 各 `ExtractedResult` → `ViewerItem`、ZIP ルート、入れ子 ZIP (collapse で
   自動降下した状態で親 `ZipDir` セルと同じキー)、変換書庫 (元書庫のキー)、PDF、EPUB、`ImageFolder`、
   `CompiledFolder`、検索から開いた物理の本 (検索前フォルダではなく本のキー)、recipe と物理状態の不一致 → `Unavailable`。
-  各ケースで「本キー == 親一覧でそのセルの `rating_path_key`」を直接比較する。
+  各ケースで「本キー == 親一覧でそのセルの `rating_path_key`」を直接比較する。ZIP は「初期ルートで collapse
+  した本 (`at_root()` かつ prefix 非空)」と「入れ子に入った後で collapse した本」を別のテストにする。
+  Ctrl+G は「検索を開いた直後 (旧の本の items と recipe がまだ採用済み)」と「検索結果を採用した後
+  (`ExtractedResult`、検索前フォルダへは書かない)」と「検索結果から物理の本を開いた後 (本のキー)」を区別する。
+  resolver がファイル照会をしないこと (存在しないパスでも同じ結果になること) も確かめる。
 - handler-level: 一覧 (カーソル単体・複数チェック 1 回 Undo・本のページ一覧) は選択項目に書く。画像閲覧の
   本では本キーへ書き、ページの★は変わらない。非本ではページへ書く。Step は未評価→★4 / ★5 で変化なし。
   評価フィルタで現在の本や項目が条件から外れても 1 回だけ適用され、Undo 1 回で戻る。
 - 複数 context: F12 で本 A を開き、メインは別フォルダ B を表示している状態で、F12 側の入力は A のキーだけに
-  書き、メイン context の items・rating_cache・current_folder_rating_cache を変えない。メイン側の入力は B 側の
-  規則で解決する。
+  書き、メイン context の items・rating_cache・current_folder_rating_cache のうち A と無関係なキーを変えない
+  (メインの一覧に A のセルがあれば、既存の共有 ledger による次回 mount 時の★更新は正しい既存動作)。
+  メイン側の入力は B 側の規則で解決する。
 - native 動画: 非本の動画では表示中アイテムへ。`NativeVideoFixedKeyAction` の結果を確認する。
 
 ## 8. 文書
