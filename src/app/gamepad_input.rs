@@ -11,8 +11,8 @@ use eframe::egui;
 #[cfg(windows)]
 use super::ViewerPresentation;
 use super::{
-    App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridCursorMove,
-    GridScrollIntent, grid_cursor_nav_target_pos,
+    App, ContainerRatingTarget, FolderNavMode, GridContainerOpenMode, GridCursorDirection,
+    GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -3145,15 +3145,19 @@ impl App {
         let video_continuous_mode = self.video_continuous_mode;
         // **保存先も開いた時点で固定する。** 確定時に「いまのフォルダ」を引き直すと、
         // リングを開いたまま前面の窓が変わったときに別のフォルダへ書く (レビュー Q01)。
-        let container_rating_target =
-            self.current_container_rating_target()
-                .map(|(path_key, source_path, meta)| {
-                    crate::ring_shortcut::RingPickerContainerTarget {
-                        path_key,
-                        source_path,
-                        meta,
-                    }
-                });
+        let container_rating_target = self.current_container_rating_target().map(
+            |ContainerRatingTarget {
+                 key: path_key,
+                 source: source_path,
+                 meta,
+             }| {
+                crate::ring_shortcut::RingPickerContainerTarget {
+                    path_key,
+                    source_path,
+                    meta,
+                }
+            },
+        );
         let original = RingPickerOriginalState {
             grid_cols,
             sort_order,

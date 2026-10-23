@@ -1175,7 +1175,12 @@ impl App {
 
     /// コンテナレーティング (Shift+F*) 用。現在表示中コンテナ 1 件の変更だけを積む。
     pub(crate) fn capture_container_rating_undo(&mut self, before: u8, after: u8) {
-        let Some((path_key, source_path, meta)) = self.current_container_rating_target() else {
+        let Some(crate::app::book_preferred_rating::ContainerRatingTarget {
+            key: path_key,
+            source: source_path,
+            meta,
+        }) = self.current_container_rating_target()
+        else {
             return;
         };
         self.capture_container_rating_undo_for_target(

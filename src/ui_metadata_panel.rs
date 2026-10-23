@@ -2957,7 +2957,7 @@ impl App {
     pub(crate) fn current_metadata_panel_container_rating(&mut self) -> Option<(&'static str, u8)> {
         use crate::rating_db::RatingItemKind;
 
-        let (_, _, meta) = self.current_container_rating_target()?;
+        let meta = self.current_container_rating_target()?.meta;
         let label = match meta.kind {
             RatingItemKind::Folder | RatingItemKind::ZipDir => "フォルダ",
             RatingItemKind::PdfFile => "PDF",

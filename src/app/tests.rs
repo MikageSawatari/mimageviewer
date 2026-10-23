@@ -10694,7 +10694,8 @@ fn metadata_panel_plain_folder_container_rating_is_unchanged() {
     std::fs::create_dir_all(&folder).unwrap();
     app.current_folder = Some(folder.clone());
 
-    let (key, source, meta) = app.current_container_rating_target().unwrap();
+    let ContainerRatingTarget { key, source, meta } =
+        app.current_container_rating_target().unwrap();
     assert_eq!(key, crate::adjustment_db::normalize_path(&folder));
     assert_eq!(source, folder);
     assert_eq!(meta.kind, crate::rating_db::RatingItemKind::Folder);
@@ -10742,7 +10743,11 @@ fn metadata_panel_zip_root_and_subdirectory_read_composed_container_keys() {
     let book_key = crate::adjustment_db::normalize_path(&zip.join("book-a"));
     app.rating_db.as_ref().unwrap().set(&book_key, 5).unwrap();
 
-    let (resolved_key, source, meta) = app.current_container_rating_target().unwrap();
+    let ContainerRatingTarget {
+        key: resolved_key,
+        source,
+        meta,
+    } = app.current_container_rating_target().unwrap();
     assert_eq!(resolved_key, book_key);
     assert_eq!(source, zip);
     assert_eq!(meta.kind, crate::rating_db::RatingItemKind::ZipDir);

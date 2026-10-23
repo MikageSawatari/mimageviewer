@@ -548,6 +548,10 @@ pub(crate) mod file_type_resume;
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
 pub(crate) mod book_materialization;
+pub(crate) mod book_preferred_rating;
+use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
+#[cfg(test)]
+mod book_preferred_rating_tests;
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;
@@ -56536,12 +56540,22 @@ impl App {
         // コンテナ★は可視アイテムが 0 件でも current_folder に対して成立するため、
         // visible_indices の有無に関係なく処理する。
         {
-            let shift_rating_key = self.keymap.consume_rating_action(ctx, true);
+            let shift_rating_key = self
+                .keymap
+                .consume_rating_action(ctx, crate::keymap::RatingTargetFamily::Container);
             if let Some(edit) = shift_rating_key {
                 self.apply_rating_edit_to_current_container(edit);
             }
-            let rating_key = self.keymap.consume_rating_action(ctx, false);
+            let rating_key = self
+                .keymap
+                .consume_rating_action(ctx, crate::keymap::RatingTargetFamily::Item);
             if let Some(edit) = rating_key {
+                self.apply_rating_edit_to_selection(edit);
+            }
+            if let Some(edit) = self
+                .keymap
+                .consume_rating_action(ctx, crate::keymap::RatingTargetFamily::BookPreferred)
+            {
                 self.apply_rating_edit_to_selection(edit);
             }
         }
@@ -74589,70 +74603,30 @@ impl App {
     /// - 本の中: BS で戻った親階層に表示される `ZipDir` セルと同じ合成キー
     /// を使う。collapse で `bookB/only/` まで自動降下していても、親セルが `bookB/`
     /// なら `root\bookB` に保存する。
-    pub(crate) fn current_container_rating_target(
-        &self,
-    ) -> Option<(String, PathBuf, crate::rating_db::RatingMeta)> {
-        use crate::rating_db::{RatingItemKind, RatingMeta};
+    pub(crate) fn current_container_rating_target(&self) -> Option<ContainerRatingTarget> {
         if self.global_search.active {
             return None;
         }
-        if let Some(nav) = self.zip_nav.as_ref() {
-            let root = zip_rating_root_path(
-                &nav.tree.zip_path,
-                self.archive_source_override.as_deref(),
-                self.current_folder.as_deref(),
-            );
-            let (key_path, meta) = if nav.at_root() {
-                let kind = archive_rating_kind_for_path(root);
-                let mut meta = RatingMeta::new(kind).with_source_path(root);
-                if kind == RatingItemKind::ConvertibleArchive
-                    && let Some(format) = archive_format_for_rating_path(root)
-                {
-                    meta.archive_format = Some(archive_format_to_rating_str(format).to_string());
-                }
-                (root.to_path_buf(), meta)
-            } else {
-                let prefix = nav.current_parent_zipdir_prefix()?;
-                let key_path = book_container_key_from_segs(root, &prefix);
-                let dir_prefix = prefix.join("/");
-                let dir_prefix = if dir_prefix.is_empty() {
-                    dir_prefix
-                } else {
-                    format!("{dir_prefix}/")
-                };
-                let mut meta = RatingMeta::new(RatingItemKind::ZipDir).with_source_path(root);
-                meta.dir_prefix = Some(dir_prefix.clone());
-                meta.zipdir_is_archive = Some(zipdir_prefix_is_archive(&dir_prefix));
-                (key_path, meta)
-            };
-            return Some((
-                crate::adjustment_db::normalize_path(&key_path),
-                root.to_path_buf(),
-                meta,
-            ));
-        }
-        let folder = self.current_folder.as_ref()?;
-        // 検索結果 / 閲覧履歴 / レーティング一覧の擬似パスは実コンテナではない。
-        if is_synthetic_view_path(folder) {
-            return None;
-        }
-        let kind = archive_rating_kind_for_path(folder);
-        let mut meta = RatingMeta::new(kind).with_source_path(folder);
-        if kind == RatingItemKind::ConvertibleArchive
-            && let Some(format) = archive_format_for_rating_path(folder)
-        {
-            meta.archive_format = Some(archive_format_to_rating_str(format).to_string());
-        }
-        Some((
-            crate::adjustment_db::normalize_path(folder),
-            folder.clone(),
+        let physical = self.physical_container_rating_key()?;
+        let kind = if physical.dir_prefix.is_some() {
+            crate::rating_db::RatingItemKind::ZipDir
+        } else {
+            archive_rating_kind_for_path(&physical.source)
+        };
+        let meta = book_preferred_rating::container_rating_meta(&physical, kind);
+        Some(ContainerRatingTarget {
+            key: physical.key,
+            source: physical.source,
             meta,
-        ))
+        })
     }
 
     pub(crate) fn current_container_rating_key_and_source(&self) -> Option<(String, PathBuf)> {
-        self.current_container_rating_target()
-            .map(|(key, source, _)| (key, source))
+        if self.global_search.active {
+            return None;
+        }
+        self.physical_container_rating_key()
+            .map(|target| (target.key, target.source))
     }
 
     /// 現在一覧表示中のコンテナ (フォルダ / ZIP / PDF / ネスト ZIP の本) の
@@ -74703,12 +74677,25 @@ impl App {
         &mut self,
         edit: crate::keymap::RatingEdit,
     ) -> bool {
+        let Some(target) = self.current_container_rating_target() else {
+            return false;
+        };
+        self.apply_rating_edit_to_container_target(&target, edit, ContainerRatingToast::Container)
+    }
+
+    /// Resolve Step and write through the same captured target, even if publication moves the page.
+    pub(crate) fn apply_rating_edit_to_container_target(
+        &mut self,
+        target: &ContainerRatingTarget,
+        edit: crate::keymap::RatingEdit,
+        toast: ContainerRatingToast,
+    ) -> bool {
         use crate::keymap::RatingEdit;
         self.sync_current_context_rating_session_writes();
         let stars = match edit {
             RatingEdit::Assign(stars) => stars,
             RatingEdit::Step(direction) => {
-                let before = self.current_folder_rating();
+                let before = self.container_rating_before(&target.key);
                 let Some(after) = crate::keymap::step_rating(before, direction) else {
                     self.show_feedback_toast(Self::rating_step_bound_toast(direction));
                     return false;
@@ -74716,9 +74703,22 @@ impl App {
                 after
             }
         };
-        match self.set_current_folder_rating(stars) {
+        match self.write_container_rating_for_target(
+            &target.key,
+            &target.source,
+            &target.meta,
+            stars,
+            true,
+        ) {
             Ok(true) => {
-                self.show_container_rating_toast(stars);
+                match toast {
+                    ContainerRatingToast::Container => self.show_container_rating_toast(stars),
+                    ContainerRatingToast::Book => self.show_feedback_toast(if stars == 0 {
+                        "[本★解除]".to_string()
+                    } else {
+                        format!("[本{}]", "★".repeat(stars as usize))
+                    }),
+                }
                 true
             }
             Ok(false) => false,
@@ -74727,6 +74727,20 @@ impl App {
                 false
             }
         }
+    }
+
+    fn showing_container_rating_key(&self, key: &str) -> bool {
+        self.current_container_rating_key_and_source()
+            .is_some_and(|(current, _)| current == key)
+    }
+
+    /// Shared by Step and the writer so their cache/DB choice cannot diverge.
+    fn container_rating_before(&self, key: &str) -> u8 {
+        self.showing_container_rating_key(key)
+            .then_some(self.current_folder_rating_cache)
+            .flatten()
+            .or_else(|| self.rating_db.as_ref().map(|db| db.get(key)))
+            .unwrap_or(0)
     }
 
     pub(crate) fn apply_rating_edit_to_fullscreen_item(
@@ -74783,7 +74797,9 @@ impl App {
         stars: u8,
         capture_undo: bool,
     ) -> Result<bool, String> {
-        let Some((key, source, meta)) = self.current_container_rating_target() else {
+        let Some(ContainerRatingTarget { key, source, meta }) =
+            self.current_container_rating_target()
+        else {
             return Ok(false);
         };
         self.write_container_rating_for_target(&key, &source, &meta, stars, capture_undo)
@@ -74822,19 +74838,13 @@ impl App {
         capture_undo: bool,
         publish: bool,
     ) -> Result<bool, String> {
-        let showing_this_container = self
-            .current_container_rating_target()
-            .is_some_and(|(current, _, _)| current == key);
+        let showing_this_container = self.showing_container_rating_key(key);
         let stars = stars.min(5);
         if capture_undo {
             self.prepare_page_edit_history_boundary();
         }
         // Undo 用に変更前の値をキャッシュ or DB から取得 (なければ 0)。
-        let before = showing_this_container
-            .then_some(self.current_folder_rating_cache)
-            .flatten()
-            .or_else(|| self.rating_db.as_ref().map(|db| db.get(key)))
-            .unwrap_or(0);
+        let before = self.container_rating_before(key);
         if before == stars {
             return Ok(false);
         }

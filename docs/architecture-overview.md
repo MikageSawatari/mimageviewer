@@ -320,6 +320,7 @@ fullscreen／通過／animation には共通 typed policy で使わない。詳�
 | `same_name_folder_book.rs` | 同名の実folder/本の「本を表示 / フォルダを表示 / 両方表示」を適格な候補へ適用するpure policy。通常一覧・Smart・サブ展開・Ctrl+↑↓/DFS・Remoteで共用し、再帰探索を刈らない。旧`skip_zip_if_folder_exists`のON→本表示/OFF→両方表示を、Settings・Remote subset・preferences transferの共通decoderで読み替える |
 | `app/startup_list_restore.rs` | 「前回終了した場所」の明示一覧 record と唯一の reducer。main の採用済み物理一覧／本／Drive の適格性を投影し、明示一覧採用、既存一覧の表示要求受理、同じ一覧の cursor 捕捉を分ける。直接読書・内部 load・合成 root・F12 表示先切替・independent viewer は target を更新しない。既存 typed request が intent を運び、ZIP prefix を含む restore hydration は最初の materialization に渡す。詳細と検証状況は [起動復元の所有設計](startup-restore-target-plan.md) |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理。native Touch は render overlay 内で完結し、App の legacy mouse 操作へは再注入しない |
+| `app/book_preferred_rating.rs` | 「本を優先」する評価対象の解決を所有する。入力を受けた mounted viewer context の採用済み recipe と物理コンテナキーを I/O なしで照合し、本全体 / 表示アイテム / 照合不能を値で確定する。本キーは親一覧の本セルと同じで、保存・公開・Undo は既存 writer を共有する。detached 述語・viewport・context lifecycle は変更せず、新しい状態は持たない |
 | `touch_input.rs` | 静止画 egui viewport と native video presenter が共有する、接点集合・所有・tap zone・pinch/pan/scroll の純粋な認識器 |
 | `touch_debug.rs` | `MIV_TOUCH_DEBUG=1` の入力源診断。Win32 pointer/mouse source に加え、native presenter / HUD の stream 所有、座標変換、認識コマンド、promoted mouse 破棄を source 別に記録する |
 | `app/recursive_snapshot_scan.rs` | 複数実フォルダを再帰列挙する snapshot view 共通 walker。cancel、深さ上限、reparse point 回避、重複 root 排除、`GlobalIoSemaphore` / `ActivityGate`、chunk sort をサブ展開とスマートフォルダで共有する |

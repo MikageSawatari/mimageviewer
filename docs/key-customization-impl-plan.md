@@ -421,9 +421,15 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     Win32 クリップボード paste、ファイル D&D は keyboard keymap の範囲外。対象にするなら
     Grid の別フェーズで明示的に設計する。
 11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear/StepUp/StepDown` と
-   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。StepUp/StepDown は既定キーなし。グリッド / 画像フルスクリーン / native 動画の
+   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。§1.417で `RatingBookPreferred1..5/Clear/StepUp/StepDown` を追加し、8操作とも既定キーなしとする。既存2系統のStepUp/StepDownも既定キーなし。グリッド / 画像フルスクリーン / native 動画の
    入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
    `set_rating` / `set_current_folder_rating` 経路を共有する。
+   入力の対象系統は `RatingTargetFamily::{Item, Container, BookPreferred}` で表し、
+   `consume_rating_action(ctx, family)` と `RatingKey.family` に渡す。nativeの照合順は
+   Container → Item → BookPreferredとし、既存2系統の優先を保つ。表示用の
+   `rating_key_action` / `first_rating_chord_label` / `rating_chord_summary_label` は既存のbool引数のまま、
+   アイテム / コンテナ用だけを扱う。本を優先する入力は一覧ではアイテム用へ、閲覧中は採用済みrecipeに
+   基づく単一resolverへ渡す。対象解決・保存の詳細は [§1.417 の設計](book-preferred-rating-plan.md) を参照。
 12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104 など) は特殊。
     元画像表示は `FsOriginalPreviewHold` へ昇格し、Windows では割り当てた修飾キーの OS 状態を読む。
     旧 F11 window mode 経路は `FsToggleWindowMode` へ昇格済みで、native 動画 presenter も
@@ -561,7 +567,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
 - RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`。
-  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`
+  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`。
+  RatingBookPreferred1..5/Clear/StepUp/StepDownも全操作 `none`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridCopyFiles / GridCutFiles は Shell clipboard 実行経路を保ったまま keymap 化済み。
   Paste `Ctrl+V`、D&D、右クリック操作そのものは OS/clipboard/マウス経路を含むため固定。
@@ -573,7 +580,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
-- レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
+- レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` / `RatingBookPreferred*` を共有する。
 - BrowserBack/Forward、マウス戻る/進むは
   `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で
   コンテキスト別に個別割り当て。動画・音声の修飾なしホイールは前後ファイル移動（既定）/

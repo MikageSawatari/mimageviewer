@@ -365,6 +365,14 @@
 # RatingContainerClear = Shift+F6 ; レーティングを解除する（コンテナ）
 # RatingContainerStepUp = none ; 評価を1段階上げる（コンテナ）
 # RatingContainerStepDown = none ; 評価を1段階下げる（コンテナ）
+# RatingBookPreferred1 = none ; 星1を付ける（本を優先）
+# RatingBookPreferred2 = none ; 星2を付ける（本を優先）
+# RatingBookPreferred3 = none ; 星3を付ける（本を優先）
+# RatingBookPreferred4 = none ; 星4を付ける（本を優先）
+# RatingBookPreferred5 = none ; 星5を付ける（本を優先）
+# RatingBookPreferredClear = none ; レーティングを解除する（本を優先）
+# RatingBookPreferredStepUp = none ; 評価を1段階上げる（本を優先）
+# RatingBookPreferredStepDown = none ; 評価を1段階下げる（本を優先）
 
 [FsImage] ; 画像フルスクリーン
 # FsClose = Enter ; 画像フルスクリーンを閉じる
