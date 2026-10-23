@@ -3,7 +3,7 @@
 - 状態: **実装済み・独立コードレビュー受入可 (2026-10-23)・本体 lib 全件緑・画面操作による実アプリ確認は未実施**。
   コードレビューは設計レビューと同じ担当 (SID 01a166e6…) が 2 回実施: 第 1 回は差し戻し (P2: 名前に拡張子を含む
   実フォルダ → §3.4・§1.418、P3 2 件)、第 2 回で受入可。本体 lib 全件 (`test-lib-full.ps1`、6e1cee860 時点) は
-  14,168 件成功・失敗 0。実アプリ: ClaudeCode が隔離 data-dir (`targetookrating-smoke\data`) で dev-runtime build を
+  14,168 件成功・失敗 0。実アプリ: ClaudeCode が隔離 data-dir (`target\bookrating-smoke\data`) で dev-runtime build を
   起動し、data-dir の keymap.ini (新操作 5 つに Ctrl+F3/F5/F6/F7/F8) が取り込まれて settings.db の keymap overrides に
   保存されたこと、生成された keymap.ini.default に新 8 操作が載ることを、ファイルと DB を読んで確認した。
   キー入力で一覧・閲覧・F12 の対象を確かめる画面操作は、利用者が画面操作の許可を出さなかったため未実施。
