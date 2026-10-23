@@ -594,10 +594,10 @@ synthetic 履歴 replay、DFS 開始、固定一覧の固定/解除は直接 ins
 サブ展開の scan→prepare と policy 変更による再 scan も同じ要求の継続である。
 ZIP の Enter/ダブルクリック/BS/DFS は成功した移動の受付で退役し、階層の再投影では退役しない。
 
-GridFolderCandidate の走査開始は移動先 viewer が未確定なので main 受付にしない。
-既存の判定で main 復帰が確定した地点で1回受付し、Smart への引き渡しと通常の
-`folder_pane_open_ready` 合流はその継続にする。復元 intent が PageContinuation でもこの受付は必要。
-通常 pane は走査開始時に受付済みで、完了時には後発 resolver を退役させない。detached 判定は変更しない。
+GridFolderCandidate は §1.419（§6.2.2）で、走査開始時に未解決の起動系要求だけを退役する。
+移動先 viewer が未確定の間は main の兄弟要求を退役せず、main 復帰が確定した地点で
+兄弟を退役するが起動系要求を再退役しない。Smart への引き渡しと通常の `folder_pane_open_ready`
+合流は継続とする。通常 pane も完了時には後発 resolver を退役させない。detached 判定は変更しない。
 
 2026-10-21、`71d5d94ba` で Continuation にした22箇所を個別に再監査した。
 以下の位置は同 commit の修正前行番号。Candidate の main 合流以外に、未受付の新しい main 要求を
@@ -632,7 +632,7 @@ Candidate の Smart main 復帰も、同じ確定地点で受付してから Con
 回帰テストは gamepad の実 Candidate 開始と本番の post_render_main_navigation 合流を通し、
 混在 folder と設定変更による PageContinuation の main 復帰を検査する。
 
-既知の別件（master `4db8a8874` から存在、§1.285 の範囲外、未対応）:
+§1.285 実装時に残した別件の調査記録（master `4db8a8874` から存在、当時未対応。現在の正本は §6.2.2）:
 先行する `BookmarkRow` 分類 A の完了が、後発 Activation B の resolver を置換し得る
 （`src/app.rs:28331` → `src/app.rs:51411` → `src/app/startup_ops.rs:327`）。
 OtherArchive（RAR 等）は PDF/EPUB の composition qualification 待ちを通らない。
@@ -821,6 +821,49 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
   受け付けても、A のページ移動と窓が保たれること（`src/app/tests.rs:33890` の状態を起点にする）。
 - §1.285 の `section1285_*` と §1.133 の既存テストが変わらず緑。
 - 隔離実アプリ: 応答しない UNC（TEST-NET、毎回アドレスを変える）で B の解決を遅らせ、先行 A の後に二重起動の転送を送る。
+
+**実装記録（2026-10-23、startup-win-1419、未コミット）:**
+
+- `src/app/startup_ops.rs::admit_explicit_main_open_request` に既存取消を合成し、R1 の非 snapshot Activation、
+  R2 のしおりクリック、R4 の snapshot 範囲内判定を接続。surface switch の受付は変更しない。
+- `src/app.rs` の BookmarkRow 分類は受付済みの継続とし、R3 の Candidate は走査開始で起動要求だけを退役、
+  main 合流では main の兄弟だけを退役する。検索の取消は追加しない。
+- R4 の BookmarkRow 継続は既存 Activation の held receiver へ格納する。拒否・Activation 置換の時計補償は
+  `defer_current_bookmark_open_timeout_at` で時計ごとに制限し、held が detached owner のときはその lease の context に限定する。
+- 実装独立レビュー（Codex gpt-6.1-sol / xhigh）で、共通受付における detached global resolver の即時取消、
+  変換 completion の Bookmark owner を保持した終端、終了済み binding の時計補償除外を補充した。
+  `finish_replaced_startup_open_owner` は受領 lease で既存 context を解決して ID 終端へ渡し、兄弟を総走査しない。
+  再レビューは追加指摘なし・受入可。実行結果は実装担当が所有する。
+- `section1419_*` の状態遷移を `startup_ops.rs` と `src/app/tests.rs` へ追加。先行8種類 × 後発2種類 × 両完了順、
+  分類済みしおり、snapshot 保留と拒否、時計の段階移行、記憶クリア、独立 detached のページ・動画待機を検査する。
+  既存 `section1285_candidate_main_join_retires_older_startup_and_activation` は、R3 に合わせて退役時点の期待値だけを
+  走査開始へ前倒しした（同じ「古い起動要求は着地しない」の不変条件を保持）。
+- 関連 nextest は **410件成功、失敗0、exit 0**（`1 leaky` 表示あり、原因未特定）。
+  `target/section1419-final-related-tests.log` と `target/section1419-related-junit.xml` に保存。
+- mutation は受付を無効化（Activation の旧個別取消は復元）、BookmarkRow 分類の旧受付、Candidate の旧退役時点、
+  BookmarkRow 継続による resolver 置換、時計への全保留時間加算を戻した。追加13件中 **9件失敗・4件成功、exit 100**。
+  受付順逆転・Candidate の後発退役・held 置換・時計過補償・旧 shell 残留の検出を確認した。
+  `target/section1419-mutation-tests.log` / `target/section1419-mutation-junit.xml` に保存し、対象2ファイルは
+  `target/section1419-mutation/manifest.json` の固定版 SHA-256 と一致する byte-for-byte 復元済み。
+  復元後の `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt` / `cargo fmt --check` は成功。
+  `section1419_*` 13件 + `section1285_*` 14件の **27件を再実行して全成功、leaky なし、exit 0**
+  （`target/section1419-restored-tests.log` / `target/section1419-restored-junit.xml`）。
+  `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` も成功（通常feature、core / remote / EPUB worker、
+  VCRT: runtime 4本・PE 3本）。実行コマンド・版・ソースhashは `target/section1419-verification.json`、
+  build記録は `target/section1419-build-dev.log`。アプリは起動していない。
+  全件 gate と隔離実アプリ検証は設計担当への引継ぎ対象。
+
+| 追加テスト（`section1419_` 以下） | 検査対象 |
+| --- | --- |
+| `activation_and_bookmark_retire_earlier_main_requests` | 先行8種類、後発 Activation / しおり、両完了順（64ケース） |
+| `classified_bookmark_click_retires_pane_before_classification` / `detached_bookmark_adopts_without_mutating_sibling_context` | 分類あり・なし、main / detached の受付と独立 sibling の保持 |
+| `candidate_main_continuation_keeps_provisional_activation` / `failed_activation_does_not_resume_the_retired_pane` | Candidate 継続と拒否された後発要求 |
+| `snapshot_bookmark_classification_continuation_is_held_until_admission` | main / detached の継続保留、範囲内なら旧 shell 終了、範囲外なら同じ resolver 再開 |
+| `timeout_compensation_is_per_clock_after_stage_transition` / `snapshot_replacement_and_refusal_never_advance_new_bookmark_clock_into_future` | 途中生成・段階移行・Activation 置換と拒否の時計補償 |
+| `retired_held_detached_context_does_not_panic_on_refusal_or_replacement` | held owner の context 終了後の拒否・置換で binding を再生成しない |
+| `explicit_admission_cancels_all_main_bookmark_stages_but_memory_clear_keeps_page_wait` | Resolving / Qualifying / AwaitingPage / Media と記憶クリア |
+| `bookmark_click_terminates_detached_resolver_and_conversion_owner` | global resolver / 変換 owner の取消、旧 pending 終了と shell Closing |
+| `main_admission_preserves_independent_detached_page_wait` / `main_admission_preserves_independent_detached_media_wait` | 独立 detached のページ / 動画・音声待ちを保持 |
 
 ### 6.3 §1.335 と compose、merge 順序
 

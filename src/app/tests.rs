@@ -34382,6 +34382,206 @@ fn begin_detached_bookmark_media_test(
 
 #[cfg(windows)]
 #[test]
+fn section1419_bookmark_click_terminates_detached_resolver_and_conversion_owner() {
+    for conversion in [false, true] {
+        for classified in [false, true] {
+            let mut app = phase_c_support::setup_app();
+            app.active_quick_folder_slot = None;
+            let ctx = egui::Context::default();
+            let source = app.tmp.path().join("old.rar");
+            std::fs::write(&source, b"fixture").unwrap();
+            arm_detached_bookmark_book_open(
+                &mut app,
+                source.clone(),
+                crate::book_bookmarks::BookContainerKind::OtherArchive,
+                crate::book_bookmarks::PageIdentity::ArchiveEntry("page.jpg".into()),
+            );
+            app.bookmark_open_request_seq = 1;
+            let pending = app.bookmark_open_pending.take().unwrap();
+            let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(source.clone());
+            assert!(app.start_detached_bookmark_loading_context(
+                &ctx,
+                pending,
+                target.clone(),
+                DetachedSource::Book,
+                source.clone()
+            ));
+            let context = app.active_viewer_context_id().unwrap();
+            let window_id = app.active_detached_window_id().unwrap();
+            let cancel = app
+                .startup_open_path_resolve_pending
+                .as_ref()
+                .unwrap()
+                .cancel
+                .clone();
+            let owner = crate::bookmark_browser::BookmarkOpenRequestOwner {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+                target,
+                detached_lease: Some(DetachedSessionLease { window_id }),
+            };
+            let mut conversion_tx = None;
+            let conversion_cancel = Arc::new(AtomicBool::new(false));
+            if conversion {
+                drop(app.startup_open_path_resolve_pending.take());
+                let (tx, rx) = mpsc::channel();
+                conversion_tx = Some(tx);
+                app.archive_convert = Some(Box::new(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                src_path: source, input_seq: 0, format: ArchiveFormat::Rar,
+                password: None, password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: conversion_cancel.clone(), rx, pending_nav: None, pending_direct_nav: None,
+                allow_direct_read: false,
+                completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Bookmark(owner),
+                pending_sibling_output: None, restore_intent: StartupListIntent::ExplicitList,
+                auto_fullscreen: false, deferred_fullscreen: None,
+                suppress_confirm: false, suppress_confirm_next_time: false,
+            }));
+            }
+            let b = app
+                .tmp
+                .path()
+                .join(if classified { "new.epub" } else { "new.pdf" });
+            if classified {
+                std::fs::create_dir(&b).unwrap();
+            } else {
+                std::fs::write(&b, b"fixture").unwrap();
+            }
+            let row = crate::bookmark_browser::BookmarkBrowserRow {
+                source: crate::bookmark_browser::BookmarkRowSource::Book(
+                    crate::book_bookmarks::BookBookmark {
+                        id: 420,
+                        container_key: crate::adjustment_db::normalize_path(&b),
+                        container_path: b.clone(),
+                        container_kind: if classified {
+                            crate::book_bookmarks::BookContainerKind::ImageFolder
+                        } else {
+                            crate::book_bookmarks::BookContainerKind::Pdf
+                        },
+                        page_identity: if classified {
+                            crate::book_bookmarks::PageIdentity::RelativePath("page.jpg".into())
+                        } else {
+                            crate::book_bookmarks::PageIdentity::PdfPage(0)
+                        },
+                        page_index_hint: 0,
+                        created_at_ms: 1,
+                        title: None,
+                    },
+                ),
+                item: GridItem::Folder(b),
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: 1,
+                missing: false,
+            };
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.open_bookmark_browser_row(&ctx, &row);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert_eq!(
+                app.detached_window_state(window_id),
+                Some(DetachedWindowState::Closing)
+            );
+            if conversion {
+                assert!(conversion_cancel.load(Ordering::Relaxed));
+                assert!(
+                    conversion_tx
+                        .unwrap()
+                        .send(
+                            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                                crate::ui_dialogs::archive_convert::ArchiveScanOutcome::Rejected {
+                                    message: "late A".into()
+                                }
+                            ))
+                        )
+                        .is_err()
+                );
+            }
+            assert!(app.archive_convert.is_none());
+            app.with_window_context_for_test(context, |old| {
+                assert!(old.bookmark_open_pending.is_none())
+            });
+            if classified {
+                assert!(app.top_level_grid_view.open_path_classification().is_some());
+            } else {
+                assert!(
+                    matches!(app.startup_open_path_resolve_pending.as_ref().map(|p| &p.owner),
+            Some(StartupOpenPathOwner::Bookmark(owner)) if owner.request_id.0 == 2)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn section1419_main_admission_preserves_independent_detached_media_wait() {
+    for is_audio in [false, true] {
+        let mut app = phase_c_support::setup_app();
+        app.active_quick_folder_slot = None;
+        let (_, target, _) = begin_detached_bookmark_media_test(&mut app, is_audio);
+        let context = app.active_viewer_context_id();
+        let window = app.active_detached_window_id();
+        let generation = app
+            .with_active_viewer_context(|active| active.items_generation)
+            .unwrap();
+        app.admit_explicit_main_open_request();
+        assert_eq!(app.active_viewer_context_id(), context);
+        assert_eq!(app.active_detached_window_id(), window);
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.items_generation, generation);
+            assert!(matches!(&active.bookmark_open_pending,
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(p)) if p.path == target && p.pts_secs == 42.0));
+        }).unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn section1419_main_admission_preserves_independent_detached_page_wait() {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    let pdf = app.tmp.path().join("independent.pdf");
+    std::fs::write(&pdf, b"fixture").unwrap();
+    arm_detached_bookmark_book_open(
+        &mut app,
+        pdf.clone(),
+        crate::book_bookmarks::BookContainerKind::Pdf,
+        crate::book_bookmarks::PageIdentity::PdfPage(0),
+    );
+    assert_eq!(
+        app.open_bookmark_book_in_detached_context(
+            &egui::Context::default(),
+            pdf.clone(),
+            crate::folder_tree::OpenablePathKind::File
+        ),
+        DetachedBuild::Built(true)
+    );
+    let context = app.active_viewer_context_id();
+    let window = app.active_detached_window_id();
+    app.admit_explicit_main_open_request();
+    assert_eq!(app.active_viewer_context_id(), context);
+    assert_eq!(app.active_detached_window_id(), window);
+    app.with_active_viewer_context(|active| {
+        assert!(matches!(
+            active
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(|p| p.book())
+                .map(|p| &p.stage),
+            Some(crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { .. })
+        ));
+        assert!(
+            active
+                .pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|p| p.0 == pdf)
+        );
+    })
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
 fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
     for is_audio in [false, true] {
         let mut app = phase_c_support::setup_app();
