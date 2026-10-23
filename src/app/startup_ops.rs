@@ -956,6 +956,12 @@ impl App {
         }
         // Detach the held chain before finishing this owner: replacement of main cannot
         // recursively cancel a bookmark resolver owned by an independent reader lease.
+        // Same line as `cancel_unresolved_open`, so a dropped late result is explainable.
+        crate::logger::log(format!(
+            "startup open: cancel resolve reason=normal_navigation source={} requested={}",
+            pending.owner.perf_tag(),
+            pending.requested.display()
+        ));
         self.finish_replaced_startup_open_pending(pending, "normal_navigation");
         held
     }
