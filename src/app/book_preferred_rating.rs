@@ -118,7 +118,15 @@ impl App {
                 }
             }
             BookScope::Document(logical) => {
-                if self.zip_nav.is_some() || !crate::folder_tree::path_eq(&physical.source, logical)
+                // Enumeration/placeholder state is transient; adopted rows retain the
+                // logical PDF/EPUB owner even after the loader has finished.
+                let has_document_page = self.items.iter().any(|item| {
+                    matches!(item, GridItem::PdfPage { pdf_path, .. }
+                        if crate::folder_tree::path_eq(pdf_path, logical))
+                });
+                if self.zip_nav.is_some()
+                    || !crate::folder_tree::path_eq(&physical.source, logical)
+                    || !has_document_page
                 {
                     return Unavailable(DocumentMismatch);
                 }

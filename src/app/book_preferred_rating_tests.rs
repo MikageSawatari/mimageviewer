@@ -178,7 +178,7 @@ fn book_preferred_nested_zip_collapse_matches_literal_parent_zipdir_cell() {
     assert_eq!(target.key, expected);
     assert_ne!(
         target.key,
-        crate::path_key::normalize(&path.join("bookB/only"))
+        crate::adjustment_db::normalize_path(&path.join("bookB/only"))
     );
     assert_eq!(target.meta.kind, RatingItemKind::ZipDir);
     assert_eq!(target.meta.dir_prefix.as_deref(), Some("bookB/"));
@@ -236,11 +236,161 @@ fn book_preferred_pdf_and_epub_match_logical_document_parent_cell() {
         let expected = parent_cell_key(&mut app, GridItem::PdfFile(logical.clone()));
         app.current_folder = Some(logical.clone());
         app.projection_recipe = ProjectionRecipe::Book(BookScope::Document(logical.clone()));
+        app.items = book_materialization::materialize_document_rows(
+            &logical,
+            &[crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 0,
+                file_size: 0,
+            }],
+        )
+        .0;
         let target = resolved_book(&app);
         assert_eq!(target.key, expected);
         assert_eq!(target.source, logical);
         assert_eq!(target.meta.kind, RatingItemKind::PdfFile);
     }
+}
+
+#[test]
+fn book_preferred_document_requires_matching_adopted_page() {
+    let mut app = setup_app();
+    for extension in ["pdf", "epub"] {
+        let logical = app.tmp.path().join(format!("absent.{extension}"));
+        app.current_folder = Some(logical.clone());
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::Document(logical.clone()));
+        for items in [
+            vec![],
+            vec![GridItem::Image(logical.join("page.png"))],
+            vec![GridItem::PdfFile(logical.clone())],
+            vec![book_materialization::document_page_item(
+                &app.tmp.path().join("other.pdf"),
+                0,
+            )],
+        ] {
+            app.items = items;
+            assert!(matches!(
+                app.resolve_book_preferred_viewer_target(),
+                BookPreferredRatingTarget::Unavailable(BookPreferredUnavailable::DocumentMismatch)
+            ));
+        }
+        // Cached placeholders have the same logical owner as completed rows.
+        app.items = book_materialization::materialize_cached_document_rows(&logical, 1, 0, 0).0;
+        assert_eq!(
+            resolved_book(&app).key,
+            parent_cell_key(&mut app, GridItem::PdfFile(logical))
+        );
+    }
+}
+
+#[test]
+fn book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo() {
+    let _input_guard = crate::key_input::lock_test_input();
+    for name in ["book.zip", "book.pdf"] {
+        let mut app = setup_app();
+        let shelf = app.tmp.path().join("shelf");
+        let folder = shelf.join(name);
+        let page = folder.join("page.png");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            &page,
+            include_bytes!("../../testdata/rating-sort/01-one.png"),
+        )
+        .unwrap();
+        // Open the real parent first: its adopted Folder row supplies the same
+        // directory proof used when entering this cell from the normal grid.
+        app.load_folder(shelf);
+        app.settle_open_path_classification_for_test();
+        app.finish_history_restore_preparation_for_test();
+        app.finish_page_identity_preparation_for_test();
+        let folder_index = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::Folder(path) if path == &folder))
+            .expect("parent grid must adopt the real directory as a Folder cell");
+        let folder_key = app.rating_path_key(folder_index).unwrap();
+        app.load_folder(folder.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_history_restore_preparation_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        assert!(matches!(app.items.as_slice(), [GridItem::Image(path)] if path == &page));
+        // The shared name-based classification remains deferred to §1.418.
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        let expected_reason = if name == "book.pdf" {
+            BookPreferredUnavailable::DocumentMismatch
+        } else {
+            BookPreferredUnavailable::ArchiveRootMismatch
+        };
+        assert!(matches!(
+            app.resolve_book_preferred_viewer_target(),
+            BookPreferredRatingTarget::Unavailable(reason) if reason == expected_reason
+        ));
+        let page_key = app.rating_path_key(0).unwrap();
+        app.fullscreen_idx = Some(0);
+        bind_action(&mut app, "RatingBookPreferred5");
+        let generation = app.rating_session_write_generation;
+        viewer_key(&mut app);
+        let db = app.rating_db.as_ref().unwrap();
+        assert_eq!(db.get(&folder_key), 0);
+        assert_eq!(db.get(&page_key), 0);
+        assert!(db.list_by_stars(5).unwrap().is_empty());
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(message, _, _)| {
+                    message == "[この本は評価できません]"
+                })
+        );
+    }
+}
+
+#[test]
+fn book_preferred_loaded_zip_writes_book_instead_of_page() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = setup_app();
+    let archive = app.tmp.path().join("real-book.zip");
+    let file = std::fs::File::create(&archive).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(
+        &mut zip,
+        include_bytes!("../../testdata/rating-sort/01-one.png"),
+    )
+    .unwrap();
+    zip.finish().unwrap();
+    let book_key = parent_cell_key(&mut app, GridItem::ZipFile(archive.clone()));
+    // Use the ordinary navigation preflight and adoption, including the real ZIP worker.
+    app.open_direct_navigation_target(
+        archive.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+        StartupListIntent::ExplicitList,
+    );
+    app.settle_open_path_classification_for_test();
+    app.finish_history_restore_preparation_for_test();
+    app.finish_page_identity_preparation_for_test();
+    assert!(
+        matches!(app.items.as_slice(), [GridItem::ZipImage { zip_path, .. }]
+        if crate::folder_tree::path_eq(zip_path, &archive))
+    );
+    assert_eq!(resolved_book(&app).key, book_key);
+    let page_key = app.rating_path_key(0).unwrap();
+    app.fullscreen_idx = Some(0);
+    bind_action(&mut app, "RatingBookPreferred5");
+    viewer_key(&mut app);
+    let db = app.rating_db.as_ref().unwrap();
+    assert_eq!(db.get(&book_key), 5);
+    assert_eq!(db.get(&page_key), 0);
+    let rows = db.list_by_stars(5).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, Some(RatingItemKind::ZipFile));
+    assert_eq!(app.meta_undo.undo_len(), 1);
 }
 
 #[test]
@@ -450,15 +600,20 @@ fn book_preferred_nonbook_viewer_step_and_bound_change_only_current_item() {
     install_rows(
         &mut app,
         vec![
-            GridItem::Image(folder.join("page.jpg")),
-            GridItem::Image(folder.join("other.jpg")),
+            GridItem::Image(folder.join("first.jpg")),
+            GridItem::Image(folder.join("viewed.jpg")),
+            GridItem::Image(folder.join("selected.jpg")),
         ],
     );
     app.projection_recipe = ProjectionRecipe::OrdinaryList;
-    app.fullscreen_idx = Some(0);
+    app.selected = Some(2);
+    app.fullscreen_idx = Some(1);
     app.finish_page_identity_preparation_for_test();
-    let page_key = app.rating_path_key(0).unwrap();
-    let other_key = app.rating_path_key(1).unwrap();
+    let page_key = app.rating_path_key(1).unwrap();
+    let other_keys = [
+        app.rating_path_key(0).unwrap(),
+        app.rating_path_key(2).unwrap(),
+    ];
     bind_action(&mut app, "RatingBookPreferredStepUp");
     viewer_key(&mut app);
     assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 4);
@@ -470,7 +625,11 @@ fn book_preferred_nonbook_viewer_step_and_bound_change_only_current_item() {
     assert_eq!(app.rating_session_write_generation, generation);
     assert_eq!(app.meta_undo.undo_len(), undo_count);
     assert_eq!(app.rating_db.as_ref().unwrap().get(&folder_key), 0);
-    assert_eq!(app.rating_db.as_ref().unwrap().get(&other_key), 0);
+    for key in other_keys {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+    }
+    assert_eq!(app.selected, Some(2));
+    assert_eq!(app.fullscreen_idx, Some(1));
 }
 
 #[test]
@@ -526,30 +685,57 @@ fn book_preferred_unavailable_viewer_never_falls_back_to_page_or_adds_undo() {
 }
 
 #[test]
-fn book_preferred_item_filter_departure_applies_once_and_one_undo_restores_value() {
+fn book_preferred_item_filter_departure_applies_once_and_one_undo_restores_reader() {
     let _input_guard = crate::key_input::lock_test_input();
     let mut app = setup_app();
-    let path = app.tmp.path().join("filter-page.jpg");
-    install_rows(&mut app, vec![GridItem::Image(path)]);
+    let folder = app.tmp.path().join("filtered-pages");
+    std::fs::create_dir(&folder).unwrap();
+    let items = ["a", "b", "c"]
+        .map(|name| {
+            let path = folder.join(format!("{name}.png"));
+            image::RgbaImage::from_pixel(4, 4, image::Rgba([90, 100, 110, 255]))
+                .save(&path)
+                .unwrap();
+            GridItem::Image(path)
+        })
+        .to_vec();
+    install_rows(&mut app, items);
+    app.current_folder = Some(folder);
     app.projection_recipe = ProjectionRecipe::OrdinaryList;
-    app.fullscreen_idx = Some(0);
+    app.selected = Some(0);
+    app.fullscreen_idx = Some(1);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
     app.finish_page_identity_preparation_for_test();
-    let key = app.rating_path_key(0).unwrap();
-    app.rating_db.as_ref().unwrap().set(&key, 4).unwrap();
-    app.rating_cache.insert(0, 4);
+    let keys: Vec<_> = (0..3)
+        .map(|idx| app.rating_path_key(idx).unwrap())
+        .collect();
+    for (idx, key) in keys.iter().enumerate() {
+        app.rating_db.as_ref().unwrap().set(key, 4).unwrap();
+        app.rating_cache.insert(idx, 4);
+    }
+    let publications = app.rating_publication_count;
     app.settings.rating_filter = [false, false, false, false, true, false];
     bind_action(&mut app, "RatingBookPreferredStepUp");
     let ctx = egui::Context::default();
     begin_key(&ctx);
-    let _ = app.handle_fs_key_input(&ctx, 0, false);
+    let _ = app.handle_fs_key_input(&ctx, 1, false);
     // Re-entering a handler in the same pass cannot reuse the departing press.
     let _ = app.handle_keyboard(&ctx);
     ctx.end_pass().drop_without_applying_deltas();
-    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
-    assert!(app.visible_indices.is_empty());
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[1]), 5);
+    for idx in [0, 2] {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[idx]), 4);
+    }
+    assert_eq!(app.visible_indices, vec![0, 2]);
+    assert_eq!(app.fullscreen_idx, Some(2));
+    assert_eq!(app.selected, Some(2));
+    assert_eq!(app.rating_publication_count, publications + 1);
     assert_eq!(app.meta_undo.undo_len(), 1);
     app.apply_meta_undo();
-    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[1]), 4);
+    assert_eq!(app.visible_indices, vec![0, 1, 2]);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.selected, Some(1));
     assert_eq!(app.meta_undo.undo_len(), 0);
 }
 

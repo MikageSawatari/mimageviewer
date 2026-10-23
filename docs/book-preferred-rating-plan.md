@@ -126,11 +126,16 @@ impl App {
 | scope | 一致の条件 |
 | --- | --- |
 | `Archive { logical_root, prefix }` | `zip_nav` があり、`zip_rating_root_path(...)` が `logical_root` と同じパス、かつ `nav.current() == prefix` |
-| `Document(logical)` | `zip_nav` が無く、物理導出の `source` が `logical` と同じパスで、かつ文書ローダーが作った状態 (採用済み items に `logical` の文書ページ行がある、または同等の context 所有の文書状態) と一致する |
+| `Document(logical)` | `zip_nav` が無く、物理導出の `source` が `logical` と同じパスで、かつ採用済み `items` に `GridItem::PdfPage { pdf_path, .. }` で `path_eq(pdf_path, logical)` の行が 1 つ以上ある |
 | `ImageFolder(p)` / `CompiledFolder(p)` | `zip_nav` が無く、`current_folder` が `p` と同じパスで合成パスでない |
 
 パス比較は既存の I/O なし比較 (`folder_tree::path_eq` 相当) を使う。不一致は採用の途中 (recipe と物理状態の
-世代がずれている瞬間) にだけ起こり得るはずで、そのときは書かずに `Unavailable` とする (§5)。
+世代のずれ) や §3.4 の共有分類不具合で起こり得る。そのときは書かずに `Unavailable` とする (§5)。
+
+文書の照合は採用済みページ行を使う。既存の `pdf_enumerate_pending` / `pdf_placeholder_count` は列挙完了後に消え、
+`display_epub_source` は EPUB のリース専用で PDF には無いので、PDF / EPUB 共通の採用済み文書状態にはできない。
+文書行を作る `materialize_cached_document_rows` / `materialize_document_rows` はどちらも `document_page_item` を通り、
+EPUB でも変換先 PDF ではなく元の EPUB パスを `pdf_path` に保持する。状態の追加・ファイル照会はしない。
 
 ### 3.4 名前に拡張子を含む実フォルダ (コードレビュー第 1 回 P2、§1.418)
 
@@ -227,9 +232,15 @@ showing=false となり、表示キャッシュ (`current_folder_rating_cache`) 
   Ctrl+G は「検索を開いた直後 (旧の本の items と recipe がまだ採用済み)」と「検索結果を採用した後
   (`ExtractedResult`、検索前フォルダへは書かない)」と「検索結果から物理の本を開いた後 (本のキー)」を区別する。
   resolver がファイル照会をしないこと (存在しないパスでも同じ結果になること) も確かめる。
+  文書は一致する採用済み `PdfPage` 行を必須とし、行なし・画像行・文書セル・別文書のページ行を拒否する。
+- 実採用経路: tempdir の実フォルダ `book.zip` / `book.pdf` (画像入り) の親一覧を採用し、実際の `Folder` セルの
+  キーを取得してから `load_folder` で開き、
+  閲覧中の本優先入力がフォルダ / ページのどちらにも書かず、Undo も積まない。本物の ZIP は通常の
+  worker / 採用経路から開き、同じ入力で親一覧の本セルと同じキーへ書く。
 - handler-level: 一覧 (カーソル単体・複数チェック 1 回 Undo・本のページ一覧) は選択項目に書く。画像閲覧の
-  本では本キーへ書き、ページの★は変わらない。非本ではページへ書く。Step は未評価→★4 / ★5 で変化なし。
-  評価フィルタで現在の本や項目が条件から外れても 1 回だけ適用され、Undo 1 回で戻る。
+  本では本キーへ書き、ページの★は変わらない。非本では 3 項目の選択位置と閲覧位置を別にして、閲覧項目だけへ書く。
+  Step は未評価→★4 / ★5 で変化なし。評価フィルタで現在の本や項目が条件から外れても 1 回だけ適用される。
+  項目は 3 項目の中央を閲覧中に外し、次項目へ移り、Undo 1 回で値と元の閲覧位置が戻る。
 - 複数 context: F12 で本 A を開き、メインは別フォルダ B を表示している状態で、F12 側の入力は A のキーだけに
   書き、メイン context の items・rating_cache・current_folder_rating_cache のうち A と無関係なキーを変えない
   (メインの一覧に A のセルがあれば、既存の共有 ledger による次回 mount 時の★更新は正しい既存動作)。
