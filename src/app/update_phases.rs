@@ -1223,6 +1223,7 @@ impl App {
             let mut pane_epub_restore = None;
             let mut navigate_owner = OpenRequestOwner::Navigation;
             let mut navigate_restore_intent = StartupListIntent::ExplicitList;
+            let mut navigate_stage = MainListRequestStage::Admission;
             let navigate = if higher_priority_direct_nav.is_some() {
                 higher_priority_direct_nav
             } else if let Some(nav) = input_nav.or(address_nav) {
@@ -1378,6 +1379,8 @@ impl App {
                 self.replace_ready_folder_pane_open(p, folder_pane_open_ready.take());
                 None
             } else if let Some(ready) = folder_pane_open_ready.take() {
+                // Main resolution admits candidates before handing their accepted scan back.
+                navigate_stage = MainListRequestStage::Continuation;
                 #[cfg(windows)]
                 {
                     self.resolve_main_folder_open_ready(ctx, ready)
@@ -1422,6 +1425,9 @@ impl App {
                             FolderOpenScanPurpose::GridFolderCandidate { collection_owner },
                             Ok(scan),
                         ) => {
+                            self.retire_replaced_main_list_requests(Some(
+                                MainListRequestOwner::Pane,
+                            ));
                             navigate_pre_scan = Some(scan);
                             if let Some(owner) = collection_owner {
                                 navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
@@ -1514,13 +1520,14 @@ impl App {
                 }
             };
             if let Some(p) = navigate {
-                self.open_direct_navigation_target(
+                self.open_direct_navigation_target_at_stage(
                     p,
                     navigate_pre_scan.take(),
                     navigate_owner,
                     navigation,
                     pane_epub_restore.take(),
                     navigate_restore_intent,
+                    navigate_stage,
                 );
             }
         }

@@ -6938,6 +6938,8 @@ mod fixed_sort_control_tests {
                 ToolbarSectionDisplay::Buttons
             };
             app.load_folder_with_scan(folder, None);
+            // Production sanitizes pointer input during hydration; this harness must settle it first.
+            app.finish_page_identity_preparation_for_test();
             assert!(app.grid_sort_lock_reason().is_none());
             let app = Rc::new(RefCell::new(app));
             let render_app = Rc::clone(&app);
@@ -6952,6 +6954,9 @@ mod fixed_sort_control_tests {
                         ctx.request_repaint();
                         return;
                     }
+                    render_app
+                        .borrow_mut()
+                        .note_main_chrome_pointer_block_transition(ctx);
                     render_app.borrow_mut().render_menubar(root_ui);
                     render_app.borrow_mut().render_toolbar(root_ui);
                     render_app.borrow_mut().render_facet_filter_bar(root_ui);
@@ -6968,6 +6973,7 @@ mod fixed_sort_control_tests {
                         .expect("rating sort combo")
                         .click();
                     harness.run();
+                    assert!(!app.borrow().main_chrome_pointer_blocked());
                     harness.get_all_by_label("評価↓").last().unwrap().click();
                 }
                 "menu" => {
@@ -7472,7 +7478,7 @@ impl App {
         let help_about_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpAbout);
 
         egui::Panel::top("menubar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() { ui.disable(); }
+            self.gate_main_chrome(ui);
             egui::MenuBar::new().ui(ui, |ui| {
                 let mut top_menu_responses = Vec::with_capacity(9);
 
@@ -10193,7 +10199,7 @@ impl App {
             Vec::new();
 
         egui::Panel::top("toolbar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() { ui.disable(); }
+            self.gate_main_chrome(ui);
             if toolbar_section_order.first() != Some(&crate::settings::ToolbarSectionId::Folder) {
                 ui.add_space(2.0);
             }
@@ -12500,7 +12506,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut sort_reload_requested = false;
         let mut sort_popup_open = false;
         egui::Panel::top("facet_filter_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() { ui.disable(); }
+            self.gate_main_chrome(ui);
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
                 let filter_label = egui::Label::new(egui::RichText::new("絞り込み:").small())
@@ -12896,6 +12902,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         egui::Panel::bottom("details_lazy_status_bar")
             .exact_size(25.0)
             .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     match self.details_image_dims_state {
@@ -15498,9 +15505,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
         egui::Panel::top("search_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() {
-                ui.disable();
-            }
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("検索:").on_hover_text(format!(
@@ -15697,9 +15702,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut query_changed = false;
 
         egui::Panel::top("favsearch_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() {
-                ui.disable();
-            }
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
@@ -15866,9 +15869,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut clicked_tag: Option<String> = None;
 
         egui::Panel::top("tag_view_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() {
-                ui.disable();
-            }
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");
@@ -20406,6 +20407,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .exact_size(selection_info_bar_height(root_ui.style()))
             .show_separator_line(true)
             .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 let source_rect = ui.available_rect_before_wrap();
                 let avail_w = source_rect.width().max(1.0);
                 let pixels_per_point = ui.ctx().pixels_per_point();
@@ -30944,6 +30946,8 @@ mod section292_tests {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
         app.load_folder_with_scan(folder, None);
+        // Production sanitizes pointer input during hydration; this harness must settle it first.
+        app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = true;
         app.settings.show_facet_sort = true;
         app.settings.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
@@ -30964,6 +30968,7 @@ mod section292_tests {
                     return;
                 }
                 let mut app = render.borrow_mut();
+                app.note_main_chrome_pointer_block_transition(ctx);
                 app.render_toolbar(root_ui);
                 app.render_facet_filter_bar(root_ui);
                 let wheel_options = ctx.options(|o| o.input_options);
@@ -30991,6 +30996,10 @@ mod section292_tests {
             assert_eq!(combos.len(), 2);
             combos[index].click();
             harness.run();
+            assert!(
+                !app.borrow().main_chrome_pointer_blocked(),
+                "sort dropdowns are menus, not common modals"
+            );
             if index == 1 {
                 harness.input_mut().events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
@@ -31012,6 +31021,9 @@ mod section292_tests {
                 .click();
             harness.run();
             assert_eq!(app.borrow().settings.sort_order, choice);
+            app.borrow_mut().finish_page_identity_preparation_for_test();
+            assert!(!app.borrow().main_chrome_pointer_blocked());
+            harness.run();
             let matching = harness
                 .get_all_by_role(egui::accesskit::Role::ComboBox)
                 .into_iter()

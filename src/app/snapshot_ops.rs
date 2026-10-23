@@ -1053,6 +1053,10 @@ impl App {
         let list_view_thumbnails = captured_thumbnails.clone();
         let list_view_image_metas = captured_image_metas.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
+        // Fixing this list is an explicit display request; late initial opens must retire.
+        if self.main_folder_history_available() {
+            self.cancel_unresolved_open_for_navigation(true);
+        }
         let saved_projection_recipe = std::mem::replace(
             &mut self.projection_recipe,
             super::book_materialization::ProjectionRecipe::ExtractedResult(
@@ -1320,6 +1324,10 @@ impl App {
         let Some(snap) = self.snapshot.take() else {
             return;
         };
+        // Unfixing explicitly chooses the retained/current list, before any restore branch.
+        if self.main_folder_history_available() {
+            self.cancel_unresolved_open_for_navigation(true);
+        }
         let top_level_origin = self.top_level_grid_view.take_return_origin();
         let top_level_return = top_level_origin
             .as_ref()
@@ -2419,7 +2427,7 @@ impl App {
             // Transfer the scan's proof to the existing prepared Physical owner. Its adoption
             // validates the source BEFORE fullscreen preparation dismisses a snapshot.
             self.snapshot_internal_nav = true;
-            let started = self.start_physical_history_transition_classified(
+            let started = self.start_physical_history_transition_classified_at_stage(
                 super::PhysicalHistoryIntent::RequiredFullscreen {
                     target,
                     history_trigger,
@@ -2431,6 +2439,7 @@ impl App {
                 super::StartupListIntent::PageContinuation,
                 navigation,
                 Some(scan),
+                super::MainListRequestStage::Continuation,
             );
             if started {
                 self.poll_collection_history_transition(ctx);

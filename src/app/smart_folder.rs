@@ -2262,7 +2262,10 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            !matches!(intent, SmartTransitionIntent::Refresh),
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2334,7 +2337,10 @@ impl App {
         )?;
         transition.phase = SmartFolderTransitionPhase::RootPrepare(pending);
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            !matches!(transition.intent, SmartTransitionIntent::Refresh),
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2409,6 +2415,7 @@ impl App {
             source_index,
             restore_intent,
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -2421,8 +2428,9 @@ impl App {
         source_index: Option<usize>,
         restore_intent: super::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> Result<(), Option<ScannedDir>> {
-        self.begin_smart_physical_navigation_with_backing(
+        self.begin_smart_physical_navigation_with_backing_at_stage(
             path.clone(),
             path,
             kind,
@@ -2431,6 +2439,7 @@ impl App {
             source_index,
             restore_intent,
             navigation,
+            stage,
         )
     }
 
@@ -2444,6 +2453,31 @@ impl App {
         source_index: Option<usize>,
         restore_intent: super::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+    ) -> Result<(), Option<ScannedDir>> {
+        self.begin_smart_physical_navigation_with_backing_at_stage(
+            path,
+            backing,
+            kind,
+            auto_fullscreen,
+            pre_scan,
+            source_index,
+            restore_intent,
+            navigation,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    pub(super) fn begin_smart_physical_navigation_with_backing_at_stage(
+        &mut self,
+        path: PathBuf,
+        backing: PathBuf,
+        kind: SmartChildKind,
+        auto_fullscreen: bool,
+        pre_scan: Option<ScannedDir>,
+        source_index: Option<usize>,
+        restore_intent: super::StartupListIntent,
+        navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> Result<(), Option<ScannedDir>> {
         let Some(mut state) = self.smart_physical_target_state(&path) else {
             return Err(pre_scan);
@@ -2546,7 +2580,11 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            restore_intent.replaces_deferred_startup_open()
+                && stage == MainListRequestStage::Admission,
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2605,13 +2643,15 @@ impl App {
         history_trigger: super::HistoryTrigger,
         restore_video_tile: bool,
     ) -> Result<(), Option<ScannedDir>> {
-        self.begin_smart_physical_navigation(
+        self.begin_smart_physical_navigation_with_navigation(
             path,
             kind,
             false,
             pre_scan,
             None,
             super::StartupListIntent::folder_navigation(&mode),
+            None,
+            MainListRequestStage::Continuation,
         )?;
         if let Some(transition) = self.smart_folder_transition.as_mut() {
             let request_id = transition.request_id;
@@ -2708,6 +2748,7 @@ impl App {
             None,
             restore_intent.clone(),
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -2721,6 +2762,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> bool {
         if self.top_level_grid_view.smart_folder_session().is_none() {
             return false;
@@ -2773,6 +2815,7 @@ impl App {
                 Some(index),
                 restore_intent.clone(),
                 navigation,
+                stage,
             )
             .is_err()
         {
@@ -10163,6 +10206,7 @@ mod tests {
                 None,
                 super::super::StartupListIntent::ExplicitList,
                 None,
+                MainListRequestStage::Admission,
             ),
             "the native classified adapter must validate the captured row identity too"
         );
@@ -10368,6 +10412,7 @@ mod tests {
             None,
             crate::app::StartupListIntent::ExplicitList,
             None,
+            MainListRequestStage::Admission,
         ));
         let transition = app.smart_folder_transition.as_mut().unwrap();
         let request_id = transition.request_id;

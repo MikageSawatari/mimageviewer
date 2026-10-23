@@ -576,6 +576,76 @@ navigation supersession 時の record/cursor の rollback journal は作らず�
 activation / bookmark に既存の modal-held behavior がある場合はそれを保ち、modal を横切って強制採用しない。
 Remote が初期 explicit target を延期する既存 semantics も保持。target ごとに new resume owner を増やさない。
 
+§1.285（2026-10-21）の要求退役は既存 `retire_replaced_main_list_requests` に集約する。
+main の未解決 InitialStartup / Activation / Bookmark を退役し、activation admission が保持した
+resolver 鎖にも同じ main 限定規則を適用する。detached lease のある Bookmark は保持する。
+まだ resolve を開始していない `startup_open_path` も、Local の新しい明示要求で退役する。
+物理 open は既存 `StartupListIntent`、合成一覧は既存 `MainHistoryOperation`、Smart root は
+既存 refresh intent で新規要求と再読込を区別し、同じ場所への明示 open も新規要求に含める。
+Remote 所有中と返却後の自動再読込は延期した起動先を消さず、Local 復帰後の通常 poll へ残す。
+synthetic 履歴 replay、DFS 開始、固定一覧の固定/解除は直接 install するため同じ退役へ接続する。
+検索結果の遅延採用と同一覧の再投影は新規要求にしない。完了時の pending take と、activation
+拒否時だけ held resolver を戻す既存順序は変更しない。新しい owner / pending / 待機は追加しない。
+
+受付と非同期の段階移行を共用する open 経路は、引数の `MainListRequestStage` で区別する。
+`StartupListIntent` は元要求の復元契約なので、完了時にも ExplicitList を持つことがあり、
+それだけで新しい受付と判定しない。分類→物理/Smart/Collection、DFS→物理、pane scan→open、
+起動 resolve→loader は Continuation とし、後から受理された resolve を退役させない。
+サブ展開の scan→prepare と policy 変更による再 scan も同じ要求の継続である。
+ZIP の Enter/ダブルクリック/BS/DFS は成功した移動の受付で退役し、階層の再投影では退役しない。
+
+GridFolderCandidate の走査開始は移動先 viewer が未確定なので main 受付にしない。
+既存の判定で main 復帰が確定した地点で1回受付し、Smart への引き渡しと通常の
+`folder_pane_open_ready` 合流はその継続にする。復元 intent が PageContinuation でもこの受付は必要。
+通常 pane は走査開始時に受付済みで、完了時には後発 resolver を退役させない。detached 判定は変更しない。
+
+2026-10-21、`71d5d94ba` で Continuation にした22箇所を個別に再監査した。
+以下の位置は同 commit の修正前行番号。Candidate の main 合流以外に、未受付の新しい main 要求を
+Continuation として飛ばす製品経路は見つからなかった。
+
+| 位置 | 継続経路 | 受付元 / 新規受付が不要な理由 |
+| --- | --- | --- |
+| `src/app.rs:28328` | 分類→DirectNavigation | 分類 worker の受付、または元 resolver の受付 |
+| `src/app.rs:28379` | 分類→SmartGrid | 分類 worker の受付 |
+| `src/app.rs:28403` | 分類→Direct | 分類 worker の受付、または元 resolver の受付 |
+| `src/app.rs:28440` | 分類→DirectScan | 分類 worker の受付、または元 resolver の受付 |
+| `src/app.rs:28473` | 分類→Physical | 分類 / DFS の受付 |
+| `src/app.rs:28494` | 分類→Collection 履歴 | 分類 worker の受付 |
+| `src/app.rs:28799` | DFS FullFeature→変換書庫 | start_folder_nav。画像着地の内部 container 展開は PageContinuation |
+| `src/app.rs:28808` | DFS FullFeature→通常 loader | start_folder_nav。画像着地の内部 container 展開は PageContinuation |
+| `src/app.rs:34328` | Snapshot cache→Physical preflight | SnapshotArchiveCacheOnly 分類の受付 |
+| `src/app.rs:57619` | Collection 元場所 jump の走査完了 | JumpToPhysicalFolder 走査の受付 |
+| `src/app.rs:57639` | 通常の元場所 jump の走査完了 | JumpToPhysicalFolder 走査の受付 |
+| `src/app.rs:58329` | EPUB batch 後の並び refresh | 同一覧の PreservePresentation、別の移動要求ではない |
+| `src/app.rs:58931` | Favsearch DFS 境界→Physical | start_folder_nav |
+| `src/app.rs:59120` | DFS→Physical claim | start_folder_nav |
+| `src/app.rs:59130` | DFS→Physical transition | start_folder_nav |
+| `src/app.rs:59342` | Favsearch DFS 境界→Physical | start_folder_nav |
+| `src/app/collection_navigation.rs:4022` | Collection の準備済み変換書庫 | enqueue_collection_navigation |
+| `src/app/smart_folder.rs:2654` | Smart DFS→child transition | start_folder_nav |
+| `src/app/snapshot_ops.rs:2442` | exact fullscreen の走査完了 | RequiredFullscreenTarget 走査の受付 |
+| `src/app/startup_ops.rs:1271` | RAR 証明不足の resolve 完了→分類 | 元の起動系 resolver の受付 |
+| `src/app/startup_ops.rs:1435` | resolve 完了→loader | 元の起動系 resolver の受付 |
+| `src/app/update_phases.rs:1381` | pane / Candidate の main 合流 | pane は走査開始。Candidate は今回 main 確定地点で受付するよう修正 |
+
+Candidate の Smart main 復帰も、同じ確定地点で受付してから Continuation として渡す。
+回帰テストは gamepad の実 Candidate 開始と本番の post_render_main_navigation 合流を通し、
+混在 folder と設定変更による PageContinuation の main 復帰を検査する。
+
+既知の別件（master `4db8a8874` から存在、§1.285 の範囲外、未対応）:
+先行する `BookmarkRow` 分類 A の完了が、後発 Activation B の resolver を置換し得る
+（`src/app.rs:28331` → `src/app.rs:51411` → `src/app/startup_ops.rs:327`）。
+OtherArchive（RAR 等）は PDF/EPUB の composition qualification 待ちを通らない。
+また、先行要求の `cancel_conflicting_bookmark_open_for_navigation` が、後発 Bookmark resolver /
+activation-held 鎖を取り消し得る（`src/app/startup_ops.rs:1029` → `src/app/startup_ops.rs:1083` →
+`src/app/startup_ops.rs:1146` / `src/app/startup_ops.rs:1162`）。
+混在フォルダ（GridFolderCandidate）A の走査中に Activation B を受理し、B の解決前に A が main 復帰すると、
+A の main 受付が後発の B を退役させる（`src/app.rs:58171`）。master では同じ地点の通常 load の
+`claim_open_request_owner` が B を取り消しており、挙動は同じ（独立レビュー 3 回目の指摘、2026-10-21）。
+どちらも「起動系要求の受理が先行中のメイン要求をどう扱うか」という別の設計であり、今回は実装しない。
+修正案は、起動系要求の受理も同じ受付境界で先行中のメイン要求を退役させるか、resolver の保管先を
+単一から owner ごとにするかの2案。どちらを採るかは未決定で、現挙動を固定するテストも追加しない。
+
 admission 待ち以外のパス解決/scan全体はモーダルにしない。モーダルを無期限に保つと本目標と矛盾し、
 遅い share が別フォルダへ移る操作まで止める。代わりに既存 navigation の取消・単一採用を使う。
 変換・パスワード・保存は既存モーダルのままで、今回その内部の interleaving を増やさない。

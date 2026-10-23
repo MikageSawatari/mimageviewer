@@ -4011,7 +4011,7 @@ impl App {
                 continuation,
             );
             let outcome = self
-                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                     ready.target.source_path,
                     false,
                     owner,
@@ -4019,7 +4019,8 @@ impl App {
                     None,
                     restore_intent.clone(),
                     request.navigation.take(),
-                );
+            super::MainListRequestStage::Continuation,
+        );
             match action {
                 CollectionNavigationAction::OuterFullscreen {
                     resume_slideshow, ..

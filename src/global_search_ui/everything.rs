@@ -591,6 +591,7 @@ impl App {
         let mut back = false;
         let running = self.everything_search_progress_visible();
         egui::Panel::top("global_search_bar").show(root_ui,|ui| {
+            self.gate_main_chrome(ui);
             ui.add_enabled_ui(!running,|ui| {
                 let controls = ui::draw_everything_controls(ui,&mut self.global_search.query,&mut self.global_search.focus_request);
                 self.global_search.has_focus = controls.has_focus;

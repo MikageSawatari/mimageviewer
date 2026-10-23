@@ -234,10 +234,37 @@ impl AdjustmentDb {
         self.remove_page_params(from_key)
     }
 
+    /// 書き込みと削除を同じトランザクションで確定し、対象キーだけを失効させる。
+    pub fn apply_page_param_writes(
+        &mut self,
+        writes: &[(String, Option<AdjustParams>)],
+    ) -> Result<(), rusqlite::Error> {
+        let keys: Vec<_> = writes.iter().map(|(key, _)| key.clone()).collect();
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_keys(&keys);
+        let tx = self.conn.transaction()?;
+        {
+            let mut set = tx.prepare(
+                "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
+                 ON CONFLICT(page_path) DO UPDATE SET params_json = ?2",
+            )?;
+            let mut remove = tx.prepare("DELETE FROM page_params WHERE page_path = ?1")?;
+            for (key, params) in writes {
+                match params {
+                    Some(params) => {
+                        let json = serde_json::to_string(params).unwrap_or_default();
+                        set.execute(rusqlite::params![key, json])?;
+                    }
+                    None => {
+                        remove.execute([key])?;
+                    }
+                }
+            }
+        }
+        tx.commit()
+    }
+
     /// 複数ページに同じパラメータを一括書込する (「全画像に適用」ボタン用)。
-    ///
-    /// 削除判定 (= グローバルと等価かどうか) は呼び出し側の責務。
-    /// グローバルと等価な params を渡したい場合は `remove_page_params_bulk` を使う。
+    /// 削除判定は呼び出し側の責務。
     pub fn set_page_params_bulk(
         &mut self,
         page_keys: &[String],

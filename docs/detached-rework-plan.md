@@ -1561,6 +1561,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   検証完了後は本記録を含む文書だけを更新し、Rustソース／snapshot PNGは変更していないため、
   上記結果を引き継ぐ（文書追記だけを理由に同じテストを再実行しない）。
 
+### 2026-10-21 §1.285 起動 open の main 所有要求だけを退役
+
+- 触れた範囲: `src/app/startup_ops.rs` の未解決 open と activation-held 鎖の退役。
+  Bookmark owner の既存 `detached_lease` を読み、独立 reader 所有の resolve は保持する。
+  viewport routing、detached の生成・切替・描画経路は変更しない。
+- 判断: 新しい main 要求の受付で取り消す対象を main 所有へ限定する所有境界の修正であり、
+  guard・遅延・再試行による症状パッチではない。ClaudeCode と独立レビュー担当の双方が
+  この範囲を構造的修正と合意した（独立レビュー担当 = Codex gpt-6.1-sol / xhigh、2026-10-21）。
+- 回帰検査: main のコレクション受付後も、直接または activation-held 鎖内にある
+  detached Bookmark resolve の receiver と cancel token を維持する。
+
 ### 2026-10-20 §1.384: 別ウィンドウの配置を物理座標で 1 か所が持つ
 
 - 発端: 倍率の違うモニター (150% / 100%) で、別ウィンドウの動画が 1.5 倍の座標 (画面外) に作られた (利用者の実機報告 2026-10-15)。
