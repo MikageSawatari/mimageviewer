@@ -18,6 +18,7 @@ pub(crate) enum OverlayDragEnd {
     Escape,
     ModeExit,
     OwnerChanged,
+    BookStructure,
     FocusLost,
     SecondaryPress,
     FrontUiClaim,
@@ -31,6 +32,7 @@ impl OverlayDragEnd {
             Self::Escape
             | Self::ModeExit
             | Self::OwnerChanged
+            | Self::BookStructure
             | Self::FocusLost
             | Self::SecondaryPress
             | Self::FrontUiClaim
@@ -386,6 +388,10 @@ impl App {
         idx: usize,
         front: &crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        // Structural-op polling owns cancellation; blocked release must never commit here.
+        if self.book_structural_op.is_some() {
+            return;
+        }
         if let Some(before) = self.export_crop_drag_snapshot() {
             let end = if !self.export_crop_mode {
                 Some(OverlayDragEnd::ModeExit)
@@ -446,6 +452,9 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = crate::ui_fullscreen::FsKeyAction {
             page_transition: Default::default(),
             close: false,
@@ -493,6 +502,9 @@ impl App {
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -578,8 +590,9 @@ impl App {
                 }
             });
         crate::ui_helpers::set_accessibility_label(&aspect_response.response, "切り取りの縦横比");
-        if aspect_mode != self.export_crop_aspect_mode
-            || current.is_some_and(|settings| settings.aspect_mode != aspect_mode)
+        if ui.is_enabled()
+            && (aspect_mode != self.export_crop_aspect_mode
+                || current.is_some_and(|settings| settings.aspect_mode != aspect_mode))
         {
             self.export_crop_aspect_mode = aspect_mode;
             if let Some(ratio) = aspect_mode.aspect_ratio() {
@@ -860,6 +873,9 @@ impl App {
         force_create_held: bool,
         front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
+        if self.book_structural_op.is_some() {
+            return false;
+        }
         self.service_export_crop_drag(ui.ctx(), fs_idx, &front);
         let (primary_pressed, primary_down, primary_released, press_origin, hover_pos, total_delta) =
             ui.input(|i| {
@@ -1630,6 +1646,141 @@ mod tests {
                 if route == "escape" {
                     assert!(app.export_crop_mode);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn crop_book_structure_poll_cancels_draft_before_fs_without_resuming() {
+        let _key_input_guard = crate::key_input::lock_test_input();
+        for (existing, create) in [(false, true), (true, true), (true, false)] {
+            for route in [
+                "poll_only",
+                "keys",
+                "panel",
+                "pointer",
+                "overlay",
+                "overlay_release",
+            ] {
+                let (mut app, ctx, transform, initial, draft) =
+                    start_test_crop_drag(existing, create);
+                let key = app.page_path_key(0).unwrap();
+                let worker = app.hold_book_structure_for_test();
+                if route == "panel" {
+                    // A disabled panel must not turn passive mode synchronization into a DB write.
+                    app.export_crop_aspect_mode = CropAspectMode::Square;
+                }
+                let events = match route {
+                    "keys" => vec![
+                        egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                        egui::Event::Key {
+                            key: egui::Key::E,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::CTRL,
+                        },
+                    ],
+                    "overlay_release" => vec![egui::Event::PointerButton {
+                        pos: transform.viewport_rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    _ => Vec::new(),
+                };
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| match route {
+                            "keys" => {
+                                app.keyboard_owner_for_pass(ctx);
+                                app.handle_export_crop_keys(ctx, 0);
+                                assert!(app.export_dialog.is_none());
+                            }
+                            "panel" => app.draw_export_crop_panel(
+                                ctx,
+                                transform.viewport_rect,
+                                0,
+                                Some([100, 100]),
+                            ),
+                            "pointer" | "overlay" | "overlay_release" => ctx.root_ui(|root| {
+                                egui::CentralPanel::default().show(root, |ui| {
+                                    if route == "pointer" {
+                                        app.handle_export_crop_pointer_with_holds(
+                                            ui,
+                                            &transform,
+                                            0,
+                                            [100, 100],
+                                            draft,
+                                            handle_points(&transform, [100, 100], draft.rect),
+                                            false,
+                                            create,
+                                        );
+                                    } else {
+                                        app.draw_export_crop_overlay(
+                                            ui,
+                                            &transform,
+                                            0,
+                                            [100, 100],
+                                            true,
+                                            Default::default(),
+                                        );
+                                    }
+                                });
+                            }),
+                            _ => {}
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                assert_eq!(
+                    app.export_crop_db.as_ref().unwrap().get(&key),
+                    initial,
+                    "input before the structural poll must not commit; route={route}"
+                );
+                app.poll_book_structural_op(&ctx);
+                assert_eq!(
+                    app.export_crop_page_settings.get(&0).copied(),
+                    initial,
+                    "structural poll must cancel the draft even without UI; route={route}"
+                );
+                assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), initial);
+                assert!(app.export_crop_drag.is_none() && app.export_crop_create_drag.is_none());
+                assert!(app.book_structural_op.is_some());
+                worker
+                    .send(Err("synthetic structural completion".into()))
+                    .unwrap();
+                app.poll_book_structural_op(&ctx);
+                assert!(app.book_structural_op.is_none());
+                for events in [
+                    vec![egui::Event::PointerMoved(
+                        transform.viewport_rect.center() + egui::vec2(40.0, 40.0),
+                    )],
+                    vec![egui::Event::PointerButton {
+                        pos: transform.viewport_rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                ] {
+                    run_crop_pointer_frame(
+                        &mut app,
+                        &ctx,
+                        &transform,
+                        [100, 100],
+                        draft,
+                        handle_points(&transform, [100, 100], draft.rect),
+                        events,
+                        false,
+                        create,
+                    );
+                }
+                assert_eq!(app.export_crop_page_settings.get(&0).copied(), initial);
+                assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), initial);
+                assert!(app.export_crop_drag.is_none() && app.export_crop_create_drag.is_none());
             }
         }
     }

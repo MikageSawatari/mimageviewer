@@ -131,6 +131,20 @@ impl StackDeletionSource {
 }
 
 impl StackPreparePending {
+    /// Only a flat-reader switch owns a later fullscreen open. Grouping and
+    /// rebuilding an already displayed aggregate are passive preparation.
+    pub(crate) fn open_pending(&self) -> bool {
+        match self {
+            Self::Switching(pending) => matches!(pending.target, StackSwitchTarget::Flat { .. }),
+            Self::Retry(pending) => matches!(
+                &pending.source,
+                StackRetrySource::SwitchReady(_, StackSwitchTarget::Flat { .. }, ..)
+                    | StackRetrySource::SwitchFresh(_, StackSwitchTarget::Flat { .. })
+            ),
+            Self::Extracting(_) | Self::Grouping(_) => false,
+        }
+    }
+
     fn cancel(&self) {
         let token = match self {
             Self::Extracting(pending) => &pending.cancel,
@@ -2252,7 +2266,8 @@ impl crate::app::App {
     /// The mounted bundle and staged location owner determine whether grid items accept input.
     /// All grid input owners (key, pointer, touch, ring, gamepad, and menu) use this gate.
     pub(crate) fn grid_item_input_allowed(&self) -> bool {
-        self.image_folder_zip_operation.is_none()
+        self.book_structural_op.is_none()
+            && self.image_folder_zip_operation.is_none()
             && !self.location_navigation_pending()
             && !matches!(self.stack_return_state.as_ref(),
             Some(StackReturnState::Refreshing { view })
@@ -3506,6 +3521,42 @@ mod tests {
             app.mask_pages.contains(&1),
             "normal folder control retains its mask"
         );
+    }
+
+    #[test]
+    fn book_structure_rejects_flat_stack_open_until_its_accepted_fullscreen_is_adopted() {
+        let mut app = crate::app::setup_app_for_test();
+        let dir = app.tmp.path().join("stack-open");
+        std::fs::create_dir(&dir).unwrap();
+        let paths = [dir.join("post_0.png"), dir.join("post_1.png")];
+        for path in &paths {
+            image::RgbaImage::new(1, 1).save(path).unwrap();
+        }
+        stack_page_edit_fixture(&mut app, dir, &paths);
+        let books = app.tmp.path().join("books");
+        std::fs::create_dir_all(books.join("Old")).unwrap();
+        app.settings.book_root = Some(books.clone());
+        let ctx = egui::Context::default();
+        app.stack_enter_flat_fullscreen(&ctx, 0);
+        assert!(app.stack_script_pending.as_ref().unwrap().open_pending());
+        app.start_book_rename(&ctx, "Old".into(), "New".into());
+        assert!(app.book_structural_op.is_none());
+        assert!(books.join("Old").exists());
+        assert!(!books.join("New").exists());
+        assert!(app.stack_script_pending.as_ref().unwrap().open_pending());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat {
+            app.poll_stack_script(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "refusal preserves the accepted fullscreen tail"
+        );
+        app.start_book_rename(&ctx, "Old".into(), "New".into());
+        assert!(app.book_structural_op.is_some());
     }
 
     #[test]

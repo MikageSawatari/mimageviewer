@@ -703,6 +703,10 @@ impl App {
         ctx: &egui::Context,
         front: &crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        // The structural owner cancels all owning contexts before its worker can proceed.
+        if self.book_structural_op.is_some() {
+            return;
+        }
         if let Some(drag) = self.sns_split_drag.as_ref() {
             let end = if self
                 .fullscreen_idx
@@ -796,6 +800,9 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = crate::ui_fullscreen::FsKeyAction {
             page_transition: Default::default(),
             close: false,
@@ -835,6 +842,9 @@ impl App {
     }
 
     fn execute_sns_split_export(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        if self.book_structural_op.is_some() {
+            return false;
+        }
         self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Execute);
         let Some(layout) = self.sns_split else {
             return false;
@@ -885,6 +895,9 @@ impl App {
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1282,6 +1295,9 @@ impl App {
         handles: [(CropHandle, egui::Pos2); 8],
         front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
+        if self.book_structural_op.is_some() {
+            return false;
+        }
         self.service_sns_split_drag(ui.ctx(), &front);
         let frame_ratio = sns_frame_ratio_from_key(self.settings.sns_split_frame_ratio.as_deref());
         let (primary_pressed, primary_down, primary_released, press_origin, hover_pos, total_delta) =
@@ -1392,6 +1408,7 @@ mod tests {
             "execute_shortcut",
             "execute_button",
             "execute_unready",
+            "book_structure",
         ] {
             let mut app = crate::app::setup_app_for_test();
             let path = app.tmp.path().join("sns-drag.jpg");
@@ -1567,6 +1584,86 @@ mod tests {
                     app.fs_cache.clear();
                     assert!(!app.execute_sns_split_export(&ctx, 0));
                     assert!(app.export_dialog.is_none());
+                }
+                "book_structure" => {
+                    let key = app.page_path_key(0).unwrap();
+                    let crop_before = app.export_crop_db.as_ref().unwrap().get(&key);
+                    let worker = app.hold_book_structure_for_test();
+                    frame(
+                        &mut app,
+                        vec![button(egui::PointerButton::Primary, false)],
+                        true,
+                    );
+                    assert!(!app.execute_sns_split_export(&ctx, 0));
+                    app.poll_book_structural_op(&ctx);
+                    assert_eq!(
+                        app.sns_split,
+                        Some(base),
+                        "structural poll must cancel SNS draft"
+                    );
+                    assert!(app.sns_split_drag.is_none());
+                    frame(
+                        &mut app,
+                        vec![button(egui::PointerButton::Primary, false)],
+                        true,
+                    );
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            egui::Event::PointerButton {
+                                pos: start,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        true,
+                    );
+                    frame(&mut app, vec![egui::Event::PointerMoved(end)], true);
+                    assert_eq!(app.sns_split, Some(base));
+                    assert!(
+                        app.sns_split_drag.is_none(),
+                        "new SNS input must stay blocked"
+                    );
+                    ctx.begin_pass(egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key: egui::Key::F13,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    });
+                    app.keyboard_owner_for_pass(&ctx);
+                    app.handle_sns_split_keys(&ctx, 0);
+                    let _ = ctx.end_pass().drop_without_applying_deltas();
+                    assert!(app.export_dialog.is_none());
+                    let _ = ctx
+                        .run_pass(
+                            egui::RawInput {
+                                screen_rect: Some(viewport),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                app.draw_sns_split_panel(ctx, 0, viewport, Some(size), None);
+                            },
+                        )
+                        .drop_without_applying_deltas();
+                    assert_eq!(app.sns_split, Some(base));
+                    worker
+                        .send(Err("synthetic structural completion".into()))
+                        .unwrap();
+                    app.poll_book_structural_op(&ctx);
+                    assert!(app.book_structural_op.is_none());
+                    frame(&mut app, vec![egui::Event::PointerMoved(end)], true);
+                    frame(
+                        &mut app,
+                        vec![button(egui::PointerButton::Primary, false)],
+                        true,
+                    );
+                    assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), crop_before);
                 }
                 _ => unreachable!(),
             }

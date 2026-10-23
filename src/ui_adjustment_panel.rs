@@ -12670,6 +12670,9 @@ impl App {
         transform: &DisplayedImageTransform,
         overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         if !self.local_adjust_mode {
@@ -14108,6 +14111,9 @@ impl App {
         reset_all_params: bool,
     ) {
         let was_dragging = self.adjustment_dragging;
+        if self.book_structural_op.is_some() && (changed || is_dragging) {
+            return;
+        }
         if (changed || is_dragging || was_dragging) && self.book_append_undo_in_progress() {
             self.admit_book_append_followup_mutation();
             return;
@@ -14267,6 +14273,9 @@ impl App {
         clear_layers: bool,
         effect_requests: LocalEffectPanelRequests,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         let changes_document = add_layer_mask.is_some()
             || change_layer_mask.is_some()
             || set_layer_effect.is_some()
@@ -14532,6 +14541,9 @@ impl App {
     }
 
     fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         if self.local_adjust_lut_pending.is_some() {
             self.show_feedback_warning("LUT読み込み中です".to_string());
             return;
@@ -15453,6 +15465,9 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     sink_rect,
                     egui::Id::unique("local_adjust_panel_click_sink"),
@@ -15631,6 +15646,9 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     tool_sink_rect,
                     egui::Id::unique("local_adjust_tool_panel_click_sink"),
@@ -16370,6 +16388,9 @@ impl App {
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel_rect));
         child.set_clip_rect(panel_rect);
+        if self.book_structural_op.is_some() {
+            child.disable();
+        }
         // ⚠ テーマ非依存で常に DARK visuals を適用。Light テーマで slider/DragValue
         // の bg が near-white になり「白の上に白文字」で読めなくなる問題への対応
         // (= 消しゴム / 隠蔽パネルと同じ方針、CLAUDE.md「フルスクリーン内は黒背景

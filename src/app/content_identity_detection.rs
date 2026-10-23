@@ -142,6 +142,9 @@ impl App {
     }
 
     pub(crate) fn maybe_start_content_identity_detection(&mut self) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         // OFF は最初の分岐にする。物理一覧判定、size index、backfill 選別の
         // いずれも行わず、folder-open 起因の file read を 0 にする。
         if !self.settings.edit_restore_prompt_enabled {

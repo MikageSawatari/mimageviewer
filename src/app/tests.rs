@@ -41485,6 +41485,7 @@ mod favorite_adjustment_defaults_tests {
         app.items.push(GridItem::Image(folder.join("p001.jpg")));
         app.items.push(GridItem::Image(page));
 
+        app.visible_indices = (0..app.items.len()).collect();
         let draft = app
             .current_book_bookmark_draft(1)
             .expect("image-only folder is a book");
@@ -41503,6 +41504,53 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn zip_bookmark_draft_counts_images_only_in_current_reading_order() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from("C:/test/book.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&[
+            "d1/a.jpg", "d2/b.jpg", "p1.jpg", "p2.jpg", "p3.jpg",
+        ]));
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
+        let idx = app
+            .items
+            .iter()
+            .position(|item| {
+                matches!(item,
+            GridItem::ZipImage { entry_name, .. } if entry_name == "p1.jpg")
+            })
+            .unwrap();
+        assert_eq!(idx, 2, "two directory rows precede the first image");
+        assert_eq!(
+            app.current_book_bookmark_draft(idx)
+                .unwrap()
+                .page_index_hint,
+            0
+        );
+    }
+
+    #[test]
+    fn pdf_bookmark_draft_keeps_zero_based_reading_position() {
+        let mut app = setup_app();
+        let pdf = PathBuf::from("C:/test/book.pdf");
+        app.current_folder = Some(pdf.clone());
+        app.items = (0..3)
+            .map(|page_num| GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        app.visible_indices = vec![0, 1, 2];
+        let draft = app.current_book_bookmark_draft(1).unwrap();
+        assert_eq!(draft.page_index_hint, 1);
+        assert_eq!(
+            draft.page_identity,
+            crate::book_bookmarks::PageIdentity::PdfPage(1)
+        );
+    }
+
+    #[test]
     fn converted_archive_bookmark_keeps_original_container_and_full_entry() {
         use crate::book_bookmarks::{BookContainerKind, PageIdentity};
 
@@ -41516,6 +41564,7 @@ mod favorite_adjustment_defaults_tests {
             entry_name: "chapter/inner.cbz/p010.jpg".to_string(),
         });
 
+        app.visible_indices = (0..app.items.len()).collect();
         let draft = app
             .current_book_bookmark_draft(0)
             .expect("converted archive page is bookmarkable");
@@ -41807,7 +41856,9 @@ mod favorite_adjustment_defaults_tests {
             .unwrap()
             .snapshot;
 
-        let result = crate::books::rename_book(&books_root, "Old", "New").unwrap();
+        let result =
+            crate::books::rename_book_at(&temp.path().join("data"), &books_root, "Old", "New")
+                .unwrap();
         let crate::books::BookOpResult::Renamed {
             source_folder,
             target_folder,
@@ -41983,26 +42034,21 @@ mod favorite_adjustment_defaults_tests {
         app.start_book_rename(&ctx, "Before".into(), "After".into());
         app.start_book_delete(&ctx, "Before".into());
         assert!(app.book_op_pending.is_none());
+        assert!(app.book_structural_op.is_none());
         let book_folder = app.tmp.path().to_path_buf();
-        assert!(
-            app.start_book_reorder_flush(&ctx, book_folder.clone(), vec![old.clone()])
-                .is_none()
-        );
+        assert!(!app.start_book_reorder_flush(&ctx, book_folder.clone(), vec![old.clone()]));
         for kind in [
             crate::books::BookTransferKind::Move,
             crate::books::BookTransferKind::Copy,
         ] {
-            assert!(
-                app.start_book_transfer(
-                    &ctx,
-                    book_folder.clone(),
-                    vec![old.clone()],
-                    vec![old.clone()],
-                    "Other".into(),
-                    kind,
-                )
-                .is_none()
-            );
+            assert!(!app.start_book_transfer(
+                &ctx,
+                book_folder.clone(),
+                vec![old.clone()],
+                vec![old.clone()],
+                "Other".into(),
+                kind,
+            ));
         }
         app.resolve_collection_migration_for_exit();
         assert_eq!(std::fs::read(&journal).unwrap(), old_bytes);
@@ -42742,18 +42788,22 @@ mod favorite_adjustment_defaults_tests {
             false,
         );
         app.rename_migration_queue.push_back(job);
-        let result = crate::books::delete_book(&actual_root, "Book").unwrap();
+        let result = crate::books::delete_book_at(&data_dir, &actual_root, "Book").unwrap();
         app.settings.book_root = Some(app.tmp.path().join("changed-books-setting"));
         let (tx, rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: actual_book.clone(),
-            },
-        });
+        app.book_structural_op = Some(
+            super::book_structural_op::BookStructuralOp::running_for_test(
+                rx,
+                crate::books::BookOpIntent::Delete {
+                    path: actual_book.clone(),
+                },
+                super::book_structural_op::Completion::Manager,
+            ),
+        );
         tx.send(Ok(result)).unwrap();
 
-        app.poll_book_op_pending(&ctx);
+        app.poll_book_structural_op(&ctx);
+        assert!(app.book_structural_op.is_none());
         assert!(!app.rename_migration_queue[0].generic_pending);
         app.flush_rename_migration_journal().unwrap();
         assert!(!crate::rename_key_migration::journal_load(&data_dir).unwrap()[0].generic_pending);
@@ -42788,17 +42838,6 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.rename_migration_in_flight.is_none());
         app.delete_pending = None;
 
-        let (_book_tx, book_rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx: book_rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: PathBuf::from("new"),
-            },
-        });
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
-        app.book_op_pending = None;
-
         let root = app.tmp.path().join("books");
         let folder = root.join("Book");
         app.settings.book_root = Some(root);
@@ -42806,23 +42845,29 @@ mod favorite_adjustment_defaults_tests {
         app.items
             .push(crate::grid_item::GridItem::Image(folder.join("0001.jpg")));
         app.open_book_reorder_from_current();
-        let (_reorder_tx, reorder_rx) = std::sync::mpsc::channel();
-        app.book_reorder.as_mut().unwrap().flush_pending = Some(crate::books::BookOpPending {
-            rx: reorder_rx,
-            intent: crate::books::BookOpIntent::SourceMutation,
-        });
-        assert!(app.rename_migration_source_changes_pending());
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
-        app.book_reorder.as_mut().unwrap().flush_pending = None;
-        let (_transfer_tx, transfer_rx) = std::sync::mpsc::channel();
-        app.book_reorder.as_mut().unwrap().transfer_pending = Some(crate::books::BookOpPending {
-            rx: transfer_rx,
-            intent: crate::books::BookOpIntent::SourceMutation,
-        });
-        assert!(app.rename_migration_source_changes_pending());
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
+        for completion in [
+            super::book_structural_op::Completion::Manager,
+            super::book_structural_op::Completion::ReorderFlush,
+            super::book_structural_op::Completion::ReorderTransfer,
+        ] {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let intent = if matches!(completion, super::book_structural_op::Completion::Manager) {
+                crate::books::BookOpIntent::Delete {
+                    path: PathBuf::from("new"),
+                }
+            } else {
+                crate::books::BookOpIntent::SourceMutation
+            };
+            app.book_structural_op = Some(
+                super::book_structural_op::BookStructuralOp::running_for_test(
+                    rx, intent, completion,
+                ),
+            );
+            assert!(app.rename_migration_source_changes_pending());
+            app.try_start_next_rename_migration();
+            assert!(app.rename_migration_in_flight.is_none());
+            app.book_structural_op = None;
+        }
     }
 
     #[test]
@@ -63125,7 +63170,7 @@ mod native_video_rating_key_tests {
             assert!(app.rating_session_generation_for_key(&key) > stale_generation);
 
             // A hydrate result started before the detached write must not win.
-            app.hydrate_ratings_from_xmp(vec![(target.clone(), 2, stale_generation)]);
+            hydrate_ratings_from_xmp(&mut app, vec![(target.clone(), 2, stale_generation)]);
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
             assert_eq!(app.rating_cache.get(&idx), Some(&4));
 
@@ -63139,7 +63184,7 @@ mod native_video_rating_key_tests {
 
             // Even a same-generation XMP result cannot resurrect an explicit
             // user clear while the writer catches up.
-            app.hydrate_ratings_from_xmp(vec![(target.clone(), 3, clear_generation)]);
+            hydrate_ratings_from_xmp(&mut app, vec![(target.clone(), 3, clear_generation)]);
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
             assert_eq!(app.rating_cache.get(&idx), Some(&0));
             app.remove_active_context_for_test();
@@ -63180,8 +63225,8 @@ mod native_video_rating_key_tests {
 
         // clear より前に開始した読み取りと、clear 後だが XMP writer 完了前に開始した読み取りの
         // どちらも、ユーザー最終値 0 を復活させてはならない。
-        app.hydrate_ratings_from_xmp(vec![(path.clone(), 4, pending_generation)]);
-        app.hydrate_ratings_from_xmp(vec![(path, 4, clear_generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path.clone(), 4, pending_generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 4, clear_generation)]);
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
         assert_eq!(app.rating_cache.get(&0), Some(&0));
@@ -63189,6 +63234,251 @@ mod native_video_rating_key_tests {
             assert_eq!(active.rating_cache.get(&0), Some(&0));
         })
         .expect("detached context");
+    }
+
+    fn hydrate_ratings_from_xmp(app: &mut App, reads: Vec<(PathBuf, u8, u64)>) {
+        let reads = reads
+            .into_iter()
+            .map(|(path, stars, rating_generation)| {
+                let key = crate::adjustment_db::normalize_path(&path);
+                crate::tag_prewarm::TagPrewarmResult {
+                    path,
+                    rating: Some(stars),
+                    rating_generation,
+                    ticket: app.rating_xmp_hydration.read_ticket(&key),
+                }
+            })
+            .collect();
+        app.hydrate_ratings_from_xmp(reads);
+    }
+
+    fn settle_xmp_rating_hydration(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        app.poll_tag_prewarm_results();
+        while app.rating_xmp_hydration.is_busy() {
+            app.poll_tag_prewarm_results();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "XMP hydration did not settle"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn exercise_xmp_hydration_after_delete_purge(book_delete: bool) {
+        for completed_before_delete in [false, true] {
+            for delete_tree in [false, true] {
+                if book_delete && !delete_tree {
+                    continue;
+                }
+                let mut app = setup_app();
+                app.settings.write_rating_to_xmp = false;
+                let books = app.tmp.path().join("books");
+                let root = books.join("Book");
+                std::fs::create_dir_all(&root).unwrap();
+                let page = root.join("0001_page.png");
+                image::RgbaImage::new(1, 1).save(&page).unwrap();
+                let untouched = books.join("Book-other.png");
+                image::RgbaImage::new(1, 1).save(&untouched).unwrap();
+                app.settings.book_root = Some(books);
+                let key = crate::adjustment_db::normalize_path(&page);
+                let other_key = crate::adjustment_db::normalize_path(&untouched);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&other_key, 2, None)
+                    .unwrap();
+                let generation = app.rating_session_generation_for_key(&key);
+                assert_eq!(
+                    generation, 0,
+                    "late first reads must not rely on a generation mismatch after purge"
+                );
+                let untouched_ticket = app.rating_xmp_hydration.read_ticket(&other_key);
+                let target = if delete_tree {
+                    root.clone()
+                } else {
+                    page.clone()
+                };
+                app.install_new_items(
+                    vec![
+                        if delete_tree {
+                            GridItem::Folder(target.clone())
+                        } else {
+                            GridItem::Image(target.clone())
+                        },
+                        GridItem::Image(untouched.clone()),
+                    ],
+                    vec![None, None],
+                );
+                app.rebuild_visible_indices();
+                // This accepted read has not returned yet. A deletion must also
+                // prevent it from creating a fresh import after the purge.
+                let late_read = crate::tag_prewarm::TagPrewarmResult {
+                    path: page.clone(),
+                    rating: Some(5),
+                    rating_generation: generation,
+                    ticket: app.rating_xmp_hydration.read_ticket(&key),
+                };
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let (completed_tx, completed_rx) = mpsc::channel();
+                app.rating_xmp_hydration.hold_next_import_for_test(
+                    crate::tag_prewarm::HydrationTestHook {
+                        entered: entered_tx,
+                        release: release_rx,
+                        completed: completed_tx,
+                    },
+                );
+                hydrate_ratings_from_xmp(&mut app, vec![(page.clone(), 4, generation)]);
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                if completed_before_delete {
+                    release_tx.send(()).unwrap();
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+                }
+                let ctx = egui::Context::default();
+                if book_delete {
+                    app.start_book_delete(&ctx, "Book".into());
+                    assert!(app.book_structural_op.is_some());
+                } else {
+                    app.start_delete_files(&ctx, vec![target.clone()]);
+                    assert!(app.delete_pending.is_some());
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while app.book_structural_op.is_some() || app.delete_pending.is_some() {
+                    app.poll_book_structural_op(&ctx);
+                    app.poll_delete_pending();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "delete must finish while the cancelled import is held"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(!target.exists());
+                assert!(!untouched_ticket.load(std::sync::atomic::Ordering::Acquire));
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+                assert!(!app.rating_session_writes.contains_key(&key));
+                if !completed_before_delete {
+                    release_tx.send(()).unwrap();
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                // Reuse the physical path before the old replies are adopted:
+                // the old image's stars must not attach to this new image.
+                std::fs::create_dir_all(&root).unwrap();
+                image::RgbaImage::new(1, 1).save(&page).unwrap();
+                let parked = app.build_window_context_for_test(1272301, |owner| {
+                    owner.tag_prewarm_pending = Some(
+                        crate::tag_prewarm::TagPrewarmPending::from_results_for_test(vec![
+                            late_read,
+                        ]),
+                    );
+                });
+                app.with_owner_viewer_context(parked, |owner| owner.poll_tag_prewarm_results())
+                    .unwrap();
+                app.poll_tag_prewarm_results();
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+                assert!(!app.rating_session_writes.contains_key(&key));
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&other_key), 2);
+                assert!(untouched.exists());
+                assert!(!app.rating_xmp_hydration.is_busy());
+                // A new read at the reused path has a new ticket and remains
+                // functional; deletion is not a persistent path blacklist.
+                hydrate_ratings_from_xmp(&mut app, vec![(page, 3, 0)]);
+                settle_xmp_rating_hydration(&mut app);
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
+                assert_eq!(app.rating_session_value_for_key(&key), Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn xmp_hydration_cannot_restore_rating_after_normal_delete_purge() {
+        exercise_xmp_hydration_after_delete_purge(false);
+    }
+
+    #[test]
+    fn xmp_hydration_cannot_restore_rating_after_book_delete_purge() {
+        exercise_xmp_hydration_after_delete_purge(true);
+    }
+
+    #[test]
+    fn accepted_xmp_hydration_cannot_restore_a_later_user_clear() {
+        // Exercise both SQLite-wait and completed-but-not-adopted boundaries.
+        for clear_after_worker_completion in [false, true] {
+            let mut app = setup_app();
+            app.settings.write_rating_to_xmp = false;
+            let path = app.tmp.path().join("hydration-clear.jpg");
+            let key = crate::adjustment_db::normalize_path(&path);
+            app.items = vec![GridItem::Image(path.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.visible_indices = vec![0];
+            app.rating_cache.insert(0, 0);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            app.rating_xmp_hydration.hold_next_import_for_test(
+                crate::tag_prewarm::HydrationTestHook {
+                    entered: entered_tx,
+                    release: release_rx,
+                    completed: completed_tx,
+                },
+            );
+            hydrate_ratings_from_xmp(&mut app, vec![(path, 4, 0)]);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(app.rating_xmp_hydration.is_busy());
+            if clear_after_worker_completion {
+                release_tx.send(()).unwrap();
+                completed_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                assert!(
+                    app.rating_xmp_hydration.is_busy(),
+                    "UI adoption remains pending"
+                );
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+            }
+            app.write_user_rating_shared(&key, 0, None).unwrap();
+            if !clear_after_worker_completion {
+                release_tx.send(()).unwrap();
+                completed_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            settle_xmp_rating_hydration(&mut app);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+            assert_eq!(app.rating_cache.get(&0), Some(&0));
+            assert!(app.rating_session_writes[&key].explicit_user);
+        }
+    }
+
+    #[test]
+    fn xmp_hydration_preserves_existing_nonzero_db_rating() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("existing-rating.jpg");
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 5, None)
+            .unwrap();
+        let writes = crate::rating_db::RATING_WRITES.sample();
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 2, 0)]);
+        settle_xmp_rating_hydration(&mut app);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+        assert_eq!(
+            crate::rating_db::RATING_WRITES.sample(),
+            writes,
+            "a skipped import must not publish a mutation"
+        );
+        assert!(!app.rating_session_writes.contains_key(&key));
     }
 
     #[test]
@@ -63202,7 +63492,8 @@ mod native_video_rating_key_tests {
         app.rating_cache.insert(0, 0);
         let generation = app.rating_session_generation_for_key(&key);
 
-        app.hydrate_ratings_from_xmp(vec![(path, 3, generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 3, generation)]);
+        settle_xmp_rating_hydration(&mut app);
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
         assert_eq!(app.rating_cache.get(&0), Some(&3));

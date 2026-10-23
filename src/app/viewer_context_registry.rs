@@ -747,6 +747,31 @@ fn reset_audio_art_terminal_rows(
 }
 
 impl App {
+    /// Includes buffered read results; inspection never mounts a context or drains it.
+    pub(super) fn has_tag_prewarm_work(&self) -> bool {
+        if self
+            .tag_prewarm_pending
+            .as_ref()
+            .is_some_and(|p| p.is_busy())
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if bundle
+                .tag_prewarm_pending
+                .as_ref()
+                .is_some_and(|p| p.is_busy())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(super) fn take_parked_page_edit_commits(&mut self) -> Vec<page_edit_owner::PageEditCommit> {
         let mut commits = Vec::new();
         #[cfg(windows)]
@@ -4987,33 +5012,6 @@ impl App {
         }
     }
 
-    /// Page mappings update retained pairing identities. A book-root rename follows the
-    /// released reload behavior and leaves every accepted context payload at its old source.
-    pub(in crate::app) fn migrate_at_rest_spread_shifts(
-        &mut self,
-        mappings: &[crate::books::BookPathMapping],
-        root_move: Option<(&std::path::Path, &std::path::Path)>,
-    ) {
-        if root_move.is_some() {
-            return;
-        }
-        for slot in self.viewer_contexts.table.slots.values_mut() {
-            let bundle = match slot {
-                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
-            };
-            if super::spread_shift_live_mappings::migrate(&mut bundle.spread_shift, mappings) {
-                bundle.fullscreen_navigator_interaction.invalidate();
-                bundle.similar_panel.preview.invalidate();
-            }
-            if let Some(snapshot) = bundle.snapshot.as_mut() {
-                super::spread_shift_live_mappings::migrate(
-                    &mut snapshot.saved_viewing_state.shift,
-                    mappings,
-                );
-            }
-        }
-    }
-
     pub(crate) fn locate_window_context(
         &self,
         window_id: u64,
@@ -7303,7 +7301,7 @@ mod tests {
             from: source.join("3.jpg"),
             to: target.join("renamed.jpg"),
         }];
-        app.migrate_at_rest_spread_shifts(&mappings, Some((source, target)));
+        app.adopt_book_path_metadata(&mappings, &[], Some((source, target)));
         assert_eq!(payload!(&app), main_before);
         assert_eq!(
             payload!(app.viewer_contexts.table.at_rest(matching).unwrap()),
@@ -7317,7 +7315,7 @@ mod tests {
         // While F12 owns the mounted projection, the parked main payload stays intact too.
         app.with_window_viewer_context(9821, |owner| {
             assert_eq!(payload!(&*owner), matching_before);
-            owner.migrate_at_rest_spread_shifts(&mappings, Some((source, target)));
+            owner.adopt_book_path_metadata(&mappings, &[], Some((source, target)));
             assert_eq!(payload!(&*owner), matching_before);
             assert_eq!(
                 payload!(owner.viewer_contexts.table.at_rest(main).unwrap()),

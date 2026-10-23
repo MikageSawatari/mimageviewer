@@ -881,6 +881,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | ドラッグ中の Escape | `Escape` | 取り消してモードを維持 |
 | パネルの終了、ページ移動、close、別ツール／補正モード、再入場、preview snapshot、恒久的な park | `ModeExit` | 取り消して既存の終了・切替を続ける |
 | items／編集投影の入替、削除、世代・対象ページの変更 | `OwnerChanged` | 取り消し。別 owner へ復元しない |
+| 本の構造操作の開始（構造 owner が存在する最初の poll、FS 開始・結果採用より前） | `BookStructure` | 全 context の所有ドラッグを取り消し。DB は保存せず、完了後も古いドラッグを再開しない |
 | フォーカス喪失 | `FocusLost` | 取り消し |
 | 右ボタン押下 | `SecondaryPress` | 取り消し |
 | 前面 UI への primary 入力所有移譲 | `FrontUiClaim` | 取り消し |
@@ -891,6 +892,8 @@ crop の確定は現在の範囲を既存 DB／sidecar 保存経路へ一度だ�
 実行入口と取消を伴うモード終了入口を分け、書き出しを取消経路へ通さない。
 別 context の一時 mount は終了操作ではなく、所有者を維持する。F12 は既存の overlay edit policy で受け付けない。
 SNS 中の通常 `FsExport` は案内だけを表示し、枠の確定・取消やモード終了を行わない。
+本の構造操作中は crop／SNS ともキー・パネル・raw pointer の新規入力を受け付けない。
+取消しは `poll_book_structural_op` が単独で所有し、入力 handler が呼ばれなくても実行する。
 
 ## テキスト注釈モード
 

@@ -936,7 +936,8 @@ fn book_rename_saved_rows_move_but_open_scopes_and_stale_actions_stay_old() {
         install_book(app, &unrelated);
         assert!(app.set_live_spread_shift(3));
     });
-    let data = env.tmp.path().join("rename-shifts");
+    // The structural worker and its service maintenance lease share one store.
+    let data = crate::data_dir::get();
     let (service, owner) = runtime(&mut env, &data);
     env.settings.remember_spread_shift_per_book = true;
     let old_scope = BookScopeKey::folder(&source).unwrap();
@@ -1908,16 +1909,24 @@ fn begin_test_book_open(app: &mut App, root: &Path) {
 
 fn finish_test_book_rename(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while app.book_op_pending.is_some() {
+    assert!(
+        app.book_structural_op.is_some(),
+        "book rename was not admitted"
+    );
+    while app.book_structural_op.is_some() {
         assert!(Instant::now() < deadline, "book rename did not finish");
-        app.poll_book_op_pending(ctx);
+        // The frame drains accepted save replies before the structural owner can
+        // establish pre-filesystem writer quiescence.
+        app.poll_spread_shift_service();
+        app.poll_book_bookmarks();
+        app.poll_book_structural_op(ctx);
         std::thread::sleep(Duration::from_millis(2));
     }
 }
 
 #[cfg(windows)]
 #[test]
-fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
+fn book_rename_rejects_pending_open_then_accepts_after_original_open_adoption() {
     for (pending, resume_pending) in [
         (None, false),
         (Some("Old"), true),
@@ -1933,7 +1942,7 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
         std::fs::write(old.join("0.png"), b"page").unwrap();
         env.settings.book_root = Some(books.clone());
         env.settings.sidecar_backup_enabled = false;
-        let data = env.tmp.path().join("pending-rename-shifts");
+        let data = crate::data_dir::get();
         let (service, owner) = runtime(&mut env, &data);
         let old_scope = BookScopeKey::folder(&old).unwrap();
         let anchor = SpreadShiftPageRef::RelativePath("0.png".into());
@@ -1949,18 +1958,36 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
             )
             .unwrap();
         assert_eq!(row(&service, &old_scope), Some(anchor.clone()));
+        let stored_rows = || {
+            let db = rusqlite::Connection::open_with_flags(
+                data.join("spread_shift.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut statement = db
+                .prepare("SELECT path, anchor_ref FROM spread_shifts ORDER BY path")
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let rows_before = stored_rows();
         let epoch = service.maintenance_epoch();
-        // The original open's shift result stays unconsumed across maintenance.
-        let pause = service.pause_for_test();
         let accepted = pending.map(|name| books.join(name));
         let mut resume_release = None;
+        let mut shift_release = None;
         let mut sibling = None;
         if let Some(source) = &accepted {
             install_book(&mut env, source);
-            sibling = Some(env.build_window_context_for_test(136_411, |app| {
-                install_book(app, source);
-            }));
-            let db_path = env.tmp.path().join("pending-rename-resume.db");
+            sibling =
+                Some(env.build_window_context_for_test(136_411, |app| install_book(app, source)));
+            // Use the same store as the real structural worker, including resume migration.
+            let db_path = data.join("book_resume.db");
+            drop(env.book_resume_writer.take());
             env.book_resume_db =
                 Some(crate::book_resume_db::BookResumeDb::open_at(&db_path).unwrap());
             env.book_resume_writer = crate::book_resume_db::BookResumeWriter::spawn_at(db_path);
@@ -1970,21 +1997,11 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
                 .read_position_after(&crate::path_key::normalize(source), 1)
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
-            assert_eq!(
-                env.book_resume_db
-                    .as_ref()
-                    .unwrap()
-                    .get_position(source)
-                    .unwrap()
-                    .page,
-                0
-            );
             resume_release = Some(writer.pause_for_test());
-            // This admitted save is pending when the original open fixes its read.
             assert!(writer.record(source, 2, None));
+            shift_release = Some(service.pause_for_test());
             begin_test_book_open(&mut env, source);
-            assert!(env.sidecar_restore_active());
-            // The same-book sibling's later save must not replace the original read.
+            // Its initial resume read is fixed before the sibling's later save.
             env.with_window_context_for_test(sibling.unwrap(), |app| app.record_book_resume(4));
             if !resume_pending {
                 resume_release.take().unwrap().send(()).unwrap();
@@ -1998,40 +2015,50 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
                 assert_eq!(latest.position.unwrap().page, 4);
             }
         }
-        let before = env.spread_shift.clone();
         let ctx = egui::Context::default();
-        env.start_book_rename(&ctx, "Old".into(), "New".into());
-        assert!(env.book_op_pending.is_some());
-        finish_test_book_rename(&mut env, &ctx);
-        assert!(!old.exists());
-        assert!(new.exists());
-        assert_eq!(env.spread_shift, before);
         if let Some(source) = &accepted {
+            let request_ids = env
+                .sidecar_restore
+                .as_ref()
+                .unwrap()
+                .connection_request_ids_for_test();
+            let before = env.spread_shift.clone();
+            env.start_book_rename(&ctx, "Old".into(), "New".into());
+            assert!(env.book_structural_op.is_none());
+            assert!(env.book_op_pending.is_none());
             assert!(
-                env.sidecar_restore_active(),
-                "rename did not wait for open adoption"
+                env.fs_feedback_toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.0.contains("開き終わってから"))
+            );
+            env.poll_book_structural_op(&ctx);
+            assert_eq!(std::fs::read(old.join("0.png")).unwrap(), b"page");
+            assert!(!new.exists());
+            assert_eq!(
+                stored_rows(),
+                rows_before,
+                "refusal must not migrate any saved row"
+            );
+            assert_eq!(service.maintenance_epoch(), epoch);
+            assert_eq!(env.spread_shift, before);
+            assert_eq!(
+                env.sidecar_restore
+                    .as_ref()
+                    .unwrap()
+                    .connection_request_ids_for_test(),
+                request_ids
             );
             assert_eq!(env.current_folder.as_deref(), Some(source.as_path()));
-            assert_eq!(
-                env.spread_shift.scope,
-                Some(BookScopeKey::folder(source).unwrap())
-            );
-        }
-        pause.send(()).unwrap();
-        assert_eq!(row(&service, &old_scope), None);
-        assert_eq!(
-            row(&service, &BookScopeKey::folder(&new).unwrap()),
-            Some(anchor)
-        );
-        assert!(service.maintenance_epoch() > epoch);
-        if let Some(source) = &accepted {
+
+            shift_release.take().unwrap().send(()).unwrap();
             if resume_pending {
-                // Drive Common to its resume-dependent terminal while Record is
-                // still held. Epoch rejection must not bypass this dependency.
                 for _ in 0..20 {
                     env.poll_sidecar_restore(&ctx);
-                    assert!(env.sidecar_restore_active(), "resume fence was discarded");
-                    std::thread::sleep(Duration::from_millis(2));
+                    assert!(
+                        env.sidecar_restore_active(),
+                        "refusal must not discard the accepted resume fence"
+                    );
+                    std::thread::yield_now();
                 }
                 assert_eq!(
                     env.book_resume_db
@@ -2053,21 +2080,22 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
                 .unwrap();
             assert_eq!(latest.position.unwrap().page, 4);
             env.finish_page_identity_preparation_for_test();
+            assert!(env.sidecar_restore.is_none());
             assert_eq!(
                 env.selected,
                 Some(2),
-                "Common must adopt the original fixed resume, not DB page 0 or 4"
+                "open adopts its original resume, not the sibling's later save"
             );
-            assert_eq!(
-                env.spread_shift_anchor_idx(),
-                None,
-                "the stale shift recipe was rejected"
-            );
-            assert_eq!(env.current_folder.as_deref(), Some(source.as_path()));
+            assert_eq!(env.spread_shift_anchor_idx(), (source == &old).then_some(0));
             assert_eq!(
                 env.fenced_book_resume(source),
                 None,
-                "initial adoption ended the fence"
+                "ordinary open adoption ends its fence"
+            );
+            assert_eq!(env.current_folder.as_deref(), Some(source.as_path()));
+            assert_eq!(
+                env.spread_shift.scope,
+                Some(BookScopeKey::folder(source).unwrap())
             );
             env.with_window_context_for_test(sibling.unwrap(), |app| {
                 assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
@@ -2077,6 +2105,50 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
                 );
                 assert_eq!(app.spread_shift_anchor_idx(), None);
             });
+            assert!(old.exists());
+            assert!(!new.exists());
+            assert_eq!(stored_rows(), rows_before);
+        }
+
+        let before = env.spread_shift.clone();
+        env.start_book_rename(&ctx, "Old".into(), "New".into());
+        assert!(
+            env.book_structural_op.is_some(),
+            "retry after open adoption is admitted"
+        );
+        finish_test_book_rename(&mut env, &ctx);
+        assert!(!old.exists());
+        assert!(new.join("0.png").exists());
+        assert_eq!(
+            env.spread_shift, before,
+            "rename does not retarget an adopted reader"
+        );
+        assert_eq!(row(&service, &old_scope), None);
+        assert_eq!(
+            row(&service, &BookScopeKey::folder(&new).unwrap()),
+            Some(anchor)
+        );
+        assert!(service.maintenance_epoch() > epoch);
+        if let Some(source) = &accepted {
+            let resume_target = if source == &old { &new } else { source };
+            assert_eq!(
+                env.book_resume_db
+                    .as_ref()
+                    .unwrap()
+                    .get_position(resume_target)
+                    .unwrap()
+                    .page,
+                4
+            );
+            if source == &old {
+                assert!(
+                    env.book_resume_db
+                        .as_ref()
+                        .unwrap()
+                        .get_position(&old)
+                        .is_none()
+                );
+            }
         }
         owner.shutdown_and_join();
     }
@@ -2101,7 +2173,7 @@ fn adjusted_retained_f12_keeps_session_across_unrelated_and_same_book_rename() {
         env.settings.remember_spread_shift_per_book = false;
         env.set_live_spread_shift(0);
         env.settings.remember_spread_shift_per_book = true;
-        let (service, owner) = runtime(&mut env, &books.join("shift-data"));
+        let (service, owner) = runtime(&mut env, &crate::data_dir::get());
         let scope = BookScopeKey::folder(&shown).unwrap();
         let operation = |sequence| ShiftOperation {
             context_id: ViewerContextId::for_test(999),
@@ -2148,9 +2220,17 @@ fn adjusted_retained_f12_keeps_session_across_unrelated_and_same_book_rename() {
         });
         let target_name = format!("{renamed}-renamed");
         env.start_book_rename(&ctx, renamed.into(), target_name.clone());
+        assert!(env.book_structural_op.is_some());
+        env.poll_book_structural_op(&ctx);
+        assert!(
+            books.join(renamed).exists(),
+            "accepted writes precede rename"
+        );
+        // Let the accepted write/read finish, but leave retained readoption
+        // unpolled until the rename's maintenance has completed.
+        pause.send(()).unwrap();
         finish_test_book_rename(&mut env, &ctx);
         assert!(books.join(&target_name).exists());
-        pause.send(()).unwrap();
         row(
             &service,
             &BookScopeKey::folder(books.join(&target_name)).unwrap(),

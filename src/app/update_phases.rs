@@ -528,8 +528,7 @@ impl App {
         self.poll_local_adjust_render(ctx);
         self.poll_local_adjust_layer_bypass_preview(ctx);
         self.poll_local_adjust_prefix_preview(ctx);
-        self.poll_local_adjust_lut_load(ctx);
-        self.poll_local_adjust_segmentation(ctx);
+        self.poll_all_page_edit_producers(ctx);
         #[cfg(test)]
         super::egui037_connection_tests::observe("media_after", self, ctx);
     }
@@ -586,6 +585,7 @@ impl App {
         self.poll_delete_purge_retry(ctx);
         self.poll_capture_pending(ctx);
         self.poll_book_op_pending(ctx);
+        self.poll_book_structural_op(ctx);
         self.poll_saved_group_open(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
         self.poll_export_pending(ctx);
@@ -669,6 +669,7 @@ impl App {
                 .tag_prewarm_pending
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
+            || self.rating_xmp_hydration.is_busy()
             || self.converted_archive_cache_paths_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {

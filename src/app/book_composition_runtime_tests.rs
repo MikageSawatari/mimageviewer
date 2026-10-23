@@ -1030,37 +1030,45 @@ fn g3_document_reentry_keeps_physical_extent_after_composed_row_reorder() {
 }
 
 #[test]
-fn g3_bookmark_hint_uses_raw_position_and_composed_detail_order_is_locked() {
+fn bookmark_hint_uses_composed_reading_position_and_composed_detail_order_is_locked() {
     let mut env = setup_app();
     let root = env.tmp.path().join("bookmark-hint.pdf");
     let scope = install_document(&mut env, &root);
     let data = env.tmp.path().join("bookmark-hint-data");
     let (service, owner) = runtime(&mut env, &data);
+    let mut composition = crate::book_composition::BookComposition::new(
+        ReadingDirection::Ltr,
+        vec![
+            crate::book_composition::fixtures::document_page(2),
+            crate::book_composition::fixtures::document_page(3),
+            crate::book_composition::fixtures::document_page(0),
+            crate::book_composition::fixtures::document_page(1),
+        ],
+    );
+    composition
+        .hidden_pages
+        .push(crate::book_composition::fixtures::document_page(3));
     service
-        .save(
-            scope.clone(),
-            PageDomain::Document,
-            crate::book_composition::BookComposition::new(
-                ReadingDirection::Ltr,
-                vec![
-                    crate::book_composition::fixtures::document_page(2),
-                    crate::book_composition::fixtures::document_page(3),
-                    crate::book_composition::fixtures::document_page(0),
-                    crate::book_composition::fixtures::document_page(1),
-                ],
-            ),
-        )
+        .save(scope.clone(), PageDomain::Document, composition)
         .recv_timeout(WAIT)
         .unwrap()
         .status
         .unwrap();
     adopt(&mut env, &service, &scope);
     let draft = env.current_book_bookmark_draft(0).unwrap();
-    assert_eq!(draft.page_index_hint, 2);
+    assert_eq!(draft.page_index_hint, 0);
     assert_eq!(
         draft.page_identity,
         crate::book_bookmarks::PageIdentity::PdfPage(2)
     );
+    let next = env.current_book_bookmark_draft(1).unwrap();
+    assert_eq!(next.page_index_hint, 1);
+    assert_eq!(
+        next.page_identity,
+        crate::book_bookmarks::PageIdentity::PdfPage(0)
+    );
+    assert_eq!(env.canonical_raw_book_page(0), 2);
+    assert_eq!(env.canonical_raw_book_page(1), 0);
     assert_eq!(
         env.details_header_sort_lock_reason(),
         Some(GridSortLockReason::PageOrderFixed)

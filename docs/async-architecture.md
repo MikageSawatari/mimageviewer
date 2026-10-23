@@ -391,7 +391,52 @@ recorderの既存終了時hash取消契約は変えない。shift UI callbackに
 捕捉rootをhard purgeへ登録する。lease中もroot操作を同一ownerのread/countと共有する待機FIFOへ
 受理して受付sequenceを進める。End/再読込後に順番に実行し、後続readは先行root操作の完了を待つ。
 正常exitの受付closeは保守/起動待ちの位相とleaseの終了送信経路を保持し、受理済依存をdrainする。
-root migrationは相対payload表記とdestination優先を維持する。ページ一枚の削除では親scopeを消さない。
+root migrationは相対payload表記を維持する。汎用改名はdestination優先、本の構造操作は
+要求の`PathMigrationCollision::SourceWins`により移行元優先とする（§1.272、下記）。
+ページ一枚の削除では親scopeを消さない。
+
+## 本の構造操作と path キーの移行（§1.272/§1.273、2026-10-21、関連自動検証済み）
+
+`app/book_structural_op::BookStructuralOp` が並べ替えの保存・別本転送・本の改名/削除の
+Requested/Runningと終端採用を所有する。待機中は UI frame で producer の静止を確認し、
+受理済みの完了から続く保存・記録は通常経路で完了させる。新規入力の拒否と Remote lease は
+受付側に置き、保存関数へ拒否条件を追加しない。producer 列挙と最終的な受付境界の記録は
+[本のキー移行計画 §8](book-key-migration-plan.md#8-実装記録) を正本とする。
+
+D2c（同計画 §3.10）の未採用 open は、全 context の既存 source/navigation owner と
+受付済み fullscreen 継続を一つの admission 判定へ集め、構造要求を理由付きで拒否する。
+同本・別本を区別せず、元の open が通常採用された後の再要求で進める。
+採用済み session の retained 再照合や、通常表示の permission・decoder 読取とは区別する。
+
+本のページ移動で scope 外へ出た構成参照・見開き基点は、本操作専用の service 要求が各 transaction 内で外す。
+汎用移動の Missing 保持とは要求で区別する。完了時の表示 cache 更新は既存 reload の対象 main に限り、
+独立別窓・Snapshot の items / accepted shift を直接作り直さず、cache を新キーへ付け替えない。
+既存の通知による旧 path の再照合は従来どおり残る（同計画 §3.10）。
+
+静止の `book_structural_writers_busy` は副作用を持たない。UI frame の明示 poll が parked を含む
+受理済み XMP 読込結果を回収し、App 共通の `XmpRatingHydration` worker へ DB 処理を渡す。
+未評価行だけを transaction で補充し、明示評価・クリアとの競合は path ごとの取消票と既存の
+rating 世代で照合する。同じ取消票を XMP 読込受付から DB 完了・UI 採用まで持ち、
+通常削除・本削除・追加 Undo・明示整理は purge 前に対象票を失効する。
+削除 purge journal の再実行は受付済み票の snapshot を worker へ渡し、既存の孤児判定後に対象だけを失効する。
+遅い読込は新しい票で再投入せず、取消済み import は DB transaction 内・UI 採用の両方で無作用となる。
+有効な import は DB 完了だけでなく UI 採用まで静止条件に含める。
+汎用改名・sidecar 復元は従来の狭い writer 条件を維持し、この新しい DB writer だけを追加する。
+
+既存の製本 worker が FS 確定後に EPUB 範囲 → shift → composition の保守 lease を取り、
+`rename_key_migration::migrate_book_paths_at` を呼ぶ。`STORES` の `book_policy` が
+Follow・編集preview所有・service所有を宣言し、同一ストアを UI と worker の両方から移さない。
+Follow は一つの transaction 内で全移行元を一時キーへ退避し、移行先の exact・`/`・`::` の
+3 面を消してから最終キーへ移す。コピーは移動後のキーから従来の編集・★・タグ8種だけを写し、
+写さないストアもコピー先を初期化する。resume identity・pin source_rel・ratings source_path は
+その transaction で、preview のファイル配置と JSON 内 path はpreviewモジュールで更新する。
+本削除は FS 前から持つ既存 guarded purge lease を通して同じ `STORES` を消す。
+
+bookmark は既存 journal、shift/composition は各 service FIFO、collections は既存参照移行へ
+完了採用から送る。UI の記憶内 presence/cache は DB を読まず付け替え・失効し、再準備へ戻す。
+汎用改名と内容同一性復元の移行先優先は維持する。汎用改名のpreviewファイル配置は今回の対象外。
+まれな失敗はログ＋通知で扱い、ストア完了印・自動再実行・新しいスキーマを追加しない。
+この節はコードの実装方針の記録であり、自動検証・独立完了レビュー・実機確認の成功を表さない。
 
 
 §1.241 Phase A: `crates/startup-diagnostics` の常時timelineはlauncher/coreの共通QPC基準と
@@ -636,6 +681,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。起動時に設定された PDFium pool の並列度を活かすためここに置く) |
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile の全体走査 (本物の同期 I/O。`fs::read_dir` 再帰探索 / ZIP セントラルディレクトリ読み込みなどメインプロセス内ブロッキング) |
 | 製本並べ替えサムネイル | `std::thread` + mpsc | 最大 4 in-flight | 本の並べ替え専用ビューの焼き込み済みページを小サムネとして先行 decode。通常グリッドのキャッシュ/drag-out 経路とは分離し、UI 側は結果 backlog から `load_texture` を 1 フレーム 1 枚だけ実行する |
+| 本の構造操作 | 既存の短命製本 worker + mpsc、App の `BookStructuralOp` | process 内の構造操作は受理から採用まで最大 1 | FS 前に受理済み producer の完了を UI frame で静止させる。FS 確定後の STORES 移行・preview ファイル配置・削除 purge まで同じ worker が所有し、完了採用は記憶内の失効と既存 service FIFO への移行要求を行う。専用 retry/journal/常駐 worker は追加しない。詳細・検証結果・保留事項は [本のキー移行計画](book-key-migration-plan.md) §8 |
 | フルスクリーンロード | `std::thread` (使い捨て) | 1 枚ごとに spawn | フルサイズ画像デコード + アニメ展開 |
 | RAW 現像 | App 共有 `RawDevelopExecutor` | 設定 1〜10、既定 3 | High / Normal / Background の優先度付き LibRaw Full / half 現像。RAW fullscreen worker は ZIP/verified bytes を fs scheduler permit 内で解決し、permit を返してから Full の結果 channel を待つ。fs ticket の cancel flag は permit 解放後も executor job と共有し、executor ticket は context-owned `fs_pending` が保持して prefetch → displayed の High 昇格と cancel を行う。UI drop は queued job を取消し、実行中 native call は join しない |
 | 通常／perf log | `std::thread` (`log-writer`) | processごとに一つ | 全ファイルI/O・通常batch即flush・perf250ms flush、有界非blocking受付、drop summary、barrier／snapshot、終了合計2秒 |
@@ -1878,13 +1924,12 @@ spawn 失敗と panic はどちらも「以後すべての書き込みが消え�
    指し得るので、そのとき解決し直すと無関係なページへ書く
    (`with_sidecar_coords_mut` がこの用途)。idx 依存の後続処理は
    `page_path_key(idx)` が同じ key を返すときだけ走らせる。
-2. **worker を経由しない同 DB 操作の前に drain / gate する。**製本ページの key 付け替え
-   (`copy_entry_key` / `move_entry_key`) は UI スレッドが直接書くので、待たずに
-   走らせると「付け替えの後に古い key の保存が着地して行を書き戻す」順序が起き得る。
-   同期保存だった頃は構造的に起きなかった。**既存の直接書き込み barrier
-   (`rename_migration_writers_busy`) にも自分を足すこと** — こちらは待つのではなく
-   「終わるまで始めない」形。未回収の完了も「終わっていない」に数える (完了を適用すると
-   サイドカーへミラーが書かれるため)。
+2. **別所有者から同 DB を変える前に、先行 producer の完了を採用する。**製本ページの
+   key 付け替えは §1.272 で UI の直接書き込みから製本 worker へ移したが、FS 後に
+   旧 key の保存が届くと別画像の情報を作り直してしまうため、FS 前の静止が必要。
+   **共通の `rename_migration_writers_busy` に新しい producer も足すこと**。
+   UI frame の「終わるまで始めない」形を使い、未回収の完了とそこから続く保存・記録も
+   「終わっていない」に数える。受理済み完了を捨てたり、保存関数を拒否して静止扱いにしない。
 3. **終了経路で在庫を書き切ってからサイドカーを flush する。**正本は worker が
    drain-on-shutdown で書き切るので編集自体は消えないが、飛ばすとサイドカー
    (フォルダ移動時の復元源) だけが古くなる。
