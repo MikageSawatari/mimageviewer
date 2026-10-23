@@ -885,6 +885,23 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
   **27件全成功、exit 0**（`target/section1419-p3-restored.log`）。最後の `cargo fmt` と `git diff --check` も成功。
   全件テストは実行していない。テストと文書のみの変更なので、実機確認用バイナリの再ビルドは省略。
 
+**検収記録（2026-10-23、設計担当 ClaudeCode）:**
+
+- 実装の独立レビュー（Codex gpt-6.1-sol / xhigh / read-only、実装担当とは別の会話）: 第 1 回 P1 / P2 なし・P3 1 件
+  （上の両完了順の補強）、第 2 回で P3 解消「受入可」。detached 到達は「症状パッチではなく構造的修正」に合意。
+- 全件: `.\scripts\test-lib-full.ps1`（`4c40f6931`）**14,207 件成功・64 skipped・441 秒**。
+- 隔離実アプリ（設計担当が実行。`target\dev-runtime\mimageviewer-core.exe`、`--data-dir target\section1419-smoke\data`、
+  「別ウィンドウで開く」「画像フォルダの自動全画面」を有効化。素材は画像 60 万枚とサブフォルダ 1 つを持つ混在フォルダ
+  `00_mixed` と、通常フォルダ `01_other`）。single-instance の名前は data-dir ごとに分かれる（`ProcessNames::for_data_dir`）ので、
+  2 本目の起動は隔離した 1 本目にだけ転送される。00_mixed を選んで Enter を送り、150 ms 後に 2 本目を起動して転送した。
+  - 応答しない UNC（`\\192.0.2.79\share\book`）を転送: 受付 6.620 秒の 2 ms 後に混在フォルダの走査と detached の
+    読み込み用ウィンドウが終了し（`keep_alive_cleanup`）、00_mixed は着地しなかった。27.625 秒に UNC の解決が失敗
+    （`activation open failed`）し、表示は root のまま（「変わる挙動」2 のとおり）。
+  - 速く解決する転送（Git Bash が UNC を `C:\192.0.2.78\...` に書き換え、`C:\` に解決した回）: 受付の 2 ms 後に同じく走査が
+    終了し、後発の `C:\` が着地した。
+  - しおり・★固定（snapshot）の組み合わせは実アプリでは確かめていない（`section1419_*` の状態遷移テストのみ）。
+- 利用者の判断（2026-10-23、親セッション経由）: 「変わる挙動」はすべてこのままでよい。
+
 ### 6.3 §1.335 と compose、merge 順序
 
 読み合わせた別枝: `C:\home\mimageviewer-v430still` / `next-startup-restore`、
