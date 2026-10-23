@@ -30,8 +30,10 @@ $streamChild = Join-Path $streamProbe 'child.ps1'
 $streamRunner = Join-Path $streamProbe 'runner.ps1'
 [IO.File]::WriteAllText($streamChild, @'
 param([string] $Release)
-[Console]::Out.WriteLine('stdout before exit')
-[Console]::Error.WriteLine('stderr before exit')
+[Console]::Out.Write("stdout before exit`n")
+[Console]::Error.Write("SLOW stderr before exit`n")
+[Console]::Out.Write('stdout partial')
+[Console]::Error.Write('stderr partial')
 while (-not [IO.File]::Exists($Release)) { Start-Sleep -Milliseconds 10 }
 [Console]::Out.WriteLine('stdout terminal')
 [Console]::Error.WriteLine('stderr terminal')
@@ -54,7 +56,11 @@ try {
             $path = Join-Path $streamProbe ($name + '.log')
             if (-not [IO.File]::Exists($path)) { $visible = $false; continue }
             $reader = New-Object IO.StreamReader([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite))
-            try { if (-not $reader.ReadToEnd().Contains($name + ' before exit')) { $visible = $false } }
+            try {
+                $text = $reader.ReadToEnd()
+                if (-not $text.Contains($name + ' before exit') -or -not $text.Contains($name + ' partial')) { $visible = $false }
+                if ($name -eq 'stderr' -and -not $text.Contains("SLOW stderr before exit`n")) { $visible = $false }
+            }
             finally { $reader.Dispose() }
         }
         if ($visible) { break }
@@ -70,12 +76,38 @@ try {
 }
 $streamResult = ConvertFrom-Json ([IO.File]::ReadAllText((Join-Path $streamProbe 'result.json')))
 Assert-That ($streamResult.ExitCode -eq 7) 'streaming changed the child exit code'
-Assert-That ($streamResult.StdOut -eq "stdout before exit`r`nstdout terminal`r`n") 'streaming changed captured stdout'
-Assert-That ($streamResult.StdErr -eq "stderr before exit`r`nstderr terminal`r`n") 'streaming changed captured stderr'
+Assert-That ($streamResult.StdOut -ceq "stdout before exit`nstdout partialstdout terminal`r`n") 'streaming changed captured stdout'
+Assert-That ($streamResult.StdErr -ceq "SLOW stderr before exit`nstderr partialstderr terminal`r`n") 'streaming changed captured stderr'
 foreach ($name in @('StdOut', 'StdErr')) {
     Assert-That ([IO.File]::ReadAllText((Join-Path $streamProbe ($name.ToLowerInvariant() + '.log'))) -eq $streamResult.$name) "streamed $name differs from captured output"
 }
 Write-Host '[test-test-tools] concurrent stdout/stderr: pre-exit flush, capture and exit code PASS'
+# Compare the streaming path with the original ReadToEndAsync path and explicit
+# expected strings. Separate pipes preserve their own order, not a merged order.
+$outputCases = @(
+    @{ Name = 'unterminated'; Script = "[Console]::Out.Write('out'); [Console]::Error.Write('err')"; StdOut = 'out'; StdErr = 'err' },
+    @{ Name = 'lf'; Script = '[Console]::Out.Write("out-1`nout-2`n"); [Console]::Error.Write("err-1`nerr-2`n")'; StdOut = "out-1`nout-2`n"; StdErr = "err-1`nerr-2`n" },
+    @{ Name = 'crlf'; Script = '[Console]::Out.Write("out-1`r`nout-2`r`n"); [Console]::Error.Write("err-1`r`nerr-2`r`n")'; StdOut = "out-1`r`nout-2`r`n"; StdErr = "err-1`r`nerr-2`r`n" },
+    @{ Name = 'alternating'; Script = '[Console]::Out.Write("out-1`n"); [Console]::Error.Write("err-1`r`n"); [Console]::Out.Write("out-2`r`n"); [Console]::Error.Write("err-2`n"); [Console]::Out.Write("out-3"); [Console]::Error.Write("err-3")'; StdOut = "out-1`nout-2`r`nout-3"; StdErr = "err-1`r`nerr-2`nerr-3" },
+    @{ Name = 'multi-buffer'; Script = '$out = ("x" * 4095) + [char]0x8A66 + "`n"; $err = ("y" * 4095) + [char]0x9A13 + "`r`n"; foreach ($i in 1..20) { [Console]::Out.Write($out); [Console]::Error.Write($err) }; [Console]::Out.Write("tail"); [Console]::Error.Write("tail")'; StdOut = (((('x' * 4095) + [char]0x8A66 + "`n") * 20) + 'tail'); StdErr = (((('y' * 4095) + [char]0x9A13 + "`r`n") * 20) + 'tail') }
+)
+foreach ($case in $outputCases) {
+    $directory = Join-Path $streamProbe $case.Name
+    [void] [IO.Directory]::CreateDirectory($directory)
+    $child = Join-Path $directory 'child.ps1'
+    [IO.File]::WriteAllText($child, "[Console]::OutputEncoding = New-Object Text.UTF8Encoding(`$false)`n" + $case.Script + "`nexit 7`n", $utf8)
+    $childArgs = @('-NoProfile', '-NonInteractive', '-File', $child)
+    $original = Invoke-MivTool 'powershell.exe' $childArgs $repo
+    $streamed = Invoke-MivTool 'powershell.exe' $childArgs $repo -LogDirectory $directory
+    Assert-That ($original.ExitCode -eq 7 -and $streamed.ExitCode -eq $original.ExitCode) "$($case.Name): exit code differs"
+    foreach ($name in @('StdOut', 'StdErr')) {
+        $log = [IO.File]::ReadAllText((Join-Path $directory ($name.ToLowerInvariant() + '.log')))
+        Assert-That ($original.$name -ceq $case[$name]) "$($case.Name): original $name differs from expected output"
+        Assert-That ($streamed.$name -ceq $original.$name) "$($case.Name): streamed $name differs from ReadToEndAsync"
+        Assert-That ($log -ceq $original.$name) "$($case.Name): logged $name differs from ReadToEndAsync"
+    }
+    Write-Host "[test-test-tools] exact output $($case.Name): ReadToEndAsync, streaming and disk PASS"
+}
 $caseFeatures = @(Get-MivFeatureArguments @('extra', 'EXTRA', 'extra'))
 Assert-That (($caseFeatures -join ' ') -eq '--features EXTRA,extra') 'case-sensitive Cargo features were merged'
 # Every TOML spelling of the Cargo env table must yield its names, or refuse reuse.

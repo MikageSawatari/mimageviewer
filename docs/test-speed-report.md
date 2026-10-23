@@ -688,18 +688,20 @@ statを信頼するgitと同様の前提で、疑わしければ `test-lib-full.
 ## 停止テストの打ち切りと逐次ログ（§1.420、2026-10-23）
 
 nextest 0.9.148で、通常は`period = "60s", terminate-after = 5`（300秒）、
-priority 100の長い5件は`period = "120s", terminate-after = 5`（600秒）とする。
-直近6回の本体lib全件では、override外の最長が約60秒（描画geometry 51〜59秒、metadata cold/warm 47〜56秒）、
-長い5件は物理走査226〜260秒、RAW 157〜194秒、音楽96〜123秒、F4 106〜136秒、EOF約75秒だった。
-通常は約5倍、長い5件も負荷時に2倍以上の余裕を持つ。priority・grace-period等は変更しない。
+priority 100の長い枠は`period = "120s", terminate-after = 5`（600秒）とする。
+初回ddcaf460aでは直近6回の本体libだけを根拠に5件を選んだが、これはfull gate全体の根拠として不十分だった。
+独立レビュー後にworkspace全targetとstandalone vendor 5実行、過去の本体lib JUnitを棚卸しし、
+成功実行で60秒超を確認した12件へ割当を修正した。[追補の表](#review1420)に秒数・graph・選定根拠を示す。
+通常300秒／長い枠600秒は維持し、grace-period等は変更しない。
 打ち切られたテストの原因は別に扱い、上限の延長やretryで成功させない。
 
-`Invoke-MivNextest`はstdout/stderrを同時に読み、run directoryへ1行ごとにflushする。
+`Invoke-MivNextest`はstdout/stderrを同時に読み、受信した文字列をrun directoryへchunkごとにflushする。
+初回の行読みを独立レビュー後に文字読みへ変更し、LF／CRLF／末尾改行なしをそのまま保存する。
 終了前からSLOW行と名前を読める。終了時の末尾20行・exit code・JUnit集計・receipt条件は維持する。
 Gitの呼び出しは従来どおり全文のStdOut/StdErrを返す。
 
 
-### 変更ファイル
+### 初回ddcaf460aの変更ファイル
 
 | ファイル | 要点 |
 | --- | --- |
@@ -888,3 +890,86 @@ Stack欠落と同じ原因だったかは確定していない。同じfixture�
 （`target/final-receipt-validity.json`）。同じ条件の独立レビューではこの成功結果を再利用できる。
 独立レビュー／ClaudeCodeによる検収は別担当。追加の既存release script検査の不一致と、nextest自身の
 終了後停止の観測は上記の別件として残し、今回のテスト修正で解消したとは扱わない。
+
+<a id="review1420"></a>
+
+## 独立レビュー追補：full gateの全graphと出力文字列（2026-10-23）
+
+ddcaf460aからの修正。P2の棚卸し漏れを補い、長い枠は5件から12件へ変更した。
+設定は`.config/nextest.toml` 1本とし、1つのoverride節に`test(=<完全なテスト名>)`のORだけを書く。
+通常300秒／長い枠600秒とretry 0を維持し、12件はpriority 100で先行実行する。
+設計担当の指示でpackage／binary IDの限定とvendor設定の分割・drift検査を外した。
+同名テストにも600秒・priority 100が適用されることは許容する。全nextest段はルートの同じ設定を使う。
+`scripts/test-full.ps1`はddcaf460aと内容差分0に戻した。
+
+### 長時間テストの棚卸し
+
+対象はworkspaceの全package・補助bin・integrationと、standalone vendorのegui／egui-winit／
+egui-wgpu／eframe（wgpu・glow）。前回通常fullのworkspace JUnitは15,522実行・48非空binary、
+vendorは順に117／43／37／55／57成功だった。過去lib 21 JUnitと保存nextestログ2本、負荷が
+重なったfullも照合し、成功時に60秒を超えた次の12件を選んだ。
+
+| テスト（完全名） | graph／binary ID（観測時） | 選定時の最大実測秒数 | 割当 |
+| --- | --- | ---: | --- |
+| `app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k` | workspace／mimageviewer | 429.813（過去lib） | 600秒・priority 100（既存） |
+| `raw::tests::all_cc0_samples_info_develop_and_preview_orientation` | workspace／mimageviewer | 296.577（過去lib） | 同上（既存） |
+| `ui_music_timeline::tests::key_synthetic_harmonic_major_minor_progressions_and_percussion_comparison` | workspace／mimageviewer | 232.435（過去lib） | 同上（既存） |
+| `ui_fullscreen::tests::still_seek_f4_screen_last_pixel_closes_strip_with_real_geometry` | workspace／mimageviewer | 135.884（過去lib） | 同上（既存） |
+| `video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch` | workspace／mimageviewer | 81.017（過去lib） | 同上（既存） |
+| `tests::all_cc0_sample_dimensions_match` | workspace／libraw-sys | 187.755（負荷が重なったfull） | 同上（追加） |
+| `ui_fullscreen::canonical_demand::tests::canonical_native_demand_matches_actual_single_and_pair_draw_geometry` | workspace／mimageviewer | 66.370（libプローブ時） | 同上（追加） |
+| `book_append_undo::tests::section1373_metadata_database_cold_and_warm_per_file_benchmark` | workspace／mimageviewer | 112.430（過去lib） | 同上（追加） |
+| `app::music_bass::tests::music_bass_decode_success_orders_final_before_bass_and_lru_hit_still_computes` | workspace／mimageviewer | 86.688（過去lib） | 同上（追加） |
+| `app::rating_membership_tests::rating_undo_grid_keys_cancel_held_restore_on_moves_edges_and_empty_sets` | workspace／mimageviewer | 77.208（過去lib） | 同上（追加） |
+| `fts_writer_dispatcher::tests::dropping_the_dispatcher_always_returns` | workspace／mimageviewer | 96.089（負荷が重なったfull） | 同上（追加） |
+| `restart_warmup_preserves_correct_active_keys_for_four_signal_cases` | workspace／music-core::harmnet（integration） | 66.945（負荷が重なったfull） | 同上（追加） |
+
+原本・全binaryの件数／最長test・45秒超の記録は`target/review1420/duration-inventory.json`と
+`before-*.junit.xml`、過去ログのpath・SHA-256・行は`past-log-inventory.json`に保存した。
+選定時のvendor最長はegui 0.445秒、egui-winit 2.339秒、egui-wgpu 2.829秒、
+eframe/wgpuは全段1.312秒以下、eframe/glow 0.135秒で、長い枠の追加は無い。
+12件以外は過去libを含め成功時の最長58.490秒。負荷fullでTIMEOUTしたclipboard deadline等は
+成功時の長い処理とは扱わず、既報の失敗として別に扱う。上限延長・retry・ignoreで通さない。
+
+### 出力の文字列を保持する逐次保存
+
+P3はReadLineAsyncが落とした改行をAppendLine／WriteLineで付け直したことが原因だった。
+`scripts/test-tools-common.ps1`は両streamを専用char bufferへReadAsyncし、受信chunkをそのまま
+戻り値のbufferとlogへ書いてflushする。Git等のReadToEndAsync経路、exit code、末尾20行表示は維持する。
+`scripts/test-test-tools.ps1`で末尾改行なし・LF・CRLF・交互出力・約80KBのbuffer境界を、
+明示した期待値／ReadToEndAsync／逐次戻り値／disk logで照合する。終了前のSLOW行と部分出力も検査する。
+実nextestの終了前SLOW保存の証拠は`target/review1420/streaming-live-observation.json`。
+
+### 単一設定へ戻した最終検証
+
+証拠の保存先は`target/simplify1420/`。製品Rustコードの追加差分は0。
+`scripts/test-release-build-safety.ps1`は既存の古い期待値を現行のegui-winit manifest指定・
+eframe両backend・Cargo 8呼出しへ更新し、全nextest段がルート設定を使うことと各段失敗時の停止を検査する。
+
+全graphに同じルート設定と同じoverride式を渡す`cargo nextest list`がexit 0。
+workspaceでは観測上12件だけに一致し、vendorは各0件だった。
+
+| graph | list全件 | override一致 | full成功 | nextest秒数 |
+| --- | ---: | ---: | ---: | ---: |
+| workspace | 15,522 | 12 | 15,522 | 532.222 |
+| egui | 117 | 0 | 117 | 0.724 |
+| egui-winit | 43 | 0 | 43 | 2.321 |
+| egui-wgpu | 37 | 0 | 37 | 2.657 |
+| eframe-wgpu | 55 | 0 | 55 | 1.265 |
+| eframe-glow | 57 | 0 | 57 | 0.221 |
+
+- `test-release-build-safety.ps1`と`test-test-tools.ps1`は一式exit 0。同名のlog／exitファイルを保存。
+  出力5caseの文字列一致・終了前flush、全nextest段のルート設定使用と8呼出しの失敗時停止を含む。
+- PS 4本のPowerShell 5.1 parse／ASCII、`cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check`は成功。
+- `test-lib-full.ps1`は設定／script差分でMISSとなり、14,195成功／失敗0／64 skipped、443.102秒、exit 0。
+  全段後は同じ成功receiptのHITでexit 0（`receipt-hit.log`）。sourceとreceiptの完全ID・commandは`test-lib-full.log`。
+- `test-full.ps1`は全段exit 0、nextest計15,831成功／失敗0、全体の壁時計554.751秒。
+  doctest段もexit 0（実行対象0、既存ignored 3）。全graphでoverride外の60秒超成功は
+  0件だった。
+
+全出力は`test-full.log`、graph別JUnitは上書き前に`gate-*.junit.xml`へ保存した。
+列挙のcommand・一致した完全名は`override-matches.json`と`list-*.json`、集計は`final-evidence.json`。
+両gateはCARGO_BUILD_JOBS=1で順に実行し、fullだけNEXTEST_FINAL_STATUS_LEVEL=allで名前・時間を保存した。
+負荷用processは起動していない。20秒間隔のprocess観測は`gate-load-samples.json`に保存した。
+製品Rustコードの変更が無い設定／script／文書の修正なのでアプリ検証用binaryのbuild／起動は行わない。
+commit・stageはしていない。

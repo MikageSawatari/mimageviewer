@@ -40,24 +40,29 @@ function Invoke-MivTool {
         if ($LogDirectory) {
             $readers = @{ StdOut = $process.StandardOutput; StdErr = $process.StandardError }
             $buffers = @{ StdOut = (New-Object Text.StringBuilder); StdErr = (New-Object Text.StringBuilder) }
+            $readBuffers = @{ StdOut = (New-Object char[] 4096); StdErr = (New-Object char[] 4096) }
             $pending = @{}
-            foreach ($name in @('StdOut', 'StdErr')) { $pending[$name] = $readers[$name].ReadLineAsync() }
+            foreach ($name in @('StdOut', 'StdErr')) {
+                $pending[$name] = $readers[$name].ReadAsync($readBuffers[$name], 0, $readBuffers[$name].Length)
+            }
             while ($pending.Count) {
                 [void] [Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]] @($pending.Values))
                 foreach ($name in @('StdOut', 'StdErr')) {
                     if (-not $pending.ContainsKey($name) -or -not $pending[$name].IsCompleted) { continue }
-                    $line = $pending[$name].GetAwaiter().GetResult()
-                    if ($null -eq $line) { $pending.Remove($name); continue }
-                    [void] $buffers[$name].AppendLine($line)
+                    $count = $pending[$name].GetAwaiter().GetResult()
+                    if ($count -eq 0) { $pending.Remove($name); continue }
+                    # Preserve LF, CRLF and unterminated output exactly as received.
+                    $chunk = [string]::new($readBuffers[$name], 0, $count)
+                    [void] $buffers[$name].Append($chunk)
                     if ($writers.ContainsKey($name)) {
-                        try { $writers[$name].WriteLine($line) }
+                        try { $writers[$name].Write($chunk) }
                         catch {
                             Write-Warning "Cannot write $name log: $_"
                             $writers[$name].Dispose()
                             $writers.Remove($name)
                         }
                     }
-                    $pending[$name] = $readers[$name].ReadLineAsync()
+                    $pending[$name] = $readers[$name].ReadAsync($readBuffers[$name], 0, $readBuffers[$name].Length)
                 }
             }
             $stdout = $buffers.StdOut.ToString()

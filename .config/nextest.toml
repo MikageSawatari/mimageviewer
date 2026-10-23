@@ -6,8 +6,9 @@ nextest-version = "0.9.143"
 test-threads = "num-cpus"
 retries = 0
 fail-fast = false
-# Six recent full runs: non-overridden tests peaked near 60s; allow 5x that.
-# The five measured long tests peaked at 260s; allow 600s without retries.
+# Inventory covers workspace targets and all five standalone vendor runs.
+# Successful tests exceeding 60s use the 600s override; all others use 300s.
+# Historical maxima include a 430s scan and 188s LibRaw check; never retry.
 slow-timeout = { period = "60s", terminate-after = 5 }
 status-level = "slow"
 final-status-level = "slow"
@@ -18,6 +19,19 @@ report-skipped = "all"
 
 # Start measured long-running tests early, without skipping or retrying them.
 [[profile.default.overrides]]
-filter = "test(=ui_fullscreen::tests::still_seek_f4_screen_last_pixel_closes_strip_with_real_geometry) | test(=app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k) | test(=raw::tests::all_cc0_samples_info_develop_and_preview_orientation) | test(=video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch) | test(=ui_music_timeline::tests::key_synthetic_harmonic_major_minor_progressions_and_percussion_comparison)"
+filter = '''
+    test(=ui_fullscreen::tests::still_seek_f4_screen_last_pixel_closes_strip_with_real_geometry)
+    | test(=app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k)
+    | test(=raw::tests::all_cc0_samples_info_develop_and_preview_orientation)
+    | test(=video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch)
+    | test(=ui_music_timeline::tests::key_synthetic_harmonic_major_minor_progressions_and_percussion_comparison)
+    | test(=ui_fullscreen::canonical_demand::tests::canonical_native_demand_matches_actual_single_and_pair_draw_geometry)
+    | test(=book_append_undo::tests::section1373_metadata_database_cold_and_warm_per_file_benchmark)
+    | test(=app::music_bass::tests::music_bass_decode_success_orders_final_before_bass_and_lru_hit_still_computes)
+    | test(=app::rating_membership_tests::rating_undo_grid_keys_cancel_held_restore_on_moves_edges_and_empty_sets)
+    | test(=fts_writer_dispatcher::tests::dropping_the_dispatcher_always_returns)
+    | test(=tests::all_cc0_sample_dimensions_match)
+    | test(=restart_warmup_preserves_correct_active_keys_for_four_signal_cases)
+'''
 priority = 100
 slow-timeout = { period = "120s", terminate-after = 5 }

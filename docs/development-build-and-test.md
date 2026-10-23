@@ -132,10 +132,15 @@ OS／別threadの到達を待つ期限は従来の20秒とし、未到達は失�
 `cargo nextest --version`）。通常の反復は `.\scripts\test-focused.ps1 -Base HEAD`、
 本体lib全件は `.\scripts\test-lib-full.ps1` を使い、上の「結果の再利用」に従う。
 nextestは1テスト1プロセスでAppのprocess-global lockを分離する。
-`.config/nextest.toml` はCPU数並列・retryなし・60秒ごとの警告と300秒での打ち切りを使い、実測の重い5件を先行実行する。
-その5件は120秒ごとの警告と600秒での打ち切り（priority 100は維持）。
-直近6回の全件では通常の最長が約60秒、5件の最長が物理走査260秒だったため、
-通常は約5倍、長い5件も負荷時に2倍以上の余裕を持たせる。打ち切られたテストの原因は
+`.config/nextest.toml` はCPU数並列・retryなし・60秒ごとの警告と300秒での打ち切りを使う。
+workspaceの全package・補助bin・integrationと、standalone vendorのegui／egui-winit／egui-wgpu／
+eframe（wgpu・glow）の5実行を棚卸しし、成功実行で60秒を超えた12件は120秒ごとの警告・600秒で打ち切る。
+本体libだけの「最長約60秒」を全体の根拠にはしない。workspaceのLibRaw検査174.018秒、
+過去の物理走査429.813秒などを含む[テスト別・graph別の実測と割当](test-speed-report.md#review1420)を根拠とする。
+長い処理を早く開始して終盤に残さない目的で、12件ともpriority 100とする。
+overrideは`test(=<完全なテスト名>)`のORだけで1節にまとめ、全graphでルートの同じ設定を使う。
+同名テストにも600秒・priority 100が適用されることは許容し、package／binary IDの限定や設定分割は行わない。
+通常300秒／長い枠600秒の値自体は変更しない。打ち切られたテストの原因は
 別に扱い、時間上限の延長やretryで通さない。grace-period等はnextestの既定のまま。
 nextest導入時にはテストの削除・新しいignoreはなかった。アプリ起動等を行う試験は下記のlive区分へ分離する。
 最終 `test-full.ps1` も同じnextest設定を使い、
@@ -150,7 +155,8 @@ nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --d
   同じworktreeの読み取り専用レビューから参照可能。別worktreeとの共有はしない。
   JUnitの件数整合・exit 0・閾値を検査し、失敗・0件・実行中の入力変更を再利用しない。
   台帳が書けなくても通常のテストは実行し、記録失敗は警告だけにする。
-  stdout/stderrは実行中から行ごとにflushして保存するため、停止中もSLOW行とテスト名を確認できる。
+  stdout/stderrは受信した文字列をchunkごとにflushして保存するため、停止中もSLOW行とテスト名を確認できる。
+  LF／CRLF／末尾改行なしを変換せず、戻り値の全文とlogの内容を一致させる。
   実行ごとの`miv-tool` profileは指定profileを継承し、defaultの打ち切りとoverrideも引き継ぐ。
 - 識別子はGitが列挙した全追跡ファイルと未追跡ファイルの**現在の内容**をSHA-256化する。
   stagingの有無・HEADの移動だけでは変えず、未コミット編集・削除・新規ファイルを検知する。
@@ -194,6 +200,9 @@ nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --d
 
 道具の回帰確認は `powershell -NoProfile -File scripts/test-test-tools.ps1`。
 使い捨て小規模crateで本物のGit/nextestを使い、台帳hit/miss・差分・失敗・0件・選択を検査する。
+実子processの末尾改行なし・LF・CRLF・stdout/stderr交互出力・複数buffer分の出力を、
+従来のReadToEndAsync経路と逐次経路の戻り値・disk logで照合する。
+終了前のSLOW行と改行前の部分出力が両logへflushされることも通知で検査する。
 statキャッシュの識別子一致・サイズ/作成日時/racy更新・`-Force`・破損/I/O失敗も検査する。
 `-Benchmark` を付けると、`target/` 配下の使い捨てrepositoryに21,247件・約1.39 GBの
 ignored fixture（うち1,247件は入れ子repository）を生成し、キャッシュなし/ありと台帳HITを測る。
@@ -360,24 +369,26 @@ runner自体は `powershell -NoProfile -File scripts/test-live-windows-runner.ps
 `test-full.ps1` はnextestの存在を確認してから次のコマンドを順に実行する。
 未導入なら `cargo install cargo-nextest --locked` を案内して非ゼロ終了し、cargo testへ代替しない。
 各段のexit codeを検査し、失敗した段より後は実行しない。nextest各段には共通で
-`--config-file <repo>/.config/nextest.toml --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`
-を渡す。既定filterでテストを落とさず、既存ignored以外の全件を実行し、retryしない。
-通常は60秒ごとの警告・300秒で打ち切り、実測の重い5件は120秒ごとの警告・600秒で打ち切る。
-5件の先行実行設定も維持する。打ち切りは名前付きの失敗としてJUnitに記録され、gateを止める。
+`--profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`
+を渡す。`--config-file <repo>/.config/nextest.toml`も全段で共通とする。
+既定filterでテストを落とさず、既存ignored以外の全件を実行し、retryしない。
+通常は60秒ごとの警告・300秒で打ち切り、全graphの実測から選んだ12件は120秒ごとの警告・600秒で打ち切る。
+12件は完全なtest名のORで指定し、priority 100で先行実行する。
+打ち切りは名前付きの失敗としてJUnitに記録され、gateを止める。
 上限の延長やretryで通さず、そのテストの原因を別に調べる。
 
 ```powershell
 cargo nextest run --workspace --features pack-build-tools # + common nextest arguments above
 cargo test --workspace --features pack-build-tools --doc --no-fail-fast
 cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib # + common arguments
-cargo nextest run -p egui-winit --lib # + common arguments
+cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib # + common arguments
 cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib # + common arguments
-cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib # + common arguments
+cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib # + common arguments
+cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,glow --lib # + common arguments
 ```
 
 vendor 4 crate は workspace から除外されているため、追加コマンドで無 filter の lib test を実行する。
-egui-winit は同梱 upstream lock の旧 image / tiff 依存が offline cache に無いため、
-root graph の patched dependency を `-p egui-winit --lib` で無 filter 実行する。
+egui-winitも現在はstandalone graphを使い、同graphのpatchから正式vendor crateを参照する。
 standalone vendor graphもルートのnextest設定を明示して使う。
 egui の判定済み release 列 API、IME 処理済み Process press の遮断と診断、GPU mipmap、
 native repaint scheduler の回帰をこの経路で保持する。
