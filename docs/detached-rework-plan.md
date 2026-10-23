@@ -1462,7 +1462,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   viewport routing、detached の生成・切替・描画経路は変更しない。
 - 判断: 新しい main 要求の受付で取り消す対象を main 所有へ限定する所有境界の修正であり、
   guard・遅延・再試行による症状パッチではない。ClaudeCode と独立レビュー担当の双方が
-  この範囲を構造的修正と合意した（利用者提示の独立レビュー結果、2026-10-21）。
+  この範囲を構造的修正と合意した（独立レビュー担当 = Codex gpt-6.1-sol / xhigh、2026-10-21）。
 - 回帰検査: main のコレクション受付後も、直接または activation-held 鎖内にある
   detached Bookmark resolve の receiver と cancel token を維持する。
 
