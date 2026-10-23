@@ -1691,6 +1691,14 @@ pub enum KeyAction {
     RatingContainerClear,
     RatingContainerStepUp,
     RatingContainerStepDown,
+    RatingBookPreferred1,
+    RatingBookPreferred2,
+    RatingBookPreferred3,
+    RatingBookPreferred4,
+    RatingBookPreferred5,
+    RatingBookPreferredClear,
+    RatingBookPreferredStepUp,
+    RatingBookPreferredStepDown,
     FsContinuousScrollForward,
     FsContinuousScrollBack,
     FsSpreadShiftLeft,
@@ -2263,6 +2271,14 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::RatingContainerClear,
     KeyAction::RatingContainerStepUp,
     KeyAction::RatingContainerStepDown,
+    KeyAction::RatingBookPreferred1,
+    KeyAction::RatingBookPreferred2,
+    KeyAction::RatingBookPreferred3,
+    KeyAction::RatingBookPreferred4,
+    KeyAction::RatingBookPreferred5,
+    KeyAction::RatingBookPreferredClear,
+    KeyAction::RatingBookPreferredStepUp,
+    KeyAction::RatingBookPreferredStepDown,
     KeyAction::FsContinuousScrollForward,
     KeyAction::FsContinuousScrollBack,
     KeyAction::FsSpreadShiftLeft,
@@ -3346,6 +3362,23 @@ const RATING_CONTAINER_ACTIONS: &[(KeyAction, u8)] = &[
     (KeyAction::RatingContainerClear, 0),
 ];
 
+const RATING_BOOK_PREFERRED_ACTIONS: &[(KeyAction, u8)] = &[
+    (KeyAction::RatingBookPreferred1, 1),
+    (KeyAction::RatingBookPreferred2, 2),
+    (KeyAction::RatingBookPreferred3, 3),
+    (KeyAction::RatingBookPreferred4, 4),
+    (KeyAction::RatingBookPreferred5, 5),
+    (KeyAction::RatingBookPreferredClear, 0),
+];
+
+/// The target policy requested by a rating shortcut, resolved by its input owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatingTargetFamily {
+    Item,
+    Container,
+    BookPreferred,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RatingStepDirection {
     Up,
@@ -3368,20 +3401,29 @@ pub fn step_rating(current: u8, direction: RatingStepDirection) -> Option<u8> {
     }
 }
 
-fn rating_step_actions(container: bool) -> [(KeyAction, RatingStepDirection); 2] {
-    if container {
-        [
+fn rating_step_actions(family: RatingTargetFamily) -> [(KeyAction, RatingStepDirection); 2] {
+    match family {
+        RatingTargetFamily::Item => [
+            (KeyAction::RatingItemStepUp, RatingStepDirection::Up),
+            (KeyAction::RatingItemStepDown, RatingStepDirection::Down),
+        ],
+        RatingTargetFamily::Container => [
             (KeyAction::RatingContainerStepUp, RatingStepDirection::Up),
             (
                 KeyAction::RatingContainerStepDown,
                 RatingStepDirection::Down,
             ),
-        ]
-    } else {
-        [
-            (KeyAction::RatingItemStepUp, RatingStepDirection::Up),
-            (KeyAction::RatingItemStepDown, RatingStepDirection::Down),
-        ]
+        ],
+        RatingTargetFamily::BookPreferred => [
+            (
+                KeyAction::RatingBookPreferredStepUp,
+                RatingStepDirection::Up,
+            ),
+            (
+                KeyAction::RatingBookPreferredStepDown,
+                RatingStepDirection::Down,
+            ),
+        ],
     }
 }
 
@@ -3685,11 +3727,19 @@ pub const LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenLocationDownloads,
 ];
 
-fn rating_actions(container: bool) -> &'static [(KeyAction, u8)] {
+fn rating_actions(family: RatingTargetFamily) -> &'static [(KeyAction, u8)] {
+    match family {
+        RatingTargetFamily::Item => RATING_ITEM_ACTIONS,
+        RatingTargetFamily::Container => RATING_CONTAINER_ACTIONS,
+        RatingTargetFamily::BookPreferred => RATING_BOOK_PREFERRED_ACTIONS,
+    }
+}
+
+fn display_rating_family(container: bool) -> RatingTargetFamily {
     if container {
-        RATING_CONTAINER_ACTIONS
+        RatingTargetFamily::Container
     } else {
-        RATING_ITEM_ACTIONS
+        RatingTargetFamily::Item
     }
 }
 
@@ -4278,6 +4328,14 @@ impl KeyAction {
             RatingContainerClear => "RatingContainerClear",
             RatingContainerStepUp => "RatingContainerStepUp",
             RatingContainerStepDown => "RatingContainerStepDown",
+            RatingBookPreferred1 => "RatingBookPreferred1",
+            RatingBookPreferred2 => "RatingBookPreferred2",
+            RatingBookPreferred3 => "RatingBookPreferred3",
+            RatingBookPreferred4 => "RatingBookPreferred4",
+            RatingBookPreferred5 => "RatingBookPreferred5",
+            RatingBookPreferredClear => "RatingBookPreferredClear",
+            RatingBookPreferredStepUp => "RatingBookPreferredStepUp",
+            RatingBookPreferredStepDown => "RatingBookPreferredStepDown",
             FsContinuousScrollForward => "FsContinuousScrollForward",
             FsContinuousScrollBack => "FsContinuousScrollBack",
             FsSpreadShiftLeft => "FsSpreadShiftLeft",
@@ -5015,6 +5073,14 @@ impl KeyAction {
             RatingContainerClear => "レーティングを解除する（コンテナ）",
             RatingContainerStepUp => "評価を1段階上げる（コンテナ）",
             RatingContainerStepDown => "評価を1段階下げる（コンテナ）",
+            RatingBookPreferred1 => "星1を付ける（本を優先）",
+            RatingBookPreferred2 => "星2を付ける（本を優先）",
+            RatingBookPreferred3 => "星3を付ける（本を優先）",
+            RatingBookPreferred4 => "星4を付ける（本を優先）",
+            RatingBookPreferred5 => "星5を付ける（本を優先）",
+            RatingBookPreferredClear => "レーティングを解除する（本を優先）",
+            RatingBookPreferredStepUp => "評価を1段階上げる（本を優先）",
+            RatingBookPreferredStepDown => "評価を1段階下げる（本を優先）",
             FsContinuousScrollForward => "連結表示中に次の画面分へスクロールする",
             FsContinuousScrollBack => "連結表示中に前の画面分へスクロールする",
             FsSpreadShiftLeft => "見開き表示を左方向へ1ページずらす",
@@ -5554,7 +5620,15 @@ impl KeyAction {
             | RatingContainer5
             | RatingContainerClear
             | RatingContainerStepUp
-            | RatingContainerStepDown => KeyContext::Rating,
+            | RatingContainerStepDown
+            | RatingBookPreferred1
+            | RatingBookPreferred2
+            | RatingBookPreferred3
+            | RatingBookPreferred4
+            | RatingBookPreferred5
+            | RatingBookPreferredClear
+            | RatingBookPreferredStepUp
+            | RatingBookPreferredStepDown => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsClose
@@ -6081,6 +6155,14 @@ impl KeyAction {
             | RatingContainerClear
             | RatingContainerStepUp
             | RatingContainerStepDown
+            | RatingBookPreferred1
+            | RatingBookPreferred2
+            | RatingBookPreferred3
+            | RatingBookPreferred4
+            | RatingBookPreferred5
+            | RatingBookPreferredClear
+            | RatingBookPreferredStepUp
+            | RatingBookPreferredStepDown
             | FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
@@ -6624,6 +6706,14 @@ impl KeyAction {
             RatingContainer5 => ChordList::one(Chord::shift(F5)),
             RatingContainerClear => ChordList::one(Chord::shift(F6)),
             RatingContainerStepUp | RatingContainerStepDown => ChordList::EMPTY,
+            RatingBookPreferred1
+            | RatingBookPreferred2
+            | RatingBookPreferred3
+            | RatingBookPreferred4
+            | RatingBookPreferred5
+            | RatingBookPreferredClear
+            | RatingBookPreferredStepUp
+            | RatingBookPreferredStepDown => ChordList::EMPTY,
             FsContinuousScrollForward => ChordList::one(Chord::key(PageDown)),
             FsContinuousScrollBack => ChordList::one(Chord::key(PageUp)),
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
@@ -7039,7 +7129,7 @@ enum IniTemplateKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RatingKey {
-    pub container: bool,
+    pub family: RatingTargetFamily,
     pub edit: RatingEdit,
 }
 
@@ -7717,7 +7807,7 @@ impl Keymap {
     }
 
     pub fn rating_key_action(container: bool, stars: u8) -> Option<KeyAction> {
-        rating_actions(container)
+        rating_actions(display_rating_family(container))
             .iter()
             .copied()
             .find_map(|(action, action_stars)| (action_stars == stars).then_some(action))
@@ -7728,7 +7818,7 @@ impl Keymap {
     }
 
     pub fn rating_chord_summary_label(&self, container: bool) -> Option<String> {
-        let labels = rating_actions(container)
+        let labels = rating_actions(display_rating_family(container))
             .iter()
             .copied()
             .filter_map(|(action, stars)| {
@@ -7787,9 +7877,9 @@ impl Keymap {
     pub fn consume_rating_action(
         &self,
         ctx: &egui::Context,
-        container: bool,
+        family: RatingTargetFamily,
     ) -> Option<RatingEdit> {
-        rating_actions(container)
+        rating_actions(family)
             .iter()
             .copied()
             .find_map(|(action, stars)| {
@@ -7797,7 +7887,7 @@ impl Keymap {
                     .then_some(RatingEdit::Assign(stars))
             })
             .or_else(|| {
-                rating_step_actions(container)
+                rating_step_actions(family)
                     .into_iter()
                     .find_map(|(action, direction)| {
                         self.consume_action(ctx, action)
@@ -7814,19 +7904,23 @@ impl Keymap {
         if key.repeat {
             return None;
         }
-        for container in [true, false] {
-            for (action, stars) in rating_actions(container).iter().copied() {
+        for family in [
+            RatingTargetFamily::Container,
+            RatingTargetFamily::Item,
+            RatingTargetFamily::BookPreferred,
+        ] {
+            for (action, stars) in rating_actions(family).iter().copied() {
                 if self.matches_vk_action(action, key) {
                     return Some(RatingKey {
-                        container,
+                        family,
                         edit: RatingEdit::Assign(stars),
                     });
                 }
             }
-            for (action, direction) in rating_step_actions(container) {
+            for (action, direction) in rating_step_actions(family) {
                 if self.matches_vk_action(action, key) {
                     return Some(RatingKey {
-                        container,
+                        family,
                         edit: RatingEdit::Step(direction),
                     });
                 }
@@ -13565,7 +13659,7 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x71, 0x3c)]);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, false),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
             Some(RatingEdit::Assign(2))
         );
         ctx.end_pass().drop_without_applying_deltas();
@@ -13734,6 +13828,216 @@ mod tests {
         }
     }
 
+    fn book_preferred_rating_actions() -> [KeyAction; 8] {
+        [
+            KeyAction::RatingBookPreferred1,
+            KeyAction::RatingBookPreferred2,
+            KeyAction::RatingBookPreferred3,
+            KeyAction::RatingBookPreferred4,
+            KeyAction::RatingBookPreferred5,
+            KeyAction::RatingBookPreferredClear,
+            KeyAction::RatingBookPreferredStepUp,
+            KeyAction::RatingBookPreferredStepDown,
+        ]
+    }
+
+    #[test]
+    fn book_preferred_rating_catalog_and_ini_settings_roundtrip() {
+        let mut ini = String::from("[Rating]\n");
+        for (offset, action) in book_preferred_rating_actions().into_iter().enumerate() {
+            assert_eq!(
+                KeyAction::all()
+                    .iter()
+                    .filter(|candidate| **candidate == action)
+                    .count(),
+                1
+            );
+            assert_eq!(action.context(), KeyContext::Rating);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert!(action.description().ends_with("（本を優先）"));
+            assert!(!action.description().contains(' '));
+            assert!(Keymap::default_reference_ini().contains(&format!(
+                "# {} = none ; {}\n",
+                action.ini_name(),
+                action.description()
+            )));
+            ini.push_str(&format!("{} = F{}\n", action.ini_name(), offset + 13));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        assert_eq!(settings.overrides.len(), 8);
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&encoded).unwrap());
+        for (offset, action) in book_preferred_rating_actions().into_iter().enumerate() {
+            let expected = vec![Chord::key(
+                [
+                    KeyName::F13,
+                    KeyName::F14,
+                    KeyName::F15,
+                    KeyName::F16,
+                    KeyName::F17,
+                    KeyName::F18,
+                    KeyName::F19,
+                    KeyName::F20,
+                ][offset],
+            )];
+            assert_eq!(parsed.effective_chords(action), expected);
+            assert_eq!(restored.effective_chords(action), expected);
+        }
+    }
+
+    #[test]
+    fn rating_existing_defaults_are_unchanged_with_book_preferred_actions() {
+        let keymap = Keymap::empty();
+        for (family, shifted) in [
+            (RatingTargetFamily::Item, false),
+            (RatingTargetFamily::Container, true),
+        ] {
+            for ((action, _), key) in rating_actions(family).iter().zip([
+                KeyName::F1,
+                KeyName::F2,
+                KeyName::F3,
+                KeyName::F4,
+                KeyName::F5,
+                KeyName::F6,
+            ]) {
+                assert_eq!(
+                    keymap.effective_chords(*action),
+                    vec![if shifted {
+                        Chord::shift(key)
+                    } else {
+                        Chord::key(key)
+                    }]
+                );
+            }
+            for (action, _) in rating_step_actions(family) {
+                assert!(keymap.effective_chords(action).is_empty());
+            }
+        }
+        for action in book_preferred_rating_actions() {
+            assert!(keymap.effective_chords(action).is_empty());
+        }
+    }
+
+    #[test]
+    fn book_preferred_rating_consume_respects_family_and_exact_modifiers() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::from_ini_str(
+            "[Rating]\nRatingBookPreferred1 = Ctrl+F13\nRatingBookPreferred2 = Ctrl+F14\n\
+             RatingBookPreferred3 = Ctrl+F15\nRatingBookPreferred4 = Ctrl+F16\n\
+             RatingBookPreferred5 = Ctrl+F17\nRatingBookPreferredClear = Ctrl+F18\n\
+             RatingBookPreferredStepUp = Ctrl+F19\nRatingBookPreferredStepDown = Ctrl+F20\n",
+        );
+        let ctx = egui::Context::default();
+        for (key, edit) in [
+            (egui::Key::F13, RatingEdit::Assign(1)),
+            (egui::Key::F14, RatingEdit::Assign(2)),
+            (egui::Key::F15, RatingEdit::Assign(3)),
+            (egui::Key::F16, RatingEdit::Assign(4)),
+            (egui::Key::F17, RatingEdit::Assign(5)),
+            (egui::Key::F18, RatingEdit::Assign(0)),
+            (egui::Key::F19, RatingEdit::Step(RatingStepDirection::Up)),
+            (egui::Key::F20, RatingEdit::Step(RatingStepDirection::Down)),
+        ] {
+            begin_key_pass(&ctx, key, egui::Modifiers::NONE);
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::BookPreferred),
+                None
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+            begin_key_pass(&ctx, key, egui::Modifiers::CTRL);
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::Container),
+                None
+            );
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
+                None
+            );
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::BookPreferred),
+                Some(edit)
+            );
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::BookPreferred),
+                None
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn book_preferred_rating_native_family_priority_and_forwarding() {
+        let _guard = crate::key_input::lock_test_input();
+        let mut event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x7c, // F13
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        let keymap = Keymap::from_ini_str(
+            "[Rating]\nRatingBookPreferred3 = F13\nRatingBookPreferredStepDown = F14\n",
+        );
+        keymap.install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&event));
+        assert_eq!(
+            keymap.native_video_rating_action(&event),
+            Some(RatingKey {
+                family: RatingTargetFamily::BookPreferred,
+                edit: RatingEdit::Assign(3),
+            })
+        );
+        event.virtual_key = 0x7d; // F14
+        assert!(native_video_fullscreen_shortcut_key(&event));
+        assert_eq!(
+            keymap.native_video_rating_action(&event),
+            Some(RatingKey {
+                family: RatingTargetFamily::BookPreferred,
+                edit: RatingEdit::Step(RatingStepDirection::Down),
+            })
+        );
+        event.repeat = true;
+        assert_eq!(keymap.native_video_rating_action(&event), None);
+        event.repeat = false;
+        event.virtual_key = 0x7c;
+        for (ini, family) in [
+            (
+                "[Rating]\nRatingContainer2 = F13\nRatingItem2 = F13\nRatingBookPreferred2 = F13\n",
+                RatingTargetFamily::Container,
+            ),
+            (
+                "[Rating]\nRatingItem2 = F13\nRatingBookPreferred2 = F13\n",
+                RatingTargetFamily::Item,
+            ),
+        ] {
+            let keymap = Keymap::from_ini_str(ini);
+            assert!(!keymap.warnings().is_empty()); // Existing duplicate-binding rules remain in force.
+            assert_eq!(
+                keymap.native_video_rating_action(&event),
+                Some(RatingKey {
+                    family,
+                    edit: RatingEdit::Assign(2),
+                })
+            );
+        }
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&event));
+    }
+
     #[test]
     fn rating_actions_are_exact_and_customizable() {
         // consume_action consults the process-global Win32 key frame on Windows;
@@ -13748,9 +14052,12 @@ mod tests {
         let ctx = egui::Context::default();
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::SHIFT);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), None);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, true),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
+            None
+        );
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Container),
             Some(RatingEdit::Assign(2))
         );
         assert_eq!(
@@ -13771,7 +14078,10 @@ mod tests {
         );
         assert!(keymap.warnings().is_empty());
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::NONE);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), None);
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
+            None
+        );
         assert_eq!(
             ctx.input(|i| i
                 .events
@@ -13784,7 +14094,7 @@ mod tests {
 
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, false),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
             Some(RatingEdit::Assign(1))
         );
         assert_eq!(
@@ -13802,13 +14112,13 @@ mod tests {
         );
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, false),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
             Some(RatingEdit::Step(RatingStepDirection::Up))
         );
         ctx.end_pass().drop_without_applying_deltas();
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::ALT);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, true),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Container),
             Some(RatingEdit::Step(RatingStepDirection::Down))
         );
         ctx.end_pass().drop_without_applying_deltas();

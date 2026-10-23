@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use super::book_preferred_rating::{BookPreferredRatingTarget, ContainerRatingToast};
 use super::*;
 use crate::keymap::{
     CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
@@ -1023,6 +1025,14 @@ impl NativeVideoKeyBlockReason {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeVideoBookPreferredAppliedTo {
+    Book,
+    Item,
+    Unavailable,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeVideoFixedKeyAction {
     ExitMusicVstShell,
     ExitVideoAudioVst,
@@ -1041,6 +1051,10 @@ enum NativeVideoFixedKeyAction {
     RatingContainer(u8),
     RatingItemStep(crate::keymap::RatingStepDirection),
     RatingContainerStep(crate::keymap::RatingStepDirection),
+    RatingBookPreferred {
+        applied_to: NativeVideoBookPreferredAppliedTo,
+        edit: crate::keymap::RatingEdit,
+    },
     ComparisonUnsupported,
 }
 
@@ -1065,6 +1079,14 @@ impl NativeVideoFixedKeyAction {
             Self::RatingContainer(stars) => format!("rating_container_{stars}"),
             Self::RatingItemStep(direction) => format!("rating_item_step_{direction:?}"),
             Self::RatingContainerStep(direction) => format!("rating_container_step_{direction:?}"),
+            Self::RatingBookPreferred { applied_to, edit } => {
+                let target = match applied_to {
+                    NativeVideoBookPreferredAppliedTo::Book => "book",
+                    NativeVideoBookPreferredAppliedTo::Item => "item",
+                    NativeVideoBookPreferredAppliedTo::Unavailable => "unavailable",
+                };
+                format!("rating_book_preferred_{target}_{edit:?}")
+            }
             Self::ComparisonUnsupported => "comparison_unsupported".to_string(),
         }
     }
@@ -12666,28 +12688,58 @@ impl App {
         }
         let mut hud_activity = true;
         if let Some(rating_key) = rating_key {
-            if rating_key.container {
-                hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
-            } else {
-                hud_activity = self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
-            }
+            use crate::keymap::{RatingEdit, RatingTargetFamily};
+            let action = match rating_key.family {
+                RatingTargetFamily::Container => {
+                    hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
+                    match rating_key.edit {
+                        RatingEdit::Assign(stars) => {
+                            NativeVideoFixedKeyAction::RatingContainer(stars)
+                        }
+                        RatingEdit::Step(direction) => {
+                            NativeVideoFixedKeyAction::RatingContainerStep(direction)
+                        }
+                    }
+                }
+                RatingTargetFamily::Item => {
+                    hud_activity =
+                        self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
+                    match rating_key.edit {
+                        RatingEdit::Assign(stars) => NativeVideoFixedKeyAction::RatingItem(stars),
+                        RatingEdit::Step(direction) => {
+                            NativeVideoFixedKeyAction::RatingItemStep(direction)
+                        }
+                    }
+                }
+                RatingTargetFamily::BookPreferred => {
+                    let applied_to = match self.resolve_book_preferred_viewer_target() {
+                        BookPreferredRatingTarget::Book(target) => {
+                            hud_activity = self.apply_rating_edit_to_container_target(
+                                &target,
+                                rating_key.edit,
+                                ContainerRatingToast::Book,
+                            );
+                            NativeVideoBookPreferredAppliedTo::Book
+                        }
+                        BookPreferredRatingTarget::ViewerItem => {
+                            hud_activity =
+                                self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
+                            NativeVideoBookPreferredAppliedTo::Item
+                        }
+                        BookPreferredRatingTarget::Unavailable(reason) => {
+                            self.report_book_preferred_unavailable(reason);
+                            NativeVideoBookPreferredAppliedTo::Unavailable
+                        }
+                    };
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to,
+                        edit: rating_key.edit,
+                    }
+                }
+            };
             if hud_activity {
                 self.request_native_video_hud_repaint(ctx);
             }
-            let action = match (rating_key.container, rating_key.edit) {
-                (true, crate::keymap::RatingEdit::Assign(stars)) => {
-                    NativeVideoFixedKeyAction::RatingContainer(stars)
-                }
-                (false, crate::keymap::RatingEdit::Assign(stars)) => {
-                    NativeVideoFixedKeyAction::RatingItem(stars)
-                }
-                (true, crate::keymap::RatingEdit::Step(direction)) => {
-                    NativeVideoFixedKeyAction::RatingContainerStep(direction)
-                }
-                (false, crate::keymap::RatingEdit::Step(direction)) => {
-                    NativeVideoFixedKeyAction::RatingItemStep(direction)
-                }
-            };
             return NativeVideoKeyOutcome::FixedAction(action);
         }
         if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
@@ -16806,6 +16858,129 @@ mod configurable_video_seek_dispatch_tests {
     }
 
     #[test]
+    fn native_book_preferred_rating_ordinary_video_and_audio_apply_to_item() {
+        use super::super::book_materialization::ProjectionRecipe;
+        use crate::keymap::{RatingEdit, RatingStepDirection};
+        let ctx = egui::Context::default();
+        for audio in [false, true] {
+            let (mut app, idx) = setup_seek_app();
+            if audio {
+                app.items[idx] = GridItem::Audio(PathBuf::from(r"C:\clips\rating.mp3"));
+            }
+            app.projection_recipe = ProjectionRecipe::OrdinaryList;
+            app.current_folder = Some(PathBuf::from(r"C:\clips"));
+            app.keymap = crate::keymap::Keymap::from_ini_str(
+                "[Rating]\nRatingBookPreferredStepUp = F13\nRatingBookPreferredClear = F14\n",
+            );
+            let item_key = app.rating_path_key(idx).unwrap();
+            let container_key = crate::adjustment_db::normalize_path(Path::new(r"C:\clips"));
+            let outcome =
+                app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+            assert_eq!(
+                outcome,
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Item,
+                        edit: RatingEdit::Step(RatingStepDirection::Up),
+                    }
+                )
+            );
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 4);
+            assert_eq!(app.get_rating(idx), 4);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 0);
+            assert_eq!(app.meta_undo.undo_len(), 1);
+            let outcome =
+                app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7d, false, false));
+            assert_eq!(
+                outcome,
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Item,
+                        edit: RatingEdit::Assign(0),
+                    }
+                )
+            );
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 0);
+            assert_eq!(app.meta_undo.undo_len(), 2);
+        }
+    }
+
+    #[test]
+    fn native_book_preferred_rating_accepted_book_uses_container_and_preserves_page() {
+        use super::super::book_materialization::{BookScope, ProjectionRecipe};
+        use crate::keymap::{RatingEdit, RatingStepDirection};
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\clips");
+        app.current_folder = Some(folder.clone());
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(folder.clone()));
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Rating]\nRatingBookPreferredStepUp = F13\nRatingBookPreferred5 = F14\n",
+        );
+        let item_key = app.rating_path_key(idx).unwrap();
+        let book_key = crate::adjustment_db::normalize_path(&folder);
+        let outcome =
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+        assert_eq!(
+            outcome,
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingBookPreferred {
+                applied_to: NativeVideoBookPreferredAppliedTo::Book,
+                edit: RatingEdit::Step(RatingStepDirection::Up),
+            })
+        );
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 4);
+        assert_eq!(app.current_folder_rating_cache, Some(4));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 0);
+        assert_eq!(app.get_rating(idx), 0);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        let outcome =
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7d, false, false));
+        assert_eq!(
+            outcome,
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingBookPreferred {
+                applied_to: NativeVideoBookPreferredAppliedTo::Book,
+                edit: RatingEdit::Assign(5),
+            })
+        );
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 5);
+        assert_eq!(app.meta_undo.undo_len(), 2);
+        app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 5);
+        assert_eq!(app.meta_undo.undo_len(), 2);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 0);
+    }
+
+    #[test]
+    fn native_book_preferred_rating_unavailable_does_not_write_an_item_or_container() {
+        use super::super::book_materialization::{BookScope, ProjectionRecipe};
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\clips");
+        let other_book = PathBuf::from(r"C:\other-book");
+        app.current_folder = Some(folder.clone());
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(other_book.clone()));
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingBookPreferred5 = F13\n");
+        let item_key = app.rating_path_key(idx).unwrap();
+        let outcome =
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+        assert_eq!(
+            outcome,
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingBookPreferred {
+                applied_to: NativeVideoBookPreferredAppliedTo::Unavailable,
+                edit: crate::keymap::RatingEdit::Assign(5),
+            })
+        );
+        for key in [
+            item_key,
+            crate::adjustment_db::normalize_path(&folder),
+            crate::adjustment_db::normalize_path(&other_book),
+        ] {
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+        }
+        assert_eq!(app.meta_undo.undo_len(), 0);
+    }
+
+    #[test]
     fn native_collection_shortcut_routes_video_and_audio_once_for_the_live_fs_index() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
@@ -17748,6 +17923,35 @@ mod native_video_key_observation_tests {
             (
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingContainer(5)),
                 "action:rating_container_5",
+            ),
+            (
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Book,
+                        edit: crate::keymap::RatingEdit::Assign(4),
+                    },
+                ),
+                "action:rating_book_preferred_book_Assign(4)",
+            ),
+            (
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Item,
+                        edit: crate::keymap::RatingEdit::Step(
+                            crate::keymap::RatingStepDirection::Up,
+                        ),
+                    },
+                ),
+                "action:rating_book_preferred_item_Step(Up)",
+            ),
+            (
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Unavailable,
+                        edit: crate::keymap::RatingEdit::Assign(5),
+                    },
+                ),
+                "action:rating_book_preferred_unavailable_Assign(5)",
             ),
             (NativeVideoKeyOutcome::NoMatch, "no_match"),
         ];

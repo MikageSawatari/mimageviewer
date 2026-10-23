@@ -35428,27 +35428,59 @@ impl App {
         // コンテナ★ (既定: Shift+F1〜F6): 開いている画像が属するコンテナ
         // (フォルダ / ZIP / PDF) にレーティング / 解除。
         // current_folder がそのまま親コンテナなので、そちらに書き込めば一覧画面で★絞り込みできる。
-        let container_rating_key = self.keymap.consume_rating_action(ctx, true);
+        let container_rating_key = self
+            .keymap
+            .consume_rating_action(ctx, crate::keymap::RatingTargetFamily::Container);
         if let Some(edit) = container_rating_key {
             self.apply_rating_edit_to_current_container(edit);
         }
 
         // レーティング 1〜5 / 解除 (既定: F1〜F6)
-        let rating_key = self.keymap.consume_rating_action(ctx, false);
-        if let Some(edit) = rating_key {
-            let rating_idx = initial_page_key
+        let rating_key = self
+            .keymap
+            .consume_rating_action(ctx, crate::keymap::RatingTargetFamily::Item);
+        // Both item families resolve the original page after any earlier publication.
+        let rating_idx = |app: &App| {
+            initial_page_key
                 .as_ref()
                 .and_then(|key| {
-                    (0..self.items.len()).find(|&idx| {
-                        self.page_path_key(idx)
-                            .or_else(|| self.rating_path_key(idx))
+                    (0..app.items.len()).find(|&idx| {
+                        app.page_path_key(idx)
+                            .or_else(|| app.rating_path_key(idx))
                             .as_ref()
                             == Some(key)
                     })
                 })
-                .or_else(|| initial_page_key.is_none().then_some(fs_idx));
-            if let Some(rating_idx) = rating_idx {
-                self.apply_rating_edit_to_fullscreen_item(rating_idx, edit);
+                .or_else(|| initial_page_key.is_none().then_some(fs_idx))
+        };
+        if let Some(edit) = rating_key {
+            if let Some(idx) = rating_idx(self) {
+                self.apply_rating_edit_to_fullscreen_item(idx, edit);
+            }
+        }
+        if let Some(edit) = self
+            .keymap
+            .consume_rating_action(ctx, crate::keymap::RatingTargetFamily::BookPreferred)
+        {
+            use crate::app::book_preferred_rating::{
+                BookPreferredRatingTarget, ContainerRatingToast,
+            };
+            match self.resolve_book_preferred_viewer_target() {
+                BookPreferredRatingTarget::Book(target) => {
+                    self.apply_rating_edit_to_container_target(
+                        &target,
+                        edit,
+                        ContainerRatingToast::Book,
+                    );
+                }
+                BookPreferredRatingTarget::ViewerItem => {
+                    if let Some(idx) = rating_idx(self) {
+                        self.apply_rating_edit_to_fullscreen_item(idx, edit);
+                    }
+                }
+                BookPreferredRatingTarget::Unavailable(reason) => {
+                    self.report_book_preferred_unavailable(reason)
+                }
             }
         }
         // Publication can move/reorder the page or return to the grid. Continue this accepted

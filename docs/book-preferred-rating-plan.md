@@ -1,6 +1,6 @@
 # 本を優先するレーティング操作 (§1.417) 設計
 
-- 状態: 設計第 2.1 版 (第 2 回レビュー P2・P3 反映)。設計第 2 版 (2026-10-23、ClaudeCode)。第 1 版の独立レビュー (Codex gpt-6.1-sol / xhigh、
+- 状態: **実装済み・独立レビュー前**。設計第 2.1 版 (第 2 回レビュー P2・P3 反映)。設計第 2 版 (2026-10-23、ClaudeCode)。第 1 版の独立レビュー (Codex gpt-6.1-sol / xhigh、
   SID 01a166e6-c2f3-7ff0-b8cf-e4a4ce5721a1) は条件付き受入 (P1 なし・P2 1 件・P3 1 件)。第 2 版で P2
   (新経路から `is_dir()` を除く) と P3 (入れ子区分を `at_root()` に) を反映。レビュー担当は本変更が
   症状パッチではなく対象解決の所有境界を明示する構造的変更であり、detached 述語・viewport 経路を変えない
@@ -16,7 +16,7 @@
 
 | ini 名 | 表示名 | 編集 |
 | --- | --- | --- |
-| `RatingBookPreferred1`〜`5` | 星N を付ける（本を優先） | Assign(N) |
+| `RatingBookPreferred1`〜`5` | 星Nを付ける（本を優先） | Assign(N) |
 | `RatingBookPreferredClear` | レーティングを解除する（本を優先） | Assign(0) |
 | `RatingBookPreferredStepUp` | 評価を1段階上げる（本を優先） | Step(Up) |
 | `RatingBookPreferredStepDown` | 評価を1段階下げる（本を優先） | Step(Down) |
