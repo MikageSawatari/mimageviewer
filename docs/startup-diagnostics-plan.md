@@ -645,6 +645,7 @@ A の main 受付が後発の B を退役させる（`src/app.rs:58171`）。mas
 どちらも「起動系要求の受理が先行中のメイン要求をどう扱うか」という別の設計であり、今回は実装しない。
 修正案は、起動系要求の受理も同じ受付境界で先行中のメイン要求を退役させるか、resolver の保管先を
 単一から owner ごとにするかの2案。どちらを採るかは未決定で、現挙動を固定するテストも追加しない。
+→ 2026-10-23、§1.419 として前者を採った。調査結果と設計は §6.2.2。
 
 admission 待ち以外のパス解決/scan全体はモーダルにしない。モーダルを無期限に保つと本目標と矛盾し、
 遅い share が別フォルダへ移る操作まで止める。代わりに既存 navigation の取消・単一採用を使う。
@@ -673,6 +674,112 @@ RequestedOwner/held-request の退役を分岐ごとに複製せず、既存 fin
 二重発行も防ぐ。Detached preparing host の具体的な terminal helper 変更は §7 の構造合意対象とする。
 同じterminal tailでも終了/取消済みownerへの遅い失敗ではnotice/held復帰を行わず、lease解放だけを行う。
 App終了時はheldも当該要求として退役させ、以前の場所を再openしない。
+
+### 6.2.2 後から受けた起動系の要求と、先に始まっていた利用者の要求（§1.419、2026-10-23）
+
+出どころはすべてコード参照（master `59ff2c518`、設計担当 ClaudeCode とその読み取り調査）。
+実行時の観測報告は無い。
+
+**原則:** main 一覧への要求は、利用者（または外部からの転送）が要求した時点で 1 回だけ受け付け、
+受付の順に後のものが前の未採用の要求を退役させる。段階移行・着地（Continuation）は退役させない。
+§1.285 は「利用者の受付が先行の起動系要求を退役させる」向きを揃えた。§1.419 は残りの
+「起動系要求の受付が先行の利用者要求を退役させる」向きを揃える。
+
+**現状:**
+
+- Activation の受理（`src/app/startup_ops.rs:304`〜`:356`）は、変換と bookmark open の取消、resolver 枠の置換だけを行い、
+  `retire_replaced_main_list_requests` を通らない。
+- しおり行のクリック（`open_bookmark_browser_row`、`src/app.rs:51890` → `:51939`）は移動元の `MainListNavigation` を
+  記録し、前の bookmark を取り消すだけで、受付境界を通らない。
+- B の resolve 完了は `MainListRequestStage::Continuation` で load する（`startup_ops.rs:1277`, `:1441`）。
+  InitialStartup / Activation は navigation を持たず load 時に取り直すので、B が先に着地すれば、後から完了する A は
+  `main_list_navigation_is_current`（`src/app.rs:24737`〜`:24788`）で古いと判定される。A が先に完了しても
+  A の着地は Continuation なので B を退役させない。したがって多くの組み合わせでは結果として B が勝つ。
+
+**組み合わせ（A = 先に始まった利用者要求、B = 後から受理した起動系要求）:**
+
+| 先行 A | B = Activation | B = main で開くしおり |
+| --- | --- | --- |
+| フォルダペイン走査 | B が勝つ（A の着地は `update_phases.rs:1381` で Continuation） | **A が勝つ（誤り）**。A の claim が B を取り消す（`src/app.rs:30230` `cancel_conflicting_bookmark_open_for_navigation`）か、B が記録した navigation が古くなり NotOpenable →「開けるパスが見つかりませんでした」（`startup_ops.rs:1231`〜`:1236`, `:757`〜`:762`） |
+| 混在フォルダ（GridFolderCandidate） | **A が勝つ（誤り）**。A の main 合流の受付（`src/app.rs:58692`）が B を退役 | **A が勝つ（誤り）** |
+| パス分類（通常） | B が勝つ | **A が勝つ（誤り）** |
+| BookmarkRow 分類（即時開始の OtherArchive / ImageFolder / CompiledBook） | **A が勝つ（誤り）**。A の継続が resolver を開始し、単一枠の B を `resolver_replaced` で終了（`src/app.rs:28920` → `:52019` / `:52118` → `startup_ops.rs:355`） | 後のしおりが前を置換（`bookmark_replaced`）。正しい |
+| BookmarkRow 分類（ZIP / PDF の composition 待ち） | B が勝つ（activation 中は `poll_bookmark_book_open` が保留、`src/app.rs:52442`） | 同上 |
+| DFS（Ctrl+↑↓）、履歴の戻る/進む、コレクション、Smart、レーティング、サブ展開、Quick folder 切替、直接 PDF | B が勝つ | **A が勝つ（誤り）** |
+| 変換（RAR / 7z、非モーダル） | B が勝つ（受理時に取消） | 不明確（しおりの claim は変換を取り消さない、`src/app.rs:30236`〜`:30247`） |
+| お気に入り検索（favsearch） | **A が勝ち得る（誤り）**。`poll_favsearch`（`src/app.rs:33807`）→ `apply_prepared_favsearch_results` が世代確認なしで install し、どの受付境界も `favsearch_pending` を取り消さない | 同左 |
+| EPUB 変換・PDF パスワード（モーダル） | B は延期され、A の終端後に受理。正しい | しおりのクリック自体が拒否。正しい |
+| Ctrl+G 検索の遅延採用 | B が勝つ（`items_are_global_search_view` が門） | 同左 |
+| Everything 検索 | 未調査（実装担当が確認） | 同左 |
+
+- InitialStartup: Deferred は利用者の受付で退役し（§1.285）、resolver 枠が埋まっている間は開始しない（`startup_ops.rs:106`）。
+  先行 A と出会うのはモーダル終端・Remote 返却の後だけで、そのとき A は着地済みか退役済み。変更しない。
+- Remote fallback（`src/remote_ipc/ui.rs:4662`）は current_folder も起動要求も無いときだけ既定先を開き、
+  Remote 取得時に local の要求はすべて退役済み（`src/app.rs:63748`〜`:63778`）。変更しない。
+- SendTo は argv（初回起動）/ activation（二重起動）として届き、独自の入口は無い
+  （`src/explorer_integration.rs`、`src/lib.rs:1924`、`src/single_instance.rs:560`）。
+
+**検討した簡素化:**
+
+1. 明示的な起動系要求（Activation・main のしおり）の受理を、利用者の main 要求と同じ受付境界にする — **採用**。
+   受付の順序が 1 本になり、「先に始まったが後に着地する」組み合わせが消える。resolver 枠は常に最後に受け付けた
+   1 本だけを持つので、owner ごとの保管は不要になる。
+2. resolver の保管先を owner ごとにする — 不採用。要求の並存を増やし、着地の順序をさらに裁定する必要が生じる。
+3. ★固定（snapshot）中の activation の保留（§1.133、`b99426eee`、v3.3.0 から公開）をやめ、受理時に常に退役させる — 不採用。
+   範囲外の activation で先行の変換作業を失う不具合を直すために入れた公開済みの挙動で、外すと退行になる。
+   保留は維持し、受付の時点を「範囲内と判定された時点」と定める（R4）。
+4. 起動系要求の解決中は main 要求をモーダルで止める — 不採用。遅い share が別の操作を止めない §6.2 の方針に反する。
+
+**設計:**
+
+- **R1 Activation の受理**（snapshot でないとき）: 個別の取消（変換・bookmark）を、利用者の main 受付と同じ境界に置き換える。
+  境界の中身は `retire_replaced_main_list_requests(None)`（分類・履歴遷移・レーティング・ペイン / 混在フォルダ走査・Smart・
+  コレクション・サブ展開・main bookmark・直接文書・close-return・未解決の起動要求）+ 変換の取消 + DFS（`cancel_pending_folder_nav`）
+  + favsearch（R5）。新しい owner / pending / bool は足さず、既存の取消を 1 つの関数にまとめ、Activation・しおり・R4 が共有する。
+  境界は main 限定（`main_folder_history_available`）。Activation の poll は ROOT pass で main が投影されている
+  （`src/app/update_phases.rs:489`〜`:503`）。
+- **R2 main で開くしおりの受理**: しおり行のクリック（分類の前）で同じ境界を通す。分類の完了と resolver の開始は
+  Continuation で、受付をやり直さない。detached に開くしおり（`detached_lease`）は main 一覧の要求ではないので境界を通さず、
+  未解決の起動要求と変換だけを取り消す（`DetachedGridArchive` の claim、`src/app.rs:30254`〜`:30258` と同じ扱い）。
+- **R3 混在フォルダ**: 走査開始の時点を利用者の明示要求の受付とし、未解決の起動系要求を退役させる。
+  main 合流での受付（`src/app.rs:58692`）は、他の main 兄弟は現状どおり退役させるが、未解決の起動系要求は退役させない。
+  移動先 viewer が未確定でも明示 open が未解決の起動要求を退役させるのは `DetachedGridArchive` と同じ。
+  R1 により、走査中に受理した後発 B は走査を取り消すので、合流で B に出会うのは R4 の仮受付中だけになる。
+- **R4 snapshot 中の activation（仮受付）**: 受理時は現状どおり退役させず、§1.133 の保留を保つ。範囲内と判定された時点
+  （`finish_startup_open_path_resolve_with_held` で `snapshot_scope_allows_open` が真）を受付とし、そこで R1 と同じ境界を
+  通してから load する（held は従来どおり破棄）。仮受付の間に先行 A の継続が resolver を開始する場合（BookmarkRow 分類の継続）は、
+  B を置換せず B の held 側へ入れる（held に既にあるものはそれより古いので置換で終了）。仮受付中の A の着地は B を退役させない。
+  仮受付中に利用者が新しく要求したもの（クリック・しおり）は通常どおり B を退役させる（§1.285）。
+- **R5 favsearch**: `favsearch_pending` を受付境界の退役対象に入れる（開始時の受付は既存の
+  `retire_main_list_requests_for_surface_switch`）。起動系に限らず利用者同士でも同じ誤り（後のクリックの後に古い検索結果が
+  一覧を置き換える）で、境界に 1 つ足すことで両方を直す。同じ検索のクエリ更新は「退役 → 新規開始」の順で既存の挙動を保つ。
+  Everything 検索も同じ観点で確かめ、同じ欠けがあれば同じ扱いにする。
+
+**変わる挙動**（いずれも「後の要求が勝つ」への統一で、通常の使い方の手間は増えない）:
+
+1. 後発の activation / しおりを受理した時点で先行の未採用の要求が止まり、先行の結果が一瞬表示されてから置き換わることが無くなる。
+2. 後発の activation が開けない（祖先も無い）とき、先行の要求は既に退役しているので表示は元の一覧のまま
+   （これまでは先行の結果が着地していた）。利用者の通常のクリックが失敗した場合と同じ扱い。
+3. 混在フォルダのクリックで、未解決の起動要求（遅い起動引数の解決など）が退役する。これまでは移動先が detached だと
+   未解決の起動要求が後から main 一覧を置き換え得た。
+4. お気に入り検索の結果待ちの間に別の場所へ移動すると、遅れて届いた検索結果で一覧が置き換わらない。
+
+まれな失敗（spawn 失敗など）の扱いは §6.2.1 のまま。新しい失敗経路は作らない。
+
+**detached への到達:** R2（detached しおりの区別）、R3（混在フォルダは detached の loading shell を伴い得る。
+走査の取消時に既存の `cancel_folder_pane_open` / shell 退役が shell を片付けることを確認する）、
+R1（変換の取消は detached owner の変換も含む。既存の activation と同じ）が detached 述語に触れ得る。
+新しい detached 述語・状態は足さない。構造的修正であることの双方合意と、触れた範囲を
+`docs/detached-rework-plan.md` §11 に記録する。
+
+**検証:**
+
+- 状態遷移テスト（`src/app/startup_ops.rs` の `section1419_*`）: 表の「誤り」の各行を、A 開始 → B 受理 → A 完了 → B 完了、
+  および A 開始 → B 受理 → B 完了 → A 完了の両順で駆動し、最終一覧が B、A が着地しない、B の resolver が残ることを確かめる。
+  snapshot の仮受付（範囲内・範囲外）で §1.133 の保留が保たれ（範囲外なら A が再開）、BookmarkRow の継続が held に入ること。
+  detached しおり・detached 混在フォルダで sibling context が変わらないこと。favsearch は利用者同士の順序も確かめる。
+- §1.285 の `section1285_*` と §1.133 の既存テストが変わらず緑。
+- 隔離実アプリ: 応答しない UNC（TEST-NET、毎回アドレスを変える）で B の解決を遅らせ、先行 A の後に二重起動の転送を送る。
 
 ### 6.3 §1.335 と compose、merge 順序
 
