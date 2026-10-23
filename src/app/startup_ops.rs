@@ -2606,7 +2606,12 @@ mod tests {
         ));
     }
 
-    // Drive real admissions, replacing only worker channels to control both completion orders.
+    // Drive real admissions and assert retirement before polling any completion. Pane,
+    // classification, DFS and history use controlled channels for both late-notification
+    // orders. Smart's private multi-stage worker has no existing channel replacement hook:
+    // its presence before B and absence immediately after B guard retirement regardless of
+    // worker timing; polling it below does not claim to force worker completion. Collection
+    // uses an already-ready queued continuation (no worker), not the synchronous shell open.
     #[test]
     fn section1419_activation_and_bookmark_retire_earlier_main_requests() {
         for earlier in [
@@ -2643,6 +2648,8 @@ mod tests {
                     let ctx = egui::Context::default();
                     let mut pane = None;
                     let mut classification = None;
+                    let mut dfs = None;
+                    let mut history = None;
                     match earlier {
                         "pane" | "candidate" => {
                             if earlier == "pane" {
@@ -2681,7 +2688,13 @@ mod tests {
                             app.top_level_grid_view
                                 .set_open_path_classification(Some(pending));
                         }
-                        "dfs" => app.start_folder_nav(origin.clone(), true, FolderNavMode::Grid),
+                        "dfs" => {
+                            app.start_folder_nav(origin.clone(), true, FolderNavMode::Grid);
+                            let pending = app.folder_nav_pending.as_mut().unwrap();
+                            let (tx, rx) = mpsc::channel();
+                            pending.rx = rx;
+                            dfs = Some((tx, pending.cancel.clone()));
+                        }
                         "history" => {
                             assert!(app.start_physical_history_transition(
                                 PhysicalHistoryIntent::Navigation {
@@ -2691,6 +2704,20 @@ mod tests {
                                 a.clone(),
                                 StartupListIntent::ExplicitList
                             ));
+                            let Some(HistoryNavigationTransition::Physical(request)) =
+                                app.top_level_grid_view.history_navigation_transition_mut()
+                            else {
+                                panic!("A physical history owner");
+                            };
+                            let PhysicalHistoryPhase::Preflighting { preflight, .. } =
+                                &mut request.phase
+                            else {
+                                panic!("A history preflight");
+                            };
+                            let (controlled, tx) =
+                                collection_navigation::PhysicalHistoryPreflight::controlled_for_test();
+                            *preflight = controlled;
+                            history = Some(tx);
                         }
                         "smart" => {
                             let mut definition = crate::settings::SmartFolderDefinition::new("A");
@@ -2704,9 +2731,24 @@ mod tests {
                             app.open_smart_folder_staged(id, false);
                             assert!(app.smart_folder_transition.is_some());
                         }
-                        "collection" => app.open_collection_grid_from_navigation(
-                            crate::collection_store::CollectionId::new(),
-                        ),
+                        "collection" => {
+                            // A bare open_collection_grid_from_navigation installs a shell
+                            // synchronously and has no navigation pending in this fixture.
+                            // Seed the existing ready continuation owner so omitting its
+                            // retirement cannot pass merely because no worker has replied.
+                            app.open_collection_grid_from_navigation(
+                                crate::collection_store::CollectionId::new(),
+                            );
+                            app.top_level_grid_view.set_collection_navigation_pending(Some(
+                                collection_navigation::CollectionNavigationPending::AwaitingOuterContinuation {
+                                    steps: 1,
+                                    fullscreen: false,
+                                    resume_slideshow: false,
+                                    native_toast: false,
+                                },
+                            ));
+                            assert!(app.top_level_grid_view.collection_navigation_pending());
+                        }
                         _ => unreachable!(),
                     }
                     app.settings.detached_viewer_open_images_in_window = false;
@@ -2723,10 +2765,28 @@ mod tests {
                         app.folder_pane_open_pending.is_none(),
                         "{earlier}/{bookmark}"
                     );
-                    assert!(app.top_level_grid_view.open_path_classification().is_none());
-                    assert!(app.folder_nav_pending.is_none());
-                    assert!(app.smart_folder_transition.is_none());
-                    assert!(!app.top_level_grid_view.collection_navigation_pending());
+                    assert!(
+                        app.top_level_grid_view.open_path_classification().is_none(),
+                        "{earlier}/{bookmark}: A classification owner must retire at B admission"
+                    );
+                    assert!(
+                        app.folder_nav_pending.is_none(),
+                        "{earlier}/{bookmark}: A DFS owner must retire at B admission"
+                    );
+                    assert!(
+                        app.top_level_grid_view
+                            .history_navigation_transition()
+                            .is_none(),
+                        "{earlier}/{bookmark}: A history owner must retire at B admission"
+                    );
+                    assert!(
+                        app.smart_folder_transition.is_none(),
+                        "{earlier}/{bookmark}: A Smart owner must retire at B admission"
+                    );
+                    assert!(
+                        !app.top_level_grid_view.collection_navigation_pending(),
+                        "{earlier}/{bookmark}: A Collection owner must retire at B admission"
+                    );
                     assert!(
                         app.startup_open_path_resolve_pending.is_some(),
                         "{earlier}/{bookmark}"
@@ -2749,8 +2809,31 @@ mod tests {
                             );
                             app.poll_open_path_classification(&ctx);
                         }
+                        if let Some((tx, cancel)) = &dfs {
+                            assert!(cancel.load(Ordering::Relaxed));
+                            assert!(
+                                tx.send(FolderNavThreadResult {
+                                    target: Some(FolderNavTarget {
+                                        route: FolderNavRoute::FullFeature(a.clone()),
+                                        smart_kind: None,
+                                        scanned: FolderNavScanResult::Ready(scan_directory(&a)),
+                                    }),
+                                    hit_image_folder: false,
+                                })
+                                .is_err()
+                            );
+                        }
+                        if let Some(tx) = &history {
+                            let payload =
+                                collection_navigation::PhysicalHistoryPreflightPayload::Folder(
+                                    scan_directory(&a),
+                                );
+                            assert!(tx.send(Ok(payload)).is_err());
+                        }
                         app.poll_collection_history_transition(&ctx);
                         assert!(app.poll_folder_nav().is_none());
+                        app.poll_smart_folder(&ctx);
+                        app.poll_collection_navigation(&ctx);
                     };
                     if earlier_first {
                         late_a(&mut app);

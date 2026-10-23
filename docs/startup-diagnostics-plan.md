@@ -834,7 +834,7 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
   変換 completion の Bookmark owner を保持した終端、終了済み binding の時計補償除外を補充した。
   `finish_replaced_startup_open_owner` は受領 lease で既存 context を解決して ID 終端へ渡し、兄弟を総走査しない。
   再レビューは追加指摘なし・受入可。実行結果は実装担当が所有する。
-- `section1419_*` の状態遷移を `startup_ops.rs` と `src/app/tests.rs` へ追加。先行8種類 × 後発2種類 × 両完了順、
+- `section1419_*` の状態遷移を `startup_ops.rs` と `src/app/tests.rs` へ追加。先行8種類 × 後発2種類 × 完了通知 / poll の2順序、
   分類済みしおり、snapshot 保留と拒否、時計の段階移行、記憶クリア、独立 detached のページ・動画待機を検査する。
   既存 `section1285_candidate_main_join_retires_older_startup_and_activation` は、R3 に合わせて退役時点の期待値だけを
   走査開始へ前倒しした（同じ「古い起動要求は着地しない」の不変条件を保持）。
@@ -855,7 +855,7 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
 
 | 追加テスト（`section1419_` 以下） | 検査対象 |
 | --- | --- |
-| `activation_and_bookmark_retire_earlier_main_requests` | 先行8種類、後発 Activation / しおり、両完了順（64ケース） |
+| `activation_and_bookmark_retire_earlier_main_requests` | 32組合せすべてで受付直後の先行 owner 退役。pane / Candidate / 分類 / BookmarkRow / DFS / 履歴の24組合せは制御した遅延通知の両順序、Collection は継続 poll、Smart は退役 assertion で保護（下記P3追補） |
 | `classified_bookmark_click_retires_pane_before_classification` / `detached_bookmark_adopts_without_mutating_sibling_context` | 分類あり・なし、main / detached の受付と独立 sibling の保持 |
 | `candidate_main_continuation_keeps_provisional_activation` / `failed_activation_does_not_resume_the_retired_pane` | Candidate 継続と拒否された後発要求 |
 | `snapshot_bookmark_classification_continuation_is_held_until_admission` | main / detached の継続保留、範囲内なら旧 shell 終了、範囲外なら同じ resolver 再開 |
@@ -864,6 +864,26 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
 | `explicit_admission_cancels_all_main_bookmark_stages_but_memory_clear_keeps_page_wait` | Resolving / Qualifying / AwaitingPage / Media と記憶クリア |
 | `bookmark_click_terminates_detached_resolver_and_conversion_owner` | global resolver / 変換 owner の取消、旧 pending 終了と shell Closing |
 | `main_admission_preserves_independent_detached_page_wait` / `main_admission_preserves_independent_detached_media_wait` | 独立 detached のページ / 動画・音声待ちを保持 |
+
+**独立レビュー P3 追補（2026-10-23、`6fa203b34` 後、未コミット）:**
+
+- `startup_ops.rs::section1419_activation_and_bookmark_retire_earlier_main_requests` に、B 受付直後の
+  `history_navigation_transition().is_none()` を追加。DFS と履歴は制御した channel へ差し替え、
+  B 完了の前後それぞれで A の成功結果を送ってから本番 poll を通し、退役済み receiver が通知を拒むことを検査する。
+  履歴の channel 差替えは `collection_navigation.rs::PhysicalHistoryPreflight::controlled_for_test`（`cfg(test)` のみ）。
+- Collection 行は旧 fixture の同期 shell open だけでは navigation owner が無かったため、既存の
+  `AwaitingOuterContinuation` を置いて受付前の存在と受付直後の消滅を検査し、本番 continuation poll を両順で呼ぶ。
+  この段階には worker 完了通知が無い。Smart は非公開の多段 worker に既存の通知差替え口が無いため、
+  完了順の強制を主張せず、受付前の `smart_folder_transition.is_some()` と受付直後の `is_none()` で退役を保証する。
+  どちらも理由をテスト内コメントへ記載し、「64ケースすべてで両完了順」という旧記録を訂正した。
+  組合せ数は先行8種類 × 後発2種類 × 2順序 = **32**（旧記録の64は誤算）。
+- 受付関数を無効化する mutation では、上の32組合せを一時的に個別テストへ展開して全行を検査し、
+  **32件すべてが B 受付直後の owner 退役 assertion で失敗、exit 100**。実workerの完了待ちには依存しない。
+  `target/section1419-p3-mutation.log` / `target/section1419-p3-mutation.json` に保存。
+  mutation 後の `startup_ops.rs` は固定版 SHA-256 と一致する byte-for-byte 復元済み。
+- 復元後の `cargo nextest run -p mimageviewer --lib -E 'test(/section1419|section1285/)'` は
+  **27件全成功、exit 0**（`target/section1419-p3-restored.log`）。最後の `cargo fmt` と `git diff --check` も成功。
+  全件テストは実行していない。テストと文書のみの変更なので、実機確認用バイナリの再ビルドは省略。
 
 ### 6.3 §1.335 と compose、merge 順序
 

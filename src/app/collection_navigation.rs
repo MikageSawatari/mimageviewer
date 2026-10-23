@@ -431,6 +431,21 @@ impl PhysicalHistoryPreflight {
         Self::prepared(payload)
     }
 
+    #[cfg(test)]
+    pub(crate) fn controlled_for_test() -> (
+        Self,
+        std::sync::mpsc::Sender<Result<PhysicalHistoryPreflightPayload, String>>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (
+            Self {
+                cancel: Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
+                receiver,
+            },
+            sender,
+        )
+    }
+
     pub(crate) fn poll(&mut self) -> PhysicalHistoryPreflightPoll {
         match self.receiver.try_recv() {
             Ok(Ok(payload)) => PhysicalHistoryPreflightPoll::Ready(payload),
