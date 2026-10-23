@@ -22,6 +22,60 @@ function Run-Script {
 }
 function Count-Runs { return @(Get-ChildItem (Join-Path $fixture 'target/test-lib-full/runs') -Directory -ErrorAction SilentlyContinue).Count }
 Assert-That ((Get-MivTextHash 'abc') -eq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'SHA-256 known vector mismatch'
+# Observe both flushed pipes before allowing the child to exit, then check capture.
+$streamProbe = Join-Path $fixture 'target/stream-probe'
+[void] [IO.Directory]::CreateDirectory($streamProbe)
+$streamRelease = Join-Path $streamProbe 'release'
+$streamChild = Join-Path $streamProbe 'child.ps1'
+$streamRunner = Join-Path $streamProbe 'runner.ps1'
+[IO.File]::WriteAllText($streamChild, @'
+param([string] $Release)
+[Console]::Out.WriteLine('stdout before exit')
+[Console]::Error.WriteLine('stderr before exit')
+while (-not [IO.File]::Exists($Release)) { Start-Sleep -Milliseconds 10 }
+[Console]::Out.WriteLine('stdout terminal')
+[Console]::Error.WriteLine('stderr terminal')
+exit 7
+'@, $utf8)
+$commonPath = (Join-Path $PSScriptRoot 'test-tools-common.ps1').Replace("'", "''")
+[IO.File]::WriteAllText($streamRunner, @"
+param([string] `$Directory, [string] `$RepoRoot)
+. '$commonPath'
+`$result = Invoke-MivTool 'powershell.exe' @('-NoProfile', '-NonInteractive', '-File', (Join-Path `$Directory 'child.ps1'), '-Release', (Join-Path `$Directory 'release')) `$RepoRoot -LogDirectory `$Directory
+[IO.File]::WriteAllText((Join-Path `$Directory 'result.json'), (`$result | ConvertTo-Json))
+"@, $utf8)
+$streamArgs = @('-NoProfile', '-NonInteractive', '-File', $streamRunner, '-Directory', $streamProbe, '-RepoRoot', $repo)
+$streamProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList (($streamArgs | ForEach-Object { ConvertTo-MivNativeArgument $_ }) -join ' ') -WindowStyle Hidden -PassThru
+try {
+    $streamDeadline = [DateTime]::UtcNow.AddSeconds(20)
+    do {
+        $visible = $true
+        foreach ($name in @('stdout', 'stderr')) {
+            $path = Join-Path $streamProbe ($name + '.log')
+            if (-not [IO.File]::Exists($path)) { $visible = $false; continue }
+            $reader = New-Object IO.StreamReader([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite))
+            try { if (-not $reader.ReadToEnd().Contains($name + ' before exit')) { $visible = $false } }
+            finally { $reader.Dispose() }
+        }
+        if ($visible) { break }
+        Assert-That (-not $streamProcess.HasExited) 'stream runner exited before releasing the child'
+        Assert-That ([DateTime]::UtcNow -lt $streamDeadline) 'both pipes were not flushed while the child was running'
+        Start-Sleep -Milliseconds 10
+    } while ($true)
+    Assert-That (-not $streamProcess.HasExited) 'streamed logs were only available after exit'
+} finally {
+    [IO.File]::WriteAllText($streamRelease, 'release')
+    Assert-That ($streamProcess.WaitForExit(20000)) 'stream runner did not finish after release'
+    $streamProcess.Dispose()
+}
+$streamResult = ConvertFrom-Json ([IO.File]::ReadAllText((Join-Path $streamProbe 'result.json')))
+Assert-That ($streamResult.ExitCode -eq 7) 'streaming changed the child exit code'
+Assert-That ($streamResult.StdOut -eq "stdout before exit`r`nstdout terminal`r`n") 'streaming changed captured stdout'
+Assert-That ($streamResult.StdErr -eq "stderr before exit`r`nstderr terminal`r`n") 'streaming changed captured stderr'
+foreach ($name in @('StdOut', 'StdErr')) {
+    Assert-That ([IO.File]::ReadAllText((Join-Path $streamProbe ($name.ToLowerInvariant() + '.log'))) -eq $streamResult.$name) "streamed $name differs from captured output"
+}
+Write-Host '[test-test-tools] concurrent stdout/stderr: pre-exit flush, capture and exit code PASS'
 $caseFeatures = @(Get-MivFeatureArguments @('extra', 'EXTRA', 'extra'))
 Assert-That (($caseFeatures -join ' ') -eq '--features EXTRA,extra') 'case-sensitive Cargo features were merged'
 # Every TOML spelling of the Cargo env table must yield its names, or refuse reuse.

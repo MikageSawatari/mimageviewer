@@ -10,7 +10,7 @@ function ConvertTo-MivNativeArgument {
 }
 
 function Invoke-MivTool {
-    param([string] $File, [string[]] $Arguments, [string] $RepoRoot)
+    param([string] $File, [string[]] $Arguments, [string] $RepoRoot, [string] $LogDirectory)
     $command = Get-Command $File -CommandType Application -ErrorAction Stop | Select-Object -First 1
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo.FileName = $command.Source
@@ -24,19 +24,61 @@ function Invoke-MivTool {
     $process.StartInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
     $process.StartInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
     $watch = [Diagnostics.Stopwatch]::StartNew()
+    $writers = @{}
     try {
+        if ($LogDirectory) {
+            foreach ($name in @('StdOut', 'StdErr')) {
+                try {
+                    $path = Join-Path $LogDirectory ($name.ToLowerInvariant() + '.log')
+                    $writers[$name] = New-Object IO.StreamWriter($path, $false, (New-Object Text.UTF8Encoding($false)))
+                    $writers[$name].AutoFlush = $true
+                } catch { Write-Warning "Cannot write $name log: $_" }
+            }
+        }
         [void] $process.Start()
         # Drain both pipes concurrently; native stderr is not a PS error record.
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if ($LogDirectory) {
+            $readers = @{ StdOut = $process.StandardOutput; StdErr = $process.StandardError }
+            $buffers = @{ StdOut = (New-Object Text.StringBuilder); StdErr = (New-Object Text.StringBuilder) }
+            $pending = @{}
+            foreach ($name in @('StdOut', 'StdErr')) { $pending[$name] = $readers[$name].ReadLineAsync() }
+            while ($pending.Count) {
+                [void] [Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]] @($pending.Values))
+                foreach ($name in @('StdOut', 'StdErr')) {
+                    if (-not $pending.ContainsKey($name) -or -not $pending[$name].IsCompleted) { continue }
+                    $line = $pending[$name].GetAwaiter().GetResult()
+                    if ($null -eq $line) { $pending.Remove($name); continue }
+                    [void] $buffers[$name].AppendLine($line)
+                    if ($writers.ContainsKey($name)) {
+                        try { $writers[$name].WriteLine($line) }
+                        catch {
+                            Write-Warning "Cannot write $name log: $_"
+                            $writers[$name].Dispose()
+                            $writers.Remove($name)
+                        }
+                    }
+                    $pending[$name] = $readers[$name].ReadLineAsync()
+                }
+            }
+            $stdout = $buffers.StdOut.ToString()
+            $stderr = $buffers.StdErr.ToString()
+        } else {
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+        }
         $process.WaitForExit()
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
-            StdOut = $stdoutTask.Result
-            StdErr = $stderrTask.Result
+            StdOut = $stdout
+            StdErr = $stderr
             Seconds = $watch.Elapsed.TotalSeconds
         }
-    } finally { $process.Dispose() }
+    } finally {
+        foreach ($writer in $writers.Values) { $writer.Dispose() }
+        $process.Dispose()
+    }
 }
 
 function Invoke-MivGit {
@@ -363,11 +405,7 @@ function Invoke-MivNextest {
         '--color', 'never', '--message-format', 'human', '--no-tests', 'fail', '--run-ignored', 'default', '--ignore-default-filter', '--retries', '0', '--no-fail-fast')
     Write-Host "[test-tools] cargo $($cmdArgs -join ' ')"
     Write-Host "[test-tools] logs: $($Run.Directory)"
-    $result = Invoke-MivTool 'cargo' $cmdArgs $RepoRoot
-    foreach ($streamName in @('StdOut', 'StdErr')) {
-        try { [IO.File]::WriteAllText((Join-Path $Run.Directory ($streamName.ToLowerInvariant() + '.log')), $result.$streamName, (New-Object Text.UTF8Encoding($false))) }
-        catch { Write-Warning "Cannot write $streamName log: $_" }
-    }
+    $result = Invoke-MivTool 'cargo' $cmdArgs $RepoRoot -LogDirectory $Run.Directory
     $tail = @($result.StdErr -split '\r?\n' | Where-Object { $_ } | Select-Object -Last 20)
     if ($tail.Count) { Write-Host ($tail -join "`n") }
     return [pscustomobject]@{ ExitCode = $result.ExitCode; Command = @('cargo') + $cmdArgs; WallSeconds = $result.Seconds }

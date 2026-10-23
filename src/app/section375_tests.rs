@@ -11,7 +11,11 @@ pub(super) fn settle(app: &mut App, ctx: &egui::Context) {
         app.poll_collection_history_transition(ctx);
         app.poll_external_rescan(ctx);
         app.poll_sidecar_restore(ctx);
-        app.poll_stack_script(ctx);
+        // Match render_other_worker_results: a grouping result cannot replace
+        // the installed list while its sidecar hydration still owns adoption.
+        if !app.sidecar_restore_active() {
+            app.poll_stack_script(ctx);
+        }
         if app.external_rescan_pending.is_none()
             && !app.sidecar_restore_active()
             && app.stack_script_pending.is_none()
@@ -46,6 +50,27 @@ pub(super) fn fixture(names: &[&str]) -> (AppTestEnvForTest, PathBuf, egui::Cont
             .is_some_and(|record| record.rows.known)
     );
     (app, folder, ctx)
+}
+
+fn wait_for_fullscreen_file_reads(app: &App) {
+    // These tests simulate an external deletion, after our own filename-based
+    // decoding has released the source. Leave its queued result and viewer intact.
+    assert!(
+        app.requested.is_empty(),
+        "fixture must not have thumbnail reads queued"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let stats = app.fs_page_load_scheduler.stats();
+        if stats.waiting == 0 && stats.running == 0 && stats.cancelling == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fullscreen file reads did not finish: {stats:?}"
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn delete_terminal(app: &mut App, paths: Vec<PathBuf>) {
@@ -608,6 +633,7 @@ fn section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps()
     settle(&mut app, &ctx);
     assert!(app.stack_showing_flat);
     assert!(app.mask_pages.contains(&2));
+    wait_for_fullscreen_file_reads(&app);
     std::fs::remove_file(folder.join("b_1.jpg")).unwrap();
     delete_terminal(&mut app, vec![folder.join("b_1.jpg")]);
     assert_eq!(app.stack_view.as_ref().unwrap().groups[1].members.len(), 1);
@@ -804,6 +830,7 @@ fn section1375_stack_retained_read_failure_keeps_flat_until_ordinary_reload() {
     settle(&mut app, &ctx);
     let source = app.capture_stack_deletion().unwrap();
     let removed = folder.join("b_1.jpg");
+    wait_for_fullscreen_file_reads(&app);
     std::fs::remove_file(&removed).unwrap();
     let mut prepared = std::thread::spawn(move || source.prepare(&[removed]))
         .join()
@@ -1514,13 +1541,26 @@ fn section1375_search_root_delete_does_not_dispatch_physical_folder_reload() {
     app.poll_current_folder_watch(&ctx);
     app.poll_external_rescan(&ctx);
     assert!(app.current_folder_watch.as_ref().unwrap().watcher.is_some());
+    // Registration above exercises the real watcher. Route the synthetic event
+    // through a separate channel so late OS events cannot re-arm its debounce.
+    let watch = app.current_folder_watch.as_mut().unwrap();
+    watch.watcher = None;
+    let (tx, rx) = crossbeam_channel::bounded(256);
+    watch.tx = tx;
+    watch.rx = rx;
+    watch.dirty.clear();
+    watch.debounce_until = None;
+    let sequence = watch
+        .sequence
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     std::fs::write(folder.join("c.jpg"), b"returned physical notification").unwrap();
     app.current_folder_watch
         .as_ref()
         .unwrap()
         .tx
         .send((
-            1,
+            sequence,
             Ok(
                 notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
                     .add_path(folder.join("c.jpg")),
@@ -1528,6 +1568,33 @@ fn section1375_search_root_delete_does_not_dispatch_physical_folder_reload() {
         ))
         .unwrap();
     app.poll_current_folder_watch(&ctx);
+    app.current_folder_watch.as_mut().unwrap().debounce_until = Some(Instant::now());
+    // Reproduce the old race deterministically: an event arriving at this poll
+    // re-arms the deadline even though the caller just made it due.
+    let watch = app.current_folder_watch.as_mut().unwrap();
+    let sequence = watch
+        .sequence
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    watch
+        .tx
+        .send((
+            sequence,
+            Ok(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(folder.join("c.jpg")),
+            ),
+        ))
+        .unwrap();
+    app.poll_current_folder_watch(&ctx);
+    assert!(app.external_rescan_pending.is_none());
+    assert!(
+        app.current_folder_watch
+            .as_ref()
+            .unwrap()
+            .debounce_until
+            .is_some()
+    );
     app.current_folder_watch.as_mut().unwrap().debounce_until = Some(Instant::now());
     app.poll_current_folder_watch(&ctx);
     settle(&mut app, &ctx);
