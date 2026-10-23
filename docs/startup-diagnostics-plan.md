@@ -745,8 +745,10 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
 - **新しい明示 main 要求の受付**（Activation・しおり・R4 が共有する 1 つの関数）:
   `retire_replaced_main_list_requests(None)`（分類・履歴遷移・レーティング・ペイン / 混在フォルダ走査・Smart・コレクション・
   サブ展開・直接文書・close-return・未解決の起動要求）
-  + 先行のしおりを段階（Resolving / Qualifying / AwaitingPage / Media 待ち）・行先にかかわらず ID 指定で終了
-  （現在の Activation の受理、`startup_ops.rs:316`〜`:324` と同じ範囲。第 1 回 P2-1）
+  + main に投影中の `bookmark_open_pending` を段階（Resolving / Qualifying / AwaitingPage / Media 待ち）にかかわらず ID 指定で終了し、
+  resolver 枠・変換の owner は既存どおり置換・取消する（現在の Activation の受理、`startup_ops.rs:316`〜`:324` と同じ範囲。第 1 回 P2-1）。
+  `bookmark_open_pending` は context ごとの所有物で（`src/app/viewer_context_registry.rs:1761`）、resolver を離れて独立した
+  detached context にあるページ待ち・動画待ちは総走査せず、取り消さない（第 3 回 P2）
   + 変換の取消 + DFS（`cancel_pending_folder_nav`）。
   新しい owner / pending / bool は足さず、既存の取消の合成にする。境界は main 限定（`main_folder_history_available`）。
   Activation の poll は `App::ui` → `update_frame` → `render_initial_open` の外側で動き、detached の一時 mount は元の投影へ戻るので、
@@ -803,7 +805,7 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
 まれな失敗（spawn 失敗など）の扱いは §6.2.1 のまま。新しい失敗経路は作らない。
 
 **detached への到達:** R2（detached 行きのしおりも main の受付を通す）、R3（混在フォルダの走査取消が detached の loading shell を
-既存経路で片付ける）、R1（変換・しおりの取消は detached owner のものも含む。既存の activation と同じ）が detached 述語に触れる。
+既存経路で片付ける）、R1（変換・resolver 枠のしおりの取消は detached owner のものも含む。既存の activation と同じ。独立した detached context の pending は取り消さない）が detached 述語に触れる。
 新しい detached 述語・状態は足さない。独立レビュー（Codex gpt-6.1-sol / xhigh、2026-10-23、第 1 回・第 2 回）は
 「受付時点の要求所有と lease 指定の終端処理を揃える構造的修正で、症状を隠す guard・待機・repaint の追加ではない」ことに
 合意した。設計担当（ClaudeCode）も同じ主張に合意する。実装後に、触れた範囲と判断理由を `docs/detached-rework-plan.md` §11 に記録する。
@@ -815,7 +817,8 @@ App終了時はheldも当該要求として退役させ、以前の場所を再o
   しおりは分類なし・分類あり、main 行き・detached 行き（detached 行きは B が detached に開けて、sibling context が変わらないこと）。
   snapshot の仮受付（範囲内・範囲外）で §1.133 の保留が保たれ（範囲外なら A が再開）、BookmarkRow の継続が held に入ること、
   保留の補償時間（途中生成・`Resolving`→`AwaitingPage`・Activation の置換・拒否）を時間制御で確かめる。
-  記憶クリア（`clear_quick_folder_slots`）の挙動が変わらないこと。
+  記憶クリア（`clear_quick_folder_slots`）の挙動が変わらないこと。detached のしおり A が AwaitingPage / Media 待ちの間に main の B を
+  受け付けても、A のページ移動と窓が保たれること（`src/app/tests.rs:33890` の状態を起点にする）。
 - §1.285 の `section1285_*` と §1.133 の既存テストが変わらず緑。
 - 隔離実アプリ: 応答しない UNC（TEST-NET、毎回アドレスを変える）で B の解決を遅らせ、先行 A の後に二重起動の転送を送る。
 
