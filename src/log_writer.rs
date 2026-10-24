@@ -102,7 +102,7 @@ impl Drops {
         // The range is cumulative, like count; no reset races can lose a drop.
         let _ = self
             .first
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(if old == 0 { stamp } else { old.min(stamp) })
             });
         self.last.fetch_max(stamp, Ordering::Relaxed);
@@ -162,7 +162,7 @@ impl Publications {
     }
     fn register(&self) -> Option<usize> {
         self.0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
                 if state & Self::CLOSED != 0 {
                     return None;
                 }

@@ -22,15 +22,23 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
+mod egui037_stage4_gpu_tests;
+mod egui_output;
+#[cfg(test)]
+mod test_native_focus;
+#[cfg(test)]
 #[path = "../tests/support/ui_harness.rs"]
 pub(crate) mod test_ui;
 mod wgpu_backend_policy;
+mod wheel_input;
 
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+pub mod detached_window_geometry;
+pub(crate) mod feedback;
 #[cfg(feature = "dev-tools")]
 pub mod raw;
 #[cfg(not(feature = "dev-tools"))]
@@ -48,6 +56,8 @@ pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapsh
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_notification_duration_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_restore_position_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
@@ -114,6 +124,7 @@ pub mod file_type_visibility;
 mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
+mod material_display_basis;
 pub mod metadata_transfer;
 mod page_turn_animation;
 #[cfg(windows)]
@@ -182,7 +193,9 @@ pub mod gamepad;
 pub mod global_search;
 mod global_search_ui;
 pub use global_search_ui::{
-    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_everything_progress_snapshot_fixture,
+    draw_everything_search_disabled_menu_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_global_search_reject_snapshot_fixture,
 };
 pub mod gpu_info;
 #[cfg(any(test, feature = "dev-tools"))]
@@ -242,6 +255,7 @@ pub mod reading_history_db;
 pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]
 mod settings_override;
+pub mod source_coverage;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
 mod vram_budget;
@@ -294,6 +308,7 @@ pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
 pub mod sidecar_import;
+mod similar_array_owner;
 mod similar_book_engine;
 mod similar_book_mih;
 mod similar_book_query;
@@ -522,8 +537,8 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
         Err(_) => Some(1),
     };
 
-    wgpu_options.present_mode = present_mode;
-    wgpu_options.desired_maximum_frame_latency = desired_maximum_frame_latency;
+    wgpu_options.surface.present_mode = present_mode;
+    wgpu_options.surface.desired_maximum_frame_latency = desired_maximum_frame_latency;
     logger::log(format!(
         "wgpu presentation: present_mode={present_mode:?} \
          desired_maximum_frame_latency={desired_maximum_frame_latency:?}"
@@ -538,6 +553,30 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
 /// docs/briefs/pdf-page-turn-and-stale-composite-plan.md の ③。
 fn install_texture_delta_ledger() {
     egui_wgpu::atlas_diag::set_sink(|message| logger::log(message));
+    egui_wgpu::install_texture_delivery_observer(perf::is_enabled, |delivery| {
+        let site = match delivery.site {
+            egui_wgpu::atlas_diag::Site::ProducedMain => "produced_main",
+            egui_wgpu::atlas_diag::Site::ProducedImmediate => "produced_immediate",
+            egui_wgpu::atlas_diag::Site::ProducedPresenter => "produced_presenter",
+            egui_wgpu::atlas_diag::Site::AppliedPaint => "applied_paint",
+            egui_wgpu::atlas_diag::Site::AppliedNoPaint => "applied_no_paint",
+            egui_wgpu::atlas_diag::Site::AppliedPresenter => "applied_presenter",
+        };
+        perf::event(
+            "gpu",
+            "texture_delivery_submitted",
+            None,
+            0,
+            &[
+                ("renderer", delivery.renderer.into()),
+                ("texture", format!("{:?}", delivery.texture_id).into()),
+                ("batch", delivery.batch.into()),
+                ("bytes", delivery.bytes.into()),
+                ("mipmap", delivery.mipmap.into()),
+                ("site", site.into()),
+            ],
+        );
+    });
 }
 
 fn install_panic_log_hook() {
@@ -1624,6 +1663,7 @@ pub fn run() -> eframe::Result {
         ));
     }
     let options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport,
         wgpu_options,
         ..Default::default()
@@ -1774,6 +1814,8 @@ pub fn run() -> eframe::Result {
             #[cfg(windows)]
             startup_windows_diag::mark("app.creator.start", 0, || serde_json::json!({}));
             #[cfg(windows)]
+            cc.egui_ctx
+                .options_mut(|options| options.quit_shortcuts.clear());
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
@@ -1834,7 +1876,7 @@ pub fn run() -> eframe::Result {
                 }
                 Err(error) => {
                     logger::log(format!("spread_shift: worker startup failed: {error}"));
-                    app.show_feedback_toast(format!(
+                    app.show_feedback_warning(format!(
                         "見開き調整の保存を開始できませんでした: {error}"
                     ));
                 }
@@ -1851,7 +1893,7 @@ pub fn run() -> eframe::Result {
                 }
                 Err(error) => {
                     logger::log(format!("book_composition: worker startup failed: {error}"));
-                    app.show_feedback_toast(format!(
+                    app.show_feedback_warning(format!(
                         "本の構成の保存を開始できませんでした: {error}"
                     ));
                 }
@@ -2389,3 +2431,6 @@ pub use ui_dialogs::preferences::draw_same_name_folder_book_settings_snapshot_fi
 
 mod ui_image_folder_zip;
 pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;
+
+pub mod avif_decoder;
+pub mod image_decode;

@@ -4,7 +4,7 @@ pub(crate) fn draw_sidecar_restore_modal(
     ctx: &egui::Context,
     presentation: crate::app::SidecarRestorePresentation,
 ) {
-    egui::Modal::new(egui::Id::new("sidecar_restore_modal")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("sidecar_restore_modal")).show(ctx, |ui| {
         ui.set_min_width(340.0);
         ui.horizontal(|ui| {
             ui.spinner();

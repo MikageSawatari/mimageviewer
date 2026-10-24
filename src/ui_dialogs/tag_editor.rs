@@ -43,7 +43,7 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut add_empty_row = false;
 
-        egui::Window::new("ピン留めタグの管理")
+        egui::Window::new("ピン留めタグの管理").drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -61,7 +61,7 @@ impl App {
                 ui.add_space(6.0);
 
                 let n = self.tag_editor_draft.len();
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .id_salt("tag_edit_scroll")
                     .max_height(360.0)
                     .auto_shrink([false, true])
@@ -74,7 +74,7 @@ impl App {
                                 ui.label(egui::RichText::new("番号").strong()).on_hover_text(
                                     "ピン留めタグ1〜20のコマンドで使う順番です。ピン留めしていないタグは番号なしです。",
                                 );
-                                ui.label(egui::RichText::new("タグ名").strong());
+                                let name_label = ui.label(egui::RichText::new("タグ名").strong());
                                 ui.label(egui::RichText::new("プレビュー").strong());
                                 ui.label(egui::RichText::new("表示").strong());
                                 ui.label(egui::RichText::new("操作").strong());
@@ -99,7 +99,7 @@ impl App {
                                         &mut self.tag_editor_draft[i].name,
                                         None,
                                         |edit| edit,
-                                    );
+                                    ).labelled_by(name_label.id);
                                     // Enter で次行 or 追加行作成 (未実装、v1.1 検討)
                                     let _ = resp;
 
@@ -189,7 +189,7 @@ impl App {
 
         if apply {
             if self.tag_maintenance_rx.is_some() {
-                self.show_feedback_toast("タグの改名/統合を反映中です".to_string());
+                self.show_feedback_warning("タグの改名/統合を反映中です".to_string());
                 return;
             }
             let previous = previous_tag_defs_by_id(&self.settings.tags);
@@ -260,7 +260,7 @@ impl App {
                 self.invalidate_tag_apply_suggestions();
                 self.show_feedback_toast(message);
             }
-            Err(e) => self.show_feedback_toast(format!("タグの改名/統合に失敗: {e}")),
+            Err(e) => self.show_feedback_error(format!("タグの改名/統合に失敗: {e}")),
         }
     }
 }

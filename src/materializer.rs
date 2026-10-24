@@ -343,6 +343,12 @@ struct MaterializerInner {
     generation: AtomicU64,
     state: Mutex<TempState>,
     startup_cleanup_ready: (Mutex<bool>, Condvar),
+    /// Test builds own a uniquely named root and delete it with the last owner.
+    /// A pid-derived name collided with roots left by earlier test processes
+    /// once nextest reused the pid, and the production "never reuse an existing
+    /// temp folder" rule then failed the test.
+    #[cfg(test)]
+    test_root: Option<tempfile::TempDir>,
 }
 
 pub struct Materializer {
@@ -361,13 +367,16 @@ impl Materializer {
     pub fn new() -> Self {
         #[cfg(test)]
         {
-            static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
-            let sequence = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
-            let temp_root = std::env::temp_dir().join(format!(
-                "mimageviewer-materializer-test-{}-{sequence}",
-                std::process::id()
-            ));
-            return Self::new_at(temp_root, std::process::id(), false);
+            let test_root = tempfile::Builder::new()
+                .prefix("mimageviewer-materializer-test-")
+                .tempdir()
+                .expect("create materializer test root");
+            let mut materializer =
+                Self::new_at(test_root.path().to_path_buf(), std::process::id(), false);
+            Arc::get_mut(&mut materializer.inner)
+                .expect("a fresh materializer has no other owners")
+                .test_root = Some(test_root);
+            return materializer;
         }
 
         #[cfg(not(test))]
@@ -395,6 +404,8 @@ impl Materializer {
             generation: AtomicU64::new(0),
             state: Mutex::new(TempState::default()),
             startup_cleanup_ready: (Mutex::new(!start_cleanup), Condvar::new()),
+            #[cfg(test)]
+            test_root: None,
         });
         let startup_cleanup = start_cleanup.then(|| {
             let cleanup_inner = Arc::clone(&inner);
@@ -3134,6 +3145,27 @@ mod tests {
         let baseline = fingerprint(8, None);
         assert_ne!(baseline, fingerprint(9, None));
         assert_ne!(baseline, fingerprint(8, Some([1920, 1080])));
+    }
+
+    #[test]
+    fn test_build_roots_are_unique_and_removed_with_the_last_owner() {
+        let first = Materializer::new();
+        let second = Materializer::new();
+        // The same pid twice in one process must still get two roots: the
+        // production rule refuses to reuse an existing process directory.
+        assert_ne!(first.inner.temp_root, second.inner.temp_root);
+        ensure_process_directory(&first.inner).unwrap();
+        ensure_process_directory(&second.inner).unwrap();
+        let first_root = first.inner.temp_root.clone();
+        assert!(first.inner.process_dir.is_dir());
+
+        // A session keeps the shared state (and so the root) alive.
+        let session = first.session();
+        drop(first);
+        assert!(first_root.is_dir());
+        drop(session);
+        assert!(!first_root.exists());
+        assert!(second.inner.process_dir.is_dir());
     }
 
     #[test]

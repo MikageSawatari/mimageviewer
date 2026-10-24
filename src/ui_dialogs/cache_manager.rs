@@ -44,6 +44,7 @@ impl App {
             let busy = self.cache_maint_pending.is_some();
 
             egui::Window::new("サムネイルキャッシュ管理")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
@@ -93,12 +94,14 @@ impl App {
                     // ── 古いキャッシュの削除 ──────────────────────
                     ui.horizontal(|ui| {
                         let mut days_str = self.cache_manager_days.to_string();
-                        ui.label("最終更新から");
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut days_str)
-                                .desired_width(48.0)
-                                .horizontal_align(egui::Align::Center),
-                        );
+                        let field_label = ui.label("最終更新から");
+                        let resp = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut days_str)
+                                    .desired_width(48.0)
+                                    .align(egui::Align2::CENTER_TOP),
+                            )
+                            .labelled_by(field_label.id);
                         if resp.changed() {
                             if let Ok(v) = days_str.parse::<u32>() {
                                 if v > 0 {
@@ -197,6 +200,7 @@ impl App {
             let mut confirm_open = true;
             let escape_pressed = self.dialog_escape_pressed(ctx);
             egui::Window::new("キャッシュの全削除")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .open(&mut confirm_open)
                 .collapsible(false)
                 .resizable(false)

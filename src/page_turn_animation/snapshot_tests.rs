@@ -344,7 +344,8 @@ fn snapshot_scene(
     // have been consumed. No texture lifetime is inferred from a texture id.
     let mut textures = None;
     let mut normal_textures = None;
-    let mut harness = crate::test_ui::builder().with_size(SIZE).build(move |ctx| {
+    let mut harness = crate::test_ui::builder().with_size(SIZE).build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
         if textures.is_none() {
             crate::ui_fonts::configure_fonts(ctx);
             let opaque = matches!(geometry, SceneGeometry::OpaqueBlack | SceneGeometry::FixedSingleSpine);
@@ -474,7 +475,7 @@ fn snapshot_scene(
                 "One leaf rotates at the spine; checker stays under transparent print. Last pose = canonical incoming."
             },
             egui::FontId::monospace(12.0), Color32::from_rgb(206, 216, 228));
-    });
+     });
     harness.run();
     harness.snapshot(&name);
     let projected = harness.render().unwrap();
@@ -558,7 +559,8 @@ fn snapshot_moving_spine(reading_rtl: bool, forward: bool) -> egui_kittest::Snap
     let mut textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(1324.0, 520.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
             if textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 textures = Some(load_textures(ctx, false, false));
@@ -623,7 +625,7 @@ fn snapshot_moving_spine(reading_rtl: bool, forward: bool) -> egui_kittest::Snap
                 egui::FontId::monospace(12.0),
                 Color32::from_rgb(206, 216, 228),
             );
-        });
+         });
     harness.run();
     harness.snapshot(&name);
     let projected = harness.render().unwrap();
@@ -1001,7 +1003,8 @@ fn snapshot_single_portrait_landscape(
     let mut landscape_textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(1550.0, 302.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
             if portrait_textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 portrait_textures = Some(load_textures(ctx, false, false));
@@ -1143,7 +1146,7 @@ fn snapshot_single_portrait_landscape(
                 egui::FontId::monospace(12.0),
                 Color32::from_rgb(206, 216, 228),
             );
-        });
+         });
     harness.run();
     harness.snapshot(&name);
     let projected = harness.render().unwrap();
@@ -1399,7 +1402,8 @@ fn snapshot_spread_windows(
     let mut landscape_textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(1550.0, 64.0 + rows as f32 * HEIGHT))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
             if pair_textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 pair_textures = Some(load_textures(ctx, false, false));
@@ -1603,7 +1607,8 @@ fn snapshot_white_paper(reading_rtl: bool, forward: bool) -> egui_kittest::Snaps
     let mut textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(SIZE.x, 530.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
             if textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 textures = Some(load_textures(ctx, true, false));

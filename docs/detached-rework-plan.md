@@ -1455,6 +1455,319 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-23 §1.419 起動系の明示要求を受付順に揃える
+
+- 正本: `startup-diagnostics-plan.md` §6.2.2 第3版。設計担当 ClaudeCode と
+  Codex の独立設計レビューは、受付時点と既存 lease 指定の終端を揃える構造的修正であり、
+  guard・待機・repaint による症状パッチではないことに合意済み。
+- `app.rs::open_bookmark_browser_row` は detached 行きも main の共通受付を1回通す。
+  `GridFolderCandidate` は走査開始で未解決の起動要求を退役し、main 合流では再退役しない。
+  走査の取消は既存 `cancel_folder_pane_open` と対象 lease の loading shell 終了を使う。
+- `startup_ops.rs` は Activation としおりの受付を既存取消の合成へ集約する。
+  main 投影中の pending と process 共通 resolver / 変換だけが対象で、独立 detached context の
+  AwaitingPage / Media 待ちは総走査しない。snapshot 仮受付中の BookmarkRow 継続は既存 held に置く。
+  新しい detached 述語・状態・viewport 配送・placement 保存先は追加しない。
+- 自動検証と mutation の結果は正本 §6.2.2 の実装記録へ集約する。実アプリ検証は未実施。
+
+### 2026-10-23 §1.417 本を優先するレーティング操作
+
+- 触れた範囲は画像閲覧と native 動画 / 音声のキー処理の既存レーティング節だけ。入力を受けた viewer context が
+  mount されている間に、その context の採用済み `ProjectionRecipe` と物理状態から対象を
+  一度だけ値で確定し、既存のアイテム / コンテナ保存・公開・Undo 経路へ渡す。
+  F12 側からメインの現在フォルダを評価対象にせず、本キーは親一覧の本セルと同じにする。
+- 設計担当と独立レビュー担当 (Codex gpt-6.1-sol / xhigh、
+  SID `01a166e6-c2f3-7ff0-b8cf-e4a4ce5721a1`) は、対象解決の所有境界を明示する構造的変更であり、
+  症状パッチではないことに同意した。これは事前設計への合意で、独立完成レビューの受入を意味しない。
+- detached 述語・viewport 経路・context lifecycle は変更しない。新しい状態・窓判定・
+  待機・再試行・追加 repaint・本判定用の同期 I/O は導入しない。
+  詳細は [本を優先するレーティング操作](book-preferred-rating-plan.md)。
+
+### 2026-10-22 §1.165 selectorから受理素材の表示基準を保持する
+
+- 設計担当と独立レビュー担当の合意に従い、通常thumbnailの選択から保持・再描画まで、
+  handleと不変の `MaterialDisplayBasis` を一体で運ぶ。producer選択はResource、
+  保持presentation選択はPayloadとして分け、保持素材からhandleだけを取り出して再構成しない。
+- passive単ページ／見開き／連結snapshot captureと既存holdover、ViewerContextBundleの
+  消しゴム下地保持へdescriptorを通す。capture時のfit設定snapshotは既存責務のまま残し、
+  素材の基準をlive idx・texture IDから再探索しない。context間で共有するtextureでも
+  素材属性は各ownerの値を保持する。
+- legacy source-layoutのlayout単位と受理raster参照寸法もfit descriptorへ値で捕捉する。
+  passive replayでlive source寸法へ戻さず、PDF page-boxと物理pixelの区別を維持する。
+- これは素材と由来の保持を完成させる構造修正であり、detached述語、viewport生成・登録、
+  lifecycle、focus、host/runtimeの所有・切替条件は変更しない。同期I/O、待機、retry、
+  再同期mapや追加repaintを導入しない。全方式の倍率契約の統一も行わない。
+
+### 2026-10-22 §1.165 100%表示基準の分離
+
+- 正準座標寸法と100%表示寸法を別型にし、既存fit descriptorに後者を保持する。
+  passive snapshot／保持unit／white companion／再描画も捕捉時のdescriptorを使うため、
+  GPU clamp後の普通素材を正準座標の大きさへ戻さず、部分代役と本画像で同じ100%になる。
+  AI完成時の実出力texture基準、RAW／PDF／連結読みの既存規則は維持する。
+- resourceとfitの値の保持を直す範囲であり、detached述語・viewport lifecycleは変更しない。
+- 指定倍率の再レビュー追補: 単ページsnapshot／display-unit captureと見開きの指定fitは、
+  同じ素材所有A/O resolverを通す。部分素材はcoverageの正準寸法とcrop前raster、保持presentationは
+  捕捉済みdescriptorを優先し、thumbnail退去後にlive idxの寸法へ戻さない。
+  frozen replayの指定値・倍率制限は既存の捕捉値を維持する。既存resourceの由来・fit保持を
+  完成させる構造修正であり、述語・viewport生成・context lifecycleへの変更はない。
+- 最終P2追補: 全面thumbnailの指定倍率もproducerと同じGPU clamp予測を含む共通A/O resolverへ
+  統合する。単ページsnapshot／display-unit capture／連結snapshotはこの値を既存fit descriptorへ
+  捕捉し、保持素材の由来を維持する。新しいsnapshot状態や再同期を追加せず、述語・viewport・
+  context lifecycleは変更しない。通常rasterの3flow共通化は設計担当の最新方針に従う。
+
+### 2026-10-21 §1.165 独立レビュー追補
+
+- P1 の幾何修正に伴い、passive snapshot の連結／単ページ／見開き prepare は通常描画と同じ
+  resource の coverage を含む可視範囲要求を使う。部分素材の正規寸法と整数 sampler 密度を分け、
+  captured pair の指定 fit 基準も live pair と同じページ寸法境界に合わせる。
+  capture 済みの由来・素材を正しく再提出する変更で、述語・viewport lifecycle は変更しない。
+- P2 は preview DB の加法 migration と worker の生成物照合に閉じ、context 所有／失効規則を変更しない。
+  P3 は実入力 handler から部分素材／空交差の描画提出・出力採用・ready 通知・次ページ確定を通す
+  headless 回帰を追加する。Unknown の利用方針は既存の一か所の判定を維持する。
+
+### 2026-10-21 §1.165 B1: crop 済み代役の生成由来を素材と一緒に保持する（実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）
+
+- 合意: 利用者から提示された ClaudeCode の採択方針と独立設計レビュー
+  `design1165-out.md`／`design1165-r2-out.md` の合意に基づく。passive detached の capture／
+  再描画へ素材の収録範囲を通す変更は「素材と由来を保持する構造修正であり、症状パッチではない」
+  という双方の判断を採用する。生成時 metadata の同時永続化、native ROI と coverage の区別、
+  全ページ下地と部分素材の分離を B1 の範囲に含める。これは事前設計への合意であり、独立完成
+  レビューや実機受入れの証拠にはしない。
+- 触れる範囲: `source_coverage.rs`／`edit_preview_cache.rs` の生成・永続化、thumbnail 応答と
+  context-owned Loaded／寸法 cache、既存 `FullscreenPaintResource`／
+  `FullscreenPresentationResource`／paint payload、`displayed_image_transform.rs` の共有
+  `source_region_texture_quad`、`ui_fullscreen.rs` の snapshot capture／保持／再描画と補助表示、
+  `ui_fullscreen/page_turn.rs`／`page_turn_animation.rs` の canonical material。
+  active detached は通常描画と同じ resource を使い、passive は捕捉した素材と generation-time
+  coverage を一緒に保持する。capture 後の thumbnail 退去・置換や同じ idx の別 context から
+  位置を推定しない。navigator／ルーペ／パノラマ navigator／SNS 分割プレビューと保持素材復元も同じ契約へつなぐ。
+  active snapshot の単ページ幾何も捕捉済み resource を受け取り、裸の texture から現行 cache を再探索しない。
+- 所有・幾何: 一覧の比率は crop 後、部分素材の構成／fit の基準は crop 前。正規座標、生成 raster、
+  PDF layout 寸法を分け、実 `pixel_bounds` の floor／ceil 結果を preview の WebP 参照と同時保存する。
+  PDF page-box cache の既知 layout も独立 nullable 列へ同時保存・復元し、preview hit のための
+  追加 IPC／待機を作らない。通常画像／旧行の layout は `None` を保持する。
+  coverage は表示 trim／split の要求や native ROI と別に保持し、全画像 transform 上へ部分画像を
+  配置する。紙めくりは全ページ下地と `PartialTexture` の domain を分け、交差なしでもページ
+  occurrence／receipt を失わない。現在 crop の値から保存素材の収録範囲を再構成しない。
+- §2 との整合: runtime／binding／live dispatch の detached 述語、HWND 同定、viewport 生成、
+  placement／focus／z-order、mount／park／promote の lifecycle は変更しない。素材・由来を
+  既存 resource owner へ載せる簡素化を選び、新しい detached flag、idx 別 metadata map、
+  全 context reset、失効同期の待機、時間窓／retry を追加しない。まれな保存失敗は既定方針で割り切る。
+- 互換・範囲外: released v6 preview は nullable geometry の加法 migration で行と WebP を保持する。
+  旧 Unknown は一覧で使い、現在 crop ありの代役には共通 typed policy の理由付きで使わない。
+  新生成の geometry は現在 crop と独立している。設計レビューが指摘した
+  `reset_export_crop_mode` の Escape 時の確定／取消問題は別件として報告に留め、今回変更しない。
+- 検証: focused 回帰119件成功（`target/coverage-focused-r3.log`）。producer/DB、worker受理、
+  回転・fit・trim/split、左右到着順、退去・保持、context隔離、native ROI、部分素材のanimation、
+  navigator/SNS previewを含む。AI到着の幾何試験は拡大素材を渡す契約検査であり、実AI workerの
+  実行証拠にはしない。lib全件の成功台帳は `target/test-lib-full/`、UI snapshot／core check／
+  確認用buildの実行結果は最終引き継ぎへ記載する。workspace全gateの前提であるrelease内包用
+  core／remote／EPUB workerの3本はこのworktreeに未配置。独立完成レビュー・実機操作は未実施。
+  最初のlib全件は14,013成功／2失敗。通常素材のnative ROI出力を補助表示へ選んだ2件であり、
+  coverage付きの全画像入力をnavigator／SNSへ共通供給する修正後、関連focused194件は成功した
+  （`target/coverage-focused-r4.log`）。最終lib gateはこの修正を含むソースで再実行し、
+  14,015成功／失敗0／既存skip63（471.074秒）。台帳は
+  `target/test-lib-full/8014b5fc01e022d5b69b827cd2b7061a4c6d008b2c045a78e9757fe7d4085ca6.json`、
+  ソース識別子は `8c916412509518b424f036cd5d2b5b3d661a118b3f3c8e027a8339c08217e615`。
+  UI snapshotも195件成功、基準PNG変更なし（`target/coverage-ui-snapshot.log`）。
+  最終core check、`cargo fmt --check`、UI glyph検査（0件）、`git diff --check`成功。
+  `build-dev.ps1 -PreserveRuntime`は通常featureでcore／remote／EPUB workerを生成し、VCRT検査も成功
+  （`target/coverage-build-dev.log`）。製品起動・独立完成レビュー・実機確認・コミットは未実施。
+  検証完了後は本記録を含む文書だけを更新し、Rustソース／snapshot PNGは変更していないため、
+  上記結果を引き継ぐ（文書追記だけを理由に同じテストを再実行しない）。
+
+### 2026-10-21 §1.285 起動 open の main 所有要求だけを退役
+
+- 触れた範囲: `src/app/startup_ops.rs` の未解決 open と activation-held 鎖の退役。
+  Bookmark owner の既存 `detached_lease` を読み、独立 reader 所有の resolve は保持する。
+  viewport routing、detached の生成・切替・描画経路は変更しない。
+- 判断: 新しい main 要求の受付で取り消す対象を main 所有へ限定する所有境界の修正であり、
+  guard・遅延・再試行による症状パッチではない。ClaudeCode と独立レビュー担当の双方が
+  この範囲を構造的修正と合意した（独立レビュー担当 = Codex gpt-6.1-sol / xhigh、2026-10-21）。
+- 回帰検査: main のコレクション受付後も、直接または activation-held 鎖内にある
+  detached Bookmark resolve の receiver と cancel token を維持する。
+
+### 2026-10-20 §1.384: 別ウィンドウの配置を物理座標で 1 か所が持つ
+
+- 発端: 倍率の違うモニター (150% / 100%) で、別ウィンドウの動画が 1.5 倍の座標 (画面外) に作られた (利用者の実機報告 2026-10-15)。
+  placement は R2c どおり window_id ごとの runtime が正本だったが、値がその窓の DPI で割った論理値で、egui-winit が窓の
+  **そのときの** DPI で物理化していた。作成直後の窓の DPI は対象モニターと無関係なので、正本が 1 つでも変換境界が複数あった。
+  BA-6 / R2c (主)、BA-2、BA-7。
+- 構造: runtime placement・F11 の restore・保存値を物理外枠矩形にし、窓への適用を `src/detached_window_geometry.rs` の
+  1 つの境界 (`apply_outer_rect`、DPI をまたぐときは対象モニターの DPI へ移す staging を経る) に集めた。HWND 登録の全入口で
+  適用し、runtime の型付き状態 `HostPlacement` (incarnation 付き) が適用と root 側の表示要求の保持を持つ。builder は host を
+  作る前の仮の配置だけを持つ (既存 latch のまま)。active の可視化は既存の順序 (nested immediate の明示 command は primary の
+  出力で処理される) に乗せ、可視化の owner・一回限りの表示指定は変えない。passive は可視化を変えず採用時に適用する。
+  最大化中の窓への適用は F11 と passive で共通の 1 規則 (`IsZoomed == false` を確かめてから適用)。
+- 合意: 設計第 6 版 (docs/detached-dpi-placement-plan.md) で、設計担当 ClaudeCode と独立設計レビュー (GPT-6.1 Sol / xhigh) の双方が
+  「症状パッチではなく構造的修正である」ことに合意 (第 1〜6 版すべてで同意を維持、第 6 版で ACCEPT WITH CHANGES)。
+  独立実装レビューも同じ主張に同意。画面外を見つけて戻す補正・時間待ち・再試行は入れていない。
+- 触れた範囲: detached の HWND 登録入口 (created / unclaimed adopted / skipped-snapshot recovered / deferred adopted / watcher repair /
+  ParkedLive)、builder の配置、F11 の入る / 出る、root 側の表示要求 (トレイ復帰・native 遷移・再アクティブ化) の共通 helper、
+  ParkedLive の新規 host の Hidden 作成、位置の記録、設定 (新 field と旧 field の移行)。rect 一致探索・キー入力 subclass・
+  状態遷移・park / promote の所有境界・F11 遷移の Settle 時間待ちは変えていない。既定サイズ拒否の防波堤は単位だけ物理にした。
+- 検証: DPI をまたぐ staging は、2026-10-21 に倍率の違うモニター (150% / 100%) の実 HWND 試験 (非表示の winit 窓) で、両方向・装飾あり / なし・境界またぎ・モニター超過・画面外からの開始の全ケースが Exact。製品での利用者の実機確認は別に行う。
+  メインから開く全画面 viewport は同型だが範囲外 (backlog §1.408)。
+
+### 2026-10-20 §1.232 第5回レビュー: viewer 不在の一覧採用
+
+- 利用者が提示した独立レビューは、一括終了の合流と内部 reopen / park / F12 の
+  内容 teardown 分離を構造修正として妥当と判断し、未合流入口は他に発見されていない。
+  今回は第4回で広げすぎた「一覧採用も常に viewer の終了」という分類を修正する。
+- stack は既存 park の後に共有セッション所有述語を読み、viewer 実在時だけ終了する。
+  他の前回無条件化箇所も、一覧操作・metadata 境界と viewer 終了を区別する。
+  [入口表と理由](version-highlights-plan.md#22-第5回レビュー-一覧採用と-viewer-終了の区別2026-10-20) に記録する。
+- detached の述語・open / close / mount / park / F12 / viewport / registry / HWND 経路は変更しない。
+  既存述語による入口の適格性判定のみを修正し、新規状態・遅延・repaint は加えない。
+  今回差分の独立レビュー承認を取得済みとは扱わない。
+
+### 2026-10-20 §1.232 第4回レビュー: 終了入口の監査と設定変更時の予約退役
+
+- 変更前 `48e2ddff4` の close 全呼出しと index / presentation / viewport / session の
+  状態解除箇所を抽出し、真の終了・内部差替え・所有移譲・表示 cleanup に分類した。
+  全入口・index-only 判定の採否と例外は
+  [version-highlights-plan §2.1](version-highlights-plan.md#21-終了入口の監査1232-第4回レビュー2026-10-20) に記録する。
+- 今回は読むだけでなく、**設定変更による終了を既存の予約退役点へ接続する**。
+  main は列挙/製本待ちで index がなくても session が生き、context は一括終了後も生存するため、
+  viewport flag の解除や detached context の退役だけでは再開予約が終わらなかった。
+  倍率・フォント・Remote の全 viewer 終了を一つの API に寄せ、専用全画面の一括終了も
+  `close_fullscreen_to_completion` へ通す。main の対象判定と通知は同じ既存 owner 由来の述語を使う。
+  App 共通 viewport flag は別窓の退役後も残り得るため、表示 cleanup と投影中 session の
+  終了を区別する。一覧だけの main PDF password と active detached の併存も回帰で固定し、
+  窓だけの表示状態を根拠に兄弟の要求を取り消さない。
+- 通常 `close_fullscreen` も真の終了処理へ合流させ、内部 folder-nav・snapshot 再開・park 後の
+  内容解除などは明示的な `close_fullscreen_content` に分ける。予約の退役は引き続き
+  `retire_viewer_reopen_requests(context)` に集約し、兄弟の書庫予約は owner ID が一致するときだけ扱う。
+  metadata の特殊終了は既存方針を維持したまま同じ終了処理へ接続する。
+- detached の open / mount / park / promote、viewport 登録/生成/placement、HWND・focus、
+  registry の所有遷移、内部 reopen の保持条件は変更しない。変更するのは終了入口から
+  既存終端への接続と内容 teardown の呼分けであり、guard / delay / repaint による症状抑制ではない。
+  一覧だけの準備を終了対象へ広げず、変換・projection の成功後の一覧採用も維持する。
+- 判断の根拠は利用者が提示した第4回レビューの対応方針と、そのコード上の確認。
+  backend close / context 退役・内部 reopen / holdover / PDF password・EPUB・registry は
+  前回レビューで妥当とされた部分を維持する。今回差分の独立レビュー承認を取得済みとは扱わない。
+
+### 2026-10-20 §1.232: 起動通知の保留と内部遷移中のビューア所有
+
+- 対象は `App::startup_notice_viewer_open` と通知側の visible / modal 判定。
+  main の `fullscreen_idx` だけでなく、既存の deferred reopen owner、active detached の
+  生存要求、App 外に退避中の active context、他の still/media 窓を読み取る。
+  重要な変更点・ネットワーク data_dir 通知・マウス操作の移行案内・初回設定で同じ述語を使う。
+- `fullscreen_idx == None` は内部 close→reopen でも発生し、閲覧終了を意味しない。
+  毎回既存所有者を読むことで、保留中は描画とモーダル入力停止の両方を無効にし、
+  真の取消・終了で所有が終われば通知を表示する。新しい bool / latch / 遅延 / repaint は加えない。
+  `fs_viewport_shown` 単独では、閉じた後の cleanup フレームも閲覧中と誤認するため使用しない。
+- 同型の継続経路は以下。通常の folder scan / staged Smart・履歴の準備は旧ページを
+  採用まで保持する経路もあり、index が残る場合は従来の `fullscreen_idx` 判定で保留する。
+
+  | index が空になる継続・退避経路 | 読み取る既存所有状態 |
+  | --- | --- |
+  | PDF/ZIP（EPUB の PDF 化後も含む）の列挙後 reopen、明示 leaf / snapshot からの再開 | `fs_nav_after_pdf_enumerate` |
+  | 製本 projection 完了・提示許可後の deferred open | `book_deferred_open_wait_active()` |
+  | 確認なし変換・直接読取り後の reopen | `archive_convert_deferred_fullscreen_active()` |
+  | 採用済み navigation の sidecar hydration 後 reopen | `sidecar_restore_navigation_fullscreen_wait_active()` |
+  | navigation holdover に属する従来の exact-page sidecar 復元待ち | `fs_nav_deferred_reopen_wait_active()` 内の context / generation / exact target 照合 |
+  | active detached の初回準備・scan / 分類 / 履歴 / 変換 / 列挙 / password / bookmark 待ち | `detached_active_window_alive_wanted()`（既存 session / runtime の生存要求） |
+  | active context の App 外への退避、別の still/media 窓への park / promote | `active_detached_context_is_at_rest()` / `detached_image_windows` |
+
+- 変更しない経路: detached の open / switch / close / cancel、context の mount / park / promote、
+  viewport の生成・維持・破棄、placement、HWND / focus / z-order、既存入力 routing。
+  通知の非表示時に入力を止めないという所有境界の修正であり、detached の症状を
+  guard / delay で抑える変更ではない。
+- 合意: ClaudeCode と独立レビュー Codex（2026-10-19/20）は、既存 detached 所有状態を読む
+  この通知述語の変更を「開閉・viewport 遷移を変える症状パッチではない」と判断・合意済み。
+  P2 は内部遷移中の判定漏れ、P3 は本節への記録漏れとして指摘され、今回それぞれを補う。
+- 再レビュー P2 への追補: 真の取消出口 `finish_fullscreen_navigation_for_true_close()` に
+  `retire_book_deferred_open()` と `clear_archive_convert_deferred_fullscreen()` を接続する。
+  既存の列挙・sidecar・folder navigation 取消と同じ境界で再開予約の寿命を終える修正。
+  製本 projection と変換本体・一覧更新は継続し、遅着の完了が元の予約で閲覧を再開しない。
+  変換の既存 clear helper は holdover も解放するため、navigation sequence の終了処理後に呼ぶ。
+  待機画面の Esc / ×、通常の閉じる操作、Backspace のページ一覧戻りはこの出口を共有する。
+  detached 初回 Preparing の lease 専用取消は既に製本 permission と該当 lease の変換を
+  退役させているので変更しない。detached session/runtime・viewport の遷移経路も変更しない。
+  製本の context / generation / scope・candidate correlation と、変換 state が所有する受信口・
+  現在の復帰予約を使い、新しい世代・待機フラグは追加しない。
+  変換 state は App 共通なので、既存 `ViewerContextId` を発行元として復帰予約に捕捉する。
+  共通取消出口はその context が一致するときだけ既存 clear helper を呼び、別 viewer の
+  Esc で元の予約を消費しない。捕捉する constructor を App 側（snapshot_ops）へ移し、
+  registry の projected identity API の private 境界は広げない。永続データの追加はない。
+  同名予約を持つ EPUB 変換は全 phase が可視モーダルで、Esc / × は既存の
+  `finish_epub_convert(Abort)` が state・予約・受信口ごと退役させる別の取消契約なので変更しない。
+  書庫の `auto_fullscreen` は明示 open 用で、復帰予約を付けるナビ入口は false を渡す。
+  今回はその独立した明示 open の契約へ広げず、待機中の復帰予約を退役させる。
+
+- 再々レビュー P2 への追補（2026-10-20）: 上記の「経路を変更しない」は当初の通知述語の
+  読取り範囲についての記録。今回の明示指示により、**再開予約の退役境界も変更する**。
+  backend の close は UI の待機画面を描画せず `accept_viewport_close_request` から入るため、
+  Esc 用の終了処理だけでは全入口が合流していなかった。全呼出し元を追い、
+  `close_fullscreen_to_completion` は終端 teardown 用、`retire_context` は at-rest bundle の
+  退役用であり、どちらも内部 folder-nav close の共通関数ではないことを確認した。
+  既存コードには両者すべてが通る一点がないため、予約所有者の共通終点
+  `retire_viewer_reopen_requests(context)` を registry 内に置く。
+
+  | 終了入口 | 共通終点までの経路 |
+  | --- | --- |
+  | 待機画面 Esc / UI close、通常 close、Backspace のページ一覧戻り | `finish_fullscreen_navigation_for_true_close` → 共通終点 |
+  | backend の全画面 close | `accept_viewport_close_request` → `close_fullscreen_to_completion` → 上記終了処理 |
+  | backend の active detached close（mounted / at-rest） | `accept_active_detached_window_close` → `close_fullscreen_to_completion`（at-rest は `close_and_retire_context` 経由） |
+  | passive detached close、発行元 context の単独退役 | `retire_context` → 共通終点（`begin_retire` 成功後） |
+  | 内部 folder-nav close→reopen | `close_fullscreen_for_folder_nav_reopen` → `close_fullscreen`。共通終点を通さず予約を保持 |
+
+  前回 snapshot_ops に置いた製本・書庫の予約退役は共通終点へ移し、context ID が一致する
+  所有者だけ退役させる。製本 permission の既存退役を bundle 自体でも使えるようにし、
+  Retiring bundle を無理に mount しない。書庫は App 共通予約だけを外し、現在投影中の
+  兄弟の lock / holdover は解放しない。close 完遂後の context 退役で同じ終点を通っても冪等。
+  context 消滅時の規則は「context 退役時に予約も退役」に統一し、完了を待って残さない。
+  直接読取りと変換キャッシュの両完了は一覧採用後の共通再開 helper で既存 `owner_context` の
+  Mounted / AtRest を照合する。一覧採用自体で退役する可能性があるため、予約を取り出す時点ではなく
+  再オープンの直前に照合する。生存中の退避 owner は認め、退役済み ID は再開を許可しない。
+  変換本体・キャッシュ生成・通常の一覧採用は従来どおり。新しい bool / generation はない。
+  同型の再点検で、EPUB も backend close はダイアログ自身の Abort を通らないことを確認した。
+  前回の「EPUB は変更しない」はダイアログ自身の Esc / × の契約については維持するが、
+  今回は mounted / Retiring bundle の EPUB `deferred_fullscreen` も同じ共通終点で退役させる。
+  viewer close では変換を継続し、遅着完了は PDF の一覧準備だけを行う回帰を追加する。
+  context 自体を捨てる場合の worker Drop / cancel は従来どおり。
+  PDF/ZIP 列挙・folder scan の予約は既存 bundle とともに退役する。App 共通 sidecar 復元は
+  既に target context の生存照合・消滅時の discard があり、別 context へ再開を渡さない。
+  backend hook を実際に呼ぶ全画面 / detached 回帰、context 単独退役、遅着完了、
+  内部 reopen の保持、兄弟 holdover の非干渉を追加した。RawInput の Close 回帰とは区別する。
+  `close_fullscreen_to_completion` から既存終了処理へ合流することで、PDF password request
+  （bundle 所有）を外した際の共通 editor（App 所有）の扱いも対象になる。共通入力欄の初期化は
+  `pdf_password_dialog_path` で所有者が残らない場合だけ行い、既存の兄弟 prompt 非干渉テストを維持する。
+  §2 の BA-7（所有者と資源寿命）の境界を揃える修正であり、viewport の生成・配置・
+  開閉判断・mount / park / promote の変更や症状 guard は加えない。
+  当初の通知述語が症状パッチでないという ClaudeCode・独立レビューの合意
+  （2026-10-19/20）は上記のとおり保持する。今回の退役境界変更は再々レビュー指摘への
+  利用者の明示対応方針に沿ったもので、追加差分の独立検収済みを意味しない。
+
+### 2026-10-18 §1.395: 全viewportのsurface窓寸法制約
+
+設計担当ClaudeCodeと独立設計レビュー（GPT-6.1 Sol / xhigh）の合意済み指示を受け、
+実装担当もPainterの初回safe／unsafe取り付け、共通resize、status再configure、Lost再作成をsourceで確認した。
+Windowsの全viewportで、renderer所有者である`vendor/egui-wgpu::Painter`がHWNDへ固定device上限を登録し、
+窓の外寸とconfigure寸法を`max_texture_dimension_2d`以下に保つ。
+panicの境界はconfigureへ渡す物理client寸法のdevice上限超過であり、外寸も同じ上限以下にするのは
+その不変条件を保証するための保守的な設計である。
+取り付け時はdevice確立後にsubclass登録・実窓補正を済ませ、再取得した実client寸法だけをinstallへ渡す。
+subclass迂回のresizeも同じ補正へ通し、surfaceだけをclampしない。解除はWM_NCDESTROYに集約する。
+実Painter回帰で判明したDXGIの同一HWND制約にも従い、WindowsのLost再作成では旧surfaceを先にdropし、
+検証済みの寸法・HWND値だけを新surfaceへ引き継ぐ（従来はconfigure完了まで旧surfaceを保持していた）。
+窓とrendererの所有境界で寸法契約を成立させる構造的修正であり、detached固有の症状guard・遅延・retry・
+追加repaintではない。既存Painterを単一所有者とし、新pending／placement同期経路を作らない方法で簡素化した。
+device要求上限8192、非Windows、`src/`の窓制御・detached述語・rect一致捕捉は変更しない。
+純関数・非表示HWND・実Painterの自動回帰を追加する。実装担当による製品起動・画面操作は行わず、
+設計担当の最終受入・利用者による実機確認とは区別する。
+
+同日、設計担当の実機確認で製品loggerが寸法制約のlog facade警告を転送しないことが判明したため、
+固定target `egui_wgpu::surface_window_limit`のWarn以上だけを既存の非同期sinkへ接続した。
+全viewport共通の診断境界の修正であり、窓制御・detached状態は変更しない。
+LimitingはDefSubclassProc前の要求が上限超過、または処理後の寸法を実際にclampした
+各WM_WINDOWPOSCHANGINGにつき1件記録する。winitが要求を大きくした場合も記録する。
+ログ抑制状態とWM_ENTERSIZEMOVE／WM_EXITSIZEMOVE追跡は撤去し、Correcting・失敗も毎回残す。
+通常の対話リサイズはWM_GETMINMAXINFOのptMaxTrackSizeで上限に止まる。
+従来のWM_ENTERSIZEMOVE後のSetWindowPos100回試験は合成された超過要求であり、通常ドラッグの証拠とはしない。
+実Painterのzero-client取り付け・描画でconfigure／acquireを行わず、非ゼロresize後は描画できることも
+非対話回帰の対象とし、製品の実機受入とは区別する。
+
 ### 2026-10-15 C1採択: 独立readerの受動更新停止
 
 **現在の利用者採択はC1だけ。案Aは不採用の履歴として保持し、source／main-owner境界の考え方だけを参照する。**
@@ -5385,3 +5698,522 @@ close/retire/取消の終端後の遅いhookは開始を公開しない。viewpo
 採択済み§27.6と利用者のD4実装指示を根拠に実装し、独立完成レビュアーも上記の具体的所有境界を
 症状パッチでなく構造修正として確認した。素材・通常producerとflat-firstを維持し、新detached bool・同期I/O・tick/queueを追加しない。
 実装・自動検証・残る実機gateは[page-turn計画 §27.12](page-turn-animation-plan.md)を正本とする。
+
+### 2026-10-16 egui 0.37 更新に伴う構造修正 (設計上の合意済み・未実装)
+
+[更新設計書第4.2版](egui-0.37-update-plan.md) §4.2・§4.5・§4.8・§4.9・§4.11の
+構造合意対象を、段0bで実装担当が下書きした。§2を再読した。
+**合意 (2026-10-16)**: 設計担当 (ClaudeCode Opus) と独立レビュー担当 (GPT-6.1 Sol / xhigh) の双方が、
+以下の 11 項目すべてについて「症状パッチではなく構造的修正である」ことに同意した (段0a・段0b のレビュー、ACCEPT)。
+これは設計上の合意であり、各項目の実装は各段の実装レビューで改めて受け入れる。実機確認・修正前失敗/修正後成功は主張しない。
+**追加合意 (2026-10-16、設計書第4.3〜4.4版)**: 利用者が案B (Windows の最小化中も要求済み repaint を UI pass として消化し、
+surface 描画の要否は別に判断する。RedrawRequested 期限超過の LogicOnly は残す) を選んだ。これに伴う
+(1) scheduler 方針の変更と残る期限超過経路、(2) root Close (トレイ退避・保存待ち・settings-family・ZIP 取消) の非描画 lifecycle 化、
+(3) `with_viewer_context` の owner 付き状態更新と mount 時の表示再採用・reconciliation の境界分離、
+(4) immediate 子窓の描画判定 (両 backend の `render_immediate_viewport` で子自身の metadata と明示描画要求を使う) について、
+設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.4版 ACCEPT) の双方が「症状パッチではなく構造的修正である」ことに同意した。
+下の 11 項目のうち「App の logic/ui 分離」「scheduler 付け直し」「非表示子 Close」の範囲を、この追加合意で補う。
+**追加合意 (2026-10-17、設計書第4.5版)**: 段3 の途中で、App 起点の子 viewport 退役 (mode change の「描かないことで GC に消させる」退役、
+active / parked / passive の終了、Remote 起点、watcher、bar の ×) を App::logic から行えず、App が先に owner を終えると段2c の Close hook が対象を同定できない
+受け渡しの不足が見つかった。App の Closing と binding を backend の受理まで延命する案は採らず、App の既存終了判断が確定した時点で、
+対象の登録寿命と子孫への退役権限を、子の GC に依存しない root の viewport command 出力へ型付きで一度だけ移譲し、backend が pass 外で
+native → Context → IME の順に対象限定で退役させる契約とした (権限移譲・寿命同定・配送境界・cleanup・終了入口・Remote の readiness)。
+設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.5版 ACCEPT) の双方が「症状パッチではなく構造的修正である」ことに同意した。
+**追加合意 (2026-10-17、設計書第4.6版)**: 段3 の実装で見つかった 2 件について、(1) 退役する別窓の Close 後の表示継続 (bookmark 一覧の更新・最後の実フォルダ復帰・auto-open の親一覧復帰) を、teardown の前に捕捉して存続する main の既存 navigation 帰還 owner へ型付きで移す (Remote 取得・新 navigation・新 bookmark 開始で同じ owner が失効させる)、(2) discard 再 pass に進む直前に生成済みの texture delta を既存の backend 共有 renderer owner へ一度だけ移譲し、旧 pass の set / partial が後発の free に追い越されないようにする、の 2 点を、設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.6版 ACCEPT) の双方が「症状パッチではなく構造的修正である」と合意した。
+旧版の静的調査・非対話検査は[段0b基準台帳](egui-0.37-baseline.md)へ分ける。
+以下のBA番号は§2が参照する[提案書§2](detached-viewer-lifecycle-redesign-proposal.md#2-初期診断の壊れた前提と現在の解消状況)への対応であり、各BA全体の解消を主張しない。
+
+段1b-1の旧版上の抽出記録は[段1b検証台帳](egui-0.37-stage1b-verification.md)を参照。
+Appの旧呼出順・早期return・mount先を保持し、passiveイベントdrainを非描画関数へ抽出する。
+非表示Close hook/退役の接続はまだ行わず、UI依存のworker採用継続も台帳へ返す。
+症状パッチではなく、上記合意済みのApp責務境界の切り出しである。
+
+- **Appのlogic/ui分離（BA-5 / BA-7）**: `src/app.rs`のservice/input/render/post-renderと
+  eframe App接続、各ラボ・`vst3-host-tester`のApp実装を対象とする。worker結果・取消/保存終端・
+  Remote完了・tray要求をUI入力に依存しないserviceへ分け、結果採用は既存registry/mount ownerへ戻す。
+  古いContext events・key level・pass counterをserviceの操作や進行条件にせず、表示ACKは描画側に残す。
+  必要なwakeに応じて進め、常時tickは追加しない。
+  frame内のmodal gateを早く外さない責務分離であり、update全体の改名、追加repaint、
+  logicからの強制UI呼出し、非表示guardや新pending boolで埋めない。
+- **viewport callbackのUi化（BA-5 / BA-7）**: `src/ui_fullscreen.rs`のdeferred/immediate、
+  本体・ラボの関連描画とvendor eframeのcallback接続を対象とする。受け取った`&mut Ui`を描画入口とし、
+  `ui.ctx()`と対象viewportの入力/出力所有を揃えるAPI移行である。既存window identity・lifetime・
+  placementを保ち、rect捕捉guard、geometry由来recreate、追加keep-alive/repaintで代用しない。
+- **gamepad物理取込みと配送の分離（BA-7）**: `src/gamepad.rs`、`src/app/gamepad_input.rs`、
+  Appのsample/service接続を対象とする。物理drain・保持更新はApp-global単一owner、操作batchと
+  modal判断は既存mounted contextへ残す。UIが進まない間の未配送edgeと意味終端も同じ物理ownerで
+  順序保持し、UI入口で一度取り出してmulti-pass batchを固定する。取込み時の既存OS前面判定を共用し、
+  離散press/repeat抑止と、復帰後の保持軸継続・release/disconnect/ring/Undo終端を分ける。
+  段1bは旧順序の抽出だけ、logic接続は段3。二重drain、新App pending bool、時間窓、
+  最終保持値だけへの置換、復帰後の中立通過要求は採らない。
+- **保留RawInputのviewport所有（BA-7）**: vendor eframeの`native/epi_integration.rs`、
+  `wgpu_integration.rs`・`glow_integration.rs`を対象とする。共通EpiIntegrationの保留を各Viewportへ
+  移管し、同じownerの保留＋新規入力だけを順に連結してhookへ渡す。root LogicOnlyの未消費入力は
+  rootへ返し、child skipはStateのtake前に判断する。deferred/immediateも同じ取得境界を使い、
+  明示終了時だけ対象の入力を終端する。誤配送を後から捨てるguard、hide/minimize時のprune・
+  一括reset、silent fallback、App側の第二queueや新pending boolは採らない。
+- **IME中断要求のviewport所有・入れ子pass（BA-7）**: vendor eguiの`memory/mod.rs`・
+  `context.rs`を対象とする。Memory共通の要求を既存viewport別Focusへ移し、begin/endは対象entry
+  だけを扱う。既存viewport復帰で親のownerを再選択するため、子beginによる親要求の消失と
+  子要求の親出力への混入を生成境界で防ぐ。実TextEdit＋同一Contextの実入れ子run_uiで親だけ/子だけ/
+  両方/なしを検査する。新map・App補助flag・手動退避復元・delay/retry・追加repaintは採らない。
+- **discard再passのIME出力集約（BA-7）**: vendor eguiの`data/output.rs`のappendと
+  `context.rs`の実run_ui回帰を対象とする。同一viewportの未配送出力では新しいIME metadataを採り、
+  中断要求はORで保持する。Noneの従来集約を保ち、一度移譲した後の新規runへ要求を残さない。
+  親子PlatformOutputを混ぜず、実TextEdit・第1pass要求/discard・第2pass新矩形で検査する。
+  消失をconsumer側で補うguard、Context外sticky flag、新queue、ACK待ち、retryは採らない。
+- **native IME intent配送（BA-7、対象同定はBA-1の禁止事項も維持）**:
+  `src/video/native_presenter/render_core.rs`、`native_window_host.rs`、`native_window_pump.rs`と
+  既存配送接続を対象とする。集約済み中断を一度だけNativeWindowIntentへ移譲し、既存control queue・
+  WindowEpochでIME入力/cursorと同じHWND owner threadへ届ける。取消後のOS通知は既存入力正規化へ戻す。
+  visual snapshotの上書きでpulseを落とす境界を直すもので、foreground/rectから別HWNDを推定せず、
+  rendererから直接IMM32を呼ばない。新queue/pending bool、retry、偽Commit、IME恒久無効化は採らない。
+- **非表示子Closeの受付・消費・終了owner合流・非描画退役（BA-5 / BA-7）**:
+  vendor eframeのApp hook（`epi.rs`）とwgpu/glow integration、vendor eguiのContext登録GC、
+  本体`src/app.rs`・`src/app/detached_window_manager.rs`・`src/ui_fullscreen.rs`の既存終了service接続を対象とする。
+  OS/programmatic Closeをbackend borrow/lock外・描画pass外で対象ViewportId付き受付へ渡す。
+  passiveは既存modal判断・batch/close-by-idsへ、active/parkedは各既存終了/取消ownerへ委譲し、
+  bar/watcher由来入口も同じ判断へ揃える。子FrameのOS Close読取りを重ねず、承認/拒否とも
+  その一回をinfo.events・保留snapshotから消費する。拒否後の新しいCloseは受け付ける。
+  承認後は子callback/親Fullを待たず、既存Closing・worker/media/gesture終端、backend window/
+  WindowId対応/State/surface/入力、Contextのviewport/親子登録を対象限定で退役する。
+  通常GCと処理を共有するpass外入口を新設し、未配送deltaは共有rendererへ引き継ぐ。
+  後続root/兄弟出力から再作成させず、兄弟の入力・IME・資源・寿命、root終了/tray契約を維持する。
+  非管理Appの明示的な従来UI委譲は保持するが、管理対象のsilent fallbackには使わない。
+  復帰待ちqueue、新pending bool、拒否ラッチ、retry、追加repaint/RequestPaintWhileHidden/強制UI、
+  全memory reset、退役済みIDの別抑止ラッチは採らない。hide/minimizeだけでは退役しない。
+- **scheduler付け直し（BA-5 / BA-7）**: vendor eframeの`native/run.rs`とintegrationを対象とする。
+  本家hidden repaint基本修正と、現vendorのdirty/painting・surface generation・outer phase・
+  非ゼロresize provenance・初回visible commitを区別して移植する。描画可否とservice進行の境界を
+  揃える構造修正で、frame頻度の差をdelay/retry・常時追加repaint・新pending boolで隠さない。
+- **texture delta付け直し（BA-7）**: vendor eframe/egui-wgpuのpending・renderer/winit、
+  本体native overlay・各headless consumerを対象とする。set drain→upload/描画submit→free drainを
+  完結ownerへ揃え、surfaceなし・acquire不成立・早期終了・viewport消滅も完結または既存ownerへ引き継ぐ。
+  同一IDのwhole/partial順序と共有rendererを保持し、headlessは検査後だけ明示破棄する。
+  window終了を理由に共有deltaを捨てず、製品の無条件clear・兄弟一括reset・二重適用・
+  重複空submit・GPU待機・retry・silent fallbackは採らない。
+- **surface付け直し（BA-7、BA-4のidentityを維持）**: vendor egui-wgpuの`winit.rs`、
+  本体`src/lib.rs`と`src/video/native_presenter/{overlay_gpu,render_core}.rs`等のsurface接続を対象とする。
+  対象surfaceだけの破棄、Surface/DeviceEpoch寿命、configure write lock・submit/present read lockを
+  新APIでも維持する。AutoVsync/latency方針を保ち、presentをgate外へ出さない。
+  geometry由来recreate、全surface clear、新device-lost latchやretryで寿命の誤りを隠さない。
+
+簡素化は既存ownerへの移管と既存終了/GCの共通化を採る。全窓をmodal化したり閉じて開き直す案は、
+既存の非表示処理・複数窓・保持軸継続や閲覧状態を失い、入力/出力の所有の誤りも解決しないため採らない。
+長い処理の既存modal gateは維持し、汎用非表示入力層・新しい回復機構は作らない。
+共通してguard・delay・retry・追加repaint・一括reset・silent fallback・新pending boolを根因修正の
+代用にしない。まれな失敗は既定のログ・通知・fault終端へ揃える。
+今段は文書下書きのみ。修正前失敗/修正後成功、実機観測、実装レビューの完了は主張しない。
+
+#### 2026-10-17 段2c-1の準備graph実装記録
+
+上記合意のうち既存scheduler・visible commit・delta配送の付け直しを、`vendor-next/eframe`
+0.37.0原本コミット`83836dd16`上へ実装した。**実装担当の内部確認**であり正式な独立ACCEPTではない。
+dirty/painting・surface generation・非ゼロresize provenanceとouter phaseを移植し、本家250msの
+期限超過はLogicOnlyのまま接続した。既存100ms下限・要求なしsleep・rootのvisible commitを保持する。
+wgpuの既存pending deltaを共有rendererと対応するSharedState ownerへ一本化し、非描画・消滅時も
+同じmutable consumerへ渡す。これは合意済みの所有境界の付け直しであり、viewport別入力や
+UI省略をguardで補う症状パッチではない。詳細・検証範囲は[段2台帳](egui-0.37-stage2-verification.md)に記録した。
+案B、保留RawInput所有、子Close受付・消費・非描画退役、root Close追加回帰は段2c-2〜4へ残す。
+root製品graph・Appの判断は変更せず、実window・live試験は実行していない。
+
+#### 2026-10-17 段2c-2の準備graph実装記録
+
+上記の保留RawInput所有合意を`vendor-next/eframe`へ実装した。共通EpiIntegrationの保留を
+各backend Viewportへ移し、同ownerの保留→新規入力をhook前に連結する。root LogicOnlyは
+未消費入力を同じrootへ返し、skip子はStateをtakeしない。wgpu／glow、deferred／immediateで
+共通取得helperを使い、ユーザーコード中はbackend borrow／lockを保持しない。
+native window再生成ではlogical ownerは続くため旧Stateの未消費入力を既存保留へ移譲し、
+logical ownerの通常GC終了では対象の入力だけを終端する。兄弟の保留を変更しない。
+準備egui-imeは通常Context GCの既存output_hookで対象composition／focus contract／retryを整理する。
+run_logicだけではinput_hook pruningが走らないため、同ID再open前に旧ownerを終端する修正である。
+新queue／pending bool／汎用復帰フィルタ／hide・minimize prune／一括resetによる症状パッチではない。
+**実装担当の内部確認**として実integration・実State・実TextEditと対象限定寿命の非対話回帰を行い、
+部分復元で失敗する証拠も段2台帳へ記録する。正式な独立ACCEPTではない。
+案B・immediate描画資格は2c-3、Closeの受付・消費・承認後のpass外退役とそのpolicy整理接続は2c-4。
+root製品graph・Appの判断は不変、実window・live試験は実行していない。
+
+#### 2026-10-17 段2c-3aの準備graph実装記録
+
+合意済み案Bのうちroot／deferredの主経路を`vendor-next/eframe`へ実装した。
+要求済みFullはWindows最小化でもUIを進め、実metadataを保ってsurface描画資格を別に決める。
+明示的LogicOnlyと本家250ms期限超過、他OSのocclusion、要求なしsleep・100ms下限・
+outer phase／bootstrap／resizeの既存例外は変更しない。常時tickや追加repaintではない。
+同じ主経路の出力helperでplatform／IMEとclipboard actionをpaint外で対象ownerへ配送し、
+当該UIの明示描画要求を既存action ownerへ一度だけ移してからpaint判定する。
+非描画時もwgpuは既存delta consumer、glowは有効な生存contextでresourceだけを適用する。
+Full中の出力元GCで他viewport宛commandや共有deltaを取り落とさず、非描画ではpresent・
+visible commit・実表示ACKを発行しない。App flag／新queue／pending bool／retryで補っていない。
+**実装担当の内部確認**として実integrationと両backendの実使用helperを窓なしで検査し、
+部分復元で失敗する証拠を段2台帳へ記録する。正式な独立ACCEPTではない。
+今回はコミット分割のため主経路だけ。immediate子自身の描画資格と出力完結は2c-3b、
+子Closeの受付・消費・pass外退役とroot LogicOnly Close回帰は2c-4へ残す。
+root製品graph・Appの判断は不変、実window・live試験は実行していない。
+
+#### 2026-10-17 段2c-3bの準備graph実装記録
+
+合意済み案Bのimmediate子の範囲を`vendor-next/eframe`の両backendへ実装した。
+実登録callbackが共通driverを通り、子自身の最新metadataとScreenshot／PaintWhileHiddenから
+surface描画を判断する。親最小化でもvisibleな子は描画し、親子最小化なら子UIだけを進める。
+親Fullから実際に呼ばれた子だけを扱い、LogicOnlyに子UIを強制する経路は追加しない。
+子UI中にnative borrowを保持せず、共有deltaを先に受領してから対象Stateへplatform／IME・
+clipboard actionを渡し、描画しない場合も資源適用と通常viewport commands配送を行う。
+glowは既存rendererのdelta ownerをRcで共有し、viewport別ownerを除いてGL資源とsurface描画を分離する。
+実入れ子passのcommandsはegui既存の親FullOutput集約に従い、通常配送後の必要な既存Fullの列で
+子Screenshotを完了する。Contextの規則・schedulerを変更せず、新queue／pending bool／retry・
+追加repaint・強制UI・App補助flagで補っていない。非描画でpresent／visible commitを発行しない。
+**実装担当の内部確認**として両実immediate入口とfake window／painter、実Contextを使い、
+親／子のpaint・callbackを分けた回帰と部分復元での失敗を確認した。詳細は段2台帳。
+正式な独立ACCEPTではなく、実HWND／GL surfaceは未実施。owner不在fixtureは資源配送の検査であり、
+Close／退役・再作成防止の検査ではない。Close受付・消費・非描画退役とroot Close回帰は2c-4へ残す。
+root製品graph・App・lockは不変。実window・live・製品は起動していない。
+
+#### 2026-10-17 段2c-4aの準備graph実装記録
+
+合意済みの非表示子Close受付・消費・非描画退役を、`vendor-next/eframe`の両backendへ接続した。
+対象ViewportId付きApp hookを、OS event完了とouter Full／logic前後のborrow・lock／pass外で呼ぶ。
+承認／拒否した要求はinfo.events・保留RawInput／State snapshotとContextの既存cached metadataから
+Closeだけを消費する。拒否後の新Closeを抑止せず、通常入力や兄弟の要求をresetしない。
+既定Appは従来UIへ委譲し、rootの終了／tray経路を子hookへ置き換えない。
+承認はAppの既存終了ownerによる確定結果とし、native公開停止・window／WindowId対応／State／surface／
+入力の対象／子孫cleanupを通常GCと共有する。既存共有rendererへのdelta移譲を先に済ませ、保持deltaを捨てない。
+borrow外でContext::retire_viewportへ接続し、返却IDだけのegui-ime composition／focus contract／retryを
+明示整理する。準備eframeのegui-imeをnative実依存へ移した。hide／minimizeだけのpruneは行わない。
+Contextのsnapshot消費補助入口は既存入力metadataだけを処理し、登録を作らず通常event列を保つ。
+追加repaint・強制UI・RequestPaintWhileHidden・新queue／pending bool・拒否／退役IDラッチ・retry・
+全memory resetで補っていない。子callbackや親FullでGCを起こす代用も採らない。
+**実装担当の内部確認**として実使用dispatch・消費・cleanupとfake App／resource owner、実State／Contextを
+接続し、拒否後Fullの非再発火・新要求・実際の資源drop・後続出力の非再作成・兄弟とIME policy保持を検査した。
+部分復元で失敗する証拠と全featureの結果は段2台帳。正式独立ACCEPT・実HWND／GL確認ではない。
+分割指示に従いroot logic-only Close確定回帰は2c-4bへ残す。製品Appの既存終了owner接続は段3。
+root製品graph・両lock・schedulerは不変。実window・live・製品は起動していない。
+
+#### 2026-10-17 段2c-4bの準備graph実装記録
+
+合意済みのroot Close非描画lifecycleについて、準備eframeの共通実update_logic_onlyに回帰を接続した。
+fake AppのlogicだけがCancelClose／Closeを返し、uiは呼ぶと失敗する。logic直後に終了が止まる／
+確定することと、完了後のCloseが通常出力から次回入力へ一度だけ渡ることを検査する。
+wgpu／glowのfeature別に同じ実integrationを使い、両backendの既存root保留入力返却・event消費2行を
+共通helperへ抽出した。native入口との接続はsource照合で、実OS／HWNDを動かした検証ではない。
+本家のlogic直後のClose確定、通常入力保持、root終了／tray契約は変更しない。製品policyは持ち込まず、
+新pending bool・repaint・強制UI・retryを足さない。製品の既存終了ownerへの接続は段3で行う。
+**実装担当の内部確認**として3種類の部分復元で失敗を確認し、復元後の非対話gateを実行した。
+正式な独立ACCEPTではない。段2準備graphの実装完了と後続引継ぎ一覧は段2台帳へ記録する。
+root製品graph・両lock・schedulerは不変。live・製品は起動していない。
+
+#### 2026-10-17 段3の実装途中記録・設計判断待ち
+
+段2の4 crateを正式vendorへコピーし、製品graphをegui 0.37 / wgpu30へoffline解決した。
+App::logic/ui、root Ui・viewport callback、入力、native GPU/delta/IME control配送を移行中。
+これは**実装担当の内部確認**であり、段3完了・正式な独立ACCEPTではない。
+
+製品C1の正式接続で、App起点で既に終了した子のbackend退役手順が未定義であることを確認した。
+`close_all_detached_viewers_for_mode_change`は旧空immediate UIによるcleanupを残す一方、
+`finish_active_detached_session_close`はruntime/bindingを先に終端する。
+段2のClose hookは存続ownerの承認を前提とするため、その後のIDだけでは対象を同定できない。
+Fullのlogicはrun_ui内で呼ばれ、pass外専用のContext退役APIも直接使えない。
+既存Closingの寿命をbackend受理まで延ばすか、承認済み退役のtyped commandを用意するか、
+設計判断と独立レビューを要する。合意済み範囲の実装完了とは扱わず、構造を追加する前に停止した。
+Remoteはlogicへ結線せず旧UI checkpointに残す。強制UI・pending bool等の代用品は追加しない。
+詳細と分野別差分・未実施gateは[段3台帳](egui-0.37-stage3-verification.md)へ記録した。
+
+#### 2026-10-17 段3再開・第4.5版の実装途中記録
+
+第4.5版と独立設計レビュー・双方の構造合意（`8944ef6a5` / `f5d632d17`）を受け、
+承認済み退役を既存root viewport command出力へ型付きで移譲する方式を実装中。
+初回の上記設計論点はこの改訂で解決済みであり、履歴は削除しない。
+
+Contextの実登録寿命とcommand sinkを既存detached runtimeおよびstandalone fullscreen ownerのbindingへ保持し、
+終了ownerがtakeして承認を渡してからApp ownerを終える。Closing延命、第二queue、新pending flagは作らない。
+mode-changeの退役用空immediate UIを撤去し、C1・watcher Closeをlogicへ接続した。
+backendはFull/LogicOnly/hookの外で同じcleanupを使い、旧output・同ID新寿命・兄弟IMEを分離する。
+
+別contextの独立実装レビューでは、Closeのbookmark/親一覧表示継続の受渡し、C1終了内pin dirtyの表示採用、
+discard第1passの未配送deltaと第2pass immediateの旧callback freeのsubmission順に未解決P1を確認した。
+この記録は新しいdelta先行移譲callbackの構造合意ではない。新callbackは未実装で設計判断待ち。
+既存ownerでの終端/表示継続分離と、追加受渡し契約を定義してから未完部分を実装する。
+**実装担当の内部確認**やcompile成功を段3完了・独立ACCEPTには読み替えない。
+分野別差分・回帰候補・コマンド結果と未達gateは[段3台帳](egui-0.37-stage3-verification.md)へ追記する。
+
+上記dirty採用P1は、既存App-global dirty集合とgate付き一覧UI consumerの存続を双方で確認した後、
+非描画Close内の表示consumer 2呼出しを外す形で補修した。新owner・状態・待機を追加しない。
+実App::logicからRemote取得・fullscreen終了を進めつつdirtyと表示itemsを保つ回帰を追加し、結果を段3台帳へ記録する。
+Closeのbookmark/親一覧継続とdelta配送の構造契約は引き続き未解決であり、今回の局所補修をその合意へ拡大しない。
+
+正式graphではApp退役10、continuation36、root lifecycle11、context-state8、gamepad94が成功した。
+vendor退役はegui14・eframe両backend各10、最小化Fullはwgpu9・glow11、viewport入力は両backend各5が成功。
+本体default全23 test executableはno-runでコンパイル成功。IME/native control等の結果も段3台帳へ記録した。
+これらは2件の未解決P1や製品Full接続回帰の不足を代替しない。stage3完了・独立ACCEPTではない。
+deltaは既存shared TextureManagerへ戻す案も検討したが、現epaint APIにはmetadata非変更の返却がなく、
+限定API追加・年代順合流・出力hook観測の契約が必要であることを双方がsourceで確認した。
+新callback案だけを必須の結論とせず、いずれの新経路も設計判断前には実装していない。
+
+#### 2026-10-17 段3再開・第4.6版の実装記録
+
+第4.6版（97ab24ae1）と独立設計ACCEPT・双方の構造合意（5c1584d8a）を受けて実装を再開した。
+上のClose帰還・delta配送の設計待ちはこの改訂で解決済みであり、過去の停止記録は残す。
+
+既存帰還boolを型付き状態へ置き換え、teardown前に既存bookmark／main navigationのidentityと所有値を捕捉し、
+存続するmainの既存navigation帰還ownerへ移す。active／standalone／parkedの真Closeを同じ帰還生成へ接続し、
+表示採用は既存main UI consumerへ残す。Remote・新navigation・新bookmarkは受付で旧ownerを失効し、
+型付きcauseによって置換／取得／App終了から通常Close帰還を生成しない。Closing／bindingの延命はしない。
+
+deltaは候補(a)を採用した。実discard再pass直前にContext一致のTLS RAII scopeを通し、
+生成済みdeltaを既存backend共有renderer ownerへ一度だけ移譲する。
+Weakとlock外callback、既存pendingの非相殺受入、描画なしのresource消費によって、
+旧set／partial→submission→後発freeを完結させる。epaint変更、第二queue、cleanup遅延、追加repaintは行わない。
+
+分野別ファイル・判断、限定独立レビューと実コマンド結果、Close／deltaそれぞれの必須回帰対応は
+[段3台帳](egui-0.37-stage3-verification.md)へ追記する。**実装担当の内部確認**を独立ACCEPTと読み替えない。
+
+初期media resolver取消では、既存Preparing sessionにまだ表示itemがなくても、exact leaseがClose用に保持したDetached bookmark targetを失ってはならない。
+第4.6版の共通transfer捕捉点で、既存Preparing・projected window・window/context bindingの同一ownerを確認してこの所有値を捕捉する。
+Ready時の実media照合、main origin/request/置換による失効は維持し、Ready空状態・別context Preparingを拒む回帰を追加した。
+これはteardown前の同じ帰還ownerの取りこぼしの補修であり、新しいqueue、pending状態、寿命延長ではない。
+分野別の限定独立source確認と正式実行の結果は台帳に分けて残す。
+
+段3の実装担当による最終内部確認では、core/test-script/workspace（利用者指定のlauncher除外）/全target check、
+本体全23 test executableとsnapshot2 targetのno-runが成功した。
+continuation47、root lifecycle11、context-state8、Close13、混在wheel19、App退役10が成功。
+正式vendorではegui退役14、eframe退役はwgpu/glow各12、minimized Fullは9/11、
+discard deltaはegui4・eframe各2・実GPU readback2が成功した。
+lib全件は最後に1回実行し、13,481件中13,132成功・290失敗・既存skip59。
+失敗はその後の限定検証で移行不備179を解消、PNG比較102と段4のlayout/挙動差9へ分類し、残る段3契約違反は0とした。
+PNG更新・ignore追加・製品build/launch・live・`test-full.ps1`は行っていない。
+全件の最終ソース再実行や設計担当の最終ACCEPTとは区別し、選択数・exit code・例外と残課題の詳細は段3台帳を正本とする。
+
+#### 2026-10-17 段3・独立レビュー指摘後の補修（1e55235f1後）
+
+上の「段4差9件／段3違反0」は独立レビュー前の実装担当の内部確認として保持する。
+A〜Dの9指摘はsourceで全て成立し、第4.6版の既存owner間の受渡し・入力所有・出力消費の範囲で補修した。
+
+Close帰還待ちのmain bookmark一覧は、変更ありread-modelと削除receiptでも、旧rowsから選択キーを捕捉して
+live scrollを保つ。既存帰還consumerは採用済みrowsへ復元keysを合わせる。hydrationの既存ownerを迂回せず、
+同passのconsumerと準備完了後の位置をともに検査した。AppのClosingやbindingは延命しない。
+
+immediate子のwheelは子の既存queueから一度だけ消費し、pass-localの型付きproposalがviewport identity、
+pointer / modifiers / drag / 音楽入力許可の事実を意味処理へ渡す。Context cloneを入力snapshotと扱わず、
+親へ戻った後の再消費を廃した。通常→Ctrl→通常の順序と、未提示Display sequenceの既存target gateを保つ。
+新しい非表示入力機構・queue・pending状態・repaint・retryは作っていない。
+
+backendの退役deltaは既存共有ownerへ回収後、非空batchだけresource consumerへ渡す。free-onlyを維持し、
+空の通常イベントでGPU submissionやGL context選択を発生させない。登録寿命・退役権限・pass外cleanupは変えない。
+gamepadも既存handoff内の隣接した同じ終端だけを集約し、UIなしlogicの反復で蓄積量を増やさない。
+
+これらは症状パッチではなく、第4.6版の既存所有境界の取りこぼしを補う構造的修正として実装した。
+限定独立source確認（Sol / xhigh、読み取り専用）はA/C/D2とB/Dに分け、補修後いずれもACCEPT。
+設計担当の最終受入や実機の証明とは区別する。実装担当の実行では、旧処理へ戻した変異でRust回帰のassert失敗を延べ19件、
+MSRV宣言不整合の検査失敗を確認し、変異を全て戻してから最終の指定確認を実行した。
+
+限定libは256件中247成功、残る9失敗はPNG7と既知layout2。Close15、wheel21、gamepad105、
+continuation47、root lifecycle11、context-state8、App退役10は成功。両integrationの高DPI検証7件、
+fullscreen高さの既存サイズ別試験1件も成功した。vendor eframeはwgpu53成功・既存ignore1、glow57成功。
+core / test-script / testerのcheck、全23 test executableのno-run、fmtも成功した。
+lib全件は利用者指定により再実行せず、旧290失敗の追跡分類を第2版（補修180 / PNG103 / 段4差7）へ更新した。
+PNG更新・新ignore・製品build/launch・live・test-fullは行わず、未コミット・未ステージで返す。
+詳細と各指摘の回帰対応表・実command / 件数 / exitは[段3台帳](egui-0.37-stage3-verification.md#独立レビュー指摘への対応1e55235f1後分類第2版)を参照する。
+
+#### 2026-10-17 段3・再確認の子クリック操作ID補修（7cb0494f9後）
+
+同じ独立レビュー担当Cの再確認で、遅延PageSideの操作ID検索だけがrootへ戻った後に残るP3を確認した。
+レビューCは、この補修を「所有境界を正す構造的修正」と明記している。
+子の既存claim内で、pointer操作IDも既存pass-local semantic inputへ捕捉し、最終navigationへ渡す。
+新しいApp状態・queue・待機・再入力・repaintやviewerの寿命延長は作らない。
+実immediate子の通常wheel→Alt+wheel＋単クリックをroot復帰後に適用し、子由来の操作IDと診断、親入力不変を確認する。
+今回2件の補修に対する限定独立source確認（Sol / xhigh、読み取り専用）もACCEPT・追加指摘なし。
+実行と変異検証は段3台帳の「再確認の残件への対応（7cb0494f9後）」を正本とし、設計担当の最終受入とは区別する。
+
+#### 2026-10-17 段3・最終全件との再照合（3aa2d8eda後）
+
+A〜D独立レビューACCEPT後の設計担当の全件では、分類外が3名残った。
+resolver取消の既存テストはmain rowsなし・生成不能な保存keyというfixtureだったため、実在Media行を既存installerで採用する形へ補修した。
+Close帰還consumerのlive row keys採用は維持し、全行削除後の空read-model→帰還consumer→同内容refreshの回帰を追加した。
+製品の所有構造・終了寿命・consumerは変更していない。独立premise / source確認（Sol / xhigh）はACCEPT。
+live keysの再捕捉を省く変異で新回帰が失敗し、復元後に指定の限定確認を行った。
+HUDのWin32通知前提とmetadata testの既存同期競合候補は、製品退行の根拠と分けて設計担当のテスト判断待ちとする。
+詳細は段3台帳の分類第3版を正本とし、過去の「未分類0」や全件の分類記録は履歴として保持する。
+
+#### 2026-10-17 段7・clean install時の未公開atlas配送の補修
+
+段6 gate後、設計担当の承認付き実機起動で、最初のFull前のWindowEvent完結が本家0.37の
+Managed(0)の0×0予約をWGPUへ配送しpanicするP1が判明した。§2を再読した。
+退役callbackのfreeを拾うpass外collectorが、共有managerの通常の未公開deltaまで無条件takeしていた。
+
+第4.6版の既存owner間の受渡しの補修として、同じmanager lock内のfont metadataが初回公開を示すまで
+take自体を行わず、全pendingを元のTextureManagerへ残す。最初の通常end_passが実atlasへ置換して配送する。
+0×0を捨てるguard、第二pending、cleanup遅延、追加repaint、強制UIは作らない。
+Context/nativeの対象限定退役はcollectorより先に進め、公開済みのset/free-onlyは従来どおり即時回収する。
+
+実装前の限定独立設計確認と完成差分の独立source確認（GPT-6.1 Sol / xhigh）は、
+この公開準備の所有境界を直す補修を症状パッチではない構造修正としてACCEPT。
+初回FullなしのContext終了と旧native replacementのsource根拠、回帰の適用範囲、
+実deviceの修正前0×0 validation再現・修正後結果は[段7起動補修台帳](egui-0.37-stage7-startup-atlas-verification.md)へ記録する。
+実装担当は製品起動・liveを実行しない。設計担当の修正後実機確認・最終受入とは区別する。
+
+### §11 追補: 紙めくり D3 の通常準備の所有・採用境界（2026-10-18、設計合意・未実装）
+
+- 対象: [page-turn 計画 §27.17](page-turn-animation-plan.md) 改訂 1 (master `720a3ca5a`)。次の unit の final / Native 出力を先回り準備する
+  (利用者採択の案 A)。D3 は採用 service、viewport の最初の表示選択、mount / park / resume の経路に触れる。
+- 合意: 独立 reviewer (Sol / xhigh、再レビュー) と ClaudeCode の双方が、§27.17.9 の具体範囲で「症状パッチではなく構造的修正」であることに合意した。
+  条件は、既存 context の service と cache / pending / 需要の移譲に限定すること、mount だけで採用・投機再開を行わないこと、
+  HWND 推測・viewport 再生成・placement 保存経路・時間窓・新しい detached フラグを足さないこと。
+- 所有の不変条件: 完成 final は context 内の `final_composite_cache`、作業中は同じ context の pending map (`Computing | CpuReady`)。
+  fork は receiver / cancel / permit を共有しない。A の close・採用・取消が B へ作用しない。park は新しい投機開始だけを止め、
+  既存の表示用カラー化 / LUT 要求は保持する (`viewer_context_registry.rs` の現行監査を維持)。
+- 実装後に記録するもの: 実際に触れた関数、park / resume 契約の実装、兄弟 context 不変の検証結果、完成レビューでの合意。
+
+#### D3-1 実装追補（2026-10-18、実機未確認）
+
+- `update_active_viewer_context` は retained-shift 採用後・gamepad 配送前に同じ context の service を行う。
+  `activate_detached_image_window_snapshot` と ParkedLive の実表示再開は、既存 mount/runtime/retained-shift 再開後に接続した。
+  `with_viewer_context` 等の汎用 mount/deposit には採用を追加していない。
+- `begin_page_turn_viewer_frame`、共通非 close navigation、decision/nav-lock、permission resume、既存 continuation に
+  `service_final_prepare_before_lookup` を接続。close/retire の既存優先、入力 edge の単一観測を維持する。
+  冒頭の detached visibility probe は paint source を捕捉しない非確定参照として明記した。
+- 既存 `final_effect_pending` の park 除外分類は変更しない。結果採用と decision cache 失効は mount された owner のみ。
+  新規投機、CpuReady、permit、予約は D3-1 では導入せず、fork は既存の非共有 receiver/cancel 契約を維持する。
+- 独立 Sol/xhigh の途中レビューでも、既存 context の service/receipt/採用境界へ限定した構造修正であり、症状パッチではないと確認。
+  観測による slideshow cache 置換と通常登録 marker の不足の2指摘は修正し、コード上の解消を再確認済み。
+  兄弟不変の実行結果と独立完成判定は、page-turn 計画 §27.17.12 と同じ `target/d3-1-handoff.md` に記録する。
+- 独立完成レビュー (ClaudeCode が別 session で依頼した Sol / xhigh、2026-10-18、`7388b3f2d`): ACCEPT、P1〜P3 なし。完成差分で
+  「症状パッチではなく構造的修正」に合意。root キー各経路と mounted update 全体の順序の一部は文字列検査で、全入口の端から端までの動的検証ではない (レビュー所見)。
+
+#### D3-2 実装追補（2026-10-18、完成 source レビュー ACCEPT・実機未確認）
+
+- 新しい一般 final の開始は root の `render_prepare_fullscreen_materials` と独立 viewer の
+  `update_active_viewer_context` の既存非 target work 境界に限る。単なる mount/deposit から開始しない。
+- 同じ context の `final_effect_pending` が Computing/CpuReady と要求種別を所有し、fork は新しい空 map、
+  park/promote は既存の資源移譲を使う。cancel/close/内容失効は当該 owner の公開権だけを外す。
+  worker の App 共通 permit は実終了まで、出力予約は登録/破棄まで保持する。
+- park は既存表示用カラー化/LUT と開始済み新 D3 worker を cancel せず保持する。park 中に次 job を開始しない。
+  復帰の D3-1 service で exact 再照合して採用し、host/window identity の変更から新しい detached 述語を推測しない。
+- 独立 Sol/xhigh の実装前構造レビューは ACCEPT WITH CHANGES。同じ context の service/pending/移譲の修正であり、
+  症状パッチではないことに合意。完成 source レビューも ACCEPT、P1/P2 残件なしで構造修正への合意を再確認した。
+  動的検証結果はこの source 判定と分け、`target/d3-2-handoff.md` へ記録する。
+
+
+#### D3-4(a) 実装追補（2026-10-18、実機未確認）
+
+- 正本は紙めくり計画 §27.17.14.10/.11。ClaudeCodeの設計記録と独立Sol/xhighの前提・完成sourceレビューで、
+  既存runtime/binding/dispatchの観測と資源移譲に限る構造修正であり、症状パッチではないことに合意した。
+- `begin_page_turn_viewer_frame` の通常paged描画入口でcontext/destinationを既存 `SpeculativeGpuFrame` に観測する。
+  候補のないownerも含む。ROOT `App::ui` の各pass開始で観測値だけを更新する。
+  mainは実dispatchを通った現在main context、active F12はactive sessionと `locate_window_context` のbinding、
+  runtime Opening/Resuming/Activeを `final_prepare_route_is_current` で再照合する。
+  `ContextResidence::AtRest` は保管位置でありpark判定に使わない。mount、backstopへの入場、
+  passive Parked/ParkedLiveのsnapshot描画だけでは通常live paged経路の証拠にしない。
+- actual offer/curl/mandatory canonical提出の活動は同じouter frameの全retryで単調に保持する。
+  Aをpark/cancelしても当該frameの活動を消さない。次frameは活動を持ち越さず、現在liveのBを再評価する。
+  Aのpresentation state、accepted materials、canonical receipt、leaseをBの登録のために変更しない。
+- `finalize_speculative_gpu_output` はnative wgpu ROOTの全retry後に既存ownerを `with_viewer_context_state` で訪ねる。
+  既存資源の一時移譲であり、publicationを採用するmountではない。hookから入力配送、permission再開、UI実行、
+  viewport生成・再生成、begin/end pass、discard要求は呼ばない。新しいHWND推測・placement・時間窓・detached flagはない。
+- 早期serviceは受信・失効照合・receipt反映・表示用/共有handle採用を維持し、非共有の新規投機登録だけを最終hookへ移す。
+  旧 `LegacyPrefetch` もON/pagedでは非表示GPU登録だけ同じ枠へ通す。park保持・LegacyDisplay・OFF/連結/Splitは従来どおり。
+  exact表示昇格は同passで採用し、incomplete AI publication後も通常品質producerを進める。
+- 通常upload/枠使用済みの既存wakeは最終境界へ移す。演出理由・VRAM不足の保留では追加wakeを発行しない。
+  Computingの既存worker pollは維持し、最終枠へ移したLegacy CpuReadyは16ms pollから除外する。別queue/heartbeatはない。
+- 回帰・完成レビューの結果は紙めくり計画の実装記録および `target/d3-4a-handoff.md` に記録する。
+
+#### D3-4(b) 実装追補（2026-10-19、実機未確認）
+
+- 紙めくり計画 §27.17.14.4/.5/.10/.11 の範囲で、通常 callback の所有 viewport／ppp／clip と次 composition の resident 値を読む。
+  通常 Single／Pair の geometry を共有し、frame 限りの候補を既存 App 共通 `SpeculativeGpuFrame` に移譲する。
+  detached の runtime／binding／live dispatch 判定と context 訪問は (a) の `final_prepare_route_is_current`／`with_viewer_context_state` をそのまま使う。
+- allocation は既存 ROOT 最終 output hook のみ。通常 UI、入力、permission、viewport 生成へ再入しない。
+  全 context の final 登録後に Native を判定する。renderer lock 中に context 訪問や会計 walker を実行しない。
+- Native cache は各 context の通常 `fs_lanczos_cache` 単独 owner、候補と一件枠は App owner。
+  fork／mount／park／promote の資源移譲や receiver 寿命を変更せず、単なる mount／passive snapshot から候補を作らない。
+  park した A の演出状態・receipt・material／lease を B の投機のために解除しない。同 frame の活動記録は (a) と同じく維持する。
+- 新しい HWND 推測・placement・時間窓・detached flag は追加しない。設計担当の既存合意範囲を使い、独立 Sol/xhigh の実装前確認でも症状パッチではない構造拡張と確認した。
+  完成 source 判定と ROOT／viewport／discard／park／兄弟不変／batch lifetime の実行結果は `target/d3-4b-handoff.md` に分けて記録する。
+
+##### D3-4(b) 独立完成レビュー対応（2026-10-19）
+
+- canonical の追加需要は既存 installed unit token の完全性証拠と索引を読み、未採用は見送る。新しい cache owner や context 世代の一括失効は追加しない。
+- 既存 App frame owner の最新 callback 値と再照合し、旧 viewport view を現行と扱わない。最終 hook 中も同じ値 owner を保持し、処理後に消費するだけで、mount／park／promote の意味は変えない。
+- 実 child callback の異なる ppp／clip と ROOT での再照合を headless テストに含める。runtime／binding／dispatch 述語、HWND、placement、viewport 生成、permission は変更しない。
+  設計担当が妥当と判断した P2 二件への修正であり、独立 source 再レビューも既存 owner 内の構造的修正として合意。検証記録は `target/d3-4b-fix-*`。
+
+##### D3-5 merge 後の横断監査（2026-10-19）
+
+- `479f7f65e`（最新master `2410719c7` merge後）で、通常producer、全contextの会計とbatch lease、park／fork／mount／promote の所有境界を再監査した。
+  静的根拠と実行gateの区別は `target/d3-5-audit.md`。runtime／binding／dispatch・HWND／placement・viewport生成は変更しない。
+- canonical Nativeとは別のCPU需要resolverに毎frameの全頁走査とmixed slideshowの列再構築が残るF1を検出した。
+  需要を減らさず、表示token／receiptを置換せず、既存SpreadDisplayUnitsCache内の派生recordへcold一回の証拠／索引を採用する。
+  同じ枝はvisible索引を参照し、異なる枝だけ完全recordを持つ。source／nav／composed／mode／shift／landscape／page-aloneを照合し、
+  warmはscalar／Arc identityだけで読む。共通adoption入口が通常serviceとROOT直接採用を覆い、producer／keep／perf観測も共有する。
+  forkはfresh owner、mount／park／promoteは既存値移譲のままで、新しいworker／pending／bool／世代／detachedフラグを足さない。
+  同owner内の再構築可能なcache field追加が必要な理由と失効契約は `target/d3-5-topology-design.md`。
+  独立設計レビューも既存合意範囲の構造的修正としてACCEPT。完成差分・実行gateの判定は `target/d3-5-*` に分けて記録する。
+- D3-3は利用者決定で次の版の後へ延期（backlog §1.401）。既存編集／comic表示経路を維持する。
+  実機操作・motion、正式3run×30機会gateは未確認。page-turn計画 §27.17.17 に実装済み範囲・計測推移・残作業をまとめた。
+
+### §11 追補: §1.396 スライドショー設定の「…」移動と前面入力状態の解放（2026-10-19、実装・独立レビュー済み・実機未確認）
+
+- 対象: ブランチ `slideshow-1396` (`3db6e24c6` / `d01fcc111` / `5e9e7a5c3` ほか)。HUD のスライドショーボタンを即時開始・停止にし、設定を上部バーの「…」(`FsOverflowPanelState::Slideshow`) へ移した。
+- 触れた detached 経路: `App::reset_detached_pause_foreground_modes` だけ。(1) 廃止した `slideshow_popup_open` のリセット行を削除、(2) overflow パネルを閉じる行の隣に `fs_primary_suppression` のリセットを追加 (直下の `fs_secondary_press.cancel()` と左右をそろえる)。detached の述語・viewport・geometry・placement・focus・window lifecycle は変更しない。
+- 所有の判断: `fs_overflow_panel_state` と `fs_primary_suppression` はどちらも前面の fullscreen viewer の一時状態として App 全体に 1 つ置かれ、open / close / 新規窓 / passive 採用 / 前面 pause の同じ境界で解放される。パネル内で始まった押下の所有 (`OverflowStream`) はこの既存モデルに載せ、ViewerContextBundle への移設はしない (移設は detached 所有境界の変更で別作業)。
+- 合意: 独立 reviewer (Sol / xhigh、2026-10-19 再レビュー) と ClaudeCode の双方が、上の 2 点は「前面を手放す既存境界で同種の一時入力状態を解放する構造的修正であり、症状パッチではない」ことに合意した。reviewer は bundle へ移さない判断にも異議なし。
+
+### §11 追補: §1.403 前面メニューの押下所有と前面境界での解放（2026-10-19、実装・独立レビュー中・実機未確認）
+
+- 対象: ブランチ `front-popup-1403` (`8051885d8` / `4960cda74` ほか)。前面メニュー (上部 / シークのメニュー、右クリックメニュー、egui memory popup) を提示している間に始まった押下を、終端まで前面の所有として背面へ渡さない。§1.396 の overflow 所有と 1 つの確定結果にまとめた。設計は [section403 調査記録](section403-front-popup-input-investigation.md) §8、実装記録は §9。
+- 触れた前面境界 (9 関数): `reset_detached_pause_foreground_modes`、`reset_active_detached_viewport_runtime_for_new_window`、`adopt_active_detached_viewport_runtime_from_passive`、`close_fullscreen_now_with_metadata_boundary`、`toggle_still_window_mode`、`apply_egui_viewer_presentation_for_current_item`、`prepare_viewer_presentation_open`、`apply_video_presentation_switched`、`handoff_active_detached_viewport_to_passive`。いずれも前面の押下所有をその境界で解放する追加で、detached の述語・viewport 生成・geometry・placement・focus・window lifecycle は変更しない。presentation 系は表示先が変わる場合だけ解放し、同じ viewer・表示先のページ移動では所有を保つ (表示先の比較、app.rs `prepare_viewer_presentation_open` 付近)。
+- 所有の判断: §1.396 と同じく前面 viewer の一時状態として App 全体に置き、ViewerContextBundle へは移さない。
+- 合意: 独立 reviewer (Sol / xhigh、2026-10-19 の完成レビューと再レビュー) と ClaudeCode の双方が、9 関数すべてについて「既存の前面境界で同種の一時入力状態を解放する構造的修正であり、症状パッチではない」ことに合意した。
+
+### §11 追補: §1.405 Previous需要と共通資源の優先順（2026-10-19、実装・自動検証済み、実機未確認）
+
+正本は[page-turn計画 §27.17.20/.12/.13/.21](page-turn-animation-plan.md)。今回の範囲が症状パッチではなく
+context所有の需要と共通admissionの構造修正であることは、設計担当ClaudeCodeと事前独立reviewer双方が合意済み（.13）。
+完成差分の承認は別であり、中間sourceレビューの確定P1〜P3指摘なしを完成承認の代用にしない。
+完成sourceの独立レビューもACCEPT（2026-10-20、残存P1〜P3なし）。今回の範囲が構造修正であるとの合意を維持する。
+focused・全lib・snapshot・解析器回帰と計測用buildは成功。途中失敗を含む件数・終了コードと未実施範囲は`target/back-handoff.md`に記録する。
+
+- `FinalUnitPosition`のPreviousは通常ordinal−1。既存後方keep内の全occurrenceだけを補完し、方向履歴やbackward slotを増やさない。
+- `CanonicalCallbackObservation`は既存frame ownerに最新callbackのroute/viewと両位置の収集結果を一体で保持。
+  `finalize_speculative_gpu_output`は既存live dispatch/runtime/bindingを再照合し、全live Nextのfinal/Native成立後だけPreviousを進める。
+- ROOT hookからのresident-only Previous CPU開始を限定拡張する。Next通常producer位置を維持し、UI/input/permission/metadata producerへ再入しない。
+- `reclaim_previous_final_results`は実Next CPU予約拒否時だけBudgetState.units最大2 unitからownerを特定し、mutexを解放後に
+  `with_viewer_context_ref`/`with_viewer_context_state`でparkedも訪問する。元mountへ復帰し、parkedの描画/再開/採用/登録/新producerは行わない。
+  未昇格PreviousのCpuReadyと未受信channelだけが結果回収対象。Current/Next共有素材、DisplayPrepared、legacy、Unknown、held/receipt/batchは保護する。
+  Emptyの実計算中は保持し、高優先化の取消でもworkerのpermit/予約は実終了まで残す。park自体で一括取消しない。
+- Previous Nativeはsmoothing clear・旧source除去・容量pruningによる既存entry除去が文字どおりゼロのときだけ。
+  `prewarm_no_removal_admission`と実行入口の再検査をclaim等より前に置き、通常draw/Nextは維持する。
+- HWND/生成identity/placementや新しいdetached flagは変更しない。fresh fork、mount/deposit/promoteの既存payload移譲、
+  parked presentation/receipt/material/lease保持を維持する。回帰と検証結果は上記.21と`target/back-*`へ記録する。
+- 完成前確認（2026-10-20）で、先頭の診断blockerがUnknownの場合に後続兄弟のPendingを取消条件から漏らす実装を修正。
+  診断と取消を分け、同じ呼出内の全Next状態から`any(Pending)`で導出する。実装担当と独立reviewer双方が設計への整合修正と確認し、
+  両訪問順と取消後の実permit/worker予約保持の回帰を追加した。新しい永続stateやparked回収範囲の拡張はない。
+
+### §11 追補: §1.392 診断用 folder-load 計数の追補（2026-10-20）
+
+`568051638` の独立レビュー P2 を設計担当が採択し、新規の一覧読み込み owner の受理を
+test-script 限定で数える。detached の変換書庫は直接書庫要求の受理、非 RAR の即時 cache hit は
+既存 owner claim の成功後に計数する。Collection の物理一覧受理も含め、detached 経路への変更は
+cfg 限定の計数だけ。
+述語・viewport・placement・focus・表示動作は変更しない。既存 owner による descriptor の水和や
+変換完了を再計数しない所有境界の修正であり、症状パッチではない（設計担当の明示方針と Codex の判断）。
+
+`001d5662a` の再レビュー後、設計担当の方針に従って一覧採用点からも逆引きした。
+直接 ZIP/PDF descriptor の新規開始（グリッド・ブックマーク・descriptor による再構築）は
+dispatcher を通らないため、開始を受理した frontend で test-script 限定の計数を補う。
+既存 context のメモリ上の一覧復元・変換完了からの descriptor 水和には加算しない。通常コードの変更は
+受理結果を局所変数へ受けて既存と同じ値を返すだけで、detached の述語・状態遷移・配置は不変。
+同じ逆引きで見つかった Collection outer の準備済み owner と、画像フォルダ ZIP 化後の
+親一覧 owner も operation が scan を引き取る受理点（`ParentScan`）で計数し、install や水和では加算しない。
+`ff5af1f53` 再レビュー後、detached DFS の DirectRar／ConversionCacheHit も proven backing の受理点で test-script 限定計数を補い、loader 全呼び出し元と FolderNavRoute 全分岐を照合した（述語・挙動は不変）。
+
+### §11 追補: 本の構造操作の cache 採用範囲（2026-10-21）
+
+設計担当の `33e9a570a` / `book-key-migration-plan.md` §3.10 の決定に従い、
+本操作の全 context への metadata cache 採用と、Snapshot saved shift / at-rest shift の一括付け替えを撤去した。
+`viewer_context_registry.rs::migrate_at_rest_spread_shifts` は production の呼出しをなくして削除し、
+既存の root 改名・resource 保持回帰は実際の book adoption 入口へ更新した。
+cache の失効は main の既存 reload 対象だけに限定し、別窓・Snapshot の items・cache・accepted shift は保持する。
+新しい live-follow・reload・窓閉鎖・detached 述語・viewport・配置・focus の変更はない。
+
+設計担当の明示決定と Codex の独立レビュー（Sol / xhigh）は、BA-7 の所有境界へ戻す構造修正であり、
+症状パッチではないと合意した。別窓の再読込設計はリワーク側の範囲に残す。
+本操作以外のメタデータ publication・通常入力・既存 refresh は今回変更しない。検証結果は同計画 §8.6 を参照。

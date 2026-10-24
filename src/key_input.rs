@@ -53,7 +53,7 @@ fn operation_input_observation_enabled(_ctx: &egui::Context) -> bool {
     // fixture flag controls only this test Context, never production policy.
     #[cfg(test)]
     if let Some(enabled) =
-        _ctx.data(|data| data.get_temp::<bool>(egui::Id::new("page_turn_input_enabled")))
+        _ctx.data(|data| data.get_temp::<bool>(egui::Id::unique("page_turn_input_enabled")))
     {
         return enabled;
     }
@@ -2172,16 +2172,21 @@ fn synthetic_perf_facts_enabled() -> bool {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn current_foreground_hwnd_raw() -> u64 {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     unsafe { GetForegroundWindow().0 as usize as u64 }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn current_foreground_hwnd_raw() -> u64 {
     0
+}
+
+#[cfg(test)]
+fn current_foreground_hwnd_raw() -> u64 {
+    crate::test_native_focus::foreground_hwnd()
 }
 
 fn resolve_registered_target(
@@ -2456,22 +2461,41 @@ impl SyntheticInputPlugin {
         });
     }
 
-    fn inject_prepared(&mut self, input: &mut egui::RawInput) {
+    fn inject_prepared(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         let Some(prepared) = self.prepared.as_mut() else {
             return;
         };
         if !prepared.armed {
             return;
         }
-        input.modifiers = prepared.final_modifiers;
+        let mut current_modifiers = input.events.iter().fold(
+            ctx.input_for(input.viewport_id, |state| state.modifiers),
+            |current, event| match event {
+                egui::Event::ModifiersChanged(modifiers) => *modifiers,
+                _ => current,
+            },
+        );
+        let mut append_modifiers = |events: &mut Vec<egui::Event>, modifiers| {
+            if current_modifiers != modifiers {
+                events.push(egui::Event::ModifiersChanged(modifiers));
+                current_modifiers = modifiers;
+            }
+        };
         let Some(batch) = prepared
             .batches
             .iter()
             .find(|batch| batch.viewport == input.viewport_id)
         else {
+            append_modifiers(&mut input.events, prepared.final_modifiers);
             return;
         };
-        input.events.extend(batch.events.iter().cloned());
+        for event in &batch.events {
+            if let egui::Event::Key { modifiers, .. } = event {
+                append_modifiers(&mut input.events, *modifiers);
+            }
+            input.events.push(event.clone());
+        }
+        append_modifiers(&mut input.events, prepared.final_modifiers);
         if !prepared.delivered_viewports.contains(&input.viewport_id) {
             #[cfg(all(windows, feature = "test-script"))]
             if crate::test_script::release_checks::is_active() {
@@ -2687,13 +2711,13 @@ impl egui::Plugin for SyntheticInputPlugin {
         "miv_synthetic_input"
     }
 
-    fn input_hook(&mut self, input: &mut egui::RawInput) {
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         if input.viewport_id == egui::ViewportId::ROOT {
             self.prepare_root(input);
         }
         #[cfg(all(windows, any(test, feature = "test-script")))]
         self.reject_physical_pointer_mix(input);
-        self.inject_prepared(input);
+        self.inject_prepared(ctx, input);
         #[cfg(all(windows, any(test, feature = "test-script")))]
         self.inject_prepared_pointer(input);
         #[cfg(all(windows, feature = "test-script"))]
@@ -2764,7 +2788,7 @@ fn egui_key_operation_batch(
     ctx: &egui::Context,
     viewport: egui::ViewportId,
 ) -> Option<Arc<[KeyOperationEdge]>> {
-    let id = egui::Id::new(("key_operation_ingress", viewport));
+    let id = egui::Id::unique(("key_operation_ingress", viewport));
     let frame_nr = ctx.cumulative_frame_nr_for(viewport);
     let first_pass_nr = ctx
         .cumulative_pass_nr_for(viewport)
@@ -2898,7 +2922,8 @@ impl egui::Plugin for KeyOperationInputPlugin {
         "miv_key_operation_ingress"
     }
 
-    fn on_begin_pass(&mut self, ctx: &egui::Context) {
+    fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx();
         // OFF leaves only generic ingress IDs on the native queue. An actual
         // egui fallback consumer may still lazily request provenance below.
         if !operation_input_observation_enabled(ctx) {
@@ -3614,6 +3639,14 @@ pub fn set_test_frame(edges: Vec<KeyEdge>) {
     set_test_frame_for_viewport(egui::ViewportId::ROOT, edges);
 }
 
+/// Queue through the same stamping/pending boundary as native ingress.
+#[cfg(test)]
+pub(crate) fn enqueue_test_pending_edge(edge: KeyEdge) {
+    if let Ok(mut guard) = state().lock() {
+        guard.enqueue_key_edge(edge);
+    }
+}
+
 #[cfg(test)]
 pub fn set_test_frame_for_viewport(viewport: egui::ViewportId, mut edges: Vec<KeyEdge>) {
     for edge in &mut edges {
@@ -4103,7 +4136,11 @@ mod tests {
     }
 
     fn run_input_hook(plugin: &mut SyntheticInputPlugin, input: &mut egui::RawInput) {
-        <SyntheticInputPlugin as egui::Plugin>::input_hook(plugin, input);
+        <SyntheticInputPlugin as egui::Plugin>::input_hook(
+            plugin,
+            &egui::Context::default(),
+            input,
+        );
     }
 
     fn raw_edge(virtual_key: u32, pressed: bool) -> RawKeyEdge {
@@ -4221,7 +4258,7 @@ mod tests {
     #[test]
     fn egui_operation_snapshot_survives_consumption_replay_and_same_time_next_batch() {
         let ctx = egui::Context::default();
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
         ctx.add_plugin(super::KeyOperationInputPlugin);
         let event = |pressed| egui::Event::Key {
             key: egui::Key::ArrowRight,
@@ -4236,10 +4273,11 @@ mod tests {
             ..Default::default()
         };
         let mut snapshots = Vec::new();
-        let _ = ctx.run(raw.clone(), |ctx| {
+        ctx.run_ui(raw.clone(), |ui| {
+            let ctx = &ui.ctx().clone();
             assert!(
                 ctx.data(
-                    |data| data.get_temp::<super::EguiKeyOperationBatch>(egui::Id::new((
+                    |data| data.get_temp::<super::EguiKeyOperationBatch>(egui::Id::unique((
                         "key_operation_ingress",
                         egui::ViewportId::ROOT
                     )))
@@ -4261,13 +4299,16 @@ mod tests {
             if ctx.current_pass_index() == 0 {
                 ctx.request_discard("operation replay regression");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0], snapshots[1]);
-        let _ = ctx.run(raw, |ctx| {
+        ctx.run_ui(raw, |ui| {
+            let ctx = &ui.ctx().clone();
             let next = super::egui_operation_key_edges(ctx, egui::ViewportId::ROOT);
             assert_ne!(next[0].operation_id(), snapshots[0][0].operation_id());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -4283,7 +4324,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut triggers = 0;
         let mut passes = 0;
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             super::begin_frame_for_context(ctx);
             assert_eq!(super::native_operation_key_edges(viewport), vec![edge]);
             if consume_key_down(viewport, true, |_| true) {
@@ -4293,7 +4335,8 @@ mod tests {
             if ctx.current_pass_index() == 0 {
                 ctx.request_discard("native replay regression");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(passes, 2);
         assert_eq!(triggers, 1);
     }
@@ -4311,45 +4354,46 @@ mod tests {
             first
         };
         let ctx = egui::Context::default();
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), false));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), false));
         super::install_operation_input_plugin(&ctx);
         let mut matches = 0;
-        let _ =
-            ctx.run(
-                egui::RawInput {
-                    events: vec![egui::Event::Key {
-                        key: egui::Key::ArrowRight,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: egui::Modifiers::NONE,
-                    }],
-                    ..Default::default()
-                },
-                |ctx| {
-                    super::begin_frame_for_context_with_tracking(ctx, false);
-                    let guard = state().lock().unwrap();
-                    assert!(guard.operation_frame.is_empty());
-                    assert_eq!(guard.operation_frame.capacity(), 0);
-                    drop(guard);
-                    assert!(
-                        ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(
-                            egui::Id::new(("key_operation_ingress", viewport))
-                        ))
-                        .is_none()
-                    );
-                    let consumed =
-                        super::consume_key_press_edges_with_result(viewport, |_| true, |_| true);
-                    matches += consumed.matched_count;
-                    if ctx.current_pass_index() == 0 {
-                        assert_eq!(consumed.operation_id, Some(first.operation_id));
-                        assert!(consumed.released_after_match);
-                        ctx.request_discard("OFF native replay");
-                    } else {
-                        assert_eq!(consumed.matched_count, 0);
-                    }
-                },
-            );
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                let ctx = &ui.ctx().clone();
+                super::begin_frame_for_context_with_tracking(ctx, false);
+                let guard = state().lock().unwrap();
+                assert!(guard.operation_frame.is_empty());
+                assert_eq!(guard.operation_frame.capacity(), 0);
+                drop(guard);
+                assert!(
+                    ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(
+                        egui::Id::unique(("key_operation_ingress", viewport))
+                    ))
+                    .is_none()
+                );
+                let consumed =
+                    super::consume_key_press_edges_with_result(viewport, |_| true, |_| true);
+                matches += consumed.matched_count;
+                if ctx.current_pass_index() == 0 {
+                    assert_eq!(consumed.operation_id, Some(first.operation_id));
+                    assert!(consumed.released_after_match);
+                    ctx.request_discard("OFF native replay");
+                } else {
+                    assert_eq!(consumed.matched_count, 0);
+                }
+            },
+        )
+        .drop_without_applying_deltas();
         assert_eq!(matches, 2);
         let mut repeat = raw_edge(0x27, true);
         repeat.repeat = true;
@@ -4369,10 +4413,10 @@ mod tests {
     #[test]
     fn off_egui_observer_is_lazy_but_matched_generic_identity_survives_replay() {
         let ctx = egui::Context::default();
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), false));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), false));
         super::install_operation_input_plugin(&ctx);
         let mut original = None;
-        let _ = ctx.run(
+        ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::ArrowRight,
@@ -4383,8 +4427,9 @@ mod tests {
                 }],
                 ..Default::default()
             },
-            |ctx| {
-                let id = egui::Id::new(("key_operation_ingress", ctx.viewport_id()));
+            |ui| {
+                let ctx = &ui.ctx().clone();
+                let id = egui::Id::unique(("key_operation_ingress", ctx.viewport_id()));
                 if ctx.current_pass_index() == 0 {
                     assert!(
                         ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(id))
@@ -4402,7 +4447,8 @@ mod tests {
                     ctx.request_discard("OFF generic egui identity replay");
                 }
             },
-        );
+        )
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -4433,8 +4479,9 @@ mod tests {
         let ctx = egui::Context::default();
         super::install_operation_input_plugin(&ctx);
         let viewport = egui::ViewportId::ROOT;
-        let id = egui::Id::new(("key_operation_ingress", viewport));
-        let _ = ctx.run(Default::default(), |ctx| {
+        let id = egui::Id::unique(("key_operation_ingress", viewport));
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             assert!(
                 ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(id))
                     .is_none()
@@ -4444,7 +4491,8 @@ mod tests {
                 ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(id))
                     .is_none()
             );
-        });
+        })
+        .drop_without_applying_deltas();
         ctx.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::ArrowRight,
@@ -4456,10 +4504,10 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(super::egui_operation_key_edges(&ctx, viewport).len(), 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         ctx.begin_pass(Default::default());
         assert!(super::egui_operation_key_edges(&ctx, viewport).is_empty());
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -4488,7 +4536,7 @@ mod tests {
         assert!(super::operation_key_edges(&ctx, egui::ViewportId::ROOT).is_empty());
         assert_eq!(super::native_operation_key_edges(sibling).len(), 1);
         assert!(pressed_key_down(sibling, |_| true));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -5068,11 +5116,11 @@ mod tests {
         assert_eq!(pending_after_first, 1);
         assert_eq!(pending_after_second, pending_after_first);
         assert_eq!(first.events, second.events);
-        assert_eq!(first.events.len(), 1);
-        assert!(first.modifiers.ctrl);
+        assert_eq!(first.events.len(), 2);
         assert!(matches!(
             first.events.as_slice(),
-            [egui::Event::Key { modifiers, .. }] if modifiers.ctrl && modifiers.command && !modifiers.mac_cmd
+            [egui::Event::ModifiersChanged(before), egui::Event::Key { modifiers, .. }]
+                if before == modifiers && modifiers.ctrl && modifiers.command && !modifiers.mac_cmd
         ));
         assert!(
             state()
@@ -5122,6 +5170,62 @@ mod tests {
             consume_key_edges(viewport, |edge| edge.virtual_key == 0x27),
             (false, true)
         );
+    }
+
+    #[test]
+    fn synthetic_modifier_changes_precede_their_edges_without_rewriting_received_keys() {
+        let ctx = egui::Context::default();
+        let key = |modifiers, pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let received = key(egui::Modifiers::ALT, true);
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(super::PreparedSyntheticFrame {
+                frame_nr: 3,
+                time_key: super::RawInputTimeKey::from(Some(1.0)),
+                raw_input_time: Some(1.0),
+                batches: vec![super::SyntheticViewportBatch {
+                    viewport: egui::ViewportId::ROOT,
+                    events: vec![
+                        key(egui::Modifiers::CTRL, true),
+                        key(egui::Modifiers::NONE, false),
+                    ],
+                }],
+                hold_attributions: Vec::new(),
+                delivered_viewports: Vec::new(),
+                final_modifiers: egui::Modifiers::NONE,
+                armed: true,
+                #[cfg(windows)]
+                pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+            }),
+            ..Default::default()
+        };
+        let mut input = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                received.clone(),
+            ],
+            ..Default::default()
+        };
+        plugin.inject_prepared(&ctx, &mut input);
+        assert_eq!(
+            input.events,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                received,
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                key(egui::Modifiers::CTRL, true),
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+                key(egui::Modifiers::NONE, false),
+            ]
+        );
+        ctx.begin_pass(input);
+        assert_eq!(ctx.input(|input| input.modifiers), egui::Modifiers::NONE);
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -5228,7 +5332,7 @@ mod tests {
                 region_geometry_token: 11,
                 press_page_index: 2,
                 press_item_identity: "page-2".to_string(),
-                widget_id: egui::Id::new("pointer-track"),
+                widget_id: egui::Id::unique("pointer-track"),
                 press_rect: rect,
                 coordinate_frame: rect,
                 press_pixels_per_point: 1.0,

@@ -869,17 +869,19 @@ mod tests {
 
     fn pointer_delta_after_events(ctx: &egui::Context, events: Vec<egui::Event>) -> egui::Vec2 {
         let mut delta = None;
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 events,
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 if delta.is_none() {
                     delta = Some(ctx.input(|input| input.pointer.delta()));
                 }
             },
         );
+        crate::egui_output::discard_headless_output(output);
         delta.unwrap()
     }
 

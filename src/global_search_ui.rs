@@ -45,8 +45,10 @@ pub(crate) use everything::SearchOpenOrigin;
 use everything::{
     EverythingPosition, SearchAccepted, SearchProducer, SearchProjection, SearchSource,
 };
+pub(crate) use everything::{EverythingSearchEntryAvailability, everything_search_menu_button};
 pub use everything::{
-    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_everything_progress_snapshot_fixture,
+    draw_everything_search_disabled_menu_snapshot_fixture, draw_everything_search_snapshot_fixture,
 };
 
 // -----------------------------------------------------------------------
@@ -200,6 +202,37 @@ fn global_search_status_width(ui: &egui::Ui, text: &str, color: egui::Color32) -
     let width = needed.clamp(GLOBAL_SEARCH_STATUS_MIN_WIDTH, max_width);
     let truncated = needed > width + 0.5;
     (width, truncated)
+}
+
+fn draw_global_search_status(
+    ui: &mut egui::Ui,
+    text: String,
+    color: egui::Color32,
+    hover: Option<String>,
+) {
+    let (status_width, truncated) = global_search_status_width(ui, &text, color);
+    let hover_text = hover.or_else(|| truncated.then(|| text.clone()));
+    let response = ui.add_sized(
+        [status_width, ui.spacing().interact_size.y],
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(GLOBAL_SEARCH_STATUS_TEXT_SIZE)
+                .color(color),
+        )
+        .truncate(),
+    );
+    if let Some(hover) = hover_text {
+        response.on_hover_text(hover);
+    }
+}
+
+/// 純粋な拒否バッジ描画。製品と同じ幅制限・全文 hover を snapshot で確認する。
+pub fn draw_global_search_reject_snapshot_fixture(ui: &mut egui::Ui, terms: &[&str]) {
+    let message = crate::global_search::RejectReason::TooShort(
+        terms.iter().map(|term| (*term).into()).collect(),
+    )
+    .as_user_message();
+    draw_global_search_status(ui, message, egui::Color32::from_rgb(200, 120, 40), None);
 }
 
 /// Ctrl+G の drill-down 状態。コンテナにドリルインしているときだけ `Some` で保持される
@@ -2955,7 +2988,7 @@ impl App {
                     visibility_notice,
                 }) => {
                     if let Some(notice) = visibility_notice {
-                        self.show_feedback_toast(notice.message().into());
+                        self.show_feedback_warning(notice.message().into());
                     }
                     // Accepted batches enter the worker FIFO in order. The worker does
                     // the rating lookup before returning each rated batch to this owner.
@@ -2976,8 +3009,7 @@ impl App {
                     self.global_search.truncated = truncated;
                     match reason {
                         DoneReason::RejectedQuery(r) => {
-                            self.global_search.reject_message =
-                                Some(r.as_user_message().to_string());
+                            self.global_search.reject_message = Some(r.as_user_message());
                         }
                         DoneReason::Cancelled => {
                             self.global_search.reject_message = Some("検索を中止しました".into());
@@ -3306,7 +3338,7 @@ impl App {
                             continue;
                         }
                         if rating_sort_failed {
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "評価順を読み込めなかったため名前順で表示しました".into(),
                             );
                         }
@@ -3384,7 +3416,7 @@ impl App {
                                         .into(),
                                 );
                             }
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "[検索結果を準備できませんでした]".to_string(),
                             );
                         }
@@ -3795,7 +3827,7 @@ impl App {
             order_request,
             crate::rating_sort::ListingOrderRequest::Rating(_)
         ) {
-            self.show_feedback_toast("評価順を準備できなかったため名前順で表示しました".into());
+            self.show_feedback_warning("評価順を準備できなかったため名前順で表示しました".into());
         }
         // Badge counts and rows belong to one accepted projection, including the fallback path.
         let drilled_counts = match self.global_search.view() {
@@ -4234,12 +4266,13 @@ impl App {
     }
 
     /// Ctrl+G トップパネルの描画 (既存 render_favsearch_bar と同パターン)。
-    pub(crate) fn render_global_search_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_global_search_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         if !self.global_search.active {
             return;
         }
         if self.global_search.source == SearchSource::Everything {
-            self.render_everything_search_bar(ctx);
+            self.render_everything_search_bar(root_ui);
             self.show_everything_search_progress(ctx);
             return;
         }
@@ -4257,7 +4290,8 @@ impl App {
 
         let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
         let mut drill_back = false;
-        egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
+        egui::Panel::top("global_search_bar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             if running {
                 ui.disable();
             }
@@ -4338,7 +4372,7 @@ impl App {
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("global_search_fav")
+                    let named_combo = egui::ComboBox::from_id_salt("global_search_fav")
                         .selected_text(label_for(current))
                         .width(160.0)
                         .height(combo_popup_height)
@@ -4351,6 +4385,7 @@ impl App {
                                 ui.selectable_value(&mut next, Some(fav.id), &fav.name);
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "お気に入り");
                     if next != current {
                         self.global_search.filters.favorite = next;
                         filter_changed = true;
@@ -4367,7 +4402,7 @@ impl App {
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("global_search_kind")
+                    let named_combo = egui::ComboBox::from_id_salt("global_search_kind")
                         .selected_text(label_for(current))
                         .width(140.0)
                         .height(combo_popup_height)
@@ -4376,6 +4411,7 @@ impl App {
                                 ui.selectable_value(&mut next, choice, label_for(choice));
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "種類");
                     if next != current {
                         self.global_search.filters.kind = next;
                         filter_changed = true;
@@ -4386,7 +4422,7 @@ impl App {
                 {
                     let current = TargetChoice::from_target(&self.global_search.filters.target);
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("global_search_target")
+                    let named_combo = egui::ComboBox::from_id_salt("global_search_target")
                         .selected_text(current.label())
                         .width(160.0)
                         .height(combo_popup_height)
@@ -4395,6 +4431,7 @@ impl App {
                                 ui.selectable_value(&mut next, choice, choice.label());
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "検索対象");
                     if next != current {
                         self.global_search.filters.target = next.to_target();
                         filter_changed = true;
@@ -4502,16 +4539,7 @@ impl App {
                 };
                 if let Some((text, color, hover)) = status {
                     ui.separator();
-                    let (status_width, truncated) = global_search_status_width(ui, &text, color);
-                    let hover_text = hover.or_else(|| truncated.then(|| text.clone()));
-                    let response = ui.add_sized(
-                        [status_width, ui.spacing().interact_size.y],
-                        egui::Label::new(egui::RichText::new(text).size(11.0).color(color))
-                            .truncate(),
-                    );
-                    if let Some(hover) = hover_text {
-                        response.on_hover_text(hover);
-                    }
+                    draw_global_search_status(ui, text, color, hover);
                 }
             });
             if !self.global_search.tag_bridge_suggestions.is_empty() {
@@ -7293,14 +7321,15 @@ pub(crate) mod tests {
             eframe::egui::ColorImage::filled([1, 1], eframe::egui::Color32::WHITE),
             eframe::egui::TextureOptions::LINEAR,
         );
-        ThumbnailState::Loaded {
+        ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        }
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )
     }
 
     #[test]

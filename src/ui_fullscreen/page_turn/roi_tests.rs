@@ -52,7 +52,7 @@ fn gpu_frame(
     gpu: &egui_wgpu::RenderState,
     mut run: impl FnMut(&mut egui::Ui, &egui::Context),
 ) {
-    let output = ctx.run(
+    let mut output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -61,20 +61,32 @@ fn gpu_frame(
             ..Default::default()
         },
         |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| run(ui, ctx));
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| run(ui, ctx))
+            });
         },
     );
     // Ordinary native preparation reads registered egui source textures.
     // Previous routing fixtures deliberately have no RenderState, which
     // bypasses native ROI generation altogether, regardless of aspect ratio.
     let mut renderer = gpu.renderer.write();
-    for (id, delta) in &output.textures_delta.set {
-        renderer.update_texture(&gpu.device, &gpu.queue, *id, delta);
+    let mut upload_pending = false;
+    for (id, updates) in output.textures_delta.set.drain() {
+        for delta in updates {
+            match renderer.update_texture_with_submission(&gpu.device, &gpu.queue, id, &delta) {
+                egui_wgpu::TextureUpdateSubmission::Pending => upload_pending = true,
+                egui_wgpu::TextureUpdateSubmission::Submitted => upload_pending = false,
+                egui_wgpu::TextureUpdateSubmission::Unchanged => {}
+            }
+        }
     }
-    for id in &output.textures_delta.free {
-        renderer.free_texture(id);
+    if upload_pending {
+        gpu.queue.submit([]);
+    }
+    for id in output.textures_delta.free.drain() {
+        renderer.free_texture(&id);
     }
 }
 
@@ -110,6 +122,8 @@ fn measured_book(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(image),
                 source_dims: Some([900, 1300]),
@@ -174,7 +188,10 @@ fn warm_unit(app: &mut App, ctx: &egui::Context, gpu: &egui_wgpu::RenderState, a
 fn page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_backward() {
     // One headless GPU and two app factories cover both directions and the
     // genuine-partial fallback. No desktop, profile, file, or product launch.
-    let gpu = egui_kittest::wgpu::create_render_state(crate::test_ui::wgpu_setup());
+    let gpu = egui_kittest::wgpu::create_render_state(
+        crate::test_ui::wgpu_setup(),
+        egui_wgpu::RendererOptions::default(),
+    );
     for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.5);
@@ -281,10 +298,9 @@ fn page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_bac
             let source_limit = app.settings.anime_upscale_source_limit;
             // Presentation has no source handle. Re-prepare only from the
             // ordinary resident owner, exactly as a new view request would.
-            let texture = app
-                .resolve_fs_processed_texture(ctx, page.occurrence.idx, false)
+            let normal = app
+                .resolve_fs_processed_material(ctx, page.occurrence.idx, false)
                 .unwrap();
-            let normal = app.fullscreen_paint_resource_for_texture(page.occurrence.idx, texture);
             let (resource, _) = app.fs_lanczos_cache.resolve(
                 Some(&gpu),
                 &normal,

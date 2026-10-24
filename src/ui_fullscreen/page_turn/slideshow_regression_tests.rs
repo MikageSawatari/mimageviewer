@@ -26,11 +26,15 @@ fn frame(
             ..Default::default()
         },
     );
-    let _ = ctx.run(raw, |ctx| {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| run(ui, ctx));
-    });
+    let _ = ctx
+        .run_pass(raw, |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| run(ui, ctx))
+            });
+        })
+        .drop_without_applying_deltas();
 }
 
 fn draw_and_sync(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitReceipt {
@@ -83,6 +87,8 @@ fn slideshow_regression_expired_outgoing_deadline_turns_and_preserves_full_displ
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -120.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 }]
             } else {
                 vec![]

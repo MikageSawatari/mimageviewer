@@ -197,8 +197,9 @@ impl App {
 
     pub(crate) fn render_folder_pane(
         &mut self,
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
     ) -> (Option<std::path::PathBuf>, Option<egui::Rect>) {
+        let ctx = &root_ui.ctx().clone();
         if !self.settings.folder_tree_pane_visible {
             return (None, None);
         }
@@ -215,11 +216,12 @@ impl App {
             FOLDER_PANE_MAX_WIDTH.min((content_width - 240.0).max(FOLDER_PANE_MIN_WIDTH));
         let default_width = (self.settings.folder_tree_pane_width_ratio * content_width)
             .clamp(FOLDER_PANE_MIN_WIDTH, max_width);
-        let panel = egui::SidePanel::left("folder_tree_pane")
-            .resizable(true)
-            .default_width(default_width)
-            .width_range(FOLDER_PANE_MIN_WIDTH..=max_width)
-            .show(ctx, |ui| {
+        let panel = egui::Panel::left("folder_tree_pane")
+            .resizable(!self.main_chrome_pointer_blocked())
+            .default_size(default_width)
+            .size_range(FOLDER_PANE_MIN_WIDTH..=max_width)
+            .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 ui.add_enabled_ui(!disabled, |ui| {
                     self.render_folder_pane_header(ui);
                     ui.separator();
@@ -245,7 +247,7 @@ impl App {
                 .unwrap_or_else(|| "Drive".to_string());
             let mut next_drive = selected_drive.clone();
             let drives = self.folder_pane.drives().to_vec();
-            egui::ComboBox::from_id_salt("folder_pane_drive_combo")
+            let named_combo = egui::ComboBox::from_id_salt("folder_pane_drive_combo")
                 .width(54.0)
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
@@ -259,6 +261,7 @@ impl App {
                         }
                     }
                 });
+            crate::ui_helpers::set_accessibility_label(&named_combo.response, "Drive");
             if let Some(drive) = next_drive
                 && selected_drive
                     .as_ref()
@@ -309,6 +312,10 @@ impl App {
         let scroll_to_cursor = self.folder_pane.scroll_to_cursor;
         let mut cursor_scrolled = false;
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt("folder_pane_tree_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -422,36 +429,44 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 240.0))
-            .build(move |ctx| {
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                let panel = egui::SidePanel::left("folder_tree_pane_sort_min_width_test")
-                    .resizable(false)
-                    .exact_width(FOLDER_PANE_MIN_WIDTH)
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
-                                .width(54.0)
-                                .selected_text("C:")
-                                .show_ui(ui, |_| {});
-                            let selected = folder_tree_sort_combo(
-                                ui,
-                                crate::settings::FolderTreeSortOrder::NameAsc,
-                            );
-                            assert_eq!(selected, crate::settings::FolderTreeSortOrder::NameAsc);
-                            ui.small_button("↻")
-                        })
-                        .inner
-                        .rect
-                    });
-                captured
-                    .lock()
-                    .unwrap()
-                    .push((panel.response.rect, panel.inner));
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let panel = egui::Panel::left("folder_tree_pane_sort_min_width_test")
+                        .resizable(false)
+                        .exact_size(FOLDER_PANE_MIN_WIDTH)
+                        .show(root_ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let drive =
+                                    egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
+                                        .width(54.0)
+                                        .selected_text("C:")
+                                        .show_ui(ui, |_| {});
+                                crate::ui_helpers::set_accessibility_label(
+                                    &drive.response,
+                                    "Drive",
+                                );
+                                let selected = folder_tree_sort_combo(
+                                    ui,
+                                    crate::settings::FolderTreeSortOrder::NameAsc,
+                                );
+                                assert_eq!(selected, crate::settings::FolderTreeSortOrder::NameAsc);
+                                ui.small_button("↻")
+                            })
+                            .inner
+                            .rect
+                        });
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((panel.response.rect, panel.inner));
+                });
             });
 
         harness.run_steps(3);
@@ -473,11 +488,11 @@ mod tests {
         let captured = Arc::clone(&widths);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(800.0, 480.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
                 captured
                     .lock()
                     .unwrap()
-                    .push(draw_loading_width_test_panel(ctx));
+                    .push(draw_loading_width_test_panel(root_ui));
             });
         harness.run_steps(8);
         assert_loading_width_stable(&widths.lock().unwrap());
@@ -489,37 +504,44 @@ mod tests {
         assert!(widths.iter().all(|width| (*width - first).abs() <= 0.1));
     }
 
-    fn draw_loading_width_test_panel(ctx: &egui::Context) -> f32 {
-        egui::SidePanel::left("folder_tree_pane_loading_width_test")
-            .resizable(true)
-            .default_width(240.0)
-            .width_range(FOLDER_PANE_MIN_WIDTH..=FOLDER_PANE_MAX_WIDTH)
-            .show(ctx, |ui| {
-                ui.label("Folder");
-                ui.separator();
-                show_bounded_folder_pane_body(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.set_height(FOLDER_PANE_ROW_HEIGHT);
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                ui.add_space(FOLDER_PANE_ARROW_WIDTH);
-                                let trailing_width = folder_pane_trailing_width(ui, true);
-                                let label_width = (ui.available_width() - trailing_width).max(16.0);
-                                ui.allocate_exact_size(
-                                    egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
-                                    egui::Sense::hover(),
-                                );
-                                ui.spinner();
+    fn draw_loading_width_test_panel(root_ui: &mut egui::Ui) -> f32 {
+        {
+            egui::Panel::left("folder_tree_pane_loading_width_test")
+                .resizable(true)
+                .default_size(240.0)
+                .size_range(FOLDER_PANE_MIN_WIDTH..=FOLDER_PANE_MAX_WIDTH)
+                .show(root_ui, |ui| {
+                    ui.label("Folder");
+                    ui.separator();
+                    show_bounded_folder_pane_body(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.set_height(FOLDER_PANE_ROW_HEIGHT);
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    ui.add_space(FOLDER_PANE_ARROW_WIDTH);
+                                    let trailing_width = folder_pane_trailing_width(ui, true);
+                                    let label_width =
+                                        (ui.available_width() - trailing_width).max(16.0);
+                                    ui.allocate_exact_size(
+                                        egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.spinner();
+                                });
                             });
-                        });
-                });
-            })
-            .response
-            .rect
-            .width()
+                    });
+                })
+        }
+        .response
+        .rect
+        .width()
     }
 
     #[test]

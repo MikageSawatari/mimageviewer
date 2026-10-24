@@ -263,13 +263,50 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 
 ## 2. モジュールマップ
 
+§1.165 B1（2026-10-21、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）は crop 済みの編集 preview を
+部分素材として扱う。収録範囲は生成時の実整数 pixel bounds から求めて preview と同時保存し、
+現在 crop から復元しない。一覧は crop 後の比率を使い、部分素材のページ構成・座標基準には
+crop 前の正規寸法を供給する。正規座標の元寸法、実 raster 寸法、PDF page-box の layout 寸法は別物である。
+PDF の既知 page-box cache 値も preview の独立 nullable layout 列へ同時保存し、preview hit から
+復元する。旧行／通常画像は `None`。layout のための追加 PDF IPC や preview の待機を加えない。
+正準座標の `CanonicalPageDimensions` と100%表示の `DisplayOriginalDimensions` を分ける。
+通常完成素材はGPU clamp後／AI後の実texture、部分代役は生成時のcrop前rasterを100%基準にし、
+`FullscreenFitInput::Raster` でcapture／replayへ保持する。crop samplerの丸めは幾何へ逆流させない。
+見開きの左右構成と指定方式の基準は共通のレイアウト寸法境界から選び、片側だけ crop の場合も
+通常 thumbnail の texel 数を外側の構成へ使わない。既存4方式の全面素材の単ページ sizing は保つ。
+指定倍率の通常rasterだけは単ページ・見開き・連結読みで同じA/O resolverへ統一する。
+本画像未到着時の100%基準は生成由来のcrop前raster、またはproducer共通のGPU clamp予測値であり、
+source寸法が判明している場合はthumbnail実寸やclamp前の正準座標寸法を流用しない。
+通常の旧catalog行でsource寸法が無い場合は、従来のsampler契約を受理時に明示して指定倍率にも保持する。
+PDF Known素材（全域収録を含む）のlegacy参照寸法はcoverageの全体座標から受理し、page-box layout単位と分ける。
+AI後もAI前raster基準を維持する。
+100%と方式別layoutの所有者は素材自身の `MaterialDisplayBasis` とする。producer selectorは
+handleとdescriptorを持つResourceを返し、保持presentationの選択はPayloadとして別に行う。
+Loaded／派生cache／通過素材／消しゴム下地から保持・captureまでdescriptorを継承し、
+fit時のidx探索やtexture IDからのproducer逆引きは行わない。Single／Spread／Continuousの
+旧4方式の契約差と指定A/Oは一つの不変descriptorから射影し、live fit設定は含めない。
+Unknown の旧行は一覧で保持する一方、現在 crop ありの
+fullscreen／通過／animation には共通 typed policy で使わない。詳細は
+[表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ)。
+
+素材の由来は `ThumbnailState::Loaded`／CPU 下地から既存の `FullscreenPaintResource`、
+`FullscreenPresentationResource`、paint payload へ値として継承する。共有純粋 helper
+`source_region_texture_quad` が coverage・表示要求・素材内 native ROI を合成し、全画像 transform
+上の頂点と texture UV を返す。ページ全体の下地と `PageMaterial::PartialTexture` の画像 domain を
+分けて、通常描画／紙めくり／passive snapshot 再描画／navigator／ルーペ／パノラマ navigator／
+保持素材復元へ接続する。capture 済み素材を現在の thumbnail metadata で置換しない。
+既存 resource owner に載せることで新しい idx 別 map、preview 失効の同期化、全 context reset、
+専用 worker を増やさない。まれな保存失敗は既定の割り切りとし、多段の復旧処理を追加しない。
+
 ### コア
 
 | モジュール | 役割 |
 | --- | --- |
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
-| `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
+| `app.rs` | `App` 構造体と `eframe::App` 実装。非描画の`logic`と、root Uiを受ける`ui`へ状態遷移を接続する |
+| `app/update_phases.rs` | service・input・render・post-renderの既存順序を所有。表示採用とGPU uploadはUI側へ残す |
+| `app/close_return.rs` / `app/root_lifecycle.rs` | teardown前に捕捉したClose帰還を存続mainの既存navigation ownerへ移し、root Closeをlogic直後のbackend終了判定へ接続する |
 | `crates/startup-diagnostics` | launcher/core共通の常時起動timeline。UIは固定容量のmemoryへ非blockingで公開し、独立writerがJSONLを保存する。UI heartbeatと独立した限定watchdog、同runの引継ぎ、保存先分類を所有する。詳細は [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §3・§10 |
 | `ui_startup.rs` | 起動stage/経過時間と「検索の準備中」の純粋描画。Indexerの5秒overlay上限・worker継続・単一採用はAppの `IndexerInit` が所有する |
 | `raw_format.rs` | 23 種の RAW 拡張子の単一リスト。フォルダ列挙はこれを含み、WIC はこの集合を拒否する |
@@ -283,6 +320,7 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 | `same_name_folder_book.rs` | 同名の実folder/本の「本を表示 / フォルダを表示 / 両方表示」を適格な候補へ適用するpure policy。通常一覧・Smart・サブ展開・Ctrl+↑↓/DFS・Remoteで共用し、再帰探索を刈らない。旧`skip_zip_if_folder_exists`のON→本表示/OFF→両方表示を、Settings・Remote subset・preferences transferの共通decoderで読み替える |
 | `app/startup_list_restore.rs` | 「前回終了した場所」の明示一覧 record と唯一の reducer。main の採用済み物理一覧／本／Drive の適格性を投影し、明示一覧採用、既存一覧の表示要求受理、同じ一覧の cursor 捕捉を分ける。直接読書・内部 load・合成 root・F12 表示先切替・independent viewer は target を更新しない。既存 typed request が intent を運び、ZIP prefix を含む restore hydration は最初の materialization に渡す。詳細と検証状況は [起動復元の所有設計](startup-restore-target-plan.md) |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理。native Touch は render overlay 内で完結し、App の legacy mouse 操作へは再注入しない |
+| `app/book_preferred_rating.rs` | 「本を優先」する評価対象の解決を所有する。入力を受けた mounted viewer context の採用済み recipe と物理コンテナキーを I/O なしで照合し、本全体 / 表示アイテム / 照合不能を値で確定する。本キーは親一覧の本セルと同じで、保存・公開・Undo は既存 writer を共有する。detached 述語・viewport・context lifecycle は変更せず、新しい状態は持たない |
 | `touch_input.rs` | 静止画 egui viewport と native video presenter が共有する、接点集合・所有・tap zone・pinch/pan/scroll の純粋な認識器 |
 | `touch_debug.rs` | `MIV_TOUCH_DEBUG=1` の入力源診断。Win32 pointer/mouse source に加え、native presenter / HUD の stream 所有、座標変換、認識コマンド、promoted mouse 破棄を source 別に記録する |
 | `app/recursive_snapshot_scan.rs` | 複数実フォルダを再帰列挙する snapshot view 共通 walker。cancel、深さ上限、reparse point 回避、重複 root 排除、`GlobalIoSemaphore` / `ActivityGate`、chunk sort をサブ展開とスマートフォルダで共有する |
@@ -348,11 +386,12 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
+| `source_coverage.rs` | §1.165 B1 の素材の収録範囲。`SourceCoverage::{FullSource, Known(EditPreviewGeometry), Unknown}` が通常素材・生成由来が既知の編集 preview・旧行を区別する。正規座標の元寸法、切り出し前 raster 寸法、実整数 pixel bounds を別に持ち、現在 crop と独立した UV を供給する。Unknown の代役可否は共通 typed policy 一か所で解決する |
 | `fullscreen_specified_scale.rs` | `FullscreenFitInput` が legacy fit と指定値＋`FullscreenFitBasis` を型で区別する。A（canonical aspect）と O（AI 前の物理原寸）を正規化し、任意軸の％ / logical px、合成 unit の実効 gap、既存倍率制限と指定方式だけの自動 5 倍上限を純粋計算する。PDF の O は page metadata と既存 Original 長辺 / native cap から解き、現在 raster へ依存しない |
 | `displayed_image_transform.rs` | identity に依存しない `DisplayedImageGeometry` が fit descriptor / scale limit / trim / 90 度・free rotation / 通常または Z の zoom-pan から paint・hit・UV rect、source↔screen 写像、total scale を一度に解決する。指定方式の `layout_full_image_rect` は A/O 由来の安定した fit 枠で、実 raster の縦横比丸めは枠内の contain と sampling へ閉じる。ページは `DisplayedImageTransform` が page idx を付け、類似候補はページへ偽装せず geometry を利用する。見開き端の単ページは `SingletonSpreadPlacement` と同じページ寸法の仮想 2-slot canvasをlayoutにだけ持ち、page/sourceを増やさず既存 4 方式・SpecifiedScale と Z を解く。`FullscreenPageLayout` は各 viewer の最後に描いた Single / Spread / Continuous の transform を paint 順で保持し、`ViewerContextBundle` とともに交換する。navigator・ルーペ・範囲コピーはその viewer の layout を参照する。見開き・連結読みの配置計算自体は `ui_fullscreen.rs` が担当する |
-| `vendor/egui` | egui 0.33.3 の判定済み全 pointer release 列を、非 click を含めて順序どおり読み取る API を追加したローカルパッチ。クリック判定は変えず、アプリの ordered focus / hit / gesture 所有と対応付ける。root と standalone vendor の path patch を統一し、`test-full.ps1` でこの crate の lib test も無 filter 実行する。navigator 側への接続・検証状況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
-| `vendor/eframe` | eframe 0.33.3 の Windows hidden/minimized repaint scheduler に upstream PR #7905 を backport するローカルパッチ。不可視 HWND へ `ControlFlow::Poll` + OS redraw を要求せず direct UI pass で pending command を消化し、アプリが要求した repaint だけを `max(要求済み時刻, now + 100ms)` へ制限し、先の予定は早めない。要求が無ければ heartbeat を作らず sleep する。App / tray / detached の状態 ownership は変更しない。**もう 1 件**: wgpu backend は `max_texture_side` を `State::new` で 1 度スナップショットするだけだったのを、glow backend と同じく毎フレーム painter の値へ同期するようにした。egui は font atlas を `Context` に 1 つしか持たず、`max_texture_side` が変わると全フォントを再パースして atlas を作り直すので、2 つの viewport が 2048 と 8192 を交互に報告すると毎パス rebuild (実測 38.6ms) になる。詳細と実測は [next-release-backlog.md](next-release-backlog.md) §1.129。上流還元候補なので vendored crate 更新時はこの差分を持ち越す |
-| `vendor/egui-wgpu` | egui 0.33.3 の managed texture に opt-in GPU mipmap を追加するローカルパッチ。`TextureOptions::mipmap_mode` 指定時だけ完全な mip chain を確保・生成し、静止画の論理 `TextureHandle` / cache 構造は変えない。`Rgba8Unorm`生成器は比較callbackと360度パノラマの独自textureにも公開して共用する。上流の`LICENSE-MIT` / `LICENSE-APACHE`本文をcrate内に保持し、アプリ内表示と配布物同梱の正本にする |
+| `vendor/egui` | egui 0.37.0の判定済みpointer release列、viewport別IME中断、寿命を持つ承認済み退役commandを所有。連続clickは上流の距離6points条件を採用する。実discard再pass直前の生成済みdeltaを、Contextに対応する既存backend rendererへ一度だけ移譲する。原本記録と差分は`vendor/upstream-provenance.json`とcrate内`PATCHES.md`を参照 |
+| `vendor/eframe` | eframe 0.37.0。非表示・最小化時のlogicとFull UI pass、surface描画を別判定にする。承認済み退役をpass外で完結し、immediate子を含むdeltaは既存共有rendererで描画またはresource消費する。`max_texture_side`同期など既存差分も保持。App/tray/detachedの終了判断は既存ownerへ残す。正式経路と回帰は[egui更新計画](egui-0.37-update-plan.md)と各`PATCHES.md`を参照 |
+| `vendor/egui-wgpu` | egui-wgpu 0.37.0 / wgpu 30のmanaged textureにopt-in GPU mipmapを追加するローカルパッチ。`TextureOptions::mipmap_mode`指定時だけ完全なmip chainを生成し、静止画の論理`TextureHandle` / cache構造は変えない。map化deltaの同一texture内順序を保持し、旧set/partial→submission→後発freeを完結させる。`Rgba8Unorm`生成器は比較callbackと360度パノラマにも共用。WindowsではPainterが全viewportのHWNDにdevice上限の外寸制約を所有し、初回取り付けと迂回resizeで実窓を補正・client寸法を再取得する。外寸制約はconfigureへ渡す物理client寸法をdeviceのmax_texture_dimension_2d以下に保つための保守的な設計で、再configure／Lost再作成も同じ不変条件に従う。device要求上限の既定8192は変更しない（§1.395）。上流license本文をcrate内に保持する |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は source identity / 編集 snapshot / preset を固定し、元画像の decode、選択段までの合成、見開き結合、画像エンコード、メタデータ転記は worker が担当 |
 | `ui_helpers.rs` | メニューバー、ツールバー、アドレスバー等の共通 UI |
@@ -477,7 +516,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「ファイル処理 → Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
 | `changelog_markdown.rs` | 更新履歴 (GitHub release body) の Markdown サブセット描画。バージョン更新ダイアログ (`ui_dialogs/update_notice.rs`) から呼ばれ、見出し / 箇条書き / `**強調**` / `` `コード` `` / `<kbd>キー</kbd>` を整形。`egui_kittest` のスナップショットテスト対象 |
-| `version_highlights.rs` (v2.0.0) | 更新後初回起動の「重要な変更点」(④)。exe 埋め込みテーブル + 純関数 `highlights_to_show` (またぎ累積、unit test) + 描画 `render`。ダイアログは `ui_dialogs/whats_new.rs`。`update_check` (更新前・ネット・全文) と別物で、更新後・オフライン・操作/既定変更の主要部分のみ。トリガは `last_seen_version` / `previous_last_seen_version` |
+| `version_highlights.rs` (v2.0.0) | 更新後の「重要な変更点」(④)。exe 埋め込みテーブル + 純関数 `highlights_to_show` (またぎ累積、unit test) + 描画 `render`。ダイアログは `ui_dialogs/whats_new.rs`。`update_check` (更新前・ネット・全文) と別物で、更新後・オフライン・操作/既定変更の主要部分のみ。`whats_new_acknowledged_version` から未読を選び、利用者が閉じたときだけ保存。main の起動通知は `startup_notice_viewer_open` で3モードの閲覧中を保留し、描画とモーダル判定を同じ visible helper へ揃える。詳細は [変更点表示計画 §2](version-highlights-plan.md#2-トリガと既読記録-12322026-10-19) |
 
 ### 検索 / インデクサ / タグ
 
@@ -501,7 +540,8 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `name_bulk_indexer.rs` | Ctrl+S 初期バルクスキャンの本体 |
 | `global_search.rs` | Ctrl+G streaming クエリワーカー (Searcher snapshot 固定 + ページング post-filter) |
 | `global_search_ui.rs` | Ctrl+G 検索バー + drill-down ビュー + Aggregated / DrilledInto 集約 |
-| `similar_image.rs` / `similar_index.rs` | 画像・ZIP/PDFページの共通Proxy生成と、別バージョン索引のscheduler・非同期照会。お気に入り対象変更とwatcher通知を集約し、索引は全体16/同一volume8、操作中1/1、明示pause中0/0で走査する。本はstagingへ全ページを書いてからCompleteを原子的に公開する。索引中も公開済みsnapshotを保持し、専用array workerが変更履歴を追随して不変snapshotを差し替える。単体照会はbase/deltaの線形検索後にSQLiteでorigin/hitのitem ID・revision・署名を検証し、origin key + memory epochの最大6件cacheを使う。NotIndexedの完成結果と現在Running由来のPreparing表示は分ける。prefillとpurgeはscheduler存続中の同じDB ownerで直列化する。本照会のcommon判定・世代整合の未修正点は[レビュー修正計画](duplicate-detection-review-fixes-20260907.md)を参照 |
+| `similar_image.rs` / `similar_index.rs` | 画像・ZIP/PDFページの共通Proxy生成と、別バージョン索引のscheduler・非同期照会。お気に入り対象変更とwatcher通知を集約し、索引は全体16/同一volume8、操作中1/1、明示pause中0/0で走査する。本はstagingへ全ページを書いてからCompleteを原子的に公開する。索引中も公開済みsnapshotを保持し、storeの単一SimilarArrayOwnerがbase I/O・変更履歴適用・公開・pruneを直列処理する。単体照会はbase/deltaの線形検索後にSQLiteでorigin/hitのitem ID・revision・署名を検証し、origin key + query scope revision + publication revisionの最大6件cacheを使う。NotIndexedの完成結果と現在Running由来のPreparing表示は分ける。prefillとpurgeはscheduler存続中の同じDB ownerで直列化する。本照会のcommon判定・世代整合の未修正点は[レビュー修正計画](duplicate-detection-review-fixes-20260907.md)を参照 |
+| `similar_array_owner.rs` | managerの固定data_dirごとに一つの検索配列owner。初期load/rebuild/refresh/compaction/replace・snapshot/revision採用・store照合後のhistory pruneを一つのworkerで所有する。構成変更でloadを取消さず、同store/seqの公開済み事実からackを返す。UIは要求と短い状態参照、shutdownはclose通知だけを行う。実I/O失敗は公開済み配列を保持して通知し、次回プロセス起動へ回す |
 | `similar_search_array.rs` | SQLiteから派生する不変base/deltaとsuperseded mask。similar.baseは1行48byteのitem ID・PDQ・品質・revisionとheaderの適用済みseqを保存する。ロード時にstore ID、hash/proxy/形式version、行数・ファイル長・item ID順序、本文SHA-256を検証する。DBの最新状態への追随は、その後の変更履歴適用が担う。変更履歴をdeltaへ適用し、更新/削除されたbase行をmaskする。compactionは新baseを非同期構築してcutoff後のdeltaを保ち、利用中snapshotを変更しない。旧rowid/key hash方式のsimilar.compactは移行前の形式で、現行検索には使わない |
 | `similar_db.rs` | 別バージョン検索の正本similar.db（schema 3）。明示AUTOINCREMENTのitem_id、revision、PDQ-256/品質、寸法・形式・保存場所を保持する。公開行の追加・署名更新・削除と同じtransactionでitem_changeへ変更連番を記録する。本のstaging/Complete公開、favorite OFFのpurge、prefill、ページ順修復を所有する。ページ順versionは変更履歴と別に管理される |
 | `io_semaphore.rs` | `GlobalIoSemaphore` — UI / PDF / サムネ / インデクサ横断の I/O 同時実行制御 (Low/Normal/High) |
@@ -518,7 +558,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `vram_budget.rs` | mImageViewer 全体の GPU メモリ予算の単一所有者。永続設定の割合から共有 pool を求め、一覧 / フルスクリーンの 80% / 20% 配分、RGBA8 bytes / texels 換算、HIGH / LOW 水位を導出する。0% は無制限として明示的に扱う |
 | `monitor.rs` | モニター情報取得 (DPI 等) |
 | `open_with.rs` | Windows の関連付けアプリ列挙と EXE 選択。列挙結果は実行パスではなく `IAssocHandler::GetName()` の handler ID として保持する。起動 worker 内で対象拡張子の handler を再列挙し、既存の Shell `IDataObject` 生成経路を介して `IAssocHandler::Invoke` を呼ぶ。利用者が明示選択した EXE だけを process spawn へ渡す |
-| `file_drag.rs` | グリッドからエクスプローラ等へのファイル D&D 送出 (シェル `IDataObject` + `SHDoDragDrop`)。`docs/file-drag-drop-design.md` |
+| `file_drag.rs` / `file_drag/async_data_object.rs` | グリッドから外部へのファイル D&D 送出。Shell `IDataObject` を送出専用 STA 委譲ラッパーで保持し、`IDataObjectAsyncCapability` で非同期を交渉する。1ドラッグ1 owner、App へ完了を戻さず、終了時に転送を待たない。共有 Shell helper / クリップボード経路は従来どおり。`docs/file-drag-drop-design.md` §12 |
 | `os_theme.rs` | Windows の「アプリ用の色」(レジストリ) を検出し、egui::Visuals へ適用。初回起動時に `Settings::ui_theme` の初期値を決める |
 
 GPU テクスチャの利用許容量は `vram_budget.rs` の共有 pool だけから導出する。サムネイル側と
@@ -535,7 +575,7 @@ GPU テクスチャの利用許容量は `vram_budget.rs` の共有 pool だけ�
 ユーザー操作 (キー/マウス)
     │
     ▼
-App::update() 内のハンドラ
+App::ui() 内の入力ハンドラ
     │  ├─ load_folder(path)         → フォルダ/ZIP/PDF 切替
     │  ├─ start_fs_load(idx)        → フルスクリーン画像ロード
     │  ├─ apply_rotation(idx)       → 回転の DB 更新
@@ -601,7 +641,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
-| `edit_preview_cache.db` | 非破壊編集結果を一覧へ戻す派生 preview の対応表 / LRU。page source の mtime + size に加え、ZIP/PDF 親代表から同じ preview を安全に読むため container size も保持する。WebP 本体は `edit_preview_cache/` 配下で、各 row が item-key hash directory の下地 + 注釈 layer を単独所有する | `edit_preview_cache.rs` |
+| `edit_preview_cache.db` | 非破壊編集結果を一覧へ戻す派生 preview の対応表 / LRU。page source の mtime + size と親代表用 container size、crop 後の一覧寸法を保持する。§1.165 B1 は released v6 を維持し nullable `source_coverage_json`／`layout_dims_json` / `metadata_content_hash` を加法追加する。旧行/WebP を残し、新生成は実 pixel bounds と正規座標/raster 寸法、独立したPDF page-box寸法を同じ upsert で保存する。WebP 本体は `edit_preview_cache/` 配下で、各 row が item-key hash directory の下地 + 注釈 layer を単独所有する | `edit_preview_cache.rs` + `source_coverage.rs` |
 | `video_pins.db` | ユーザーがフルスクリーン HUD で指定した動画フレームの抽出 WebP。`(path, pin_pts_secs, thumb_webp, thumb_pts_secs)`。folder thumb pin の source が動画のときは `seed_folder_video_pin_thumbs` が起動時にこの WebP を catalog にミラー seed する。左ジャンプパネルのピン行もこの WebP を再利用する | `video_pins.rs` |
 | `video_bookmarks.db` | 動画ブックマーク (pts / title / jump panel 用 WebP)。初回表示時に FFmpeg worker で取得したサムネを `thumb_webp` に保存し、次回以降は DB から復元する | `video_bookmarks.rs` |
 | `video_chapter_thumbs.db` | 埋め込みチャプターの jump panel 用 WebP キャッシュ。path + file size + mtime + chapter start をキーにし、動画更新後は古いサムネを参照しない | `video_chapter_thumbs.rs` |
@@ -876,3 +916,21 @@ PDFの仮想項目はruntime keyと同じ`page_<u32>`だけを許可し、評価
 5. **ドキュメント同時更新** — [public-wording-policies.md](public-wording-policies.md) の「コード修正時のドキュメント同時更新」セクションに従う
 
 §1.333の最後まで視聴した動画・音声は、Settingsの `video_watched_to_end` 集合とsettings.db同名の追加tableで記録する。既存再生位置表・再開動作は保持し、集合から本体一覧へ満タンを描く。詳細はbook-resume-meter-plan.md §11。
+
+
+### 一時通知の時間ポリシー（§1.402）
+
+`feedback.rs` が情報/警告/エラーの型と表示時間の倍率を所有する。
+App の発行境界で寿命とnative fadeを確定して、既存 toast state と native transport へ渡す。
+標準は従来の面別の時間・fadeを維持し、nativeのlinger/fadeの既存不一致は今回修正しない。
+動画内部の発行元は種類を明示し、既存 NativeChromeSnapshot から選択値を読む。
+設定は既存 settings.db KV の追加項目で、旧項目欠落時は標準へ移行する。
+新しい worker・channel・detached context state は持たない。
+[時間・例外・棚卸しの詳細](notification-duration-policy.md)。
+
+## AVIF 内蔵デコード（§1.407）
+
+`crates/libavif-sys` の C shim が libavif の構造体 ABI を閉じ込め、既存の静的
+libavif / dav1d / libyuv をリンクする。safe Rust APIが予算検査・RGBA8確保・表示変換と
+画素を確保しない寸法解析を所有し、core / Remote / EPUBで共用する。`avif_decoder` は本体のperf/ログ層。`image_decode` は形式選択と WIC 接続、使用デコーダと向き状態を共有する。
+worker・queue・context owner・永続 schema は追加しない。

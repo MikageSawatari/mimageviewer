@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -66,12 +66,45 @@ pub enum PadEvent {
     Disconnected,
 }
 
+#[cfg(all(windows, not(test)))]
+pub(crate) fn foreground_app_hwnd() -> Option<u64> {
+    crate::video::native_window::foreground_process_hwnd()
+}
+
+#[cfg(all(not(windows), not(test)))]
+pub(crate) fn foreground_app_hwnd() -> Option<u64> {
+    Some(1)
+}
+
+#[cfg(test)]
+pub(crate) fn foreground_app_hwnd() -> Option<u64> {
+    crate::test_native_focus::foreground_belongs_to_current_process_strict()
+        .then(crate::test_native_focus::foreground_hwnd)
+}
+
+/// The producer's foreground observation travels with this event through stalls.
+/// It only grants discrete presses; physical releases, axes and terminals always pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PadEventReceipt {
+    pub(crate) event: PadEvent,
+    pub(crate) accepted: bool,
+}
+
+impl PadEventReceipt {
+    pub(crate) fn new(event: PadEvent, foreground: Option<u64>) -> Self {
+        Self {
+            event,
+            accepted: foreground.is_some(),
+        }
+    }
+}
+
 pub struct GamepadRuntime {
     /// producer (gilrs スレッド) → consumer (UI スレッド) の共有キュー。mpsc を使わず
     /// `VecDeque` にしているのは、満杯時に **最古** を捨てて最新を残す (drop-oldest) ため。
     /// mpsc の sync_channel は満杯時に送ろうとした最新を捨ててしまい、release / disconnect /
     /// 中立軸を取りこぼして状態が固着しうる。
-    queue: Arc<Mutex<VecDeque<PadEvent>>>,
+    queue: Arc<Mutex<VecDeque<PadEventReceipt>>>,
     shutdown: Arc<AtomicBool>,
     #[cfg(not(test))]
     handle: Option<std::thread::JoinHandle<()>>,
@@ -102,7 +135,7 @@ impl GamepadRuntime {
     /// `ctx.request_repaint()` を呼ぶので、スティックが少しずれているパッドが
     /// 挿さっているだけで UI が起き続ける。無効にした人が求めているのは
     /// 「反応しないこと」であって「反応しないまま起き続けること」ではない。
-    pub fn drain(&mut self, ctx: &egui::Context, enabled: bool) -> Vec<PadEvent> {
+    pub(crate) fn drain(&mut self, ctx: &egui::Context, enabled: bool) -> Vec<PadEventReceipt> {
         if !enabled {
             self.stop();
             return Vec::new();
@@ -118,7 +151,7 @@ impl GamepadRuntime {
         self.queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(event);
+            .push_back(PadEventReceipt::new(event, Some(1)));
     }
 
     /// 読み取りスレッドを止め、溜まっていたイベントを捨てる。再度 `enabled` に
@@ -127,6 +160,14 @@ impl GamepadRuntime {
     /// `shutdown` は次に生きるスレッドと共有しないよう、停止のたびに新しい
     /// フラグへ差し替える。使い回すと、再開したスレッドが前回の停止要求を
     /// 読んで即座に終了する。
+    #[cfg(test)]
+    pub(crate) fn push_receipt_for_test(&mut self, event: PadEvent, foreground: Option<u64>) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(PadEventReceipt::new(event, foreground));
+    }
+
     fn stop(&mut self) {
         if !self.started {
             return;
@@ -176,7 +217,7 @@ impl GamepadRuntime {
                             if q.len() >= GAMEPAD_EVENT_CAP {
                                 q.pop_front();
                             }
-                            q.push_back(mapped);
+                            q.push_back(PadEventReceipt::new(mapped, foreground_app_hwnd()));
                             drop(q);
                             sent_any = true;
                         }
@@ -286,9 +327,41 @@ pub enum WestReleaseOutcome {
     Suppressed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PadPressAdmission {
+    Accepted,
+    Suppressed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PhysicalButtonLevel {
+    #[default]
+    Up,
+    Down(PadPressAdmission),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DeliveredButtonLevel {
+    #[default]
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ButtonLevel {
+    physical: PhysicalButtonLevel,
+    delivered: DeliveredButtonLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AxisLevel {
+    physical: f32,
+    delivered: f32,
+}
+
 pub struct GamepadInputState {
-    buttons: HashSet<PadButton>,
-    axes: [f32; 6],
+    buttons: HashMap<PadButton, ButtonLevel>,
+    axes: [AxisLevel; 6],
     trigger_ranges: [TriggerRange; 2],
     repeat_next: HashMap<PadButton, Instant>,
     y_modifier_used: bool,
@@ -303,8 +376,8 @@ pub struct GamepadInputState {
 impl Default for GamepadInputState {
     fn default() -> Self {
         Self {
-            buttons: HashSet::new(),
-            axes: [0.0; 6],
+            buttons: HashMap::new(),
+            axes: [AxisLevel::default(); 6],
             trigger_ranges: [TriggerRange::Unknown; 2],
             repeat_next: HashMap::new(),
             y_modifier_used: false,
@@ -319,34 +392,95 @@ impl Default for GamepadInputState {
 }
 
 impl GamepadInputState {
+    /// Direct state setup used by input-state callers; runtime intake and UI
+    /// delivery use the two explicit stage methods below.
     pub fn set_button_down(&mut self, button: PadButton, down: bool, now: Instant) -> bool {
-        let changed = if down {
-            self.buttons.insert(button)
+        let changed = self.set_physical_button_down(button, down, now);
+        if changed {
+            self.deliver_button_edge(button, down);
+        }
+        changed
+    }
+
+    pub(crate) fn set_physical_button_down(
+        &mut self,
+        button: PadButton,
+        down: bool,
+        now: Instant,
+    ) -> bool {
+        let level = self.buttons.entry(button).or_default();
+        let was_down = matches!(level.physical, PhysicalButtonLevel::Down(_));
+        if down && !was_down {
+            level.physical = PhysicalButtonLevel::Down(PadPressAdmission::Accepted);
+        } else if !down {
+            level.physical = PhysicalButtonLevel::Up;
+            self.repeat_next.remove(&button);
+        }
+        if down && !was_down && is_repeatable_button(button) {
+            self.repeat_next
+                .insert(button, now + Duration::from_millis(300));
+        }
+        was_down != down
+    }
+
+    pub(crate) fn deliver_button_edge(&mut self, button: PadButton, down: bool) {
+        let level = self.buttons.entry(button).or_default();
+        let was_down = level.delivered == DeliveredButtonLevel::Down;
+        level.delivered = if down {
+            DeliveredButtonLevel::Down
         } else {
-            self.buttons.remove(&button)
+            DeliveredButtonLevel::Up
         };
-        if down && changed {
+        if down && !was_down {
             if button == PadButton::North {
                 self.y_modifier_used = false;
             }
             if button == PadButton::West {
                 self.reset_west_ring_state();
             }
-        } else if !down {
-            self.repeat_next.remove(&button);
         }
-        if down && changed && is_repeatable_button(button) {
-            self.repeat_next
-                .insert(button, now + Duration::from_millis(300));
+    }
+
+    pub(crate) fn delivered_button_down(&self, button: PadButton) -> bool {
+        self.buttons
+            .get(&button)
+            .is_some_and(|level| level.delivered == DeliveredButtonLevel::Down)
+    }
+
+    pub(crate) fn clear_physical(&mut self) {
+        for level in self.buttons.values_mut() {
+            level.physical = PhysicalButtonLevel::Up;
         }
-        changed
+        for level in &mut self.axes {
+            level.physical = 0.0;
+        }
+        self.repeat_next.clear();
+        self.analog_last_tick = None;
+        self.left_stick_next_step = None;
+        self.trigger_next_step = None;
+    }
+
+    pub(crate) fn end_delivered_session(&mut self) {
+        for level in self.buttons.values_mut() {
+            level.delivered = DeliveredButtonLevel::Up;
+        }
+        for level in &mut self.axes {
+            level.delivered = 0.0;
+        }
+        self.y_modifier_used = false;
+        self.reset_west_ring_state();
+        self.directional_neutral_required = false;
     }
 
     /// 保持している入力が何も無いか。終端処理を毎フレーム空振りさせないための述語で、
     /// [`Self::clear`] が落とす項目とここが見る項目は**同じ**でなければならない。
     pub fn is_idle(&self) -> bool {
-        self.buttons.is_empty()
-            && self.axes.iter().all(|value| *value == 0.0)
+        self.buttons.values().all(|level| {
+            level.physical == PhysicalButtonLevel::Up && level.delivered == DeliveredButtonLevel::Up
+        }) && self
+            .axes
+            .iter()
+            .all(|level| level.physical == 0.0 && level.delivered == 0.0)
             && self.repeat_next.is_empty()
             && !self.y_modifier_used
             && self.west_ring_direction.is_none()
@@ -362,7 +496,7 @@ impl GamepadInputState {
     /// 不具合を防ぐ。トリガーのレンジ較正 (`trigger_ranges`) は次接続でも有効なので残す。
     pub fn clear(&mut self) {
         self.buttons.clear();
-        self.axes = [0.0; 6];
+        self.axes = [AxisLevel::default(); 6];
         self.repeat_next.clear();
         self.y_modifier_used = false;
         self.reset_west_ring_state();
@@ -377,12 +511,21 @@ impl GamepadInputState {
     /// (= 解除後に保持中ボタンが勝手に連続発火しない)、保持中の Y は modifier 使用済み
     /// 扱いにして「離し = タップ」を抑止する。軸 / ボタン保持状態自体は残すので、
     /// 一瞬のポップアップ後もアナログ操作はそのまま継続できる。
-    pub fn suppress_pending_actions(&mut self) {
+    pub(crate) fn suppress_physical_actions(&mut self) {
         self.repeat_next.clear();
-        if self.buttons.contains(&PadButton::North) {
+        for level in self.buttons.values_mut() {
+            if matches!(level.physical, PhysicalButtonLevel::Down(_)) {
+                level.physical = PhysicalButtonLevel::Down(PadPressAdmission::Suppressed);
+            }
+        }
+    }
+
+    pub fn suppress_pending_actions(&mut self) {
+        self.suppress_physical_actions();
+        if self.delivered_button_down(PadButton::North) {
             self.y_modifier_used = true;
         }
-        if self.buttons.contains(&PadButton::West) {
+        if self.delivered_button_down(PadButton::West) {
             self.west_tap_suppressed = true;
             self.west_ring_direction = None;
             // X リング操作中にブロックされた場合、リング用に倒していたスティックが
@@ -394,22 +537,42 @@ impl GamepadInputState {
     }
 
     pub fn set_axis(&mut self, axis: PadAxis, value: f32) {
+        self.set_physical_axis(axis, value);
+        self.axes[axis.index()].delivered = self.axes[axis.index()].physical;
+    }
+
+    pub(crate) fn set_physical_axis(&mut self, axis: PadAxis, value: f32) {
         let value = value.clamp(-1.0, 1.0);
-        if axis == PadAxis::LeftTrigger || axis == PadAxis::RightTrigger {
-            let idx = if axis == PadAxis::LeftTrigger { 0 } else { 1 };
-            if value < -0.25 {
-                self.trigger_ranges[idx] = TriggerRange::MinusOneToOne;
-            }
+        if matches!(axis, PadAxis::LeftTrigger | PadAxis::RightTrigger) && value < -0.25 {
+            self.trigger_ranges[if axis == PadAxis::LeftTrigger { 0 } else { 1 }] =
+                TriggerRange::MinusOneToOne;
         }
-        self.axes[axis.index()] = value;
+        self.axes[axis.index()].physical = value;
     }
 
+    pub(crate) fn physical_axes(&self) -> [f32; 6] {
+        self.axes.map(|level| level.physical)
+    }
+    pub(crate) fn deliver_axes(&mut self, values: [f32; 6]) {
+        for (level, value) in self.axes.iter_mut().zip(values) {
+            level.delivered = value;
+        }
+    }
+    pub(crate) fn delivered_axis(&self, axis: PadAxis) -> f32 {
+        self.axes[axis.index()].delivered
+    }
+    pub(crate) fn button_release_admitted(&self, button: PadButton) -> bool {
+        self.buttons.get(&button).is_some_and(|level| {
+            level.physical == PhysicalButtonLevel::Down(PadPressAdmission::Accepted)
+        })
+    }
     pub fn button_down(&self, button: PadButton) -> bool {
-        self.buttons.contains(&button)
+        self.buttons
+            .get(&button)
+            .is_some_and(|level| matches!(level.physical, PhysicalButtonLevel::Down(_)))
     }
-
     pub fn axis(&self, axis: PadAxis) -> f32 {
-        self.axes[axis.index()]
+        self.axes[axis.index()].physical
     }
 
     pub fn trigger_value(&self, left: bool) -> f32 {
@@ -459,7 +622,7 @@ impl GamepadInputState {
     }
 
     pub fn mark_y_modifier_used(&mut self) {
-        if self.button_down(PadButton::North) {
+        if self.delivered_button_down(PadButton::North) {
             self.y_modifier_used = true;
         }
     }
@@ -469,7 +632,7 @@ impl GamepadInputState {
     }
 
     pub fn west_ring_active(&self) -> bool {
-        self.button_down(PadButton::West) && !self.west_tap_suppressed
+        self.delivered_button_down(PadButton::West) && !self.west_tap_suppressed
     }
 
     pub fn west_ring_direction(&self) -> Option<RingDirection> {
@@ -487,7 +650,7 @@ impl GamepadInputState {
     }
 
     pub fn cancel_west_ring(&mut self) {
-        if self.button_down(PadButton::West) {
+        if self.delivered_button_down(PadButton::West) {
             self.west_ring_direction = None;
             self.west_tap_suppressed = true;
             self.require_directional_neutral();
@@ -512,9 +675,7 @@ impl GamepadInputState {
     }
 
     pub fn dpad_direction_down(&self) -> bool {
-        DPAD_BUTTONS
-            .iter()
-            .any(|button| self.buttons.contains(button))
+        DPAD_BUTTONS.iter().any(|&button| self.button_down(button))
     }
 
     pub fn finish_west_release(&mut self) -> WestReleaseOutcome {
@@ -552,9 +713,9 @@ impl GamepadInputState {
     }
 
     pub fn repeat_active(&self) -> bool {
-        self.buttons
-            .iter()
-            .any(|&button| is_repeatable_button(button))
+        self.buttons.iter().any(|(&button, level)| {
+            matches!(level.physical, PhysicalButtonLevel::Down(_)) && is_repeatable_button(button)
+        })
     }
 
     fn reset_west_ring_state(&mut self) {
@@ -630,7 +791,10 @@ mod tests {
             .queue
             .lock()
             .unwrap()
-            .push_back(PadEvent::ButtonPressed(PadButton::South));
+            .push_back(super::PadEventReceipt::new(
+                PadEvent::ButtonPressed(PadButton::South),
+                Some(1),
+            ));
         assert!(runtime.drain(&ctx, false).is_empty());
         assert!(!runtime.started, "無効なら読み取りを止める");
         assert!(

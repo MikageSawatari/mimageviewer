@@ -111,6 +111,8 @@ fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() 
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
+                        pdf_metadata: None,
                         tex,
                         pixels: image,
                         source_dims: Some([80, 120]),
@@ -1048,6 +1050,8 @@ fn saved_pdf_viewer(ctx: &egui::Context, book: &BookComposition) -> crate::app::
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: image,
                 source_dims: Some([576, 816]),
@@ -1077,7 +1081,7 @@ fn paint_saved_pdf_viewport(
     ctx: &egui::Context,
 ) -> Vec<crate::app::paint_record_test_support::PaintRecord> {
     let output = crate::app::paint_record_test_support::with_capture(|| {
-        ctx.run(
+        crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -1085,8 +1089,8 @@ fn paint_saved_pdf_viewport(
                 )),
                 ..Default::default()
             },
-            |ctx| app.render_fullscreen_viewport(ctx),
-        )
+            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+        ))
     });
     crate::app::paint_record_test_support::paint_records(egui::ViewportId::ROOT, &output)
 }
@@ -1111,6 +1115,8 @@ fn assert_saved_pdf_singleton_paint(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([576, 816]),
@@ -1312,6 +1318,8 @@ fn page_turn_saved_coverless_boundary_remainder_actual_viewport_matrix() {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some([816, 576]),

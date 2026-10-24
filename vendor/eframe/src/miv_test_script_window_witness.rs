@@ -92,7 +92,7 @@ pub fn set_capture_probe(active: bool) {
         CAPTURE_PROBE_DETAIL_ATTEMPTS.store(0, Ordering::Relaxed);
     }
     CAPTURE_PROBE.store(active, Ordering::Relaxed);
-    #[cfg(feature = "wgpu")]
+    #[cfg(feature = "wgpu_no_default_features")]
     egui_wgpu::atlas_diag::set_capture_probe(active);
 }
 
@@ -128,7 +128,7 @@ fn records() -> &'static Mutex<Vec<WindowRecord>> {
 
 fn next_token() -> u64 {
     NEXT_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .expect("mImageViewer native window witness token space exhausted")

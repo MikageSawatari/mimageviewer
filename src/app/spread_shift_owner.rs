@@ -280,6 +280,11 @@ pub(super) struct ViewerBookRestore {
 }
 
 impl ViewerBookRestore {
+    #[cfg(test)]
+    pub(super) fn open_id_for_test(&self) -> u64 {
+        self.receipt.open_id
+    }
+
     pub(super) fn refresh_memory_policy(
         &mut self,
         generation: u64,
@@ -329,7 +334,7 @@ impl App {
             }
             Err(error) => {
                 crate::logger::log(format!("retained spread shift restore failed: {error}"));
-                self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を復元できませんでした: {error}"));
                 return;
             }
         }
@@ -356,7 +361,7 @@ impl App {
             }
             Err(error) => {
                 crate::logger::log(format!("retained spread shift restore failed: {error}"));
-                self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を復元できませんでした: {error}"));
             }
         }
     }
@@ -498,7 +503,7 @@ impl App {
             }
             Err(error) => {
                 crate::logger::log(format!("composition removed shift restore failed: {error}"));
-                self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を復元できませんでした: {error}"));
             }
         }
     }
@@ -795,7 +800,7 @@ impl App {
                     *persistence = ShiftPersistence::SaveFailed;
                 }
                 crate::logger::log(format!("spread shift admission failed: {error}"));
-                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を保存できませんでした: {error}"));
             }
         }
     }
@@ -818,7 +823,7 @@ impl App {
                 })
                 .and_then(|identity| SpreadShiftPageRef::from_identity(scope, &identity).ok());
             let Some(reference) = reference else {
-                self.show_feedback_toast("見開き調整の基点を保存できませんでした".into());
+                self.show_feedback_warning("見開き調整の基点を保存できませんでした".into());
                 return false;
             };
             Some(reference)
@@ -921,7 +926,7 @@ impl App {
             },
             PairingAction::SetMemoryPolicy,
         ) {
-            self.show_feedback_toast(reason.into());
+            self.show_feedback_warning(reason.into());
             return false;
         }
         self.spread_shift_memory_setting_changed(enabled);

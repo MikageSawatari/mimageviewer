@@ -197,6 +197,31 @@ enum EditorExitRequest {
 }
 
 impl App {
+    #[cfg(test)]
+    pub(crate) fn sent_composition_save_for_lifecycle_test(
+        &mut self,
+    ) -> Box<dyn FnOnce(Result<(), String>)> {
+        let (worker, receiver) = mpsc::channel();
+        self.composition_editor_operations
+            .tickets
+            .push(SentSaveTicket {
+                owner: CompositionEditorOwner {
+                    context_id: self.projected_viewer_context_id(),
+                    scope: BookScopeKey::document(std::path::Path::new("C:/test/save.cbz"))
+                        .unwrap(),
+                    request_id: u64::MAX,
+                },
+                receiver,
+            });
+        Box::new(move |status| {
+            worker
+                .send(SaveCompletion {
+                    status: status.map(|()| None),
+                })
+                .unwrap()
+        })
+    }
+
     pub(crate) fn composition_editor_modal_active(&self) -> bool {
         self.composition_editor_operations.owner.is_some()
     }
@@ -454,7 +479,7 @@ impl App {
         if let Err(error) = spawn {
             crate::logger::log(format!("composition editor prepare: {error}"));
             self.close_local_composition_editor(CompositionEditorCloseReason::Cancel);
-            self.show_feedback_toast("本の構成を準備できませんでした".into());
+            self.show_feedback_warning("本の構成を準備できませんでした".into());
             return false;
         }
         ctx.request_repaint();
@@ -464,7 +489,6 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         ctx.input_mut(|input| {
-            input.raw_scroll_delta = egui::Vec2::ZERO;
             input.smooth_scroll_delta = egui::Vec2::ZERO;
             input.events.clear();
         });
@@ -480,26 +504,44 @@ impl App {
         }
     }
     pub(crate) fn close_local_composition_editor(&mut self, reason: CompositionEditorCloseReason) {
-        let Some(owner) = self.composition_editor_operations.owner.take() else {
+        let Some(owner) = self.composition_editor_operations.owner.clone() else {
             return;
         };
-        let _ = self.with_viewer_context(owner.context_id, |app| {
-            app.composition_editor = CompositionEditorState::Closed;
+        self.with_composition_editor_owner_state(&owner, |state| {
+            *state = CompositionEditorState::Closed;
         });
+        self.composition_editor_operations.owner = None;
         if reason == CompositionEditorCloseReason::RemoteAcquire
             && !self.composition_editor_writes_pending()
         {
-            self.show_feedback_toast("Remoteからの操作に切り替えたため、本の構成の編集を閉じました。未保存の変更は保存されません".into());
+            self.show_feedback_warning("Remoteからの操作に切り替えたため、本の構成の編集を閉じました。未保存の変更は保存されません".into());
         }
     }
+    #[cfg(test)]
     pub(super) fn defer_composition_editor_root_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|input| input.viewport().close_requested()) {
-            self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
-            if self.composition_editor_writes_pending() {
-                self.composition_editor_operations.exit = EditorExitRequest::RootClose;
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            }
+        if ctx.input(|input| {
+            input
+                .raw
+                .viewports
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|root| root.close_requested())
+        }) {
+            self.accept_composition_editor_root_close(ctx);
         }
+        self.resume_composition_editor_root_close(ctx);
+    }
+
+    pub(super) fn accept_composition_editor_root_close(&mut self, ctx: &egui::Context) -> bool {
+        self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
+        let pending = self.composition_editor_writes_pending();
+        if pending {
+            self.composition_editor_operations.exit = EditorExitRequest::RootClose;
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
+        }
+        pending
+    }
+
+    pub(super) fn resume_composition_editor_root_close(&mut self, ctx: &egui::Context) {
         if !self.composition_editor_writes_pending()
             && matches!(
                 self.composition_editor_operations.exit,
@@ -507,85 +549,17 @@ impl App {
             )
         {
             self.composition_editor_operations.exit = EditorExitRequest::None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.resume_root_lifecycle_close(
+                ctx,
+                super::root_lifecycle::RootCloseIntent::WindowClose,
+            );
         }
     }
     pub(super) fn poll_composition_editor_operations(&mut self, ctx: &egui::Context) {
         if self.remote_session_blocks_local_control() {
             self.close_local_composition_editor(CompositionEditorCloseReason::RemoteAcquire);
         }
-        let tickets = std::mem::take(&mut self.composition_editor_operations.tickets);
-        for ticket in tickets {
-            let completion = match ticket.receiver.try_recv() {
-                Ok(reply) => reply,
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.composition_editor_operations.tickets.push(ticket);
-                    continue;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => SaveCompletion {
-                    status: Err("本の構成の保存処理が終了しました".into()),
-                },
-            };
-            let still_owned =
-                self.composition_editor_operations.owner.as_ref() == Some(&ticket.owner);
-            match completion.status {
-                Ok(resume) => {
-                    // This is the sole receipt consumer, before service publications start reloads.
-                    if let Some(resume) = resume {
-                        let recorded = self.with_viewer_context(ticket.owner.context_id, |app| {
-                            app.persist_book_resume_with_identity(
-                                resume.key.clone(),
-                                resume.position.page,
-                                Some(resume.meter),
-                                resume.position.identity.clone(),
-                            );
-                        });
-                        // A sent receipt remains authoritative after its viewer closes.
-                        if recorded.is_err()
-                            && let Some(writer) = self.book_resume_writer.as_ref()
-                            && !writer.record_identity(
-                                &resume.key,
-                                resume.position.page,
-                                Some(resume.meter),
-                                resume.position.identity,
-                            )
-                        {
-                            crate::logger::log("composition editor: resume write unavailable");
-                            self.show_feedback_toast("読書位置を保存できませんでした".into());
-                        }
-                    }
-                    if still_owned {
-                        let _ = self.with_viewer_context(ticket.owner.context_id, |app| {
-                            app.composition_editor = CompositionEditorState::Reloading
-                        });
-                    } else {
-                        self.show_feedback_toast(if self.remote_session_blocks_local_control() {
-                            "本の構成を保存し、Remoteからの操作に切り替えました".into()
-                        } else {
-                            "本の構成を保存しました".into()
-                        });
-                    }
-                }
-                Err(error) => {
-                    crate::logger::log(format!("composition editor save: {error}"));
-                    self.show_feedback_toast(error.clone());
-                    if still_owned {
-                        let _ = self.with_viewer_context(ticket.owner.context_id, |app| {
-                            let state = std::mem::take(&mut app.composition_editor);
-                            app.composition_editor = match state {
-                                CompositionEditorState::Saving(mut session) => {
-                                    session.error = Some(error);
-                                    session.refresh_view();
-                                    CompositionEditorState::Editing(session)
-                                }
-                                state => state,
-                            };
-                        });
-                    }
-                }
-            }
-            ctx.request_repaint();
-        }
+        self.poll_composition_editor_save_receipts(ctx);
         if let Some(owner) = self.composition_editor_operations.owner.clone() {
             let result = self.with_viewer_context(owner.context_id, |app| {
                 let state = std::mem::take(&mut app.composition_editor);
@@ -631,6 +605,77 @@ impl App {
         }
         if self.composition_editor_modal_active() || self.composition_editor_writes_pending() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Harvest sent tickets once, before UI publication, without mounting a viewer.
+    pub(crate) fn poll_composition_editor_save_receipts(&mut self, ctx: &egui::Context) {
+        let tickets = std::mem::take(&mut self.composition_editor_operations.tickets);
+        for ticket in tickets {
+            let completion = match ticket.receiver.try_recv() {
+                Ok(reply) => reply,
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.composition_editor_operations.tickets.push(ticket);
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => SaveCompletion {
+                    status: Err("本の構成の保存処理が終了しました".into()),
+                },
+            };
+            let still_owned =
+                self.composition_editor_operations.owner.as_ref() == Some(&ticket.owner);
+            match completion.status {
+                Ok(resume) => {
+                    // This is the sole receipt consumer, before service publications start reloads.
+                    if let Some(resume) = resume {
+                        let recorded = self.persist_book_resume_with_identity(
+                            resume.key.clone(),
+                            resume.position.page,
+                            Some(resume.meter),
+                            resume.position.identity.clone(),
+                        );
+                        if !recorded
+                            && self.book_resume_writer.is_some()
+                            && matches!(
+                                self.viewer_context_residence(ticket.owner.context_id),
+                                super::ContextResidence::Retired | super::ContextResidence::Unknown
+                            )
+                        {
+                            crate::logger::log("composition editor: resume write unavailable");
+                            self.show_feedback_warning("読書位置を保存できませんでした".into());
+                        }
+                    }
+                    if still_owned {
+                        self.with_composition_editor_owner_state(&ticket.owner, |state| {
+                            *state = CompositionEditorState::Reloading
+                        });
+                    } else {
+                        self.show_feedback_toast(if self.remote_session_blocks_local_control() {
+                            "本の構成を保存し、Remoteからの操作に切り替えました".into()
+                        } else {
+                            "本の構成を保存しました".into()
+                        });
+                    }
+                }
+                Err(error) => {
+                    crate::logger::log(format!("composition editor save: {error}"));
+                    self.show_feedback_error(error.clone());
+                    if still_owned {
+                        self.with_composition_editor_owner_state(&ticket.owner, |editor| {
+                            let state = std::mem::take(editor);
+                            *editor = match state {
+                                CompositionEditorState::Saving(mut session) => {
+                                    session.error = Some(error);
+                                    session.refresh_view();
+                                    CompositionEditorState::Editing(session)
+                                }
+                                state => state,
+                            };
+                        });
+                    }
+                }
+            }
+            ctx.request_repaint();
         }
     }
 
@@ -741,7 +786,7 @@ impl App {
             });
         if let Err(error) = spawn {
             self.composition_editor = CompositionEditorState::Editing(session);
-            self.show_feedback_toast(format!("本の構成を保存できませんでした: {error}"));
+            self.show_feedback_warning(format!("本の構成を保存できませんでした: {error}"));
             return;
         }
         let handle = self.remote_session_handle().cloned();
@@ -790,10 +835,10 @@ impl App {
             ctx.memory_mut(|memory| {
                 memory.set_modal_layer(egui::LayerId::new(
                     egui::Order::Foreground,
-                    egui::Id::new("composition-editor-owner-notice"),
+                    egui::Id::unique("composition-editor-owner-notice"),
                 ))
             });
-            egui::Area::new(egui::Id::new("composition-editor-owner-notice"))
+            egui::Area::new(egui::Id::unique("composition-editor-owner-notice"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(ctx.content_rect().min + egui::vec2(12.0, 12.0))
                 .show(ctx, |ui| {
@@ -804,7 +849,7 @@ impl App {
                 });
             return;
         }
-        let marker = egui::Id::new(("composition-editor-drawn", owner.request_id));
+        let marker = egui::Id::unique(("composition-editor-drawn", owner.request_id));
         let frame = ctx.cumulative_frame_nr();
         if ctx.data(|data| data.get_temp::<u64>(marker)) == Some(frame) {
             return;
@@ -849,7 +894,7 @@ impl App {
                 }
                 ui::show_window(
                     ctx,
-                    egui::Id::new(("book-composition-editor", owner.request_id)),
+                    egui::Id::unique(("book-composition-editor", owner.request_id)),
                     &session.view,
                     &mut session.ui,
                     keys,
@@ -867,7 +912,7 @@ impl App {
                 );
                 ui::show_window(
                     ctx,
-                    egui::Id::new(("book-composition-editor", owner.request_id)),
+                    egui::Id::unique(("book-composition-editor", owner.request_id)),
                     &view,
                     &mut ui::EditorUiState::default(),
                     keys,
@@ -1426,3 +1471,224 @@ mod tests;
 #[cfg(test)]
 #[path = "book_composition_editor/metadata_transfer_tests.rs"]
 mod metadata_transfer_tests;
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn egui037_continuation_context_state_save_receipt_preserves_both_unadopted_views() {
+        use crate::app::context_state_tests::Fixture;
+        for mounted_other in [false, true] {
+            let Fixture {
+                mut env,
+                main,
+                other,
+                old_stamp,
+                ..
+            } = Fixture::new();
+            env.book_resume_writer = Some(
+                crate::book_resume_db::BookResumeWriter::spawn_at(
+                    env.tmp.path().join("receipt-resume.db"),
+                )
+                .unwrap(),
+            );
+            let owner = CompositionEditorOwner {
+                context_id: if mounted_other { main } else { other },
+                scope: BookScopeKey::document(&env.tmp.path().join("authoritative.cbz")).unwrap(),
+                request_id: 701,
+            };
+            env.composition_editor_operations.owner = Some(owner.clone());
+            let resume_path = owner.scope.logical_root.clone();
+            let identity = PageIdentity::Archive {
+                container: crate::path_key::normalize(&resume_path),
+                entry_name: "saved.jpg".into(),
+            };
+            let meter = ReadingMeterValue::new(2, 4).unwrap();
+            let (worker, receiver) = mpsc::channel();
+            env.composition_editor_operations
+                .tickets
+                .push(SentSaveTicket {
+                    owner: owner.clone(),
+                    receiver,
+                });
+            worker
+                .send(SaveCompletion {
+                    status: Ok(Some(ResumeCommit {
+                        key: resume_path.clone(),
+                        position: ReadingPosition {
+                            page: 2,
+                            identity: Some(identity.clone()),
+                        },
+                        meter,
+                    })),
+                })
+                .unwrap();
+            let generation = env.items_generation;
+            let publications = env.rating_publication_count;
+            App::start_rating_boundary_trace_for_test();
+            let projected = if mounted_other { other } else { main };
+            env.with_viewer_context_state(projected, |app| {
+                app.poll_composition_editor_save_receipts(&egui::Context::default())
+            })
+            .unwrap();
+            assert!(App::take_rating_boundary_trace_for_test().is_empty());
+            App::stop_rating_boundary_trace_for_test();
+            assert!(!env.composition_editor_writes_pending());
+            assert_eq!(env.items_generation, generation);
+            assert_eq!(env.rating_publication_count, publications);
+            for id in [main, other] {
+                env.with_viewer_context_state(id, |app| {
+                    Fixture::assert_pending(app, id, if id == main { 4 } else { 7 }, old_stamp);
+                    assert_eq!(
+                        matches!(app.composition_editor, CompositionEditorState::Reloading),
+                        id == owner.context_id
+                    );
+                })
+                .unwrap();
+            }
+            let writer = env.book_resume_writer.as_ref().unwrap();
+            assert_eq!(writer.watermarks().admitted, 1);
+            let reply = writer
+                .read_position_after(&crate::path_key::normalize(&resume_path), 1)
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
+            assert_eq!(
+                reply.position.unwrap(),
+                ReadingPosition {
+                    page: 2,
+                    identity: Some(identity)
+                }
+            );
+            env.poll_composition_editor_save_receipts(&egui::Context::default());
+            assert_eq!(
+                env.book_resume_writer
+                    .as_ref()
+                    .unwrap()
+                    .watermarks()
+                    .admitted,
+                1
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn egui037_continuation_context_state_late_receipt_records_resume_after_owner_retirement() {
+        let mut app = crate::app::setup_app_for_test();
+        app.book_resume_writer = Some(
+            crate::book_resume_db::BookResumeWriter::spawn_at(
+                app.tmp.path().join("late-receipt.db"),
+            )
+            .unwrap(),
+        );
+        let retired = app
+            .build_viewer_context("receipt_test", |_, _| {
+                super::super::viewer_context_registry::BuildOutcome::Commit
+            })
+            .unwrap();
+        let old = CompositionEditorOwner {
+            context_id: retired,
+            scope: BookScopeKey::document(&app.tmp.path().join("closed.cbz")).unwrap(),
+            request_id: 1,
+        };
+        app.retire_context(retired, "late_receipt_test", |_| ())
+            .unwrap();
+        let new = CompositionEditorOwner {
+            context_id: app.projected_viewer_context_id(),
+            request_id: 2,
+            ..old.clone()
+        };
+        app.composition_editor_operations.owner = Some(new.clone());
+        let (worker, receiver) = mpsc::channel();
+        app.composition_editor_operations
+            .tickets
+            .push(SentSaveTicket {
+                owner: old.clone(),
+                receiver,
+            });
+        worker
+            .send(SaveCompletion {
+                status: Ok(Some(ResumeCommit {
+                    key: old.scope.logical_root.clone(),
+                    position: ReadingPosition {
+                        page: 4,
+                        identity: None,
+                    },
+                    meter: ReadingMeterValue::new(4, 5).unwrap(),
+                })),
+            })
+            .unwrap();
+        app.poll_composition_editor_save_receipts(&egui::Context::default());
+        assert_eq!(app.composition_editor_operations.owner, Some(new));
+        assert!(matches!(
+            app.composition_editor,
+            CompositionEditorState::Closed
+        ));
+        let writer = app.book_resume_writer.as_ref().unwrap();
+        assert_eq!(writer.watermarks().admitted, 1);
+        assert_eq!(
+            writer
+                .read_position_after(&crate::path_key::normalize(&old.scope.logical_root), 1)
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap()
+                .position
+                .unwrap()
+                .page,
+            4
+        );
+    }
+
+    #[test]
+    fn egui037_continuation_sent_save_terminal_unblocks_remote_without_editor_ui() {
+        for status in [Ok(None), Err("fake save failure".to_owned())] {
+            let mut app = crate::app::setup_app_for_test();
+            drop(app.book_resume_writer.take());
+            let ctx = egui::Context::default();
+            let (worker, receiver) = mpsc::channel();
+            let scope = BookScopeKey::document(&app.tmp.path().join("saved.cbz")).unwrap();
+            app.composition_editor_operations
+                .tickets
+                .push(SentSaveTicket {
+                    owner: CompositionEditorOwner {
+                        context_id: ViewerContextId::for_test(999),
+                        scope,
+                        request_id: 1,
+                    },
+                    receiver,
+                });
+            let handle = crate::remote_ipc::session::SessionHandle::new();
+            app.set_remote_session_handle(handle.clone());
+            handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+                client_id: "save-continuation".into(),
+                peer: mimageviewer_ipc::SessionPeerInfo {
+                    connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                    device_name: None,
+                },
+            });
+            app.service_remote_session(&ctx);
+            app.poll_composition_editor_save_receipts(&ctx);
+            assert!(app.composition_editor_writes_pending());
+            assert_eq!(
+                handle.snapshot().phase,
+                crate::remote_ipc::session::RemoteControlPhase::AcquiringRemote
+            );
+            worker.send(SaveCompletion { status }).unwrap();
+            app.poll_composition_editor_save_receipts(&ctx);
+            assert!(!app.composition_editor_writes_pending());
+            assert!(matches!(
+                app.composition_editor,
+                CompositionEditorState::Closed
+            ));
+            app.service_remote_session(&ctx);
+            assert_eq!(
+                handle.snapshot().phase,
+                crate::remote_ipc::session::RemoteControlPhase::RemoteActive
+            );
+            app.poll_composition_editor_save_receipts(&ctx);
+            assert!(app.composition_editor_acquire_ready());
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+        }
+    }
+}

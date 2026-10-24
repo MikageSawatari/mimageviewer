@@ -21,7 +21,7 @@ impl App {
     /// グリッドのキー操作から、単一の実ファイル / 実フォルダだけを名前変更へ渡す。
     pub(crate) fn request_grid_rename_dialog(&mut self) {
         if self.checked.len() > 1 {
-            self.show_feedback_toast("名前の変更は 1 項目ずつ行ってください".to_owned());
+            self.show_feedback_warning("名前の変更は 1 項目ずつ行ってください".to_owned());
             return;
         }
         let target_index = self.checked.iter().next().copied().or(self.selected);
@@ -36,7 +36,7 @@ impl App {
                 })
             })
         else {
-            self.show_feedback_toast("この項目は名前を変更できません".to_owned());
+            self.show_feedback_warning("この項目は名前を変更できません".to_owned());
             return;
         };
         self.request_rename_dialog(target, target_is_file);
@@ -44,11 +44,11 @@ impl App {
 
     pub(crate) fn request_rename_dialog(&mut self, target: PathBuf, target_is_file: bool) {
         if self.rename_pending.is_some() {
-            self.show_feedback_toast("名前の変更が完了するまでお待ちください".to_owned());
+            self.show_feedback_warning("名前の変更が完了するまでお待ちください".to_owned());
             return;
         }
         let Some(_name) = target.file_name().and_then(|name| name.to_str()) else {
-            self.show_feedback_toast("この項目は名前を変更できません".to_owned());
+            self.show_feedback_warning("この項目は名前を変更できません".to_owned());
             return;
         };
         // The request producer already owns the typed GridItem. Capture that kind here instead of
@@ -100,7 +100,7 @@ impl App {
                 }
                 NamePromptOutcome::Failed => {
                     self.clear_rename_dialog_state();
-                    self.show_feedback_toast("名前の変更画面を開けませんでした".to_owned());
+                    self.show_feedback_warning("名前の変更画面を開けませんでした".to_owned());
                     return;
                 }
             };
@@ -203,10 +203,7 @@ impl App {
                         .map(str::to_owned);
                     self.pending_reload = true;
                 }
-                self.show_feedback_toast(format!(
-                    "名前を変更しました: {}",
-                    outcome.new_path.display()
-                ));
+                self.show_feedback_toast(rename_success_message(&outcome.new_path));
             }
             Ok(Err(message)) => {
                 self.clear_rename_dialog_state();
@@ -227,7 +224,7 @@ impl App {
         #[cfg(not(test))]
         crate::native_name_dialog::show_warning(self.main_hwnd, DIALOG_TITLE, message);
         #[cfg(test)]
-        self.show_feedback_toast(message.to_owned());
+        self.show_feedback_warning(message.to_owned());
     }
 
     fn clear_rename_dialog_state(&mut self) {
@@ -239,6 +236,14 @@ impl App {
 
 /// UTF-16 code units in the stem before the final extension.
 /// Extensionless names and dotfiles select the whole name.
+fn rename_success_message(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    format!("名前を変更: {name}")
+}
+
 fn rename_stem_utf16_len(name: &str) -> usize {
     let Some(extension) = final_extension(name) else {
         return name.encode_utf16().count();
@@ -322,6 +327,21 @@ fn matches_reserved_numbered_device(stem: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{rename_extension_changed, rename_stem_utf16_len, validate_rename_item_name};
+
+    #[test]
+    fn notification_rename_success_uses_complete_filename_without_parent_path() {
+        let path =
+            std::path::PathBuf::from(r"C:\長い親フォルダ\さらに長い場所\日本語の新しい画像名.jpg");
+        assert_eq!(
+            super::rename_success_message(&path),
+            "名前を変更: 日本語の新しい画像名.jpg"
+        );
+        let name = format!("{}.png", "長い名前".repeat(35));
+        assert_eq!(
+            super::rename_success_message(&std::path::PathBuf::from(r"C:\folder").join(&name)),
+            format!("名前を変更: {name}")
+        );
+    }
 
     #[test]
     fn rename_stem_utf16_len_handles_extensions_dotfiles_and_unicode() {

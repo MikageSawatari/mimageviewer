@@ -240,9 +240,10 @@ mod spread_shift_d3 {
             app.remote_session_ui
                 .pending_reading_writes
                 .push(PendingRemoteReadingWrite::ViewTrim { pending, receiver });
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let mut output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.poll_remote_session(ctx)
             });
+            output.textures_delta.clear();
             assert!(
                 output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
                     <= Duration::from_millis(16)
@@ -783,7 +784,8 @@ mod spread_shift_d3 {
         for frame in 0..6 {
             let mut raw = egui::RawInput::default();
             raw.time = Some(frame as f64 / 60.0);
-            let output = ctx.run(raw, |ctx| app.poll_remote_session(ctx));
+            let mut output = ctx.run_pass(raw, |ctx| app.poll_remote_session(ctx));
+            output.textures_delta.clear();
             assert!(
                 output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
                     <= Duration::from_millis(16)

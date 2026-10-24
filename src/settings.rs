@@ -890,6 +890,7 @@ pub enum FullscreenOverflowItemId {
     NavigatorToggle,
     NavigatorPosition,
     PageTurnAnimationToggle,
+    SlideshowSettings,
     ImageAnalysis,
     PixelGrid,
     LoupeLock,
@@ -902,6 +903,7 @@ impl FullscreenOverflowItemId {
             Self::NavigatorToggle,
             Self::NavigatorPosition,
             Self::PageTurnAnimationToggle,
+            Self::SlideshowSettings,
             Self::ImageAnalysis,
             Self::PixelGrid,
             Self::LoupeLock,
@@ -914,6 +916,7 @@ impl FullscreenOverflowItemId {
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
             Self::PageTurnAnimationToggle => "ページめくりアニメーション",
+            Self::SlideshowSettings => "スライドショー",
             Self::ImageAnalysis => "分析ツール",
             Self::PixelGrid => "ピクセルグリッド",
             Self::LoupeLock => "ルーペ固定",
@@ -2810,6 +2813,28 @@ impl TextContrast {
         match self {
             Self::Unknown => Self::Standard,
             value => value,
+        }
+    }
+}
+
+/// 通常の一時通知の表示時間。旧設定の項目欠落は Standard に移行する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDuration {
+    Short,
+    #[default]
+    Standard,
+    Long,
+    #[serde(other)]
+    Unknown,
+}
+
+impl NotificationDuration {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "短い",
+            Self::Long => "長い",
+            Self::Standard | Self::Unknown => "標準",
         }
     }
 }
@@ -5221,6 +5246,9 @@ pub struct Settings {
     /// Targets whose fixed display becomes automatic only on the current F11 surface.
     #[serde(default)]
     pub fullscreen_chrome_suppression: FullscreenChromeSuppression,
+    /// 手動の前後移動を現在の閲覧順の先頭 / 末尾で折り返す。
+    #[serde(default)]
+    pub fullscreen_manual_nav_wrap: bool,
     /// フルスクリーンで先頭 / 末尾に達したときの案内を表示する。
     #[serde(default = "default_true")]
     pub fullscreen_boundary_notice_visible: bool,
@@ -5364,6 +5392,10 @@ pub struct Settings {
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
+
+    /// 一時通知の全体設定。警告・エラーは短い設定でも標準時間を確保する。
+    #[serde(default)]
+    pub notification_duration: NotificationDuration,
 
     /// OS DPI とは独立したアプリ内 UI 表示倍率 (50%..=200%、10% 刻み)。
     #[serde(default = "default_ui_scale_factor")]
@@ -5957,10 +5989,13 @@ pub struct Settings {
     /// (複数ウィンドウモードでは常にメディア窓なので、このフラグは見ない)。
     #[serde(default)]
     pub fullfeature_media_window: bool,
-    /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画
-    /// top-level window の両方で共有する。
+    /// 旧版の論理配置。物理配置への移行用に読み取り、以後は書き換えない。
     #[serde(default)]
     pub detached_viewer_window_placement: Option<DetachedViewerWindowPlacement>,
+    /// 別ウィンドウビューアの通常時の物理外枠配置。旧値より優先して読み込む。
+    #[serde(default)]
+    pub detached_viewer_window_physical_placement:
+        Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
 
     // ── VST3 プラグイン処理 (v0.9.0+) ──
     //
@@ -6038,6 +6073,10 @@ pub struct Settings {
     /// 新規 (= 過去に保存履歴なし) や旧コードで保存された JSON では None。
     #[serde(default)]
     pub last_seen_version: Option<String>,
+    /// 最後に利用者が「重要な変更点」を閉じた版。起動しただけでは進めない。
+    /// 旧設定の欠落値は load 時に前回起動版 (新規なら現行版) へ移行・保存する。
+    #[serde(default)]
+    pub whats_new_acknowledged_version: Option<String>,
 }
 
 /// VST3 プラグインチェーンの 1 エントリ。
@@ -7729,6 +7768,7 @@ impl Default for Settings {
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_chrome_suppression: FullscreenChromeSuppression::default(),
+            fullscreen_manual_nav_wrap: false,
             fullscreen_boundary_notice_visible: true,
             fullscreen_processing_status_visible: true,
             fullscreen_prefetch_status_visible: true,
@@ -7769,6 +7809,7 @@ impl Default for Settings {
             ui_theme: UiTheme::default(),
             preferences_restore_position: true,
             text_contrast: TextContrast::default(),
+            notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),
             ui_font: UiFontSettings::default(),
             first_setup_completed: false,
@@ -7957,6 +7998,7 @@ impl Default for Settings {
             detached_viewer_open_images_in_window: false,
             fullfeature_media_window: false,
             detached_viewer_window_placement: None,
+            detached_viewer_window_physical_placement: None,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
             vst3_plugin_path: None,
@@ -7974,6 +8016,7 @@ impl Default for Settings {
             audio_normalize_enabled: false,
             audio_normalize_target_lufs_milli: default_audio_normalize_target_lufs_milli(),
             last_seen_version: None,
+            whats_new_acknowledged_version: None,
             // ── 隠蔽加工 (Phase 1) ────────────────────────────
             conceal_type: crate::conceal::ConcealType::default(),
             conceal_mosaic_tile_mode: crate::conceal::TileSizeMode::default(),
@@ -9015,6 +9058,20 @@ impl Settings {
 
     /// 位置復元マトリクス「動画 × 一覧から開く」セル。保存先は互換維持のため既存 bool
     /// `video_grid_open_starts_from_beginning`。FromStart = 先頭から開く。
+    /// Clear only saved media memory. Runtime playback continues to record normally.
+    /// Persistence follows the caller's existing settings-save boundary.
+    pub(crate) fn clear_video_media_memory(&mut self) -> (usize, usize, usize) {
+        let counts = (
+            self.video_resume_positions.len(),
+            self.video_watched_to_end.len(),
+            self.video_audio_track_choices.len(),
+        );
+        self.video_resume_positions.clear();
+        self.video_watched_to_end.clear();
+        self.video_audio_track_choices.clear();
+        counts
+    }
+
     pub fn video_open_resume(&self) -> ResumeMode {
         if self.video_grid_open_starts_from_beginning {
             ResumeMode::FromStart
@@ -9383,6 +9440,15 @@ impl Settings {
                 }
             }
         }
+        let whats_new_acknowledgement_migrated = settings.whats_new_acknowledged_version.is_none();
+        if whats_new_acknowledgement_migrated && db_loaded {
+            settings.whats_new_acknowledged_version = Some(
+                previous_last_seen_version
+                    .as_deref()
+                    .unwrap_or(current_version)
+                    .to_owned(),
+            );
+        }
         if version_marker_changed && db_loaded {
             // Clean install has no previous version to snapshot. Record the current marker through
             // the bootstrap save so later launches can distinguish a real version transition.
@@ -9422,7 +9488,8 @@ impl Settings {
             || toolbar_sort_rating_options_migrated
             || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
-            || version_marker_changed;
+            || version_marker_changed
+            || whats_new_acknowledgement_migrated;
         let bootstrap_saved = if bootstrap_save_needed {
             settings.save_internal_no_rotation()
         } else {
@@ -9838,6 +9905,9 @@ impl Settings {
         self.restore_toolbar_name_filter_after_load();
         self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
         self.text_contrast = self.text_contrast.normalized();
+        if self.notification_duration == NotificationDuration::Unknown {
+            self.notification_duration = NotificationDuration::Standard;
+        }
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
         self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
@@ -10243,6 +10313,9 @@ impl Settings {
     /// `src` 側は Vec / String など大きいフィールドは `std::mem::take` で奪うので、
     /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
+        // 通知を閉じる前の環境設定 draft で既読を巻き戻さない。
+        self.whats_new_acknowledged_version
+            .clone_from(&src.whats_new_acknowledged_version);
         // ── グリッド / ツールバー runtime 状態 ──
         self.grid_cols = src.grid_cols;
         self.grid_view_mode = src.grid_view_mode;
@@ -10437,6 +10510,8 @@ impl Settings {
         self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
+        self.detached_viewer_window_physical_placement =
+            src.detached_viewer_window_physical_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
         // が切り替わっても、古い snapshot の overlay へ巻き戻さない。
         self.favorite_view_overlay = src.favorite_view_overlay.clone();
@@ -10649,6 +10724,60 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_duration_defaults_and_sqlite_roundtrip() {
+        assert_eq!(
+            Settings::default().notification_duration,
+            NotificationDuration::Standard
+        );
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            missing.notification_duration,
+            NotificationDuration::Standard
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        for value in [
+            NotificationDuration::Short,
+            NotificationDuration::Standard,
+            NotificationDuration::Long,
+        ] {
+            let mut settings = Settings::default();
+            settings.notification_duration = value;
+            settings.grid_cols = 9;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().notification_duration,
+                value
+            );
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'notification_duration'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+        assert_eq!(
+            loaded.grid_cols, 9,
+            "old settings survive the additive migration"
+        );
+    }
+
+    #[test]
+    fn notification_duration_unknown_value_is_forward_compatible() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"notification_duration":"future"}"#).unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Unknown);
+        assert_eq!(loaded.notification_duration.label(), "標準");
+        loaded.sanitize();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+    }
+
     #[test]
     fn preferences_restore_position_defaults_on_and_sqlite_roundtrip() {
         assert!(Settings::default().preferences_restore_position);
@@ -11918,7 +12047,7 @@ mod tests {
         let applied = apply_ui_scale_factor(&ctx, 1.46);
         assert_f32_close(applied, 1.5);
         ctx.begin_pass(egui::RawInput::default());
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
         assert_f32_close(ctx.zoom_factor(), 1.5);
     }
 
@@ -12266,6 +12395,125 @@ mod tests {
     }
 
     #[test]
+    fn whats_new_acknowledgement_migrates_missing_released_field_and_persists_before_dismissal() {
+        for current in ["3.9.0", "3.10.0"] {
+            let env = setup_backup_env();
+            let mut old = Settings::load_with_meta_for_version("3.9.0").settings;
+            old.whats_new_acknowledged_version = None;
+            old.save();
+            // Model a released DB that has no key, rather than just a JSON null value.
+            let conn = rusqlite::Connection::open(env._tmp.path().join("settings.db")).unwrap();
+            conn.execute(
+                "DELETE FROM settings_kv WHERE key = 'whats_new_acknowledged_version'",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            assert_eq!(loaded.settings.last_seen_version.as_deref(), Some(current));
+            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            assert_eq!(
+                stored.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            // No dialog dismissal/save: a second launch must retain the original range even
+            // though the startup/version marker has already advanced. Also covers same-version
+            // migration, where the acknowledgement alone must cause bootstrap writeback.
+            reset_backup_state_for_test();
+            let next = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                next.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            let versions = |previous| {
+                crate::version_highlights::highlights_to_show(
+                    previous,
+                    current,
+                    crate::version_highlights::table(),
+                )
+                .iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                versions(next.settings.whats_new_acknowledged_version.as_deref()),
+                versions(Some("3.9.0"))
+            );
+        }
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_clean_install_is_current_and_has_no_highlights() {
+        let _env = setup_backup_env();
+        let loaded = Settings::load_with_meta_for_version("3.10.0");
+        assert_eq!(loaded.meta.previous_last_seen_version, None);
+        assert_eq!(
+            loaded.settings.whats_new_acknowledged_version.as_deref(),
+            Some("3.10.0")
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.whats_new_acknowledged_version,
+            loaded.settings.whats_new_acknowledged_version
+        );
+        assert!(
+            crate::version_highlights::highlights_to_show(
+                stored.whats_new_acknowledged_version.as_deref(),
+                "3.10.0",
+                crate::version_highlights::table(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_stale_preferences_draft() {
+        let mut live = Settings::default();
+        live.whats_new_acknowledged_version = Some("3.9.0".to_owned());
+        let mut draft = live.clone();
+        live.whats_new_acknowledged_version = Some("3.11.0".to_owned());
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.whats_new_acknowledged_version.as_deref(),
+            Some("3.11.0")
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_undismissed_relaunch_and_skipped_upgrades() {
+        let _env = setup_backup_env();
+        let mut old = Settings::load_with_meta_for_version("3.8.0").settings;
+        old.whats_new_acknowledged_version = Some("3.8.0".to_owned());
+        old.save();
+        for current in ["3.9.0", "3.9.0", "3.10.0"] {
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.8.0")
+            );
+            let versions: Vec<_> = crate::version_highlights::highlights_to_show(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                current,
+                crate::version_highlights::table(),
+            )
+            .iter()
+            .map(|entry| entry.version)
+            .collect();
+            if current == "3.9.0" {
+                assert_eq!(versions, ["3.9.0"]);
+            } else {
+                assert_eq!(versions, ["3.9.0", "3.10.0"]);
+            }
+        }
+    }
+
+    #[test]
     fn grid_selection_upgrade_runs_only_once_after_user_restores_check_mode() {
         let mut settings = Settings::default();
         settings.grid_click_selection_mode = GridClickSelectionMode::Check;
@@ -12390,6 +12638,33 @@ mod tests {
         let mut loaded: Settings = serde_json::from_value(value).unwrap();
         loaded.sanitize();
         assert!(loaded.grid_cursor_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_defaults_off_and_survives_sanitize() {
+        assert!(!Settings::default().fullscreen_manual_nav_wrap);
+        let mut legacy: Settings = serde_json::from_str("{}").unwrap();
+        legacy.sanitize();
+        assert!(!legacy.fullscreen_manual_nav_wrap);
+        let mut enabled: Settings =
+            serde_json::from_str(r#"{"fullscreen_manual_nav_wrap":true}"#).unwrap();
+        enabled.sanitize();
+        assert!(enabled.fullscreen_manual_nav_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_roundtrips_json() {
+        for enabled in [false, true] {
+            let original = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&original).unwrap();
+            assert_eq!(value["fullscreen_manual_nav_wrap"], enabled);
+            let mut loaded: Settings = serde_json::from_value(value).unwrap();
+            loaded.sanitize();
+            assert_eq!(loaded.fullscreen_manual_nav_wrap, enabled);
+        }
     }
 
     #[test]
@@ -14591,6 +14866,88 @@ mod tests {
         assert!(edited.show_toolbar_effetune);
         assert_eq!(edited.effetune_gui_pos, Some((120, 240)));
         assert_eq!(edited.effetune_gui_size, Some((900, 700)));
+    }
+
+    #[test]
+    fn detached_physical_placement_preserves_legacy_only_settings() {
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: true,
+        };
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("detached_viewer_window_physical_placement");
+        stored["detached_viewer_window_placement"] = serde_json::to_value(legacy).unwrap();
+
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(loaded.detached_viewer_window_physical_placement, None);
+    }
+
+    #[test]
+    fn detached_physical_placement_roundtrips_without_changing_legacy_value() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: -1920,
+                top: -200,
+                right: -720,
+                bottom: 700,
+            },
+            maximized: true,
+        };
+        let settings = Settings {
+            detached_viewer_window_placement: Some(legacy),
+            detached_viewer_window_physical_placement: Some(physical),
+            ..Settings::default()
+        };
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(
+            loaded.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+    }
+
+    #[test]
+    fn detached_physical_placement_live_copy_keeps_latest_physical_rect() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let mut draft = Settings::default();
+        let mut live = Settings::default();
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: 6000,
+                top: 2270,
+                right: 6960,
+                bottom: 2990,
+            },
+            maximized: false,
+        };
+        live.detached_viewer_window_physical_placement = Some(physical);
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+
+        live.detached_viewer_window_physical_placement = None;
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(draft.detached_viewer_window_physical_placement, None);
     }
 
     #[test]

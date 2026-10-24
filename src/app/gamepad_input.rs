@@ -1,3 +1,8 @@
+mod physical;
+
+pub(crate) use physical::GamepadPhysicalInput;
+use physical::{PadPhysicalEvent, PadPhysicalHandoff};
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -6,12 +11,16 @@ use eframe::egui;
 #[cfg(windows)]
 use super::ViewerPresentation;
 use super::{
-    App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridCursorMove,
-    GridScrollIntent, grid_cursor_nav_target_pos,
+    App, ContainerRatingTarget, FolderNavMode, GridContainerOpenMode, GridCursorDirection,
+    GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
-use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
+#[cfg(test)]
+use crate::gamepad::PadEvent;
+use crate::gamepad::{
+    GamepadInputState, PadAxis, PadButton, WestReleaseOutcome, foreground_app_hwnd,
+};
 use crate::grid_item::GridItem;
 use crate::keymap::KeyAction;
 use crate::ring_shortcut::{
@@ -54,7 +63,7 @@ struct PadNavigationDispatchScope {
 impl Drop for PadNavigationDispatchScope {
     fn drop(&mut self) {
         self.ctx.data_mut(|data| {
-            let id = egui::Id::new("page_turn_pad_dispatch");
+            let id = egui::Id::unique("page_turn_pad_dispatch");
             data.remove::<PadNavigationDispatch>(id);
             if let Some(previous) = self.previous {
                 data.insert_temp(id, previous);
@@ -95,19 +104,27 @@ pub(crate) struct GamepadFrameBatch {
     /// final level. Replay must still invalidate presentation without moving.
     analog_operation: bool,
     now: Instant,
-    actions: Vec<PadAction>,
+    events: Vec<PadBatchEvent>,
     saw_input_event: bool,
-    /// この frame でパッド入力の区切りが来た (無効化 / 切断)。
-    ///
-    /// 物理側の保持解除は sample が済ませている。**残っているのは所有 context で確定
-    /// すべき編集** — リングのプレビュー評価がそれ (v3.5.0 レビュー N01)。
-    session_ended: bool,
 }
 
 impl GamepadFrameBatch {
     #[cfg(test)]
     pub(crate) fn session_ended_for_test(&self) -> bool {
-        self.session_ended
+        self.events
+            .iter()
+            .any(|event| matches!(event, PadBatchEvent::SessionEnded))
+    }
+
+    #[cfg(test)]
+    fn actions_for_test(&self) -> Vec<PadAction> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                PadBatchEvent::Action(action) => Some(*action),
+                PadBatchEvent::AxesChanged(_) | PadBatchEvent::SessionEnded => None,
+            })
+            .collect()
     }
 
     /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。
@@ -118,8 +135,7 @@ impl GamepadFrameBatch {
             delivery: PadBatchDelivery::Fresh,
             analog_operation: false,
             now: Instant::now(),
-            actions: Vec::new(),
-            session_ended: false,
+            events: Vec::new(),
             saw_input_event: false,
         }
     }
@@ -359,6 +375,14 @@ enum PadActionKind {
     Press,
     Repeat,
     Release,
+    SuppressedRelease,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PadBatchEvent {
+    Action(PadAction),
+    AxesChanged([f32; 6]),
+    SessionEnded,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -387,13 +411,16 @@ impl PadOperationId {
 impl GamepadFrameBatch {
     fn presentation_operations(&self) -> Vec<(ViewerOperationId, OperationPhase, &'static str)> {
         let mut operations = self
-            .actions
+            .events
             .iter()
-            .filter_map(|action| {
+            .filter_map(|event| {
+                let PadBatchEvent::Action(action) = event else {
+                    return None;
+                };
                 let phase = match action.kind {
                     PadActionKind::Press => OperationPhase::Press,
                     PadActionKind::Repeat => OperationPhase::Repeat,
-                    PadActionKind::Release => return None,
+                    PadActionKind::Release | PadActionKind::SuppressedRelease => return None,
                 };
                 Some((
                     ViewerOperationId::Pad {
@@ -409,7 +436,7 @@ impl GamepadFrameBatch {
             operations.push((
                 ViewerOperationId::Pad {
                     batch: self.operation_batch,
-                    ordinal: self.actions.len() as u32,
+                    ordinal: self.events.len() as u32,
                 },
                 OperationPhase::Continuous,
                 "gamepad_analog",
@@ -505,26 +532,6 @@ fn mouse_button_action_blocked_by_edit_mode(edit_mode_active: bool, action: &Rin
 /// mIV のいずれかのウィンドウが OS の前面なら、その HWND を返す。
 /// gilrs はフォーカス非依存でグローバル入力を拾うため、別アプリ前面時の入力を
 /// ブロックすると同時に、detached viewer とメイングリッドのどちらが入力面かを決める。
-#[cfg(windows)]
-fn foreground_app_hwnd() -> Option<u64> {
-    use windows::Win32::System::Threading::GetCurrentProcessId;
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return None;
-        }
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        (pid != 0 && pid == GetCurrentProcessId()).then_some(hwnd.0 as u64)
-    }
-}
-
-#[cfg(not(windows))]
-fn foreground_app_hwnd() -> Option<u64> {
-    Some(1)
-}
-
 fn ring_shortcut_context_for_surface_state(
     surface: crate::app::ActionSurface,
     detached_dual_surface: bool,
@@ -756,14 +763,14 @@ impl App {
         full_rect: egui::Rect,
         surface: crate::app::ActionSurface,
     ) {
-        if self.ring_picker.is_some() || !self.gamepad_state.west_ring_active() {
+        if self.ring_picker.is_some() || !self.gamepad.state.west_ring_active() {
             return;
         }
         if self.dispatched_input_surface() != surface {
             return;
         }
         let context = self.ring_shortcut_context_for_surface(surface);
-        let selected = self.gamepad_state.west_ring_direction();
+        let selected = self.gamepad.state.west_ring_direction();
         let painter = ui.painter();
         let center = full_rect.center();
         let radius = ring_guide_radius_for_rect(full_rect);
@@ -1912,7 +1919,7 @@ impl App {
         draw_gamepad_list_picker_overlay_layout(
             ui.ctx(),
             full_rect,
-            egui::Id::new("gamepad_favorite_picker_overlay"),
+            egui::Id::unique("gamepad_favorite_picker_overlay"),
             GamepadListPickerHeading::FavoriteTabs(tab),
             "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
             len,
@@ -1967,7 +1974,7 @@ impl App {
         draw_gamepad_list_picker_overlay_layout(
             ui.ctx(),
             full_rect,
-            egui::Id::new("gamepad_video_marker_picker_overlay"),
+            egui::Id::unique("gamepad_video_marker_picker_overlay"),
             GamepadListPickerHeading::Title("ブックマーク / チャプター"),
             "上下:選択  A:移動  B/Select:閉じる",
             markers.len(),
@@ -2003,7 +2010,7 @@ impl App {
         draw_gamepad_list_picker_overlay_layout(
             ui.ctx(),
             full_rect,
-            egui::Id::new("gamepad_location_picker_overlay"),
+            egui::Id::unique("gamepad_location_picker_overlay"),
             GamepadListPickerHeading::Title("場所"),
             "上下:選択  A:移動  B/Select:閉じる",
             picker.entries.len(),
@@ -2095,7 +2102,8 @@ impl App {
 
     /// デバイスを読んで、この frame の操作を作る。**配り先はまだ決めない。**
     ///
-    /// 物理デバイスは 1 つなので、drain・ボタン状態・リピート生成は App-global に置く。
+    /// 物理デバイスは 1 つなので、drain・保持状態は App-global の物理 owner に置く。
+    /// リピート生成・frame 内配送/replay はこの UI batch 側に残す。
     /// context と一緒に入れ替えると、別ウィンドウへ切り替えた瞬間にリピートや軸の保持が
     /// 飛ぶ。配り先 (= 前面の viewer) を決めて消費するのは
     /// [`Self::dispatch_gamepad_batch`] の仕事で、そちらは context を mount した状態で
@@ -2103,7 +2111,7 @@ impl App {
     pub(crate) fn sample_gamepad_input(&mut self, ctx: &egui::Context) -> GamepadFrameBatch {
         let track_presentation = self.page_turn_operation_tracking_needed();
         let transaction_id = if track_presentation {
-            egui::Id::new("gamepad_operation_ingress")
+            egui::Id::unique("gamepad_operation_ingress")
         } else {
             egui::Id::NULL
         };
@@ -2127,107 +2135,26 @@ impl App {
             0
         };
         let now = Instant::now();
-        // 無効なら読まない。runtime 側が読み取りスレッドごと止めるので、
-        // 「反応しないのに UI だけ起き続ける」状態にはならない。
         let enabled = self.settings.gamepad_enabled;
-        let events = self.gamepad.drain(ctx, enabled);
-        // **無効化は物理切断と同じ終端。** 読み捨てるだけでは、握ったボタンと倒した軸が
-        // consumer 側に残ったまま `due_button_repeat` / `dispatch_gamepad_analog` が動き続け、
-        // 停止したスレッドから中立イベントは二度と届かない。スティックがずれている状態で
-        // 設定を OFF にすると、移動やズームと再描画が止まらなくなる (v3.5.0 レビュー F06)。
-        // パッドでしか閉じられない操作 UI も、同じ遷移でここで終わらせる。
-        if !enabled {
-            self.release_gamepad_input_holds(ctx);
-            return GamepadFrameBatch {
-                operation_batch,
-                delivery: PadBatchDelivery::Fresh,
-                analog_operation: false,
-                now,
-                actions: Vec::new(),
-                saw_input_event: false,
-                session_ended: true,
-            };
-        }
-        let mut actions = Vec::new();
-        let mut saw_input_event = false;
-        let mut session_ended = false;
-        let mut analog_operation = track_presentation && self.gamepad_analog_active();
-
-        for event in events {
-            match event {
-                PadEvent::ButtonPressed(button) => {
-                    saw_input_event = true;
-                    if self.gamepad_state.set_button_down(button, true, now) {
-                        actions.push(PadAction {
-                            operation_id: PadOperationId {
-                                batch: operation_batch,
-                                ordinal: actions.len() as u32,
-                            },
-                            button,
-                            kind: PadActionKind::Press,
-                        });
-                    }
-                }
-                PadEvent::ButtonReleased(button) => {
-                    saw_input_event = true;
-                    if self.gamepad_state.set_button_down(button, false, now) {
-                        actions.push(PadAction {
-                            operation_id: PadOperationId {
-                                batch: operation_batch,
-                                ordinal: actions.len() as u32,
-                            },
-                            button,
-                            kind: PadActionKind::Release,
-                        });
-                    }
-                }
-                PadEvent::AxisChanged(axis, value) => {
-                    saw_input_event = true;
-                    self.gamepad_state.set_axis(axis, value);
-                    if track_presentation {
-                        analog_operation |= self.gamepad_analog_active();
-                    }
-                }
-                PadEvent::Connected => {
-                    saw_input_event = true;
-                }
-                PadEvent::Disconnected => {
-                    saw_input_event = true;
-                    // 握ったまま切断すると保持状態が残りリピート/アナログが止まらない。
-                    // 設定 OFF と同じ終端を通す。
-                    session_ended = true;
-                    self.release_gamepad_input_holds(ctx);
-                }
-            }
-        }
-
-        for button in REPEAT_BUTTONS {
-            let interval = repeat_interval_for_button(button);
-            if self.gamepad_state.due_button_repeat(button, now, interval) {
-                actions.push(PadAction {
-                    operation_id: PadOperationId {
-                        batch: operation_batch,
-                        ordinal: actions.len() as u32,
-                    },
-                    button,
-                    kind: PadActionKind::Repeat,
-                });
-            }
-        }
-
-        let batch = GamepadFrameBatch {
-            operation_batch,
-            delivery: PadBatchDelivery::Fresh,
-            analog_operation,
+        let physical = self.gamepad.take_pending();
+        let batch = self.gamepad_batch_from_physical_input(
+            ctx,
+            physical,
+            enabled,
             now,
-            actions,
-            saw_input_event,
-            session_ended,
-        };
+            operation_batch,
+            track_presentation,
+        );
+        if !enabled {
+            return batch;
+        }
         if track_presentation {
             // The sampled immutable batch is the application ingress owner;
             // dispatch/replay must not replace arrival with acceptance time.
-            for action in &batch.actions {
+            for event in &batch.events {
+                let PadBatchEvent::Action(action) = event else {
+                    continue;
+                };
                 let operation_id = ViewerOperationId::Pad {
                     batch: action.operation_id.batch,
                     ordinal: action.operation_id.ordinal,
@@ -2239,7 +2166,7 @@ impl App {
                     match action.kind {
                         PadActionKind::Press => "Press",
                         PadActionKind::Repeat => "Repeat",
-                        PadActionKind::Release => "release",
+                        PadActionKind::Release | PadActionKind::SuppressedRelease => "release",
                     },
                     "gamepad_sample",
                 );
@@ -2247,7 +2174,7 @@ impl App {
             if batch.analog_operation {
                 let operation_id = ViewerOperationId::Pad {
                     batch: batch.operation_batch,
-                    ordinal: batch.actions.len() as u32,
+                    ordinal: batch.events.len() as u32,
                 };
                 crate::key_input::trace_page_turn_operation_ingress(
                     || format!("{operation_id:?}"),
@@ -2268,6 +2195,95 @@ impl App {
             });
         }
         batch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sample_gamepad_input_with_logic_for_test(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> GamepadFrameBatch {
+        self.drain_gamepad_physical_input(ctx, Instant::now());
+        self.sample_gamepad_input(ctx)
+    }
+
+    /// Physical ingress only: no egui input/pass/frame reads and no mounted-context work.
+    /// App::logic owns the single physical poll; UI sampling only takes pending facts.
+    pub(crate) fn drain_gamepad_physical_input(&mut self, ctx: &egui::Context, now: Instant) {
+        self.gamepad.drain(ctx, self.settings.gamepad_enabled, now);
+    }
+
+    /// Take physical facts into one UI batch. Repeat, operation identity and modal
+    /// delivery stay on the UI side; the physical owner retains facts until taken.
+    fn gamepad_batch_from_physical_input(
+        &mut self,
+        _ctx: &egui::Context,
+        physical: PadPhysicalHandoff,
+        enabled: bool,
+        now: Instant,
+        operation_batch: u64,
+        track_presentation: bool,
+    ) -> GamepadFrameBatch {
+        if !enabled {
+            return GamepadFrameBatch {
+                operation_batch,
+                delivery: PadBatchDelivery::Fresh,
+                analog_operation: false,
+                now,
+                events: vec![PadBatchEvent::SessionEnded],
+                saw_input_event: false,
+            };
+        }
+        let saw_input_event = physical.saw_input_event;
+        let analog_operation = track_presentation && physical.analog_operation;
+        let mut events = Vec::new();
+        for event in physical.events {
+            let (button, kind) = match event {
+                PadPhysicalEvent::ButtonPressed(button) => (button, PadActionKind::Press),
+                PadPhysicalEvent::ButtonReleased(button) => (button, PadActionKind::Release),
+                PadPhysicalEvent::SuppressedRelease(button) => {
+                    (button, PadActionKind::SuppressedRelease)
+                }
+                PadPhysicalEvent::AxesChanged(values) => {
+                    events.push(PadBatchEvent::AxesChanged(values));
+                    continue;
+                }
+                PadPhysicalEvent::SessionEnded => {
+                    events.push(PadBatchEvent::SessionEnded);
+                    continue;
+                }
+            };
+            events.push(PadBatchEvent::Action(PadAction {
+                operation_id: PadOperationId {
+                    batch: operation_batch,
+                    ordinal: events.len() as u32,
+                },
+                button,
+                kind,
+            }));
+        }
+
+        for button in REPEAT_BUTTONS {
+            let interval = repeat_interval_for_button(button);
+            if self.gamepad.state.due_button_repeat(button, now, interval) {
+                events.push(PadBatchEvent::Action(PadAction {
+                    operation_id: PadOperationId {
+                        batch: operation_batch,
+                        ordinal: events.len() as u32,
+                    },
+                    button,
+                    kind: PadActionKind::Repeat,
+                }));
+            }
+        }
+
+        GamepadFrameBatch {
+            operation_batch,
+            delivery: PadBatchDelivery::Fresh,
+            analog_operation,
+            now,
+            events,
+            saw_input_event,
+        }
     }
 
     /// 前面の context へ操作を配る。**その context を mount した状態で呼ぶこと。**
@@ -2319,9 +2335,8 @@ impl App {
             delivery,
             analog_operation,
             now,
-            actions,
+            events,
             saw_input_event,
-            session_ended,
             ..
         } = batch;
         // Sidecar restore is an App-global semantic-input barrier. End the physical session and
@@ -2331,7 +2346,7 @@ impl App {
         if self.sidecar_restore_active() {
             self.finish_gamepad_input_for_sidecar_restore(ctx);
             self.reset_gamepad_continuous_steps(now);
-            self.gamepad_state.suppress_pending_actions();
+            self.gamepad.state.suppress_pending_actions();
             return GamepadDispatchOutcome {
                 nav: None,
                 dispatched: false,
@@ -2339,15 +2354,8 @@ impl App {
                 saw_input_event,
             };
         }
-        // **リングの確定は所有 context で。** ここは通常の配送と同じ場所で、別ウィンドウが
-        // 活性なら mount 済み。評価行はプレビューの時点で DB へ書いており、開いたときの
-        // before から Undo を組むのは確定処理だけなので、捨てると書いた評価が取り消せなく
-        // なる (レビュー R12)。root で確定すると保存先を間違える (レビュー N01)。
-        //
-        // `dispatch_allowed` より前に置く。パッドはもう無いので、抑止する相手がいない。
-        if session_ended && delivery == PadBatchDelivery::Fresh {
-            self.commit_ring_picker(ctx);
-        }
+        // Meaningful terminals are dispatched in receipt order in the mounted
+        // context. They must also commit previews when operation admission is denied.
         let dispatch_allowed = admission(self, ctx);
         let mut nav = None;
         let mut dispatched = false;
@@ -2369,14 +2377,38 @@ impl App {
                 };
             }
             self.consume_gamepad_directional_neutral_gate(now);
-            let analog_ordinal = actions.len() as u32;
-            for action in actions {
-                if let Some(next_nav) = self.dispatch_gamepad_button_with_operation(ctx, action) {
-                    nav = Some(next_nav);
-                    dispatched = true;
-                    break;
+            let analog_ordinal = events.len() as u32;
+            for event in events {
+                if self.gamepad_targets_viewer() {
+                    self.service_final_prepare_before_lookup(ctx);
                 }
-                dispatched = true;
+                match event {
+                    PadBatchEvent::SessionEnded => {
+                        self.clear_gamepad_input_overlays(ctx);
+                        self.commit_ring_picker_in_owner(ctx);
+                        self.gamepad.state.end_delivered_session();
+                    }
+                    PadBatchEvent::AxesChanged(values) => self.gamepad.state.deliver_axes(values),
+                    PadBatchEvent::Action(action) => {
+                        if action.kind == PadActionKind::Press {
+                            self.gamepad.state.deliver_button_edge(action.button, true);
+                        }
+                        if nav.is_none() {
+                            if let Some(next_nav) =
+                                self.dispatch_gamepad_button_with_operation(ctx, action)
+                            {
+                                nav = Some(next_nav);
+                            }
+                            dispatched = true;
+                        }
+                        if matches!(
+                            action.kind,
+                            PadActionKind::Release | PadActionKind::SuppressedRelease
+                        ) {
+                            self.gamepad.state.deliver_button_edge(action.button, false);
+                        }
+                    }
+                }
             }
             // A neutral poll is not input. Preserve the sampled analog fact;
             // merely entering the analog handler must not cancel a page turn.
@@ -2396,9 +2428,32 @@ impl App {
                 dispatched = true;
             }
         } else {
+            if delivery == PadBatchDelivery::Fresh {
+                for event in events {
+                    match event {
+                        PadBatchEvent::SessionEnded => {
+                            self.clear_gamepad_input_overlays(ctx);
+                            self.commit_ring_picker_in_owner(ctx);
+                            self.gamepad.state.end_delivered_session();
+                        }
+                        PadBatchEvent::AxesChanged(values) => {
+                            self.gamepad.state.deliver_axes(values)
+                        }
+                        PadBatchEvent::Action(action) => match action.kind {
+                            PadActionKind::Press => {
+                                self.gamepad.state.deliver_button_edge(action.button, true)
+                            }
+                            PadActionKind::Release | PadActionKind::SuppressedRelease => {
+                                self.gamepad.state.deliver_button_edge(action.button, false)
+                            }
+                            PadActionKind::Repeat => {}
+                        },
+                    }
+                }
+            }
             self.reset_gamepad_continuous_steps(now);
             // ブロック中に押されたボタンが解除後に遅れて発火しないよう抑止する。
-            self.gamepad_state.suppress_pending_actions();
+            self.gamepad.state.suppress_pending_actions();
         }
 
         GamepadDispatchOutcome {
@@ -2414,21 +2469,26 @@ impl App {
         ctx: &egui::Context,
         action: PadAction,
     ) -> Option<AddressBarNav> {
-        let _operation_scope = (action.kind != PadActionKind::Release)
-            .then(|| {
-                self.gamepad_navigation_dispatch_scope(
-                    ctx,
-                    ViewerOperationId::Pad {
-                        batch: action.operation_id.batch,
-                        ordinal: action.operation_id.ordinal,
-                    },
-                    match action.kind {
-                        PadActionKind::Press | PadActionKind::Release => OperationPhase::Press,
-                        PadActionKind::Repeat => OperationPhase::Repeat,
-                    },
-                )
-            })
-            .flatten();
+        let _operation_scope = (!matches!(
+            action.kind,
+            PadActionKind::Release | PadActionKind::SuppressedRelease
+        ))
+        .then(|| {
+            self.gamepad_navigation_dispatch_scope(
+                ctx,
+                ViewerOperationId::Pad {
+                    batch: action.operation_id.batch,
+                    ordinal: action.operation_id.ordinal,
+                },
+                match action.kind {
+                    PadActionKind::Press
+                    | PadActionKind::Release
+                    | PadActionKind::SuppressedRelease => OperationPhase::Press,
+                    PadActionKind::Repeat => OperationPhase::Repeat,
+                },
+            )
+        })
+        .flatten();
         self.dispatch_gamepad_button(ctx, action)
     }
 
@@ -2442,7 +2502,7 @@ impl App {
             return None;
         }
         self.page_turn_external_operation(ctx, operation_id, phase, "gamepad_dispatch");
-        let id = egui::Id::new("page_turn_pad_dispatch");
+        let id = egui::Id::unique("page_turn_pad_dispatch");
         let dispatch = PadNavigationDispatch {
             frame: ctx.cumulative_frame_nr(),
             destination: self.page_turn_destination(),
@@ -2467,7 +2527,7 @@ impl App {
             return None;
         }
         ctx.data(|data| {
-            data.get_temp::<PadNavigationDispatch>(egui::Id::new("page_turn_pad_dispatch"))
+            data.get_temp::<PadNavigationDispatch>(egui::Id::unique("page_turn_pad_dispatch"))
         })
         .filter(|dispatch| {
             dispatch.frame == ctx.cumulative_frame_nr()
@@ -2488,8 +2548,8 @@ impl App {
             Some(ctx),
         );
         self.release_gamepad_input_holds(ctx);
-        self.gamepad_state.clear();
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.clear();
+        self.gamepad.state.require_directional_neutral();
     }
 
     /// frame 全体の後始末。activity gate と repaint は App-global なので、配り先に
@@ -2532,7 +2592,7 @@ impl App {
                 && self.fs_context_menu_idx.is_none()
                 && !self.is_overlay_edit_mode_active();
         }
-        !self.shortcuts_blocked_by_text_input(ctx) && !ctx.is_popup_open()
+        !self.shortcuts_blocked_by_text_input(ctx) && !ctx.any_popup_open()
     }
 
     #[cfg(windows)]
@@ -2553,20 +2613,22 @@ impl App {
     }
 
     fn reset_gamepad_continuous_steps(&mut self, now: Instant) {
-        let _ = self.gamepad_state.analog_dt(false, now);
+        let _ = self.gamepad.state.analog_dt(false, now);
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(false, now, STICK_STEP_INTERVAL);
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .trigger_step_due(false, now, TRIGGER_STEP_INTERVAL);
     }
 
     fn gamepad_needs_repaint(&self) -> bool {
-        self.gamepad_state.repeat_active()
+        self.gamepad.state.repeat_active()
             || self.gamepad_analog_active()
-            || self.gamepad_state.button_down(PadButton::North)
-            || self.gamepad_state.button_down(PadButton::West)
+            || self.gamepad.state.button_down(PadButton::North)
+            || self.gamepad.state.button_down(PadButton::West)
             || self.ring_picker.is_some()
             || self.gamepad_favorite_picker.is_some()
             || self.gamepad_location_picker.is_some()
@@ -2574,12 +2636,7 @@ impl App {
     }
 
     fn gamepad_analog_active(&self) -> bool {
-        let left = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
-        let right = stick_pair(&self.gamepad_state, PadAxis::RightX, PadAxis::RightY);
-        left.length_sq() > 0.0
-            || right.length_sq() > 0.0
-            || self.gamepad_state.trigger_value(true) > TRIGGER_THRESHOLD
-            || self.gamepad_state.trigger_value(false) > TRIGGER_THRESHOLD
+        self.gamepad.analog_active()
     }
 
     fn dispatch_gamepad_button(
@@ -2587,6 +2644,17 @@ impl App {
         ctx: &egui::Context,
         action: PadAction,
     ) -> Option<AddressBarNav> {
+        if action.kind == PadActionKind::SuppressedRelease {
+            if action.button == PadButton::West
+                && self
+                    .ring_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.x_close_armed)
+            {
+                self.commit_ring_picker_in_owner(ctx);
+            }
+            return None;
+        }
         if self.gamepad_video_marker_picker.is_some() {
             self.dispatch_gamepad_video_marker_picker_button(ctx, action);
             return None;
@@ -2601,7 +2669,7 @@ impl App {
             self.dispatch_gamepad_picker_button(ctx, action);
             return None;
         }
-        if self.gamepad_state.directional_neutral_required()
+        if self.gamepad.state.directional_neutral_required()
             && (button_dir(action.button).is_some() || action.button == PadButton::West)
         {
             return None;
@@ -2609,30 +2677,30 @@ impl App {
         match action.kind {
             PadActionKind::Release if action.button == PadButton::West => {
                 if let Some(direction) = self.current_ring_gamepad_direction() {
-                    self.gamepad_state.mark_west_ring_direction(direction);
+                    self.gamepad.state.mark_west_ring_direction(direction);
                 }
                 self.finish_gamepad_west_release(ctx)
             }
             PadActionKind::Release if action.button == PadButton::North => {
-                if !self.gamepad_state.y_modifier_used() {
+                if !self.gamepad.state.y_modifier_used() {
                     self.handle_gamepad_y_tap(ctx);
                 }
                 None
             }
-            PadActionKind::Release => None,
+            PadActionKind::Release | PadActionKind::SuppressedRelease => None,
             PadActionKind::Press | PadActionKind::Repeat => {
-                if self.gamepad_state.west_ring_active() {
+                if self.gamepad.state.west_ring_active() {
                     if let Some(dir) = button_dir(action.button) {
                         let direction = self
                             .current_ring_gamepad_direction()
                             .unwrap_or_else(|| ring_direction_from_pad_dir(dir));
-                        self.gamepad_state.mark_west_ring_direction(direction);
+                        self.gamepad.state.mark_west_ring_direction(direction);
                         self.sync_native_video_ring_guide_overlay(ctx);
                         ctx.request_repaint();
                     } else if action.button == PadButton::East
                         && action.kind == PadActionKind::Press
                     {
-                        self.gamepad_state.cancel_west_ring();
+                        self.gamepad.state.cancel_west_ring();
                         self.clear_native_video_ring_guide_overlay(ctx);
                         ctx.request_repaint();
                     }
@@ -2705,9 +2773,9 @@ impl App {
         if self.consume_gamepad_directional_neutral_gate(now) {
             return false;
         }
-        if self.gamepad_state.west_ring_active() {
+        if self.gamepad.state.west_ring_active() {
             if let Some(direction) = self.current_ring_gamepad_direction() {
-                self.gamepad_state.mark_west_ring_direction(direction);
+                self.gamepad.state.mark_west_ring_direction(direction);
             }
             self.sync_native_video_ring_guide_overlay(ctx);
             return true;
@@ -2725,20 +2793,21 @@ impl App {
     }
 
     fn gamepad_directional_neutral(&self) -> bool {
-        !self.gamepad_state.dpad_direction_down()
-            && stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY).length_sq() == 0.0
+        !self.gamepad.state.dpad_direction_down()
+            && stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY).length_sq() == 0.0
     }
 
     fn consume_gamepad_directional_neutral_gate(&mut self, now: Instant) -> bool {
-        if !self.gamepad_state.directional_neutral_required() {
+        if !self.gamepad.state.directional_neutral_required() {
             return false;
         }
-        let _ = self.gamepad_state.analog_dt(false, now);
+        let _ = self.gamepad.state.analog_dt(false, now);
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(false, now, STICK_STEP_INTERVAL);
         if self.gamepad_directional_neutral() {
-            self.gamepad_state.clear_directional_neutral_required();
+            self.gamepad.state.clear_directional_neutral_required();
             false
         } else {
             true
@@ -2746,11 +2815,14 @@ impl App {
     }
 
     fn current_ring_gamepad_direction(&self) -> Option<RingDirection> {
-        ring_direction_from_dpad_buttons(&self.gamepad_state).or_else(|| {
-            let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        ring_direction_from_dpad_buttons(&self.gamepad.state).or_else(|| {
+            let stick = egui::vec2(
+                deadzone(self.gamepad.state.delivered_axis(PadAxis::LeftX)),
+                deadzone(self.gamepad.state.delivered_axis(PadAxis::LeftY)),
+            );
             ring_direction_from_stick_with_hysteresis(
                 stick,
-                self.gamepad_state.west_ring_direction(),
+                self.gamepad.state.west_ring_direction(),
             )
         })
     }
@@ -2761,25 +2833,28 @@ impl App {
             return false;
         }
         let mut changed = false;
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let stick_active = stick_dir.is_some();
         if self.folder_pane_blocks_grid_keyboard() {
             if self
-                .gamepad_state
+                .gamepad
+                .state
                 .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
                 && let Some(dir) = stick_dir
             {
                 changed = self.handle_gamepad_folder_tree_direction(dir);
             }
             let _ = self
-                .gamepad_state
+                .gamepad
+                .state
                 .trigger_step_due(false, now, Duration::from_millis(70));
-            let _ = self.gamepad_state.analog_dt(stick_active, now);
+            let _ = self.gamepad.state.analog_dt(stick_active, now);
             return changed;
         }
         if self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
             && let Some(dir) = stick_dir
         {
@@ -2787,12 +2862,13 @@ impl App {
             changed = true;
         }
 
-        let lt = self.gamepad_state.trigger_value(true);
-        let rt = self.gamepad_state.trigger_value(false);
+        let lt = self.gamepad.state.trigger_value(true);
+        let rt = self.gamepad.state.trigger_value(false);
         let trigger_delta = rt - lt;
         let trigger_active = trigger_delta.abs() > TRIGGER_THRESHOLD;
         if self
-            .gamepad_state
+            .gamepad
+            .state
             .trigger_step_due(trigger_active, now, Duration::from_millis(70))
         {
             self.scroll_gamepad_grid(trigger_delta.signum());
@@ -2800,22 +2876,23 @@ impl App {
         }
 
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .analog_dt(stick_active || trigger_active, now);
         changed
     }
 
     fn dispatch_gamepad_still_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
-        let left = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
-        let right = stick_pair(&self.gamepad_state, PadAxis::RightX, PadAxis::RightY);
-        let lt = self.gamepad_state.trigger_value(true);
-        let rt = self.gamepad_state.trigger_value(false);
+        let left = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
+        let right = stick_pair(&self.gamepad.state, PadAxis::RightX, PadAxis::RightY);
+        let lt = self.gamepad.state.trigger_value(true);
+        let rt = self.gamepad.state.trigger_value(false);
         let pan_active = left.length_sq() > 0.0;
         let zoom_axis = (right.y * RIGHT_STICK_ZOOM_MULTIPLIER + rt - lt)
             .clamp(-RIGHT_STICK_ZOOM_MULTIPLIER, RIGHT_STICK_ZOOM_MULTIPLIER);
         let zoom_active = zoom_axis.abs() > 0.05;
         let active = pan_active || zoom_active;
-        let dt = self.gamepad_state.analog_dt(active, now);
+        let dt = self.gamepad.state.analog_dt(active, now);
         if !active || dt <= 0.0 {
             return false;
         }
@@ -2874,7 +2951,8 @@ impl App {
         let stick_dir = dominant_stick_dir(stick);
         let stick_active = stick_dir.is_some();
         if self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
             && let Some(fs_idx) = self.fullscreen_idx
             && let Some(dir) = stick_dir
@@ -2892,14 +2970,15 @@ impl App {
         fs_idx: usize,
         now: Instant,
     ) -> bool {
-        let lt = self.gamepad_state.trigger_value(true);
-        let rt = self.gamepad_state.trigger_value(false);
+        let lt = self.gamepad.state.trigger_value(true);
+        let rt = self.gamepad.state.trigger_value(false);
         let trigger_delta = rt - lt;
         let trigger_active = trigger_delta.abs() > TRIGGER_THRESHOLD;
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .trigger_step_due(trigger_active, now, TRIGGER_STEP_INTERVAL);
-        let _ = self.gamepad_state.analog_dt(trigger_active, now);
+        let _ = self.gamepad.state.analog_dt(trigger_active, now);
         if !due {
             return false;
         }
@@ -2949,20 +3028,20 @@ impl App {
 
     fn finish_gamepad_west_release(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         self.clear_native_video_ring_guide_overlay(ctx);
-        match self.gamepad_state.finish_west_release() {
+        match self.gamepad.state.finish_west_release() {
             WestReleaseOutcome::Picker => {
                 self.open_gamepad_ring_picker(ctx);
                 None
             }
             WestReleaseOutcome::Ring(direction) => {
-                self.gamepad_state.require_directional_neutral();
+                self.gamepad.state.require_directional_neutral();
                 self.trigger_gamepad_ring_action(ctx, direction)
             }
             WestReleaseOutcome::Suppressed => {
                 // 抑止されたリング操作 (ブロック中に suppress された等) でも、リング用に
                 // 倒したままのスティックが通常アナログ操作へ漏れないようニュートラル通過を
                 // 要求する (review-v2.3.0 hunt P2。Ring 側と対称)。
-                self.gamepad_state.require_directional_neutral();
+                self.gamepad.state.require_directional_neutral();
                 None
             }
         }
@@ -3066,15 +3145,19 @@ impl App {
         let video_continuous_mode = self.video_continuous_mode;
         // **保存先も開いた時点で固定する。** 確定時に「いまのフォルダ」を引き直すと、
         // リングを開いたまま前面の窓が変わったときに別のフォルダへ書く (レビュー Q01)。
-        let container_rating_target =
-            self.current_container_rating_target()
-                .map(|(path_key, source_path, meta)| {
-                    crate::ring_shortcut::RingPickerContainerTarget {
-                        path_key,
-                        source_path,
-                        meta,
-                    }
-                });
+        let container_rating_target = self.current_container_rating_target().map(
+            |ContainerRatingTarget {
+                 key: path_key,
+                 source: source_path,
+                 meta,
+             }| {
+                crate::ring_shortcut::RingPickerContainerTarget {
+                    path_key,
+                    source_path,
+                    meta,
+                }
+            },
+        );
         let original = RingPickerOriginalState {
             grid_cols,
             sort_order,
@@ -3146,7 +3229,7 @@ impl App {
         }
         self.settings.ring_shortcuts.x_picker_hint_shown = true;
         self.settings.save();
-        self.show_feedback_toast_with_duration(
+        self.show_feedback_warning_with_duration(
             "ピッカーを開きました。メタデータ表示は画像リングの右上スロットから使えます。"
                 .to_string(),
             X_PICKER_HINT_TOAST_SECS,
@@ -3200,7 +3283,7 @@ impl App {
                     self.commit_ring_picker(ctx);
                 }
             }
-            PadActionKind::Release => {}
+            PadActionKind::Release | PadActionKind::SuppressedRelease => {}
             PadActionKind::Press | PadActionKind::Repeat => {
                 if let Some(dir) = button_dir(action.button) {
                     self.handle_ring_picker_direction(ctx, dir);
@@ -3248,11 +3331,12 @@ impl App {
             self.close_stale_ring_picker(ctx);
             return false;
         }
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir) = stick_dir {
             self.handle_ring_picker_direction(ctx, dir);
@@ -3266,7 +3350,7 @@ impl App {
         action: PadAction,
     ) {
         match action.kind {
-            PadActionKind::Release => {}
+            PadActionKind::Release | PadActionKind::SuppressedRelease => {}
             PadActionKind::Press | PadActionKind::Repeat => {
                 if let Some(dir) = button_dir(action.button) {
                     if matches!(dir, PadDir::Up | PadDir::Down) {
@@ -3281,7 +3365,7 @@ impl App {
                     PadButton::East | PadButton::Select if action.kind == PadActionKind::Press => {
                         self.gamepad_video_marker_picker = None;
                         self.clear_native_video_picker_overlay(ctx);
-                        self.gamepad_state.require_directional_neutral();
+                        self.gamepad.state.require_directional_neutral();
                         ctx.request_repaint();
                     }
                     _ => {}
@@ -3295,11 +3379,12 @@ impl App {
         ctx: &egui::Context,
         now: Instant,
     ) -> bool {
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir @ (PadDir::Up | PadDir::Down)) = stick_dir {
             self.move_gamepad_video_marker_picker(ctx, dir);
@@ -3311,7 +3396,7 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         };
@@ -3319,7 +3404,7 @@ impl App {
         if len == 0 {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         }
@@ -3336,7 +3421,7 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         };
@@ -3350,15 +3435,15 @@ impl App {
         let Some(marker) = markers.get(selected).cloned() else {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         };
         self.gamepad_video_marker_picker = None;
         self.clear_native_video_picker_overlay(ctx);
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.require_directional_neutral();
         if let Some(player) = self.fs_video_player(fs_idx) {
-            player.seek(marker.pts);
+            player.seek(marker.pts, crate::video::SeekOrigin::User);
         }
         #[cfg(windows)]
         {
@@ -3375,7 +3460,7 @@ impl App {
         action: PadAction,
     ) -> Option<AddressBarNav> {
         match action.kind {
-            PadActionKind::Release => None,
+            PadActionKind::Release | PadActionKind::SuppressedRelease => None,
             PadActionKind::Press | PadActionKind::Repeat => {
                 if let Some(dir) = button_dir(action.button) {
                     match dir {
@@ -3405,7 +3490,7 @@ impl App {
                     PadButton::East | PadButton::Start if action.kind == PadActionKind::Press => {
                         self.gamepad_favorite_picker = None;
                         self.clear_native_video_picker_overlay(ctx);
-                        self.gamepad_state.require_directional_neutral();
+                        self.gamepad.state.require_directional_neutral();
                         ctx.request_repaint();
                         None
                     }
@@ -3420,11 +3505,12 @@ impl App {
         ctx: &egui::Context,
         now: Instant,
     ) -> bool {
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir) = stick_dir {
             match dir {
@@ -3509,8 +3595,8 @@ impl App {
         }
         self.gamepad_favorite_picker = None;
         self.clear_native_video_picker_overlay(ctx);
-        self.gamepad_state.require_directional_neutral();
-        if self.fullscreen_idx.is_some() {
+        self.gamepad.state.require_directional_neutral();
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         if let Some(target) = favorite_target {
@@ -3541,7 +3627,7 @@ impl App {
         action: PadAction,
     ) -> Option<AddressBarNav> {
         match action.kind {
-            PadActionKind::Release => None,
+            PadActionKind::Release | PadActionKind::SuppressedRelease => None,
             PadActionKind::Press | PadActionKind::Repeat => {
                 if let Some(dir) = button_dir(action.button) {
                     if matches!(dir, PadDir::Up | PadDir::Down) {
@@ -3555,7 +3641,7 @@ impl App {
                     }
                     PadButton::East | PadButton::Select if action.kind == PadActionKind::Press => {
                         self.gamepad_location_picker = None;
-                        self.gamepad_state.require_directional_neutral();
+                        self.gamepad.state.require_directional_neutral();
                         ctx.request_repaint();
                         None
                     }
@@ -3570,11 +3656,12 @@ impl App {
         ctx: &egui::Context,
         now: Instant,
     ) -> bool {
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir @ (PadDir::Up | PadDir::Down)) = stick_dir {
             self.move_gamepad_location_picker(ctx, dir);
@@ -3589,7 +3676,7 @@ impl App {
         let len = picker.entries.len();
         if len == 0 {
             self.gamepad_location_picker = None;
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         }
@@ -3611,7 +3698,7 @@ impl App {
             .and_then(|picker| picker.entries.get(selected))
             .map(|entry| entry.nav.clone());
         self.gamepad_location_picker = None;
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.require_directional_neutral();
         ctx.request_repaint();
 
         let Some(nav) = nav else {
@@ -3632,7 +3719,7 @@ impl App {
             GamepadLocationNav::BooksRoot => AddressBarNav::BooksRoot,
             GamepadLocationNav::Direct(path) => {
                 let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-                    self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
+                    self.show_feedback_warning(format!("場所が見つかりません: {}", path.display()));
                     return None;
                 };
                 AddressBarNav::Direct(resolved, crate::app::StartupListIntent::ExplicitList)
@@ -3649,23 +3736,27 @@ impl App {
         })
     }
 
-    /// パッド入力が終わったときの**物理側**の終端。無効化と切断の共通の出口。
+    /// sidecar restoreから保持とoverlayを一緒に終わらせる既存入口。
+    /// 無効化/切断の保持解除は物理owner、overlay終了はUI batch作成側で行う。
     ///
-    /// 保持中のボタン / 軸 / リピート予約を落とし、パッドでしか閉じられない overlay を
-    /// 閉じる。何も残っていなければ何もしない (毎フレーム呼ばれるので再描画も要求しない)。
-    ///
-    /// **リングの確定はここでやらない。** ここは sample の中 = root 投影で走るが、リングの
-    /// 確定はフォルダ評価のように**所有 context の保存先**へ書く。root のまま確定すると、
-    /// 別ウィンドウで変えた評価がメイン側のフォルダへ書かれる (v3.5.0 レビュー N01)。
-    /// 確定は通常の配送と同じ経路 ([`Self::dispatch_gamepad_batch`]) が担う。
+    /// **リングの確定はここでやらない。** 通常終端は所有contextの保存先/Undoへ書く
+    /// [`Self::dispatch_gamepad_batch`] が担う。sidecar restoreはその前に既存の
+    /// commitしない終端を通す。root投影で別contextの編集を確定しない。
     fn release_gamepad_input_holds(&mut self, ctx: &egui::Context) {
         let had_overlay = self.gamepad_favorite_picker.is_some()
             || self.gamepad_location_picker.is_some()
             || self.gamepad_video_marker_picker.is_some();
-        if !had_overlay && self.ring_picker.is_none() && self.gamepad_state.is_idle() {
+        if !had_overlay && self.ring_picker.is_none() && self.gamepad.state.is_idle() {
             return;
         }
-        self.gamepad_state.clear();
+        self.gamepad.state.clear();
+        self.clear_gamepad_input_overlays(ctx);
+    }
+
+    fn clear_gamepad_input_overlays(&mut self, ctx: &egui::Context) {
+        let had_overlay = self.gamepad_favorite_picker.is_some()
+            || self.gamepad_location_picker.is_some()
+            || self.gamepad_video_marker_picker.is_some();
         if had_overlay {
             self.gamepad_favorite_picker = None;
             self.gamepad_location_picker = None;
@@ -3681,8 +3772,8 @@ impl App {
                 crate::rating_membership::RatingAdoptionIntent::Reconcile,
                 Some(ctx),
             );
-            self.gamepad_state.cancel_west_ring();
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.cancel_west_ring();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
         }
     }
@@ -4647,11 +4738,11 @@ impl App {
             return None;
         }
         let (selected, heading, detail, center_client_px, slot_labels) =
-            if owner == RightDragOwner::Root && self.gamepad_state.west_ring_active() {
+            if owner == RightDragOwner::Root && self.gamepad.state.west_ring_active() {
                 if self.ring_picker.is_some() {
                     return None;
                 }
-                let selected = self.gamepad_state.west_ring_direction();
+                let selected = self.gamepad.state.west_ring_direction();
                 let (heading, detail) = ring_guide_heading_detail(
                     &self.settings.ring_shortcuts.profile(context).slots,
                     context,
@@ -4750,12 +4841,20 @@ impl App {
     }
 
     pub(crate) fn commit_ring_picker(&mut self, ctx: &egui::Context) {
+        if self.ring_picker.is_none() {
+            return;
+        }
+        self.gamepad.state.cancel_west_ring();
+        self.gamepad.state.require_directional_neutral();
+        self.commit_ring_picker_in_owner(ctx);
+    }
+
+    /// End a preview belonging to an earlier physical session without changing
+    /// the current physical owner: a new press or axis may follow its terminal.
+    fn commit_ring_picker_in_owner(&mut self, ctx: &egui::Context) {
         let Some(picker) = self.ring_picker.clone() else {
             return;
         };
-        // 物理側は App-global。パッドはもう無いかもしれないので mount に依存させない。
-        self.gamepad_state.cancel_west_ring();
-        self.gamepad_state.require_directional_neutral();
         let owner = picker.owner;
         let applied = self.with_owner_viewer_context(owner, |app| {
             let (item_rating_changes, container_rating_record) =
@@ -4779,8 +4878,10 @@ impl App {
             }
         });
         if applied.is_none() {
-            self.finish_rating_picker_without_commit(
-                crate::rating_membership::RatingAdoptionIntent::Manual,
+            self.terminate_rating_picker_in_owner(
+                RatingPickerTermination::Release(
+                    crate::rating_membership::RatingAdoptionIntent::Manual,
+                ),
                 Some(ctx),
             );
         }
@@ -4825,6 +4926,21 @@ impl App {
         terminal: RatingPickerTermination,
         ctx: Option<&egui::Context>,
     ) {
+        if self.ring_picker.is_none() {
+            return;
+        }
+        self.terminate_rating_picker_in_owner(terminal, ctx);
+        self.gamepad.state.cancel_west_ring();
+        self.gamepad.state.require_directional_neutral();
+    }
+
+    /// Complete only the recipe/Undo lifetime, including a retired owner. The
+    /// physical session may already contain a newer hold after this terminal.
+    fn terminate_rating_picker_in_owner(
+        &mut self,
+        terminal: RatingPickerTermination,
+        ctx: Option<&egui::Context>,
+    ) {
         let Some(picker) = self.ring_picker.take() else {
             return;
         };
@@ -4842,8 +4958,6 @@ impl App {
             }
             #[cfg(windows)]
             self.set_native_video_ring_picker_overlay(None);
-            self.gamepad_state.cancel_west_ring();
-            self.gamepad_state.require_directional_neutral();
             return;
         };
         let owner = picker.owner;
@@ -4878,8 +4992,6 @@ impl App {
                 picker.rating_origin.clone(),
             );
         }
-        self.gamepad_state.cancel_west_ring();
-        self.gamepad_state.require_directional_neutral();
     }
 
     fn picker_success_rating_toast(picker: &RingPickerState) -> Option<String> {
@@ -5516,10 +5628,24 @@ impl App {
         allow_start: bool,
         surface: crate::app::ActionSurface,
     ) -> bool {
+        self.update_mouse_middle_short_click_with_release(ctx, allow_start, surface, true)
+    }
+
+    pub(crate) fn cancel_mouse_middle_short_click(&mut self) {
+        self.mouse_middle_click_start = None;
+    }
+
+    pub(crate) fn update_mouse_middle_short_click_with_release(
+        &mut self,
+        ctx: &egui::Context,
+        allow_start: bool,
+        surface: crate::app::ActionSurface,
+        allow_release: bool,
+    ) -> bool {
         let sample = ctx.input(|i| MouseMiddleInputSample {
             is_down: i.pointer.button_down(egui::PointerButton::Middle),
             is_pressed: i.pointer.button_pressed(egui::PointerButton::Middle),
-            is_released: i.pointer.button_released(egui::PointerButton::Middle),
+            is_released: allow_release && i.pointer.button_released(egui::PointerButton::Middle),
             current_pos: i.pointer.interact_pos(),
         });
         update_mouse_middle_click_state(
@@ -5620,13 +5746,13 @@ impl App {
 
     fn location_navigation_blocked(&mut self) -> bool {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return true;
         }
         if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            self.show_feedback_toast("検索中は場所ジャンプを使用できません".to_string());
+            self.show_feedback_warning("検索中は場所ジャンプを使用できません".to_string());
             return true;
         }
         false
@@ -5639,7 +5765,7 @@ impl App {
         source: &'static str,
     ) -> Option<AddressBarNav> {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return None;
@@ -5650,10 +5776,10 @@ impl App {
             .get(slot.saturating_sub(1))
             .map(|favorite| favorite.path.clone())
         else {
-            self.show_feedback_toast(format!("お気に入り {slot} は未登録です"));
+            self.show_feedback_warning(format!("お気に入り {slot} は未登録です"));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
@@ -5674,10 +5800,10 @@ impl App {
         }
         let path = super::drive_root_path_for_letter(letter)?;
         let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_toast(format!("ドライブが見つかりません: {}", path.display()));
+            self.show_feedback_warning(format!("ドライブが見つかりません: {}", path.display()));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
@@ -5692,17 +5818,17 @@ impl App {
             return None;
         }
         let Some(path) = self.current_location_root() else {
-            self.show_feedback_toast("現在位置のルートディレクトリが見つかりません".to_string());
+            self.show_feedback_warning("現在位置のルートディレクトリが見つかりません".to_string());
             return None;
         };
         let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "ルートディレクトリが見つかりません: {}",
                 path.display()
             ));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(
@@ -5735,19 +5861,19 @@ impl App {
             path
         } else {
             if let Some(path) = remembered.as_ref() {
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "{} の最後の場所が見つかりません。ルートへ移動します: {}",
                     drive_key,
                     path.display()
                 ));
             }
             let Some(resolved_root) = crate::folder_tree::resolve_openable_path(&root) else {
-                self.show_feedback_toast(format!("ドライブが見つかりません: {}", root.display()));
+                self.show_feedback_warning(format!("ドライブが見つかりません: {}", root.display()));
                 return None;
             };
             resolved_root
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(
@@ -5793,7 +5919,7 @@ impl App {
             }
             _ => return None,
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("{nav:?}")));
@@ -5841,7 +5967,7 @@ impl App {
             .nth(slot.saturating_sub(1))
             .map(|tag| tag.name.clone())
         else {
-            self.show_feedback_toast(format!("ピン留めタグ {slot} は未登録です"));
+            self.show_feedback_warning(format!("ピン留めタグ {slot} は未登録です"));
             return;
         };
         self.bump_input_seq(source, Some(&format!("pinned_tag_slot={slot}")));
@@ -5856,7 +5982,7 @@ impl App {
             .tag_target_paths(crate::app::ActionSurface::MainWindow)
             .is_empty()
         {
-            self.show_feedback_toast("[タグ対象なし]".to_string());
+            self.show_feedback_warning("[タグ対象なし]".to_string());
             return;
         }
         self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
@@ -5881,14 +6007,14 @@ impl App {
         source: &'static str,
     ) -> Option<AddressBarNav> {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return None;
         }
         let len = self.settings.favorites.len();
         if len == 0 {
-            self.show_feedback_toast("お気に入りが登録されていません".to_string());
+            self.show_feedback_warning("お気に入りが登録されていません".to_string());
             return None;
         }
         let current = self.current_gamepad_favorite_index();
@@ -5907,11 +6033,11 @@ impl App {
         label: &'static str,
     ) -> Option<AddressBarNav> {
         let Some(path) = path else {
-            self.show_feedback_toast(format!("{label} が見つかりません"));
+            self.show_feedback_warning(format!("{label} が見つかりません"));
             return None;
         };
         let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
+            self.show_feedback_warning(format!("場所が見つかりません: {}", path.display()));
             return None;
         };
         Some(AddressBarNav::Direct(
@@ -6029,7 +6155,7 @@ impl App {
         if self.active_detached_viewer_has_foreground() {
             self.bump_input_seq(source, Some(detail));
             self.cancel_pending_folder_nav();
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 Self::nav_noop_title(crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent)
                     .to_string(),
             );
@@ -6147,7 +6273,7 @@ impl App {
             }
             RingActionId::GridToggleSnapshotLock if context == RingShortcutContext::Grid => {
                 if let Some(reason) = self.snapshot_button_disabled_reason() {
-                    self.show_feedback_toast(reason.to_string());
+                    self.show_feedback_warning(reason.to_string());
                 } else {
                     let label = self.infer_snapshot_source_label();
                     self.toggle_snapshot(label);
@@ -6336,7 +6462,7 @@ impl App {
             RingActionId::ImageRotateLeft if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     if self.current_fullscreen_spread_is_double(fs_idx) {
-                        self.show_feedback_toast("見開き表示中は回転できません".to_string());
+                        self.show_feedback_warning("見開き表示中は回転できません".to_string());
                     } else {
                         self.rotate_image_ccw(fs_idx);
                     }
@@ -6346,7 +6472,7 @@ impl App {
             RingActionId::ImageRotateRight if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     if self.current_fullscreen_spread_is_double(fs_idx) {
-                        self.show_feedback_toast("見開き表示中は回転できません".to_string());
+                        self.show_feedback_warning("見開き表示中は回転できません".to_string());
                     } else {
                         self.rotate_image_cw(fs_idx);
                     }
@@ -6412,7 +6538,9 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.copy_item_image_to_clipboard(fs_idx)
                 {
-                    self.show_feedback_toast("この項目は画像コピーに対応していません".to_string());
+                    self.show_feedback_warning(
+                        "この項目は画像コピーに対応していません".to_string(),
+                    );
                 }
                 None
             }
@@ -6420,7 +6548,7 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.open_item_folder_in_explorer(fs_idx)
                 {
-                    self.show_feedback_toast("フォルダを開けません".to_string());
+                    self.show_feedback_warning("フォルダを開けません".to_string());
                 }
                 None
             }
@@ -6428,7 +6556,7 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.copy_item_path_to_clipboard(ctx, fs_idx)
                 {
-                    self.show_feedback_toast("パスをコピーできません".to_string());
+                    self.show_feedback_warning("パスをコピーできません".to_string());
                 }
                 None
             }
@@ -6436,7 +6564,7 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.copy_item_file_name_to_clipboard(ctx, fs_idx)
                 {
-                    self.show_feedback_toast("ファイル名をコピーできません".to_string());
+                    self.show_feedback_warning("ファイル名をコピーできません".to_string());
                 }
                 None
             }
@@ -6462,7 +6590,8 @@ impl App {
                         if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
                             self.fs_cache.get(&fs_idx)
                         {
-                            let _ = player.seek_relative(delta_secs);
+                            let _ =
+                                player.seek_relative(delta_secs, crate::video::SeekOrigin::User);
                         }
                     }
                 }
@@ -6537,7 +6666,7 @@ impl App {
                     .fullscreen_idx
                     .is_some_and(|i| self.fs_music_view_active(i))
                 {
-                    self.show_feedback_toast("タイル表示は動画のみ対応です".to_string());
+                    self.show_feedback_warning("タイル表示は動画のみ対応です".to_string());
                 } else {
                     self.toggle_ring_video_tile_mode(ctx);
                 }
@@ -6580,7 +6709,7 @@ impl App {
                 #[cfg(not(windows))]
                 {
                     let _ = ctx;
-                    self.show_feedback_toast("この操作は Windows でのみ利用できます".to_string());
+                    self.show_feedback_warning("この操作は Windows でのみ利用できます".to_string());
                 }
             }
             RingShortcutContext::VideoFullscreen => {
@@ -6796,7 +6925,7 @@ impl App {
             RingShortcutContext::Grid => {
                 // A stale/misrouted Grid ring action must never reinterpret the fullscreen
                 // item as a grid selection or silently register a different source.
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "フルスクリーン表示中はグリッドの項目をコレクションに追加できません"
                         .to_string(),
                 );
@@ -6824,7 +6953,9 @@ impl App {
                     .fullscreen_idx
                     .is_some_and(|i| self.fs_music_view_active(i))
                 {
-                    self.show_feedback_toast("代表サムネのピン留めは動画のみ対応です".to_string());
+                    self.show_feedback_warning(
+                        "代表サムネのピン留めは動画のみ対応です".to_string(),
+                    );
                 } else {
                     self.pin_ring_video_frame(ctx);
                 }
@@ -6854,20 +6985,7 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        if self.slideshow_playing {
-            self.slideshow_playing = false;
-            self.slideshow_anchor_idx = None;
-            self.continuous_reading_scroll_transition = None;
-            self.slideshow_scroll_range_cache = None;
-        } else if matches!(
-            self.items.get(fs_idx),
-            Some(GridItem::Image(_))
-                | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::PdfPage { .. })
-        ) {
-            self.slideshow_playing = true;
-            self.schedule_next_slideshow_from_now();
-        }
+        self.toggle_fullscreen_slideshow(fs_idx);
     }
 
     fn cycle_ring_transparent_background(&mut self, fs_idx: usize) {
@@ -6876,7 +6994,7 @@ impl App {
             crate::ui_fullscreen::SpreadPair::Single => vec![fs_idx],
         };
         if !idxs.iter().any(|&i| self.fs_image_has_alpha(i)) {
-            self.show_feedback_toast("透過画像ではないため背景は切り替えできません".to_string());
+            self.show_feedback_warning("透過画像ではないため背景は切り替えできません".to_string());
             return;
         }
         let modulo: u8 = if self.ai_upscale_enabled { 2 } else { 3 };
@@ -6969,7 +7087,7 @@ impl App {
             // グリッド面: Y でツリーをトグル。detached viewer が同時表示中でも
             // foreground / last-touched がメインならこちらを操作する。
             if self.folder_pane_disabled() && !self.settings.folder_tree_pane_visible {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "スナップショット中は他のフォルダに移動できません".to_string(),
                 );
                 return;
@@ -6988,9 +7106,9 @@ impl App {
     fn handle_gamepad_direction(&mut self, ctx: &egui::Context, dir: PadDir, repeat: bool) {
         let route = self.dpad_route();
         self.log_dpad_route_if_changed(route);
-        let y_modifier = self.gamepad_state.button_down(PadButton::North);
+        let y_modifier = self.gamepad.state.delivered_button_down(PadButton::North);
         if y_modifier {
-            self.gamepad_state.mark_y_modifier_used();
+            self.gamepad.state.mark_y_modifier_used();
         }
         match (route, y_modifier) {
             (DpadRoute::Grid, _) => self.handle_gamepad_direction_for_grid(dir),
@@ -7241,13 +7359,13 @@ impl App {
 
     fn handle_gamepad_start(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return None;
         }
         if self.settings.favorites.is_empty() && self.settings.smart_folders.is_empty() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "お気に入り／スマートフォルダが登録されていません".to_string(),
             );
             return None;
@@ -7286,7 +7404,7 @@ impl App {
     fn open_gamepad_video_marker_picker(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let markers = self.collect_video_nav_markers(fs_idx);
         if markers.is_empty() {
-            self.show_feedback_toast("ブックマーク / チャプターがありません".to_string());
+            self.show_feedback_warning("ブックマーク / チャプターがありません".to_string());
             return;
         }
         let current = self
@@ -7312,19 +7430,19 @@ impl App {
 
     fn open_gamepad_location_picker(&mut self, ctx: &egui::Context) {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return;
         }
         if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            self.show_feedback_toast("検索中は場所リストを開けません".to_string());
+            self.show_feedback_warning("検索中は場所リストを開けません".to_string());
             return;
         }
         let rating_counts = self.rating_counts();
         let entries = self.build_gamepad_location_entries(rating_counts);
         if entries.is_empty() {
-            self.show_feedback_toast("移動できる場所がありません".to_string());
+            self.show_feedback_warning("移動できる場所がありません".to_string());
             return;
         }
         let selected = self.current_gamepad_location_index(&entries).unwrap_or(0);
@@ -7572,7 +7690,7 @@ impl App {
             Some(GridItem::ConvertibleArchive { path, .. }) => {
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                 } else if self.begin_smart_grid_container_navigation(
@@ -7821,10 +7939,10 @@ fn ring_direction_from_pad_dir(dir: PadDir) -> RingDirection {
 }
 
 fn ring_direction_from_dpad_buttons(state: &GamepadInputState) -> Option<RingDirection> {
-    let up = state.button_down(PadButton::DPadUp);
-    let down = state.button_down(PadButton::DPadDown);
-    let left = state.button_down(PadButton::DPadLeft);
-    let right = state.button_down(PadButton::DPadRight);
+    let up = state.delivered_button_down(PadButton::DPadUp);
+    let down = state.delivered_button_down(PadButton::DPadDown);
+    let left = state.delivered_button_down(PadButton::DPadLeft);
+    let right = state.delivered_button_down(PadButton::DPadRight);
     let vertical = match (up, down) {
         (true, false) => Some(PadDir::Up),
         (false, true) => Some(PadDir::Down),
@@ -8080,7 +8198,7 @@ fn draw_gamepad_ring_picker_overlay_layout(
     let scrollbar_gutter = if count > visible_rows { 18.0 } else { 0.0 };
     let mut content_rect = egui::Rect::NOTHING;
     let mut selected_rect = None;
-    let area = egui::Area::new(egui::Id::new("gamepad_ring_picker_overlay"))
+    let area = egui::Area::new(egui::Id::unique("gamepad_ring_picker_overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(panel_rect.min)
         .show(ctx, |ui| {
@@ -8206,7 +8324,7 @@ fn draw_gamepad_list_picker_overlay_layout(
             )
         })
     };
-    let style = ctx.style();
+    let style = ctx.global_style();
     let headings = match heading {
         GamepadListPickerHeading::Title(title) => {
             vec![text_galley(title, 17.0, egui::Color32::WHITE, inner_w)]
@@ -8889,6 +9007,148 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 }
 
 #[cfg(test)]
+impl App {
+    /// Observe the actual media-handler request without spawning a resolver or player.
+    pub(crate) fn capture_manual_media_request_for_test(
+        &mut self,
+        action: impl FnOnce(&mut Self),
+    ) -> (Vec<usize>, u32, &'static str) {
+        assert!(self.media_navigation_resolver.is_none());
+        assert!(self.media_navigation_pending.is_none());
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (_result_tx, result_rx) = std::sync::mpsc::channel();
+        self.media_navigation_resolver = Some(super::MediaNavigationResolver {
+            request_tx,
+            result_rx,
+            next_request_id: 1,
+        });
+        action(self);
+        let request = request_rx
+            .try_recv()
+            .expect("the handler sends one media request");
+        assert!(request_rx.try_recv().is_err(), "one request per input");
+        self.media_navigation_pending = None;
+        self.media_navigation_resolver = None;
+        (
+            request
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.idx)
+                .collect(),
+            request.required_matches,
+            request.source,
+        )
+    }
+}
+
+#[cfg(test)]
+mod manual_nav_wrap_input_tests {
+    use super::*;
+    use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
+
+    #[test]
+    fn manual_nav_wrap_gamepad_and_assigned_mouse_page_steps_land_at_the_same_endpoint() {
+        for wrap in [false, true] {
+            for forward in [false, true] {
+                let current = if forward { 3 } else { 0 };
+                let expected = if wrap { 3 - current } else { current };
+                for mouse in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut app = ready_app(&ctx, SpreadMode::Single);
+                    app.settings.page_turn_animation_enabled = false;
+                    app.settings.fullscreen_manual_nav_wrap = wrap;
+                    app.fullscreen_idx = Some(current);
+                    app.selected = Some(current);
+                    frame(&ctx, |_, ctx| {
+                        if mouse {
+                            // The released mouse assignment is a source-page step
+                            // in Single/Split mode and a pairing nudge in Spread.
+                            let action = if forward {
+                                RingActionId::ImageSpreadShiftNext
+                            } else {
+                                RingActionId::ImageSpreadShiftPrev
+                            };
+                            let profile = app
+                                .settings
+                                .ring_shortcuts
+                                .mouse_button_profile_mut(RingShortcutContext::ImageFullscreen);
+                            profile.back = action.clone();
+                            let dispatched = app.dispatch_mouse_button(
+                                ctx,
+                                MouseButtonSlot::Back,
+                                crate::app::ActionSurface::Viewer,
+                                "manual-wrap-mouse-test",
+                            );
+                            assert_eq!(dispatched.dispatched_action, Some(action));
+                        } else {
+                            app.navigate_gamepad_still(ctx, current, if forward { 1 } else { -1 });
+                        }
+                    });
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(expected),
+                        "wrap={wrap} forward={forward} mouse={mouse}"
+                    );
+                    if wrap {
+                        assert!(app.fs_boundary_hint.is_none());
+                    } else {
+                        assert!(
+                            matches!(app.fs_boundary_hint, Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == forward)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_does_not_change_assigned_home_end_or_spread_nudge() {
+        for wrap in [false, true] {
+            for end in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = ready_app(&ctx, SpreadMode::Single);
+                app.settings.page_turn_animation_enabled = false;
+                app.settings.fullscreen_manual_nav_wrap = wrap;
+                app.fullscreen_idx = Some(1);
+                app.settings
+                    .ring_shortcuts
+                    .mouse_button_profile_mut(RingShortcutContext::ImageFullscreen)
+                    .back = if end {
+                    RingActionId::ImageEnd
+                } else {
+                    RingActionId::ImageHome
+                };
+                for _ in 0..2 {
+                    frame(&ctx, |_, ctx| {
+                        app.apply_mouse_button(
+                            ctx,
+                            MouseButtonSlot::Back,
+                            crate::app::ActionSurface::Viewer,
+                            "manual-wrap-jump-test",
+                        );
+                    });
+                    assert_eq!(app.fullscreen_idx, Some(if end { 3 } else { 0 }));
+                }
+                assert!(
+                    matches!(app.fs_boundary_hint, Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == end)
+                );
+            }
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, SpreadMode::Ltr);
+            app.settings.page_turn_animation_enabled = false;
+            app.settings.fullscreen_manual_nav_wrap = wrap;
+            app.fullscreen_idx = Some(0);
+            let before = app.spread_shift_anchor_idx();
+            frame(&ctx, |_, ctx| {
+                app.apply_ring_image_spread_shift(ctx, -1, "manual-wrap-nudge-test");
+            });
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.spread_shift_anchor_idx(), before);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
@@ -8984,7 +9244,9 @@ mod tests {
                         let mut harness = crate::test_ui::builder()
                             .with_size(size)
                             .with_pixels_per_point(ppp)
-                            .build(move |ctx| {
+                            .build_ui(move |root_ui| {
+                                let ctx = &root_ui.ctx().clone();
+
                                 if !fonts_ready {
                                     crate::ui_fonts::configure_fonts(ctx);
                                     fonts_ready = true;
@@ -9023,7 +9285,7 @@ mod tests {
                                     Some(draw_gamepad_list_picker_overlay_layout(
                                         ctx,
                                         egui::Rect::from_min_size(egui::Pos2::ZERO, size),
-                                        egui::Id::new("list_picker_geometry_fixture"),
+                                        egui::Id::unique("list_picker_geometry_fixture"),
                                         heading,
                                         footer,
                                         len,
@@ -9116,7 +9378,9 @@ mod tests {
                     let mut harness = crate::test_ui::builder()
                         .with_size(size)
                         .with_pixels_per_point(ppp)
-                        .build(move |ctx| {
+                        .build_ui(move |root_ui| {
+                            let ctx = &root_ui.ctx().clone();
+
                             if !fonts_ready {
                                 crate::ui_fonts::configure_fonts(ctx);
                                 fonts_ready = true;
@@ -9659,7 +9923,7 @@ mod tests {
             ..Default::default()
         });
         let keyboard = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(keyboard.is_none());
         assert_eq!(app.folder_nav_back_stack, before);
         assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
@@ -9680,21 +9944,22 @@ mod tests {
         app.settings.gamepad_enabled = false;
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::South));
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
         assert!(
-            batch.actions.is_empty(),
+            batch.actions_for_test().is_empty(),
             "無効のあいだはボタンを押しても操作にならない"
         );
 
         app.settings.gamepad_enabled = true;
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::South));
-        let batch = app.sample_gamepad_input(&ctx);
-        assert!(!batch.actions.is_empty(), "有効に戻したら届く");
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(!batch.actions_for_test().is_empty(), "有効に戻したら届く");
     }
 
     #[test]
     fn pad_operation_batch_preserves_multiple_press_release_edges_and_phase() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
@@ -9707,48 +9972,58 @@ mod tests {
         ] {
             app.gamepad.push_for_test(event);
         }
-        let batch = app.sample_gamepad_input(&ctx);
-        assert_eq!(batch.actions.len(), 4);
-        for (ordinal, action) in batch.actions.iter().enumerate() {
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert_eq!(batch.actions_for_test().len(), 4);
+        for (ordinal, action) in batch.actions_for_test().iter().enumerate() {
             assert_eq!(action.operation_id.batch, batch.operation_batch);
             assert_eq!(action.operation_id.ordinal, ordinal as u32);
         }
-        assert_eq!(batch.actions[0].kind, super::PadActionKind::Press);
-        assert_eq!(batch.actions[1].kind, super::PadActionKind::Release);
+        assert_eq!(
+            batch.actions_for_test()[0].kind,
+            super::PadActionKind::Press
+        );
+        assert_eq!(
+            batch.actions_for_test()[1].kind,
+            super::PadActionKind::Release
+        );
         let facts = batch.presentation_operations();
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].1, super::OperationPhase::Press);
         assert_eq!(facts[1].1, super::OperationPhase::Press);
         assert_ne!(facts[0].0, facts[1].0);
-        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
-        let next = app.sample_gamepad_input(&ctx);
+        assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
+        let next = app.sample_gamepad_input_with_logic_for_test(&ctx);
         assert!(next.presentation_operations().is_empty());
         assert_ne!(next.operation_batch, batch.operation_batch);
     }
 
     #[test]
     fn pad_operation_initial_press_is_not_reclassified_from_held_level() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
         app.settings.page_turn_animation_enabled = true;
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
-        let initial = app.sample_gamepad_input(&ctx);
-        assert!(app.gamepad_state.button_down(PadButton::DPadRight));
+        let initial = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
         assert_eq!(
             initial.presentation_operations()[0].1,
             super::OperationPhase::Press
         );
-        app.gamepad_state.clear();
-        app.gamepad_state.set_button_down(
+        app.gamepad.state.clear();
+        app.gamepad.state.set_button_down(
             PadButton::DPadRight,
             true,
             Instant::now() - std::time::Duration::from_secs(1),
         );
-        let repeat = app.sample_gamepad_input(&ctx);
-        assert_eq!(repeat.actions.len(), 1);
-        assert_eq!(repeat.actions[0].kind, super::PadActionKind::Repeat);
+        let repeat = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert_eq!(repeat.actions_for_test().len(), 1);
+        assert_eq!(
+            repeat.actions_for_test()[0].kind,
+            super::PadActionKind::Repeat
+        );
         assert_eq!(
             repeat.presentation_operations()[0].1,
             super::OperationPhase::Repeat
@@ -9761,6 +10036,7 @@ mod tests {
 
     #[test]
     fn pad_operation_replay_preserves_ids_and_continuous_fact_after_neutral() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
@@ -9774,8 +10050,8 @@ mod tests {
             app.gamepad.push_for_test(event);
         }
         let mut observed = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            let batch = app.sample_gamepad_input(ctx);
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
             assert_eq!(
                 batch.delivery,
                 if ctx.current_pass_index() == 0 {
@@ -9784,7 +10060,7 @@ mod tests {
                     super::PadBatchDelivery::Replay
                 }
             );
-            assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+            assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
             assert!(!app.gamepad_analog_active());
             let facts = batch.presentation_operations();
             assert_eq!(facts.len(), 2);
@@ -9795,18 +10071,21 @@ mod tests {
             if ctx.current_pass_index() == 0 {
                 ctx.request_discard("pad operation replay");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(observed.len(), 2);
         assert_eq!(observed[0], observed[1]);
-        let _ = ctx.run(Default::default(), |ctx| {
-            let batch = app.sample_gamepad_input(ctx);
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
             assert_eq!(batch.delivery, super::PadBatchDelivery::Fresh);
             assert!(batch.presentation_operations().is_empty());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
     fn pad_operation_off_keeps_existing_polling_on_discarded_passes() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
@@ -9814,16 +10093,16 @@ mod tests {
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
         let mut kinds = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            let batch = app.sample_gamepad_input(ctx);
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
             assert_eq!(batch.delivery, super::PadBatchDelivery::Fresh);
             assert_eq!(batch.operation_batch, 0);
             assert!(!batch.analog_operation);
-            assert_eq!(batch.actions.len(), 1);
-            kinds.push(batch.actions[0].kind);
+            assert_eq!(batch.actions_for_test().len(), 1);
+            kinds.push(batch.actions_for_test()[0].kind);
             assert!(
                 ctx.data(
-                    |data| data.get_temp::<super::SampledPadTransaction>(egui::Id::new(
+                    |data| data.get_temp::<super::SampledPadTransaction>(egui::Id::unique(
                         "gamepad_operation_ingress"
                     ))
                 )
@@ -9834,12 +10113,13 @@ mod tests {
                     .push_for_test(PadEvent::ButtonReleased(PadButton::DPadRight));
                 ctx.request_discard("pad off retains live polling");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             kinds,
             vec![super::PadActionKind::Press, super::PadActionKind::Release]
         );
-        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+        assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
     }
 
     #[test]
@@ -9880,30 +10160,36 @@ mod tests {
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
         app.gamepad
             .push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
-        let batch = app.sample_gamepad_input(&ctx);
-        assert!(!batch.actions.is_empty(), "押した frame は届く");
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(!batch.actions_for_test().is_empty(), "押した frame は届く");
         assert!(
-            !app.gamepad_state.is_idle(),
+            !app.gamepad.state.is_idle(),
             "押しっぱなし / 倒しっぱなしが残っている"
         );
 
         app.settings.gamepad_enabled = false;
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
 
-        assert!(batch.actions.is_empty(), "OFF の frame は操作を作らない");
+        assert!(
+            batch.actions_for_test().is_empty(),
+            "OFF の frame は操作を作らない"
+        );
         assert!(
             !batch.saw_input_event,
             "OFF の frame は入力があったことにしない (再描画を続けない)"
         );
         assert!(
-            app.gamepad_state.is_idle(),
+            app.gamepad.state.is_idle(),
             "OFF は保持中のボタン / 軸 / リピート予約をすべて終わらせる"
         );
 
         // リピート間隔を跨いでも、OFF のあいだは何も生えない。
         std::thread::sleep(std::time::Duration::from_millis(320));
-        let batch = app.sample_gamepad_input(&ctx);
-        assert!(batch.actions.is_empty(), "OFF 中にリピートが湧かない");
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(
+            batch.actions_for_test().is_empty(),
+            "OFF 中にリピートが湧かない"
+        );
         assert!(!batch.saw_input_event);
     }
 
@@ -9920,7 +10206,12 @@ mod tests {
         });
 
         app.settings.gamepad_enabled = false;
-        let _ = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(
+            app.gamepad_favorite_picker.is_some(),
+            "sampling cannot end a mounted-context overlay"
+        );
+        app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| false);
 
         assert!(
             app.gamepad_favorite_picker.is_none(),
@@ -9971,7 +10262,7 @@ mod tests {
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
         app.gamepad
             .push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
-        let _ = app.sample_gamepad_input(&ctx);
+        let _ = app.sample_gamepad_input_with_logic_for_test(&ctx);
         app.activate_sidecar_restore_modal_for_test(std::path::PathBuf::from("sidecar-fixture"));
 
         let outcome = app.dispatch_gamepad_batch(
@@ -9981,20 +10272,19 @@ mod tests {
                 delivery: super::PadBatchDelivery::Fresh,
                 analog_operation: false,
                 now: Instant::now(),
-                actions: Vec::new(),
+                events: vec![super::PadBatchEvent::SessionEnded],
                 saw_input_event: true,
-                session_ended: true,
             },
         );
 
         assert!(!outcome.dispatch_allowed);
         assert!(!outcome.dispatched);
         assert!(app.ring_picker.is_none(), "picker ownership must terminate");
-        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
-        assert_eq!(app.gamepad_state.axis(PadAxis::LeftX), 0.0);
-        assert!(!app.gamepad_state.repeat_active());
+        assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.0);
+        assert!(!app.gamepad.state.repeat_active());
         assert!(
-            app.gamepad_state.directional_neutral_required(),
+            app.gamepad.state.directional_neutral_required(),
             "resume must start behind a fresh-neutral re-arm gate"
         );
         assert_eq!(
@@ -10219,7 +10509,7 @@ mod tests {
     }
 
     use crate::app::ActionSurface;
-    use crate::gamepad::{GamepadInputState, PadButton, PadEvent};
+    use crate::gamepad::{GamepadInputState, PadButton, PadEvent, foreground_app_hwnd};
     use crate::ring_shortcut::{
         GamepadFavoritePickerState, GamepadFavoritePickerTab, GamepadListCursor,
         MOUSE_FLICK_MOVE_THRESHOLD_PX, MOUSE_FLICK_NEUTRAL_RADIUS_PX, MouseFlickState,
@@ -10250,6 +10540,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn gamepad_text_input_gate_unions_all_three_surfaces() {
         let no_presenter_input =
             crate::video::native_presenter::NativeOverlayInputRouting::default();
@@ -10265,7 +10559,10 @@ mod tests {
             egui::ViewportId::ROOT,
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "あ".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
         ));
         assert!(gamepad_text_input_active(
@@ -10273,7 +10570,7 @@ mod tests {
             Some(viewer_viewport),
             no_presenter_input,
         ));
-        let _ = root_ctx.end_pass();
+        root_ctx.end_pass().drop_without_applying_deltas();
 
         let ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&ctx);
@@ -10282,11 +10579,14 @@ mod tests {
             fullscreen_viewport,
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "あ".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
         ));
         assert!(crate::ime_focus::ime_input_active(&ctx));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         // RawInput reports every live viewport, including a sibling whose
         // composition is read by this ROOT pass without consuming its queue.
@@ -10300,7 +10600,7 @@ mod tests {
             Some(fullscreen_viewport),
             no_presenter_input,
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         // Omitting the viewer now explicitly models its destruction. Its stale
         // composition must no longer block the gamepad on a surviving surface.
@@ -10310,7 +10610,7 @@ mod tests {
             Some(fullscreen_viewport),
             no_presenter_input,
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let presenter_ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&presenter_ctx);
@@ -10325,7 +10625,7 @@ mod tests {
             Some(viewer_viewport),
             no_presenter_input,
         ));
-        let _ = presenter_ctx.end_pass();
+        presenter_ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -10989,10 +11289,12 @@ mod next_input_tests {
             }
             Route::PadRing => {
                 let now = Instant::now();
-                app.gamepad_state
+                app.gamepad
+                    .state
                     .set_button_down(PadButton::West, true, now);
-                app.gamepad_state.mark_west_ring_direction(direction);
-                app.gamepad_state
+                app.gamepad.state.mark_west_ring_direction(direction);
+                app.gamepad
+                    .state
                     .set_button_down(PadButton::West, false, now);
                 app.finish_gamepad_west_release(ctx);
             }
@@ -11116,7 +11418,7 @@ mod next_input_tests {
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(ctx, 0, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             #[cfg(windows)]
             crate::key_input::set_test_frame(Vec::new());
         }
@@ -11380,5 +11682,645 @@ mod next_input_tests {
                 assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod physical_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn egui037_continuation_gamepad_real_logic_keeps_order_without_advancing_a_ui_frame() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        for event in [
+            PadEvent::ButtonPressed(PadButton::South),
+            PadEvent::ButtonReleased(PadButton::South),
+            PadEvent::Disconnected,
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+        ] {
+            app.gamepad.push_for_test(event);
+            integration.update_logic_only(&mut app.app, egui::RawInput::default());
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+        }
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(matches!(
+            batch.events.as_slice(),
+            [
+                PadBatchEvent::Action(PadAction {
+                    button: PadButton::South,
+                    kind: PadActionKind::Press,
+                    ..
+                }),
+                PadBatchEvent::Action(PadAction {
+                    button: PadButton::South,
+                    kind: PadActionKind::Release,
+                    ..
+                }),
+                PadBatchEvent::SessionEnded,
+                PadBatchEvent::Action(PadAction {
+                    button: PadButton::DPadRight,
+                    kind: PadActionKind::Press,
+                    ..
+                }),
+                PadBatchEvent::AxesChanged(_),
+            ]
+        ));
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    fn gamepad_y_press_release_press_across_logic_keeps_the_old_modifier_use() {
+        for tracking in [false, true] {
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.settings.page_turn_animation_enabled = tracking;
+            app.settings.folder_tree_pane_visible = false;
+            for event in [
+                PadEvent::ButtonPressed(PadButton::North),
+                PadEvent::ButtonPressed(PadButton::DPadRight),
+                PadEvent::ButtonReleased(PadButton::DPadRight),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(app.gamepad.state.y_modifier_used());
+            for event in [
+                PadEvent::ButtonReleased(PadButton::North),
+                PadEvent::ButtonPressed(PadButton::North),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            let batch = app.sample_gamepad_input(&ctx);
+            assert_eq!(batch.actions_for_test().len(), 2);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                !app.settings.folder_tree_pane_visible,
+                "old modifier release cannot become a tap"
+            );
+            assert!(app.gamepad.state.delivered_button_down(PadButton::North));
+            assert!(
+                !app.gamepad.state.y_modifier_used(),
+                "the new press starts its own semantic hold"
+            );
+            app.gamepad
+                .push_for_test(PadEvent::ButtonReleased(PadButton::North));
+            integration.update_logic_only(&mut app.app, Default::default());
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                app.settings.folder_tree_pane_visible,
+                "the new hold still has its own tap"
+            );
+        }
+    }
+
+    #[test]
+    fn gamepad_west_press_release_press_uses_axis_at_the_release_boundary() {
+        for tracking in [false, true] {
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.settings.page_turn_animation_enabled = tracking;
+            app.items = vec![GridItem::Image(app.tmp.path().join("west-boundary.jpg"))];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+            for event in [
+                PadEvent::ButtonPressed(PadButton::West),
+                PadEvent::ButtonReleased(PadButton::West),
+                PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+                PadEvent::ButtonPressed(PadButton::West),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            let batch = app.sample_gamepad_input(&ctx);
+            assert!(matches!(
+                batch.events.as_slice(),
+                [
+                    PadBatchEvent::Action(_),
+                    PadBatchEvent::Action(_),
+                    PadBatchEvent::AxesChanged(_),
+                    PadBatchEvent::Action(_)
+                ]
+            ));
+            // Isolate the ordered discrete edges from the next continuous
+            // picker step. That step intentionally edits a value and disarms
+            // X-close; its timer must not obscure the release-boundary check.
+            assert!(
+                app.gamepad
+                    .state
+                    .left_stick_step_due(true, batch.now, STICK_STEP_INTERVAL,)
+            );
+            let continuous_tick = batch.now + STICK_STEP_INTERVAL;
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                app.ring_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.x_close_armed),
+                "the first neutral tap opens the picker; the new press arms its close"
+            );
+            assert!(app.gamepad.state.button_down(PadButton::West));
+            assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+            assert_eq!(app.gamepad.state.delivered_axis(PadAxis::LeftX), 0.9);
+            let mut next = GamepadFrameBatch::empty_for_test();
+            next.now = continuous_tick;
+            next.analog_operation = true;
+            let continuous = app.dispatch_gamepad_batch_with_admission(&ctx, next, |_, _| true);
+            assert!(continuous.dispatched);
+            assert!(
+                app.ring_picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.x_close_armed),
+                "the same held axis edits the picker and disarms X-close at its next scheduled tick"
+            );
+            assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        }
+    }
+
+    #[test]
+    fn gamepad_west_delivered_direction_survives_release_and_new_physical_press() {
+        for tracking in [false, true] {
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.settings.page_turn_animation_enabled = tracking;
+            app.settings.ring_shortcuts.grid = crate::ring_shortcut::RingShortcutProfile::default();
+            app.items = vec![GridItem::Image(app.tmp.path().join("west-delivered.jpg"))];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+            for event in [
+                PadEvent::ButtonPressed(PadButton::West),
+                PadEvent::ButtonPressed(PadButton::DPadRight),
+                PadEvent::ButtonReleased(PadButton::DPadRight),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert_eq!(
+                app.gamepad.state.west_ring_direction(),
+                Some(RingDirection::Right)
+            );
+            for event in [
+                PadEvent::ButtonReleased(PadButton::West),
+                PadEvent::ButtonPressed(PadButton::West),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            assert_eq!(
+                app.gamepad.state.west_ring_direction(),
+                Some(RingDirection::Right),
+                "intake cannot reset the delivered old hold"
+            );
+            let batch = app.sample_gamepad_input(&ctx);
+            assert_eq!(batch.actions_for_test().len(), 2);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                app.ring_picker.is_none(),
+                "the old ring release must not turn into a picker tap"
+            );
+            assert!(app.gamepad.state.west_ring_active());
+            assert_eq!(
+                app.gamepad.state.west_ring_direction(),
+                None,
+                "the new delivered hold has its own direction"
+            );
+        }
+    }
+
+    #[test]
+    fn gamepad_logic_ingress_during_replay_waits_for_the_next_fresh_ui_batch() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+        let mut first_id = None;
+        let mut passes = 0;
+        ctx.run_pass(Default::default(), |ctx| {
+            // EpiIntegration runs logic before UI on every discarded pass too.
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            passes += 1;
+            let actions = batch.actions_for_test();
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].kind, PadActionKind::Press);
+            if ctx.current_pass_index() == 0 {
+                first_id = Some(actions[0].operation_id);
+                app.gamepad
+                    .push_for_test(PadEvent::ButtonReleased(PadButton::DPadRight));
+                app.gamepad.push_for_test(PadEvent::Disconnected);
+                ctx.request_discard("new physical terminal during gamepad replay");
+            } else {
+                assert_eq!(batch.delivery, PadBatchDelivery::Replay);
+                assert_eq!(Some(actions[0].operation_id), first_id);
+                assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            assert_eq!(batch.delivery, PadBatchDelivery::Fresh);
+            assert_eq!(batch.actions_for_test().len(), 1);
+            assert_eq!(batch.actions_for_test()[0].kind, PadActionKind::Release);
+            assert!(matches!(
+                batch.events.as_slice(),
+                [PadBatchEvent::Action(_), PadBatchEvent::SessionEnded]
+            ));
+            assert_ne!(Some(batch.actions_for_test()[0].operation_id), first_id);
+            app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| false);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn gamepad_retired_picker_terminal_keeps_new_physical_repeat_axis_and_one_undo() {
+        for suppressed_release in [false, true] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.gamepad
+                .push_for_test(PadEvent::ButtonPressed(PadButton::West));
+            integration.update_logic_only(&mut app.app, Default::default());
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+
+            let path = app.tmp.path().join("retired-picker.jpg");
+            app.items = vec![GridItem::Image(path)];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+            let key = app.rating_path_key(0).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 1, None)
+                .unwrap();
+            app.rating_cache.insert(0, 1);
+            let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+            picker.dirty_rows.push(RingPickerRowId::ItemRating);
+            picker.item_rating = 4;
+            picker.x_close_armed = true;
+            app.ring_picker = Some(picker.clone());
+            app.preview_picker_item_rating(&picker, 4);
+            let generation = app.rating_session_write_generation;
+            let retired = app.stash_mounted_and_start_fresh("test_gamepad_picker_park");
+            assert_eq!(retired, picker.owner);
+            app.retire_context(retired, "test_gamepad_picker_retire", |_| ())
+                .unwrap();
+            assert!(
+                app.ring_picker.is_some(),
+                "passive retirement retains the terminal recipe"
+            );
+            assert_eq!(app.meta_undo.undo_len(), 0);
+
+            if suppressed_release {
+                app.gamepad
+                    .push_receipt_for_test(PadEvent::ButtonReleased(PadButton::West), None);
+            } else {
+                app.gamepad.push_for_test(PadEvent::Disconnected);
+            }
+            integration.update_logic_only(&mut app.app, Default::default());
+            for event in [
+                PadEvent::ButtonPressed(PadButton::DPadRight),
+                PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+            let batch = app.sample_gamepad_input(&ctx);
+            assert_eq!(batch.delivery, PadBatchDelivery::Fresh);
+            assert!(matches!(
+                batch.events.last(),
+                Some(PadBatchEvent::AxesChanged(_))
+            ));
+            if suppressed_release {
+                assert!(matches!(
+                    batch.events.first(),
+                    Some(PadBatchEvent::Action(PadAction {
+                        kind: PadActionKind::SuppressedRelease,
+                        ..
+                    }))
+                ));
+            } else {
+                assert!(matches!(
+                    batch.events.first(),
+                    Some(PadBatchEvent::SessionEnded)
+                ));
+            }
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(app.ring_picker.is_none());
+            assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+            assert!(
+                app.gamepad
+                    .state
+                    .delivered_button_down(PadButton::DPadRight)
+            );
+            assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+            assert_eq!(app.gamepad.state.delivered_axis(PadAxis::LeftX), 0.9);
+            assert!(!app.gamepad.state.directional_neutral_required());
+            assert!(
+                app.gamepad.state.due_button_repeat(
+                    PadButton::DPadRight,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_millis(70),
+                ),
+                "the old owner's terminal cannot remove the new physical repeat schedule"
+            );
+            assert_eq!(app.meta_undo.undo_len(), 1);
+            assert_eq!(app.rating_session_write_generation, generation);
+            let empty = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, empty, |_, _| false);
+            assert_eq!(app.meta_undo.undo_len(), 1);
+            assert_eq!(app.rating_session_write_generation, generation);
+        }
+    }
+
+    #[test]
+    fn gamepad_multiple_logic_terminals_commit_preview_once_without_cancelling_new_input() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        let path = app.tmp.path().join("logic-preview.jpg");
+        app.items = vec![GridItem::Image(path)];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = app.rating_path_key(0).unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, None)
+            .unwrap();
+        app.rating_cache.insert(0, 1);
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.dirty_rows.push(RingPickerRowId::ItemRating);
+        picker.item_rating = 4;
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 4);
+        let generation = app.rating_session_write_generation;
+        let now = Instant::now();
+        for event in [
+            PadEvent::Disconnected,
+            PadEvent::Connected,
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+        ] {
+            app.gamepad.push_for_test(event);
+            app.drain_gamepad_physical_input(&ctx, now);
+        }
+        assert_eq!(ctx.cumulative_frame_nr(), 0);
+        assert!(
+            app.ring_picker.is_some(),
+            "logic cannot commit a mounted owner"
+        );
+        app.settings.page_turn_animation_enabled = true;
+        let mut passes = 0;
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            assert!(matches!(
+                batch.events.first(),
+                Some(PadBatchEvent::SessionEnded)
+            ));
+            assert_eq!(
+                batch.delivery,
+                if passes == 0 {
+                    PadBatchDelivery::Fresh
+                } else {
+                    PadBatchDelivery::Replay
+                }
+            );
+            app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true);
+            assert_eq!(
+                app.meta_undo.undo_len(),
+                1,
+                "meaningful terminal is delivered once even when UI is discarded"
+            );
+            passes += 1;
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("terminal preview commit replay");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        assert!(app.ring_picker.is_none());
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        assert!(!app.gamepad.state.directional_neutral_required());
+        let empty = app.sample_gamepad_input(&ctx);
+        app.dispatch_gamepad_batch_with_admission(&ctx, empty, |_, _| false);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+    }
+
+    #[test]
+    fn gamepad_ui_take_preserves_split_drain_edges_without_another_poll() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        let now = Instant::now();
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::South));
+        app.drain_gamepad_physical_input(&ctx, now);
+        app.gamepad
+            .push_for_test(PadEvent::ButtonReleased(PadButton::South));
+        app.drain_gamepad_physical_input(&ctx, now);
+        let physical = app.gamepad.take_pending();
+        // Input arriving after take belongs to the next explicit physical drain.
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::East));
+        assert!(!app.gamepad.state.button_down(PadButton::East));
+        let batch = app.gamepad_batch_from_physical_input(&ctx, physical, true, now, 42, true);
+        assert!(
+            !app.gamepad.state.button_down(PadButton::East),
+            "UI batch construction must leave queued input untouched"
+        );
+        assert_eq!(batch.actions_for_test().len(), 2);
+        assert_eq!(batch.actions_for_test()[0].kind, PadActionKind::Press);
+        assert_eq!(batch.actions_for_test()[1].kind, PadActionKind::Release);
+        assert_eq!(
+            batch.actions_for_test()[0].operation_id,
+            PadOperationId {
+                batch: 42,
+                ordinal: 0
+            }
+        );
+        assert_eq!(
+            batch.actions_for_test()[1].operation_id,
+            PadOperationId {
+                batch: 42,
+                ordinal: 1
+            }
+        );
+        assert!(!app.gamepad.state.button_down(PadButton::South));
+        assert!(app.gamepad.take_pending().events.is_empty());
+
+        app.drain_gamepad_physical_input(&ctx, now);
+        assert!(app.gamepad.state.button_down(PadButton::East));
+        let physical = app.gamepad.take_pending();
+        assert_eq!(
+            physical.events,
+            [PadPhysicalEvent::ButtonPressed(PadButton::East)]
+        );
+        let next = app.gamepad_batch_from_physical_input(&ctx, physical, true, now, 43, true);
+        assert_eq!(next.actions_for_test().len(), 1);
+        assert_eq!(next.actions_for_test()[0].button, PadButton::East);
+        assert_eq!(next.actions_for_test()[0].kind, PadActionKind::Press);
+        assert!(next.saw_input_event);
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    fn gamepad_disconnect_overlay_cleanup_keeps_later_press_in_same_drain() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.gamepad_favorite_picker = Some(GamepadFavoritePickerState {
+            tab: GamepadFavoritePickerTab::Favorites,
+            favorites: GamepadListCursor::new(0),
+            smart_folders: GamepadListCursor::new(0),
+        });
+        for event in [
+            PadEvent::ButtonPressed(PadButton::West),
+            PadEvent::Disconnected,
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+        ] {
+            app.gamepad.push_for_test(event);
+        }
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(batch.session_ended_for_test());
+        assert!(batch.saw_input_event);
+        assert_eq!(batch.actions_for_test().len(), 2);
+        assert!(app.gamepad_favorite_picker.is_some());
+        app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| false);
+        assert!(app.gamepad_favorite_picker.is_none());
+        assert!(!app.gamepad.state.button_down(PadButton::West));
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+    }
+
+    #[test]
+    fn gamepad_disabled_ui_discards_handoff_actions_without_tracking_cache() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::South));
+        app.drain_gamepad_physical_input(&ctx, Instant::now());
+        app.settings.gamepad_enabled = false;
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(batch.actions_for_test().is_empty());
+        assert!(!batch.saw_input_event);
+        assert!(!batch.analog_operation);
+        assert!(batch.session_ended_for_test());
+        assert!(
+            ctx.data(|data| data
+                .get_temp::<SampledPadTransaction>(egui::Id::unique("gamepad_operation_ingress")))
+                .is_none()
+        );
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    fn gamepad_blocked_dispatch_keeps_held_axis_for_admitted_resume() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("pad-axis.jpg");
+        app.items = vec![GridItem::Image(path)];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.settings.gamepad_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        let blocked = app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| false);
+        assert!(!blocked.dispatch_allowed);
+        assert!(!blocked.dispatched);
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        assert!(!app.gamepad.state.directional_neutral_required());
+
+        // No new axis event or neutral crossing is required after admission resumes.
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(!batch.saw_input_event);
+        let resumed = app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+        assert!(resumed.dispatch_allowed);
+        assert!(resumed.dispatched);
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3_forked_mounted_gamepad_adopts_its_own_result_before_first_lookup() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        let main_key = crate::app::final_prepare_tests::queued_final(&mut app, 0);
+        let fork = app.fork_materialized_still_context(std::path::Path::new("C:/page-turn"), 0);
+        app.with_viewer_context(fork, |owner| {
+            assert!(
+                owner.final_effect_pending.is_empty(),
+                "fork must not share receiver/cancel ownership"
+            );
+            owner.reading_direction = crate::settings::ReadingDirection::Ltr;
+            owner.settings.gamepad_enabled = true;
+            let key = crate::app::final_prepare_tests::queued_final(owner, 1);
+            owner
+                .gamepad
+                .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+            let batch = owner.sample_gamepad_input_with_logic_for_test(&ctx);
+            crate::app::final_prepare_tests::expect_adopted_before_lookup(key, || {
+                let outcome = owner.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+                assert!(outcome.dispatched);
+            });
+            assert_eq!(owner.fullscreen_idx, Some(1));
+        })
+        .unwrap();
+        assert!(app.final_effect_pending.contains_key(&main_key));
+        assert!(app.final_composite_cache.get(&main_key).is_none());
     }
 }

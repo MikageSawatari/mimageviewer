@@ -488,9 +488,8 @@ mod tests {
 
     #[test]
     fn gather_fonts_classifies() {
-        let base = std::env::temp_dir().join("miv_build_editing_pack_fonts_t1");
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
         fs::write(base.join("Foo-Regular.ttf"), b"ttf").unwrap();
         fs::write(base.join("Foo-OFL.txt"), b"ofl").unwrap();
         fs::write(base.join("README.md"), b"readme").unwrap();
@@ -506,14 +505,12 @@ mod tests {
             out.iter()
                 .any(|f| f.kind == FileKind::License && f.rel == "fonts/Foo-OFL.txt")
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn gather_models_classifies() {
-        let base = std::env::temp_dir().join("miv_build_editing_pack_models_t1");
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
         fs::write(base.join("birefnet_fp16.onnx"), b"onnx").unwrap();
         fs::write(base.join("BiRefNet-LICENSE.txt"), b"mit").unwrap();
         let mut out = Vec::new();
@@ -526,6 +523,5 @@ mod tests {
         assert_eq!(model.rel, "models/birefnet_fp16.onnx");
         assert_eq!(model.model_id.as_deref(), Some("birefnet_fp16"));
         assert!(out.iter().any(|f| f.kind == FileKind::License));
-        let _ = fs::remove_dir_all(&base);
     }
 }

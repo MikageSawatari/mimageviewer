@@ -506,17 +506,11 @@ mod tests {
     use super::*;
     use crate::mask_db::{LineKind, Shape, ShapeOp};
 
-    fn tmp_db() -> (ConcealDb, std::path::PathBuf) {
-        let p = std::env::temp_dir().join(format!(
-            "mimageviewer_conceal_db_test_{}_{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&p);
-        (ConcealDb::open_at(&p).expect("open"), p)
+    // Bind the directory before the connection so the connection drops first.
+    fn tmp_db() -> (tempfile::TempDir, ConcealDb) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = ConcealDb::open_at(&temp.path().join("test.db")).expect("open");
+        (temp, db)
     }
 
     #[test]
@@ -527,7 +521,7 @@ mod tests {
 
     #[test]
     fn set_and_get_roundtrip() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let w = 50;
         let h = 50;
         let mut mask = vec![false; w * h];
@@ -553,12 +547,11 @@ mod tests {
         let (got_mask, got_shapes) = db.get_full("test/image.png", w, h).expect("get");
         assert_eq!(got_mask, mask);
         assert_eq!(got_shapes, shapes);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn load_existing_conceal_keys_returns_only_requested_exact_keys() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let mask = vec![true];
         db.set("c:/a.jpg", &mask, &[], 1, 1).unwrap();
         db.set("c:/b.jpg", &mask, &[], 1, 1).unwrap();
@@ -567,12 +560,11 @@ mod tests {
             loaded,
             std::collections::HashSet::from(["c:/b.jpg".to_string()])
         );
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn edit_bundle_bulk_conceal_strict_reader_rejects_corrupt_shapes() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let compressed = crate::mask_db::compress_mask(&[true]);
         db.set_raw("key", &compressed, Some("{invalid"), 1, 1)
             .unwrap();
@@ -580,22 +572,20 @@ mod tests {
         let (_, shapes, _) = db.get_full_checked("key").unwrap().unwrap();
         assert!(shapes.is_empty(), "通常readerの寛容動作は保つ");
         assert!(db.get_full_strict("key").is_err());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn empty_mask_and_empty_shapes_deletes() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let mask = vec![false; 100];
         db.set("k", &mask, &[], 10, 10).unwrap();
         // set 後でも全 false / 空 shapes なら DB に何も入らない
         assert!(db.get_full("k", 10, 10).is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn empty_mask_with_shapes_persists() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let mask = vec![false; 100];
         let shapes = vec![Shape::Line {
             op: ShapeOp::Add,
@@ -609,12 +599,11 @@ mod tests {
         assert_eq!(got_mask.len(), 100);
         assert!(!got_mask.iter().any(|&b| b));
         assert_eq!(got_shapes, shapes);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn slot_roundtrip() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let mask = vec![true; 64];
         let shapes = vec![Shape::Rect {
             op: ShapeOp::Add,
@@ -633,12 +622,11 @@ mod tests {
         // delete_slot で消える
         db.delete_slot(1).unwrap();
         assert!(db.get_slot_full(1, 8, 8).is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn rescale_on_size_change() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let w = 100;
         let h = 100;
         let mut mask = vec![false; w * h];
@@ -667,12 +655,11 @@ mod tests {
             }
             _ => panic!("rect expected"),
         }
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn load_conceal_keys_excludes_slots() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let w = 4;
         let h = 4;
         let mask = vec![true; 16];
@@ -686,12 +673,11 @@ mod tests {
         assert!(keys.contains("c:/foo/img2.png"));
         // スロットは除外
         assert!(!keys.iter().any(|k| k.starts_with("__slot_")));
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_raw_with_explicit_json() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let mask = vec![true; 16];
         let blob = compress_mask(&mask);
         // タグ付き Shape JSON を直接渡す
@@ -708,6 +694,5 @@ mod tests {
             } => {}
             _ => panic!("expected line"),
         }
-        let _ = std::fs::remove_file(&p);
     }
 }

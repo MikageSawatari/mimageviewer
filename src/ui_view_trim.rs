@@ -1094,6 +1094,9 @@ impl App {
         pair: SpreadPair,
         action: OriginalViewTrimAction,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         self.cancel_original_material_entry_intents(None);
         let request = OriginalViewTrimRequest {
             requested_fs_idx: anchor,
@@ -1146,7 +1149,7 @@ impl App {
                 Some(crate::fs_animation::FsCacheEntry::Failed)
             )
         }) {
-            self.show_feedback_toast("画像の読み込みに失敗しました".to_string());
+            self.show_feedback_error("画像の読み込みに失敗しました".to_string());
             return;
         }
         for &idx in &indices {
@@ -1279,7 +1282,7 @@ impl App {
             }
         }
         if !changed {
-            self.show_feedback_toast("自動検出できる余白がありません".to_string());
+            self.show_feedback_warning("自動検出できる余白がありません".to_string());
             return;
         }
         if request.action == OriginalViewTrimAction::DetectBook {
@@ -1304,7 +1307,7 @@ impl App {
         }
         ctx.data_mut(|data| {
             data.insert_temp(
-                egui::Id::new(("view_trim_auto_page_seed_pending", anchor)),
+                egui::Id::unique(("view_trim_auto_page_seed_pending", anchor)),
                 false,
             )
         });
@@ -1321,6 +1324,9 @@ impl App {
         editor_root_idx: usize,
         spread_pair: SpreadPair,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         self.cancel_original_material_entry_intents(None);
         let indices = match spread_pair {
             SpreadPair::Single => vec![editor_root_idx],
@@ -1415,6 +1421,9 @@ impl App {
         body_width: f32,
         body_height: f32,
     ) {
+        if self.book_structural_op.is_some() {
+            ui.disable();
+        }
         let is_spread = matches!(spread_pair, SpreadPair::Double { .. });
         let had_any_page_override = match spread_pair {
             SpreadPair::Single => self.view_trim_page_overrides.contains_key(&fs_idx),
@@ -1449,7 +1458,8 @@ impl App {
         };
         // Auto → Manual → このページは 2 クリックになるため、Auto から Manual へ入った
         // 事実だけ UI 一時状態に保持し、次の page_apply ON で従来の自動余白シードを使う。
-        let auto_page_seed_pending_id = egui::Id::new(("view_trim_auto_page_seed_pending", fs_idx));
+        let auto_page_seed_pending_id =
+            egui::Id::unique(("view_trim_auto_page_seed_pending", fs_idx));
         let mut auto_page_seed_pending = ui.ctx().data(|data| {
             data.get_temp::<bool>(auto_page_seed_pending_id)
                 .unwrap_or(false)
@@ -1488,6 +1498,10 @@ impl App {
         let append_undo_pending = self.book_append_undo_in_progress();
 
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .max_height(body_height.max(160.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1828,7 +1842,7 @@ impl App {
         let panel_h = panel_rect.height();
         let mut close = false;
 
-        egui::Area::new(egui::Id::new("view_trim_panel"))
+        egui::Area::new(egui::Id::unique("view_trim_panel"))
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
@@ -1837,7 +1851,7 @@ impl App {
                         egui::Pos2::ZERO,
                         egui::vec2(PANEL_W + 12.0, panel_h + 12.0),
                     ),
-                    egui::Id::new("view_trim_panel_click_sink"),
+                    egui::Id::unique("view_trim_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())

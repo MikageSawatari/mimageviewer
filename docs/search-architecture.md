@@ -50,12 +50,24 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
   `normalize_for_match` (= `to_lowercase`)。**ingest 側・クエリ側・post-filter 側で
   必ずこの 1 関数を通す**。片方だけ NFKC を入れると偽ヒット / 検索漏れが出る。
 
-最小クエリ長:
+最小クエリ長 (Ctrl+G 専用。Ctrl+F / Ctrl+S には適用しない、§1.229):
 
-- CJK を 1 文字でも含む → 2 文字以上
-- 英数字のみ → 3 文字以上 (bigram の爆発的ヒット回避)
+- 通常の include 語が 1 文字なら、他に長い語があっても拒否する (2026-10-19 利用者決定)。
+  bigram 照会の構築前に判定し、post-filter だけの 1 文字検索は行わない。
+- CJK を 1 文字でも含む語は 2 文字以上、その他 (英数字・記号等) は 3 文字以上なら
+  単独で候補を絞れる長さとする。長さは語ごとに空白を除いて数える。
+- 非 CJK 2 文字語は、**AND で上記の長さを満たす include 語が 1 つ以上あるときだけ**許可する。
+  `EOS R5` は両語の部分一致で、順序・隣接・同一ソースを要求しない。`r5` 単独や `sd ai` は拒否。
+  OR は各語の従来の検査を維持し、`EOS R5` を拒否する (短い語で候補が広がるため)。
+- `global_search::QueryTermLength` で索引照会不可 / 長い語との併用が必要 / 十分な長さを区別し、
+  `RejectReason::TooShort` に拒否した語をすべて保持してメッセージへ出す。
+  除外語は検査対象外。タグ候補への橋渡しの `#a` 等の免除と、フレーズの連続一致は維持する。
 - NOT-only (正トークン 0) は **Ctrl+G では拒否** (全件 scan になるため)。Ctrl+F は
   対象件数が小さいので許可。
+
+2 文字語も既存の `build_bigram_and_query` にそのまま渡し、1 個の bigram を top-level Must の
+子照会へ入れる。全語を既存 post-filter でも再確認するため、候補を広げずに絞り込める。
+検査は純粋な語分類だけで完結し、非同期状態・待機や専用の照会経路を追加しない。
 
 Ctrl+R はこのparser、正規化、最小文字数、OR toggle、FTS post-filterを通さず、
 非空queryをそのままEverythingへ明示送信する。自動`ext:`追記も行わない。
@@ -758,7 +770,7 @@ UI (global_search_ui::render_global_search_bar)
     → global_search::run (別スレッド)
 
   [worker] スレッド内ループ:
-    0. クエリ検証 (最小長、NOT-only 禁止)
+    0. クエリ検証 (mode ごとの最小長、1 文字語拒否、NOT-only 禁止。§1.2)
     1. 正トークンを bigram 分解し build_bigram_and_query で BooleanQuery を構築
        - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/video_meta/tags)
          ごとの OR を各トークンの子クエリにし、mode=AND なら top-level Must で、

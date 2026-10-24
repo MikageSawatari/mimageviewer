@@ -50,7 +50,7 @@ impl Drop for Recording<'_> {
 
 fn acquire(gate: &AtomicUsize) -> Option<Recording<'_>> {
     let acquired = gate
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             (value & CLOSED == 0).then_some(value + 1)
         })
         .is_ok();

@@ -500,7 +500,12 @@ fn install_primary_fonts(
             hud_names.push("ui_hud_default".to_owned());
             let relative = selected_target
                 .map(|target| {
-                    row_alignment_factor(default_font.font.as_ref(), index, &['今', 'あ'], target)
+                    row_alignment_factor(
+                        default_font.font.as_ref().as_ref(),
+                        index,
+                        &['今', 'あ'],
+                        target,
+                    )
                 })
                 .unwrap_or(0.0);
             let mut japanese = (*default_font).clone();
@@ -873,7 +878,9 @@ mod tests {
                 fonts
                     .font_data
                     .get(*font_name)
-                    .and_then(|font| ttf_parser::Face::parse(font.font.as_ref(), font.index).ok())
+                    .and_then(|font| {
+                        ttf_parser::Face::parse(font.font.as_ref().as_ref(), font.index).ok()
+                    })
                     .and_then(|face| face.glyph_index(ch))
                     .is_some()
             });
@@ -907,7 +914,7 @@ mod tests {
                         .font_data
                         .get(*font_name)
                         .and_then(|font| {
-                            ttf_parser::Face::parse(font.font.as_ref(), font.index).ok()
+                            ttf_parser::Face::parse(font.font.as_ref().as_ref(), font.index).ok()
                         })
                         .and_then(|face| face.glyph_index(ch))
                         .is_some()
@@ -1029,7 +1036,7 @@ mod tests {
                 candidate.label
             );
             assert_eq!(
-                hud.font.as_ref(),
+                hud.font.as_ref().as_ref(),
                 default_data.as_slice(),
                 "{} must not change the fixed HUD font",
                 candidate.label,

@@ -36,6 +36,16 @@ pub(crate) enum StartupListIntent {
 }
 
 impl StartupListIntent {
+    pub(super) fn replaces_deferred_startup_open(&self) -> bool {
+        !matches!(
+            self.materialization_intent(),
+            Self::InternalInstall
+                | Self::PreservePresentation
+                | Self::RefreshList { .. }
+                | Self::ResumeList { .. }
+        )
+    }
+
     pub(super) fn imports_sidecars(&self) -> bool {
         !matches!(
             self.materialization_intent(),

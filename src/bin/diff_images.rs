@@ -41,8 +41,22 @@ fn main() {
         i += 1;
     }
 
-    let a = image::open(&a_path).expect("load A");
-    let b = image::open(&b_path).expect("load B");
+    let a = mimageviewer::image_decode::decode(
+        mimageviewer::image_decode::Source::Path(&a_path),
+        mimageviewer::avif_decoder::Workload::Background,
+        false,
+        None,
+    )
+    .map(|decoded| decoded.image)
+    .expect("load A");
+    let b = mimageviewer::image_decode::decode(
+        mimageviewer::image_decode::Source::Path(&b_path),
+        mimageviewer::avif_decoder::Workload::Background,
+        false,
+        None,
+    )
+    .map(|decoded| decoded.image)
+    .expect("load B");
 
     let a_rgba = a.to_rgba8();
     let b_rgba = b.to_rgba8();

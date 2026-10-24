@@ -5,7 +5,8 @@
 //! 行わないよう、書き込みは [`ReadingHistoryWriter`] の専用スレッドへ送る。
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
@@ -312,6 +313,7 @@ impl ReadingHistoryDb {
 
 /// 閲覧履歴の書き込みを UI スレッドから外す background writer。
 pub struct ReadingHistoryWriter {
+    pending: Arc<AtomicUsize>,
     tx: Option<mpsc::Sender<ReadingHistoryCommand>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -359,12 +361,31 @@ impl MediaProgressUpdate {
 }
 
 impl ReadingHistoryWriter {
+    pub(crate) fn is_busy(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+    }
+
     pub fn spawn() -> Option<Self> {
+        Self::spawn_at(ReadingHistoryDb::db_path())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_at_for_test(path: PathBuf) -> Option<Self> {
+        Self::spawn_at(path)
+    }
+
+    fn spawn_at(path: PathBuf) -> Option<Self> {
         let (tx, rx) = mpsc::channel::<ReadingHistoryCommand>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
         let spawned = std::thread::Builder::new()
             .name("reading-history-writer".into())
             .spawn(move || {
-                let db = match ReadingHistoryDb::open() {
+                let db = match ReadingHistoryDb::open_at(path) {
                     Ok(db) => db,
                     Err(e) => {
                         crate::logger::log(format!("reading-history writer: DB open failed: {e}"));
@@ -381,6 +402,7 @@ impl ReadingHistoryWriter {
                                 phase,
                             );
                             let _ = reply.send(result);
+                            worker_pending.fetch_sub(1, Ordering::AcqRel);
                             continue;
                         }
                         ReadingHistoryCommand::Upsert(entry, limit) => db.upsert(entry, limit),
@@ -399,10 +421,12 @@ impl ReadingHistoryWriter {
                     if let Err(e) = result {
                         crate::logger::log(format!("reading-history writer: write failed: {e}"));
                     }
+                    worker_pending.fetch_sub(1, Ordering::AcqRel);
                 }
             });
         match spawned {
             Ok(handle) => Some(Self {
+                pending,
                 tx: Some(tx),
                 handle: Some(handle),
             }),
@@ -415,7 +439,13 @@ impl ReadingHistoryWriter {
 
     pub fn record(&self, entry: ReadingHistoryEntry, limit: usize) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(ReadingHistoryCommand::Upsert(entry, limit));
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            if tx
+                .send(ReadingHistoryCommand::Upsert(entry, limit))
+                .is_err()
+            {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -425,15 +455,22 @@ impl ReadingHistoryWriter {
         destination: PathBuf,
     ) -> crate::image_folder_zip_metadata::CopyPortal {
         let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
         std::sync::Arc::new(move |_, phase| {
             let (reply, rx) = mpsc::channel();
             if let Some(tx) = &tx {
-                let _ = tx.send(ReadingHistoryCommand::FolderZip(
-                    source.clone(),
-                    destination.clone(),
-                    phase,
-                    reply,
-                ));
+                pending.fetch_add(1, Ordering::AcqRel);
+                if tx
+                    .send(ReadingHistoryCommand::FolderZip(
+                        source.clone(),
+                        destination.clone(),
+                        phase,
+                        reply,
+                    ))
+                    .is_err()
+                {
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             rx
         })
@@ -441,13 +478,22 @@ impl ReadingHistoryWriter {
 
     pub fn prune(&self, limit: usize) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(ReadingHistoryCommand::Prune(limit));
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            if tx.send(ReadingHistoryCommand::Prune(limit)).is_err() {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
     pub(crate) fn update_media_progress(&self, update: MediaProgressUpdate) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(ReadingHistoryCommand::UpdateMediaProgress(update));
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            if tx
+                .send(ReadingHistoryCommand::UpdateMediaProgress(update))
+                .is_err()
+            {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -456,7 +502,10 @@ impl ReadingHistoryWriter {
             return;
         }
         if let Some(tx) = &self.tx {
-            let _ = tx.send(ReadingHistoryCommand::RemoveKeys(keys));
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            if tx.send(ReadingHistoryCommand::RemoveKeys(keys)).is_err() {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -667,6 +716,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = ReadingHistoryDb::open_at(dir.path().join("reading_history.db")).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn history_busy_includes_queued_writes_and_folder_zip_portal() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reading_history.db");
+        let db = ReadingHistoryDb::open_at(path.clone()).unwrap();
+        db.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = ReadingHistoryWriter::spawn_at(path).unwrap();
+        writer.record(entry("C:/books/book.zip", 0), 10);
+        writer.prune(10);
+        assert!(writer.is_busy());
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("page.jpg"), b"image").unwrap();
+        let manifest = crate::image_folder_zip::prepare_manifest(
+            &source,
+            None,
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
+        let portal = writer.folder_zip_portal(source, manifest.destination.clone());
+        let reply = portal(
+            &manifest,
+            crate::image_folder_zip_metadata::CopyPhase::Check,
+        );
+        assert!(writer.is_busy());
+        db.conn.execute_batch("ROLLBACK").unwrap();
+        let _ = reply.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while writer.is_busy() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(writer.pending.load(Ordering::Acquire), 0);
     }
 
     fn entry(path: &str, page: i64) -> ReadingHistoryEntry {

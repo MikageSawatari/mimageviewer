@@ -484,6 +484,15 @@ fn xhtml_info(bytes: &[u8], path: &str) -> Result<XhtmlInfo, EpubError> {
     Ok((size, if images == 1 && !other { image } else { None }))
 }
 fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if libavif_sys::is_avif(bytes) {
+        return match libavif_sys::dimensions(bytes, libavif_sys::Limits::default(), 1) {
+            Ok(size) => Some(size),
+            Err(error) => {
+                eprintln!("epub AVIF dimensions: {error}");
+                None
+            }
+        };
+    }
     image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
@@ -1496,5 +1505,18 @@ mod tests {
             z.finish().unwrap();
         }
         assert!(inspect_bytes(&out.into_inner()).is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod avif_intrinsic_tests {
+    #[test]
+    fn avif_spine_image_uses_shared_intrinsic_dimensions() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/avif/animated_first_quadrant.avif");
+        assert_eq!(
+            super::image_size(&std::fs::read(path).unwrap()),
+            Some((64, 64))
+        );
     }
 }

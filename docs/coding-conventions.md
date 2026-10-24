@@ -40,6 +40,10 @@
   止めるため、モデルレス Window と将来の登録漏れにも安全側で動く。state が存在しても
   Window を描かない phase がある処理は、state の有無ではなく「現在表示されるか」を返す
   helper を登録すること。
+- **メイン枠のポインター操作**: 各バーとフォルダーツリーは `gate_main_chrome` で停止する。
+  グリッドの右クリックメニューだけは除外し、modal への遷移時に既存 popup と submenu 状態を閉じる。
+  遷移判定は root の worker 採用・入力処理後、ウィンドウ描画前に1回だけ行い、
+  その後 dialog 自身が開いた popup は閉じない。無効化時の枠全体の配色は維持する。
 - 数十分以上続く取得・管理 UI (TensorRT パック等) はモデルレス tool window とし、
   `common_modal_dialog_open` へ含めて閲覧全体を停止しない。Window 上の入力だけは floating-layer
   guard で背面へ漏らさない。
@@ -69,7 +73,7 @@
 ### パネル (Area + Frame::popup)
 - フルスクリーン上の固定パネルで `egui::Area::fixed_pos` + `Frame::popup` +
   `ScrollArea` を組み合わせる場合、`ScrollArea::max_height` だけに頼らない。
-  egui 0.33 は親 `Ui` の `available_rect_before_wrap()` を上限にするため、自動サイズの
+  egui は親 `Ui` の `available_rect_before_wrap()` を上限にするため (0.33 で確認)、自動サイズの
   `Area` / `Frame::popup` 内ではコンテンツ高に縮むことがある。
 - 下端近くまで伸ばしたいパネルは、ScrollArea の前に
   `ui.allocate_ui_with_layout(egui::vec2(width, body_height), ...)` で親領域を明示確保し、
@@ -410,9 +414,10 @@ TTF/OTF/TTC/OTC の日本語 upright face を選べる。日本語なし / Itali
 `miv-user-text` family を別途登録する。この family は text-presentation 記号、
 数学英字、絵文字の fallback を明示し、ttf-parser で選択 face / Yu Gothic の代表 glyph と
 Segoe UI Emoji の代表 glyph の中心を読んで
-baseline 補正を計算する。egui 0.33 は `ab_glyph` の outline 描画を使うため、
-計測も outline bbox を優先し、raster image bounds は bbox が取れない場合の fallback
-とする。動画・音声 HUD の固定サイズ control label は選択 face ではなく `miv-hud-text`
+baseline 補正を計算する。計測は egui 0.33 の `ab_glyph` outline 描画に合わせて
+outline bbox を優先し、raster image bounds は bbox が取れない場合の fallback とする。
+egui 0.37 (Skrifa + vello_cpu) への更新後もこの計測を使い、文字の見え方は 2026-10-17 に
+利用者が旧版と比較して採択した ([egui 0.37 更新計画 §5](egui-0.37-update-plan.md))。動画・音声 HUD の固定サイズ control label は選択 face ではなく `miv-hud-text`
 (無補正の既定日本語フォント) を使い、VST 等の固定 glyph はベクター描画する。
 複数サンプルは中央値で扱う。ツールバーは既定 Yu Gothic の実測補正値に
 選択 face との差分を加え、環境設定の ±4pt 微調整を最後に加える。`✉` / `⋈` のような text-presentation 記号は

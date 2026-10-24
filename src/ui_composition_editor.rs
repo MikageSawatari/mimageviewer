@@ -144,11 +144,12 @@ pub fn show_window(
     // backdrop do the dimming. Disabled Ui opacity would also fade the window
     // fill and expose the viewer page underneath. Limit this style to the
     // editor draw; the confirmation and other UI retain their normal style.
-    let editor_style = ctx.style();
+    let editor_style = ctx.global_style();
     if confirmation_at_start != EditorConfirmation::None {
-        ctx.style_mut(|style| style.visuals.disabled_alpha = 1.0);
+        ctx.global_style_mut(|style| style.visuals.disabled_alpha = 1.0);
     }
     egui::Window::new("本の構成を編集")
+        .drag_area(egui::WindowDrag::Anywhere)
         .id(id)
         .order(egui::Order::Foreground)
         .enabled(confirmation_at_start == EditorConfirmation::None)
@@ -165,7 +166,7 @@ pub fn show_window(
             actions = render(ui, view, state);
         });
     if confirmation_at_start != EditorConfirmation::None {
-        ctx.set_style(editor_style);
+        ctx.set_global_style(editor_style);
     }
     if state.confirmation != EditorConfirmation::None {
         // A click opening a confirmation must not also accept it with a key
@@ -255,7 +256,7 @@ fn show_confirmation(
         });
     }
     let screen = ctx.content_rect();
-    let frame = egui::Frame::popup(&ctx.style());
+    let frame = egui::Frame::popup(&ctx.global_style());
     let margin = frame.total_margin();
     let size = (screen.size() - margin.sum() - egui::vec2(24.0, 24.0)).max(egui::vec2(1.0, 1.0));
     let mut choice = None;
@@ -295,6 +296,10 @@ fn show_confirmation(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .max_height(body_height)
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, true])
@@ -537,6 +542,10 @@ pub fn render(
             let scroll = &mut ui.spacing_mut().scroll;
             scroll.floating_allocated_width = scroll.bar_inner_margin + scroll.bar_width;
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .auto_shrink([false, true])
                 .max_height(ui.available_height().max(0.0))
                 .show(ui, |ui| {
@@ -621,7 +630,7 @@ pub fn render(
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
         data.insert_temp(
-            egui::Id::new("composition_editor_geometry"),
+            egui::Id::unique("composition_editor_geometry"),
             EditorGeometry {
                 surface,
                 body: body_rect,
@@ -703,6 +712,10 @@ fn source_list(
         );
     let height = ui.available_height().min(height).max(0.0);
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("composition_sources")
         .max_height(height)
         .auto_shrink([false, false])
@@ -853,7 +866,14 @@ fn badge(view: &EditorView, id: usize) -> String {
         specified.into()
     }
 }
-fn result_row_height(ui: &egui::Ui) -> f32 {
+#[derive(Clone, Copy)]
+struct ResultRowLayout {
+    thumbnail_height: f32,
+    blank_height: f32,
+    row_height: f32,
+}
+
+fn result_row_layout(ui: &egui::Ui, viewport_height: f32) -> ResultRowLayout {
     let label_height = ui
         .painter()
         .layout_no_wrap("0ページ".into(), page_card_label_font(), Color32::WHITE)
@@ -868,10 +888,32 @@ fn result_row_height(ui: &egui::Ui) -> f32 {
         )
         .size()
         .y;
+    let blank_label_height = ui
+        .painter()
+        .layout_no_wrap(
+            "この見開きの\n空き側".into(),
+            egui::FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        )
+        .size()
+        .y;
+    // Keep the complete card in a short, bounded result viewport. The label
+    // owns its measured band; only the thumbnail scales down from its normal
+    // maximum. Paint, hit testing and virtual row pitch share this geometry.
+    let thumbnail_height =
+        (viewport_height - label_height - PAGE_CARD_LABEL_GAP).clamp(0.0, PAGE_CARD_THUMB_HEIGHT);
+    let blank_height = thumbnail_height.max(blank_label_height);
     // The tallest actual content owns the row. Vertical separation belongs to
     // show_rows' item_spacing; an inset here would consume the minimum viewport
     // needed to show one entire thumbnail and its Japanese label band.
-    page_card_height(label_height).max(2.0 * description_height + ui.spacing().item_spacing.y)
+    let row_height = page_card_height(label_height, thumbnail_height)
+        .max(2.0 * description_height + ui.spacing().item_spacing.y)
+        .max(blank_height);
+    ResultRowLayout {
+        thumbnail_height,
+        blank_height,
+        row_height,
+    }
 }
 fn unit_list(
     ui: &mut egui::Ui,
@@ -895,9 +937,14 @@ fn unit_list(
         .on_hover_text("白紙は見開きだけに使い、単ページ・横長分割では表示しません");
     }
     directive_controls(ui, view, state, actions);
-    let row_height = result_row_height(ui);
     let height = ui.available_height().min(height).max(0.0);
+    let layout = result_row_layout(ui, height);
+    let row_height = layout.row_height;
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("composition_units")
         .max_height(height)
         .auto_shrink([false, false])
@@ -961,8 +1008,8 @@ fn unit_list(
                             } else {
                                 (second, first)
                             };
-                            page_card(ui, view, state, left, false, actions, thumbnails);
-                            page_card(ui, view, state, right, false, actions, thumbnails);
+                            page_card(ui, view, state, left, false, layout, actions, thumbnails);
+                            page_card(ui, view, state, right, false, layout, actions, thumbnails);
                         }
                         EditorUnitView::Single {
                             page,
@@ -971,11 +1018,15 @@ fn unit_list(
                         } => {
                             let slot = placement.screen_slot(view.direction);
                             if slot == ScreenSlot::Right {
-                                companion_card(ui, view, state, companion, actions, thumbnails);
+                                companion_card(
+                                    ui, view, state, companion, layout, actions, thumbnails,
+                                );
                             }
-                            page_card(ui, view, state, page, false, actions, thumbnails);
+                            page_card(ui, view, state, page, false, layout, actions, thumbnails);
                             if slot != ScreenSlot::Right {
-                                companion_card(ui, view, state, companion, actions, thumbnails);
+                                companion_card(
+                                    ui, view, state, companion, layout, actions, thumbnails,
+                                );
                             }
                         }
                     };
@@ -1010,8 +1061,8 @@ fn page_card_label_font() -> egui::FontId {
     egui::FontId::proportional(12.0)
 }
 
-fn page_card_height(label_height: f32) -> f32 {
-    PAGE_CARD_THUMB_HEIGHT + PAGE_CARD_LABEL_GAP + label_height
+fn page_card_height(label_height: f32, thumbnail_height: f32) -> f32 {
+    thumbnail_height + PAGE_CARD_LABEL_GAP + label_height
 }
 
 fn page_card(
@@ -1020,6 +1071,7 @@ fn page_card(
     state: &mut EditorUiState,
     id: usize,
     supplement: bool,
+    layout: ResultRowLayout,
     _actions: &mut Vec<EditorUiAction>,
     thumbnails: &mut Vec<usize>,
 ) {
@@ -1039,12 +1091,15 @@ fn page_card(
     );
     let width = PAGE_CARD_WIDTH.max(label.size().x);
     let (rect, r) = ui.allocate_exact_size(
-        egui::vec2(width, page_card_height(label.size().y)),
+        egui::vec2(
+            width,
+            page_card_height(label.size().y, layout.thumbnail_height),
+        ),
         Sense::click(),
     );
     r.widget_info(|| {
         egui::WidgetInfo::labeled(
-            egui::WidgetType::Button,
+            egui::Role::Button,
             ui.is_enabled(),
             if supplement {
                 format!("末尾に添えた表紙: {}ページ", page.physical_number)
@@ -1053,7 +1108,8 @@ fn page_card(
             },
         )
     });
-    let thumb_rect = egui::Rect::from_min_size(rect.min, egui::vec2(width, PAGE_CARD_THUMB_HEIGHT));
+    let thumb_rect =
+        egui::Rect::from_min_size(rect.min, egui::vec2(width, layout.thumbnail_height));
     if let Some((texture, size)) = page
         .thumbnail
         .filter(|_| !page.excluded_by_policy && !page.missing)
@@ -1115,6 +1171,7 @@ fn companion_card(
     view: &EditorView,
     state: &mut EditorUiState,
     companion: EditorCompanionView,
+    layout: ResultRowLayout,
     actions: &mut Vec<EditorUiAction>,
     thumbnails: &mut Vec<usize>,
 ) {
@@ -1124,13 +1181,14 @@ fn companion_card(
             // Auxiliary copies do not become selection or drag sources.
             let saved_selection = state.selected_pages.clone();
             ui.add_enabled_ui(false, |ui| {
-                page_card(ui, view, state, id, true, actions, thumbnails)
+                page_card(ui, view, state, id, true, layout, actions, thumbnails)
             });
             state.selected_pages = saved_selection;
             ui.weak("補助");
         }
         EditorCompanionView::Blank => {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(94.0, 52.0), Sense::hover());
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(94.0, layout.blank_height), Sense::hover());
             let color = ui.visuals().weak_text_color().gamma_multiply(0.6);
             ui.painter()
                 .rect_filled(rect, 3.0, ui.visuals().faint_bg_color);
@@ -1235,7 +1293,7 @@ mod row_tests {
                 for confirmation in [EditorConfirmation::Remove, EditorConfirmation::Reload] {
                     let ctx = egui::Context::default();
                     crate::os_theme::apply_resolved(&ctx, theme);
-                    ctx.style_mut(|style| {
+                    ctx.global_style_mut(|style| {
                         style.animation_time = 0.0;
                         // A non-default alpha catches accidental resets to the default.
                         style.visuals.disabled_alpha = 0.23;
@@ -1249,7 +1307,7 @@ mod row_tests {
                         egui::Pos2::ZERO,
                         egui::vec2(1093.0, 614.0) / scale,
                     );
-                    let id = egui::Id::new("opaque_editor");
+                    let id = egui::Id::unique("opaque_editor");
                     let view = fixture(8);
                     let mut state = EditorUiState {
                         confirmation,
@@ -1257,7 +1315,8 @@ mod row_tests {
                     };
                     let mut output = egui::FullOutput::default();
                     for _ in 0..6 {
-                        output = ctx.run(
+                        std::mem::take(&mut output).drop_without_applying_deltas();
+                        output = crate::test_ui::headless_paint_output(ctx.run_pass(
                             egui::RawInput {
                                 screen_rect: Some(screen),
                                 ..Default::default()
@@ -1271,7 +1330,7 @@ mod row_tests {
                                 );
                                 show_window(ctx, id, &view, &mut state, DialogKeys::default());
                             },
-                        );
+                        ));
                     }
                     let interior = ctx
                         .memory(|memory| memory.area_rect(id))
@@ -1306,6 +1365,7 @@ mod row_tests {
                         window_index < backdrop_index,
                         "darken the opaque editor from above"
                     );
+                    output.drop_without_applying_deltas();
                     for (theme, style) in [egui::Theme::Light, egui::Theme::Dark]
                         .into_iter()
                         .zip(&styles)
@@ -1333,8 +1393,9 @@ mod row_tests {
             let mut fonts_ready = false;
             let mut h = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build_state(
-                    move |ctx, actions: &mut Vec<EditorUiAction>| {
+                .build_ui_state(
+                    move |root_ui, actions: &mut Vec<EditorUiAction>| {
+                        let ctx = &root_ui.ctx().clone();
                         if !fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             fonts_ready = true;
@@ -1343,7 +1404,7 @@ mod row_tests {
                         }
                         *actions = show_window(
                             ctx,
-                            egui::Id::new("denied_enter"),
+                            egui::Id::unique("denied_enter"),
                             &view,
                             &mut state,
                             DialogKeys::default(),
@@ -1359,8 +1420,11 @@ mod row_tests {
                     "キャンセル"
                 })
                 .find(|node| {
-                    let id =
-                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+                    let id = unsafe {
+                        egui::Id::from_high_entropy_bits(
+                            ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                        )
+                    };
                     h.ctx
                         .read_response(id)
                         .is_some_and(|response| response.enabled())
@@ -1396,18 +1460,20 @@ mod row_tests {
                         confirmation,
                         ..Default::default()
                     };
-                    let id = egui::Id::new("confirmation_bounds");
+                    let id = egui::Id::unique("confirmation_bounds");
                     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, physical / scale);
                     for _ in 0..6 {
-                        let _ = ctx.run(
-                            egui::RawInput {
-                                screen_rect: Some(screen),
-                                ..Default::default()
-                            },
-                            |ctx| {
-                                show_window(ctx, id, &view, &mut state, DialogKeys::default());
-                            },
-                        );
+                        let _ = ctx
+                            .run_pass(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    show_window(ctx, id, &view, &mut state, DialogKeys::default());
+                                },
+                            )
+                            .drop_without_applying_deltas();
                     }
                     let (heading, accept, accept_hit, cancel, cancel_hit, actual) = ctx
                         .data(|data| {
@@ -1467,25 +1533,27 @@ mod row_tests {
                             egui::vec2(width / scale, height / scale),
                         );
                         for _ in 0..5 {
-                            let _ = ctx.run(
-                                egui::RawInput {
-                                    screen_rect: Some(screen),
-                                    ..Default::default()
-                                },
-                                |ctx| {
-                                    show_window(
-                                        ctx,
-                                        egui::Id::new("footer_geometry_window"),
-                                        &view,
-                                        &mut state,
-                                        DialogKeys::default(),
-                                    );
-                                },
-                            );
+                            let _ = ctx
+                                .run_pass(
+                                    egui::RawInput {
+                                        screen_rect: Some(screen),
+                                        ..Default::default()
+                                    },
+                                    |ctx| {
+                                        show_window(
+                                            ctx,
+                                            egui::Id::unique("footer_geometry_window"),
+                                            &view,
+                                            &mut state,
+                                            DialogKeys::default(),
+                                        );
+                                    },
+                                )
+                                .drop_without_applying_deltas();
                         }
                         let geometry = ctx
                             .data(|data| {
-                                data.get_temp::<EditorGeometry>(egui::Id::new(
+                                data.get_temp::<EditorGeometry>(egui::Id::unique(
                                     "composition_editor_geometry",
                                 ))
                             })
@@ -1515,33 +1583,112 @@ mod row_tests {
     }
 
     #[test]
+    fn bounded_result_cards_share_viewport_geometry_with_companions() {
+        for scale in [1.0, 2.0] {
+            for height in [64.0, 160.0] {
+                for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                    for companion in [
+                        EditorCompanionView::Vacant,
+                        EditorCompanionView::Blank,
+                        EditorCompanionView::Cover(0),
+                    ] {
+                        let ctx = egui::Context::default();
+                        crate::ui_fonts::configure_fonts(&ctx);
+                        ctx.set_pixels_per_point(scale);
+                        let mut view = fixture(2);
+                        view.direction = direction;
+                        view.units = vec![EditorUnitView::Single {
+                            page: 1,
+                            placement: SinglePlacement::Leading,
+                            companion,
+                        }];
+                        let mut state = EditorUiState::default();
+                        for _ in 0..3 {
+                            ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(620.0, 480.0),
+                                    )),
+                                    ..Default::default()
+                                },
+                                |ui| {
+                                    egui::CentralPanel::default().show(ui, |ui| {
+                                        let layout = result_row_layout(ui, height);
+                                        if height == 160.0 {
+                                            assert_eq!(layout.thumbnail_height, PAGE_CARD_THUMB_HEIGHT);
+                                        } else {
+                                            assert!(layout.thumbnail_height < PAGE_CARD_THUMB_HEIGHT);
+                                        }
+                                        let output = unit_list(
+                                            ui,
+                                            &view,
+                                            &mut state,
+                                            height,
+                                            false,
+                                            &mut vec![],
+                                            &mut vec![],
+                                        );
+                                        assert_eq!(output.inner.len(), 1);
+                                        assert!(
+                                            output.inner_rect.contains_rect(output.inner[0].1),
+                                            "whole card and companion must fit actual viewport: scale={scale} height={height} row={:?} viewport={:?}",
+                                            output.inner[0].1, output.inner_rect,
+                                        );
+                                        ScrollLayout::from_output(&output).assert_height(
+                                            HeightExpectation::Fits,
+                                            ctx.content_rect(),
+                                            ctx.pixels_per_point(),
+                                        );
+                                    });
+                                },
+                            ).drop_without_applying_deltas();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn short_result_list_fits_without_unnecessary_scroll() {
         let ctx = egui::Context::default();
         let view = fixture(2);
         let mut state = EditorUiState::default();
         for _ in 0..3 {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(620.0, 640.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let output =
-                            unit_list(ui, &view, &mut state, 540.0, true, &mut vec![], &mut vec![]);
-                        ScrollLayout::from_output(&output).assert_height(
-                            HeightExpectation::Fits,
-                            ctx.content_rect(),
-                            ctx.pixels_per_point(),
-                        );
-                        assert_eq!(output.inner.len(), 2);
-                        assert!(output.inner[0].1.bottom() <= output.inner[1].1.top());
-                    });
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(620.0, 640.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                let output = unit_list(
+                                    ui,
+                                    &view,
+                                    &mut state,
+                                    540.0,
+                                    true,
+                                    &mut vec![],
+                                    &mut vec![],
+                                );
+                                ScrollLayout::from_output(&output).assert_height(
+                                    HeightExpectation::Fits,
+                                    ctx.content_rect(),
+                                    ctx.pixels_per_point(),
+                                );
+                                assert_eq!(output.inner.len(), 2);
+                                assert!(output.inner[0].1.bottom() <= output.inner[1].1.top());
+                            })
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
         }
     }
 
@@ -1550,14 +1697,16 @@ mod row_tests {
         for scale in [1.0, 2.0] {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(scale);
-            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            ctx.global_style_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none()
+            });
             let view = fixture(100);
             let mut state = EditorUiState::default();
             let mut previous_layout = None;
             let mut origin: Option<f32> = None;
             let mut first_indices = Vec::new();
             for frame in 0..12 {
-                let _ = ctx.run(
+                let _ = ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1570,7 +1719,7 @@ mod row_tests {
                                     unit: egui::MouseWheelUnit::Point,
                                     delta: egui::vec2(0.0, -800.0),
                                     modifiers: egui::Modifiers::NONE,
-                                },
+                                 phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown,},
                             ]
                         } else {
                             vec![]
@@ -1578,16 +1727,18 @@ mod row_tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 13.0;
-                            let pitch = result_row_height(ui) + ui.spacing().item_spacing.y;
+                            let pitch = result_row_layout(ui, 360.0).row_height + ui.spacing().item_spacing.y;
                             // egui draws from begin()'s loaded offset, and only
                             // applies this frame's wheel in end(). Output.state
                             // therefore describes the next render's offset.
-                            let rendered_offset = egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("composition_units")))
-                                .unwrap_or_default().offset.y;
+                            let scroll_id = ui.make_persistent_id(egui::IdSalt::new("composition_units"));
+                            let rendered_offset = egui::scroll_area::State::load(ctx, scroll_id)
+                                .unwrap_or_default().clamped_offset().y;
                             let output =
                                 unit_list(ui, &view, &mut state, 360.0, true, &mut vec![], &mut vec![]);
+                            assert_eq!(output.id, scroll_id, "rendered offset belongs to the real ScrollArea");
                             let layout = ScrollLayout::from_output(&output);
                             layout.assert_height(
                                 HeightExpectation::Scrolls,
@@ -1627,9 +1778,9 @@ mod row_tests {
                             if frame == 11 {
                                 assert!(layout.offset.y > previous_layout.unwrap().offset.y);
                             }
-                        });
+                        }));
                     },
-                );
+                ).drop_without_applying_deltas();
             }
             assert!(
                 first_indices.iter().any(|&index| index > 0),

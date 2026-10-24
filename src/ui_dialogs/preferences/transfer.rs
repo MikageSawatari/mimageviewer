@@ -204,7 +204,7 @@ impl App {
         let escape = !busy && self.dialog_escape_pressed(ctx);
         let mut choose_file = None;
         let mut close = false;
-        egui::Modal::new(egui::Id::new("preferences_transfer_dialog")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("preferences_transfer_dialog")).show(ctx, |ui| {
             ui.set_width(420.0);
             match transfer {
                 PreferencesTransferState::Explanation { action, feedback } => {
@@ -514,9 +514,11 @@ mod tests {
 
         app.show_settings_restore = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_settings_restore_dialog(ctx);
                     app.show_preferences_dialog(ctx);
                 },
@@ -545,6 +547,9 @@ mod tests {
             target_db.load_into_settings().unwrap().ui_theme,
             UiTheme::Light
         );
+        // The worker can finish in the first invisible sizing pass of the newly opened Window.
+        // Finish its requested UI work before querying the real, visible confirmation control.
+        harness.run();
         harness.get_by_label("  OK  ").click();
         harness.run();
         assert!(!harness.state().show_preferences);
@@ -628,9 +633,11 @@ mod tests {
         .unwrap();
         app.show_settings_restore = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_settings_restore_dialog(ctx);
                     app.show_preferences_dialog(ctx);
                 },
@@ -654,6 +661,9 @@ mod tests {
             crate::settings::UiTheme::Light
         );
 
+        // The worker can finish in the first invisible sizing pass of the newly opened Window.
+        // Finish its requested UI work before querying the real, visible confirmation control.
+        harness.run();
         harness.get_by_label("  OK  ").click();
         harness.run();
         assert!(!harness.state().show_preferences);
@@ -675,9 +685,11 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.show_settings_restore = true;
         crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_settings_restore_dialog(ctx);
                     app.show_preferences_dialog(ctx);
                 },
@@ -698,9 +710,11 @@ mod tests {
                 app.open_preferences_page(PreferencesPage::General);
             }
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1200.0, 900.0))
-                .build_state(
-                    |ctx, app| {
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
                         app.show_settings_restore_dialog(ctx);
                         app.show_preferences_dialog(ctx);
                     },
@@ -789,9 +803,11 @@ mod tests {
             _ => panic!("import must terminate with a notification"),
         }
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_preferences_dialog(ctx);
                     app.show_settings_restore_dialog(ctx);
                 },
@@ -850,9 +866,11 @@ mod tests {
             app.show_operation_customize = true;
             app.open_settings_restore_dialog();
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1200.0, 950.0))
-                .build_state(
-                    |ctx, app| {
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
                         // App::update draws these dialogs in this order.
                         app.show_preferences_dialog(ctx);
                         app.show_operation_customize_dialog(ctx);
@@ -955,9 +973,11 @@ mod tests {
         let before = serde_json::to_value(&state.settings).unwrap();
         let generation = crate::settings::save_generation();
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_preferences_dialog(ctx);
                     app.show_settings_restore_dialog(ctx);
                 },
@@ -1194,6 +1214,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn preferences_transfer_explanation_ime_enter_escape_does_not_select_or_close() {
         let mut app = crate::app::setup_app_for_test();
         app.show_settings_restore = true;
@@ -1201,23 +1225,28 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&ctx);
         for key in [egui::Key::Enter, egui::Key::Escape] {
-            let _ = ctx.run(
-                egui::RawInput {
-                    events: vec![
-                        egui::Event::Ime(egui::ImeEvent::Enabled),
-                        egui::Event::Ime(egui::ImeEvent::Preedit("移行".into())),
-                        egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                    ..Default::default()
-                },
-                |ctx| app.show_settings_restore_dialog(ctx),
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        events: vec![
+                            egui::Event::Ime(egui::ImeEvent::Enabled),
+                            egui::Event::Ime(egui::ImeEvent::Preedit {
+                                text: "移行".into(),
+                                active_range_chars: None,
+                            }),
+                            egui::Event::Key {
+                                key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| app.show_settings_restore_dialog(ctx),
+                )
+                .drop_without_applying_deltas();
             assert!(matches!(
                 app.settings_restore_state.preferences_transfer.as_deref(),
                 Some(PreferencesTransferState::Explanation { .. })
@@ -1248,16 +1277,18 @@ mod tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1700.0, 500.0))
-                .build_state(
-                    move |ctx, app| {
+                .build_ui_state(
+                    move |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
                         if !fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             fonts_ready = true;
                             ctx.request_repaint();
                             return;
                         }
-                        app.render_menubar(ctx);
-                        app.render_toolbar(ctx);
+                        app.note_main_chrome_pointer_block_transition(ctx);
+                        app.render_menubar(root_ui);
+                        app.render_toolbar(root_ui);
                         app.show_settings_restore_dialog(ctx);
                     },
                     app,
@@ -1285,6 +1316,10 @@ mod tests {
             assert_eq!(
                 harness.state().modal_dialog_block_reason(),
                 Some("settings_restore")
+            );
+            assert!(
+                harness.query_by_label(&label).is_none(),
+                "modal admission closes the already open settings menu"
             );
             // Click the actual menu header and toolbar through the production
             // preferences modal, with no transfer-specific guards in either handler.
@@ -1323,6 +1358,11 @@ mod tests {
             harness.get_by_label("評価↓").click();
             harness.run();
             assert_eq!(harness.state().settings.sort_order, SortOrder::RatingDesc);
+            // Production sanitizes pointer input during hydration; this harness must settle it first.
+            harness
+                .state_mut()
+                .finish_page_identity_preparation_for_test();
+            harness.run();
             harness.hover_at(menu_header_pos);
             for pressed in [true, false] {
                 harness.event(egui::Event::PointerButton {

@@ -264,6 +264,7 @@ macro_rules! preferences_policy {
 preferences_policy! {
     export {
         ui_theme: UiTheme => ("テーマ", |v, _raw| matches!(v, UiTheme::System | UiTheme::Light | UiTheme::Dark), plain, plain);
+        notification_duration: NotificationDuration => ("通知の表示時間", |v, _raw| !matches!(v, NotificationDuration::Unknown), plain, plain);
         preferences_restore_position: bool => ("環境設定の前回位置を復元", |_, _| true, plain, plain);
         text_contrast: TextContrast => ("文字コントラスト", |v, _raw| matches!(v, TextContrast::Standard | TextContrast::Strong), plain, plain);
         raw_brightness: crate::raw::RawBrightness => ("RAW の明るさ", |v, _raw| matches!(v, crate::raw::RawBrightness::MatchPreview | crate::raw::RawBrightness::None), plain, plain);
@@ -359,6 +360,7 @@ preferences_policy! {
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
         fullscreen_side_panel_mode: FsSidePanelMode => ("閲覧表示の左右パネル", |v, _raw| FsSidePanelMode::all().contains(v), plain, plain);
         fullscreen_chrome_suppression: FullscreenChromeSuppression => ("全画面中の固定表示の一時抑制", |_, _| true, plain, plain);
+        fullscreen_manual_nav_wrap: bool => ("閲覧表示の手動前後移動ループ", |_, _| true, plain, plain);
         fullscreen_boundary_notice_visible: bool => ("閲覧表示の境界通知", |_, _| true, plain, plain);
         fullscreen_processing_status_visible: bool => ("閲覧表示の処理状況", |_, _| true, plain, plain);
         fullscreen_prefetch_status_visible: bool => ("閲覧表示の先読み状況", |_, _| true, plain, plain);
@@ -711,6 +713,7 @@ preferences_policy! {
         video_in_window_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_window_placement => "runtime overlay / PC のウィンドウ配置";
+        detached_viewer_window_physical_placement => "runtime overlay / PC のウィンドウ配置";
         vst3_enabled => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugins => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugin_path => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
@@ -724,6 +727,7 @@ preferences_policy! {
         audio_normalize_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         audio_normalize_target_lufs_milli => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         last_seen_version => "初回/学習/通知/保存版の内部記録";
+        whats_new_acknowledged_version => "初回/学習/通知/保存版の内部記録";
     }
 }
 
@@ -972,6 +976,7 @@ mod tests {
         settings.fullfeature_media_window = !settings.fullfeature_media_window;
         settings.restore_last_cursor = !settings.restore_last_cursor;
         settings.preferences_restore_position = !settings.preferences_restore_position;
+        settings.notification_duration = NotificationDuration::Long;
         settings.startup_window_state = different_enum(
             &settings.startup_window_state,
             &[
@@ -1236,6 +1241,7 @@ mod tests {
             &[FsSidePanelMode::Hover, FsSidePanelMode::ClickToShow],
         );
         settings.fullscreen_boundary_notice_visible = !settings.fullscreen_boundary_notice_visible;
+        settings.fullscreen_manual_nav_wrap = !settings.fullscreen_manual_nav_wrap;
         settings.fullscreen_processing_status_visible =
             !settings.fullscreen_processing_status_visible;
         settings.fullscreen_prefetch_status_visible = !settings.fullscreen_prefetch_status_visible;
@@ -1911,20 +1917,20 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 461);
+        assert_eq!(entries.len(), 465);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            146
+            148
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            315
+            317
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1934,7 +1940,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 144);
+        assert_eq!(wire.len(), 146);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2061,6 +2067,39 @@ mod tests {
             assert_eq!(parsed.issues.len(), 1);
             parsed.apply_to(&mut destination);
             assert_eq!(destination.preferences_restore_position, enabled);
+        }
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_transfer_roundtrip_missing_and_invalid_values() {
+        for enabled in [false, true] {
+            let source = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                fullscreen_manual_nav_wrap: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let parsed =
+                    parse_preferences(&document(json!({"fullscreen_manual_nav_wrap": invalid})))
+                        .unwrap();
+                assert_eq!(parsed.issues.len(), 1);
+                parsed.apply_to(&mut destination);
+                assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            }
         }
     }
 
@@ -2360,6 +2399,67 @@ mod tests {
         let report = parsed.apply_to(&mut destination);
         assert_eq!(report.issues.len(), 1);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
+        assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn detached_placement_transfer_excludes_both_formats_and_keeps_destination() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+        use crate::settings::DetachedViewerWindowPlacement;
+
+        let source = Settings {
+            detached_viewer_window_placement: Some(DetachedViewerWindowPlacement {
+                x: 4000.0,
+                y: 100.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            }),
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: 6000,
+                    top: 150,
+                    right: 7440,
+                    bottom: 1230,
+                },
+                maximized: true,
+            }),
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+        for key in [
+            "detached_viewer_window_placement",
+            "detached_viewer_window_physical_placement",
+        ] {
+            assert!(document["preferences"].get(key).is_none(), "{key}");
+            document["preferences"][key] = serde_json::to_value(&source).unwrap()[key].clone();
+        }
+        let mut destination = Settings {
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: -1920,
+                    top: 0,
+                    right: -960,
+                    bottom: 720,
+                },
+                maximized: false,
+            }),
+            ..Settings::default()
+        };
+        let before = destination.clone();
+        let report = parse_preferences(&document.to_string())
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(report.unknown_count, 2);
+        assert_eq!(
+            destination.detached_viewer_window_placement,
+            before.detached_viewer_window_placement
+        );
+        assert_eq!(
+            destination.detached_viewer_window_physical_placement,
+            before.detached_viewer_window_physical_placement
+        );
         assert_excluded_unchanged(&before, &destination);
     }
 

@@ -8,18 +8,18 @@
 //!     └─ data[1] = subresource index (intptr)
 //!         │
 //!         ▼
-//!  ID3D11VideoProcessor (BT.601/709 → RGBA, bicubic)
-//!         │ output: NT-shared ID3D11Texture2D (RGBA8 / RGBA16F) + 共有 fence
+//!  ID3D11VideoProcessor (BT.601/709 → BGRA8, bicubic) → intermediate RT (NT/KM なし)
+//!         │ CopyResource → NT-shared ID3D11Texture2D (BGRA8 pool slot) + 共有 fence
 //!         ▼
-//!  decoder thread → UI thread (channel 経由)
+//!  decoder thread → native render thread (channel 経由)
 //!         ▼
-//!  NativeRenderCore が `OpenSharedHandle` で取得 → 自身の swap chain backbuffer に copy
+//!  NativeRenderCore が `OpenSharedResource1` で取得 → 自身の swap chain backbuffer に描画
 //! ```
 //!
 //! HW デコードできない場合 (= GpuVideoDevice 未作成 / D3D11VA 失敗) は
 //! `decoder.rs` 内で SW デコード + swscale を走らせ、`VideoFrameData::Cpu` 形式で
-//! native presenter に渡される (= native presenter 側で `UpdateSubresource` で
-//! バックバッファに upload)。
+//! native presenter に渡される (= native presenter 側で GPU texture に
+//! upload して描画)。
 //!
 //! ## なぜ複雑なことをするか
 //! 4K HEVC 動画を 30fps でカクつかず再生するには、1 フレームあたりの
@@ -27,16 +27,16 @@
 //! HW デコード自体は 1-2ms / frame だが、`av_hwframe_transfer_data` (GPU→CPU)
 //! と CPU 上の `swscale` (NV12→RGBA) と CPU→GPU upload で合計 36-50ms 食って
 //! 予算を超過する (perf log 実測)。CPU readback を完全に省くには D3D11 video
-//! processor で直接 NT 共有テクスチャに書き込み、native presenter の D3D11 device で
-//! `OpenSharedHandle` するのが最速。
+//! processor の intermediate 出力を NT 共有テクスチャへ GPU copy し、native presenter の
+//! D3D11 device で `OpenSharedResource1` すれば、CPU を経由せずに受け渡せる。
 //!
 //! ## ライフタイム
 //! - `GpuVideoDevice` 1 個 / アプリ寿命。Drop で全 D3D11 リソース解放。
-//! - 出力テクスチャは毎フレーム新規作成、`D3d11Frame` が NT shared HANDLE の close を
-//!   `Drop` で行う (= UI が描画中の HANDLE が close される race を防ぐ)。
+//! - 出力テクスチャは pool slot を再利用。`D3d11Frame::Drop` は slot の使用権を返し、
+//!   pool から借りた HANDLE は閉じず、フレーム所有の HANDLE だけを close する。
 //! - decoder thread の書き込み完了 → native presenter の sample の同期は
-//!   **D3D11 共有 fence** で行う (`ID3D11Fence::Signal` → 受信側の
-//!   `ID3D11DeviceContext4::Wait`)。
+//!   **D3D11 共有 fence** で行う (`ID3D11DeviceContext4::Signal` → 受信側の
+//!   `ID3D11DeviceContext4::Wait`)。共有 slot の排他は keyed mutex で行う。
 
 #![cfg(windows)]
 

@@ -206,7 +206,7 @@ impl App {
 
         let Some(slot) = self.settings.vst3_chain_slots.slots[slot_idx].clone() else {
             let key_label = crate::adjustment::slot_key_label(slot_idx);
-            self.show_feedback_toast(format!("[VST3 Slot {key_label} は空です]"));
+            self.show_feedback_warning(format!("[VST3 Slot {key_label} は空です]"));
             return;
         };
 

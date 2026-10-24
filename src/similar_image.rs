@@ -111,6 +111,7 @@ pub enum DecodeMethod {
     TurboJpegDct,
     Image,
     Wic,
+    Libavif,
     Susie,
     Raster,
     RawPreview,
@@ -123,6 +124,7 @@ impl DecodeMethod {
             Self::TurboJpegDct => "turbojpeg_dct",
             Self::Image => "image_full",
             Self::Wic => "wic_full",
+            Self::Libavif => "libavif_full",
             Self::Susie => "susie_full",
             Self::Raster => "raster",
             Self::RawPreview => "libraw_preview",
@@ -329,59 +331,64 @@ fn decode_full(
     prefix_note: Option<String>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<CanonicalProxy, ProxyError> {
-    let (image, method, fallback_note) = match image::load_from_memory(bytes) {
-        Ok(image) => (image, DecodeMethod::Image, None),
-        Err(primary) => {
-            if is_cancelled(cancel) {
-                return Err(ProxyError::Cancelled);
-            }
-            let wic = file_path
-                .and_then(crate::wic_decoder::decode_to_dynamic_image)
-                .or_else(|| {
-                    crate::wic_decoder::decode_to_dynamic_image_from_bytes(
-                        bytes,
-                        Path::new(filename_hint)
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .unwrap_or(""),
-                    )
-                });
-            if let Some(image) = wic {
-                (
-                    image,
-                    DecodeMethod::Wic,
-                    Some(format!("image crate failed: {primary}")),
-                )
-            } else {
-                if is_cancelled(cancel) {
-                    return Err(ProxyError::Cancelled);
-                }
-                let susie = match file_path {
-                    Some(path) => crate::susie_loader::decode_file(path, false, cancel.cloned()),
-                    None => crate::susie_loader::decode_bytes(
-                        filename_hint,
-                        bytes,
-                        false,
-                        cancel.cloned(),
-                    ),
-                };
-                match susie {
-                    Ok(image) => (
-                        image,
-                        DecodeMethod::Susie,
-                        Some(format!("image crate failed: {primary}; WIC failed")),
-                    ),
-                    Err(susie) => {
-                        return Err(ProxyError::Decode(format!(
-                            "{filename_hint}: image crate failed ({primary}); WIC failed; Susie failed ({susie})"
-                        )));
-                    }
-                }
-            }
-        }
+    let source = crate::image_decode::Source::Bytes {
+        bytes,
+        hint: filename_hint,
     };
-    // File / ZIP の区別で向きが変わらないよう、どちらも同じ source bytes を読む。
-    let image = apply_exif_orientation_from_bytes(image, bytes);
+    struct VerifiedFileBackend<'a>(Option<&'a Path>);
+    impl crate::image_decode::Backend for VerifiedFileBackend<'_> {
+        fn avif(
+            &self,
+            source: crate::image_decode::Source<'_>,
+            workload: crate::avif_decoder::Workload,
+            budget: Option<u64>,
+        ) -> Result<DynamicImage, crate::avif_decoder::Error> {
+            crate::image_decode::Backend::avif(
+                &crate::image_decode::System,
+                source,
+                workload,
+                budget,
+            )
+        }
+        fn wic(
+            &self,
+            source: crate::image_decode::Source<'_>,
+            budget: Option<u64>,
+        ) -> Option<DynamicImage> {
+            self.0
+                .and_then(|path| {
+                    crate::image_decode::Backend::wic(
+                        &crate::image_decode::System,
+                        crate::image_decode::Source::Path(path),
+                        budget,
+                    )
+                })
+                .or_else(|| {
+                    crate::image_decode::Backend::wic(&crate::image_decode::System, source, budget)
+                })
+        }
+    }
+    let mut fallback_note = None;
+    let decoded = crate::image_decode::primary_with_backend(
+        source, crate::avif_decoder::Workload::Background, None, cancel.map(Arc::as_ref),
+        || image::load_from_memory(bytes), &VerifiedFileBackend(file_path),
+    ).or_else(|primary| {
+        if is_cancelled(cancel) { return Err(ProxyError::Cancelled); }
+        let susie_source = file_path.map_or(source, crate::image_decode::Source::Path);
+        fallback_note = Some(format!("image crate failed: {primary}; WIC failed"));
+        crate::image_decode::susie(susie_source, false, cancel.cloned())
+            .map_err(|susie| ProxyError::Decode(format!("{filename_hint}: image crate failed ({primary}); WIC failed; Susie failed ({susie})")))
+    })?;
+    if is_cancelled(cancel) {
+        return Err(ProxyError::Cancelled);
+    }
+    let method = match decoded.decoder {
+        crate::stats::DecodeSource::Libavif => DecodeMethod::Libavif,
+        crate::stats::DecodeSource::Wic => DecodeMethod::Wic,
+        crate::stats::DecodeSource::Susie => DecodeMethod::Susie,
+        _ => DecodeMethod::Image,
+    };
+    let image = decoded.oriented(source);
     let source_dims = image.dimensions();
     let note = match (prefix_note, fallback_note) {
         (Some(prefix), Some(fallback)) => Some(format!("{prefix}; {fallback}")),

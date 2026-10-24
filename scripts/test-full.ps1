@@ -3,6 +3,10 @@
 # The pack-build-tools feature exposes only the two development helper binaries
 # that contain unit tests. Other development binaries remain outside the test
 # graph, while every selected target shares one mimageviewer library build.
+# This is a noninteractive gate: the live eframe run_native test is #[ignore].
+# Headless unit tests with message-only/hidden HWNDs or fake input stay enabled.
+# Run only the approved live suite via scripts/test-live-windows.ps1 separately;
+# record unperformed live checks as NOT RUN, never as an automated-gate PASS.
 
 [CmdletBinding()]
 param(
@@ -85,10 +89,10 @@ public static class MivTestErrorMode
         if ($gateExit -eq 0) {
             # vendor/egui-winit is workspace-excluded. Exercise IME key routing and
             # trace regressions without a filter, including future tests.
-            # Select the patched dependency from the root graph, keeping its
-            # versions aligned with the application and the offline cache.
-            Write-Host '[test-full] cargo nextest run -p egui-winit --lib'
-            & cargo nextest run -p egui-winit --lib @nextestArgs
+            # Cargo requires this excluded package's standalone graph for its
+            # dev-dependencies; its patches point at the formal vendor crates.
+            Write-Host '[test-full] cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib'
+            & cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib @nextestArgs
             $gateExit = $LASTEXITCODE
         }
 
@@ -103,9 +107,18 @@ public static class MivTestErrorMode
 
         if ($gateExit -eq 0) {
             # vendor/eframe is workspace-excluded for the same reason. Keep this unfiltered so every
-            # scheduler and Windows process regression added to the vendored event-loop fork runs.
-            Write-Host '[test-full] cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib'
-            & cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib @nextestArgs
+            # nonignored pure scheduler regression in the vendored event-loop fork runs.
+            # The real-window process test remains ignored (separate approved live entry).
+            Write-Host '[test-full] cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib'
+            & cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib @nextestArgs
+            $gateExit = $LASTEXITCODE
+        }
+
+        if ($gateExit -eq 0) {
+            # Keep the second native backend's lifecycle/output contracts in the
+            # automated graph; real-window tests remain ignored as above.
+            Write-Host '[test-full] cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,glow --lib'
+            & cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,glow --lib @nextestArgs
             $gateExit = $LASTEXITCODE
         }
 

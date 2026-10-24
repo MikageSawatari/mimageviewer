@@ -614,3 +614,38 @@ fn album_art_decoder_cancel_never_saves_negative_cache() {
     assert!(matches!(result, Err(AudioThumbnailError::Canceled)));
     assert!(matches!(cached(&path, &options), AudioArtCached::Miss));
 }
+
+#[cfg(windows)]
+#[test]
+fn avif_corrupt_sidecar_falls_back_to_valid_mp3_apic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("song.mp3");
+    let sidecar = tmp.path().join("song.avif");
+    let red = png(RED, 3, 2);
+    std::fs::write(&path, mp3(&[(&red, 3)])).unwrap();
+    // Both malformed fixtures fail native/WIC/Susie; neither is an I/O failure.
+    let options = with_sidecar_decoder(options(&tmp.path().join("cache"), CachePolicy::Off));
+    for fixture in ["truncated", "not_avif"] {
+        std::fs::copy(crate::avif_decoder::tests::fixture(fixture), &sidecar).unwrap();
+        let error = crate::thumb_loader::decode_image_for_thumb_with_dims(
+            &sidecar,
+            32,
+            options.raw_executor.as_ref().unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, crate::raw::RawError::Corrupt(_)),
+            "{error:?}"
+        );
+        let pixels = generate_pixels(
+            &path,
+            Some(&sidecar),
+            &options,
+            LoadSourcePolicy::SourceOnly,
+        )
+        .unwrap();
+        assert_color(&pixels, RED);
+        assert_eq!(pixels.source_dims, (3, 2));
+    }
+    assert!(!catalog_path(&path, &options).exists());
+}

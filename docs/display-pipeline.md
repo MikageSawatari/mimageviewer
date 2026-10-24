@@ -110,6 +110,23 @@ PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに�
 GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
 [詳細](pdf-render-epoch-ownership-plan.md)。
 
+2026-10-18 D3-2: ON/paged の現在 unit の受理後だけ、通常 fullscreen work から次 unit の
+一般 final を CPU 先回り準備する。入力は既存 CPU pixels のみで、新しい編集 materialization や I/O は行わない。
+共有 final executor と同じ Triangle 表示 clamp を worker 上で実行し、正本/表示用 Arc を同じ pending の CpuReady に保持する。
+登録は共通投機枠と実 options の VRAM admission を使う。表示要求は CpuReady を通常登録へ引き取り、
+同期可能な未完成仕事は公開権を外して同期 takeover する。カラー化/LUT 待ちは同 worker を表示へ昇格する。
+無補正 source 共有、初回/OFF の同 pass 完成、保持 presentation と canonical receipt は維持する。
+
+2026-10-18 D3-1: final-effect の受信と採用を表示 decision から分離した。
+各入力・描画・permission continuation・実表示再開の入口で、確定済み失効の後に
+保持 presentation の accepted receipt、final 結果の exact 再照合・採用、通常 selector の順で処理する。
+通常 source の selector 照合が必要な receipt は採用後へ残す。受信は非 blocking・再入可能で、
+公開時は当該 viewport の decision cache だけを失効する。一般画像の exact complete final も
+edit texture 確保前に再利用する。通常同期 miss、無補正 handle 共有、D2 素材、D4 時計は維持する。
+この D3-1 段階では次 unit を通常 composition の実 occurrence/role から観測するだけだった。
+現在は上記 D3-2 と下記 D3-4 の条件を満たす場合だけ先回り準備へ接続する。
+slideshow の still-only unit 計算は表示 cache を置換しない。詳細・検証は page-turn 計画 §27.17.12。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
@@ -138,7 +155,7 @@ hideのCPU画像解放も同ownerのdiscardを通す。[寿命計画と検証](t
 
 ```
 Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, origin, rendered_at_px,
-                                                           source_dims, layout_dims }
+                                                           source_dims, layout_dims, source_coverage }
                                                        │
                                            (keep_range 外に出ると)
                                                        ▼
@@ -154,9 +171,11 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 cache由来かどうかはoriginから導出し、独立した`from_cache`状態は保持しない。
 画像なしのfinalized/cancel/errorはLoaded画像のoriginを更新しない。
 
-`Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）と PDF の `layout_dims` を
-per-context の `PageDimsCache` の別 map に記録する。`source_dims` は常にピクセル座標、
-`layout_dims` は PDF page box の 1/1000 point であり、単位を混ぜない。`Evicted` は GPU texture
+`Loaded` へ遷移した時点で、全体のピクセル寸法と PDF の `layout_dims` を
+per-context の `PageDimsCache` の別 map に記録する。部分編集 preview の全体寸法は
+`source_coverage` の生成由来から取り、crop 後 `source_dims` は一覧の比率に残す。
+通常素材は従来の `source_dims`（無ければロード済み画像寸法）を使う。
+`layout_dims` は PDF page box の 1/1000 point であり、ピクセル寸法と単位を混ぜない。`Evicted` は GPU texture
 だけを破棄し、同じ `items_generation` で判明済みの両寸法は残す。idx 空間が変わるときだけ
 `invalidate_idx_state_and_queues` で clear し、cache 自身の generation 不一致も `None` へ
 fail-closed する。
@@ -185,6 +204,8 @@ bookmark title plateも実描画の矩形を返す。右クリック／右ドラ
 押下のCell／Background所属は既存pairing ownerの型で持ち、永続hit cacheや別の背景ownerを作らない。
 native D&Dはその押下時の所属を使い、読込み完了後の矩形で押下点を再判定しない。
 小さいセルでplateからはみ出すcaption・理由・アイコンも、描いた領域のセル／一覧clip内を項目として返す。
+代表画像のないフォルダ・ドライブ・ZIP内directoryは、アイコン周囲も描画ownerの`inner`全体を項目にする。
+代表画像ありのletterbox、セル外周4pt、実際の空き領域の背景判定は維持する（§1.399）。
 媒体別の境界・実描画順の検証は[決定仕様](grid-background-double-click-plan.md#描画領域とセル種類)を参照。
 
 ### 1.2 2 フェーズ優先ロード
@@ -263,7 +284,7 @@ egui pass を続けても `SurfaceAbsent` となり screenshot と表示更新�
    └─ ミス or `SourceOnly`:
         ├─ ソースデコード (RAW=LibRaw preview、必要なら executor で half 現像,
         │                   JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
-        │                   HEIC/AVIF/JXL=WIC, PDF=PDFium ワーカー)
+        │                   AVIF=libavif→WIC、HEIC/JXL=WIC, PDF=PDFium ワーカー)
         ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes。RAW は LibRaw の
         │                   flip 適用済み、PDF は対象外)
         ├─ Lanczos3 で display_px までリサイズ
@@ -284,6 +305,47 @@ crop を実切り出しする。最大辺 2048px の下地は WebP q=90、透明
 lossless WebP として分離保存する。保存先は `<data_dir>/edit_preview_cache/`、対応表と LRU は
 `<data_dir>/edit_preview_cache.db` に保持し、crop 後の縦横寸法を一覧のアスペクト比として使う。
 元画像と各編集 DB は変更しない。
+
+§1.165 B1（2026-10-21、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）では、生成時の収録範囲を
+`source_coverage::EditPreviewGeometry` として preview 自身へ持たせる。座標空間は EXIF 適用後、
+保存回転・自由回転前。`coordinate_dims` は正規ページ座標の元寸法、`raster_dims` は実際に
+切り出す直前の raster 寸法、`pixel_bounds` はその raster に対する `CropRect::pixel_bounds`
+の整数結果（min=floor、max=ceil）である。8192 clamp／PDF 再レンダ後の raster、crop 設定の
+authoring 寸法、PDF page-box のレイアウト単位を正規ページ寸法へ読み替えない。
+下地と Normal／Multiply 注釈には同一境界を適用し、crop 後の一覧寸法と生成由来を別に保持する。
+
+既存の released v6 DB は `CACHE_FORMAT_VERSION=6` を維持し、nullable な
+`source_coverage_json` と独立の `layout_dims_json`、生成物への束縛を示す
+`metadata_content_hash` を加法 migration で追加する。
+この追加で既存行や WebP を削除しない。
+新生成は crop の有無にかかわらず `SourceCoverage::Known(geometry)` とし、WebP の参照と
+同じ upsert で geometry と既知の layout 寸法を保存する。content hash にも由来を含め、同じ画素内容でも
+元画像内の位置が異なる素材を区別する。旧行の NULL は `Unknown` のまま一覧で利用し、
+次の通常生成で metadata が埋まる。
+metadata は下地／注釈と geometry／layout を含む生成物の content hash に束縛し、
+`cached_path` の WebP basename に含まれる hash と照合する。旧 writer の実 UPSERT は新列を
+更新しないため、束縛が NULL／不一致なら coverage を `Unknown`、layout を `None` として
+画像自体は利用する。同寸法の上書きでも古い由来を新しい素材へ適用しない。
+hash の basename で照合するので、同一生成物の content-copy は由来を維持する。
+束縛が一致した非 NULL の coverage／layout JSON が壊れている場合や寸法・境界が不正な場合は
+ログを残してその preview の load を失敗させ、旧行扱いへの読み替えや行・WebP の削除はしない。
+
+PDF の既知 page-box 寸法は `EditPreviewData.layout_dims` として coverage と別に保存・復元する。
+保存要求は既存の page-box cache 値を渡し、通常画像と旧行は `None` のまま扱う。
+preview hit の早期 return でも worker はこの値を thumbnail payload へ継承するため、layout を
+整数 raster 比から再計算せず、preview 利用のための追加 PDF IPC／待機も発生させない。
+
+coverage は「その素材が収録する範囲」であり、現在の crop DB／メモリ値から再構成しない。
+crop A→B の保存後・非同期 Delete 前や、保存済み crop と未保存の生成入力が違う場合にも、
+読み込んだ preview は自身の生成時点を示す。`Unknown` の表示可否は
+`App::resolve_preview_coverage_for_display` 一か所で決める（現方針の純粋な判定は
+`SourceCoverage::resolve_for_display`）。入口は owning App／idx／素材を受け取るため、将来推測方針を
+採る場合もその入口の実装だけで切り替え、各 consumer の変更や同期 I/O を必要としない。現在 crop ありなら typed reason
+`UnknownWithCurrentCrop` で fullscreen／通過表示／animation の代役から除外し、現在 crop
+なしなら互換方針として `FullSource` を返す。これは一覧の旧 preview 利用を止める判定ではない。
+worker受理では、この現在cropによる利用許可を寸法descriptorへ固定しない。crop中にUnknownを
+受理しても、後でcropを解除すれば同じ素材を既存の互換方針で利用できる。
+
 読み込み worker は保存サイズを品質原本として残したまま、現在の `display_px` へ下地と
 全注釈レイヤーを Lanczos3 で同一寸法へ縮小してから合成する。UI / GPU には表示寸法の
 画像だけを渡し、ページ数ベースの eviction と共有 VRAM 会計を実際のテクスチャ寸法に一致させる。
@@ -654,6 +716,121 @@ visible-pages painter を使う。general keepalive / embedded deferred の canv
 ある場合だけ現在の余白色にし、unit の無い media transition は egui 側の黒を保つ。native 動画の
 letterbox canvas は別の DComp owner が現在の余白色を描き、音声系だけ黒を保つ。
 
+#### 2.1.1 crop 済み代役の全体寸法と収録範囲（§1.165 B1、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）
+
+一覧のアスペクト比は従来どおり crop 後の `source_dims` を使う。部分編集 preview のページ構成
+（見開き・横長分割）と注釈座標には crop 前の正準座標寸法を供給する。
+100%表示の基準は独立した `DisplayOriginalDimensions` で表す。通常完成素材は選択中の実
+texture 寸法（GPU clamp 後／AI 適用後）、部分代役は生成時の crop 前 `raster_dims` を使う。
+正準20000×15000／GPU raster8192×6144の場合も、代役と本画像の100%は8192×6144で一致する。
+`SourceCoverage::is_partial()` は実画素境界から派生させ、収録範囲が
+全体の素材（新生成 no-crop Known を含む）の単ページの従来 Original／thumbnail sizing は維持する。
+`poll_thumbnails` の寸法記録と Loaded を直接参照する fallback の双方でこの区別を保ち、
+texture 退去後も `PageDimsCache` に crop 後寸法を再登録しない。PDF page-box、RAW の許可 gate、
+processed の縦横比変更、指定方式の既存 A/O 基準は、それぞれの既存の意味を維持する。
+
+`SourceCoverage` は `ThumbnailState::Loaded`／CPU 下地から通常の
+`FullscreenPaintResource`、prepare 後の `FullscreenPresentationResource`、paint payload へ
+素材と一緒に継承する。coverage を idx 別の追加 map や `content_bbox` へ置かない。
+`content_bbox`／左右分割は表示要求であり、coverage は自由回転時も失われない素材の由来である。
+単ページ・見開き左右・連結読みは全画像 transform を先に解き、その全体枠へ部分素材だけを配置する。
+見開き gap や連結読みの extent を、crop 後 quad の外接矩形で縮めない。
+見開き全体の左右寸法と100%基準は `fs_spread_page_layout_size`／`fs_spread_fit_input` の
+供給境界で選ぶ。通常完成素材は7474e5cf1の実texture基準、部分代役は切り出し前raster、
+通常thumbnailはページ全体を代表するGPU raster寸法で構成する。後者の8192 clamp計算は
+実producerの `gpu_raster_dimensions` と共有し、UIで元画像を読み直さない。
+これはcropなしの読込中代役にも適用する、設計担当が受け入れた仕様差である。
+7474e5cf1ではOriginal見開きの代役をthumbnail実寸（例:150×200）で表示し、本画像
+（例:600×800）の到着時に拡大していた。現在は代役もページ全体のraster寸法の枠へ置き、
+到着時に大きさが跳ばないようにする。7474e5cf1と同じ倍率契約へ戻した範囲は完成素材であり、
+読込中の代役まで完全に同じ表示へ戻したものではない。
+指定方式は通常rasterのAI前A/Oを単ページ・見開き・連結読みで共通に解決する。
+RAWのdeveloped寸法、PDF page-box、他4方式の連結読みのsource基準は維持する。
+通過renditionも部分素材なら同じ切り出し前rasterを使い、全面renditionの従来source基準は維持する。
+各ページ内の通常素材の contain／物理 pixel snapping は既存の規則を維持する。
+正準寸法とGPU clamp後寸法が異なる場合も、注釈・source座標を100%表示寸法で上書きしない。
+
+`MaterialDisplayBasis` が素材の不変な寸法契約を所有する。thumbnailはworker受理時のsource寸法と
+生成coverage、sourceは自身のmetadata、派生素材は実際に選択した入力ownerから値を受け取る。
+Single／Spread／Continuousの旧4方式と指定A/Oは、この一つのdescriptorからの名前付き射影とする。
+producer selectorは `FullscreenPaintResource` を返し、handle getterはその射影に限定する。
+frame stateの通常素材・thumbnail／通過代役、Native不採用時の描画fallbackもResourceとして受け渡す。
+描画入口でbare handleをLoadedと照合し直す処理は置かない。
+保持presentationの選択は別に `FullscreenPaintPayload` を返し、NormalResourceもPresentationMaterialも
+そのまま運ぶ。fit・見開き構成・指定倍率・保持・退去後の再描画でidxやtexture IDから100%を再探索しない。
+現在のfit設定・倍率制限は描画時に適用し、frozen captureだけが設定を含むfit descriptorも捕捉する。
+通常thumbnailの旧catalog行でsource寸法が無い場合は、指定倍率を含め従来の選択済みsampler契約を
+受理時に明示して保持する。描画側でsamplerや正準座標から100%を補う処理は置かない。
+不正寸法や、従来から表示に必要なPDF／RAW metadataの未確定は、互換行の寸法省略と区別する。
+RAW／PDF／連結のlegacy source-layoutは `LegacySourceLayoutBasis` にlayout単位と
+受理rasterの参照寸法を別々に持つ。単ページのaspect正規化もこの参照寸法を使い、
+cache退去後の座標寸法やsamplerへ戻らない。PDFの有効なKnown素材は全域収録でも、従来のPDF契約に従って
+coverageの全体座標寸法をlegacy参照寸法として受理し、page-box layout単位とは分離する。
+FullSource thumbnailの参照寸法は従来どおりown samplerとする。PDF thumbnailのmetadata再受理では
+page-boxと指定A/Oを更新し、同じ素材のlegacy参照寸法は保持する。
+
+受理条件の棚卸し（`76eeab77b`との比較）:
+
+| 素材 | legacy参照寸法・受理条件 |
+| --- | --- |
+| PDF Known部分収録 | coverageの全体coordinate寸法。page-box layout単位とは別に保持 |
+| PDF Known全域収録（cropなしの注釈・局所編集preview） | 部分判定をせず、同じ全体coordinate寸法を保持。Original／Page／指定倍率で本画像採用前後を比較 |
+| PDF FullSource（座標なし） | 従来のown sampler参照を維持 |
+| RAW Known | 全域／部分ともcoordinate寸法を受理。worker寸法・RawInfoも既存の受理境界で扱う |
+| 通常画像／ZIP | 全域／部分とも座標・crop前rasterを受理。残る部分判定はsampler表示／部分素材aspect等の既存の方式別契約に限る |
+
+RAWの旧catalog行に寸法が無い場合は、受理済みRawInfoのdeveloped寸法をthumbnail受理時に採用する。
+thumbnailが先に届いた場合も、RawInfo／previewの実受理境界でlive descriptorを再受理する。
+PDF／RAWでdescriptorが変わったページの依存通過素材だけを退役し、保持済みcaptureと兄弟ページは維持する。
+見開き・連結の既存layout単位はそのまま使い、物理100%の型へ統一しない。
+素材のない連結ページのlegacy placeholderは、退去後も正準layoutを保持する。これは未描画ページの
+空間だけを確保する値であり、指定倍率の物理100%基準には使わない。ページ送り受付も共通の
+fit resolverから型付きの基準欠落を受け取り、描画不能な素材をNormal入力としてpinしない。
+
+部分素材の `full_source_size_vec2` はsampling canvasを表す。fitが読む型付き100%基準は
+素材descriptorの値であり、`coordinate_dims` と混ぜない。
+`FullscreenFitInput::Raster` がOriginal／Page／Width／Heightと倍率制限の100%基準を
+capture／replay／Zへ保持する。AI完成後は従来どおり実出力textureの100%へ再配置する。
+丸め後の texture 寸法を coverage の幅・高さで個別に割って全体寸法を逆算しない。
+native resampler は別に保持する実 texel 寸法と coverage から軸別の sampling 密度を求め、
+共有 geometry が返す交差範囲と物理出力寸法を使う。細い crop の縮小丸めも全画像の aspect や
+fit／contain へ戻さず、native ROI の素材内座標への変換は準備境界だけで行う。
+
+純粋 helper `source_region_texture_quad` が描画頂点と素材 UV を一元計算する。
+coverage を C、表示要求を V とすると描画範囲は C∩V、素材 UV は `(source-C.min)/C.size`。
+native ROI がある場合は素材内 ROI を C の空間へ合成し、さらに交差させてその ROI 内 UV へ写す。
+画面位置は全画像の transform、保存回転、自由回転から求める。通常 mesh、保持素材、canonical
+animation はこの helper の結果を共有し、native の不完全 ROI を許すための条件緩和はしない。
+
+透明下地とページ枠は全画像側へ残す。ページ送りは `PageMaterial::PartialTexture` により
+紙面全体と部分素材の domain を分けて保持・投影する。coverage と表示範囲が交差しない場合も
+背景だけのページ occurrence として提示／receipt を進め、crop を理由に animation を無効にしない。
+passive detached の snapshot capture／保持／再描画、navigator、ルーペ、パノラマ navigator、
+保持素材復元も同じ resource の coverage を使い、capture 後の thumbnail 差し替えで再推定しない。
+通過 rendition は注釈を含まない CPU 下地と coverage を継承し、注釈を省略する既存契約を保つ。
+
+設計簡素化として既存 resource／presentation の所有へ由来を載せ、現在 crop と preview の
+非同期失効を同期させる追加状態・全 context reset・待機は導入しない。保存や DB のまれな失敗は
+既定の割り切り（ログ＋既存通知・単純な作り直し）とし、多段の復旧処理を足さない。
+SNS 分割パネルのプレビューも、各分割枠を全画像座標へ戻して同じ resource の mapping を使う。
+シーク用の一覧素材プレビューは従来どおり crop 後の素材として扱う。
+この節は実装契約の記録であり、完了した自動検証／実 GPU 提示／実機の成功証拠ではない。
+
+検証と未決（2026-10-22、master 取り込み `124dc4828`。経緯の全文は取り込み前の backlog §1.165 = コミット `e5c9fc951`）:
+- 独立レビュー（Codex xhigh）最終判定は受入可（`629a7d85b..a43750fb8`）。`test-lib-full.ps1` 14,070 件成功、`ui_snapshot` 195 件成功。
+- ClaudeCode の隔離環境での操作（画面操作の許可なし。PostMessage のキー + 全画面の連続切り出し、8000×11000 の格子 PNG と
+  合成 8 ページ PDF、crop は `export_crop.db` へ直接記入）: 単ページ（Page / Original / 指定倍率 + 縮小しない）・見開き・縦連結・
+  crop 済み PDF の Original で、代役は全体枠の中の切り取り位置に出て、本画像到着の前後で切り取り範囲の画素位置が変わらず
+  外側が補われた。crop なしの巨大画像の代役も本画像と同じ位置・大きさ（ぼけのみ差）。
+- 未確認: AI アップスケール併用、回転・表示トリム・分割との組み合わせ、crop なしの編集済み PDF（自動テストのみ）。利用者の実機確認は未。
+- **利用者決定（2026-10-22）**: 旧行（Unknown）＋現在 crop ありは全画面の代役に使わない現行の扱いを維持する。
+  そのページを新版で編集し直せば coverage 付きの行に置き換わって解消するので、「現在の crop から推測して使う」案は採らない。
+  判断は `App::resolve_preview_coverage_for_display` の 1 か所。
+- crop ドラッグ中の Escape の別件は、2026-10-22 の追補で開始前の `Option<CropSettings>` を復元する。
+  修正前の handler-level テストで、DB は元の値のまま、メモリだけ新しい crop が残る失敗を確認した。
+  ドラッグだけ取り消してモードを維持し、次の Escape で終了する。取り消しは保存や preview 失効を発行せず、
+  close / ページ移動 / ツール切替の preview snapshot より前に完了する。詳細は [crop の所有と終了](preset-and-adjustment.md#crop-ドラッグの所有と終了2026-10-22)。
+
 frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
 現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
 ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
@@ -876,6 +1053,48 @@ open 内で取得し、ページ全体表示なら
 - zoom 再レンダは display-fit 長辺を基準に倍率を掛け、8192 と raster native で clamp する。
   AI が必要な raster は display-fit が native より小さい場合も大きい場合も native へ収束させ、
   その間の final AI / AI 先読みを保留する。
+
+表示解像度合わせ・zoom/AI native・指定倍率の再レンダはすべて
+`request_pdf_rerender_at_target` で進行中要求に合流する。`FsPendingValue` 自身が
+source (`metadata_cache_key`)・要求長辺・PDF pool の priority lane を所有し、同じ source/長辺の
+要求を毎フレーム取り消さない。Critical は Normal の需要も満たす。Normal → Critical だけは
+一度取り消して置き換え、異なる source/長辺も置き換える。取消済み ticket には合流しない。
+完了・取消・close・世代破棄で pending が消えれば identity も消える。別の要求表は持たない。
+`fs_pdf_rerender_demand` は完了後も zoom/指定倍率の需要を記憶するため維持する。
+
+2026-10-22 追補: 再レンダの失敗は、pending を回収する境界で、そのページの既存
+`FsCacheEntry::Static.pdf_rerender_failures` へ要求 identity（source / target / lane）を移す。
+画素・texture・派生 cache・input 世代を維持し、失敗結果を upload backlog の `Failed` へ流さない。
+全 producer が同じ入口で source / target の失敗事実を照合するため、fit と AI 等で失敗 target が
+交互に出ても同じ組を再要求しない。priority の昇格も失敗した組の再要求理由にはしない。
+異なる source / target は要求でき、新しい raster の採用・cache 退去でその画に属する失敗記録も終わる。
+Static が無い初回の失敗は従来どおり `Failed`。未取消の再レンダ worker の切断も既存画を保持する。
+取消済み ticket や source が更新された旧要求の失敗は、現在の画の失敗事実へ採用せず破棄する。
+native 再レンダが失敗した場合は AI の再レンダ待ちも終え、保持した raster で既存の AI 経路を続ける。
+まれな失敗は割り切り（ログ + `show_feedback_warning` による通知）。同じ組への通知は一度だけ。
+画が残るだけでは品質更新の失敗に気付けないため通知し、再試行時間窓・回数・新しい要求表は作らない。
+
+cache の長辺は通常どおり要求の 90〜110% で照合する。ただし極端に細長いページでは、
+既存の比率精度 0.05% を満たす整数寸法が要求長辺の 90% 未満になることがある
+（page box 比 1:160、要求 256px → 1×160px）。不足判定時だけ、worker と共有する
+`render_dimensions_for_layout` を page box の固定小数点寸法へ適用し、実際に生成される長辺とも
+照合する。live / retained raster の両方で同じ規則を使い、完了→再要求の反復を防ぐ。
+renderer の寸法選択・画質は変更しない。metadata がない間は従来の要求長辺で比較する。
+再レンダの共通入口でも既存の source-keyed retained metadata 採用を通すため、
+snapshot 等で layout 投影だけを失った細長いページも、保持 pixel を繰り返し enqueue しない。
+
+設計の簡素化として pending に合流し、別の「前フレームの需要」や時刻・再試行状態を足さない。
+PDF 表示準備を modal にすると閲覧・ページ移動を妨げるため採用しない。
+
+この合流は backlog §1.114 の修正（2026-10-21、`5392c03ac` + `5a7d3523e`、master 取り込み `124dc4828`）。
+修正前はページ全体 / 幅 / 高さフィットの `ensure_pdf_display_resolution` が毎フレーム同じ要求を出し直して
+進行中を取り消し、PDFium のレンダが一度も完了しなかった（利用者の 2026-08 のログ）。
+ClaudeCode の隔離環境での操作では、合成 8 ページ PDF を全画面で幅フィット・先頭 / 末尾ジャンプ・ページ送りして、
+再レンダ要求がそれぞれ約 0.2 秒で 1 回ずつ完了し、取消は 0 回だった（§1.165 の構造変更後のビルドでも同じ）。
+再レンダ失敗で Static が Failed に置き換わる別件は、2026-10-22 の追補で上記の保持と失敗記録へ変更した。
+source inspection の所見に加え、修正前の状態遷移テストで Static を失う失敗を確認した。
+実アプリで失敗を起こした観測はない。再試行や多段の recovery 機構は追加しない。
+
 WebP は `ANIM` chunk の背景色を `WebPDecoder::set_background_color` に渡してから
 展開する。`image-webp` は dispose-to-background の処理を持つが、背景色未設定のままだと
 dispose が実質 no-op になり、透明差分フレームで前フレームの軌跡が残る。
@@ -1726,14 +1945,103 @@ active CentralPanelの `ui.max_rect()` から一度解決した `StillSeekGeomet
 （見開き単ページ / 見開き 2 ページ × ページ単位 / 連結読み）で走らせ、登録済み button rect の
 個数と全 x 座標が一致することを回帰テストで固定する。
 
-「その他の機能」パネルは `FsOverflowPanelState` が閉 / root / ナビゲータ位置を排他的に所有し、
-上部バーの下へ 12pt、画面右端から 12pt 離して配置する。項目はナビゲータ ON / OFF →
-ナビゲータ位置 → 分析ツール → ピクセルグリッド → ルーペ固定の固定順にする。行高は 48pt、
+「その他の機能」パネルは `FsOverflowPanelState` が閉 / root / ナビゲータ位置 / 見開きの調整 / スライドショー / 音名の色を排他的に所有し、
+上部バーの下へ 12pt、画面右端から 12pt 離して配置する。項目は
+`FullscreenOverflowItemId::fixed_order()` と同じく、見開きの調整 → ナビゲータ ON / OFF →
+ナビゲータ位置 → ページめくりアニメーション → スライドショー → 分析ツール →
+ピクセルグリッド → ルーペ固定の固定順にする。行高は 48pt、
 ヘッダーと閉じる hit target は 44pt とし、短い viewport では本文だけをスクロールする。同じ純粋な
-panel rect resolver を描画と `touch_excluded` が共有する。表示中は
-`App::common_modal_dialog_open` に含めて wheel / key を止め、背面キャンバスの pointer / navigator
-操作も止める。touch recognizer 自体は terminal frame まで駆動して ownership を残さない。状態表示や
+panel rect resolver を描画と入力が共有する。入力は現在の矩形を egui の layer hit-test に
+通し、押下位置で最前面が overflow の Area となる領域だけを対象にする。
+同じ pass の領域を左・右ボタンの開始判定と `touch_excluded` が共有する。
+シーク設定・回転等の popup が手前なら、そのメニューが入力列を所有する。
+メニュー自体の描画・Response による項目選択は省略しない。
+初回 / sizing で Area がまだ hit-test に現れない部分は、現在の矩形と既存の hit 情報で補う。
+既存の最前面が Foreground 以上なら補わず、Area の登録・順序変更はしない。
+閉じた状態では矩形を返さないので、前 pass の Area が残っても新しい押下を所有しない。
+パネル内の wheel はパネルが受け、パネル外の wheel は背面へ流れる。スライドショー設定中も
+外側の wheel でページ送り・ズームでき、パネルは維持する。外側の左クリック / タップは
+パネルを閉じるだけで消費し、その入力でページ送りやバー表示切替をしない。
+スワイプ・ドラッグ等の連続操作は既存の扱いを維持する。最前面が overflow パネルの位置で始まった左・右・touch 入力は
+離すまでパネルが所有し、矩形外へ出てもナビゲータを含む背面へ渡さない。
+右クリック終了・リング・ジェスチャにも渡さない。overflow の外側で始まった入力は従来どおり扱う。
+overflow 単独では中ボタンを所有せず、従来の短クリック割り当てと drag zoom を維持する。
+中ボタンの前面所有は、後述するメニューが提示されているときだけ開始する。
+所有は、root の早期描画が閉じる / 行選択で状態を変える前に `capture_fs_front_pointer_input` で一度確定する。
+`FsFrontPointerOwnership` に物理列を保持し、`FsFrontPointerFrameInput` を全背面 consumer に配る。
+これはパネルと同じく App 全体の前面 viewer の一時状態であり、context bundle には移さない。
+同じ viewer 内のページ移動 (`open_fullscreen`) では終わらず、物理 release、最後の touch End / Cancel、
+所有 viewport の focus loss、実際の表示先移譲 / close で終わる。
+F11 / F12、native presentation の確定などで表示先が変わる境界と、active viewer を passive へ
+移譲する境界で所有を終了する。fullscreen の close、新規 detached viewport / passive viewport 採用、
+`reset_detached_pause_foreground_modes` でも既存の前面リセットと同時に解放する。
+他 viewport の描画や focus loss は所有を変更せず、同じ表示先の再確認でも終了させない。
+focus loss で物理所有を終了しても、その pass の確定イベント列は破棄しない。
+release が focus loss より前なら範囲コピーを確定し、逆順なら取消する。最終 focus level とイベント順序を区別する。
+同じ pass-local 所有結果を、ナビゲータの予約 / 直接処理に渡す raw 入力の projection と
+secondary action が共有する。所有結果には pass 最後の down / press と旧列の release mask に加え、
+元イベント順に対応する所有情報を保持する。ナビゲータ / 範囲キャプチャの raw event projection は
+この情報で所有したボタンedgeを除き、位置・focus・wheel・非所有ボタンは残す。範囲キャプチャは所有moveも除く。
+背面ナビゲータと重なる場所でも所有は変わらず、
+外側開始のパンや範囲選択、外側 wheel を止めない。終端フレームの primary 抑止は
+後続 touch 判定の Allow で上書きしない。
+最前面が overflow パネルの押下は、背面のすべての raw 入力処理が確定済みの所有結果を読む。
+対象はナビゲータ / 範囲ズーム、比較ワイプ、通常パン / 回転 / 連結読み、リング / ジェスチャ、
+分析のパン / ガイド / 色固定、ブックマーク行、metadata の長押しプレビュー、
+シークバー / サムネイル列、中ボタン短押し / drag zoom、touch コマンド、範囲キャプチャ、
+編集 canvas（消しゴム・隠蔽・注釈・補正レイヤー・切り取り・SNS 分割）。キーでパネルを閉じて
+編集へ入る同一 pass でも所有は維持し、ボタンごとに入力を除くので非所有ボタンの操作は残す。
+旧所有列の release と新しい背面 press が同じ pass にある場合は、release mask を新しい down / press と
+分けて渡す。古い終端を背面 click / drag-stop として再利用せず、新しい列の開始を維持する。
+同じ pass 内で owned press → move → release → 新 press が完結しても、最後の down 状態から
+前半の所有を再推定しない。メニューの提示条件は pass 入口で一度確定するため、その pass 内の
+後続 press もメニューに属する。overflow 単独では後続 press の位置により新しい所有を判定する。
+画像パイプラインより前の隠蔽プレビュー hold だけは、前 pass で確定した同じ前面所有を
+継続参照する。新しい矩形判定や viewport 経路は作らない。範囲コピーの排他条件、Response が
+所有する入力、hover 描画・保存終了判定等の区別は [raw 入力監査表](section396-overflow-input-audit.md) を参照。
+パネル表示中はカーソル自動非表示の clean 判定を false にする。モーダルダイアログ扱いにはせず、
+フォーカス中の設定部品へはキーを渡し、それ以外のキーはパネルを閉じて通常の操作へ進む。
+touch recognizer 自体は terminal frame まで駆動して ownership を残さない。状態表示や
 実効 shortcut label は既存 state / keymap の読み取りだけで組み立て、UI 描画のための同期 I/O は行わない。
+
+§1.403 の前面メニュー F / S / R / P / Q / fullscreen context menu と、その viewport の
+egui memory popup は、提示中に始まった押下を位置によらず終端まで所有する。
+提示条件は上部バー / メニュー内容の描画条件と共有し、非提示の開 bool だけでは背面を止めない。
+mIV のメニューは各描画境界で外側 press により閉じ、起動ボタンと開いた子メニューを内側に含める。
+パネル内 ComboBox・色 picker・context menu は egui の click 基準を維持する。個別 ID の close は
+対象 viewport のみで行い、`Popup::close_all` は使わない。native context menu は OS menu loop が所有する。
+背面の double-click は前面所有の境界以降に背面が受理した click の対と egui の click count の両方を要求する。
+通常 canvas の変形リセットと flat / panorama ナビゲータの中央移動は同じ境界を使う。
+メニューを閉じた click と背面の最初の click を対にせず、続く背面の二つの click で成立させる。
+独自タイマーは持たない。共通 modal Window、VST manager、gamepad picker、上部バー / 360 品質ボタンの余白、
+AI status / toast の入力関係はこの契約に含めない。詳細は [§1.403 設計・実装記録](section403-front-popup-input-investigation.md)。
+
+スライドショーの root 行には現在のページ送り間隔を表示する。
+サブパネルは環境設定と同じページ送り間隔、連結読みの待機時間・スクロール時間・スクロール量、
+末尾動作を編集し、開始 / 停止ボタンを置かない。旧 `slideshow_popup_open` と設定 popup は廃止する。
+root の先頭には既存の「本の構成を編集」行を置く。スライダーは操作中に設定値を更新し、
+ドラッグ終了またはキーボード等による変更時に一度だけ既存の `settings.save()` で保存する。
+末尾動作は選択時に保存する。ヘッダーと「戻る」は固定し、本文だけを `DragScroll::Always` で
+スクロールする。フォーカス中の設定部品へキーを渡し、背面のページ送りには流さない。
+HUD の再生 / 停止ボタンは 1 クリックで即時切り替え、`KeyAction::FsSlideshow`、マウス割当、
+リング、ジェスチャと同じ `App::toggle_fullscreen_slideshow` へ合流する。開始対象は `Image` / `ZipImage` / `PdfPage`
+だけとし、停止時の状態解放も共通化する。既存の表示完了待ち、ページめくり、連結読みの進行は維持する。
+
+再生中に設定を変えても現在の `slideshow_next_at` は変更せず、次回の切替・待機の予定から新しい値を使う。
+進捗リングは現在の設定間隔を分母にするため、変更直後から次の予定を作るまで一時的に進捗がずれる。
+これは既知の制約であり、設定変更で現在の表示時間を再計算しない。
+ファイル切替で閉じるのは、内容が表示中のファイル / 本に依存する `SpreadAdjustment` だけとする
+（調整の基点・解除がその本に依存する）。全体設定を扱う root / ナビゲータ位置 / 音名の色 /
+スライドショーは、自動送り・手動送りとも開いたままにする。判定は
+`FsOverflowPanelState::closes_on_file_change` に集約する。root の行・見開き調整の status・本の構成の可否は
+毎フレーム `fullscreen_overflow_panel_view` から作り直し、切替先の状態を表示する。
+`close_fullscreen` と viewer の前面所有権を手放す境界では、すべての状態を閉じる。
+音楽ビュー終了時の音名の色パネルの close、キー・外側クリック / タップによる close は従来どおりとする。
+通常の物理フォルダへ自動で進む経路は、`try_start_slideshow_next_folder` →
+`start_folder_nav(...SlideshowNext)` → `FolderNavMode::SlideshowNext` →
+`close_fullscreen_for_folder_nav_reopen()` で一度 fullscreen を閉じてから開き直し・再生再開するため、
+その境界で設定パネルも閉じる。ZIP 内 DFS / snapshot / collection 等は各既存経路の
+close 有無に従い、フォルダをまたぐすべての経路でパネルを維持する契約にはしない。
 
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して
@@ -2231,16 +2539,38 @@ valueは `PercentTenths` / `LogicalPixels`。OFF中も数値・単位を保持�
 単ページZはPage・制限なしを維持し、見開きZの照準は選択fitと実効gapを使う。
 
 `FullscreenFitInput` は旧方式と指定値・共通最大倍率snapshot＋`FullscreenFitBasis` を型で分ける。
-Aは取得済みcanonical aspect、OはAI前の物理原寸で、Aの長辺をOの画素長辺へ正規化する。
-AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け、派生textureやGPU clamp後の
-寸法から逆算しない。PDFは検証済みpage boxとcontent typeから、Vectorは長辺4096px、Rasterは
+Aは部分素材のcoverage座標aspect／RAWのdeveloped aspect／PDF page box、通常の全面rasterでは
+解決済みAI前rasterのaspectとする。OはAI前の物理原寸で、Aの長辺をOの画素長辺へ正規化する。
+通常全面素材はAも予測rasterと到着rasterで揃え、pre-AI cache登録だけで正準aspectから
+整数丸め済みaspectへ切り替えない。正準source座標とページ構成の寸法は独立して維持する。
+AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け、派生textureや
+AI出力寸法から逆算しない。source寸法が判明している通常thumbnailで本画像未到着なら、生成時のcrop前raster寸法を使い、
+それが無ければ正準寸法をproducerと共通の `gpu_raster_dimensions` へ渡してGPU raster寸法を予測する。
+正準座標寸法を物理100%へそのまま流用しない。PDFは検証済みpage boxとcontent typeから、Vectorは長辺4096px、Rasterは
 `min(4096, native_long_edge)` の固定Oを解く。既存source座標用のraster寸法は別用途のまま残す。
+通常の旧catalog行でsource寸法が無い場合は、従来の選択済みsampler基準を受理時に保持して表示する。
+これは既知寸法のGPU raster予測とは別の互換契約であり、描画時に不足寸法を探すfallbackではない。
 
 `layout_full_image_rect` はこのA/Oから得るfull-page fit枠。実textureの整数丸めで縦横比が微妙に
 違ってもこの枠を変更せず、`from_layout_rect` がsampling用の `full_image_rect` を枠内へcontainする。
 paint / hit / UV / source写像は実際のcontained textureを共有し、PDF需要・合成layout・captureの
 fit枠は安定したcanonical extentを使う。descriptorと枠はcapture時の値を保存し、frozen / holdover
 replayやnavigatorから現在の指定値・共通最大倍率や新しいraster寸法を後読みしない。
+単ページ・見開き・連結読みは選択した素材の `MaterialDisplayBasis::specified` からA/Oを読む。
+部分素材はcoverageの正準座標寸法とcrop前raster、保持presentationは同時に保持したdescriptorを
+使い、thumbnail退去後にidx探索の正準寸法へ100%基準を戻さない。見開き全体と各ページも
+同じ `fs_spread_fit_input` の結果を使う。連結読みのreference／measurementも同じ素材selectorを使い、
+元画像／解析表示ではsource素材、通常表示ではprocessed／保持素材を選ぶ。
+§1.165最終P2追補（2026-10-22）の仕様差として、source寸法が判明している通常thumbnailの指定倍率は7474e5cf1の
+thumbnail実寸（例:60×80）へ戻さず、到着予定GPU raster（正準15000×20000なら6144×8192）を
+100%基準にする。指定倍率＋「縮小しない」でも到着時に枠・倍率が跳ばない。
+通常rasterの指定方式では連結読みのsource原寸例外も外し、到着後・AI前metadata・退去後まで
+同じraster基準を維持する。正準座標とページ構成、RAW／PDF、他4方式の連結規則は変更しない。
+NormalResource保持後のthumbnail退去でも、素材自身の6144×8192などの受理済み基準を維持する。
+同じallocationを共有するthumbnail／通過素材／元画像／finalも、実際に選んだproducerのdescriptorを
+運び、texture IDから属性を逆引きしない。消しゴムの独立下地・worker preview・preview昇格、
+注釈preview、連結transition、captureも入力ownerのdescriptorを継承する。
+[素材所有の設計判断](material-display-basis-ownership-plan.md)に境界と維持する方式差を記録する。
 捕捉済みの `SpecifiedScale.max_tenths` をgeometryの再解決にも使い、live設定変更を混ぜない。
 
 見開きは既存高さ合わせと仮想slotを維持し、2枚＋gap全体をfitする。幅指定が極小なら表示だけ
@@ -2462,6 +2792,20 @@ captured previous unit を原子的に保持する。
 そのページの代役にする」表示契約である。未着なら直前の表示単位を原子的に保持し、後続 repeat を
 drop する。rendition ready 後の target を実際に 1 frame 提示してから次を受理する。
 加工の扱いは**見た目の差**と**処理時間**の 2 つで決める。
+
+§1.165 B1 では、編集 preview を代役に採る前に §1.3.1 の共通 Unknown policy を通す。
+Known coverage は現在 crop から変更せず、CPU 下地から生成する rendition と保持 resource へ
+同じ由来を継承する。全体寸法の fit と部分素材の mapping は §2.1.1 を共有し、crop 前の全体を
+crop 後 texture で引き伸ばさない。これにより本画像到着時に既存内容の倍率・位置とページ枠を
+維持し、未収録だった外側が補われることを受入条件とする。代役が持たない crop 外画素の復元を
+到着前の要件にはしない。旧 Unknown＋現在 crop ありはこの代役を使えないため、本画像または
+既存の利用可能な代役を待つ互換上の制約が残る（実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）。
+renditionは下地の受理済み `MaterialDisplayBasis` も継承する。無加工時にcatalogと同じtextureを
+共有しても、通常thumbnailと通過素材の方式別契約はそれぞれの素材が保持する値を使う。
+生成後のselector・連結transition・ページ送り受付ではResourceのまま運び、保持済み素材から
+handleだけを取り出してthumbnail寸法や現在のidxから基準を作り直さない。PDF metadataの採用で
+現在のthumbnailを再受理した場合は、そのthumbnailに依存するrenditionを再生成対象とする。
+既に保持・captureした素材の不変descriptorは書き換えない。
 
 | 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
 | --- | --- | --- | --- |
@@ -3024,7 +3368,12 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   raster pixels を解放する。この PDF ページスロットと汎用保持 LRU は同じ枚数 / MiB 予算で
   合算 LRU 退去される。再表示時に `FinalAi` が条件一致すれば PDF worker を起こさず、AI pixels
   から `final_composite_cache` を直接復元する。`Raster` lookup は固定 4096 ではなく、現在の
-  display target と保持 raster の縦横比から必要長辺を再計算し、±10% 内だけを再利用する。
+  display target と保持 raster の縦横比から必要長辺を再計算し、±10% 内だけを再利用する
+  （細長いページの整数寸法は上記の共有 renderer 規則でも照合する）。毎フレームの
+  `fs_page_load_state` が行う `FinalAi` 照合は、非 PDF を先に除外し、保持スロットに
+  `FinalAi` がない場合も source key の normalize / String 生成より先に終了する。
+  既存 LRU の設定上限は合算 20 件なので、種別だけの走査を選び、件数カウンタや
+  別索引を追加しない。`FinalAi` がある場合のページ・現在パラメータ照合は維持する。
   外部変更や AI 設定変更で retained epoch が進んでいた場合、その orphan 結果は store 時に捨てる。
   汎用保持 LRU の store / hit /
   miss / skip / evict / clear は `mimageviewer.log` に `[AI] Retained final AI ...`
@@ -3112,7 +3461,7 @@ edit/final の clone は生存するが、raw cache がある証明には使わ�
 
 | 処理 | Image | ZipImage | PdfPage | Video |
 | --- | --- | --- | --- | --- |
-| サムネイルデコード | image/turbojpeg/WIC | image::load_from_memory | PDFium ワーカー | Shell API (別スレッド) |
+| サムネイルデコード | image/turbojpeg/libavif/WIC | 共通 bytes decode（AVIF=libavif） | PDFium ワーカー | Shell API (別スレッド) |
 | フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で実 viewport×ppp に fit (raster は native 上限) | なし (サムネのみ) |
 | EXIF Orientation | ✅ path から読む | ✅ bytes から読む | ❌ | — |
 | アニメーション | GIF/APNG/WebP ✅ | GIF/APNG/WebP ✅ | ❌ | — |
@@ -3202,3 +3551,58 @@ local paged見開きのcompositionは演出ON時だけ先頭・末尾配置を�
 通常Pairと同じtexture/role付きreceiptでめくり、白companionの拒否は維持する。
 ON/OFFによるgeometry変更では同じpresentation ownerの
 旧flat/ready/receiptを失効し、一件のcontinuationを新canonical採用まで保持する。
+
+
+## 紙めくりD3-4(a)の投機登録境界（2026-10-18）
+
+非共有finalの新規投機登録はnative wgpu ROOTの全retry後のoutput hookで行う。
+通常の表示昇格・同期takeover・共有handle採用はlookup前のserviceを維持する。
+最終passの通常live paged dispatchと現在runtime/session/binding、当該outer frameのoffer/curl/mandatory canonical活動で排他する。
+追加delta/freeは返却済みoutputに `append_texture_delta` で結合して既存配送へ渡す。
+ON/pagedのLegacyPrefetchも同じ非表示登録枠に含め、OFF/連結/Split/通常表示は維持する。
+詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.14.10/.11、§27.17.15を参照。
+
+D3-4(b) は通常 Single／Pair と canonical geometry を共有し、採用済み resident 入力だけから
+次 composition の Native 需要を frame 限りの値で求める。未配送 backing・cold 回転／auto bbox・
+未確定 fit basis は見送り、通常表示は従来の prepare を行う。同じ ROOT 最終 hook で全 live context の
+Next final登録→Next Native→全Next成立を再照合し、その後だけPrevious登録→Previous Native→
+resident-only Previous CPU開始へ進む（§1.405の限定拡張）。通常 Native key／plan と出力＋一時 allocation 会計を使い、
+新規投機GPU仕事はouter frame当たり最大一件とする。Next CPUの通常producer位置は維持する。
+出力は通常 `fs_lanczos_cache` に置き、最初の通常 prepare の hit と既存 D2 handoff を使う。
+held／canonical receipt／D4 時計へ後付けせず、parked snapshot や単なる mount から開始しない。
+
+2026-10-19 D3-5整理: Native canonical 候補収集・最終再照合は、既存 installed unit token の完全性証拠と
+頁→unit 索引を読む。未採用の証拠を全頁走査で補わず、その機会を見送る。slideshow も既存 still-only
+topology の採用を必要とする。最新 callback の viewport／clip／ppp と一致する frame 内候補だけを使う。
+未実体化の erase／local／conceal・mask と comic の CPU-only 接続は D3-3 として次の版の後へ延期した
+（[backlog §1.401](backlog-on-hold.md#1401-ページめくり-d3-3-編集済み注釈付きの頁でも-final-を先回り準備する--d3-の残り-2026-10-19)）。
+これらの通常表示・同期 miss は維持する。完了範囲・計測の限界は [計画 §27.17.17](page-turn-animation-plan.md) を参照。
+CPU 需要用 resolver に残っていた全頁走査・mixed slideshow 列再構築は、D3-5 で同owner内の派生 record に移す。
+visible と同じ枝は既存索引を読み、異なる枝だけcoldに導出する。CPU需要は縮小せず、adoption／producer／keepの
+共有prefixで同pass採用する。通常表示token／units／receiptを準備用に置換しない。詳細は同節F1を参照。
+
+§1.405のPreviousは通常unit ordinal−1、既存後方keep内の全occurrenceだけを補完する。
+Next CPUの実予約拒否時だけ予約表最大2 unitからparkedを含むownerを訪問し、未昇格Previousの完成結果
+（未受信channelも含む）をdropして一度だけ再試行する。Current/Next共有素材・表示昇格・legacy・Unknownは保護する。
+Previous Nativeはsmoothing clear/旧source除去/容量pruningによる既存entry除去ゼロを、事前と実行入口で検査する。
+上限・D2/D4・通常draw/Next/source/AIの範囲は維持する。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
+
+## 一時通知の表示時間（§1.402）
+
+通知の種類、文字数・指定秒数・動画の既定時間、設定の倍率と例外は
+[通知時間ポリシーと棚卸し](notification-duration-policy.md) を正本とする。
+App で寿命とnative fadeを確定して渡し、描画側は倍率を再適用しない。
+標準ではnativeの既存linger/fadeの不一致、保存完了のegui1.2秒/native1.8秒も維持する。
+動画内部で発行する通知だけは、既存 chrome snapshot の選択値から同じ関数で一度確定する。
+処理の寿命に連動する進捗表示、ナビゲーション境界の専用ヒントは独立した表示を維持する。
+
+### AVIF の共通デコード境界（§1.407）
+
+`image_decode` は path / bytes の AVIF を内蔵 libavif → WIC → Susie の順に接続する。
+他形式の image / TurboJPEG の順序を保ち、呼出元の worker で実行する。
+内蔵は RGBA8 straight alpha、最初のフレームのみ。`libavif-sys` のsafe Rust APIがRGB上で
+clap → irot → imir を一度だけ適用し、不正 clap は無視する。
+`Decoded::orientation = Applied` を canonical / thumbnail / 類似検索 / clipboard へ運び、
+後段 EXIF / WIC orientation を重ねない。サムネイルの source_dims はこの変換後の寸法。
+WIC / Susie 成功時は既存の orientation 規則を使う（bounded WIC は内部で適用済み）。
+背景処理・先読みは dav1d 1 thread、需要のフルサイズは 4 threads。

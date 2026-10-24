@@ -83,11 +83,15 @@ fn viewer_frame_with_focus(
             ..Default::default()
         },
     );
-    let _ = ctx.run(raw, |ctx| {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| run(ui, ctx));
-    });
+    let _ = ctx
+        .run_pass(raw, |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| run(ui, ctx))
+            });
+        })
+        .drop_without_applying_deltas();
 }
 
 fn neutral_gamepad_poll(app: &mut App, ctx: &egui::Context) {
@@ -178,7 +182,7 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
     let ctx = egui::Context::default();
     install(&ctx);
     crate::key_input::install_operation_input_plugin(&ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(&ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -218,18 +222,19 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
         app.edit_result_cache.retain(|key, _| key.idx < target);
         for idx in target..target + if mode.is_spread() { 2 } else { 1 } {
             app.fs_cache.remove(&idx);
-            app.thumbnails[idx] = ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails[idx] = ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     format!("input-resident-thumb-{idx}"),
                     egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                rendered_at_px: 12,
-                source_dims: Some((80, 120)),
-                layout_dims: None,
-            };
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                12,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((80, 120)),
+                None,
+            );
         }
     }
 
@@ -405,7 +410,7 @@ fn first_pointer_click_reaches_started_and_finished(root: bool, mode: SpreadMode
     let ctx = egui::Context::default();
     install(&ctx);
     install_fs_navigator_input_tracking(&ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(&ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -554,7 +559,7 @@ fn ready_single_viewer(ctx: &egui::Context) -> (crate::app::AppTestEnvForTest, e
     install(ctx);
     install_fs_navigator_input_tracking(ctx);
     crate::key_input::install_operation_input_plugin(ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(ctx, SpreadMode::Single);
     app.settings.page_turn_animation_enabled = true;
     let viewport = app.fullscreen_viewport_id();
@@ -823,6 +828,8 @@ fn child_key_and_wheel_navigation_start_and_complete_after_outer_root_acceptance
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -120.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
             ]
         } else {
@@ -912,6 +919,8 @@ fn mixed_key_and_wheel_batch_skips_once_for_the_actual_accepted_key_navigation()
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -1.0),
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         },
     ];
     let mut accepted_operation = None;
@@ -1026,6 +1035,8 @@ fn raw_wheel(delta: egui::Vec2) -> Vec<egui::Event> {
             unit: egui::MouseWheelUnit::Point,
             delta,
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         },
     ]
 }
@@ -1038,7 +1049,7 @@ fn ready_wheel_viewer(
     install(ctx);
     install_fs_navigator_input_tracking(ctx);
     crate::key_input::install_operation_input_plugin(ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -1392,7 +1403,7 @@ fn horizontal_wheel_and_sibling_delivery_do_not_turn_the_owner_page() {
         raw_wheel(egui::vec2(0.0, -120.0)),
         |_, ctx| {
             observe_pointer_transaction(ctx);
-            let id = egui::Id::new(("page_turn_pointer_transaction", sibling));
+            let id = egui::Id::unique(("page_turn_pointer_transaction", sibling));
             let transaction = ctx
                 .data(|data| data.get_temp::<PointerTransaction>(id))
                 .unwrap();
@@ -1594,6 +1605,8 @@ fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
             owner.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: Arc::new(image),
                     source_dims: Some([80, 120]),

@@ -14,7 +14,7 @@ fn resolved(book: &BookComposition, count: u32) -> ResolvedComposition {
     .unwrap()
 }
 
-fn composed_app(book: &BookComposition) -> crate::app::AppTestEnvForTest {
+pub(super) fn composed_app(book: &BookComposition) -> crate::app::AppTestEnvForTest {
     let scope = crate::book_scope::BookScopeKey::document("c:/g3-display.pdf").unwrap();
     let count = 4;
     let raw = (0..count)
@@ -869,6 +869,8 @@ fn separated_hidden_candidates_stay_excluded_during_the_same_viewport_episode() 
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([10, 10]),
@@ -964,13 +966,16 @@ fn alternating_hidden_window_over_forty_units_keeps_bounded_ranges_and_reentry_i
 }
 
 fn painted_texture_ids(ctx: &egui::Context, output: egui::FullOutput) -> Vec<egui::TextureId> {
-    ctx.tessellate(output.shapes, output.pixels_per_point)
+    let ids = ctx
+        .tessellate(output.shapes.clone(), output.pixels_per_point)
         .into_iter()
         .filter_map(|primitive| match primitive.primitive {
             egui::epaint::Primitive::Mesh(mesh) => Some(mesh.texture_id),
             egui::epaint::Primitive::Callback(_) => None,
         })
-        .collect()
+        .collect();
+    output.drop_without_applying_deltas();
+    ids
 }
 
 fn paint_composition_surface(
@@ -982,31 +987,33 @@ fn paint_composition_surface(
     Vec<crate::app::paint_record_test_support::PaintRecord>,
 ) {
     let output = crate::app::paint_record_test_support::with_capture(|| {
-        ctx.run(
+        crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 ..Default::default()
             },
             |ctx| {
                 if app.reading_flow.is_paged() {
-                    app.render_fullscreen_viewport(ctx);
+                    ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                 } else {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let idx = app.fullscreen_idx.unwrap();
-                            app.draw_fs_continuous_reading(
-                                ui,
-                                ctx,
-                                rect,
-                                idx,
-                                true,
-                                FsPageTurnDecision::normal(),
-                            );
-                        });
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let idx = app.fullscreen_idx.unwrap();
+                                app.draw_fs_continuous_reading(
+                                    ui,
+                                    ctx,
+                                    rect,
+                                    idx,
+                                    true,
+                                    FsPageTurnDecision::normal(),
+                                );
+                            })
+                    });
                 }
             },
-        )
+        ))
     });
     let records =
         crate::app::paint_record_test_support::paint_records(egui::ViewportId::ROOT, &output);
@@ -1082,6 +1089,9 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                 let mut texture_ids = Vec::new();
                 let mut cached_rasters = Vec::new();
                 for idx in 0..4 {
+                    if let GridItem::PdfPage { content_type, .. } = &mut app.items[idx] {
+                        *content_type = Some(crate::pdf_loader::PdfPageContentType::Vector);
+                    }
                     let pixels = Arc::new(egui::ColorImage::filled(
                         [40, 60],
                         if idx == 0 {
@@ -1100,6 +1110,11 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
+                            pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
+                                layout_dims: (40_000, 60_000),
+                                content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                            }),
                             tex,
                             pixels,
                             source_dims: Some([40, 60]),
@@ -1110,6 +1125,24 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.record_page_layout_dims_for_spread(idx, (40_000, 60_000));
                     app.rotation_cache
                         .insert(idx, crate::rotation_db::Rotation::None);
+                }
+                // The cached PDF producer owns its page box independently of
+                // the shared layout cache. Original continuous layout must use
+                // that accepted page box, with the raster as its fit reference.
+                for idx in 0..4 {
+                    assert_eq!(
+                        app.source_material_for_idx(idx)
+                            .unwrap()
+                            .display_basis()
+                            .legacy(crate::material_display_basis::MaterialDisplayView::Continuous),
+                        crate::material_display_basis::MaterialLegacyBasis::SourceLayout {
+                            basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                                layout_size: egui::vec2(40_000.0, 60_000.0),
+                                reference_size: egui::vec2(40.0, 60.0),
+                            },
+                        },
+                        "{case}: cached PDF {idx} retains its accepted layout and raster reference",
+                    );
                 }
                 let old = app.book_target_presentation_demand(0);
                 assert_eq!(old[0].slot, PresentationSlot::Center);
@@ -1250,6 +1283,11 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.fs_cache.insert(
                         1,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
+                            pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
+                                layout_dims: (40_000, 60_000),
+                                content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                            }),
                             tex,
                             pixels,
                             source_dims: Some([40, 60]),
@@ -1263,6 +1301,9 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     .unwrap()
                     .id();
                 pdf_rerender.take_requests();
+                // The Single warm-up supplied geometry/paint proof. Clear its
+                // pending stub too, preserving the no-worker admission fixture.
+                app.cancel_fs_page_load(0);
                 app.apply_fullscreen_view_mode(&ctx, 0, FullscreenViewMode::Spread);
                 assert!(
                     matches!(
@@ -1402,7 +1443,20 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     .fullscreen_page_layout
                     .displayed_pages()
                     .collect::<Vec<_>>();
-                assert_eq!(displayed.len(), if hidden_companion { 1 } else { 2 });
+                assert_eq!(
+                    displayed.len(),
+                    if hidden_companion { 1 } else { 2 },
+                    "{case}: terminal displayed={:?}, admission={:?}",
+                    displayed
+                        .iter()
+                        .map(|page| (
+                            page.page_idx(),
+                            page.occurrence(),
+                            page.transform.layout_full_image_rect,
+                        ))
+                        .collect::<Vec<_>>(),
+                    app.spread_display_units_cache.continuous_admission,
+                );
                 assert!(displayed.iter().all(|page| page.page_idx() < 2));
                 app.install_hidden_presentation_for_test(&next);
                 let (painted, records) = paint_composition_surface(&mut app, &ctx, rect);
@@ -1476,6 +1530,8 @@ fn same_generation_reader_order_change_retires_hidden_position_ranges() {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([10, 10]),
@@ -1561,16 +1617,17 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             app.rotation_cache
                 .insert(idx, crate::rotation_db::Rotation::None);
             if cache == "thumbnail" {
-                app.thumbnails[idx] = ThumbnailState::Loaded {
+                app.thumbnails[idx] = ThumbnailState::loaded_raster(
                     tex,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 60,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 60,
-                    source_dims: Some((40, 60)),
-                    layout_dims: None,
-                };
+                    false,
+                    60,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((40, 60)),
+                    None,
+                );
                 app.thumb_pixels.insert(idx, pixels);
                 app.fs_cache.insert(
                     idx,
@@ -1584,6 +1641,8 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
+                        pdf_metadata: None,
                         tex,
                         pixels,
                         source_dims: Some([40, 60]),
@@ -1614,26 +1673,28 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             if hidden {
                 app.install_hidden_presentation_for_test(&b);
             }
-            let output = ctx.run(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            app.draw_fs_continuous_reading(
-                                ui,
-                                ctx,
-                                rect,
-                                0,
-                                cache != "processed",
-                                FsPageTurnDecision::normal(),
-                            );
-                        });
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                app.draw_fs_continuous_reading(
+                                    ui,
+                                    ctx,
+                                    rect,
+                                    0,
+                                    cache != "processed",
+                                    FsPageTurnDecision::normal(),
+                                );
+                            })
+                    });
                 },
-            );
+            ));
             let painted = painted_texture_ids(&ctx, output);
             let allowed_ids = if cache == "processed" {
                 &source_ids[4..6]
@@ -1684,15 +1745,15 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             if hidden {
                 app.install_hidden_presentation_for_test(&b);
             }
-            let output = ctx.run(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
                 |ctx| {
-                    app.render_fullscreen_viewport(ctx);
+                    ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                 },
-            );
+            ));
             let painted = painted_texture_ids(&ctx, output);
             assert!(
                 !painted.contains(&source_ids[2]) && !painted.contains(&source_ids[3]),
@@ -1751,6 +1812,8 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([400, 600]),
@@ -1770,26 +1833,28 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
     let held_b = app.install_checking_presentation_for_test(&b);
     let b_correlation = app.checking_presentation_correlations_for_test(&b);
     let draw = |app: &mut crate::app::App, rect: egui::Rect| {
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        app.draw_fs_continuous_reading(
-                            ui,
-                            ctx,
-                            rect,
-                            app.fullscreen_idx.unwrap(),
-                            true,
-                            FsPageTurnDecision::normal(),
-                        );
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fs_continuous_reading(
+                                ui,
+                                ctx,
+                                rect,
+                                app.fullscreen_idx.unwrap(),
+                                true,
+                                FsPageTurnDecision::normal(),
+                            );
+                        })
+                });
             },
-        );
+        ));
         painted_texture_ids(&ctx, output)
     };
     app.fs_vertical_scroll = 1.0;
@@ -1937,28 +2002,32 @@ fn composed_continuous_geometry_and_pdf_demand_match_the_real_e_consumer() {
                         app.fs_zoom = zoom;
                         app.fs_vertical_scroll = scroll;
                         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-                        let _ = ctx.run(
-                            egui::RawInput {
-                                screen_rect: Some(rect),
-                                ..Default::default()
-                            },
-                            |ctx| {
-                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
-                                    ctx,
-                                    |ui| {
-                                        app.draw_fs_continuous_reading(
-                                            ui,
-                                            ctx,
-                                            rect,
-                                            0,
-                                            true,
-                                            FsPageTurnDecision::normal(),
-                                        );
-                                        app.reconcile_specified_pdf_demand(ctx);
-                                    },
-                                );
-                            },
-                        );
+                        let _ = ctx
+                            .run_pass(
+                                egui::RawInput {
+                                    screen_rect: Some(rect),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    ctx.root_ui(|root_ui| {
+                                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                            root_ui,
+                                            |ui| {
+                                                app.draw_fs_continuous_reading(
+                                                    ui,
+                                                    ctx,
+                                                    rect,
+                                                    0,
+                                                    true,
+                                                    FsPageTurnDecision::normal(),
+                                                );
+                                                app.reconcile_specified_pdf_demand(ctx);
+                                            },
+                                        )
+                                    });
+                                },
+                            )
+                            .drop_without_applying_deltas();
                         records.push(
                             app.fullscreen_page_layout
                                 .displayed_pages()
@@ -2017,20 +2086,22 @@ fn g3_similar_preview_continuous_routing_requires_admitted_anchor_occurrence() {
         }
         let demand = units[0].presentation_demand();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(rect),
-                focused: true,
-                events: vec![egui::Event::PointerButton {
-                    pos: rect.center(),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    focused: true,
+                    events: vec![egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         let hit = crate::similar_index::QueryHit {
             item_id: 901,
             item_key: "c:/preview/candidate.png".into(),
@@ -2089,30 +2160,33 @@ fn g3_similar_preview_continuous_routing_requires_admitted_anchor_occurrence() {
         if expected == "hidden" {
             app.install_hidden_presentation_for_test(&demand);
         }
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 focused: true,
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let asset = app
-                            .similar_preview_asset_for_permitted_surface(ctx, rect, 0, false, true);
-                        assert_eq!(
-                            asset.is_some(),
-                            expected == "allowed",
-                            "{expected} anchor admission"
-                        );
-                        if let Some(asset) = asset {
-                            let style = app.fs_bg_style(ctx);
-                            app.draw_similar_preview_asset(ui, rect, &asset, &style);
-                        }
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let asset = app.similar_preview_asset_for_permitted_surface(
+                                ctx, rect, 0, false, true,
+                            );
+                            assert_eq!(
+                                asset.is_some(),
+                                expected == "allowed",
+                                "{expected} anchor admission"
+                            );
+                            if let Some(asset) = asset {
+                                let style = app.fs_bg_style(ctx);
+                                app.draw_similar_preview_asset(ui, rect, &asset, &style);
+                            }
+                        })
+                });
             },
-        );
+        ));
         assert_eq!(
             painted_texture_ids(&ctx, output).contains(&candidate_texture),
             expected == "allowed",
@@ -2527,22 +2601,24 @@ fn book_composition_legacy_spread_keys_match_binding_and_preserve_record() {
                 app.apply_fullscreen_view_mode(&ctx, 0, FullscreenViewMode::Single);
                 app.spread_shift.state = crate::app::spread_shift_owner::ViewerShift::Ordinary(2);
                 let revision_before = app.book_append_undo_revision;
-                let _ = ctx.run(
-                    egui::RawInput {
-                        focused: true,
-                        events: vec![egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::NONE,
-                        }],
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        app.handle_fs_key_input(ctx, 0, false);
-                    },
-                );
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            focused: true,
+                            events: vec![egui::Event::Key {
+                                key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            }],
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.handle_fs_key_input(ctx, 0, false);
+                        },
+                    )
+                    .drop_without_applying_deltas();
                 assert_eq!(
                     app.spread_mode,
                     if requested == expected {

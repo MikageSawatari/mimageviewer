@@ -12,6 +12,7 @@ name = "epub-pdf-job-probe"
 path = "src/job_probe.rs"
 
 [dependencies]
+libavif-sys = { path = "../libavif-sys" }
 quick-xml = "0.41"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 serde = { version = "1", features = ["derive"] }

@@ -172,7 +172,7 @@ pub fn render_overlay(ctx: &egui::Context) {
         return;
     }
     let lines = snapshot_lines();
-    egui::Area::new("key_debug_overlay".into())
+    egui::Area::new(egui::Id::unique("key_debug_overlay"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_TOP, [-12.0, 72.0])
         .interactable(false)

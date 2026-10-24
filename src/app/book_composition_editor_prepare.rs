@@ -664,6 +664,35 @@ mod tests {
     use super::*;
     use std::{io::Write, sync::Arc};
 
+    #[cfg(windows)]
+    #[test]
+    fn avif_archive_landscape_probe_reads_complete_container_beyond_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = archive_input(temp.path(), &[("page.avif", 64, 32)]);
+        let mut bytes = crate::avif_decoder::tests::with_clap_and_mirror(true);
+        let iloc = bytes.windows(4).position(|b| b == b"iloc").unwrap() - 4;
+        let mdat = bytes.windows(4).position(|b| b == b"mdat").unwrap() - 4;
+        let padding = 70 * 1024u32;
+        let offset = u32::from_be_bytes(bytes[iloc + 22..iloc + 26].try_into().unwrap());
+        bytes[iloc + 22..iloc + 26].copy_from_slice(&(offset + padding).to_be_bytes());
+        let mut free = vec![0; padding as usize];
+        free[..4].copy_from_slice(&padding.to_be_bytes());
+        free[4..8].copy_from_slice(b"free");
+        bytes.splice(mdat..mdat, free);
+        let zip_path = temp.path().join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.avif", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let items = [GridItem::ZipImage {
+            zip_path,
+            entry_name: "page.avif".into(),
+        }];
+        assert_eq!(read_landscape(&input, &items).unwrap(), [true]);
+    }
+
     fn archive_input(root: &Path, entries: &[(&str, u32, u32)]) -> EditorSourceInput {
         let path = root.join("book.zip");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
@@ -1445,7 +1474,11 @@ fn read_landscape(input: &EditorSourceInput, items: &[GridItem]) -> Result<Vec<b
                 let GridItem::ZipImage { entry_name, .. } = item else {
                     continue;
                 };
-                let head = if crate::raw_format::is_raw_path(Path::new(entry_name)) {
+                let head = if crate::raw_format::is_raw_path(Path::new(entry_name))
+                    || Path::new(entry_name)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("avif"))
+                {
                     crate::zip_loader::read_entry_bytes(&tree.zip_path, entry_name)
                 } else {
                     // Nested members require the existing nested byte reader.

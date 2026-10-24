@@ -256,6 +256,12 @@ user seek coalesce (250ms)、open 進捗 HUD (50ms) の最短 one-shot だけを
 ### NativeVideoPlacement と detached viewer
 
 native presenter の表示先は `NativeVideoPlacement` を正本にする。
+detached host の通常配置・F11 restore は runtime が物理外枠座標で所有し、HWND 登録時に
+`detached_window_geometry` で適用する。builder の位置・寸法は生成前の仮配置に限る。
+配置の適用だけでは Hidden host を見せず、最大化を含む可視化は既存の表示 commit が行う。
+F11・終了・再作成や park の判断時は HWND を読み直し、通常 frame の egui 観測は変更通知として扱う。
+判断時・通常観測の最大化状態は未処理の app command を優先し、無ければ HWND の状態を使う。
+pending は OS の一致、次の root 出力の入力 hook、または backend の close 通知入口（出力処理後、対象 host のみ）で解除する。
 
 - `MainWindowChild`: main HWND の child window。メインウィンドウ内に表示する。
 - `FullscreenBorderless`: monitor rect 全体の borderless presenter。fullscreen 専用 HUD overlay HWND、
@@ -1191,6 +1197,13 @@ keyframe が疎すぎる material unavailable も同じ UI surface と入力 gat
 
 #### `mod.rs` (`VideoPlayer`)
 - 公開 API (`open` / `tick` / `seek` / `set_volume` / `set_loop_enabled` / `shutdown`)
+- 再生するseek APIは必須の `SeekOrigin::User` / `Internal(InternalContinuation)` を受ける。
+  UserはEOF／再生意図なしの受付時、DSP取得より前にUserPlayを登録し、actorの既存start判定を使う。
+  内部Pauseでは非EOFのSuccessReady／Establishedを保持し、ユーザーPauseによるNoneへの破棄と区別する。
+  Loop・音声トラック・DSP・cached openの内部seekはstartを増やさず、seekによる再生強制は従来どおり。
+  Now Playingの最終EOFはAppの再生方針／連続navigationの結果確定が判断する。
+  非同期の次候補確認中をplayerのEOF状態だけでclearしない。詳細と全入口分類は
+  [EffeTune自動表示計画](effetune-auto-open-plan.md#eof後のユーザーseek入口の分類2026-10-17) を参照。
 - decoder スレッド・audio スレッドのライフサイクル管理
 - native presenter のライフタイム管理 (`native_output: Option<NativeVideoOutput>`)
 - remote-owned player に限る headless video output consumer の起動・停止・join
@@ -3990,3 +4003,13 @@ ui_snapshotは直列で123件成功し、既存PNGと一致した。cargo fmt / 
 通常profileのcore・remote service・EPUB PDF workerを生成した。製品起動・実機操作・commitは
 行っていない。実機では測定がrelease前に終了してもフレーム送りが再開せず、新しい押下で
 通常の反復が戻ることを利用者が確認する。
+
+
+## 一時通知の表示時間（§1.402）
+
+通知の種類、文字数・指定秒数・動画の既定時間、設定の倍率と例外は
+[通知時間ポリシーと棚卸し](notification-duration-policy.md) を正本とする。
+App で寿命とnative fadeを確定して渡し、描画側は倍率を再適用しない。
+標準ではnativeの既存linger/fadeの不一致、保存完了のegui1.2秒/native1.8秒も維持する。
+動画内部で発行する通知だけは、既存 chrome snapshot の選択値から同じ関数で一度確定する。
+処理の寿命に連動する進捗表示、ナビゲーション境界の専用ヒントは独立した表示を維持する。

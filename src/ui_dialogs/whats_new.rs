@@ -3,19 +3,63 @@
 //! - 表示判定 (どのバージョンの変更点を出すか) は `App` 構築時に
 //!   [`crate::version_highlights::highlights_to_show`] (純関数) で決め、`whats_new_entries` に入る。
 //! - ここはその描画だけを担当する (display-only。移行の二択 UI は持たない)。
-//! - `last_seen_version` の更新は `Settings::load` 側で済んでいるので、閉じる際に永続化は不要
-//!   (次回起動では previous == current となり再表示されない)。
+//! - ビューア表示中は保留し、描画・モーダル判定・閉じる入力は同じ visible helper に従う。
+//! - 利用者が閉じたときだけ既読版を保存する。保留したまま終了しても次回へ持ち越す。
 
-use crate::app::App;
+use crate::app::{ActionSurface, App};
 use eframe::egui;
 
 impl App {
+    pub(crate) fn whats_new_visible(&self) -> bool {
+        self.show_whats_new && !self.startup_notice_viewer_open()
+    }
+
+    pub(crate) fn request_whats_new_from_help(&mut self) {
+        // A pending cumulative/forced request must not lose unread entries when help is
+        // selected from main while a detached viewer still owns another window.
+        if self.show_whats_new {
+            return;
+        }
+        let mut entries = crate::version_highlights::for_version(
+            env!("CARGO_PKG_VERSION"),
+            crate::version_highlights::table(),
+        );
+        if entries.is_empty()
+            && let Some(latest) = crate::version_highlights::latest_not_newer_than(
+                env!("CARGO_PKG_VERSION"),
+                crate::version_highlights::table(),
+            )
+        {
+            entries = vec![latest];
+        }
+        if !entries.is_empty() {
+            self.whats_new_entries = entries;
+            self.show_whats_new = true;
+        }
+    }
+
     pub(crate) fn show_whats_new_dialog(&mut self, ctx: &egui::Context) {
-        if !self.show_whats_new || self.whats_new_entries.is_empty() {
+        if !self.whats_new_visible() {
             return;
         }
         let mut open = true;
+        // The next startup notice can become visible later in this same pass. Escape belongs
+        // to this visible dialog and must not dismiss that previously hidden notice as well.
         let escape_pressed = self.dialog_escape_pressed(ctx);
+        if escape_pressed {
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+            });
+        }
         let close;
         let open_changelog;
         // &'static 参照の Vec なので clone は安価 (借用衝突回避のためローカルへ)。
@@ -32,6 +76,15 @@ impl App {
         }
         if close || !open || escape_pressed {
             self.show_whats_new = false;
+            self.settings.whats_new_acknowledged_version =
+                Some(env!("CARGO_PKG_VERSION").to_owned());
+            if !self.settings.save_checked() {
+                self.show_feedback_warning_on(
+                    "重要な変更点の既読状態を保存できませんでした。次回起動時に再表示されることがあります"
+                        .to_owned(),
+                    ActionSurface::MainWindow,
+                );
+            }
         }
     }
 }
@@ -42,17 +95,13 @@ pub(super) fn draw_whats_new_dialog(
     entries: &[&crate::version_highlights::VersionHighlights],
 ) -> (bool, bool) {
     let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-    // Preserve the previous 650pt outer reading width independently of content.
-    // Window::default_width takes the inner width; use the actual frame margins
-    // and let the existing Window owner handle later user/viewport resizing.
-    // Round the viewport-limited width inward: a half-point logical viewport at
-    // 200% must not gain an outward rounded frame edge.
-    let default_width = (650.0_f32.min(ctx.content_rect().width()).floor()
-        - egui::Frame::window(&ctx.style()).total_margin().sum().x)
-        .max(1.0);
+    // Window 0.37 sizes are outer dimensions, including the actual frame.
+    // Round the viewport-limited width inward at fractional logical sizes.
+    let default_width = 650.0_f32.min(ctx.content_rect().width()).floor().max(1.0);
     let mut close = false;
     let mut open_changelog = false;
     egui::Window::new("重要な変更点")
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(open)
         .collapsible(false)
         .resizable(true)
@@ -66,9 +115,18 @@ pub(super) fn draw_whats_new_dialog(
             ui.add_space(6.0);
             let footer =
                 super::startup_dialog_footer_height(ui, &["すべての変更を見る", "閉じる"], 4.0);
-            super::startup_dialog_scroll_body(ui, "whats_new_scroll", footer, |ui| {
+            let body = super::startup_dialog_scroll_body(ui, "whats_new_scroll", footer, |ui| {
                 crate::version_highlights::render(ui, &entries);
             });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::unique("whats_new_scroll_layout"),
+                    crate::test_ui::scroll_layout::ScrollLayout::from_output(&body),
+                );
+            });
+            #[cfg(not(test))]
+            let _ = body;
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("すべての変更を見る").clicked() {
@@ -88,35 +146,109 @@ mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
 
     #[test]
-    fn version_highlights_initial_width_keeps_previous_reading_area() {
+    fn whats_new_changelog_action_does_not_request_dismissal() {
+        let response = std::rc::Rc::new(std::cell::Cell::new((false, false, true)));
+        let observed = response.clone();
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder().build_ui(move |ui| {
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ui.ctx());
+                fonts_ready = true;
+                return;
+            }
+            let mut open = true;
+            let entries: Vec<_> = crate::version_highlights::table().iter().rev().collect();
+            let (close, changelog) = draw_whats_new_dialog(ui.ctx(), &mut open, &entries);
+            observed.set((close, changelog, open));
+        });
+        harness.run_steps(5);
+        harness.get_by_label("すべての変更を見る").click_accesskit();
+        harness.run_steps(1);
+        assert_eq!(response.get(), (false, true, true));
+    }
+
+    #[test]
+    fn version_highlights_initial_width_respects_037_window_budget() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
             for scale in [1.0, 2.0] {
                 let mut fonts_ready = false;
-                let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-                    if !fonts_ready {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        crate::settings::apply_ui_scale_factor(ctx, scale);
-                        fonts_ready = true;
-                        return;
-                    }
-                    let entries: Vec<_> = crate::version_highlights::table().iter().rev().collect();
-                    draw_whats_new_dialog(ctx, &mut true, &entries);
-                });
+                let mut harness =
+                    crate::test_ui::builder()
+                        .with_size(size)
+                        .build_ui(move |root_ui| {
+                            let ctx = &root_ui.ctx().clone();
+                            if !fonts_ready {
+                                crate::ui_fonts::configure_fonts(ctx);
+                                crate::settings::apply_ui_scale_factor(ctx, scale);
+                                fonts_ready = true;
+                                return;
+                            }
+                            let entries: Vec<_> =
+                                crate::version_highlights::table().iter().rev().collect();
+                            draw_whats_new_dialog(ctx, &mut true, &entries);
+                        });
                 harness.run_steps(12);
+                let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+                std::fs::create_dir_all(dir).unwrap();
+                harness
+                    .render()
+                    .unwrap()
+                    .save(dir.join(format!("whats-new-{}x{}-scale{scale}.png", size.x, size.y)))
+                    .unwrap();
                 let viewport = harness.ctx.content_rect();
-                let intended_width = 650.0_f32.min(viewport.width()).floor();
+                // 利用者が比較資料で採択した0.37の実寸を基準にする。
+                // 小画面200%では Window/Resize の初期内寸制約と内容の実測で
+                // 外幅537ptになる（旧546pt）。他3条件は指定外幅650ptを保つ。
+                // Resizeの初期desired_sizeだけでは内容計測後の外寸を表せない。
+                let intended_width = if size.x == 1093.0 && scale == 2.0 {
+                    537.0
+                } else {
+                    650.0
+                };
                 for frame in 0..8 {
                     let window = harness
                         .ctx
-                        .memory(|memory| memory.area_rect(egui::Id::new("重要な変更点")))
+                        .memory(|memory| memory.area_rect(egui::Id::unique(Some("重要な変更点"))))
                         .unwrap();
                     assert!(
                         (window.width() - intended_width).abs() < 0.1,
                         "size={size:?} scale={scale} frame={frame}: intended={intended_width} actual={window:?}"
                     );
                     assert!(viewport.contains_rect(window));
+                    for label in ["Close window", "すべての変更を見る", "閉じる"] {
+                        assert!(viewport.contains_rect(harness.get_by_label(label).rect()));
+                    }
                     harness.run_steps(1);
                 }
+                let read = || {
+                    harness.ctx.data(|data| {
+                        data.get_temp::<ScrollLayout>(egui::Id::unique("whats_new_scroll_layout"))
+                            .unwrap()
+                    })
+                };
+                let before = read();
+                before.assert_height(
+                    HeightExpectation::Scrolls,
+                    viewport,
+                    harness.ctx.pixels_per_point(),
+                );
+                harness.event(egui::Event::PointerMoved(before.inner.center()));
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -100000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.run_steps(40);
+                harness
+                    .ctx
+                    .data(|data| {
+                        data.get_temp::<ScrollLayout>(egui::Id::unique("whats_new_scroll_layout"))
+                            .unwrap()
+                    })
+                    .assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
             }
         }
     }
@@ -126,14 +258,15 @@ mod tests {
         for width in [440.0, 507.0, 640.0, 860.0] {
             for scale in [1.0, 2.0] {
                 let mut fonts_ready = false;
-                let mut harness = crate::test_ui::builder().build(move |ctx| {
+                let mut harness = crate::test_ui::builder().build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         crate::settings::apply_ui_scale_factor(ctx, scale);
                         fonts_ready = true;
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(width, 500.0),
                             egui::Layout::top_down(egui::Align::Min),
@@ -186,7 +319,8 @@ mod tests {
                 let mut fonts_ready = false;
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(1093.0, 614.0))
-                    .build(move |ctx| {
+                    .build_ui(move |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
                         if !fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             crate::settings::apply_ui_scale_factor(ctx, scale);
@@ -204,13 +338,15 @@ mod tests {
                     harness.run_steps(12);
                     let window = harness
                         .ctx
-                        .memory(|memory| memory.area_rect(egui::Id::new("重要な変更点")))
+                        .memory(|memory| memory.area_rect(egui::Id::unique(Some("重要な変更点"))))
                         .unwrap();
                     assert!(harness.ctx.content_rect().contains_rect(window));
                     for label in ["Close window", "すべての変更を見る", "閉じる"] {
                         let node = harness.get_by_label(label);
                         let id = unsafe {
-                            egui::Id::from_high_entropy_bits(node.accesskit_node().id().0)
+                            egui::Id::from_high_entropy_bits(
+                                (u128::from(node.accesskit_node().id()) >> 64) as u64,
+                            )
                         };
                         let initial = harness.ctx.read_response(id).unwrap().rect;
                         harness.hover_at(initial.center());
@@ -221,7 +357,14 @@ mod tests {
                                 current.rect, initial,
                                 "extended={extended} scale={scale} size={size:?} {label} frame={frame}"
                             );
-                            assert_eq!(harness.ctx.memory(|memory| memory.area_rect(egui::Id::new("重要な変更点"))).unwrap(), window);
+                            assert_eq!(
+                                harness
+                                    .ctx
+                                    .memory(|memory| memory
+                                        .area_rect(egui::Id::unique(Some("重要な変更点"))))
+                                    .unwrap(),
+                                window
+                            );
                             assert!(current.contains_pointer());
                             assert!(current.interact_rect.contains_rect(current.rect));
                         }

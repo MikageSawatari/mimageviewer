@@ -1545,7 +1545,7 @@ impl App {
                     });
                 }
             }
-            Err(error) => self.show_feedback_toast(format!(
+            Err(error) => self.show_feedback_warning(format!(
                 "スマートフォルダの評価更新を開始できませんでした: {error}"
             )),
         }
@@ -1607,7 +1607,9 @@ impl App {
             Ok(None) => {}
             Err(error) => {
                 crate::logger::log(format!("smart_folder: rating membership failed: {error}"));
-                self.show_feedback_toast("スマートフォルダの評価条件を更新できませんでした".into());
+                self.show_feedback_warning(
+                    "スマートフォルダの評価条件を更新できませんでした".into(),
+                );
             }
         }
     }
@@ -2078,7 +2080,7 @@ impl App {
             crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
         );
         self.reprepare_visible_smart_root_after_staged_terminal();
-        self.show_feedback_toast("スマートフォルダ処理を中止しました".into());
+        self.show_feedback_warning("スマートフォルダ処理を中止しました".into());
         true
     }
 
@@ -2260,7 +2262,10 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            !matches!(intent, SmartTransitionIntent::Refresh),
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2278,6 +2283,18 @@ impl App {
             progress: SmartFolderProgress::default(),
             phase: SmartFolderTransitionPhase::RootScan(pending),
         });
+        #[cfg(all(windows, feature = "test-script"))]
+        if self
+            .smart_folder_transition
+            .as_ref()
+            .is_some_and(|request| {
+                matches!(request.target, SmartFolderTransitionTarget::Child { .. })
+                    && self.main_list_navigation_is_current(&request.navigation)
+            })
+        {
+            // A nonresident history child creates its owner before preparing its root.
+            self.test_script_record_folder_load_owner(&super::StartupListIntent::ExplicitList);
+        }
         Ok(request_id)
     }
 
@@ -2320,7 +2337,10 @@ impl App {
         )?;
         transition.phase = SmartFolderTransitionPhase::RootPrepare(pending);
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            !matches!(transition.intent, SmartTransitionIntent::Refresh),
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2395,6 +2415,7 @@ impl App {
             source_index,
             restore_intent,
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -2407,8 +2428,9 @@ impl App {
         source_index: Option<usize>,
         restore_intent: super::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> Result<(), Option<ScannedDir>> {
-        self.begin_smart_physical_navigation_with_backing(
+        self.begin_smart_physical_navigation_with_backing_at_stage(
             path.clone(),
             path,
             kind,
@@ -2417,6 +2439,7 @@ impl App {
             source_index,
             restore_intent,
             navigation,
+            stage,
         )
     }
 
@@ -2430,6 +2453,31 @@ impl App {
         source_index: Option<usize>,
         restore_intent: super::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+    ) -> Result<(), Option<ScannedDir>> {
+        self.begin_smart_physical_navigation_with_backing_at_stage(
+            path,
+            backing,
+            kind,
+            auto_fullscreen,
+            pre_scan,
+            source_index,
+            restore_intent,
+            navigation,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    pub(super) fn begin_smart_physical_navigation_with_backing_at_stage(
+        &mut self,
+        path: PathBuf,
+        backing: PathBuf,
+        kind: SmartChildKind,
+        auto_fullscreen: bool,
+        pre_scan: Option<ScannedDir>,
+        source_index: Option<usize>,
+        restore_intent: super::StartupListIntent,
+        navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> Result<(), Option<ScannedDir>> {
         let Some(mut state) = self.smart_physical_target_state(&path) else {
             return Err(pre_scan);
@@ -2532,7 +2580,11 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            restore_intent.replaces_deferred_startup_open()
+                && stage == MainListRequestStage::Admission,
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2560,6 +2612,16 @@ impl App {
             progress: SmartFolderProgress::default(),
             phase,
         });
+        #[cfg(all(windows, feature = "test-script"))]
+        if self
+            .smart_folder_transition
+            .as_ref()
+            .is_some_and(|request| self.main_list_navigation_is_current(&request.navigation))
+        {
+            // Direct dispatcher entries delegate here; they do not count a second start.
+            // Prepared child adoption and conversion/password resumes keep this owner.
+            self.test_script_record_folder_load_owner(&restore_intent);
+        }
         // Archive conversion is a separate dialog/worker owner. Retire an older dialog only
         // after this request is admitted; its exact request ID prevents the old cancel callback
         // from retiring the newly staged Smart open, including a same-source re-open.
@@ -2581,13 +2643,15 @@ impl App {
         history_trigger: super::HistoryTrigger,
         restore_video_tile: bool,
     ) -> Result<(), Option<ScannedDir>> {
-        self.begin_smart_physical_navigation(
+        self.begin_smart_physical_navigation_with_navigation(
             path,
             kind,
             false,
             pre_scan,
             None,
             super::StartupListIntent::folder_navigation(&mode),
+            None,
+            MainListRequestStage::Continuation,
         )?;
         if let Some(transition) = self.smart_folder_transition.as_mut() {
             let request_id = transition.request_id;
@@ -2684,6 +2748,7 @@ impl App {
             None,
             restore_intent.clone(),
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -2697,6 +2762,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> bool {
         if self.top_level_grid_view.smart_folder_session().is_none() {
             return false;
@@ -2727,7 +2793,7 @@ impl App {
         if kind == SmartChildKind::ConvertibleArchive
             && self.settings.archive_file_handling_ignores_convertible()
         {
-            self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
+            self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
             return true;
         }
         if kind == SmartChildKind::Pdf
@@ -2737,7 +2803,7 @@ impl App {
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
         {
-            self.show_feedback_toast("設定により EPUB を無視しています".into());
+            self.show_feedback_warning("設定により EPUB を無視しています".into());
             return true;
         }
         if self
@@ -2749,10 +2815,11 @@ impl App {
                 Some(index),
                 restore_intent.clone(),
                 navigation,
+                stage,
             )
             .is_err()
         {
-            self.show_feedback_toast("コンテナの読み取りを開始できませんでした".into());
+            self.show_feedback_warning("コンテナの読み取りを開始できませんでした".into());
             return true;
         }
         if kind == SmartChildKind::ConvertibleArchive {
@@ -2820,7 +2887,7 @@ impl App {
                 crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
             );
             self.reprepare_visible_smart_root_after_staged_terminal();
-            self.show_feedback_toast("アーカイブの読み取りを開始できませんでした".into());
+            self.show_feedback_warning("アーカイブの読み取りを開始できませんでした".into());
         }
     }
 
@@ -2930,7 +2997,7 @@ impl App {
                 true
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 false
             }
         }
@@ -2990,7 +3057,7 @@ impl App {
                 true
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 false
             }
         }
@@ -3051,7 +3118,7 @@ impl App {
                     child: SmartPhysicalPreflight::ArchiveConvert,
                 };
                 drop(transition);
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 self.reprepare_visible_smart_root_after_staged_terminal();
                 return false;
             }
@@ -3332,7 +3399,7 @@ impl App {
                 ) {
                     Ok(_) => true,
                     Err(message) => {
-                        self.show_feedback_toast(message);
+                        self.show_feedback_warning(message);
                         false
                     }
                 };
@@ -3353,7 +3420,7 @@ impl App {
         {
             Ok(_) => true,
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 false
             }
         }
@@ -3619,7 +3686,7 @@ impl App {
         });
         if let SmartPhysicalReady::Error(reason) = &child {
             crate::logger::log(reason.log_line());
-            self.show_feedback_toast(reason.message().to_owned());
+            self.show_feedback_warning(reason.message().to_owned());
             self.retire_smart_folder_payloads([Box::new(child) as RetiredSmartFolderPayload]);
             return false;
         }
@@ -3630,7 +3697,7 @@ impl App {
                 && !self.smart_folder_navigation_target_current(&target, &source.logical_source))
         {
             self.retire_smart_folder_payloads([Box::new(child) as RetiredSmartFolderPayload]);
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スマートフォルダの並びが変わりました。もう一度操作してください".into(),
             );
             return false;
@@ -4350,7 +4417,7 @@ impl App {
                         if result.snapshot.diag.source_failures
                             == active_rules(&result.snapshot.definition).len()
                         {
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "スマートフォルダの検索元を1件も読み込めませんでした".into(),
                             );
                             self.retire_smart_folder_payloads([
@@ -4370,7 +4437,7 @@ impl App {
                             ) {
                                 Ok(count) => Some(SmartFolderTransitionPhase::RootCount(count)),
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4399,7 +4466,7 @@ impl App {
                                     Some(SmartFolderTransitionPhase::RootPrepare(prepare))
                                 }
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4411,7 +4478,7 @@ impl App {
                     Some(SmartFolderTransitionPhase::RootScan(pending))
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("スマートフォルダ走査が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダ走査が中断されました".into());
                     None
                 }
             },
@@ -4445,7 +4512,7 @@ impl App {
                             ) {
                                 Ok(count) => Some(SmartFolderTransitionPhase::RootCount(count)),
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4473,7 +4540,7 @@ impl App {
                                     Some(SmartFolderTransitionPhase::RootPrepare(prepare))
                                 }
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4481,7 +4548,7 @@ impl App {
                     }
                 }
                 Ok(SmartFolderPrepareEvent::Error(message)) => {
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     None
                 }
                 Ok(SmartFolderPrepareEvent::Cancelled) => None,
@@ -4493,7 +4560,7 @@ impl App {
                     Some(SmartFolderTransitionPhase::RootCount(pending))
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("スマートフォルダの件数確認が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダの件数確認が中断されました".into());
                     None
                 }
             },
@@ -4511,7 +4578,7 @@ impl App {
                     }
                 }
                 Ok(SmartFolderPrepareEvent::Error(message)) => {
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     None
                 }
                 Ok(SmartFolderPrepareEvent::Cancelled) => None,
@@ -4523,7 +4590,7 @@ impl App {
                     Some(SmartFolderTransitionPhase::RootPrepare(pending))
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("スマートフォルダの表示準備が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダの表示準備が中断されました".into());
                     None
                 }
             },
@@ -4550,7 +4617,7 @@ impl App {
                         ) {
                             Ok(pending) => Some(SmartFolderTransitionPhase::RootScan(pending)),
                             Err(message) => {
-                                self.show_feedback_toast(message);
+                                self.show_feedback_warning(message);
                                 None
                             }
                         }
@@ -4611,7 +4678,7 @@ impl App {
                                     Some(SmartFolderTransitionPhase::RootPrepare(pending))
                                 }
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4657,7 +4724,7 @@ impl App {
                                             })
                                         }
                                         Err(message) => {
-                                            self.show_feedback_toast(message);
+                                            self.show_feedback_warning(message);
                                             None
                                         }
                                     }
@@ -4666,7 +4733,7 @@ impl App {
                         }
                     }
                 } else {
-                    self.show_feedback_toast("スマートフォルダが見つかりません".into());
+                    self.show_feedback_warning("スマートフォルダが見つかりません".into());
                     None
                 }
             }
@@ -4727,7 +4794,7 @@ impl App {
                 }
                 SmartPhysicalPoll::Cancelled => None,
                 SmartPhysicalPoll::Failed(message) => {
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     None
                 }
             },
@@ -7763,11 +7830,11 @@ impl App {
             .find(|definition| definition.id == definition_id)
             .cloned()
         else {
-            self.show_feedback_toast("スマートフォルダが見つかりません".into());
+            self.show_feedback_warning("スマートフォルダが見つかりません".into());
             return None;
         };
         if active_rules(&definition).is_empty() {
-            self.show_feedback_toast("表示条件を追加してください".into());
+            self.show_feedback_warning("表示条件を追加してください".into());
             self.open_smart_folder_manager(Some(definition_id));
             return None;
         }
@@ -7788,7 +7855,7 @@ impl App {
                 Some(request_id)
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 None
             }
         }
@@ -7897,7 +7964,7 @@ impl App {
                 self.smart_folder_prepare_pending = Some(pending);
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 self.restore_pending_smart_folder_origin();
             }
         }
@@ -7994,7 +8061,7 @@ impl App {
                 });
                 self.smart_folder_prepare_pending = Some(pending);
             }
-            Err(message) => self.show_feedback_toast(message),
+            Err(message) => self.show_feedback_warning(message),
         }
     }
 
@@ -8396,7 +8463,7 @@ impl App {
         self.cancel_media_navigation_pending_for_current_context(
             "restore_prepared_smart_folder_session",
         );
-        self.close_fullscreen();
+        self.close_fullscreen_content();
         self.bump_full_context_for_load();
         self.cancel_pending_folder_nav();
         self.pdf_enumerate_pending = None;
@@ -8823,7 +8890,7 @@ impl App {
                         == active_rules(&result.snapshot.definition).len()
                     {
                         self.smart_folder_progress = None;
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "スマートフォルダの検索元を1件も読み込めませんでした".into(),
                         );
                         self.restore_pending_smart_folder_origin();
@@ -8884,7 +8951,7 @@ impl App {
                     );
                     self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
-                    self.show_feedback_toast("スマートフォルダ走査が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダ走査が中断されました".into());
                     self.restore_pending_smart_folder_origin();
                     break;
                 }
@@ -9069,7 +9136,7 @@ impl App {
                     );
                     self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     self.restore_pending_smart_folder_origin();
                     break;
                 }
@@ -9082,7 +9149,7 @@ impl App {
                     );
                     self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
-                    self.show_feedback_toast("スマートフォルダの表示準備が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダの表示準備が中断されました".into());
                     self.restore_pending_smart_folder_origin();
                     break;
                 }
@@ -9103,7 +9170,7 @@ impl App {
             self.smart_folder_local_search_reapply = Some(self.search_query.clone());
         }
         let PreparedSmartFolder {
-            mut snapshot,
+            snapshot,
             presentation,
             items,
             image_metas,
@@ -9368,14 +9435,14 @@ impl App {
                 .first()
                 .map(|(path, error)| format!(" / {}: {error}", path.display()))
                 .unwrap_or_default();
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "スマートフォルダを{prefix}: {qualifying_count}件 (読めなかった項目 {skipped}件){source_detail}"
             ));
         } else {
             self.show_feedback_toast(format!("スマートフォルダを{prefix}: {qualifying_count}件"));
         }
         if rating_sort_failed {
-            self.show_feedback_toast("評価順を読み込めなかったため名前順で表示しました".into());
+            self.show_feedback_warning("評価順を読み込めなかったため名前順で表示しました".into());
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -9671,7 +9738,7 @@ impl App {
         if let Some(id) = reopen {
             let _ = self.refresh_smart_folder_staged(id);
         } else if retired_transition {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "名前変更でスマートフォルダの読み込みを中止しました。開き直してください".into(),
             );
         }
@@ -9692,7 +9759,7 @@ impl App {
             let scanning = matches!(transition.phase, SmartFolderTransitionPhase::RootScan(_));
             let counting = matches!(transition.phase, SmartFolderTransitionPhase::RootCount(_));
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_transition_progress_modal")).show(
+            egui::Modal::new(egui::Id::unique("smart_folder_transition_progress_modal")).show(
                 ctx,
                 |ui| {
                     ui.set_min_width(460.0);
@@ -9758,7 +9825,7 @@ impl App {
             let name = confirm.snapshot.definition.name.clone();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_transition_large_confirm")).show(
+            egui::Modal::new(egui::Id::unique("smart_folder_transition_large_confirm")).show(
                 ctx,
                 |ui| {
                     ui.heading("スマートフォルダを表示");
@@ -9797,7 +9864,7 @@ impl App {
                             transition.phase = SmartFolderTransitionPhase::RootPrepare(pending);
                             self.smart_folder_transition = Some(transition);
                         }
-                        Err(message) => self.show_feedback_toast(message),
+                        Err(message) => self.show_feedback_warning(message),
                     }
                 }
             }
@@ -9807,7 +9874,7 @@ impl App {
             let name = confirm.snapshot.definition.name.clone();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_large_confirm")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("smart_folder_large_confirm")).show(ctx, |ui| {
                 ui.heading("スマートフォルダを表示");
                 ui.label(format!("「{name}」の結果は {count} 件です。"));
                 ui.label("一覧の準備に時間とメモリを使用する可能性があります。");
@@ -9856,7 +9923,7 @@ impl App {
             return;
         };
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("smart_folder_progress_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("smart_folder_progress_modal")).show(ctx, |ui| {
             // サブ展開と同じ幅・構成にして、走査中は背面の一覧を操作できないことを
             // 見た目でも明示する。処理本体と cancel の所有境界は変更しない。
             ui.set_min_width(460.0);
@@ -9910,7 +9977,7 @@ impl App {
         });
         if cancel {
             self.cancel_smart_folder_pending_and_restore_origin();
-            self.show_feedback_toast("スマートフォルダ処理を中止しました".into());
+            self.show_feedback_warning("スマートフォルダ処理を中止しました".into());
         }
         ctx.request_repaint_after(Duration::from_millis(50));
     }
@@ -10139,6 +10206,7 @@ mod tests {
                 None,
                 super::super::StartupListIntent::ExplicitList,
                 None,
+                MainListRequestStage::Admission,
             ),
             "the native classified adapter must validate the captured row identity too"
         );
@@ -10268,7 +10336,9 @@ mod tests {
             .fake_published_sender_for_test();
         publish();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert_eq!(app.fs_nav_locked_gen, None);
         assert!(
@@ -10342,6 +10412,7 @@ mod tests {
             None,
             crate::app::StartupListIntent::ExplicitList,
             None,
+            MainListRequestStage::Admission,
         ));
         let transition = app.smart_folder_transition.as_mut().unwrap();
         let request_id = transition.request_id;
@@ -10421,7 +10492,9 @@ mod tests {
         app.epub_convert.as_mut().unwrap().phase =
             crate::ui_dialogs::epub_convert::EpubConvertPhase::Error("test".into());
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_some());
         assert!(smart_epub_waiting(&app));
         let input = egui::RawInput {
@@ -10434,7 +10507,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(input, |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert!(app.smart_folder_transition.is_none());
     }

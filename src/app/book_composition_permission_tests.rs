@@ -3,6 +3,117 @@
 use super::*;
 
 #[test]
+fn book_structure_waits_for_open_permission_but_not_passive_display_reads_or_adopted_episode() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let admit = |app: &mut App| {
+        app.request_book_structural_op(
+            &ctx,
+            "permission-admission-test",
+            crate::books::BookOpIntent::SourceMutation,
+            super::super::book_structural_op::Completion::Manager,
+            || Err("test terminal".into()),
+        )
+    };
+    let candidate = CandidatePage {
+        identity: crate::book_resume_db::PageIdentity::Document {
+            container: "C:/book.pdf".into(),
+            page_num: 0,
+        },
+        physical_archive: None,
+        raw_tree: None,
+    };
+    let context_id = app.spread_shift_context_id().serial();
+    let items_generation = app.items_generation;
+    app.book_composition_permission
+        .bind(context_id, items_generation);
+    let correlation = app
+        .book_composition_permission
+        .correlation(occurrence(0), &candidate);
+    let (_tx, rx) = mpsc::channel();
+    app.book_composition_permission.occurrences.insert(
+        occurrence(0),
+        OccurrencePermission::Checking {
+            correlation,
+            candidate,
+            receiver: rx,
+        },
+    );
+    assert!(app.book_composition_permission.pending());
+    assert!(
+        admit(&mut app),
+        "passive reads do not own an unadopted open"
+    );
+    app.book_structural_op = None;
+    let intent = OpenIntent {
+        context_id: app.spread_shift_context_id().serial(),
+        items_generation: app.items_generation,
+        idx: 0,
+        history_trigger: HistoryTrigger::UserChosen,
+        materialization: FsOpenMaterialization::Eager,
+        contract: FsPageLoadContract::Sequential,
+        purpose: BookTargetPurpose::Explicit,
+        route: BookTargetRoute::FullscreenOpen(FsMetadataBoundary::Manual),
+        navigation_origin: Vec::new(),
+    };
+    app.book_composition_permission.open = OpenPermission::Checking {
+        intent: intent.clone(),
+        candidates: Vec::new(),
+    };
+    assert!(!admit(&mut app));
+    assert!(matches!(
+        app.book_composition_permission.open,
+        OpenPermission::Checking { .. }
+    ));
+    app.book_composition_permission.open = OpenPermission::Ready {
+        intent: intent.clone(),
+        candidates: Vec::new(),
+    };
+    assert!(!admit(&mut app), "buffered replies still require adoption");
+    assert!(matches!(
+        app.book_composition_permission.open,
+        OpenPermission::Ready { .. }
+    ));
+    app.book_composition_permission.open = OpenPermission::Resuming {
+        intent,
+        candidates: Vec::new(),
+    };
+    assert!(
+        admit(&mut app),
+        "an adopted navigation episode may retain its proof"
+    );
+}
+
+#[test]
+fn d3_permission_direct_landing_adopts_before_its_first_lookup() {
+    let ctx = egui::Context::default();
+    let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+        &ctx,
+        crate::settings::SpreadMode::Single,
+    );
+    let intent = OpenIntent {
+        context_id: app.spread_shift_context_id().serial(),
+        items_generation: app.items_generation,
+        idx: 1,
+        history_trigger: HistoryTrigger::UserChosen,
+        materialization: FsOpenMaterialization::Eager,
+        contract: FsPageLoadContract::Sequential,
+        purpose: BookTargetPurpose::Next,
+        route: BookTargetRoute::FullscreenNavigation,
+        navigation_origin: Vec::new(),
+    };
+    app.book_composition_permission.open = OpenPermission::Resuming {
+        intent: intent.clone(),
+        candidates: Vec::new(),
+    };
+    let key = crate::app::final_prepare_tests::queued_final(&mut app, 1);
+    crate::app::final_prepare_tests::expect_adopted_before_lookup(key, || {
+        app.resume_qualified_book_target(&ctx, &intent)
+    });
+    assert_eq!(app.fullscreen_idx, Some(1));
+}
+
+#[test]
 fn deferred_projection_wait_is_retired_by_close_source_replacement_and_fork() {
     for close in ["replace", "manual", "rating"] {
         let mut env = crate::app::setup_app_for_test();
@@ -490,6 +601,7 @@ fn navigation_open_waits_for_atomic_unit_then_requalifies_same_unit_survivor() {
             contract: FsPageLoadContract::Sequential,
             purpose: BookTargetPurpose::Next,
             route: BookTargetRoute::FullscreenNavigation,
+            navigation_origin: Vec::new(),
         },
         candidates,
     };
@@ -730,6 +842,7 @@ fn hidden_navigation_keeps_captured_identity_until_projection_order_is_ready() {
             contract: FsPageLoadContract::Sequential,
             purpose: BookTargetPurpose::Next,
             route: BookTargetRoute::FullscreenNavigation,
+            navigation_origin: Vec::new(),
         },
         candidates,
     };
@@ -1067,6 +1180,7 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
                 contract: FsPageLoadContract::Sequential,
                 purpose: BookTargetPurpose::FirstInBook,
                 route: BookTargetRoute::ZipDfs(continuation),
+                navigation_origin: Vec::new(),
             },
             candidates,
         };
@@ -1100,9 +1214,10 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
         };
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.poll_book_composition_read(ctx)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             env.zip_nav.as_ref().unwrap().current(),
             &["c-show".to_owned()],
@@ -1151,9 +1266,10 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
             }
         }
         env.book_composition_permission.open = OpenPermission::Ready { intent, candidates };
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.poll_book_composition_read(ctx)
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             matches!(env.items.get(env.fullscreen_idx.unwrap()), Some(crate::grid_item::GridItem::ZipImage { entry_name, .. }) if entry_name == "c-show/c.jpg")
         );
@@ -1234,9 +1350,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
         env.book_composition_permission.bind(context_id, generation);
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.advance_slideshow(ctx, 0)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             (
                 env.fullscreen_idx,
@@ -1275,9 +1392,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
         env.book_composition_permission.open = OpenPermission::Checking { intent, candidates };
         if stop_while_checking {
             assert!(env.stop_slideshow_playback());
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(deliver.send(hidden_reply).is_err());
             assert!(matches!(
                 env.book_composition_permission.open,
@@ -1290,9 +1408,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
             assert!(!env.slideshow_playing);
         } else {
             deliver.send(hidden_reply).unwrap();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert_eq!(
                 (
                     env.fullscreen_idx,
@@ -1311,9 +1430,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
                 _ => panic!("C checking request"),
             };
             let sequence = env.book_composition_permission.sequence;
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.advance_slideshow(ctx, 0)
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(
                 matches!(&env.book_composition_permission.open, OpenPermission::Checking { intent, candidates } if intent.idx == 2 && candidates.iter().map(|candidate| candidate.correlation.clone()).collect::<Vec<_>>() == pending)
             );
@@ -1345,9 +1465,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
                 candidate.state = OpenCandidateState::Checking(receiver);
             }
             env.book_composition_permission.open = OpenPermission::Checking { intent, candidates };
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert_eq!(env.fullscreen_idx, Some(2));
             assert_eq!(env.selected, Some(2));
             assert!(env.slideshow_playing);
@@ -1440,9 +1561,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         );
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.advance_slideshow(ctx, 0)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             (
                 env.fullscreen_page_slice,
@@ -1487,9 +1609,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         candidates[0].state = OpenCandidateState::Checking(receiver);
         env.book_composition_permission.open = OpenPermission::Checking { intent, candidates };
         let sequence = env.book_composition_permission.sequence;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.advance_slideshow(ctx, 0)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(env.book_composition_permission.sequence, sequence);
         assert!(
             matches!(&env.book_composition_permission.open, OpenPermission::Checking { candidates, .. } if candidates[0].correlation == correlation)
@@ -1500,9 +1623,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         );
         if stop_while_checking {
             assert!(env.stop_slideshow_playback());
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(deliver.send(reply).is_err());
             assert!(matches!(
                 env.book_composition_permission.open,
@@ -1522,9 +1646,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
             );
         } else {
             deliver.send(reply).unwrap();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert_eq!(env.fullscreen_idx, Some(0));
             assert_eq!(env.fullscreen_page_slice, PageSlice::Right);
             assert_eq!(

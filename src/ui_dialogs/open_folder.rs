@@ -32,6 +32,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("フォルダを開く")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -141,6 +142,10 @@ mod ime_handler_tests {
         Password,
     }
 
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn run_committed_dialog_key(dialog: Dialog, key: egui::Key, same_pass: bool) {
         let mut env = crate::app::setup_app_for_test();
         let target = env.tmp.path().join("committed-folder");
@@ -173,7 +178,8 @@ mod ime_handler_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1000.0, 600.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::ime_focus::install_ime_input_policy(ctx);
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -203,7 +209,10 @@ mod ime_handler_tests {
         assert!(harness.ctx.memory(|memory| memory.focused().is_some()));
         harness.input_mut().events = vec![
             egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("preedit".into())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "preedit".into(),
+                active_range_chars: None,
+            }),
         ];
         harness.step();
         assert!(app.borrow().ime_input_active(&harness.ctx));

@@ -186,7 +186,7 @@ const CROP_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
     FixedShortcutRow {
         keys: "Esc",
-        description: "切り取りモードを終了する",
+        description: "ドラッグを取り消す。ドラッグ中でなければ切り取りモードを終了する",
     },
     FixedShortcutRow {
         keys: "ドラッグ",
@@ -205,7 +205,7 @@ const SNS_SPLIT_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
     FixedShortcutRow {
         keys: "Esc",
-        description: "SNS 分割モードを終了する",
+        description: "ドラッグを取り消す。ドラッグ中でなければSNS 分割モードを終了する",
     },
     FixedShortcutRow {
         keys: "ドラッグ",
@@ -440,6 +440,7 @@ impl App {
         let mut close_clicked = false;
 
         egui::Window::new("ショートカット")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -450,6 +451,10 @@ impl App {
                 ui.label(format!("現在のコンテキスト: {}", help_context.title()));
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("context_shortcuts_scroll")
                     .max_height(scroll_max_h)
                     .auto_shrink([false, false])

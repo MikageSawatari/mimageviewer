@@ -43,7 +43,7 @@ try {
         'Contents\Resources\webview\THIRD-PARTY-NOTICES.txt',
         'Contents\Resources\webview\plugins\dsp\NOTICE.txt'
     )) {
-        foreach ($path in @((Join-Path $bundle $relative), (Join-Path (Join-Path $noticesRoot 'v0.13.0') $relative))) {
+        foreach ($path in @((Join-Path $bundle $relative), (Join-Path (Join-Path $noticesRoot 'v0.14.0') $relative))) {
             New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
             [System.IO.File]::WriteAllText($path, "notice $relative")
         }
@@ -51,7 +51,7 @@ try {
     $hidden = Join-Path $bundle '.gitignore'
     [System.IO.File]::WriteAllText($hidden, 'resource')
     (Get-Item -LiteralPath $hidden).Attributes = [System.IO.FileAttributes]::Hidden
-    [System.IO.File]::WriteAllText((Join-Path $source 'VERSION'), 'v0.13.0')
+    [System.IO.File]::WriteAllText((Join-Path $source 'VERSION'), 'v0.14.0')
     $fakeDll = Join-Path $bundle 'not-a-pe.dll'
     [System.IO.File]::WriteAllText($fakeDll, 'MZ')
     Assert-True (Test-MivPeFile $pePath) 'missed .vst3 PE'
@@ -64,11 +64,18 @@ try {
     Remove-Item -LiteralPath $fakeDll, $badOffset
     # Fixture approval is created once, before testing any local modification.
     $sourceFull = [System.IO.Path]::GetFullPath($source)
-    $manifestPath = Join-Path $noticesRoot 'v0.13.0\manifest.sha256'
+    $manifestPath = Join-Path $noticesRoot 'v0.14.0\manifest.sha256'
     $manifestLines = @(Get-MivTreeFiles $source | ForEach-Object {
         '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.FullName.Substring($sourceFull.Length + 1).Replace('\', '/')
     })
     [System.IO.File]::WriteAllText($manifestPath, ($manifestLines -join "`n") + "`n")
+    $versionPath = Join-Path $source 'VERSION'
+    $versionBytes = [System.IO.File]::ReadAllBytes($versionPath)
+    foreach ($unsupported in @('v0.13.0', 'v99.0.0')) {
+        [System.IO.File]::WriteAllText($versionPath, $unsupported)
+        Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'Unsupported VERSION'
+    }
+    [System.IO.File]::WriteAllBytes($versionPath, $versionBytes)
     $resource = Join-Path $bundle '.gitignore'
     $resourceBytes = [System.IO.File]::ReadAllBytes($resource)
     Write-FixtureBytes $resource ([System.Text.Encoding]::UTF8.GetBytes('modified'))
@@ -136,7 +143,7 @@ try {
         # Nonrecursive deletion removes only the junction entry.
         [System.IO.Directory]::Delete($stage)
     }
-    $notice = Join-Path $noticesRoot 'v0.13.0\Contents\Resources\THIRD-PARTY-NOTICES.txt'
+    $notice = Join-Path $noticesRoot 'v0.14.0\Contents\Resources\THIRD-PARTY-NOTICES.txt'
     [System.IO.File]::WriteAllText($notice, 'changed')
     Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'differs from vendor'
     Remove-Item -LiteralPath (Join-Path $source 'VERSION')

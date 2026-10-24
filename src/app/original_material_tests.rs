@@ -16,7 +16,7 @@ fn source_texture_sharing_survives_source_eviction_and_normal_reload_invalidates
     drop(app.ensure_final_composite_texture(&ctx, 0).unwrap());
     let old_key = app.current_edit_result_key(0);
     let old_final = app.final_composite_key_for_pixels(old_key, [4, 6], app.effective_params(0));
-    ctx.tex_manager().write().take_delta();
+    ctx.tex_manager().write().take_delta().clear();
     app.fs_cache.remove(&0);
     assert!(app.current_raw_source_pixels(0).is_none());
     assert!(ctx.tex_manager().read().meta(id).is_some());
@@ -518,13 +518,14 @@ fn original_material_backlog_merges_entry_and_preserves_sibling_context() {
             let texture_id = texture.id();
             owner.final_composite_cache.insert(
                 sibling_key,
-                FinalCompositeEntry {
+                FinalCompositeEntry::raster(
                     canonical_dims,
                     source_size,
-                    pixels: Arc::clone(&sibling_pixels),
+                    Arc::clone(&sibling_pixels),
                     texture,
-                    complete: true,
-                },
+                    DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                    true,
+                ),
             );
             assert!(owner.exact_complete_final_pixels_available(0));
             sibling_tx = Some(inject_pending(owner, OriginalMaterialEntry::MaterialOnly));
@@ -713,6 +714,9 @@ fn original_material_stage_join_preserves_commit_contract_and_cancel_consumes_on
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let pending = EraseInpaintPending {
+            display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+            ),
             idx: 0,
             items_generation: app.items_generation,
             path_key: app.page_path_key(0),
@@ -842,6 +846,8 @@ fn switch_fixture(ctx: &egui::Context, tool: PageEditTargetSwitchTool) -> AppTes
     app.fs_cache.insert(
         21,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: ctx.load_texture("switch_old", image.clone(), egui::TextureOptions::LINEAR),
             pixels: Arc::new(image),
             source_dims: Some([4, 6]),

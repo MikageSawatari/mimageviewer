@@ -488,7 +488,7 @@ impl App {
         if saved {
             self.show_feedback_toast(format!("[隠蔽スロット{}に保存]", slot));
         } else {
-            self.show_feedback_toast(format!("[隠蔽スロット{}保存失敗]", slot));
+            self.show_feedback_error(format!("[隠蔽スロット{}保存失敗]", slot));
         }
     }
 
@@ -501,11 +501,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((slot_mask, slot_shapes)) = slot_data else {
-            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[隠蔽スロット{}は空です]", slot));
             return;
         };
         if !slot_mask.iter().any(|&m| m) && slot_shapes.is_empty() {
-            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[隠蔽スロット{}は空です]", slot));
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -565,7 +565,7 @@ impl App {
     /// bump して全 idx を stale 扱いにする (次回 compose で再生成)。
     pub(crate) fn apply_conceal_preset(&mut self, slot: usize) {
         let Some(preset) = self.settings.conceal_presets.get(slot).cloned().flatten() else {
-            self.show_feedback_toast(format!("[プリセット{}は空]", slot + 1));
+            self.show_feedback_warning(format!("[プリセット{}は空]", slot + 1));
             return;
         };
         self.settings.conceal_type = preset.conceal_type;
@@ -620,6 +620,9 @@ impl App {
         ctx: &egui::Context,
         _fs_idx: usize,
     ) -> FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = FsKeyAction {
             page_transition: Default::default(),
             close: false,
@@ -694,7 +697,7 @@ impl App {
             if self.redo_conceal() {
                 self.show_feedback_toast("[やり直す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -712,7 +715,7 @@ impl App {
             if self.undo_conceal() {
                 self.show_feedback_toast("[元に戻す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -1063,7 +1066,7 @@ impl App {
         seed_y: usize,
     ) {
         let Some((source, _)) = self.current_conceal_source_pixels(fs_idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う加工前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1071,14 +1074,14 @@ impl App {
         };
         let [w, h] = self.conceal_mask_size;
         if source.size != [w, h] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
             return;
         }
         let Some(mask) = self.conceal_mask.as_ref() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使うマスクを準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1103,7 +1106,7 @@ impl App {
         match outcome {
             crate::mask_db::BucketFillOutcome::Filled => {}
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
                 return;
@@ -1113,7 +1116,7 @@ impl App {
                 if let Some(message) =
                     crate::ui_helpers::bucket_shape_fit_failed_message(self.conceal_bucket_region)
                 {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
                 return;
             }
@@ -1321,15 +1324,25 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
         if self.fs_primary_suppression.is_active() {
             return;
         }
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
-        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| i.pointer.primary_released());
-        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed())
+        let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
+        let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
+        let primary_released = ctx.input(|i| {
+            primary_allowed
+                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                && i.pointer.primary_released()
+        });
+        let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
             && self
                 .settings
                 .ring_shortcuts
@@ -1404,7 +1417,7 @@ impl App {
                         img_pos.1.floor() as usize,
                     );
                 } else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "バケツの対象画像を確認できません。画像を開き直してからもう一度クリックしてください。"
                             .to_string(),
                     );
@@ -1958,12 +1971,23 @@ impl App {
         viewport_id: egui::ViewportId,
     ) {
         let (pointer_pos, primary_down) = conceal_preview_pointer_state(ctx, viewport_id);
+        // This pipeline read precedes the target viewport's per-pass input capture. A held
+        // press already has its canonical owner from the previous pass; do not reinterpret
+        // that overflow press as an eye-button hold after entering conceal mode by key.
+        let primary_down = primary_down && !self.fs_front_pointer.owns_primary_in(viewport_id);
         self.conceal_preview_active = conceal_preview_pointer_active(
             self.conceal_mode,
             self.conceal_preview_button_rect,
             pointer_pos,
             primary_down,
         );
+        #[cfg(test)]
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("conceal_pipeline_preview_test_active"),
+                self.conceal_preview_active,
+            )
+        });
     }
 
     /// マスクオーバーレイ + ハンドル + ツールプレビュー + パネルを描画する。
@@ -2236,15 +2260,16 @@ impl App {
         let sink_rect =
             egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, panel_h + 8.0));
 
-        egui::Area::new(egui::Id::new("conceal_panel"))
+        egui::Area::new(egui::Id::unique("conceal_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() { ui.disable(); }
                 // 1. sink を widget より前に登録 (egui の hit test 後勝ちルール対策)
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("conceal_panel_click_sink"),
+                    egui::Id::unique("conceal_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 // 2. Frame::popup で背景 + 内容を描く (auto-size、clipping なし)
@@ -2356,7 +2381,7 @@ impl App {
                                 ui.set_min_width(PANEL_W);
                                 ui.set_max_width(PANEL_W);
                                 ui.set_min_height(body_height);
-                                egui::ScrollArea::vertical()
+                                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
@@ -3289,7 +3314,7 @@ mod tests {
             ],
             ..Default::default()
         });
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(
             conceal_preview_pointer_state(&ctx, fullscreen_id),

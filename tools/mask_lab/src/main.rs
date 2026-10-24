@@ -9,6 +9,7 @@ use image::{ImageBuffer, Rgba, RgbaImage};
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default()
             .with_title("mIV Mask Lab")
             .with_inner_size([1280.0, 840.0])
@@ -81,6 +82,10 @@ struct MaskLabApp {
 
 impl MaskLabApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.quit_shortcuts.clear());
+        cc.egui_ctx
+            .global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
         let mut app = Self {
             image: None,
             texture: None,
@@ -272,10 +277,12 @@ impl MaskLabApp {
 }
 
 impl eframe::App for MaskLabApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root_ui.ctx().clone();
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
-            if let Some(path) = file.path {
+            {
+                let path = file.path().to_path_buf();
                 self.load_path(ctx, &path);
                 break;
             }
@@ -291,10 +298,10 @@ impl eframe::App for MaskLabApp {
             self.polygon.clear();
         }
 
-        egui::SidePanel::left("tools")
+        egui::Panel::left("tools")
             .resizable(false)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show(root_ui, |ui| {
                 ui.heading("Mask Lab");
                 ui.label(&self.status);
                 ui.separator();
@@ -391,7 +398,7 @@ impl eframe::App for MaskLabApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             self.ensure_mask_texture(ctx);
             let (img_w, img_h, tex_id) = match (&self.image, &self.texture) {
                 (Some(img), Some(tex)) => (img.w, img.h, tex.id()),

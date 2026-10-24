@@ -30,7 +30,7 @@ pub(crate) enum Action {
 /// The same process modal blocks pointer/focus in every displayed viewport,
 /// including a sibling that does not own the conversion's dialog.
 pub(crate) fn block_background(ctx: &egui::Context) {
-    let _ = egui::Modal::new(egui::Id::new("image_folder_zip_input_barrier"))
+    let _ = egui::Modal::new(egui::Id::unique("image_folder_zip_input_barrier"))
         .frame(egui::Frame::NONE)
         .backdrop_color(egui::Color32::TRANSPARENT)
         .show(ctx, |_| {});
@@ -52,8 +52,8 @@ pub(crate) fn draw(
     let mut open = true;
     let result = matches!(phase, Phase::Result { .. });
     let notice = matches!(phase, Phase::GuideConfirm(_));
-    egui::Window::new("画像フォルダを ZIP に変換")
-        .id(egui::Id::new("image_folder_zip_modal"))
+    egui::Window::new("画像フォルダを ZIP に変換").drag_area(egui::WindowDrag::Anywhere)
+        .id(egui::Id::unique("image_folder_zip_modal"))
         .order(egui::Order::Foreground)
         .open(&mut open).collapsible(false).resizable(true)
         .default_pos(rect.min+egui::vec2(20.0,20.0))
@@ -62,7 +62,7 @@ pub(crate) fn draw(
             ui.style_mut().spacing.scroll.floating_allocated_width = ui.spacing().scroll.bar_inner_margin + ui.spacing().scroll.bar_width;
             let action_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0;
             let body_height = (ui.available_height()-action_height).max(40.0);
-            egui::ScrollArea::vertical().auto_shrink([false,true]).max_height(body_height).show(ui, |ui| {
+            egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() }).auto_shrink([false,true]).max_height(body_height).show(ui, |ui| {
                 ui.label("元のフォルダは残します。画像を再圧縮せずに保存します。");
                 ui.label(egui::RichText::new(source.display().to_string()).strong());
                 ui.label("作成先:");

@@ -32,7 +32,7 @@ pub enum StartupDiagnosticEvent {
         success: bool,
     },
     AdapterSelected(wgpu::AdapterInfo),
-    /// Emitted only after the real root `SurfaceTexture::present` returns.
+    /// Emitted only after the real root `Queue::present` returns.
     RootPresented {
         frame: u64,
         normal: bool,
@@ -49,12 +49,14 @@ pub struct RootStartupFrameTag {
     pub normal: bool,
 }
 
+#[cfg(feature = "capture")]
 fn tag_id() -> egui::Id {
-    egui::Id::new("miv.root_startup_frame_tag")
+    egui::Id::unique("miv.root_startup_frame_tag")
 }
 
 /// Call once on every root App pass with that pass's actual shell state.
 /// Child viewports cannot overwrite the root's tag.
+#[cfg(feature = "capture")]
 pub fn set_root_startup_frame_tag(ctx: &egui::Context, normal: bool) {
     if ctx.viewport_id() != egui::ViewportId::ROOT {
         return;
@@ -69,6 +71,7 @@ pub fn set_root_startup_frame_tag(ctx: &egui::Context, normal: bool) {
 
 /// Capture after Context::run has accepted its final pass. Missing final tags
 /// are fail-closed: an earlier discarded Normal pass cannot prove readiness.
+#[cfg(feature = "capture")]
 pub fn take_root_startup_frame_tag(ctx: &egui::Context) -> RootStartupFrameTag {
     let frame = ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT);
     let pass = ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
@@ -80,12 +83,14 @@ pub fn take_root_startup_frame_tag(ctx: &egui::Context) -> RootStartupFrameTag {
     }
 }
 
+#[cfg(feature = "winit")]
 #[derive(Default)]
 pub(crate) struct RootPresentObserver {
     first_returned: bool,
     normal_returned: bool,
 }
 
+#[cfg(feature = "winit")]
 impl RootPresentObserver {
     pub(crate) fn pending(&self) -> bool {
         !self.normal_returned
@@ -119,37 +124,45 @@ impl RootPresentObserver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "winit"))]
 mod tests {
     use super::*;
 
     #[test]
     fn final_pass_tag_wins_and_missing_final_tag_is_not_normal() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
             set_root_startup_frame_tag(ctx, ctx.current_pass_index() == 0);
             if ctx.current_pass_index() == 0 {
                 ctx.request_discard("exercise final overlay pass");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(!take_root_startup_frame_tag(&ctx).normal);
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
             set_root_startup_frame_tag(ctx, ctx.current_pass_index() > 0);
             if ctx.current_pass_index() == 0 {
                 ctx.request_discard("exercise final normal pass");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(take_root_startup_frame_tag(&ctx).normal);
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
             if ctx.current_pass_index() == 0 {
                 set_root_startup_frame_tag(ctx, true);
                 ctx.request_discard("final pass intentionally has no tag");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(!take_root_startup_frame_tag(&ctx).normal);
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
             set_root_startup_frame_tag(ctx, true)
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(take_root_startup_frame_tag(&ctx).normal);
         assert!(!take_root_startup_frame_tag(&ctx).normal);
     }

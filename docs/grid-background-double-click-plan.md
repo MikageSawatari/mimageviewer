@@ -178,7 +178,8 @@ filename、形式・評価・タグ・編集・bookmark時刻・stack数・動�
 | 読込済み画像、ZIP画像、PDFページ、Stack、動画 | aspect fitした描画画像の外がletterbox。実際のoverlay部分は項目 |
 | 読込済みフォルダ、ZIP／PDF／変換書庫、ZIP内directory／archive | 代表画像も同じaspect fit。画像外・ラベル外の余白が背景 |
 | 読込済みSearchContainer代表画像 | 上部62%枠でfitした画像外がletterbox。下部label plate・種別marker・件数は項目 |
-| フォルダ／ドライブ／ZIP内directoryのアイコン表示、代表画像なしSearchContainer | bitmapのaspect-fit letterboxはない。描いたアイコン・ラベル・件数以外の空白が背景 |
+| フォルダ／ドライブ／ZIP内directoryのアイコン表示 | bitmapのaspect-fit letterboxはない。アイコン周囲を含むセル内側（4pt外周を除く）が項目（§1.399）。描いたラベル等も従来どおり項目 |
+| 代表画像なしSearchContainer | 描いたアイコン・ラベル・件数以外の空白が背景 |
 | アルバムアート読込済み音声 | aspect fitしたアート画像の外がletterbox。設定に従って実際に描いた音声マーク・音声badge・ファイル名は項目。§1.347との結合時（2026-10-08）に同じ描画ownerへ統合 |
 | アートなし（NoArt）／読込中・Evicted・失敗の音声、画像／動画／archiveの読込中・Evicted・失敗plate、CollectionPlaceholder | 内側plateを塗りつぶすためaspect-fit letterboxはない。内側全体と描いたアイコン・caption・理由が項目で、それらに覆われない外周余白だけ背景 |
 | 詳細一覧 | 行内は従来どおり項目。最終行より下の空白だけ背景 |
@@ -223,3 +224,32 @@ resume帯OFF・小さいセルでは内側plateから文字がはみ出しても
 回帰検証は`process_scroll`→`render_grid`で、押下→読込み完了→ドラッグ開始のnative要求を検査する
 （shell実行はしない）。逆方向の描画変更と、小さいセル・resume帯OFFで実際に描いたcaption／理由／
 plate文字の外周クリックも検査する。利用者決定・保存形式への変更や新しい利用者質問はない。
+
+## §1.399 フォルダアイコン周囲の操作領域（2026-10-18）
+
+代表画像のない実Folder・ドライブ・通常ZipDirは、小さいアイコンだけを項目としていたため、
+その周囲のセル内側が背景親操作へ渡っていた。`grid_paint::paint_cell` の同じ `inner` を
+アイコン配置とヒット登録に共有する。追加の矩形計算・入力状態・ダブルクリック認識器は作らない。
+代表画像が届けば従来の画像fit矩形へ戻り、外周4ptと実際の空き領域は背景のまま。
+ZipDirの内側archive、PDF等のplateは既にinner全体を所有しているため変更しない。
+SearchContainerは独自の代表枠・階層ラベルを持つため、全セル扱いには広げない。
+
+押下所属・drag・touch・取消は既存の単一pairing ownerを共有する。長時間処理や非同期の
+状態追加はなく、modal化は不要。まれな失敗は既定の割り切り方針を維持する。
+実描画順の回帰は `background_click_scroll_regression_tests::letterbox_real_grid_folder_icon*`。
+
+### 自動検証（2026-10-18、backlog-1399の未コミット差分）
+
+- 修正前のfolder icon回帰4件は1成功・3失敗（exit 101）。選択・drag押下所属・touchで失敗し、外周／空白の親操作は成功。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/background_click_scroll_regression_tests/) | test(/grid_reclick_open_tests/) | test(/app::grid_paint::/)' --no-fail-fast`: 125成功、exit 0。既存snapshot差なし、PNG更新なし。
+- 変異: 通常ZipDirのinner登録だけを削除すると選択／open回帰1件が失敗（exit 101）。Folderのinnerをcell全体へ広げると外周／空白回帰1件が失敗（exit 101）。両変異を復元後、folder icon回帰4件が成功（exit 0）。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --check`: exit 0。
+- 初回native buildはG:上のMSBuild並列実行／PDB作成で失敗。検証プロセス内の`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1`、`_CL_=/Z7`で準備し、その後のfocusedはjobs=24。設定ファイルは変更していない。FFmpeg DLL 6本を`target/debug/deps`へコピー。
+- ログ: `target/1399-{red-valid,focused,mutation-zipdir,mutation-whole-cell,restored,check,fmt}.log`。変異の復元時はmtimeを進めて再コンパイルし、変異版実行体の再利用を避けた。
+- 2項目統合後の全lib結果は`target/test-lib-full/`台帳を参照。製品build・live試験は今回の依頼により実施しない。
+
+## §1.399 の実機確認 (2026-10-18)
+
+設計担当 (ClaudeCode) が確認用ビルド (`backlog-1399`、`c84bea5dd`) を使い捨ての data-dir で起動し、設定「サムネイルの余白部分のダブルクリックで親フォルダへ移動」を ON にして確かめた。
+代表画像のないフォルダ (空のフォルダ、テキストだけのフォルダ、ZIP だけのフォルダ) のアイコンから離れたセル内側をダブルクリックすると、そのフォルダが開いた。
+空の一覧の余白と、一覧のセルより下の空き領域のダブルクリックでは、従来どおり親フォルダへ戻った。

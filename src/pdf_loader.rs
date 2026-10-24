@@ -1168,6 +1168,70 @@ pub enum CancelWaitPolicy {
     HarvestOnCancel,
 }
 
+// Share the production cancellation/harvest loop with deterministic receive tests.
+fn wait_for_pool_reply<T>(
+    mut receive: impl FnMut(std::time::Duration) -> Result<std::io::Result<T>, mpsc::RecvTimeoutError>,
+    cancel: Option<&Arc<AtomicBool>>,
+    cancel_policy: CancelWaitPolicy,
+    perf_key: Option<&str>,
+) -> std::io::Result<T> {
+    let t_wait = std::time::Instant::now();
+    let mut harvest_logged = false;
+    loop {
+        match receive(std::time::Duration::from_millis(50)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(c) = cancel
+                    && c.load(Ordering::Relaxed)
+                {
+                    match cancel_policy {
+                        CancelWaitPolicy::AbortOnCancel => {
+                            if crate::perf::is_enabled() {
+                                let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+                                crate::perf::event(
+                                    "pdf",
+                                    "pool_cancel_requester",
+                                    perf_key,
+                                    0,
+                                    &[("waited_ms", serde_json::Value::from(waited_ms))],
+                                );
+                            }
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "cancelled while waiting for reply",
+                            ));
+                        }
+                        CancelWaitPolicy::HarvestOnCancel => {
+                            // 初回のみ perf イベント (harvest 待ちが発動した旨)。
+                            // 以降は同じループで何度 cancel.load() が true でも追加発火しない。
+                            if !harvest_logged {
+                                harvest_logged = true;
+                                if crate::perf::is_enabled() {
+                                    let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+                                    crate::perf::event(
+                                        "pdf",
+                                        "pool_cancel_harvest_wait",
+                                        perf_key,
+                                        0,
+                                        &[("waited_ms", serde_json::Value::from(waited_ms))],
+                                    );
+                                }
+                            }
+                            // 待ち継続 → 次の iteration で reply を待つ
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "pdf-pool dispatcher disconnected",
+                ));
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Context epoch (render ジョブの世代管理)
 // -----------------------------------------------------------------------
@@ -4046,61 +4110,12 @@ impl PdfWorkerPool {
         // - HarvestOnCancel: cancel が立っても reply を待ち続け、in-flight IPC があれば
         //   結果を harvest する。caller (= load_one_cached) が cache 保存に進めて、
         //   PDFium の処理結果を投資回収する
-        let t_wait = std::time::Instant::now();
-        let mut harvest_logged = false;
-        loop {
-            match reply_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(result) => return result,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(c) = cancel
-                        && c.load(Ordering::Relaxed)
-                    {
-                        match cancel_policy {
-                            CancelWaitPolicy::AbortOnCancel => {
-                                if crate::perf::is_enabled() {
-                                    let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
-                                    crate::perf::event(
-                                        "pdf",
-                                        "pool_cancel_requester",
-                                        perf_key.as_deref(),
-                                        0,
-                                        &[("waited_ms", serde_json::Value::from(waited_ms))],
-                                    );
-                                }
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Interrupted,
-                                    "cancelled while waiting for reply",
-                                ));
-                            }
-                            CancelWaitPolicy::HarvestOnCancel => {
-                                // 初回のみ perf イベント (harvest 待ちが発動した旨)。
-                                // 以降は同じループで何度 cancel.load() が true でも追加発火しない。
-                                if !harvest_logged {
-                                    harvest_logged = true;
-                                    if crate::perf::is_enabled() {
-                                        let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
-                                        crate::perf::event(
-                                            "pdf",
-                                            "pool_cancel_harvest_wait",
-                                            perf_key.as_deref(),
-                                            0,
-                                            &[("waited_ms", serde_json::Value::from(waited_ms))],
-                                        );
-                                    }
-                                }
-                                // 待ち継続 → 次の iteration で reply を待つ
-                            }
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "pdf-pool dispatcher disconnected",
-                    ));
-                }
-            }
-        }
+        wait_for_pool_reply(
+            |timeout| reply_rx.recv_timeout(timeout),
+            cancel,
+            cancel_policy,
+            perf_key.as_deref(),
+        )
     }
 
     fn parse_enumerate_response(data: &[u8]) -> std::io::Result<PdfEnumerateResult> {
@@ -6620,6 +6635,30 @@ pub(crate) fn completed_enumerate_handle_for_test(
     completed_enumerate_handle(pdf_path, result)
 }
 
+/// Keep the real coordinator/request correlation while delivering completion after
+/// the consumer's close. No PDFium process or timing-dependent worker is needed.
+#[cfg(test)]
+pub(crate) fn pending_enumerate_handle_for_test(
+    pdf_path: &Path,
+) -> (
+    PdfEnumerateHandle,
+    impl FnOnce(std::io::Result<Vec<PdfPageEntry>>),
+) {
+    let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+    let key = PdfEnumerateKey::new(pdf_path, None);
+    let (handle, admission) = coordinator.subscribe(key.clone());
+    let PdfEnumerateAdmission::Start(start) = admission else {
+        unreachable!("a fresh test coordinator must start one request");
+    };
+    (handle, move |result| {
+        coordinator.complete(
+            &key,
+            start.request_id,
+            result.map(Into::into).map_err(Into::into),
+        );
+    })
+}
+
 /// UI および worker preflight のナビゲーション経路の PDF ページ列挙。
 ///
 /// Ctrl+↑↓ で PDF を高速連打したときの grid 更新頻度を上げるため、以下を組み合わせる:
@@ -7031,12 +7070,38 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
         let scale = target as f32 / long;
         return (w * scale, h * scale);
     };
-    let (width, height) = crate::fast_resize::aspect_accurate_fit_dimensions(
-        (target, target),
-        (target, target),
-        source_dims,
-    );
+    let (width, height) = render_dimensions_for_layout(target, source_dims);
     (width as f32, height as f32)
+}
+
+/// The same integer sizing contract is used by the worker and cache sufficiency checks.
+pub(crate) fn render_dimensions_for_layout(target: u32, layout_dims: (u32, u32)) -> (u32, u32) {
+    crate::fast_resize::aspect_accurate_fit_dimensions(
+        (target, target),
+        (target, target),
+        layout_dims,
+    )
+}
+
+pub(crate) fn raster_matches_render_target(
+    cached_long: u32,
+    target: u32,
+    layout_dims: Option<(u32, u32)>,
+) -> bool {
+    let ratio = cached_long as f32 / target.max(1) as f32;
+    if (0.9..=1.1).contains(&ratio) {
+        return true;
+    }
+    // Only undersized rasters need the integer sizing calculation. Thin pages can
+    // legitimately render below 90% of target to preserve the existing aspect accuracy.
+    if ratio >= 0.9 {
+        return false;
+    }
+    let Some(layout_dims) = layout_dims else {
+        return false;
+    };
+    let (w, h) = render_dimensions_for_layout(target, layout_dims);
+    (0.9..=1.1).contains(&(cached_long as f32 / w.max(h) as f32))
 }
 
 // -----------------------------------------------------------------------
@@ -8344,6 +8409,43 @@ C:\isolated\miv-data"#
                 "{width}x{height} -> {render_w}x{render_h}: {relative_error:.6}"
             );
         }
+    }
+
+    #[test]
+    fn pdf_render_target_cache_match_uses_the_workers_integer_dimensions() {
+        for (points, target) in [
+            ((600.0, 900.0), 1702),
+            ((1643.0, 2375.0), 473),
+            ((1.0, 160.0), 256),
+            ((1.0, 5000.0), 8192),
+        ] {
+            let layout = PdfPageSizePoints {
+                width: points.0,
+                height: points.1,
+            }
+            .catalog_layout_dims()
+            .unwrap();
+            let (w, h) = fit_to_target(points.0, points.1, target as f32);
+            let dims = render_dimensions_for_layout(target, layout);
+            assert_eq!((w as u32, h as u32), dims);
+            assert!(raster_matches_render_target(
+                dims.0.max(dims.1),
+                target,
+                Some(layout)
+            ));
+            assert!(!raster_matches_render_target(
+                dims.0.max(dims.1) / 2,
+                target,
+                Some(layout)
+            ));
+        }
+        assert!(!raster_matches_render_target(160, 256, None));
+        assert!(raster_matches_render_target(256, 256, None));
+        assert!(!raster_matches_render_target(
+            512,
+            256,
+            Some((1000, 160_000))
+        ));
     }
 
     #[test]
@@ -10261,100 +10363,78 @@ C:\isolated\miv-data"#
         assert_eq!(q.normal_in_flight, lane_caps.normal);
     }
 
-    fn mock_recv_loop(
-        reply_rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
-        cancel: Arc<AtomicBool>,
-        policy: CancelWaitPolicy,
-    ) -> std::io::Result<Vec<u8>> {
-        loop {
-            match reply_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                Ok(result) => return result,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if cancel.load(Ordering::Relaxed) {
-                        match policy {
-                            CancelWaitPolicy::AbortOnCancel => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Interrupted,
-                                    "cancelled",
-                                ));
-                            }
-                            CancelWaitPolicy::HarvestOnCancel => {
-                                // 待ち継続
-                            }
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "disconnected",
-                    ));
-                }
-            }
-        }
-    }
-
     #[test]
     fn abort_on_cancel_returns_interrupted_immediately() {
-        let (_tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
-        // 別スレッドで 30 ms 後に cancel を立てる (reply は来ない = receiver hold)
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            cancel_clone.store(true, Ordering::Relaxed);
-        });
-        let t0 = std::time::Instant::now();
-        let result = mock_recv_loop(rx, cancel, CancelWaitPolicy::AbortOnCancel);
-        let elapsed_ms = t0.elapsed().as_millis();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
-        // ~30-50 ms (cancel 検出 + 次の timeout) で返るはず
-        assert!(
-            elapsed_ms < 200,
-            "AbortOnCancel should return quickly, took {elapsed_ms}ms"
+        let mut attempts = 0;
+        let mut cancelled_attempts = 0;
+        let result = wait_for_pool_reply::<Vec<u8>>(
+            |timeout| {
+                assert_eq!(timeout, std::time::Duration::from_millis(50));
+                attempts += 1;
+                assert!(
+                    attempts <= 2,
+                    "abort must not wait for a reply after cancellation"
+                );
+                if attempts == 2 {
+                    cancel.store(true, Ordering::Relaxed);
+                    cancelled_attempts += 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout)
+            },
+            Some(&cancel),
+            CancelWaitPolicy::AbortOnCancel,
+            None,
         );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(attempts, 2);
+        assert_eq!(cancelled_attempts, 1);
     }
 
     #[test]
     fn harvest_on_cancel_waits_for_reply() {
-        let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
-        let tx_clone = tx.clone();
-        // 30 ms 後に cancel、80 ms 後に reply を投入
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            cancel_clone.store(true, Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = tx_clone.send(Ok(vec![1, 2, 3]));
-        });
-        drop(tx); // 元の tx は drop して、clone した tx だけが live
-        let t0 = std::time::Instant::now();
-        let result = mock_recv_loop(rx, cancel, CancelWaitPolicy::HarvestOnCancel);
-        let elapsed_ms = t0.elapsed().as_millis();
-        // HarvestOnCancel: cancel が立っても待ち続け、reply (= Ok([1,2,3])) を受け取る
-        assert!(
-            result.is_ok(),
-            "harvest should receive reply, got {result:?}"
+        let mut attempts = 0;
+        let result = wait_for_pool_reply(
+            |_| {
+                attempts += 1;
+                match attempts {
+                    1 => Err(mpsc::RecvTimeoutError::Timeout),
+                    2 | 3 => {
+                        cancel.store(true, Ordering::Relaxed);
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    }
+                    4 => Ok(Ok(vec![1, 2, 3])),
+                    _ => panic!("must return the harvested reply"),
+                }
+            },
+            Some(&cancel),
+            CancelWaitPolicy::HarvestOnCancel,
+            None,
         );
         assert_eq!(result.unwrap(), vec![1, 2, 3]);
-        // ~80 ms 後 + 1 timeout = ~80-100 ms
-        assert!(
-            elapsed_ms >= 70,
-            "harvest should have waited at least 70ms, took {elapsed_ms}ms"
-        );
+        assert_eq!(attempts, 4);
     }
 
     #[test]
     fn harvest_on_cancel_still_returns_on_disconnect() {
-        let (tx, rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
-        let cancel = Arc::new(AtomicBool::new(true)); // 最初から cancel
-        drop(tx); // sender 即 drop → receiver は disconnected を受ける
-        let result = mock_recv_loop(rx, cancel, CancelWaitPolicy::HarvestOnCancel);
-        assert!(result.is_err());
-        // disconnected の Other エラーが返るはず
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut attempts = 0;
+        let result = wait_for_pool_reply::<Vec<u8>>(
+            |_| {
+                attempts += 1;
+                match attempts {
+                    1 => Err(mpsc::RecvTimeoutError::Timeout),
+                    2 => Err(mpsc::RecvTimeoutError::Disconnected),
+                    _ => panic!("must return on disconnect"),
+                }
+            },
+            Some(&cancel),
+            CancelWaitPolicy::HarvestOnCancel,
+            None,
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
+        assert_eq!(attempts, 2);
     }
 
     // ── promote_to_high_normal tests (JobQueue 直操作で API ロジックを検証) ──

@@ -859,7 +859,7 @@ fn draw_native_seek_strip_lock_button(
     let response = ui
         .interact(
             lock_rect,
-            egui::Id::new("native_video_seek_strip_lock"),
+            egui::Id::unique("native_video_seek_strip_lock"),
             egui::Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1033,7 +1033,6 @@ fn consume_seek_strip_wheel(
         return steps;
     }
     ctx.input_mut(|input| {
-        input.raw_scroll_delta = egui::Vec2::ZERO;
         input.smooth_scroll_delta = egui::Vec2::ZERO;
         input
             .events
@@ -1125,7 +1124,7 @@ fn draw_native_seek_strip(
         stamp: strip.stamp,
     });
 
-    egui::Area::new(egui::Id::new("native_video_seek_strip"))
+    egui::Area::new(egui::Id::unique("native_video_seek_strip"))
         .order(egui::Order::Foreground)
         .fixed_pos(strip_rect.min)
         .show(ctx, |ui| {
@@ -1391,7 +1390,7 @@ fn draw_native_seek_strip(
                 crate::video::seek_strip_layout::seek_strip_lock_button_rect(local_rect);
             let response = ui.interact(
                 local_rect,
-                egui::Id::new("native_video_seek_strip_drag"),
+                egui::Id::unique("native_video_seek_strip_drag"),
                 egui::Sense::click_and_drag(),
             );
             // 鍵はストリップ全面の `click_and_drag` と同じ矩形の中にある。egui は重なった
@@ -1583,7 +1582,7 @@ fn draw_native_seek_strip_menu_button(
     let enabled = unavailable_tooltip.is_none();
     let response = ui.interact(
         button_rect,
-        egui::Id::new("native_video_seek_strip_selector"),
+        egui::Id::unique("native_video_seek_strip_selector"),
         if enabled {
             egui::Sense::click()
         } else {
@@ -1635,7 +1634,7 @@ fn draw_native_seek_strip_menu_button(
         *menu_open = !*menu_open;
         if *menu_open {
             ui.ctx().data_mut(|data| {
-                data.remove_temp::<f32>(egui::Id::new("native_video_seek_strip_menu_scroll"))
+                data.remove_temp::<f32>(egui::Id::unique("native_video_seek_strip_menu_scroll"))
             });
         }
     }
@@ -1785,7 +1784,7 @@ fn draw_native_seek_strip_menu(
         + SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
         + SEEK_STRIP_MENU_SEPARATOR_HEIGHT;
     let max_scroll = (content_height - size.y).max(0.0);
-    let scroll_id = egui::Id::new("native_video_seek_strip_menu_scroll");
+    let scroll_id = egui::Id::unique("native_video_seek_strip_menu_scroll");
     let mut scroll = ctx
         .data_mut(|data| data.get_temp::<f32>(scroll_id))
         .unwrap_or(0.0)
@@ -1793,18 +1792,21 @@ fn draw_native_seek_strip_menu(
     if max_scroll > 0.0
         && anchor.contains(ctx.input(|input| input.pointer.hover_pos().unwrap_or_default()))
     {
-        let delta = ctx.input(|input| input.raw_scroll_delta.y);
-        if delta < -0.1 {
-            scroll = (scroll + row_height).min(max_scroll);
-        } else if delta > 0.1 {
-            scroll = (scroll - row_height).max(0.0);
+        let options = ctx.options(|options| options.input_options);
+        let wheel = ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, options));
+        for delta in wheel.into_iter().map(|wheel| wheel.delta.y) {
+            if delta < -0.1 {
+                scroll = (scroll + row_height).min(max_scroll);
+            } else if delta > 0.1 {
+                scroll = (scroll - row_height).max(0.0);
+            }
         }
     }
     ctx.data_mut(|data| data.insert_temp(scroll_id, scroll));
 
     let mut selected = None;
     let mut drawn_rect = anchor;
-    egui::Area::new(egui::Id::new("native_video_seek_strip_menu"))
+    egui::Area::new(egui::Id::unique("native_video_seek_strip_menu"))
         .order(egui::Order::Foreground)
         .fixed_pos(anchor.min)
         .show(ctx, |ui| {
@@ -1887,7 +1889,7 @@ fn draw_native_seek_strip_menu(
                 draw_choice(
                     ui,
                     item_rect,
-                    egui::Id::new(("native_video_seek_strip_menu_view", index)),
+                    egui::Id::unique(("native_video_seek_strip_menu_view", index)),
                     label,
                     *is_current,
                     command,
@@ -1949,7 +1951,7 @@ fn draw_native_seek_strip_menu(
                 draw_choice(
                     ui,
                     left_rect,
-                    egui::Id::new(("native_video_seek_strip_menu_height", index)),
+                    egui::Id::unique(("native_video_seek_strip_menu_height", index)),
                     &height_row.0,
                     height_row.1,
                     &height_row.2,
@@ -1957,7 +1959,7 @@ fn draw_native_seek_strip_menu(
                 draw_choice(
                     ui,
                     right_rect,
-                    egui::Id::new(("native_video_seek_strip_menu_preview", index)),
+                    egui::Id::unique(("native_video_seek_strip_menu_preview", index)),
                     &preview_row.0,
                     preview_row.1,
                     &preview_row.2,
@@ -2045,12 +2047,15 @@ pub(crate) fn draw_native_audio_track_menu(
         })
         .min(max_first);
     if anchor.contains(ctx.input(|input| input.pointer.hover_pos().unwrap_or_default())) {
-        let delta = ctx.input(|input| input.raw_scroll_delta.y);
-        if delta < -0.1 {
-            first = (first + 1).min(max_first);
-        }
-        if delta > 0.1 {
-            first = first.saturating_sub(1);
+        let options = ctx.options(|options| options.input_options);
+        let wheel = ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, options));
+        for delta in wheel.into_iter().map(|wheel| wheel.delta.y) {
+            if delta < -0.1 {
+                first = (first + 1).min(max_first);
+            }
+            if delta > 0.1 {
+                first = first.saturating_sub(1);
+            }
         }
     }
     ctx.data_mut(|data| data.insert_temp(scroll_id, first));
@@ -2152,7 +2157,7 @@ pub(crate) fn draw_native_audio_track_menu(
 }
 
 fn native_audio_track_menu_id() -> egui::Id {
-    egui::Id::new("native_video_audio_track_menu")
+    egui::Id::unique("native_video_audio_track_menu")
 }
 
 fn reset_native_audio_track_menu_for_source_change(
@@ -3065,10 +3070,15 @@ pub(super) struct NativeOverlayToast {
     pub(super) text: String,
     pub(super) started_at: Instant,
     pub(super) centered: bool,
-    /// このトーストを表示し続ける時間。`started_at` からこれを過ぎたら消す。
-    /// `show_toast` で `linger` 指定があればその値、無ければ `centered` から導いた
-    /// 既定値 (centered: 2.5s / それ以外: 1.8s) が入る。
-    linger: Duration,
+    /// Resolved lifetime and fade preserve the legacy independent clocks.
+    /// Expiry uses native_linger; drawing uses the resolved 1.8/2.5-second fade baseline.
+    timing: crate::feedback::ResolvedFeedbackTiming,
+}
+
+impl NativeOverlayToast {
+    pub(super) fn opacity_at(&self, elapsed: f32) -> f32 {
+        self.timing.native_opacity_at(elapsed, self.centered)
+    }
 }
 
 #[cfg(test)]
@@ -3078,7 +3088,12 @@ impl NativeOverlayToast {
             text: text.to_string(),
             started_at: Instant::now(),
             centered: false,
-            linger: Duration::from_secs_f32(1.8),
+            timing: crate::feedback::resolve_timing(
+                crate::settings::NotificationDuration::Standard,
+                crate::feedback::FeedbackKind::Info,
+                text,
+                crate::feedback::FeedbackTiming::Seconds(1.8),
+            ),
         }
     }
 }
@@ -3803,6 +3818,24 @@ struct NativeOverlayLogicalBatch {
 }
 
 impl NativeOverlayLogicalBatch {
+    fn append_result(
+        &mut self,
+        output: Result<NativeOverlayLogicalOutput, String>,
+    ) -> Result<(), String> {
+        match output {
+            Ok(output) => {
+                self.append(output);
+                Ok(())
+            }
+            Err(error) => {
+                // The caller faults and retires this renderer; no future pass can use it.
+                if let Some(mut output) = self.full_output.take() {
+                    crate::egui_output::terminate_renderer_output(&mut output.textures_delta);
+                }
+                Err(error)
+            }
+        }
+    }
     fn append(&mut self, output: NativeOverlayLogicalOutput) {
         self.draw_facts = output.draw_facts;
         if let Some(full_output) = self.full_output.as_mut() {
@@ -4129,7 +4162,8 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
     for (event_index, event) in events.iter().enumerate() {
         if let NativeEvent::MouseWheel(wheel) = event {
             if ownership_commit_pending && target.batch_needs_render() {
-                logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+                logical_batch
+                    .append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
                 logical_pass_count += 1;
                 let routing = native_routing_after_segment(target, segment_routing);
                 assign_native_routing_segment(
@@ -4142,7 +4176,8 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
             }
             ownership_commit_pending = false;
             event_dispositions[event_index] = target.batch_push_wheel(*wheel);
-            logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+            logical_batch
+                .append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
             logical_pass_count += 1;
             let routing = native_routing_after_segment(target, segment_routing);
             assign_native_routing_segment(
@@ -4169,7 +4204,7 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
     }
 
     if logical_input_pending {
-        logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+        logical_batch.append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
         logical_pass_count += 1;
     }
     let routing = native_routing_after_segment(target, segment_routing);
@@ -4271,6 +4306,11 @@ impl NativeOverlayInputOutcome {
 /// OS clipboard から UTF-16 テキストを読み出す。空 / 失敗時は None。
 /// text input ダイアログ (一括ブックマーク登録 / bookmark title 編集) の Ctrl+V から呼ぶ。
 fn read_clipboard_text_windows() -> Option<String> {
+    #[cfg(test)]
+    if let Some(text) = chrome_suppression_interaction_tests::read_scoped_clipboard_text() {
+        return text;
+    }
+
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -4964,7 +5004,7 @@ fn configure_overlay_style(ctx: &egui::Context, text_contrast: crate::settings::
         crate::os_theme::ResolvedTheme::Dark,
         text_contrast,
     );
-    ctx.style_mut(|style| {
+    ctx.global_style_mut(|style| {
         // native HUD は HUD_BOTTOM_HEIGHT (= 64pt、2 段) の小さな操作面なので、ヘルプ
         // text は hover 直後に出す。egui default の 0.5s delay だと「初回だけ待つ /
         // 隣ボタンは即時」という grace-time 由来の不揃いな挙動に見える。
@@ -8517,12 +8557,23 @@ impl NativeRenderCore {
         }
     }
 
-    pub fn show_overlay_toast(
+    pub(crate) fn show_overlay_toast(
         &mut self,
         text: String,
         centered: bool,
-        linger: Option<std::time::Duration>,
+        kind: crate::feedback::FeedbackKind,
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
     ) {
+        // App notifications carry their resolved lifetime. Native-origin notifications
+        // read the preference from the existing chrome snapshot and resolve it here once.
+        let linger = linger.unwrap_or_else(|| {
+            crate::feedback::resolve_timing(
+                self.chrome.policy.notification_duration,
+                kind,
+                &text,
+                crate::feedback::FeedbackTiming::Seconds(if centered { 2.5 } else { 1.8 }),
+            )
+        });
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.show_toast(text, centered, linger);
         }
@@ -9605,7 +9656,10 @@ impl NativeEguiOverlay {
         crate::ime_focus::install_ime_input_policy(&egui_ctx);
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         crate::double_click_time::configure_context(&egui_ctx);
-        egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
+        egui_ctx.options_mut(|options| {
+            options.zoom_with_keyboard = false;
+            options.quit_shortcuts.clear();
+        });
         let fonts_t0 = Instant::now();
         configure_overlay_fonts(&egui_ctx, &ui_font);
         let fonts_ms = fonts_t0.elapsed().as_secs_f64() * 1000.0;
@@ -10055,6 +10109,8 @@ impl NativeEguiOverlayState {
         let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, wheel.alt);
         self.pointer_pos = Some(pos);
         self.modifiers = modifiers;
+        self.pending_events
+            .push(egui::Event::ModifiersChanged(self.modifiers));
         if matches!(
             self.normalize_state.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
@@ -10125,6 +10181,8 @@ impl NativeEguiOverlayState {
                 unit: egui::MouseWheelUnit::Line,
                 delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
                 modifiers,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             });
         }
         self.dirty = true;
@@ -10150,6 +10208,8 @@ impl NativeEguiOverlayState {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
                 let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
                 self.modifiers = modifiers;
+                self.pending_events
+                    .push(egui::Event::ModifiersChanged(self.modifiers));
                 if self.shortcut_help_open {
                     if matches!(event, NativeEvent::KeyDown(_))
                         && !key.repeat
@@ -10229,15 +10289,18 @@ impl NativeEguiOverlayState {
                 //   (= 'V' 文字を typing 扱いで挿入してしまうのを防ぐ)。
                 // plugin state に pending event を最終状態まで投影する
                 // `ime_composing()` で判定し、commit 後の通常ショートカットは通す。
-                let is_clipboard_shortcut = key.ctrl
-                    && !key.alt
-                    && self.text_input_active()
-                    && !self.ime_composing()
-                    && matches!(key.virtual_key, 0x43 | 0x56 | 0x58); // C/V/X
-                if is_clipboard_shortcut {
+                let clipboard_command =
+                    if key.ctrl && !key.alt && self.text_input_active() && !self.ime_composing() {
+                        egui_key_from_virtual_key(key.virtual_key).and_then(|key| {
+                            egui_ime::native_windows_clipboard_command(modifiers, key)
+                        })
+                    } else {
+                        None
+                    };
+                if let Some(clipboard_command) = clipboard_command {
                     if matches!(event, NativeEvent::KeyDown(_)) {
-                        match key.virtual_key {
-                            0x56 => {
+                        match clipboard_command {
+                            egui_ime::ClipboardCommand::Paste => {
                                 // Ctrl+V: Windows の CF_UNICODETEXT は CRLF 改行なので
                                 // \r\n / 単独 \r を \n に正規化する。クリップボード読み出しが
                                 // 失敗 (空 / 非テキスト) しても intercept は成立 (raw 'V' 入力防止)。
@@ -10259,15 +10322,14 @@ impl NativeEguiOverlayState {
                                     }
                                 }
                             }
-                            0x43 => {
+                            egui_ime::ClipboardCommand::Copy => {
                                 self.pending_events.push(egui::Event::Copy);
                                 self.dirty = true;
                             }
-                            0x58 => {
+                            egui_ime::ClipboardCommand::Cut => {
                                 self.pending_events.push(egui::Event::Cut);
                                 self.dirty = true;
                             }
-                            _ => unreachable!(),
                         }
                     }
                     // KeyDown / KeyUp 両方を return で抑止 (Codex C15)
@@ -10293,9 +10355,14 @@ impl NativeEguiOverlayState {
                 self.dirty = true;
             }
             NativeEvent::Ime(ime) => {
+                // Native WM_IME termination still feeds the shared cancellation normalizer.
+                #[allow(deprecated)]
                 let ime = match ime {
                     NativeVideoImeEvent::Enabled => egui::ImeEvent::Enabled,
-                    NativeVideoImeEvent::Preedit(text) => egui::ImeEvent::Preedit(text),
+                    NativeVideoImeEvent::Preedit(text) => egui::ImeEvent::Preedit {
+                        text,
+                        active_range_chars: None,
+                    },
                     NativeVideoImeEvent::Commit(text) => egui::ImeEvent::Commit(text),
                     NativeVideoImeEvent::Disabled => egui::ImeEvent::Disabled,
                 };
@@ -10306,6 +10373,8 @@ impl NativeEguiOverlayState {
                 let pos = self.native_pos(mouse.x, mouse.y);
                 self.pointer_pos = Some(pos);
                 self.modifiers = egui_modifiers(mouse.shift, mouse.ctrl, false);
+                self.pending_events
+                    .push(egui::Event::ModifiersChanged(self.modifiers));
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 self.dirty = true;
             }
@@ -10395,6 +10464,8 @@ impl NativeEguiOverlayState {
                 let modifiers = egui_modifiers(button.shift, button.ctrl, false);
                 self.pointer_pos = Some(pos);
                 self.modifiers = modifiers;
+                self.pending_events
+                    .push(egui::Event::ModifiersChanged(self.modifiers));
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 let egui_button = match button.button {
                     NativeVideoMouseButton::Left => egui::PointerButton::Primary,
@@ -11150,17 +11221,20 @@ impl NativeEguiOverlayState {
         self.dirty = true;
     }
 
-    fn show_toast(&mut self, text: String, centered: bool, linger: Option<Duration>) {
+    fn show_toast(
+        &mut self,
+        text: String,
+        centered: bool,
+        timing: crate::feedback::ResolvedFeedbackTiming,
+    ) {
         if text.trim().is_empty() {
             return;
         }
-        let linger =
-            linger.unwrap_or_else(|| Duration::from_millis(if centered { 2500 } else { 1800 }));
         self.toast = Some(NativeOverlayToast {
             text,
             started_at: Instant::now(),
             centered,
-            linger,
+            timing,
         });
         self.dirty = true;
     }
@@ -12459,6 +12533,7 @@ impl NativeEguiOverlay {
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: self.gpu.format,
+                color_space: wgpu::SurfaceColorSpace::Auto,
                 width: self.width,
                 height: self.height,
                 present_mode: self.gpu.present_mode,
@@ -12540,7 +12615,7 @@ impl NativeEguiOverlay {
         if self
             .toast
             .as_ref()
-            .is_some_and(|toast| toast.started_at.elapsed() > toast.linger)
+            .is_some_and(|toast| toast.started_at.elapsed() > toast.timing.native_linger())
         {
             self.toast = None;
         }
@@ -12932,7 +13007,6 @@ impl NativeEguiOverlayState {
             )),
             time: Some(self.started_at.elapsed().as_secs_f64()),
             predicted_dt: 1.0 / 60.0,
-            modifiers: self.modifiers,
             events: std::mem::take(&mut self.pending_events),
             ..Default::default()
         };
@@ -12943,7 +13017,8 @@ impl NativeEguiOverlayState {
         let mut seek_strip_area_ran = false;
         let mut seek_strip_preview_hover = NativeSeekStripPreviewHover::Outside;
         let egui_run_t0 = Instant::now();
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+        let full_output = self.egui_ctx.run_ui(raw_input, |root_ui| {
+            let ctx = root_ui.ctx();
             draw_facts = NativeOverlayDrawFacts::default();
             if !overlay_visible {
                 return;
@@ -13377,7 +13452,7 @@ impl NativeEguiOverlayState {
                 // 左パネル幅の右端から 12pt 右、シークバー直上に配置。
                 // ユーザー案の図 (左パネル + 動画 + シークバー上にバナー) に合わせる。
                 let banner_x = native_jump_panel_width() + 12.0;
-                egui::Area::new(egui::Id::new("native_video_now_playing_banner"))
+                egui::Area::new(egui::Id::unique("native_video_now_playing_banner"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(egui::pos2(banner_x, banner_y))
                     .interactable(false)
@@ -13435,7 +13510,7 @@ impl NativeEguiOverlayState {
             }
 
             if bottom_hud_visible && bottom_bar_height > 0.0 {
-                egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                egui::Area::new(egui::Id::unique("native_video_seek_hud"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(seek_geometry.normal_bar_rect.min)
                     .show(ctx, |ui| {
@@ -13593,7 +13668,7 @@ impl NativeEguiOverlayState {
                             } else {
                                 egui::Rect::NOTHING
                             },
-                            egui::Id::new("native_video_seek_hit"),
+                            egui::Id::unique("native_video_seek_hit"),
                             if seek_row_available && position_controls_available {
                                 egui::Sense::click_and_drag()
                             } else {
@@ -13831,12 +13906,12 @@ impl NativeEguiOverlayState {
                                         native_seek_preview_action_rects(action_rect);
                                     let pin_resp = ui.interact(
                                         pin_rect,
-                                        egui::Id::new("native_video_hover_pin"),
+                                        egui::Id::unique("native_video_hover_pin"),
                                         egui::Sense::click(),
                                     );
                                     let bookmark_resp = ui.interact(
                                         bookmark_rect,
-                                        egui::Id::new("native_video_hover_bookmark"),
+                                        egui::Id::unique("native_video_hover_bookmark"),
                                         egui::Sense::click(),
                                     );
                                     paint_native_seek_preview(
@@ -14063,8 +14138,8 @@ impl NativeEguiOverlayState {
         // Query after `run`: egui updates these flags from the just-processed
         // frame, which lets this presenter decide whether to forward the same
         // native input batch to the legacy fullscreen shortcut path.
-        self.wants_pointer_input = self.egui_ctx.wants_pointer_input();
-        self.wants_keyboard_input = self.egui_ctx.wants_keyboard_input();
+        self.wants_pointer_input = self.egui_ctx.egui_wants_pointer_input();
+        self.wants_keyboard_input = self.egui_ctx.egui_wants_keyboard_input();
         self.last_seek_target_secs = last_seek_target_secs;
         // T35: hover_preview_target_secs が Some → None に遷移したら clear イベントを
         // 送って player 側の pump_native_hover_thumbnail 永久リトライを止める
@@ -14139,13 +14214,12 @@ impl NativeEguiOverlayState {
                 write_clipboard_text_windows(text);
             }
         }
-        if let Some(intent) = self.ime_cursor_area_intent(full_output.platform_output.ime) {
-            window_intents.push(intent);
-        }
-        window_intents.push(NativeWindowIntent::SetCursorPolicy {
-            icon: Self::resolve_cursor_icon(full_output.platform_output.cursor_icon),
-            auto_hide_allowed: !cursor_blocking_overlay_visible,
-        });
+        append_native_platform_window_intents(
+            &full_output.platform_output,
+            self.pixels_per_point,
+            !cursor_blocking_overlay_visible,
+            &mut window_intents,
+        );
 
         self.dirty = self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
@@ -14239,7 +14313,7 @@ impl NativeEguiOverlay {
             #[cfg(feature = "test-script")]
             ui_smoke_command_attributions,
         } = batch;
-        let full_output = full_output
+        let mut full_output = full_output
             .ok_or_else(|| "native overlay logical batch produced no output".to_string())?;
         self.gpu.diagnostics.snapshot("final_draw", || {
             let resolved = state.resolved_chrome();
@@ -14299,6 +14373,7 @@ impl NativeEguiOverlay {
         // A read guard covers all texture/queue/surface GPU work through present; configure
         // takes the matching write guard. Context::run and tessellation stay outside.
         // `gate_wait_ms` below reports whether the overlap is ever actually observed.
+        let texture_set_count = full_output.textures_delta.set.len();
         let window_epoch = state.window_epoch;
         let (
             NativeOverlayGpuTimings {
@@ -14315,21 +14390,22 @@ impl NativeEguiOverlay {
             &mut self.gpu,
             overlay_visible,
             |gpu| {
-                gpu.present_batch(
-                    &full_output.textures_delta,
+                let timings = gpu.present_batch(
+                    &mut full_output.textures_delta,
                     &paint_jobs,
                     &screen_descriptor,
                     window_epoch,
-                )
+                )?;
+                Ok((timings, full_output.textures_delta))
             },
             |gpu, visible| gpu.set_visual_attached(visible, window_epoch),
-            |gpu, timings| {
+            |gpu, (timings, textures_delta)| {
                 let (commands, intents) = commit_native_overlay_presented(
                     state,
                     seek_strip_inventory,
                     seek_strip_window_request,
-                    &full_output.textures_delta.free,
-                    |id| gpu.renderer.free_texture(&id),
+                    textures_delta,
+                    |id| gpu.renderer.free_texture(id),
                     commands,
                     window_intents,
                 )?;
@@ -14369,10 +14445,7 @@ impl NativeEguiOverlay {
                 ),
                 ("shapes", Value::from(shape_count as i64)),
                 ("paint_jobs", Value::from(paint_jobs.len() as i64)),
-                (
-                    "texture_set_count",
-                    Value::from(full_output.textures_delta.set.len() as i64),
-                ),
+                ("texture_set_count", Value::from(texture_set_count as i64)),
                 ("wants_pointer", Value::from(state.wants_pointer_input)),
                 ("wants_keyboard", Value::from(state.wants_keyboard_input)),
                 ("hud_visible", Value::from(hud_visible)),
@@ -14399,26 +14472,256 @@ impl NativeEguiOverlay {
     }
 }
 
-impl NativeEguiOverlayState {
-    fn ime_cursor_area_intent(
-        &self,
-        ime: Option<egui::output::IMEOutput>,
-    ) -> Option<NativeWindowIntent> {
-        let ime = ime?;
-        let ppp = self.pixels_per_point;
-        let cursor = ime.cursor_rect;
-        let x = (cursor.min.x * ppp).round() as i32;
-        let y = (cursor.min.y * ppp).round() as i32;
-        let width = (cursor.width().max(1.0) * ppp).round() as i32;
-        let height = (cursor.height().max(1.0) * ppp).round() as i32;
-        Some(NativeWindowIntent::UpdateImeCursorArea {
-            x,
-            y,
-            width,
-            height,
-        })
+// Keep platform conversion separate from both GPU presentation and HWND mutation. The
+// logical batch still accumulates these intents in the same order before its one present.
+pub(crate) fn append_native_platform_window_intents(
+    output: &egui::PlatformOutput,
+    pixels_per_point: f32,
+    auto_hide_allowed: bool,
+    intents: &mut Vec<NativeWindowIntent>,
+) {
+    if output
+        .ime
+        .as_ref()
+        .is_some_and(|ime| ime.should_interrupt_composition)
+    {
+        intents.push(NativeWindowIntent::InterruptImeComposition);
+    }
+    if let Some(intent) = native_ime_cursor_area_intent(output.ime, pixels_per_point) {
+        intents.push(intent);
+    }
+    intents.push(NativeWindowIntent::SetCursorPolicy {
+        icon: NativeEguiOverlayState::resolve_cursor_icon(output.cursor_icon),
+        auto_hide_allowed,
+    });
+}
+
+fn native_ime_cursor_area_intent(
+    ime: Option<egui::output::IMEOutput>,
+    pixels_per_point: f32,
+) -> Option<NativeWindowIntent> {
+    let ime = ime?;
+    let ppp = pixels_per_point;
+    let cursor = ime.cursor_rect;
+    let x = (cursor.min.x * ppp).round() as i32;
+    let y = (cursor.min.y * ppp).round() as i32;
+    let width = (cursor.width().max(1.0) * ppp).round() as i32;
+    let height = (cursor.height().max(1.0) * ppp).round() as i32;
+    Some(NativeWindowIntent::UpdateImeCursorArea {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+#[cfg(test)]
+mod native_output_tests {
+    use super::*;
+
+    #[test]
+    fn notification_duration_native_standard_preserves_legacy_linger_and_fade() {
+        use crate::feedback::{FeedbackKind, FeedbackTiming, resolve_timing};
+        use crate::settings::NotificationDuration;
+        let mut toast = NativeOverlayToast::for_test("通知");
+        for centered in [false, true] {
+            toast.centered = centered;
+            let fade_end = if centered { 2.5 } else { 1.8 };
+            for seconds in [0.7, 1.2, 1.8, 2.5, 3.5, 5.5] {
+                toast.timing = resolve_timing(
+                    NotificationDuration::Standard,
+                    FeedbackKind::Info,
+                    "通知",
+                    FeedbackTiming::Seconds(seconds),
+                );
+                assert_eq!(
+                    toast.timing.native_linger(),
+                    Duration::from_secs_f32(seconds)
+                );
+                // Compare with the pre-§1.402 formula, including long invisible linger.
+                for elapsed in [
+                    0.0, 0.69, 1.19, 1.45, 1.625, 1.8, 2.15, 2.325, 2.5, 3.49, 5.49,
+                ] {
+                    let legacy = if elapsed > fade_end - 0.35 {
+                        ((fade_end - elapsed) / 0.35_f32).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    assert_eq!(
+                        toast.opacity_at(elapsed),
+                        legacy,
+                        "centered={centered}, linger={seconds}, elapsed={elapsed}"
+                    );
+                }
+            }
+        }
     }
 
+    #[test]
+    fn notification_duration_native_scales_visible_fade_once_and_keeps_seek_boundary_unchanged() {
+        use crate::feedback::{FeedbackKind, FeedbackTiming, resolve_timing};
+        use crate::settings::NotificationDuration;
+        let mut toast = NativeOverlayToast::for_test("通知");
+        for (setting, factor) in [
+            (NotificationDuration::Short, 0.6),
+            (NotificationDuration::Standard, 1.0),
+            (NotificationDuration::Long, 1.5),
+        ] {
+            for centered in [false, true] {
+                toast.centered = centered;
+                let fade_end = if centered { 2.5 } else { 1.8 };
+                for kind in [
+                    FeedbackKind::Info,
+                    FeedbackKind::Warning,
+                    FeedbackKind::Error,
+                ] {
+                    let factor =
+                        if kind != FeedbackKind::Info && setting == NotificationDuration::Short {
+                            1.0
+                        } else {
+                            factor
+                        };
+                    toast.timing =
+                        resolve_timing(setting, kind, "通知", FeedbackTiming::Seconds(5.5));
+                    assert_eq!(
+                        toast.timing.native_linger(),
+                        Duration::from_secs_f32(5.5 * factor)
+                    );
+                    assert_eq!(toast.opacity_at((fade_end - 0.4) * factor), 1.0);
+                    assert!((toast.opacity_at((fade_end - 0.175) * factor) - 0.5).abs() < 0.00001);
+                    assert_eq!(toast.opacity_at(fade_end * factor), 0.0);
+                }
+            }
+            toast.centered = true;
+            toast.timing = resolve_timing(
+                setting,
+                FeedbackKind::Info,
+                "動画先頭です",
+                FeedbackTiming::Immediate(0.7),
+            );
+            assert_eq!(toast.timing.native_linger(), Duration::from_secs_f32(0.7));
+            for elapsed in [0.0, 0.35, 0.525, 0.699, 0.7] {
+                assert_eq!(toast.opacity_at(elapsed), 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_platform_intents_keep_focus_ime_and_cursor_order_without_presenting() {
+        let output = egui::PlatformOutput {
+            ime: Some(egui::output::IMEOutput {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 30.0)),
+                purpose: egui::IMEPurpose::Normal,
+                should_interrupt_composition: false,
+                cursor_rect: egui::Rect::from_min_size(
+                    egui::pos2(-1.5, 3.0),
+                    egui::vec2(0.25, 10.0),
+                ),
+            }),
+            cursor_icon: egui::CursorIcon::Text,
+            ..Default::default()
+        };
+        let mut intents = vec![NativeWindowIntent::ClaimTextInputFocus];
+        append_native_platform_window_intents(&output, 1.5, false, &mut intents);
+        assert!(matches!(
+            intents.as_slice(),
+            [
+                NativeWindowIntent::ClaimTextInputFocus,
+                NativeWindowIntent::UpdateImeCursorArea {
+                    x: -2,
+                    y: 5,
+                    width: 2,
+                    height: 15,
+                },
+                NativeWindowIntent::SetCursorPolicy {
+                    icon: NativeCursorIcon::Text,
+                    auto_hide_allowed: false,
+                },
+            ]
+        ));
+    }
+
+    #[test]
+    fn native_ime_interrupt_real_text_edit_cursor_move_becomes_one_intent() {
+        let context = egui::Context::default();
+        let id = egui::Id::unique("native-ime-cursor-move");
+        let mut text = "sample text".to_owned();
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(300.0, 30.0));
+        let raw = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 360.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let output = context.run_ui(raw(Vec::new()), |ui| {
+                ui.put(rect, egui::TextEdit::singleline(&mut text).id(id))
+                    .request_focus();
+            });
+            crate::egui_output::discard_headless_output(output);
+        }
+        let pointer = rect.left_center() + egui::vec2(8.0, 0.0);
+        let output = context.run_ui(
+            raw(vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ui| {
+                ui.put(rect, egui::TextEdit::singleline(&mut text).id(id));
+            },
+        );
+        let ime = output.platform_output.ime;
+        let mut intents = Vec::new();
+        append_native_platform_window_intents(&output.platform_output, 2.0, false, &mut intents);
+        crate::egui_output::discard_headless_output(output);
+        assert!(
+            ime.expect("focused real TextEdit")
+                .should_interrupt_composition
+        );
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| matches!(intent, NativeWindowIntent::InterruptImeComposition))
+                .count(),
+            1
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|intent| matches!(intent, NativeWindowIntent::UpdateImeCursorArea { .. }))
+        );
+    }
+
+    #[test]
+    fn native_platform_output_without_ime_keeps_only_its_cursor_policy() {
+        let mut intents = Vec::new();
+        append_native_platform_window_intents(
+            &egui::PlatformOutput {
+                cursor_icon: egui::CursorIcon::None,
+                ..Default::default()
+            },
+            2.0,
+            true,
+            &mut intents,
+        );
+        assert!(matches!(
+            intents.as_slice(),
+            [NativeWindowIntent::SetCursorPolicy {
+                icon: NativeCursorIcon::Hidden,
+                auto_hide_allowed: true,
+            }]
+        ));
+    }
+}
+
+impl NativeEguiOverlayState {
     fn resolve_cursor_icon(cursor_icon: egui::CursorIcon) -> NativeCursorIcon {
         match cursor_icon {
             egui::CursorIcon::None => NativeCursorIcon::Hidden,
@@ -14500,8 +14803,8 @@ fn commit_native_overlay_presented(
     state: &mut NativeEguiOverlayState,
     seek_strip_inventory: Option<crate::video::seek_strip::SeekStripPresentedInventory>,
     seek_strip_window_request: Option<NativeOverlayCommand>,
-    free: &[egui::TextureId],
-    mut free_texture: impl FnMut(egui::TextureId),
+    textures_delta: egui::TexturesDelta,
+    free_texture: impl FnMut(&egui::TextureId),
     commands: Vec<NativeOverlayCommand>,
     window_intents: Vec<NativeWindowIntent>,
 ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
@@ -14519,9 +14822,7 @@ fn commit_native_overlay_presented(
         inventory,
         window,
     );
-    for id in free {
-        free_texture(*id);
-    }
+    crate::egui_output::finish_texture_output(textures_delta, free_texture);
     state.render_count = state.render_count.saturating_add(1);
     Ok((commands, window_intents))
 }
@@ -14575,7 +14876,7 @@ fn apply_native_overlay_visibility(
 impl NativeEguiOverlayGpu {
     fn present_batch(
         &mut self,
-        textures_delta: &egui::TexturesDelta,
+        textures_delta: &mut egui::TexturesDelta,
         paint_jobs: &[egui::ClippedPrimitive],
         screen_descriptor: &egui_wgpu::ScreenDescriptor,
         window_epoch: u64,
@@ -14584,7 +14885,10 @@ impl NativeEguiOverlayGpu {
         let gate_wait_t0 = Instant::now();
         let _submission_guard = self.gpu_epoch.submission_guard();
         let gate_wait_ms = gate_wait_t0.elapsed().as_secs_f64() * 1000.0;
-        self.gpu_epoch.ensure_alive("overlay GPU submission")?;
+        if let Err(error) = self.gpu_epoch.ensure_alive("overlay GPU submission") {
+            crate::egui_output::terminate_renderer_output(textures_delta);
+            return Err(error);
+        }
 
         // presenter は本体とは別の egui Context / Renderer を持つ。font atlas の追跡台帳は
         // renderer 番号で区別するので、こちらの適用も同じ経路に載せる
@@ -14596,107 +14900,116 @@ impl NativeEguiOverlayGpu {
             textures_delta,
         );
         let texture_update_t0 = Instant::now();
-        for (id, image_delta) in &textures_delta.set {
-            let before = self.renderer.texture_size(id);
-            self.renderer.update_texture(
+        let mut queue_needs_submit = false;
+        crate::egui_output::apply_texture_sets(textures_delta, |id, image_delta| {
+            let before = self.renderer.texture_size(&id);
+            match self.renderer.update_texture_with_submission(
                 self.gpu_epoch.device(),
                 self.gpu_epoch.queue(),
-                *id,
+                id,
                 image_delta,
-            );
-            let after = self.renderer.texture_size(id);
-            egui_wgpu::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
-        }
+            ) {
+                egui_wgpu::TextureUpdateSubmission::Unchanged => {}
+                egui_wgpu::TextureUpdateSubmission::Pending => queue_needs_submit = true,
+                egui_wgpu::TextureUpdateSubmission::Submitted => queue_needs_submit = false,
+            }
+            let after = self.renderer.texture_size(&id);
+            egui_wgpu::atlas_diag::record_applied(id, diag_id, image_delta, before, after);
+        });
         let texture_update_ms = texture_update_t0.elapsed().as_secs_f64() * 1000.0;
         if atlas_batch.tracked() {
             egui_wgpu::atlas_diag::flush("applying the presenter's texture delta batch");
         }
 
-        let surface_acquire_t0 = Instant::now();
-        let surface_texture = match self.surface.get_current_texture() {
-            Ok(texture) => texture,
-            Err(error) => {
-                self.diagnostics.count("surface_acquire_error", 1);
-                self.diagnostics.event("surface_error", || {
-                    DiagnosticSample::new().bool("device_lost", self.gpu_epoch.is_lost())
-                });
-                if error == wgpu::SurfaceError::Other && self.gpu_epoch.is_lost() {
-                    return Err(format!(
-                        "wgpu overlay device epoch {} was lost during surface acquire: {error:?}",
-                        self.gpu_epoch.generation()
-                    ));
+        // Completion runs on acquire errors as well: writes/mipmaps precede frees.
+        let result = (|| {
+            let surface_acquire_t0 = Instant::now();
+            let surface_texture = match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(texture)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+                error => {
+                    self.diagnostics.count("surface_acquire_error", 1);
+                    self.diagnostics.event("surface_error", || {
+                        DiagnosticSample::new().bool("device_lost", self.gpu_epoch.is_lost())
+                    });
+                    return Err(format!("egui overlay get_current_texture: {error:?}"));
                 }
-                // Lost / Outdated / Timeout are surface conditions. They preserve the
-                // epoch cache; only the device-lost callback can latch an epoch.
-                return Err(format!("egui overlay get_current_texture: {error:?}"));
-            }
-        };
-        let surface_acquire_ms = surface_acquire_t0.elapsed().as_secs_f64() * 1000.0;
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let buffer_update_encode_t0 = Instant::now();
-        let mut encoder =
-            self.gpu_epoch
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("mIV native egui overlay encoder"),
-                });
-        let user_cmds = self.renderer.update_buffers(
-            self.gpu_epoch.device(),
-            self.gpu_epoch.queue(),
-            &mut encoder,
-            &paint_jobs,
-            &screen_descriptor,
-        );
-        {
-            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("mIV native egui overlay render"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            self.renderer.render(
-                &mut render_pass.forget_lifetime(),
+            };
+            let surface_acquire_ms = surface_acquire_t0.elapsed().as_secs_f64() * 1000.0;
+            let view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let buffer_update_encode_t0 = Instant::now();
+            let mut encoder =
+                self.gpu_epoch
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("mIV native egui overlay encoder"),
+                    });
+            let user_cmds = self.renderer.update_buffers(
+                self.gpu_epoch.device(),
+                self.gpu_epoch.queue(),
+                &mut encoder,
                 &paint_jobs,
                 &screen_descriptor,
             );
+            {
+                let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("mIV native egui overlay render"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.renderer.render(
+                    &mut render_pass.forget_lifetime(),
+                    &paint_jobs,
+                    &screen_descriptor,
+                );
+            }
+            let mut submissions = user_cmds;
+            submissions.push(encoder.finish());
+            let buffer_update_encode_ms = buffer_update_encode_t0.elapsed().as_secs_f64() * 1000.0;
+            let submit_present_t0 = Instant::now();
+            self.gpu_epoch.queue().submit(submissions);
+            queue_needs_submit = false;
+            {
+                let _operation = self
+                    .health
+                    .begin_render_operation(NativeRenderOperation::Present, window_epoch);
+                self.diagnostics.count("Present", 1);
+                self.gpu_epoch.queue().present(surface_texture);
+                self.diagnostics.event("Present", || {
+                    DiagnosticSample::new().text("completion", "wgpu_call_returned")
+                });
+            }
+            let submit_present_ms = submit_present_t0.elapsed().as_secs_f64() * 1000.0;
+            let gpu_span_ms = gpu_span_t0.elapsed().as_secs_f64() * 1000.0;
+            Ok(NativeOverlayGpuTimings {
+                gate_wait_ms,
+                texture_update_ms,
+                surface_acquire_ms,
+                buffer_update_encode_ms,
+                submit_present_ms,
+                gpu_span_ms,
+            })
+        })();
+        if queue_needs_submit {
+            self.gpu_epoch.queue().submit([]);
         }
-        let mut submissions = user_cmds;
-        submissions.push(encoder.finish());
-        let buffer_update_encode_ms = buffer_update_encode_t0.elapsed().as_secs_f64() * 1000.0;
-        let submit_present_t0 = Instant::now();
-        self.gpu_epoch.queue().submit(submissions);
-        {
-            let _operation = self
-                .health
-                .begin_render_operation(NativeRenderOperation::Present, window_epoch);
-            self.diagnostics.count("Present", 1);
-            surface_texture.present();
-            self.diagnostics.event("Present", || {
-                DiagnosticSample::new().text("completion", "wgpu_call_returned")
-            });
-        }
-        let submit_present_ms = submit_present_t0.elapsed().as_secs_f64() * 1000.0;
-        let gpu_span_ms = gpu_span_t0.elapsed().as_secs_f64() * 1000.0;
-        drop(_submission_guard);
-        Ok(NativeOverlayGpuTimings {
-            gate_wait_ms,
-            texture_update_ms,
-            surface_acquire_ms,
-            buffer_update_encode_ms,
-            submit_present_ms,
-            gpu_span_ms,
-        })
+        crate::egui_output::finish_texture_output(std::mem::take(textures_delta), |id| {
+            self.renderer.free_texture(id)
+        });
+        result
     }
 
     fn set_visual_attached(&mut self, attached: bool, window_epoch: u64) -> Result<(), String> {
@@ -14890,7 +15203,7 @@ fn draw_native_bottom_controls(
 
             let replay_resp = ui.interact(
                 replay_rect,
-                egui::Id::new("native_video_replay"),
+                egui::Id::unique("native_video_replay"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(painter, replay_rect, replay_resp.hovered(), false);
@@ -14908,7 +15221,7 @@ fn draw_native_bottom_controls(
 
             let play_resp = ui.interact(
                 play_rect,
-                egui::Id::new("native_video_play"),
+                egui::Id::unique("native_video_play"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(painter, play_rect, play_resp.hovered(), false);
@@ -14931,7 +15244,7 @@ fn draw_native_bottom_controls(
 
             let loop_resp = ui.interact(
                 loop_rect,
-                egui::Id::new("native_video_loop"),
+                egui::Id::unique("native_video_loop"),
                 egui::Sense::click(),
             );
             // 4 段階ループモード: Off / Full / Chapter / Bookmark
@@ -15024,7 +15337,7 @@ fn draw_native_bottom_controls(
 
             let continuous_resp = ui.interact(
                 continuous_rect,
-                egui::Id::new("native_video_continuous"),
+                egui::Id::unique("native_video_continuous"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(
@@ -15061,13 +15374,13 @@ fn draw_native_bottom_controls(
             let prev_marker_resp = if markers_present {
                 ui.interact(
                     prev_marker_rect,
-                    egui::Id::new("native_video_prev_marker"),
+                    egui::Id::unique("native_video_prev_marker"),
                     egui::Sense::click(),
                 )
             } else {
                 ui.interact(
                     prev_marker_rect,
-                    egui::Id::new("native_video_prev_marker"),
+                    egui::Id::unique("native_video_prev_marker"),
                     egui::Sense::hover(),
                 )
             };
@@ -15093,13 +15406,13 @@ fn draw_native_bottom_controls(
             let next_marker_resp = if markers_present {
                 ui.interact(
                     next_marker_rect,
-                    egui::Id::new("native_video_next_marker"),
+                    egui::Id::unique("native_video_next_marker"),
                     egui::Sense::click(),
                 )
             } else {
                 ui.interact(
                     next_marker_rect,
-                    egui::Id::new("native_video_next_marker"),
+                    egui::Id::unique("native_video_next_marker"),
                     egui::Sense::hover(),
                 )
             };
@@ -15142,7 +15455,7 @@ fn draw_native_bottom_controls(
 
             let screenshot_resp = ui.interact(
                 screenshot_rect,
-                egui::Id::new("native_video_screenshot"),
+                egui::Id::unique("native_video_screenshot"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(painter, screenshot_rect, screenshot_resp.hovered(), false);
@@ -15155,7 +15468,7 @@ fn draw_native_bottom_controls(
 
             let save_resp = ui.interact(
                 save_rect,
-                egui::Id::new("native_video_save_frame"),
+                egui::Id::unique("native_video_save_frame"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(painter, save_rect, save_resp.hovered(), false);
@@ -15207,7 +15520,7 @@ fn draw_native_bottom_controls(
 
             let response = ui.interact(
                 rect,
-                egui::Id::new("native_video_audio_track_button"),
+                egui::Id::unique("native_video_audio_track_button"),
                 egui::Sense::click(),
             );
             #[cfg(feature = "test-script")]
@@ -15244,8 +15557,8 @@ fn draw_native_bottom_controls(
                 text_center_y,
                 playback_speed,
                 Some(&layout.labels.speed),
-                egui::Id::new("native_video_speed"),
-                egui::Id::new("native_video_speed_popup"),
+                egui::Id::unique("native_video_speed"),
+                egui::Id::unique("native_video_speed_popup"),
                 0.0,
                 overlay_width_points,
                 hud_rect.min.y,
@@ -15262,7 +15575,7 @@ fn draw_native_bottom_controls(
             let painter = &base_painter.with_clip_rect(mute_rect);
             let mute_resp = ui.interact(
                 mute_rect,
-                egui::Id::new("native_video_mute"),
+                egui::Id::unique("native_video_mute"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(painter, mute_rect, mute_resp.hovered(), muted);
@@ -15293,7 +15606,7 @@ fn draw_native_bottom_controls(
             let norm_unmeasured = matches!(norm_ui_state, NormalizeUiState::OnUnmeasured);
             let norm_resp = ui.interact(
                 norm_rect,
-                egui::Id::new("native_video_normalize"),
+                egui::Id::unique("native_video_normalize"),
                 egui::Sense::CLICK | egui::Sense::HOVER,
             );
             let norm_hover_label = match norm_ui_state {
@@ -15366,7 +15679,7 @@ fn draw_native_bottom_controls(
                 painter,
                 vol_rect,
                 volume,
-                egui::Id::new("native_video_volume"),
+                egui::Id::unique("native_video_volume"),
                 Some(vol_tooltip),
                 last_volume_target,
             ) {
@@ -15406,7 +15719,7 @@ fn draw_native_bottom_controls(
             if limiter_ceiling_hit {
                 let limiter_resp = ui.interact(
                     limiter_rect,
-                    egui::Id::new("native_video_limiter_indicator"),
+                    egui::Id::unique("native_video_limiter_indicator"),
                     egui::Sense::hover(),
                 );
                 painter.circle_filled(
@@ -15523,7 +15836,7 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
         .rect_filled(hud, 0.0, egui::Color32::from_black_alpha(176));
     let rows = native_bottom_hud_rows(hud, true);
     let metadata = native_hud_multitrack_fixture_metadata();
-    let cache_id = egui::Id::new("native_bottom_snapshot_text_cache");
+    let cache_id = egui::Id::unique("native_bottom_snapshot_text_cache");
     let mut text_cache = ui
         .ctx()
         .data_mut(|data| data.get_temp::<super::bottom_hud::TextCache>(cache_id))
@@ -15771,7 +16084,7 @@ mod chrome_suppression_interaction_tests {
             let output = frame(&mut overlay);
             let facts = output.draw_facts;
             let mut batch = NativeOverlayLogicalBatch::default();
-            batch.append(output);
+            batch.append(output.into_inner());
             record_native_overlay_drawn_rects(&diagnostics, &overlay, batch.draw_facts);
             let snapshot = latest(&diagnostics, "drawn_rects").unwrap();
             for (name, rect) in [
@@ -15808,8 +16121,10 @@ mod chrome_suppression_interaction_tests {
                 serde_json::json!([0, if show_bar { 984 } else { 1020 }, 1920, 1080])
             );
             assert!(snapshot.get("omitted_fields").is_none());
+            crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
 
-            let off = overlay.render_logical_once(false, false).unwrap();
+            let off =
+                HeadlessLogicalOutput(Some(overlay.render_logical_once(false, false).unwrap()));
             assert!(off.overlay_visible);
             assert!(
                 [
@@ -15871,8 +16186,9 @@ mod chrome_suppression_interaction_tests {
             overlay.pending_events.push(egui::Event::PointerGone);
             let final_hidden = frame(&mut overlay);
             assert!(!final_hidden.overlay_visible);
-            batch.append(final_hidden);
+            batch.append(final_hidden.into_inner());
             record_native_overlay_drawn_rects(&diagnostics, &overlay, batch.draw_facts);
+            crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
             let hidden = latest(&diagnostics, "drawn_rects").unwrap();
             for name in [
                 "top_bar",
@@ -15886,6 +16202,10 @@ mod chrome_suppression_interaction_tests {
         }
     }
 
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn tag_picker_ime_fixture() -> NativeEguiOverlayState {
         let (mut overlay, _) = fixture(false);
         crate::ime_focus::install_ime_input_policy(&overlay.egui_ctx);
@@ -15899,7 +16219,10 @@ mod chrome_suppression_interaction_tests {
         }
         overlay.pending_events.extend([
             egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("かな".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "かな".to_owned(),
+                active_range_chars: None,
+            }),
         ]);
         let output = frame(&mut overlay);
         assert!(overlay.ime_composing());
@@ -15923,6 +16246,300 @@ mod chrome_suppression_interaction_tests {
         }
     }
 
+    fn native_clipboard_key(
+        virtual_key: u32,
+        alt: bool,
+    ) -> crate::video::native_window::NativeVideoKeyEvent {
+        crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: true,
+            ctrl: true,
+            alt,
+            repeat: false,
+        }
+    }
+
+    struct NativeClipboardFixture {
+        text: Option<String>,
+        reads: usize,
+    }
+
+    thread_local! {
+        static CLIPBOARD_FIXTURE: std::cell::RefCell<Option<NativeClipboardFixture>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    struct ScopedNativeClipboard {
+        previous: Option<NativeClipboardFixture>,
+    }
+
+    impl ScopedNativeClipboard {
+        fn new(text: Option<&str>) -> Self {
+            let previous = CLIPBOARD_FIXTURE.with(|slot| {
+                slot.replace(Some(NativeClipboardFixture {
+                    text: text.map(str::to_owned),
+                    reads: 0,
+                }))
+            });
+            Self { previous }
+        }
+
+        fn reads(&self) -> usize {
+            CLIPBOARD_FIXTURE.with(|slot| slot.borrow().as_ref().unwrap().reads)
+        }
+    }
+
+    impl Drop for ScopedNativeClipboard {
+        fn drop(&mut self) {
+            CLIPBOARD_FIXTURE.with(|slot| {
+                let _ = slot.replace(self.previous.take());
+            });
+        }
+    }
+
+    // The outer Option selects the test override; None inside models an empty
+    // clipboard. An unscoped unit-test read fails before any user clipboard I/O.
+    pub(super) fn read_scoped_clipboard_text() -> Option<Option<String>> {
+        CLIPBOARD_FIXTURE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let fixture = slot
+                .as_mut()
+                .expect("native clipboard reads require a scoped fake in unit tests");
+            fixture.reads += 1;
+            Some(fixture.text.clone())
+        })
+    }
+
+    #[test]
+    fn native_clipboard_ctrl_shift_paste_normalizes_once_and_suppresses_raw_v() {
+        let clipboard = ScopedNativeClipboard::new(Some("first\r\nsecond\rthird\nlast"));
+        let (mut overlay, _) = fixture(false);
+        overlay.tag_picker_open = true;
+        overlay.pending_events.clear();
+        let key = native_clipboard_key(0x56, false);
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        let modifiers = egui_modifiers(true, true, false);
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Paste("first\nsecond\nthird\nlast".to_owned()),
+                egui::Event::ModifiersChanged(modifiers),
+            ],
+            "one press reads once and release emits neither Paste nor raw V"
+        );
+        assert_eq!(clipboard.reads(), 1);
+
+        // Nested fixtures restore the outer owner without changing its reads.
+        {
+            let nested = ScopedNativeClipboard::new(None);
+            assert_eq!(read_clipboard_text_windows(), None);
+            assert_eq!(nested.reads(), 1);
+        }
+        assert_eq!(clipboard.reads(), 1);
+        assert_eq!(
+            read_clipboard_text_windows().as_deref(),
+            Some("first\r\nsecond\rthird\nlast")
+        );
+    }
+
+    #[test]
+    fn native_clipboard_empty_ctrl_shift_paste_suppresses_raw_v_and_release_read() {
+        let clipboard = ScopedNativeClipboard::new(None);
+        let (mut overlay, _) = fixture(false);
+        overlay.tag_picker_open = true;
+        overlay.pending_events.clear();
+        let key = native_clipboard_key(0x56, false);
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        let modifiers = egui_modifiers(true, true, false);
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::ModifiersChanged(modifiers),
+            ],
+            "recognized empty paste emits neither Paste, Text nor raw V"
+        );
+        assert_eq!(clipboard.reads(), 1);
+    }
+
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "Disabled remains the native IME cancellation terminal"
+    )]
+    fn native_clipboard_paste_waits_for_pending_ime_commit_before_reading() {
+        use crate::video::native_window::NativeVideoImeEvent;
+
+        let clipboard = ScopedNativeClipboard::new(Some("pasted\r\ntext"));
+        let mut overlay = tag_picker_ime_fixture();
+        overlay.pending_events.clear();
+        let key = native_clipboard_key(0x56, false);
+        let modifiers = egui_modifiers(true, true, false);
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: Some(egui::Key::V),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: Some(egui::Key::V),
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+            ]
+        );
+        assert_eq!(clipboard.reads(), 0, "composition owns both raw key edges");
+        assert!(overlay.ime_composing());
+
+        overlay.pending_events.clear();
+        overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(
+            "かな".to_owned(),
+        )));
+        overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Disabled));
+        assert!(!overlay.ime_composing());
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::Ime(egui::ImeEvent::Commit("かな".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Paste("pasted\ntext".to_owned()),
+                egui::Event::ModifiersChanged(modifiers),
+            ],
+            "pending commit admits exactly one normalized paste before the next UI pass"
+        );
+        assert_eq!(clipboard.reads(), 1);
+    }
+
+    #[test]
+    fn native_clipboard_ctrl_shift_copy_cut_suppress_raw_keys_and_release_duplicates() {
+        for (virtual_key, is_copy) in [(0x43, true), (0x58, false)] {
+            let (mut overlay, _) = fixture(false);
+            overlay.tag_picker_open = true;
+            overlay.pending_events.clear();
+            let key = native_clipboard_key(virtual_key, false);
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            let modifiers = egui_modifiers(true, true, false);
+            let action = if is_copy {
+                egui::Event::Copy
+            } else {
+                egui::Event::Cut
+            };
+            assert_eq!(
+                overlay.pending_events,
+                [egui::Event::ModifiersChanged(modifiers), action.clone()]
+            );
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert_eq!(
+                overlay.pending_events,
+                [
+                    egui::Event::ModifiersChanged(modifiers),
+                    action,
+                    egui::Event::ModifiersChanged(modifiers)
+                ],
+                "release updates modifiers without duplicating the clipboard action or raw key"
+            );
+
+            overlay.pending_events.clear();
+            let key = native_clipboard_key(virtual_key, true);
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert!(
+                matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::ModifiersChanged(before_down),
+                     egui::Event::Key { pressed: true, modifiers: down, .. },
+                     egui::Event::ModifiersChanged(before_up),
+                     egui::Event::Key { pressed: false, modifiers: up, .. }]
+                        if down.ctrl && down.shift && down.alt && up == down
+                            && before_down == down && before_up == up
+                ),
+                "Ctrl+Alt keeps the ordinary raw-key path"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
+    fn native_clipboard_copy_cut_follow_pending_ime_composition_and_commit() {
+        use crate::video::native_window::NativeVideoImeEvent;
+
+        for (virtual_key, is_copy) in [(0x43, true), (0x58, false)] {
+            let mut overlay = tag_picker_ime_fixture();
+            overlay.pending_events.clear();
+            let key = native_clipboard_key(virtual_key, false);
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert!(
+                matches!(
+                    overlay.pending_events.as_slice(),
+                    [
+                        egui::Event::ModifiersChanged(before_down),
+                        egui::Event::Key { pressed: true, modifiers: down, .. },
+                        egui::Event::ModifiersChanged(before_up),
+                        egui::Event::Key { pressed: false, modifiers: up, .. }
+                    ] if *down == egui_modifiers(true, true, false)
+                        && before_down == down && up == down && before_up == up
+                ),
+                "active IME must retain both ordinary key events"
+            );
+            overlay.pending_events.clear();
+            overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(
+                "かな".to_owned(),
+            )));
+            overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Disabled));
+            assert!(!overlay.ime_composing());
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert!(
+                matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::Ime(egui::ImeEvent::Commit(text)),
+                     egui::Event::Ime(egui::ImeEvent::Disabled),
+                     egui::Event::ModifiersChanged(down), egui::Event::Copy,
+                     egui::Event::ModifiersChanged(up)]
+                        if text == "かな" && is_copy
+                            && *down == egui_modifiers(true, true, false) && up == down
+                ) || matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::Ime(egui::ImeEvent::Commit(text)),
+                     egui::Event::Ime(egui::ImeEvent::Disabled),
+                     egui::Event::ModifiersChanged(down), egui::Event::Cut,
+                     egui::Event::ModifiersChanged(up)]
+                        if text == "かな" && !is_copy
+                            && *down == egui_modifiers(true, true, false) && up == down
+                ),
+                "pending commit enables exactly one clipboard event before the next pass"
+            );
+        }
+    }
+
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn tag_picker_after_ime_commit(key: egui::Key, same_pass: bool) {
         let mut overlay = tag_picker_ime_fixture();
         overlay.pending_events.extend([
@@ -16010,7 +16627,7 @@ mod chrome_suppression_interaction_tests {
             }
             let pos = overlay
                 .egui_ctx
-                .read_response(egui::Id::new(id))
+                .read_response(egui::Id::unique(id))
                 .unwrap()
                 .rect
                 .center();
@@ -16036,7 +16653,7 @@ mod chrome_suppression_interaction_tests {
                     assert!(
                         !overlay
                             .egui_ctx
-                            .read_response(egui::Id::new(id))
+                            .read_response(egui::Id::unique(id))
                             .unwrap()
                             .enabled()
                     );
@@ -16066,7 +16683,7 @@ mod chrome_suppression_interaction_tests {
 
     fn frame_hold_scan_end_before_release(cancel: bool) {
         use crate::video::normalize_types::{NormalizeOverlayState, NormalizeUiState};
-        fn draw(overlay: &mut NativeEguiOverlayState) -> NativeOverlayLogicalOutput {
+        fn draw(overlay: &mut NativeEguiOverlayState) -> HeadlessLogicalOutput {
             // Keep the real egui click-duration contract deterministic under full-suite load.
             let time = overlay.egui_ctx.input(|i| i.time) + 1.0 / 60.0;
             overlay.started_at = Instant::now() - Duration::from_secs_f64(time);
@@ -16094,7 +16711,7 @@ mod chrome_suppression_interaction_tests {
             }
             let pos = overlay
                 .egui_ctx
-                .read_response(egui::Id::new(id))
+                .read_response(egui::Id::unique(id))
                 .unwrap()
                 .rect
                 .center();
@@ -16150,7 +16767,7 @@ mod chrome_suppression_interaction_tests {
             assert!(
                 overlay
                     .egui_ctx
-                    .read_response(egui::Id::new(id))
+                    .read_response(egui::Id::unique(id))
                     .unwrap()
                     .enabled()
             );
@@ -16193,7 +16810,7 @@ mod chrome_suppression_interaction_tests {
     #[test]
     fn native_tracks_hud_disabled_frame_button_cannot_resume_a_hold() {
         let (mut overlay, _) = fixture(false);
-        let id = egui::Id::new("native_video_next_frame");
+        let id = egui::Id::unique("native_video_next_frame");
         let pos = overlay.egui_ctx.read_response(id).unwrap().rect.center();
         pointer(&mut overlay, pos);
         frame(&mut overlay);
@@ -16308,7 +16925,7 @@ mod chrome_suppression_interaction_tests {
             }
             let response = overlay
                 .egui_ctx
-                .read_response(egui::Id::new("native_video_audio_track_button"))
+                .read_response(egui::Id::unique("native_video_audio_track_button"))
                 .unwrap_or_else(|| panic!("track selection must remain reachable at {width}pt"));
             assert!(response.rect.is_positive());
             assert!(
@@ -16351,7 +16968,7 @@ mod chrome_suppression_interaction_tests {
             "native_video_mute",
             "native_video_speed",
         ] {
-            if let Some(response) = overlay.egui_ctx.read_response(egui::Id::new(name)) {
+            if let Some(response) = overlay.egui_ctx.read_response(egui::Id::unique(name)) {
                 assert!(
                     !time.intersect(response.rect).is_positive(),
                     "time overlaps {name}"
@@ -16372,7 +16989,7 @@ mod chrome_suppression_interaction_tests {
                 }
                 let pos = overlay
                     .egui_ctx
-                    .read_response(egui::Id::new("native_video_audio_track_button"))
+                    .read_response(egui::Id::unique("native_video_audio_track_button"))
                     .unwrap()
                     .rect
                     .center();
@@ -16444,7 +17061,7 @@ mod chrome_suppression_interaction_tests {
         frame(&mut overlay);
         let pos = overlay
             .egui_ctx
-            .read_response(egui::Id::new("native_video_volume"))
+            .read_response(egui::Id::unique("native_video_volume"))
             .unwrap()
             .rect
             .center();
@@ -16492,7 +17109,7 @@ mod chrome_suppression_interaction_tests {
         let before = ids.map(|id| {
             overlay
                 .egui_ctx
-                .read_response(egui::Id::new(id))
+                .read_response(egui::Id::unique(id))
                 .unwrap()
                 .rect
         });
@@ -16504,7 +17121,10 @@ mod chrome_suppression_interaction_tests {
             frame(&mut overlay);
         }
         for (id, rect) in ids.into_iter().zip(before) {
-            let response = overlay.egui_ctx.read_response(egui::Id::new(id)).unwrap();
+            let response = overlay
+                .egui_ctx
+                .read_response(egui::Id::unique(id))
+                .unwrap();
             assert_eq!(response.rect, rect);
             assert_eq!(
                 response.enabled(),
@@ -16586,10 +17206,33 @@ mod chrome_suppression_interaction_tests {
         (overlay, chrome)
     }
 
-    fn frame(overlay: &mut NativeEguiOverlayState) -> NativeOverlayLogicalOutput {
-        overlay
-            .render_logical_once(false, true)
-            .expect("real CPU draw and hidden cleanup")
+    struct HeadlessLogicalOutput(Option<NativeOverlayLogicalOutput>);
+
+    impl HeadlessLogicalOutput {
+        fn into_inner(mut self) -> NativeOverlayLogicalOutput {
+            self.0.take().unwrap()
+        }
+    }
+    impl std::ops::Deref for HeadlessLogicalOutput {
+        type Target = NativeOverlayLogicalOutput;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+    impl Drop for HeadlessLogicalOutput {
+        fn drop(&mut self) {
+            if let Some(output) = self.0.take() {
+                crate::egui_output::discard_headless_output(output.full_output);
+            }
+        }
+    }
+
+    fn frame(overlay: &mut NativeEguiOverlayState) -> HeadlessLogicalOutput {
+        HeadlessLogicalOutput(Some(
+            overlay
+                .render_logical_once(false, true)
+                .expect("real CPU draw and hidden cleanup"),
+        ))
     }
 
     #[derive(Default)]
@@ -16700,9 +17343,12 @@ mod chrome_suppression_interaction_tests {
             batch: NativeOverlayLogicalBatch,
             _: Instant,
         ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
-            let output = batch
+            let mut output = batch
                 .full_output
                 .expect("production logical passes produced output");
+            let texture_sets = output.textures_delta.set.len();
+            let texture_frees = output.textures_delta.free.len();
+            crate::egui_output::apply_texture_sets(&mut output.textures_delta, |_, _| {});
             let state = &mut self.state;
             let result = finalize_native_overlay_gpu_batch(
                 &mut self.gpu,
@@ -16714,18 +17360,20 @@ mod chrome_suppression_interaction_tests {
                         state,
                         batch.seek_strip_inventory,
                         batch.seek_strip_window_request,
-                        &output.textures_delta.free,
+                        std::mem::take(&mut output.textures_delta),
                         |id| {
                             gpu.operations.push("FreeTexture");
-                            gpu.freed.push(id);
+                            gpu.freed.push(*id);
                         },
                         batch.commands,
                         batch.window_intents,
                     )
                 },
-            )?;
-            self.texture_sets += output.textures_delta.set.len();
-            self.texture_frees += output.textures_delta.free.len();
+            );
+            crate::egui_output::discard_headless_output(output);
+            let result = result?;
+            self.texture_sets += texture_sets;
+            self.texture_frees += texture_frees;
             Ok(result)
         }
     }
@@ -16900,7 +17548,7 @@ mod chrome_suppression_interaction_tests {
         ] {
             let rect = overlay
                 .egui_ctx
-                .read_response(egui::Id::new(id))
+                .read_response(egui::Id::unique(id))
                 .expect("640pt scan keeps the real HUD arrow")
                 .rect;
             assert!(
@@ -16925,7 +17573,7 @@ mod chrome_suppression_interaction_tests {
             {
                 let response = overlay
                     .egui_ctx
-                    .read_response(egui::Id::new(id))
+                    .read_response(egui::Id::unique(id))
                     .expect("real blocked HUD widget");
                 let pos = response.rect.center();
                 pointer(&mut overlay, pos);
@@ -16943,7 +17591,7 @@ mod chrome_suppression_interaction_tests {
         assert!(
             overlay
                 .egui_ctx
-                .read_response(egui::Id::new(("native_video_normalize_file_nav", 1)))
+                .read_response(egui::Id::unique(("native_video_normalize_file_nav", 1)))
                 .is_none(),
             "no alternate modal navigation widget"
         );
@@ -16975,7 +17623,7 @@ mod chrome_suppression_interaction_tests {
         assert!(overlay.bottom_hud_visible, "existing edge reveal");
         let pos = overlay
             .egui_ctx
-            .read_response(egui::Id::new("native_video_next_file"))
+            .read_response(egui::Id::unique("native_video_next_file"))
             .unwrap()
             .rect
             .center();
@@ -17041,7 +17689,7 @@ mod chrome_suppression_interaction_tests {
         );
         let pos = overlay
             .egui_ctx
-            .read_response(egui::Id::new("native_video_prev_file"))
+            .read_response(egui::Id::unique("native_video_prev_file"))
             .unwrap()
             .rect
             .center();
@@ -17056,7 +17704,7 @@ mod chrome_suppression_interaction_tests {
         );
         let pos = overlay
             .egui_ctx
-            .read_response(egui::Id::new("native_video_normalize_cancel"))
+            .read_response(egui::Id::unique("native_video_normalize_cancel"))
             .unwrap()
             .rect
             .center();
@@ -17081,13 +17729,13 @@ mod chrome_suppression_interaction_tests {
         assert!(
             overlay
                 .egui_ctx
-                .read_response(egui::Id::new("native_video_prev_file"))
+                .read_response(egui::Id::unique("native_video_prev_file"))
                 .is_some()
         );
         assert!(
             overlay
                 .egui_ctx
-                .read_response(egui::Id::new("native_video_play"))
+                .read_response(egui::Id::unique("native_video_play"))
                 .is_some()
         );
     }
@@ -17097,7 +17745,7 @@ mod chrome_suppression_interaction_tests {
         let (mut overlay, _) = fixture(false);
         let before = overlay
             .egui_ctx
-            .read_response(egui::Id::new("native_video_prev_file"))
+            .read_response(egui::Id::unique("native_video_prev_file"))
             .unwrap()
             .rect;
         overlay.set_normalize_state(crate::video::normalize_types::NormalizeOverlayState {
@@ -17110,7 +17758,7 @@ mod chrome_suppression_interaction_tests {
         assert_eq!(
             overlay
                 .egui_ctx
-                .read_response(egui::Id::new("native_video_prev_file"))
+                .read_response(egui::Id::unique("native_video_prev_file"))
                 .unwrap()
                 .rect,
             before
@@ -17167,7 +17815,7 @@ mod chrome_suppression_interaction_tests {
         };
         let pos = overlay
             .egui_ctx
-            .read_response(egui::Id::new(id))
+            .read_response(egui::Id::unique(id))
             .expect("drawn owner widget")
             .rect
             .center();
@@ -17251,7 +17899,7 @@ mod chrome_suppression_interaction_tests {
         assert!(
             overlay
                 .egui_ctx
-                .read_response(egui::Id::new("native_video_seek_hit"))
+                .read_response(egui::Id::unique("native_video_seek_hit"))
                 .is_some_and(|response| response.rect.max.y > 1000.0)
         );
     }
@@ -17363,7 +18011,7 @@ mod chrome_suppression_interaction_tests {
         let (mut overlay, chrome) = fixture(false);
         let pos = overlay
             .egui_ctx
-            .read_response(egui::Id::new("native_video_speed"))
+            .read_response(egui::Id::unique("native_video_speed"))
             .unwrap()
             .rect
             .center();
@@ -18330,7 +18978,7 @@ mod tests {
         for frame in 0..3 {
             let mut controls = Vec::new();
             let mut menu_rect = None;
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(full_rect),
                     ..Default::default()
@@ -18349,6 +18997,7 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
             assert!(menu_open);
             assert_eq!(controls.len(), 3);
             assert!(
@@ -18458,12 +19107,13 @@ mod tests {
         let button = egui::Rect::from_min_size(egui::pos2(150.0, 170.0), egui::vec2(62.0, 28.0));
         let mut commands = Vec::new();
         open = true;
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(viewport),
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 super::draw_native_audio_track_menu(
                     ctx,
                     viewport,
@@ -18478,6 +19128,7 @@ mod tests {
                 );
             },
         );
+        crate::egui_output::discard_headless_output(output);
         let first = ctx
             .data(|data| data.get_temp::<usize>(scroll_id))
             .expect("reopened menu should store its first visible row");
@@ -18574,13 +19225,14 @@ mod tests {
         let mut run = || {
             let time = time_secs;
             time_secs += 1.0;
-            ctx.run(
+            ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     time: Some(time),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         layout,
@@ -18599,7 +19251,7 @@ mod tests {
                 },
             )
         };
-        let _ = run();
+        crate::egui_output::discard_headless_output(run());
         run()
     }
 
@@ -18704,6 +19356,7 @@ mod tests {
             egui::Shape::LineSegment { stroke, .. } if stroke.width == 5.0
         )));
         assert_fixed_range_text_colors(&shapes, "画像間隔");
+        crate::egui_output::discard_headless_output(output);
 
         strip.thumbnail_notice = Some(super::NativeOverlaySeekStripThumbnailNotice::Unavailable);
         let notice_output =
@@ -18718,6 +19371,7 @@ mod tests {
                 if text.galley.text().contains(strip.thumbnail_notice.unwrap().label())
                     && text.fallback_color == egui::Color32::from_gray(210)
         )));
+        crate::egui_output::discard_headless_output(notice_output);
     }
 
     #[test]
@@ -18813,6 +19467,7 @@ mod tests {
             egui::Shape::LineSegment { stroke, .. } if stroke.width == 5.0
         )));
         assert_fixed_range_text_colors(&shapes, "表示範囲");
+        crate::egui_output::discard_headless_output(output);
     }
 
     /// テストが使う帯の寸法。overlay の `seek_strip_layout` と同じ引数で解決する。
@@ -18931,7 +19586,7 @@ mod tests {
         let mut cursor_icons = Vec::new();
         for frame in 0..4 {
             let mut commands = Vec::new();
-            let output = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     time: Some(frame as f64 / 60.0),
@@ -18942,7 +19597,8 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         test_strip_layout(overlay_size),
@@ -18958,7 +19614,7 @@ mod tests {
                         &mut commands,
                         None,
                     );
-                    egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                    egui::Area::new(egui::Id::unique("native_video_seek_hud"))
                         .order(egui::Order::Foreground)
                         .fixed_pos(egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT))
                         .show(ctx, |ui| {
@@ -18969,6 +19625,7 @@ mod tests {
             let egui_hover = ctx.pointer_hover_pos();
             egui_hover_positions.push(egui_hover);
             cursor_icons.push(output.platform_output.cursor_icon);
+            crate::egui_output::discard_headless_output(output);
         }
 
         assert_eq!(
@@ -19026,15 +19683,16 @@ mod tests {
 
             // `Area` intentionally makes its first frame an invisible sizing pass. Prime the
             // two test-only areas so the assertions below inspect their painted second frame.
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     for id in [
-                        egui::Id::new(("seek_preview_clip", case)),
-                        egui::Id::new(("seek_preview_legacy_clip", case)),
+                        egui::Id::unique(("seek_preview_clip", case)),
+                        egui::Id::unique(("seek_preview_legacy_clip", case)),
                     ] {
                         egui::Area::new(id)
                             .fade_in(false)
@@ -19045,14 +19703,16 @@ mod tests {
                     }
                 },
             );
+            crate::egui_output::discard_headless_output(output);
 
-            let output = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::Area::new(egui::Id::new(("seek_preview_clip", case)))
+                |root_ui| {
+                    let ctx = root_ui.ctx();
+                    egui::Area::new(egui::Id::unique(("seek_preview_clip", case)))
                         .fade_in(false)
                         .fixed_pos(egui::Pos2::ZERO)
                         .show(ctx, |ui| {
@@ -19179,13 +19839,14 @@ mod tests {
                 "{case}: bookmark action icon"
             );
 
-            let legacy_output = ctx.run(
+            let legacy_output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::Area::new(egui::Id::new(("seek_preview_legacy_clip", case)))
+                |root_ui| {
+                    let ctx = root_ui.ctx();
+                    egui::Area::new(egui::Id::unique(("seek_preview_legacy_clip", case)))
                         .fade_in(false)
                         .fixed_pos(egui::Pos2::ZERO)
                         .show(ctx, |ui| {
@@ -19222,6 +19883,8 @@ mod tests {
                 !hud_rect.intersects(layout.preview_rect.expand(2.0)),
                 "{case}: that HUD-only clip excludes the complete popup"
             );
+            crate::egui_output::discard_headless_output(output);
+            crate::egui_output::discard_headless_output(legacy_output);
         }
     }
 
@@ -19766,17 +20429,20 @@ mod tests {
                 immediate_native_wheel_command(120, false, false, false, false, true).is_none(),
                 "wheel over the strip must not enqueue navigation before egui handles it"
             );
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     events: vec![egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Line,
                         delta: egui::vec2(0.0, 1.0),
                         modifiers: egui::Modifiers::default(),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         test_strip_layout(overlay_size),
@@ -19792,8 +20458,9 @@ mod tests {
                         &mut commands,
                         None,
                     );
+                    let options = ctx.options(|options| options.input_options);
                     wheel_remaining = ctx.input(|input| {
-                        input.raw_scroll_delta != egui::Vec2::ZERO
+                        !crate::wheel_input::remaining_wheel_inputs(input, options).is_empty()
                             || input.smooth_scroll_delta != egui::Vec2::ZERO
                             || input
                                 .events
@@ -19802,6 +20469,7 @@ mod tests {
                     });
                 },
             );
+            crate::egui_output::discard_headless_output(output);
 
             assert!(!wheel_remaining);
             assert!(commands.iter().any(|command| matches!(
@@ -19878,13 +20546,14 @@ mod tests {
         let mut drag_origin = None;
         let mut commands = Vec::new();
         for chunk in std::iter::once(Vec::new()).chain(frames) {
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     events: chunk,
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         layout,
@@ -19906,6 +20575,7 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
         }
         (commands, layout)
     }
@@ -19952,7 +20622,7 @@ mod tests {
             320.0,
         );
         let release = egui::pos2(480.0, 0.0);
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -19969,7 +20639,8 @@ mod tests {
                 ],
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 let _ = draw_native_seek_strip(
                     ctx,
                     layout,
@@ -19989,8 +20660,9 @@ mod tests {
         );
         assert!(drag_origin.is_some());
         assert!(commands.is_empty());
+        crate::egui_output::discard_headless_output(output);
 
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -20007,7 +20679,8 @@ mod tests {
                 ],
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 let _ = draw_native_seek_strip(
                     ctx,
                     layout,
@@ -20025,6 +20698,7 @@ mod tests {
                 );
             },
         );
+        crate::egui_output::discard_headless_output(output);
         assert!(drag_origin.is_none());
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -20154,6 +20828,8 @@ mod tests {
                 unit: egui::MouseWheelUnit::Line,
                 delta: egui::vec2(0.0, 1.0),
                 modifiers: egui::Modifiers::default(),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             }]],
             Some(layout_center(overlay_size)),
         );
@@ -20316,17 +20992,18 @@ mod tests {
                         }],
                         _ => Vec::new(),
                     };
-                    let _ = ctx.run(
+                    let output = ctx.run_ui(
                         egui::RawInput {
                             screen_rect: Some(full),
                             events,
                             ..Default::default()
                         },
-                        |ctx| {
+                        |root_ui| {
+                            let ctx = root_ui.ctx();
                             if pass == 1 && overlay_size.y < 140.0 && *row_index >= 5 {
                                 ctx.data_mut(|data| {
                                     data.insert_temp(
-                                        egui::Id::new("native_video_seek_strip_menu_scroll"),
+                                        egui::Id::unique("native_video_seek_strip_menu_scroll"),
                                         77.0_f32,
                                     )
                                 });
@@ -20347,6 +21024,7 @@ mod tests {
                             );
                         },
                     );
+                    crate::egui_output::discard_headless_output(output);
                     // Area は 1 フレーム目にまだ `fixed_pos` へ落ち着いていない。押す位置は
                     // 落ち着いた後 (pass 1) の実 rect から取る。
                     if pass <= 1 {
@@ -20362,7 +21040,7 @@ mod tests {
                         let row_height = row_height.max(18.0);
                         let scroll = ctx
                             .data(|data| {
-                                data.get_temp::<f32>(egui::Id::new(
+                                data.get_temp::<f32>(egui::Id::unique(
                                     "native_video_seek_strip_menu_scroll",
                                 ))
                             })
@@ -20434,16 +21112,19 @@ mod tests {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, -1.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 }],
                 _ => Vec::new(),
             };
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(full),
                     events,
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     super::draw_native_seek_strip_menu(
                         ctx,
                         full,
@@ -20460,9 +21141,12 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
         }
         let scroll = ctx
-            .data(|data| data.get_temp::<f32>(egui::Id::new("native_video_seek_strip_menu_scroll")))
+            .data(|data| {
+                data.get_temp::<f32>(egui::Id::unique("native_video_seek_strip_menu_scroll"))
+            })
             .unwrap_or(0.0);
         assert!(scroll > 0.0, "ホイールでメニューがスクロールする: {scroll}");
     }
@@ -20494,8 +21178,8 @@ mod tests {
         let captured_for_ui = Arc::clone(&captured);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
-            .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui(move |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let painter = ui.painter().clone();
                     let mut commands = Vec::new();
                     super::draw_native_seek_strip_lock_button(
@@ -20549,58 +21233,61 @@ mod tests {
             let captured_for_ui = Arc::clone(&captured);
             let drag_origin = Arc::new(Mutex::new(None));
             let mut fonts_ready = false;
-            let mut harness = crate::test_ui::builder()
-                .with_size(overlay_size)
-                .build(move |ctx| {
-                    if !fonts_ready {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        fonts_ready = true;
-                        ctx.request_repaint();
-                        return;
-                    }
-                    let strip = NativeOverlaySeekStrip {
-                        stamp: test_seek_strip_stamp(),
-                        span: crate::video::seek_strip_layout::SeekStripSpan::Window,
-                        cell_aspect: None,
-                        center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
-                            center_index: 4.0,
-                        },
-                        axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
-                            crate::video::seek_strip::StripAxis::TimeGrid {
-                                interval_secs: 15.0,
-                                fallback_interval_secs: 15.0,
-                                duration_secs: 480.0,
+            let mut harness =
+                crate::test_ui::builder()
+                    .with_size(overlay_size)
+                    .build_ui(move |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
+
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        let strip = NativeOverlaySeekStrip {
+                            stamp: test_seek_strip_stamp(),
+                            span: crate::video::seek_strip_layout::SeekStripSpan::Window,
+                            cell_aspect: None,
+                            center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                                center_index: 4.0,
                             },
-                        )),
-                        range_value_secs:
-                            crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
-                        cell_count: 32,
-                        cells: Vec::new(),
-                        thumbnail_notice: None,
-                        wave_image: None,
-                        wave_notice: None,
-                        waveform_span_secs:
-                            crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
-                        duration_secs: 600.0,
-                    };
-                    let mut commands = Vec::new();
-                    draw_native_seek_strip(
-                        ctx,
-                        test_strip_layout(overlay_size),
-                        crate::video::seek_strip_layout::SeekStripMarker::Center,
-                        Some(pointer),
-                        true,
-                        &strip,
-                        false,
-                        false,
-                        &std::collections::HashMap::new(),
-                        None,
-                        &mut drag_origin.lock().unwrap(),
-                        &mut commands,
-                        None,
-                    );
-                    captured_for_ui.lock().unwrap().extend(commands);
-                });
+                            axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
+                                crate::video::seek_strip::StripAxis::TimeGrid {
+                                    interval_secs: 15.0,
+                                    fallback_interval_secs: 15.0,
+                                    duration_secs: 480.0,
+                                },
+                            )),
+                            range_value_secs:
+                                crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
+                            cell_count: 32,
+                            cells: Vec::new(),
+                            thumbnail_notice: None,
+                            wave_image: None,
+                            wave_notice: None,
+                            waveform_span_secs:
+                                crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                            duration_secs: 600.0,
+                        };
+                        let mut commands = Vec::new();
+                        draw_native_seek_strip(
+                            ctx,
+                            test_strip_layout(overlay_size),
+                            crate::video::seek_strip_layout::SeekStripMarker::Center,
+                            Some(pointer),
+                            true,
+                            &strip,
+                            false,
+                            false,
+                            &std::collections::HashMap::new(),
+                            None,
+                            &mut drag_origin.lock().unwrap(),
+                            &mut commands,
+                            None,
+                        );
+                        captured_for_ui.lock().unwrap().extend(commands);
+                    });
             harness.run();
             harness.hover_at(pointer);
             for pressed in [true, false] {
@@ -20665,7 +21352,9 @@ mod tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(overlay_size)
                 .with_pixels_per_point(1.5)
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -20715,7 +21404,7 @@ mod tests {
                             None,
                         );
                     }
-                    egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                    egui::Area::new(egui::Id::unique("native_video_seek_hud"))
                         .order(egui::Order::Foreground)
                         .fixed_pos(egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT))
                         .show(ctx, |ui| {
@@ -20823,7 +21512,9 @@ mod tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(overlay_size)
                 .with_pixels_per_point(1.5)
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
+
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -20831,7 +21522,7 @@ mod tests {
                         return;
                     }
                     let mut commands = Vec::new();
-                    egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                    egui::Area::new(egui::Id::unique("native_video_seek_hud"))
                         .order(egui::Order::Foreground)
                         .fixed_pos(egui::pos2(
                             0.0,
@@ -21150,7 +21841,7 @@ mod tests {
         ) {
             let strip_steps = consume_seek_strip_wheel(ctx, consume_strip);
             let strip_size = egui::vec2(160.0, 160.0);
-            let strip = egui::Area::new(egui::Id::new("headless_native_wheel_strip"))
+            let strip = egui::Area::new(egui::Id::unique("headless_native_wheel_strip"))
                 .fixed_pos(egui::pos2(200.0, 20.0))
                 .default_size(strip_size)
                 .constrain(false)
@@ -21161,20 +21852,24 @@ mod tests {
                 });
             let mut panel_inner_rect = egui::Rect::NOTHING;
             let mut panel_offset = 0.0;
-            egui::Area::new(egui::Id::new("headless_native_wheel_panel_area"))
+            egui::Area::new(egui::Id::unique("headless_native_wheel_panel_area"))
                 .fixed_pos(egui::pos2(400.0, 20.0))
                 .constrain(false)
                 .show(ctx, |ui| {
                     ui.set_min_size(egui::vec2(220.0, 320.0));
                     ui.set_max_size(egui::vec2(220.0, 320.0));
                     let output = egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("headless_native_wheel_panel")
                         .max_height(320.0)
                         .show(ui, |ui| {
                             ui.allocate_space(egui::vec2(190.0, 1200.0));
                         });
                     panel_inner_rect = output.inner_rect;
-                    panel_offset = output.state.offset.y;
+                    panel_offset = output.state.clamped_offset().y;
                 });
             (strip.inner, panel_inner_rect, strip_steps, panel_offset)
         }
@@ -21191,19 +21886,33 @@ mod tests {
 
         fn batch_prepare(&mut self) -> Result<(), String> {
             let mut rects = None;
-            let _ = self.ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(640.0, 360.0),
-                    )),
-                    time: Some(0.0),
-                    ..Default::default()
-                },
-                |ctx| {
-                    let (strip, panel, _, _) = Self::draw_regions(ctx, false);
-                    rects = Some((strip, panel));
-                },
+            // A new 0.37 Area first measures an invisible, non-interactable sizing pass.
+            // Prepare the existing visible panel before delivering the tested physical input.
+            for _ in 0..2 {
+                let full_output = self.ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(640.0, 360.0),
+                        )),
+                        time: Some(0.0),
+                        ..Default::default()
+                    },
+                    |root_ui| {
+                        let ctx = root_ui.ctx();
+                        let (strip, panel, _, _) = Self::draw_regions(ctx, false);
+                        rects = Some((strip, panel));
+                    },
+                );
+                crate::egui_output::discard_headless_output(full_output);
+            }
+            assert_eq!(
+                self.ctx.layer_id_at(egui::pos2(450.0, 100.0)),
+                Some(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::unique("headless_native_wheel_panel_area"),
+                )),
+                "the wheel fixture requires the actual visible panel layer",
             );
             let (strip, panel) = rects.expect("headless regions");
             assert!(
@@ -21289,6 +21998,8 @@ mod tests {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
                     modifiers: super::egui_modifiers(wheel.shift, wheel.ctrl, wheel.alt),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 });
             }
             disposition
@@ -21307,7 +22018,7 @@ mod tests {
             let mut panel_raw_delta = None;
             let strip_rect = self.strip_rect.expect("prepared strip rect");
             let panel_rect = self.panel_rect.expect("prepared panel rect");
-            let mut full_output = ctx.run(
+            let mut full_output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -21317,7 +22028,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     assert!(
                         ctx.input(|input| input.stable_dt) > 0.0,
                         "headless logical pass clock must advance monotonically"
@@ -21326,7 +22038,13 @@ mod tests {
                     let over_strip = pointer.is_some_and(|pos| strip_rect.contains(pos));
                     let over_panel = pointer.is_some_and(|pos| panel_rect.contains(pos));
                     if over_panel {
-                        panel_raw_delta = Some(ctx.input(|input| input.raw_scroll_delta.y));
+                        let options = ctx.options(|options| options.input_options);
+                        panel_raw_delta = Some(ctx.input(|input| {
+                            crate::wheel_input::remaining_wheel_inputs(input, options)
+                                .iter()
+                                .map(|wheel| wheel.delta.y)
+                                .sum()
+                        }));
                     }
                     let (actual_strip, actual_panel, steps, offset) =
                         Self::draw_regions(ctx, over_strip);
@@ -21356,13 +22074,13 @@ mod tests {
                 .platform_output
                 .commands
                 .push(egui::OutputCommand::CopyText(format!("pass-{pass}")));
-            full_output.textures_delta.set.push((
+            full_output.textures_delta.push(
                 egui::TextureId::Managed(10_000 + pass as u64),
                 egui::epaint::ImageDelta::full(
                     egui::ColorImage::new([1, 1], vec![egui::Color32::from_gray(pass as u8)]),
                     egui::TextureOptions::NEAREST,
                 ),
-            ));
+            );
             self.last_logical_shape_count = full_output.shapes.len();
             self.dirty = false;
             Ok(NativeOverlayLogicalOutput {
@@ -21440,6 +22158,7 @@ mod tests {
                 .map(egui::TextureId::Managed)
                 .collect();
             self.presented_shape_count = full_output.shapes.len();
+            crate::egui_output::discard_headless_output(full_output);
             Ok((batch.commands, batch.window_intents))
         }
     }
@@ -21449,14 +22168,14 @@ mod tests {
         let ctx = egui::Context::default();
         configure_overlay_style(&ctx, crate::settings::TextContrast::Strong);
 
-        assert!(ctx.style().visuals.dark_mode);
+        assert!(ctx.global_style().visuals.dark_mode);
         assert_eq!(
             crate::os_theme::current_text_contrast(&ctx),
             crate::settings::TextContrast::Strong
         );
-        assert_eq!(ctx.style().interaction.tooltip_delay, 0.0);
+        assert_eq!(ctx.global_style().interaction.tooltip_delay, 0.0);
         assert_eq!(
-            ctx.style().visuals.text_color(),
+            ctx.global_style().visuals.text_color(),
             crate::os_theme::dark_visuals(crate::settings::TextContrast::Strong).text_color()
         );
 
@@ -21466,7 +22185,7 @@ mod tests {
             crate::settings::TextContrast::Standard
         );
         assert_eq!(
-            ctx.style().visuals.text_color(),
+            ctx.global_style().visuals.text_color(),
             crate::os_theme::dark_visuals(crate::settings::TextContrast::Standard).text_color()
         );
     }
@@ -21668,12 +22387,18 @@ mod tests {
                 target.presented_platform_markers,
                 ["pass-0".to_owned(), "pass-1".to_owned()]
             );
+            assert_eq!(target.presented_texture_ids.len(), 2);
             assert_eq!(
-                target.presented_texture_ids,
-                [
+                target
+                    .presented_texture_ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>(),
+                std::collections::HashSet::from([
                     egui::TextureId::Managed(10_000),
                     egui::TextureId::Managed(10_001)
-                ]
+                ]),
+                "both pass textures survive; the 0.37 map has no cross-ID iteration order"
             );
             assert_eq!(
                 target.presented_shape_count,
@@ -21879,6 +22604,74 @@ mod tests {
             Some(1.0),
             "the final pass inventory remains the presented inventory"
         );
+        crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
+    }
+
+    #[test]
+    fn native_ime_interrupt_multiple_logical_passes_keep_one_generated_request() {
+        let mut target = HeadlessNativeBatchTarget::default();
+        target.batch_prepare().unwrap();
+        let context = egui::Context::default();
+        let id = egui::Id::unique("native-multiple-pass-ime");
+        let mut text = "日本語 sample".to_owned();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let output = context.run_ui(raw(), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(id))
+                    .request_focus();
+            });
+            crate::egui_output::discard_headless_output(output);
+        }
+        let mut batch = NativeOverlayLogicalBatch::default();
+        for interrupt in [true, false] {
+            let mut logical = target.batch_render_logical_once(false).unwrap();
+            let output = context.run_ui(raw(), |ui| {
+                let response = ui.add(egui::TextEdit::singleline(&mut text).id(id));
+                if interrupt {
+                    response.request_focus();
+                }
+            });
+            assert_eq!(
+                output
+                    .platform_output
+                    .ime
+                    .expect("actual field")
+                    .should_interrupt_composition,
+                interrupt
+            );
+            super::append_native_platform_window_intents(
+                &output.platform_output,
+                1.0,
+                false,
+                &mut logical.window_intents,
+            );
+            crate::egui_output::discard_headless_output(std::mem::replace(
+                &mut logical.full_output,
+                output,
+            ));
+            batch.append(logical);
+        }
+        let ime = batch.full_output.as_ref().unwrap().platform_output.ime;
+        let interrupts = batch
+            .window_intents
+            .iter()
+            .filter(|intent| matches!(intent, super::NativeWindowIntent::InterruptImeComposition))
+            .count();
+        crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
+        assert!(
+            ime.expect("aggregated field metadata")
+                .should_interrupt_composition
+        );
+        assert_eq!(
+            interrupts, 1,
+            "the second logical pass does not recreate the delivered pulse"
+        );
     }
 
     #[test]
@@ -21920,6 +22713,7 @@ mod tests {
             .is_none()
         );
 
+        crate::egui_output::discard_headless_output(hidden_final.full_output.take().unwrap());
         let mut intermediate = target.batch_render_logical_once(false).unwrap();
         intermediate.seek_strip_inventory =
             crate::video::seek_strip::SeekStripPresentedInventory::Hidden(stamp);
@@ -21941,6 +22735,7 @@ mod tests {
                 ..
             })
         ));
+        crate::egui_output::discard_headless_output(visible_final.full_output.take().unwrap());
     }
 
     #[test]
@@ -21959,7 +22754,7 @@ mod tests {
         let mut observations = Vec::new();
         for frame in 0..4 {
             let mut commands = Vec::new();
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -21968,7 +22763,8 @@ mod tests {
                     time: Some(frame as f64),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     let _ = draw_native_seek_strip(
                         ctx,
                         layout,
@@ -21986,6 +22782,7 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
             observations.push(
                 commands
                     .into_iter()
@@ -22018,6 +22815,7 @@ mod tests {
             "only the final actual logical-pass observation may survive"
         );
 
+        crate::egui_output::discard_headless_output(two_pass_batch.full_output.take().unwrap());
         let mut committed = None;
         // A failed present never calls the commit helper. Even though both logical passes
         // observed the same layout, their speculative observations cannot mutate the dedup
@@ -24252,13 +25050,14 @@ mod tests {
         let mut time_shape = None;
         let mut notice_shape = None;
         let mut range_shape = None;
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(hud_rect),
                 ..Default::default()
             },
-            |ctx| {
-                egui::Area::new(egui::Id::new("tiny_bottom_hud_geometry_test"))
+            |root_ui| {
+                let ctx = root_ui.ctx();
+                egui::Area::new(egui::Id::unique("tiny_bottom_hud_geometry_test"))
                     .fixed_pos(hud_rect.min)
                     .show(ctx, |ui| {
                         ui.set_min_size(hud_rect.size());
@@ -24315,6 +25114,7 @@ mod tests {
                     });
             },
         );
+        crate::egui_output::discard_headless_output(output);
 
         assert_eq!(actual_lock, Some(expected_lock));
         assert_eq!(actual_selector, Some(expected_selector));
@@ -24330,7 +25130,8 @@ mod tests {
     fn fitted_strip_text_preserves_short_normal_text_and_only_skips_empty_rects() {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        crate::egui_output::discard_headless_output(output);
         let painter = ctx.layer_painter(egui::LayerId::background());
         let text = "画像間隔 15秒";
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 104.0));

@@ -1,9 +1,9 @@
 [
   {
     "operation": "replace_inline",
-    "anchor": "Ctrl（MacではCmd）",
-    "replacement": "Ctrl",
-    "reason": "mIV is Windows-only; canvas zoom added in v0.13.0."
+    "anchor": "細かく配置したいときは、キャンバスのツールバーの **−**・**+** で拡大・縮小できます。Ctrl（MacではCmd）を押しながらスクロールすると、ポインターの位置を中心に拡大・縮小します。",
+    "replacement": "細かく配置したいときは、キャンバスのツールバーの **−**・**+** で拡大・縮小できます。Ctrlを押しながらスクロールすると、ポインターの位置を中心に拡大・縮小します。",
+    "reason": "v0.14.0 visualizer-editor.js supports Ctrl canvas zoom; mIV is Windows-only."
   },
   {
     "operation": "replace_paragraph",
@@ -21,7 +21,7 @@
     "operation": "insert_note",
     "heading_id": "visualizer",
     "note": "mImageViewer の音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像をこの表示へ自動で渡します。曲名が無ければ拡張子を除いたファイル名を使い、ほかの情報が無ければ空欄になります。画像は長辺1024ピクセルまでで、動く画像は最初の一枚を使います。先に文字を渡し、画像の準備ができたら表示します。音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使います。一時停止やシークでは情報を残し、PCでの停止・閉じる・再生終了では消します。リモートは最後の曲が終わっても情報を残し、次曲への切替中は空になることがあります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像も使用できます。",
-    "reason": "Mixwright v0.13.0 EffeTune.NowPlaying full snapshots supplied by mIV; user-approved lifecycle and artwork limits in effetune-now-playing-plan.md."
+    "reason": "v0.14.0 visualizer-view.js metadata() still uses getNowPlayingMetadata; unchanged EffeTune.NowPlaying contract, lifecycle and artwork limits in effetune-now-playing-plan.md. No lyrics sent by mIV."
   },
   {
     "operation": "replace_paragraph",
@@ -64,5 +64,41 @@
     "anchor": "複数のアイテムを選ぶには、キャンバスかアイテム一覧でShift+クリックします。選択中のアイテムをShift+クリックすると選択が外れます。アイテム一覧ではCtrl+クリック（MacではCmd+クリック）でも同じように選べます。キャンバスの空いている所からドラッグすると枠内に完全に収まるアイテムを選べ、Shiftを押しながらドラッグすると選択に追加できます。アイテムが重なっている所では、キャンバス上でCtrl+クリック（MacではCmd+クリック）すると背面のアイテムを選べます。Ctrl+クリックするたびに1つずつ奥のアイテムへ移り、最背面の次は最前面に戻ります。選んだアイテムはそのままドラッグできます。Ctrl+A（MacではCmd+A）ですべて選択し、Escで選択を解除します。移動・削除・複製・切り取り・コピー・貼り付けは選択中のすべてのアイテムにまとめて働きます。大きさの変更は1つずつ行います。同じ種類のアイテムだけを選んでいるときは、右側に先頭のアイテムの設定が表示され、変更は選択中のすべてのアイテムに反映されます。右側には並べ替えのボタンのほか、左端・左右中央・右端・上端・上下中央・下端に揃えるボタンも表示されます。",
     "replacement": "複数のアイテムを選ぶには、キャンバスかアイテム一覧でShift+クリックします。選択中のアイテムをShift+クリックすると選択が外れます。アイテム一覧ではCtrl+クリックでも同じように選べます。キャンバスの空いている所からドラッグすると枠内に完全に収まるアイテムを選べ、Shiftを押しながらドラッグすると選択に追加できます。アイテムが重なっている所では、キャンバス上でCtrl+クリックすると背面のアイテムを選べます。Ctrl+クリックするたびに1つずつ奥のアイテムへ移り、最背面の次は最前面に戻ります。選んだアイテムはそのままドラッグできます。Ctrl+Aですべて選択し、Escで選択を解除します。移動・削除・複製・切り取り・コピー・貼り付けは選択中のすべてのアイテムにまとめて働きます。大きさの変更は1つずつ行います。同じ種類のアイテムだけを選んでいるときは、右側に先頭のアイテムの設定が表示され、変更は選択中のすべてのアイテムに反映されます。右側には並べ替えのボタンのほか、左端・左右中央・右端・上端・上下中央・下端に揃えるボタンも表示されます。",
     "reason": "mIV is Windows-only; preserve multi-selection and cycling through overlapping items."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "このほかの7種類は、それぞれが最も映える比率にだけ用意しています。**Fretboard**（21:9、9:16）は検出した音をギターのネック上に示し、ビート表示を添えます。21:9ではネックの上にピアノロール表示も加わります。**Power Amp**（21:9、16:9）は、黒いアンプのフロントパネルに青く光るVUメーターを並べます。**Round Dials**（1:1、9:16）は、真鍮の縁に収めた丸型のVUメーターです。**Beat Stage**（16:9、9:16）は、低音に合わせて膨らむ大きなビートサークルの中に検出したテンポを表示し、ネオン調のスペクトラムバーと組み合わせます。**Lyric Stage**（16:9、9:16）は、低音に合わせて膨らむアルバムアートワークのやわらかな光の上に同期歌詞を表示し、現在の行を単語ごとに塗りつぶしていきます。歌詞のない曲では、落ち着いたアートワーク画面として表示されます。**Cinema Strip**（21:9）は、スペクトログラム、10秒分の波形、横に流れる歌詞を画面の横幅いっぱいに並べます。**Meter Bridge**（21:9、4:3）は、True Peak、VU、ゆっくり応答するRMS、ラウドネスの各メーターを並べ、同じ音楽に対する指示の違いを見比べられるようにします。下段にはレベルメーターと波形も表示します。",
+    "replacement": "このほかの6種類は、それぞれが最も映える比率にだけ用意しています。**Fretboard**（21:9、9:16）は検出した音をギターのネック上に示し、ビート表示を添えます。21:9ではネックの上にピアノロール表示も加わります。**Power Amp**（21:9、16:9）は、黒いアンプのフロントパネルに青く光るVUメーターを並べます。**Round Dials**（1:1、9:16）は、真鍮の縁に収めた丸型のVUメーターです。**Beat Stage**（16:9、9:16）は、低音に合わせて膨らむ大きなビートサークルの中に検出したテンポを表示し、ネオン調のスペクトラムバーと組み合わせます。**Cinema Strip**（21:9）は、スペクトログラムと10秒分の波形を画面の横幅いっぱいに並べます。**Meter Bridge**（21:9、4:3）は、True Peak、VU、ゆっくり応答するRMS、ラウドネスの各メーターを並べ、同じ音楽に対する指示の違いを見比べられるようにします。下段にはレベルメーターと波形も表示します。",
+    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**Lyrics**, **Artwork**",
+    "replacement": "**Artwork**",
+    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**Lyrics** を追加すると、内蔵プレーヤーで再生している曲の歌詞を表示できます。Clean Feed にも表示されます。音楽ファイルに埋め込まれた歌詞、または同じフォルダーにある同じ名前の `.lrc` ファイルを使い、ファイル名の大文字・小文字は区別しません。時刻付きの歌詞を優先し、同じ条件なら `.lrc` を使います。デスクトップアプリとブラウザーのライブラリフォルダーでは自動で見つかります。ブラウザーで音楽ファイルを直接開くかドロップする場合は、`.lrc` も一緒に選択またはドロップしてください。CUE の曲では `Artist - Title.lrc` や `Title.lrc` など曲名に対応するファイルを優先し、なければアルバムファイルの時刻付き歌詞からその曲の部分を表示します。ストリームの歌詞は表示されません。",
+    "replacement": "mImageViewer の EffeTune は歌詞を表示しません。**Lyrics** は追加メニューにありません。既存または読み込んだレイアウトにある Lyrics アイテムは編集できますが、再生中の歌詞は渡されません。",
+    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "Clean Feedにも反映され、",
+    "replacement": "",
+    "reason": "Edge Fade is bundled; standalone Clean Feed is unavailable in the VST."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**表示** は **一覧** または **1行** を選べます。",
+    "replacement": "既存または読み込んだ Lyrics アイテムを編集する場合、**表示** は **一覧** または **1行** を選べます。",
+    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "サイズ変更中にShiftを押すと縦横比を、Ctrl（MacではCmd）を押すと中心位置を維持します。",
+    "replacement": "サイズ変更中にShiftを押すと縦横比を、Ctrlを押すと中心位置を維持します。",
+    "reason": "Windows VST modifier; retain new proportional and centered resizing."
   }
 ]

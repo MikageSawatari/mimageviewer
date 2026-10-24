@@ -25,7 +25,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
     install(&ctx);
     let budget = VramPoolBudget::from_pool_bytes(Some(12_655_263_744), VramBudgetMode::Fullscreen);
     assert_eq!(page_turn_pin_limit(budget), 1_012_421_099);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_test_budget"), budget));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget));
     let mut app = ready_app(&ctx, SpreadMode::Ltr);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 200;
@@ -53,6 +53,8 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex: texture.clone(),
                     pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
                     source_dims: Some(source_size),
@@ -61,7 +63,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
                 },
             );
             page.resource = crate::gpu_lanczos::test_native_resource(
-                app.fullscreen_paint_resource_for_texture(idx, texture),
+                app.fixture_raster_paint_resource(idx, texture),
                 output_size,
             )
             .into();
@@ -222,18 +224,16 @@ fn demand_matched_native_materials_survive_eviction_through_real_next_frame_draw
             else {
                 panic!("ordinary adopted material");
             };
-            let source = material.source_texture().unwrap().clone();
-            source_ids.push(source.id());
-            let request = page
-                .transform
-                .visible_region_request(page.painter.clip_rect())
+            source_ids.push(material.source_texture_id());
+            let normal = super::prepare_boundary_tests::normal_source_for_page(&app, page);
+            let request = normal
+                .visible_region_request(&page.transform, page.painter.clip_rect())
                 .unwrap();
             assert!(page.transform.total_scale * page.transform.pixels_per_point > 1.0);
             assert_eq!(
                 app.effective_params(page.occurrence.idx).post_filter,
                 crate::adjustment::PostFilter::None
             );
-            let normal = app.fullscreen_paint_resource_for_texture(page.occurrence.idx, source);
             let native = crate::gpu_lanczos::test_native_resource_with_region(
                 normal,
                 request.target_size,
@@ -391,12 +391,12 @@ fn real_offer_and_prepared_pin_boundaries_admit_equality_and_reject_excess() {
             assert_eq!(page_turn_pin_limit(budget), limit);
             if !prepared {
                 ctx.data_mut(|data| {
-                    data.insert_temp(egui::Id::new("page_turn_test_budget"), budget)
+                    data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget)
                 });
             } else {
                 ctx.data_mut(|data| {
                     data.insert_temp(
-                        egui::Id::new("page_turn_test_budget"),
+                        egui::Id::unique("page_turn_test_budget"),
                         VramPoolBudget::from_pool_bytes(
                             Some(1024 * 1024 * 1024),
                             VramBudgetMode::Fullscreen,
@@ -440,7 +440,7 @@ fn real_offer_and_prepared_pin_boundaries_admit_equality_and_reject_excess() {
                 incoming[0].resource =
                     crate::gpu_lanczos::test_native_resource(source.clone(), [40, 60]).into();
                 ctx.data_mut(|data| {
-                    data.insert_temp(egui::Id::new("page_turn_test_budget"), budget)
+                    data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget)
                 });
                 app.fullscreen_idx = Some(1);
                 let receipt = app
@@ -458,7 +458,7 @@ fn prepared_pin_recheck_rejects_output_that_exceeds_budget_after_input_release()
     install(&ctx);
     let budget =
         VramPoolBudget::from_pool_bytes(Some(16 * 1024 * 1024), VramBudgetMode::Fullscreen);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_test_budget"), budget));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget));
     let mut app = ready_app(&ctx, SpreadMode::Single);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 200;

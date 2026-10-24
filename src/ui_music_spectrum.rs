@@ -464,7 +464,7 @@ impl MusicSpectrumState {
     ) {
         let response = ui.interact(
             rect,
-            ui.id().with("music_spectrum_panel"),
+            ui.scope_id().with("music_spectrum_panel"),
             egui::Sense::hover(),
         );
         let painter = ui.painter_at(rect);
@@ -1386,28 +1386,32 @@ mod tests {
             let mut painted = Vec::new();
             let selected = select_bass(&probabilities);
             assert_eq!(selected.midi, midi);
-            let _ = ctx.run(Default::default(), |ctx| {
-                let painter = ctx.layer_painter(egui::LayerId::background());
-                draw_bass_marker(
-                    &painter,
-                    egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
-                    &mut trail,
-                    selected,
-                    MusicNoteColorScheme::default(),
-                );
-                painted = (0..trail.len()).filter(|&i| trail[i] > 0.0).collect();
-            });
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::background());
+                    draw_bass_marker(
+                        &painter,
+                        egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
+                        &mut trail,
+                        selected,
+                        MusicNoteColorScheme::default(),
+                    );
+                    painted = (0..trail.len()).filter(|&i| trail[i] > 0.0).collect();
+                })
+                .drop_without_applying_deltas();
             assert_eq!(painted, vec![(midi - SPECTRUM_NOTE_MIN_MIDI) as usize]);
             let old = trail[painted[0]];
-            let _ = ctx.run(Default::default(), |ctx| {
-                draw_bass_marker(
-                    &ctx.layer_painter(egui::LayerId::background()),
-                    egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
-                    &mut trail,
-                    BassEstimate::default(),
-                    MusicNoteColorScheme::default(),
-                );
-            });
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    draw_bass_marker(
+                        &ctx.layer_painter(egui::LayerId::background()),
+                        egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
+                        &mut trail,
+                        BassEstimate::default(),
+                        MusicNoteColorScheme::default(),
+                    );
+                })
+                .drop_without_applying_deltas();
             assert!((trail[painted[0]] - old * BASS_MARKER_DECAY).abs() < 1e-6);
         }
     }
@@ -1876,12 +1880,15 @@ mod tests {
         let ctx = egui::Context::default();
         // Consume Context's initial immediate repaint before checking our delayed request.
         for _ in 0..3 {
-            let _ = ctx.run(egui::RawInput::default(), |_| {});
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |_| {})
+                .drop_without_applying_deltas();
         }
-        let output = ctx.run(egui::RawInput::default(), |_| {
-            state.last_request = Some(Instant::now());
-            state.update(&ctx, Some(&pcm), 0.0, false);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |_| {
+                state.last_request = Some(Instant::now());
+                state.update(&ctx, Some(&pcm), 0.0, false);
+            }));
         assert!(
             request_rx.try_recv().is_err(),
             "throttle should skip sending"
@@ -1890,6 +1897,8 @@ mod tests {
             output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
                 <= SPECTRUM_REFRESH_INTERVAL
         );
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]

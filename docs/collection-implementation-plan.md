@@ -1313,6 +1313,14 @@ Busy/Starting 後に同じ revision の要求も落とさない。window を閉�
 この変更でコード上の一過性 admission 経路を扱うが、利用者が報告した一度だけの
 「ぱらどっとが読み込み中で止まった」事象は再現・原因特定されておらず、解決済みとは扱わない。
 
+2026-10-17、連続EOFのNow Playing終端を補完。read client不在・終端read error・応答切断も、
+既存requestのcontext／surface／items／intentとEOF actionの元player identity／seek世代を照合して
+既存の最終EOF clearへ合流する。prepare／preflightの終端もrequest所有を照合する。
+終端失敗はEOF claimを処理済みで保持し、自動再要求しない。supersede・stale・Cancelledは
+取消のままとしclearしない。Busy／Startingの既存deferは非終端として維持する。
+新しいcontext token・pending・retryは追加せず、通常操作を制限するモーダル化も不要。
+再生開始との境界・同型終端の分類は[自動表示計画](effetune-auto-open-plan.md#内部停止と終端エラーの追補2026-10-17-独立レビュー-p2)に記録する。
+
 ### 23.6A コレクションから元の場所へ移動（A-6）
 
 コレクション root のセルメニューに「元の場所へ移動」を追加した。Folder 本体も含め、元 source の

@@ -2,7 +2,7 @@
 
 ## 調査条件
 
-- 基礎調査対象は commit `a94b6b1b` のコードで、§4 の外部ツールだけ P2c 実装まで追補した。列はブリーフ指定どおり、
+- 基礎調査対象は commit `a94b6b1b` のコードで、§4 の外部ツールは P2c 実装と §1.397 の実フォルダー対応まで追補した。列はブリーフ指定どおり、
   `GridItem` の `Image` / `Video` / `Audio`、`Folder`、`ZipFile` / `PdfFile`、
   `ZipImage`、`PdfPage`、`Stack`、`ZipDir` をまとめた
   (`src/grid_item.rs:33-98`)。`ConvertibleArchive` と `SearchContainer` も enum にはあるが、
@@ -118,7 +118,7 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 
 | 機能・入口 | 実ファイル (`Image` / `Video` / `Audio`) | `Folder` | コンテナファイル (`ZipFile` / `PdfFile`) | `ZipImage` | `PdfPage` | `Stack` | `ZipDir` | 保存先・対象ファイルの変更 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。クリック項目を先頭、残りを `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。画像は `TempEdited` なら常に PNG、`TempOriginal` なら常に元バイト列のコピー、`OriginalFile` なら実ファイルそのもの。動画は `VideoPolicy::CurrentFrame` のとき提示済みフレームを原寸 decode し、それ以外は動画本体を渡す (コピーしない)。 | **対応 (コンテナー入口) / 拒否 (ページ入口)**。フォルダー項目の右クリックと物理フォルダー背景はフォルダー 1 件を渡す。通常のページ対象では `Unsupported`。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **対応**。`TempOriginal` は常に元バイト列を一時展開、`TempEdited` は常に PNG。`OriginalFile` は元ファイルが無いので同期判定で無効化し、native / egui menu の hover で理由を表示する (隠さない)。worker でも拒否する。実ファイルとの混在も全件を選択ポリシーへ渡す。 | **対応**。`TempOriginal` / `TempEdited` はツール指定長辺で PNG (PDF ページには元バイト列が無い)。`OriginalFile` の扱いは `ZipImage` と同じ。 | **対応**。束ねられた全 member を表示順の実項目へ展開してから `SelectionPolicy` と件数上限を適用する。 | **拒否**。書庫内ディレクトリ自体は実体化対象にしないため、混在時も部分実行せず全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。派生 temp は process 単位 directory に置くが元 file は変更しない。外部 process が元実ファイルを変更した後の監視・再読込は P5。 |
+| ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。全対象を `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。画像は `TempEdited` なら常に PNG、`TempOriginal` なら常に元バイト列のコピー、`OriginalFile` なら実ファイルそのもの。動画は `VideoPolicy::CurrentFrame` のとき提示済みフレームを原寸 decode し、それ以外は動画本体を渡す (コピーしない)。 | **対応**。キー・固定スロット・ツール選択は選択した実フォルダー自身を `RealFile` として渡し、checked の表示順・件数制限を適用する。画像用一時出力は行わない。フォルダー項目の右クリックと物理フォルダー背景は従来どおりコンテナー 1 件を渡す。設定previewとメニューcapabilityも `LaunchTarget::from_grid_item` を共有する（§1.397）。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **対応**。`TempOriginal` は常に元バイト列を一時展開、`TempEdited` は常に PNG。`OriginalFile` は元ファイルが無いので同期判定で無効化し、native / egui menu の hover で理由を表示する (隠さない)。worker でも拒否する。実ファイルとの混在も全件を選択ポリシーへ渡す。 | **対応**。`TempOriginal` / `TempEdited` はツール指定長辺で PNG (PDF ページには元バイト列が無い)。`OriginalFile` の扱いは `ZipImage` と同じ。 | **対応**。束ねられた全 member を表示順の実項目へ展開してから `SelectionPolicy` と件数上限を適用する。 | **拒否**。書庫内ディレクトリ自体は実体化対象にしないため、混在時も部分実行せず全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。派生 temp は process 単位 directory に置くが元 file は変更しない。外部 process が元実ファイルを変更した後の監視・再読込は P5。 |
 | ExternalTool — ビューア | **対応**。checked を無視して viewer の現在ページ 1 件を共通 resolver へ渡す。見開き中も P4 までは現在ページ 1 件で、`SpreadPolicy` 3 値は適用しない。ただし起動完了前でも viewer close を予約する。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない。 | **拒否**。コンテナ自身は viewer leaf にしない。現在の ZIP / PDF page で `Container` を選んだ場合は各 page セルのとおり親本体を渡す。 | **対応 (P3)**。現在の ZIP page をグリッドと同じ materializer へ渡す。`Container` は外側の元書庫を渡す。 | **対応 (P3)**。現在の PDF page をグリッドと同じ materializer へ渡す。`Container` は PDF 本体を渡す。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない。 | グリッドと同じ tool 定義・worker・一時ファイル寿命を使う。mIV は元 file を書き換えない。 |
 
 `SelectionPolicy::Single` は対象が 1 件のときだけ渡し、2 件以上なら全体を拒否する。既定の `Each` は
@@ -130,7 +130,7 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 複数試行の結果は 1 利用者操作として成功 / 失敗件数を集約して通知する。
 
 P2b-1 の `ExternalToolPicker` / `ExternalTool1` .. `ExternalTool10` /
-`ExternalToolForContainer` は main-window の Grid 専用で、既定キーは設定しない。前二者はページ対象、
+`ExternalToolForContainer` は main-window の Grid 専用で、既定キーは設定しない。前二者は選択項目（実フォルダーを含む）対象、
 最後は現在の `effective_folder()` からフォルダー / 本 1 件を解決する。変換アーカイブでは変換 cache ZIP
 でなく元アーカイブを渡し、検索・タグ・履歴・snapshot 等の集約ビュー背景では単一の現在地を決めず
 拒否する。右クリックは登録済みの全ツールを平坦に並べ、フォルダー背景と

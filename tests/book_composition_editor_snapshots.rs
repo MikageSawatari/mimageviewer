@@ -9,6 +9,9 @@ use mimageviewer::ui_composition_editor::*;
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 
+#[path = "support/logical_bounds.rs"]
+mod logical_bounds;
+
 fn fixture(phase: EditorPhase) -> EditorView {
     let pages = (0..600)
         .map(|id| EditorPageView {
@@ -103,12 +106,15 @@ fn view_harness(
     mut state: EditorUiState,
 ) -> Harness<'static, Vec<EditorUiAction>> {
     let mut fonts_ready = false;
-    test_ui::builder().with_size(physical).build_state(
-        move |ctx, actions: &mut Vec<EditorUiAction>| {
+    test_ui::builder().with_size(physical).build_ui_state(
+        move |ui, actions: &mut Vec<EditorUiAction>| {
+            let ctx = &ui.ctx().clone();
             mimageviewer::os_theme::apply_resolved(ctx, theme);
             // Geometry and interaction tests do not need real-time scrolling
             // animation; the production ScrollArea still uses its normal style.
-            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            ctx.global_style_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none()
+            });
             if !fonts_ready {
                 mimageviewer::ui_fonts::configure_fonts(ctx);
                 mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
@@ -117,8 +123,8 @@ fn view_harness(
                 return;
             }
             *actions = show_window(
-                ctx,
-                egui::Id::new("composition_snapshot"),
+                ui,
+                egui::Id::unique("composition_snapshot"),
                 &view,
                 &mut state,
                 DialogKeys::default(),
@@ -374,8 +380,39 @@ fn composition_editor_confirmation_modals_small_screen_and_background_isolation(
     }
 }
 
-// egui raw input uses logical points; AccessKit Node::click sends physical
-// bounds unchanged. Exercise real pointer hit testing at the response rect.
+#[test]
+fn composition_editor_high_dpi_controls_receive_pointer_clicks() {
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        let mut h = harness(
+            size,
+            2.0,
+            mimageviewer::os_theme::ResolvedTheme::Light,
+            EditorPhase::Editing,
+        );
+        h.run();
+        for label in ["保存", "キャンセル", "元に戻す", "やり直す", "Close window"] {
+            assert_control_inside(&h, label, "200% editor boundary");
+        }
+        let remove = assert_control_inside(&h, "構成を解除", "200% remove entry");
+        click_logical_response(&mut h, &remove);
+        h.run_steps(4);
+        let cancel = assert_control_inside(&h, "キャンセル", "200% confirmation cancel");
+        click_logical_response(&mut h, &cancel);
+        h.run_steps(4);
+        assert!(h.query_by_label("解除する").is_none());
+        assert!(!h.state().contains(&EditorUiAction::Cancel));
+        let remove = assert_control_inside(&h, "構成を解除", "200% remove reentry");
+        click_logical_response(&mut h, &remove);
+        h.run_steps(4);
+        let accept = assert_control_inside(&h, "解除する", "200% confirmation accept");
+        click_logical_response(&mut h, &accept);
+        h.step();
+        assert!(h.state().contains(&EditorUiAction::Remove));
+        assert!(!h.state().contains(&EditorUiAction::Save));
+    }
+}
+
+// Exercise real pointer hit testing at the logical response rect.
 fn click_logical_response(h: &mut Harness<'_, Vec<EditorUiAction>>, response: &egui::Response) {
     let pos = response.rect.center();
     h.event(egui::Event::PointerMoved(pos));
@@ -389,7 +426,7 @@ fn click_logical_response(h: &mut Harness<'_, Vec<EditorUiAction>>, response: &e
     }
 }
 
-/// AccessKit exports physical-pixel bounds; egui responses use logical points.
+/// Node::rect and egui responses both use logical points.
 /// Check both, including the actual unclipped pointer interaction rectangle.
 fn assert_control_inside(
     h: &Harness<'_, Vec<EditorUiAction>>,
@@ -402,24 +439,16 @@ fn assert_control_inside(
     let node = nodes
         .iter()
         .find(|node| {
-            let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+            let id = egui_id_from_accesskit(node.accesskit_node().id());
             h.ctx
                 .read_response(id)
                 .is_some_and(|response| response.enabled())
         })
         .unwrap_or(&nodes[0]);
     let logical_screen = h.ctx.content_rect();
-    let physical_screen = egui::Rect::from_min_max(
-        logical_screen.min * h.ctx.pixels_per_point(),
-        logical_screen.max * h.ctx.pixels_per_point(),
-    );
-    assert!(
-        physical_screen.contains_rect(node.rect()),
-        "{detail} {label}: physical screen={physical_screen:?} bounds={:?}",
-        node.rect()
-    );
+    logical_bounds::assert_node_inside(&h.ctx, node.rect(), &format!("{detail} {label}"));
     // AccessKit stores the original egui widget id (same bridge as ui_snapshot).
-    let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+    let id = egui_id_from_accesskit(node.accesskit_node().id());
     let response = h
         .ctx
         .read_response(id)
@@ -449,8 +478,9 @@ fn composition_editor_hud_real_entry_and_indicator_c9() {
             let mut fonts_ready = false;
             let mut h = test_ui::builder()
                 .with_size(egui::vec2(450.0, 200.0))
-                .build_state(
-                    move |ctx, activated: &mut bool| {
+                .build_ui_state(
+                    move |ui, activated: &mut bool| {
+                        let ctx = &ui.ctx().clone();
                         mimageviewer::os_theme::apply_resolved(ctx, theme);
                         if !fonts_ready {
                             mimageviewer::ui_fonts::configure_fonts(ctx);
@@ -458,11 +488,13 @@ fn composition_editor_hud_real_entry_and_indicator_c9() {
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            *activated |=
-                                mimageviewer::draw_composition_editor_hud_snapshot_fixture(
-                                    ui, available, true,
-                                );
+                        test_ui::full_viewport_ui(ui, |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
+                                *activated |=
+                                    mimageviewer::draw_composition_editor_hud_snapshot_fixture(
+                                        ui, available, true,
+                                    );
+                            });
                         });
                     },
                     false,
@@ -493,7 +525,7 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
     let mut state = EditorUiState::default();
     let mut actions = Vec::new();
     for key in [egui::Key::Enter, egui::Key::Escape] {
-        let _ = ctx.run(
+        ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -508,23 +540,26 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
                 }],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 actions = show_window(
                     ctx,
-                    egui::Id::new("filtered_keys"),
+                    egui::Id::unique("filtered_keys"),
                     &view,
                     &mut state,
                     DialogKeys::default(),
                 );
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert!(!actions.contains(&EditorUiAction::Save));
         assert!(!actions.contains(&EditorUiAction::Cancel));
     }
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+    ctx.run_ui(egui::RawInput::default(), |ui| {
+        let ctx = &ui.ctx().clone();
         actions = show_window(
             ctx,
-            egui::Id::new("filtered_keys"),
+            egui::Id::unique("filtered_keys"),
             &view,
             &mut state,
             DialogKeys {
@@ -532,6 +567,14 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
                 escape: true,
             },
         );
-    });
+    })
+    .drop_without_applying_deltas();
     assert!(actions.contains(&EditorUiAction::Cancel));
+}
+
+// accesskit_consumer 0.39's public FullNodeId conversion packs the local node ID
+// above the tree index. The local node ID is egui's original widget identity.
+fn egui_id_from_accesskit(node_id: impl Into<u128>) -> egui::Id {
+    let local_id = (node_id.into() >> 64) as u64;
+    unsafe { egui::Id::from_high_entropy_bits(local_id) }
 }

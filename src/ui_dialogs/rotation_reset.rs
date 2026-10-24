@@ -23,6 +23,7 @@ impl crate::app::App {
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
         egui::Window::new("回転情報のリセット")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)

@@ -28,9 +28,9 @@ pub(super) struct OverlayGpuService {
 impl OverlayGpuService {
     fn new() -> Self {
         Self {
-            instance: wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            instance: wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::DX12,
-                ..Default::default()
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
             }),
             epochs: Mutex::new(Vec::new()),
             next_generation: AtomicU64::new(1),
@@ -78,6 +78,7 @@ impl OverlayGpuService {
             pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
                 compatible_surface: Some(surface),
             }))
             .map_err(|e| format!("wgpu request_adapter for DComp overlay: {e:?}"))?;
@@ -238,7 +239,7 @@ fn dx12_device_luid(device: &wgpu::Device) -> (Option<[u32; 2]>, Option<&'static
     // SAFETY: This guard only borrows the existing wgpu DX12 device. The COM
     // query is read-only, does not submit/wait/destroy, and only scalar LUID
     // bits escape; neither the raw COM pointer nor the HAL guard is retained.
-    let Some(hal_device) = (unsafe { device.as_hal::<wgpu_hal::api::Dx12>() }) else {
+    let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }) else {
         return (None, Some("dx12_hal_device_unavailable"));
     };
     // SAFETY: raw_device is alive for the HAL borrow and GetAdapterLuid only

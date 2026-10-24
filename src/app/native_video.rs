@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use super::book_preferred_rating::{BookPreferredRatingTarget, ContainerRatingToast};
 use super::*;
 use crate::keymap::{
     CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
@@ -1023,6 +1025,14 @@ impl NativeVideoKeyBlockReason {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeVideoBookPreferredAppliedTo {
+    Book,
+    Item,
+    Unavailable,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeVideoFixedKeyAction {
     ExitMusicVstShell,
     ExitVideoAudioVst,
@@ -1041,6 +1051,10 @@ enum NativeVideoFixedKeyAction {
     RatingContainer(u8),
     RatingItemStep(crate::keymap::RatingStepDirection),
     RatingContainerStep(crate::keymap::RatingStepDirection),
+    RatingBookPreferred {
+        applied_to: NativeVideoBookPreferredAppliedTo,
+        edit: crate::keymap::RatingEdit,
+    },
     ComparisonUnsupported,
 }
 
@@ -1065,6 +1079,14 @@ impl NativeVideoFixedKeyAction {
             Self::RatingContainer(stars) => format!("rating_container_{stars}"),
             Self::RatingItemStep(direction) => format!("rating_item_step_{direction:?}"),
             Self::RatingContainerStep(direction) => format!("rating_container_step_{direction:?}"),
+            Self::RatingBookPreferred { applied_to, edit } => {
+                let target = match applied_to {
+                    NativeVideoBookPreferredAppliedTo::Book => "book",
+                    NativeVideoBookPreferredAppliedTo::Item => "item",
+                    NativeVideoBookPreferredAppliedTo::Unavailable => "unavailable",
+                };
+                format!("rating_book_preferred_{target}_{edit:?}")
+            }
             Self::ComparisonUnsupported => "comparison_unsupported".to_string(),
         }
     }
@@ -1791,6 +1813,20 @@ impl App {
         (result.outcome != crate::video::AudioTrackSelectOutcome::Rejected).then_some(label)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn poll_audio_track_notice_toast(&mut self, fs_idx: usize) {
+        if let Some(message) = self
+            .take_audio_track_open_notice_toast(fs_idx)
+            .or_else(|| self.take_audio_track_failure_toast(fs_idx))
+        {
+            if self.fs_music_view_active(fs_idx) {
+                self.show_feedback_warning(message.to_string());
+            } else {
+                self.show_native_video_overlay_warning(message.to_string(), false);
+            }
+        }
+    }
+
     pub(crate) fn take_audio_track_failure_toast(&self, fs_idx: usize) -> Option<&'static str> {
         self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. }
@@ -2235,7 +2271,7 @@ impl App {
 
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         let Some(slot) = self.settings.video_preset_slots.slots[slot_idx].clone() else {
-            self.show_feedback_toast(format!("[動画スロット{key_label} は空です]"));
+            self.show_feedback_warning(format!("[動画スロット{key_label} は空です]"));
             return;
         };
         self.settings.video_adjustments = slot.adjustments;
@@ -2552,7 +2588,7 @@ impl App {
                     "[native-video] detached host wait timeout: idx={idx} waited_ms={:.1}",
                     requested_at.elapsed().as_secs_f64() * 1000.0
                 ));
-                self.show_feedback_toast(
+                self.show_feedback_error(
                     "別ウィンドウの準備に失敗したため動画を開けませんでした".to_string(),
                 );
                 if let Some(window_id) = parked_live_window_id {
@@ -2643,7 +2679,7 @@ impl App {
                     ],
                 );
             }
-            self.show_feedback_toast("前の動画デコード終了待ちがタイムアウトしました".to_string());
+            self.show_feedback_error("前の動画デコード終了待ちがタイムアウトしました".to_string());
             if let Some(window_id) = parked_live_window_id {
                 self.request_parked_live_media_close_after_poll(
                     window_id,
@@ -2945,6 +2981,20 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_window_id_for_presentation_request(
+        &self,
+        request: super::presentation_transition::PresentationRequest,
+    ) -> Option<u64> {
+        use super::presentation_transition::DetachedTargetLease;
+        match request.target_detached {
+            DetachedTargetLease::Candidate(lease)
+            | DetachedTargetLease::KeepLive(lease)
+            | DetachedTargetLease::Transferred(lease) => Some(lease.session.window_id),
+            DetachedTargetLease::None => self.active_detached_hwnd_window_id(),
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn execute_video_presentation_host_effect(
         &mut self,
         ctx: &egui::Context,
@@ -2963,7 +3013,19 @@ impl App {
                 let maximized = request.target == super::ViewerPresentation::DetachedWindow
                     && self.active_detached_viewport_maximized_on_visible_commit();
                 if request.target == super::ViewerPresentation::DetachedWindow {
-                    Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+                    if let Some(window_id) =
+                        self.detached_window_id_for_presentation_request(request)
+                    {
+                        self.request_detached_window_visibility(
+                            ctx,
+                            window_id,
+                            true,
+                            Some(maximized),
+                            false,
+                        );
+                    } else {
+                        self.send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+                    }
                 } else {
                     ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
                 }
@@ -2979,10 +3041,17 @@ impl App {
             }
             super::PresentationTransitionEffect::FocusHost { request, hwnd } => {
                 Self::log_presentation_transition_effect(request.id, request.target, "Focus", hwnd);
-                ctx.send_viewport_cmd_to(
-                    self.fullscreen_viewport_id(),
-                    egui::ViewportCommand::Focus,
-                );
+                if request.target == super::ViewerPresentation::DetachedWindow
+                    && let Some(window_id) =
+                        self.detached_window_id_for_presentation_request(request)
+                {
+                    self.request_detached_window_visibility(ctx, window_id, true, None, true);
+                } else {
+                    ctx.send_viewport_cmd_to(
+                        self.fullscreen_viewport_id(),
+                        egui::ViewportCommand::Focus,
+                    );
+                }
                 crate::presentation_observer::observe_viewport_command_for_transition(
                     request.id,
                     Self::presentation_probe_target(request.target),
@@ -3045,7 +3114,7 @@ impl App {
                 // ここで通常の teardown まで走る。呼び出し側が「まだ閉じていない」と
                 // 判断して二度目を呼ぶと、初回 close が整えた状態を巻き戻す。
                 match metadata_boundary {
-                    super::FsMetadataBoundary::Manual => self.close_fullscreen(),
+                    super::FsMetadataBoundary::Manual => self.close_fullscreen_content(),
                     boundary @ super::FsMetadataBoundary::BookAppend(_) => {
                         self.close_fullscreen_now_with_metadata_boundary(boundary)
                     }
@@ -3868,7 +3937,7 @@ impl App {
             crate::logger::log(format!(
                 "[native-video] deferred source swap aborted: presenter closed target_idx={target_idx}"
             ));
-            self.show_feedback_toast("動画プレゼンターが閉じられました".to_string());
+            self.show_feedback_warning("動画プレゼンターが閉じられました".to_string());
             if let Some(window_id) = parked_live_window_id {
                 crate::logger::log(format!(
                     "[native-video] parked deferred source swap aborted; closing owner after poll: \
@@ -3932,7 +4001,7 @@ impl App {
                         ],
                     );
                 }
-                self.show_feedback_toast(
+                self.show_feedback_error(
                     "前の動画デコード終了待ちがタイムアウトしました".to_string(),
                 );
                 if let Some(window_id) = parked_live_window_id {
@@ -4274,7 +4343,7 @@ impl App {
             // UI thread から presenter HWND を直接 SetWindowPos せず、復旧が必要な
             // foreground 状態を観測したら presenter 所有スレッドへ依頼する。
             let now = std::time::Instant::now();
-            let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+            let foreground_hwnd = foreground_observer::foreground_hwnd();
             let editor_snapshot = self.dsp_bridge.editor_ui_snapshot();
             let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_snapshot);
             let foreground_group = crate::video::native_window::ui_group_for_hwnd(
@@ -4706,10 +4775,10 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn cancel_video_audio_viewport_handoff_for_external_foreground(&mut self) {
-        let foreground = crate::video::native_window::foreground_hwnd();
+        let foreground = foreground_observer::foreground_hwnd();
         if super::should_cancel_video_audio_handoff_for_external_foreground(
             foreground,
-            crate::video::native_window::foreground_belongs_to_current_process_strict(),
+            foreground_observer::foreground_belongs_to_current_process_strict(),
         ) {
             self.cancel_video_audio_viewport_handoff("external_foreground");
         }
@@ -5101,6 +5170,8 @@ impl App {
     /// モード」設定で、動画 HUD のトグルと同じ値を切り替える。
     #[cfg(windows)]
     pub(crate) fn toggle_still_window_mode(&mut self) {
+        // The physical input owner belongs to the old rendering viewport, not the new one.
+        self.fs_front_pointer = Default::default();
         let in_window = !self.settings.video_in_window_mode;
         let now = std::time::Instant::now();
         crate::dwm_transitions::disable_transitions_for_thread_windows();
@@ -5176,6 +5247,9 @@ impl App {
     /// 「ユーザーが見ていない未確定モード」が次回起動時に持ち越される。
     #[cfg(windows)]
     pub(crate) fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
+        if self.viewer_presentation != presentation {
+            self.fs_front_pointer = Default::default();
+        }
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
@@ -6217,7 +6291,7 @@ impl App {
                 if let Some(target_secs) = target_secs
                     && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
                 {
-                    player.seek_with_play_state(target_secs, true);
+                    player.seek_with_play_state(target_secs, true, crate::video::SeekOrigin::User);
                     self.mark_native_video_hud_activity(ctx);
                     self.apply_loop_mode_to_player(fs_idx);
                 }
@@ -6478,7 +6552,7 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {
                 if !self.vst3_playback_ui_context_is_main_fullscreen() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
                     );
                     self.mark_native_video_hud_activity(ctx);
@@ -6705,7 +6779,7 @@ impl App {
                     self.settings.save();
                 }
                 if let Some(toast) = toast {
-                    self.show_native_video_overlay_toast(toast, false);
+                    self.show_native_video_overlay_warning(toast, false);
                 }
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -7020,7 +7094,7 @@ impl App {
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
         {
-            player.seek(target_secs);
+            player.seek(target_secs, crate::video::SeekOrigin::User);
             self.mark_native_video_hud_activity(ctx);
             true
         } else {
@@ -7085,7 +7159,7 @@ impl App {
                     ],
                 );
             }
-            player.seek(target_secs);
+            player.seek(target_secs, crate::video::SeekOrigin::User);
             player.set_native_tile_overlay(None);
             true
         } else {
@@ -7115,7 +7189,7 @@ impl App {
             // 旧コードは `if !is_playing() { toggle_play() }` で「念のため再生」を
             // 意図していたが、intent ベースの toggle_play (= 2026-05 修正) では
             // `intent_playing()=true` を見て Pause に反転していたバグ。
-            player.seek(0.0);
+            player.seek(0.0, crate::video::SeekOrigin::User);
             true
         } else {
             false
@@ -7212,7 +7286,7 @@ impl App {
     /// 設定保存 → effective mode を再計算して player に反映 → トースト → HUD activity 更新。
     pub(crate) fn cycle_native_video_loop_common(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.video_continuous_mode.is_enabled() {
-            self.show_native_video_overlay_toast("連続再生中はループ無効".to_string(), false);
+            self.show_native_video_overlay_warning("連続再生中はループ無効".to_string(), false);
             self.mark_native_video_hud_activity(ctx);
             return;
         }
@@ -7417,7 +7491,12 @@ impl App {
             }
             crate::settings::BoundaryDecision::Loop { seek_to } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.seek(seek_to);
+                    player.seek(
+                        seek_to,
+                        crate::video::SeekOrigin::Internal(
+                            crate::video::InternalContinuation::Loop,
+                        ),
+                    );
                     // loop_target は同区間の開始 (= seek_to) で維持
                     player.set_loop_target_secs(seek_to);
                 }
@@ -8801,6 +8880,8 @@ impl App {
     fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
         match row.spec.action {
             KeyAction::ToggleAlwaysOnTop
+            | KeyAction::ClearVideoMediaMemory
+            | KeyAction::ClearBookResumePositions
             | KeyAction::ToggleDetachedViewerMode
             | KeyAction::FsToggleWindowMode
             | KeyAction::FsBackToList
@@ -9288,6 +9369,7 @@ impl App {
                 info_open: self.fs_info_panel.open,
                 info_locked: self.fs_info_panel.locked,
                 suppression: self.settings.fullscreen_chrome_suppression,
+                notification_duration: self.settings.notification_duration,
             },
             detached,
         }
@@ -11506,7 +11588,19 @@ impl App {
                     crate::video::seek_strip::SeekStripMaterialAvailability::Unavailable(reason);
                 if player.seek_strip_material_availability() != unavailable {
                     player.set_seek_strip_material_availability(unavailable);
-                    player.show_native_overlay_toast(reason.user_notice().to_string(), true, None);
+                    let text = reason.user_notice().to_string();
+                    let resolved = crate::feedback::resolve_timing(
+                        self.settings.notification_duration,
+                        crate::feedback::FeedbackKind::Warning,
+                        &text,
+                        crate::feedback::FeedbackTiming::Seconds(2.5),
+                    );
+                    player.show_native_overlay_toast(
+                        text,
+                        true,
+                        crate::feedback::FeedbackKind::Warning,
+                        Some(resolved),
+                    );
                 }
             }
             crate::logger::log(format!(
@@ -11971,7 +12065,12 @@ impl App {
             "video bookmark bulk add: {msg} ({})",
             path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
         ));
-        self.show_native_video_overlay_toast(msg, true);
+        self.show_native_video_feedback(
+            msg,
+            true,
+            crate::feedback::FeedbackKind::result(errors > 0),
+            crate::feedback::FeedbackTiming::Seconds(2.5),
+        );
         self.mark_native_video_hud_activity(ctx);
     }
 
@@ -11996,7 +12095,7 @@ impl App {
         let entries = db.list_marker_meta(&path);
         let count = entries.len();
         if count == 0 {
-            self.show_native_video_overlay_toast(
+            self.show_native_video_overlay_warning(
                 "コピーするブックマークがありません".to_string(),
                 true,
             );
@@ -12053,7 +12152,10 @@ impl App {
             }
             Err(e) => {
                 crate::logger::log(format!("video bookmark clear failed: {e}"));
-                self.show_native_video_overlay_toast(format!("ブックマーク削除に失敗: {e}"), true);
+                self.show_native_video_overlay_warning(
+                    format!("ブックマーク削除に失敗: {e}"),
+                    true,
+                );
             }
         }
         self.mark_native_video_hud_activity(ctx);
@@ -12329,7 +12431,7 @@ impl App {
         let presentation = self.viewer_presentation;
         let video_audio_mode = self.video_audio_mode;
         let music_vst_shell = self.music_vst_shell.is_some();
-        let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+        let foreground_hwnd = foreground_observer::foreground_hwnd();
         let presenter_hwnd = self
             .pending_native_video_output_hwnds_for_fs(fs_idx)
             .map(|(hwnd, _)| hwnd)
@@ -12437,6 +12539,8 @@ impl App {
             KeyAction::FsBackToList,
             KeyAction::VideoSeekStart,
             KeyAction::ToggleAlwaysOnTop,
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
             KeyAction::ToggleDetachedViewerMode,
             KeyAction::FsToggleWindowMode,
             KeyAction::FsPanoramaProjection,
@@ -12584,28 +12688,58 @@ impl App {
         }
         let mut hud_activity = true;
         if let Some(rating_key) = rating_key {
-            if rating_key.container {
-                hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
-            } else {
-                hud_activity = self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
-            }
+            use crate::keymap::{RatingEdit, RatingTargetFamily};
+            let action = match rating_key.family {
+                RatingTargetFamily::Container => {
+                    hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
+                    match rating_key.edit {
+                        RatingEdit::Assign(stars) => {
+                            NativeVideoFixedKeyAction::RatingContainer(stars)
+                        }
+                        RatingEdit::Step(direction) => {
+                            NativeVideoFixedKeyAction::RatingContainerStep(direction)
+                        }
+                    }
+                }
+                RatingTargetFamily::Item => {
+                    hud_activity =
+                        self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
+                    match rating_key.edit {
+                        RatingEdit::Assign(stars) => NativeVideoFixedKeyAction::RatingItem(stars),
+                        RatingEdit::Step(direction) => {
+                            NativeVideoFixedKeyAction::RatingItemStep(direction)
+                        }
+                    }
+                }
+                RatingTargetFamily::BookPreferred => {
+                    let applied_to = match self.resolve_book_preferred_viewer_target() {
+                        BookPreferredRatingTarget::Book(target) => {
+                            hud_activity = self.apply_rating_edit_to_container_target(
+                                &target,
+                                rating_key.edit,
+                                ContainerRatingToast::Book,
+                            );
+                            NativeVideoBookPreferredAppliedTo::Book
+                        }
+                        BookPreferredRatingTarget::ViewerItem => {
+                            hud_activity =
+                                self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
+                            NativeVideoBookPreferredAppliedTo::Item
+                        }
+                        BookPreferredRatingTarget::Unavailable(reason) => {
+                            self.report_book_preferred_unavailable(reason);
+                            NativeVideoBookPreferredAppliedTo::Unavailable
+                        }
+                    };
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to,
+                        edit: rating_key.edit,
+                    }
+                }
+            };
             if hud_activity {
                 self.request_native_video_hud_repaint(ctx);
             }
-            let action = match (rating_key.container, rating_key.edit) {
-                (true, crate::keymap::RatingEdit::Assign(stars)) => {
-                    NativeVideoFixedKeyAction::RatingContainer(stars)
-                }
-                (false, crate::keymap::RatingEdit::Assign(stars)) => {
-                    NativeVideoFixedKeyAction::RatingItem(stars)
-                }
-                (true, crate::keymap::RatingEdit::Step(direction)) => {
-                    NativeVideoFixedKeyAction::RatingContainerStep(direction)
-                }
-                (false, crate::keymap::RatingEdit::Step(direction)) => {
-                    NativeVideoFixedKeyAction::RatingItemStep(direction)
-                }
-            };
             return NativeVideoKeyOutcome::FixedAction(action);
         }
         if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
@@ -12702,10 +12836,21 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
                     // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
-                    player.seek(0.0);
+                    player.seek(0.0, crate::video::SeekOrigin::User);
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
+            }
+            _ if !key.repeat
+                && matches!(
+                    resolved_action,
+                    Some(KeyAction::ClearVideoMediaMemory | KeyAction::ClearBookResumePositions)
+                ) =>
+            {
+                let action = resolved_action.expect("resolved clear action");
+                self.execute_saved_position_clear(action, crate::app::ActionSurface::Viewer);
+                hud_activity = false;
+                NativeVideoKeyOutcome::Action(action)
             }
             _ if !key.repeat && resolved_action == Some(KeyAction::ToggleAlwaysOnTop) => {
                 self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
@@ -13392,7 +13537,7 @@ impl App {
         match target {
             Some(marker) => {
                 if let Some(player) = self.fs_video_player(fs_idx) {
-                    player.seek(marker.pts);
+                    player.seek(marker.pts, crate::video::SeekOrigin::User);
                 }
                 // CH/BM ループ中ならマーカージャンプ後に loop_target を更新
                 self.apply_loop_mode_to_player(fs_idx);
@@ -13429,7 +13574,7 @@ impl App {
                 // J キーで前のマーカーが見つからない (= 最初のマーカー手前または空) かつ
                 // 既に先頭に居なければ動画先頭へ seek。
                 if let Some(player) = self.fs_video_player(fs_idx) {
-                    player.seek(0.0);
+                    player.seek(0.0, crate::video::SeekOrigin::User);
                 }
                 self.apply_loop_mode_to_player(fs_idx);
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
@@ -13511,7 +13656,7 @@ impl App {
         // VST owner/HUD 機構は OFF モードのメイン fullscreen 前提。detached / 複数
         // ウィンドウ mode ではチェーン処理だけを共有し、GUI は開かない。
         if !self.vst3_playback_ui_context_is_main_fullscreen() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
             );
             return;
@@ -13522,7 +13667,7 @@ impl App {
                 crate::video::dsp::DspState::Enabled
             )
         {
-            self.show_feedback_toast("VST3 が有効ではありません".to_string());
+            self.show_feedback_warning("VST3 が有効ではありません".to_string());
             return;
         }
         let Some((placement, rect, owner_hwnd)) =
@@ -13592,7 +13737,7 @@ impl App {
                 crate::logger::log(format!("[music-vst] entered VST shell for fs_idx={fs_idx}"));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("VST 画面を開けません: {err}"));
+                self.show_feedback_warning(format!("VST 画面を開けません: {err}"));
                 crate::logger::log(format!("[music-vst] attach failed: {err}"));
             }
         }
@@ -14028,7 +14173,7 @@ impl App {
         if let Some(reason) =
             video_audio_enter_gate_rejection(VideoAudioEnterGate::AudioTrackMissing(no_audio_track))
         {
-            self.show_feedback_toast("この動画には音声トラックがありません".to_string());
+            self.show_feedback_warning("この動画には音声トラックがありません".to_string());
             return VideoAudioEnterOutcome::Rejected(reason);
         }
         // exit で placement 復帰の判定に使う enter 時点の物理ターゲット (placement / rect /
@@ -14046,7 +14191,7 @@ impl App {
                 target_available: entry_target.is_some(),
             })
         {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "別ウィンドウの準備中です。少し待ってからもう一度お試しください".to_string(),
             );
             return VideoAudioEnterOutcome::Rejected(reason);
@@ -14438,7 +14583,10 @@ impl App {
             player.set_media_visual_mode(music_core::MediaVisualMode::Video);
             let pos = player.position().max(0.0);
             let _ = player.take_native_output();
-            player.seek(pos);
+            player.seek(
+                pos,
+                crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Transport),
+            );
             if let Some(config) = config {
                 match player.attach_native_output_from_config(config) {
                     Ok(()) => {
@@ -14450,7 +14598,7 @@ impl App {
                         crate::logger::log(format!(
                             "[video-audio] fallback exit re-attach failed fs_idx={fs_idx}: {err}"
                         ));
-                        self.show_feedback_toast(format!("動画表示に戻れませんでした: {err}"));
+                        self.show_feedback_warning(format!("動画表示に戻れませんでした: {err}"));
                     }
                 }
             } else {
@@ -14510,7 +14658,7 @@ impl App {
         // VST owner/HUD 機構は OFF モードのメイン fullscreen 前提。detached / 複数
         // ウィンドウ mode ではチェーン処理だけを共有し、GUI は開かない。
         if !self.vst3_playback_ui_context_is_main_fullscreen() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
             );
             return;
@@ -14521,7 +14669,7 @@ impl App {
                 crate::video::dsp::DspState::Enabled
             )
         {
-            self.show_feedback_toast("VST3 が有効ではありません".to_string());
+            self.show_feedback_warning("VST3 が有効ではありません".to_string());
             return;
         }
         // presenter が上がっている (HWND publish 済み) こと。音声モードなら通常 hidden で存在する。
@@ -14726,25 +14874,59 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn show_native_video_overlay_toast(&self, text: String, centered: bool) {
-        self.show_native_video_overlay_toast_with_linger(text, centered, None);
+        self.show_native_video_feedback(
+            text,
+            centered,
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Seconds(if centered { 2.5 } else { 1.8 }),
+        );
     }
 
-    /// `show_native_video_overlay_toast` の linger 指定版。`linger` が `Some` のとき
-    /// その時間だけトーストを表示し続ける。←→ 押しっぱなしの境界トーストのように
-    /// 「キーを離したら早めに消したい」用途で短い値を渡す。`None` なら従来どおり
-    /// `centered` から既定値 (centered: 2.5s / それ以外: 1.8s) が使われる。
     #[cfg(windows)]
-    pub(crate) fn show_native_video_overlay_toast_with_linger(
+    pub(crate) fn show_native_video_overlay_warning(&self, text: String, centered: bool) {
+        self.show_native_video_feedback(
+            text,
+            centered,
+            crate::feedback::FeedbackKind::Warning,
+            crate::feedback::FeedbackTiming::Seconds(if centered { 2.5 } else { 1.8 }),
+        );
+    }
+
+    #[cfg(windows)]
+    fn show_native_video_feedback(
         &self,
         text: String,
         centered: bool,
-        linger: Option<std::time::Duration>,
+        kind: crate::feedback::FeedbackKind,
+        timing: crate::feedback::FeedbackTiming,
+    ) {
+        let resolved = crate::feedback::resolve_timing(
+            self.settings.notification_duration,
+            kind,
+            &text,
+            timing,
+        );
+        self.publish_native_video_overlay_toast(text, centered, resolved);
+    }
+
+    /// Transport only: the caller has already resolved the duration. Never apply policy here.
+    #[cfg(windows)]
+    pub(crate) fn publish_native_video_overlay_toast(
+        &self,
+        text: String,
+        centered: bool,
+        resolved: crate::feedback::ResolvedFeedbackTiming,
     ) {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.show_native_overlay_toast(text, centered, linger);
+            player.show_native_overlay_toast(
+                text,
+                centered,
+                crate::feedback::FeedbackKind::Info,
+                Some(resolved),
+            );
         }
     }
 
@@ -14788,7 +14970,9 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn native_video_seek_relative_with_hint(&mut self, fs_idx: usize, delta_secs: f64) {
         let outcome = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.seek_relative(delta_secs),
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.seek_relative(delta_secs, crate::video::SeekOrigin::User)
+            }
             _ => return,
         };
         let hint = match outcome {
@@ -14802,10 +14986,11 @@ impl App {
         // ←→ 押しっぱなしの間は repeat ごとに re-show されて表示が維持され、
         // キーを離すと linger 経過 (700ms) で早めに消える。通常トーストの
         // 既定値 (2.5s) のままだとキーを離した後も長く残り続けて煩わしい。
-        self.show_native_video_overlay_toast_with_linger(
+        self.show_native_video_feedback(
             hint.to_string(),
             true,
-            Some(std::time::Duration::from_millis(700)),
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Immediate(0.7),
         );
     }
 
@@ -14860,7 +15045,12 @@ impl App {
             self.settings.fullscreen_boundary_notice_visible,
             hint,
         ) {
-            self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
+            self.show_native_video_feedback(
+                Self::native_boundary_hint_text(hint),
+                true,
+                crate::feedback::FeedbackKind::Info,
+                crate::feedback::FeedbackTiming::Immediate(2.5),
+            );
         }
     }
 
@@ -14884,6 +15074,7 @@ impl App {
                 fs_idx,
                 base_delta,
                 crate::app::ManualMediaNavigationLanding::NativeVideo,
+                self.manual_nav_wrap_enabled(),
             ) {
                 return;
             }
@@ -14912,23 +15103,30 @@ impl App {
             fs_idx,
             base_delta,
             crate::app::ManualMediaNavigationLanding::NativeVideo,
+            self.manual_nav_wrap_enabled(),
         ) {
             return;
         }
         let display_order = self.current_reader_order().to_vec();
         let page_nav = self.spread_page_nav(base_delta);
-        let nav_delta = match page_nav {
+        let (nav_delta, wrap) = match page_nav {
             crate::ui_fullscreen::FsPageNav::None => return,
-            crate::ui_fullscreen::FsPageNav::Delta(delta) => delta,
-            crate::ui_fullscreen::FsPageNav::Target(target) => {
+            crate::ui_fullscreen::FsPageNav::Delta(delta) => {
+                (delta, self.manual_nav_wrap_enabled())
+            }
+            crate::ui_fullscreen::FsPageNav::Wrap(target) => {
+                (if target.forward { 1 } else { -1 }, true)
+            }
+            crate::ui_fullscreen::FsPageNav::Target(target) => (
                 crate::ui_fullscreen::navigable_delta_between(
                     &self.items,
                     &display_order,
                     fs_idx,
                     target,
                 )
-                .unwrap_or(base_delta)
-            }
+                .unwrap_or(base_delta),
+                self.manual_nav_wrap_enabled(),
+            ),
             crate::ui_fullscreen::FsPageNav::Boundary { at_end } => {
                 self.show_native_video_boundary_toast(ctx, at_end);
                 return;
@@ -14938,13 +15136,16 @@ impl App {
             crate::ui_fullscreen::FsPageNav::Split(step) if step.source_idx == fs_idx => return,
             crate::ui_fullscreen::FsPageNav::Split(step) => {
                 // 左右は着地側が決めるので、ここでは元ページまでの距離だけ見る。
-                crate::ui_fullscreen::navigable_delta_between(
-                    &self.items,
-                    &display_order,
-                    fs_idx,
-                    step.source_idx,
+                (
+                    crate::ui_fullscreen::navigable_delta_between(
+                        &self.items,
+                        &display_order,
+                        fs_idx,
+                        step.source_idx,
+                    )
+                    .unwrap_or(base_delta),
+                    self.manual_nav_wrap_enabled(),
                 )
-                .unwrap_or(base_delta)
             }
         };
         self.start_manual_media_navigation(
@@ -14952,6 +15153,7 @@ impl App {
             &display_order,
             fs_idx,
             nav_delta,
+            wrap,
             "native_media_window_manual",
             crate::app::ManualMediaNavigationLanding::NativeVideo,
         );
@@ -16027,6 +16229,80 @@ impl App {
 }
 
 #[cfg(all(test, windows))]
+mod manual_nav_wrap_native_media_tests {
+    use super::*;
+    use crate::ui_fullscreen::page_turn_submission_tests::ready_app;
+
+    #[test]
+    fn manual_nav_wrap_native_media_wrap_uses_input_direction_and_one_required_match() {
+        for forward in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, crate::settings::SpreadMode::Ltr);
+            app.items = (0..4)
+                .map(|idx| GridItem::Video(app.tmp.path().join(format!("video-{idx}.mp4"))))
+                .collect();
+            app.settings.fullscreen_manual_nav_wrap = true;
+            let current = if forward { 3 } else { 0 };
+            app.fullscreen_idx = Some(current);
+            let delta = if forward { 3 } else { -3 };
+            assert!(
+                matches!(app.spread_page_nav(delta), crate::ui_fullscreen::FsPageNav::Wrap(target) if target.forward == forward)
+            );
+            let (candidates, count, source) = app.capture_manual_media_request_for_test(|app| {
+                app.navigate_native_video_fullscreen(&ctx, current, delta);
+            });
+            assert_eq!(
+                candidates,
+                if forward {
+                    vec![0, 1, 2]
+                } else {
+                    vec![3, 2, 1]
+                }
+            );
+            assert_eq!(
+                count, 1,
+                "Wrap is one input-directed step, not the numeric distance across the list"
+            );
+            assert_eq!(source, "native_media_window_manual");
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_native_media_delta_uses_the_setting() {
+        for wrap in [false, true] {
+            for forward in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = ready_app(&ctx, crate::settings::SpreadMode::Single);
+                app.items = (0..4)
+                    .map(|idx| GridItem::Video(app.tmp.path().join(format!("video-{idx}.mp4"))))
+                    .collect();
+                app.settings.fullscreen_manual_nav_wrap = wrap;
+                let current = if forward { 3 } else { 0 };
+                app.fullscreen_idx = Some(current);
+                let delta = if forward { 1 } else { -1 };
+                assert!(matches!(
+                    app.spread_page_nav(delta),
+                    crate::ui_fullscreen::FsPageNav::Delta(_)
+                ));
+                let (candidates, count, _) = app.capture_manual_media_request_for_test(|app| {
+                    app.navigate_native_video_fullscreen(&ctx, current, delta);
+                });
+                let expected = if !wrap {
+                    vec![]
+                } else if forward {
+                    vec![0, 1, 2]
+                } else {
+                    vec![3, 2, 1]
+                };
+                assert_eq!(candidates, expected);
+                assert_eq!(count, 1);
+                assert!(!candidates.contains(&current));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
 mod rating_terminal_close_tests {
     use super::*;
     use crate::undo_stack::{RatingChange, TagChange, UndoEntry};
@@ -16352,6 +16628,51 @@ mod configurable_video_seek_dispatch_tests {
     use super::*;
 
     #[test]
+    fn manual_nav_wrap_does_not_change_native_or_music_seek_targets() {
+        for wrap in [false, true] {
+            let (mut app, idx) = setup_seek_app();
+            app.settings.fullscreen_manual_nav_wrap = wrap;
+            app.settings.video_loop_mode = crate::settings::VideoLoopMode::Off;
+            let ctx = egui::Context::default();
+            for (route, target) in [
+                ("native_bar", 5.0),
+                ("native_start", 0.0),
+                ("native_key", 83.0),
+                ("music_bar", 5.0),
+                ("music_relative", 117.0),
+                ("music_start", 0.0),
+            ] {
+                reset_seek_player(&mut app, idx);
+                match route {
+                    "native_bar" => app.handle_native_video_seek_command(&ctx, idx, 5.0),
+                    "native_start" => app.handle_native_video_seek_to_start_command(&ctx, idx),
+                    "native_key" => {
+                        assert!(matches!(
+                            app.dispatch_native_video_key_event(
+                                &ctx,
+                                idx,
+                                native_key(0x7c, false, false)
+                            ),
+                            NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackMedium)
+                        ));
+                    }
+                    "music_bar" => app.music_seek_to(idx, 5.0),
+                    "music_relative" => app.music_seek_relative(idx, 17.0),
+                    "music_start" => app.music_seek_start(idx),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    player_seek_base(&app, idx),
+                    target,
+                    "wrap={wrap} route={route}"
+                );
+                assert_eq!(app.fullscreen_idx, Some(idx));
+                assert!(app.media_navigation_pending.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn native_seek_start_window_event_works_without_egui_viewport_focus() {
         let ctx = egui::Context::default();
         let mut input = egui::RawInput {
@@ -16363,7 +16684,7 @@ mod configurable_video_seek_dispatch_tests {
             .get_mut(&egui::ViewportId::ROOT)
             .unwrap()
             .focused = Some(false);
-        let _ = ctx.run(input, |_| {});
+        let _ = ctx.run_pass(input, |_| {}).drop_without_applying_deltas();
         assert_eq!(ctx.input(|input| input.viewport().focused), Some(false));
 
         for (bindings, virtual_key) in [
@@ -16420,6 +16741,73 @@ mod configurable_video_seek_dispatch_tests {
         assert!(!app.settings.always_on_top);
     }
 
+    #[test]
+    fn saved_position_clear_native_keys_dispatch_independently_without_repeats() {
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Global]\nClearVideoMediaMemory = F16\nClearBookResumePositions = F17\n",
+        );
+        let book = app.tmp.path().join("native-clear.zip");
+        app.persist_book_resume(
+            book.clone(),
+            1,
+            crate::book_resume_db::ReadingMeterValue::new(2, 4),
+        );
+        app.book_resume_writer
+            .as_ref()
+            .unwrap()
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        app.settings
+            .video_resume_positions
+            .insert("keep-media".into(), 42.0);
+        let mut repeat = native_key(0x7f, false, false);
+        repeat.repeat = true;
+        assert!(!matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, repeat),
+            NativeVideoKeyOutcome::Action(KeyAction::ClearVideoMediaMemory)
+        ));
+        assert_eq!(
+            app.settings.video_resume_positions.get("keep-media"),
+            Some(&42.0)
+        );
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x80, false, false)),
+            NativeVideoKeyOutcome::Action(KeyAction::ClearBookResumePositions)
+        ));
+        app.book_resume_writer
+            .as_ref()
+            .unwrap()
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        app.poll_book_resume_meters(&ctx);
+        assert_eq!(app.book_resume_db.as_ref().unwrap().count(), 0);
+        assert_eq!(
+            app.settings.video_resume_positions.get("keep-media"),
+            Some(&42.0)
+        );
+        // Reading again after clearing remains enabled; media clear must leave it alone.
+        app.persist_book_resume(book.clone(), 2, None);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
+            NativeVideoKeyOutcome::Action(KeyAction::ClearVideoMediaMemory)
+        ));
+        app.book_resume_writer
+            .as_ref()
+            .unwrap()
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(app.settings.video_resume_positions.is_empty());
+        assert_eq!(app.book_resume_db.as_ref().unwrap().count(), 1);
+    }
+
     fn native_key(
         virtual_key: u32,
         shift: bool,
@@ -16467,6 +16855,129 @@ mod configurable_video_seek_dispatch_tests {
                 load_seq: 0,
             },
         );
+    }
+
+    #[test]
+    fn native_book_preferred_rating_ordinary_video_and_audio_apply_to_item() {
+        use super::super::book_materialization::ProjectionRecipe;
+        use crate::keymap::{RatingEdit, RatingStepDirection};
+        let ctx = egui::Context::default();
+        for audio in [false, true] {
+            let (mut app, idx) = setup_seek_app();
+            if audio {
+                app.items[idx] = GridItem::Audio(PathBuf::from(r"C:\clips\rating.mp3"));
+            }
+            app.projection_recipe = ProjectionRecipe::OrdinaryList;
+            app.current_folder = Some(PathBuf::from(r"C:\clips"));
+            app.keymap = crate::keymap::Keymap::from_ini_str(
+                "[Rating]\nRatingBookPreferredStepUp = F13\nRatingBookPreferredClear = F14\n",
+            );
+            let item_key = app.rating_path_key(idx).unwrap();
+            let container_key = crate::adjustment_db::normalize_path(Path::new(r"C:\clips"));
+            let outcome =
+                app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+            assert_eq!(
+                outcome,
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Item,
+                        edit: RatingEdit::Step(RatingStepDirection::Up),
+                    }
+                )
+            );
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 4);
+            assert_eq!(app.get_rating(idx), 4);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 0);
+            assert_eq!(app.meta_undo.undo_len(), 1);
+            let outcome =
+                app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7d, false, false));
+            assert_eq!(
+                outcome,
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Item,
+                        edit: RatingEdit::Assign(0),
+                    }
+                )
+            );
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 0);
+            assert_eq!(app.meta_undo.undo_len(), 2);
+        }
+    }
+
+    #[test]
+    fn native_book_preferred_rating_accepted_book_uses_container_and_preserves_page() {
+        use super::super::book_materialization::{BookScope, ProjectionRecipe};
+        use crate::keymap::{RatingEdit, RatingStepDirection};
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\clips");
+        app.current_folder = Some(folder.clone());
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(folder.clone()));
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Rating]\nRatingBookPreferredStepUp = F13\nRatingBookPreferred5 = F14\n",
+        );
+        let item_key = app.rating_path_key(idx).unwrap();
+        let book_key = crate::adjustment_db::normalize_path(&folder);
+        let outcome =
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+        assert_eq!(
+            outcome,
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingBookPreferred {
+                applied_to: NativeVideoBookPreferredAppliedTo::Book,
+                edit: RatingEdit::Step(RatingStepDirection::Up),
+            })
+        );
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 4);
+        assert_eq!(app.current_folder_rating_cache, Some(4));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 0);
+        assert_eq!(app.get_rating(idx), 0);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        let outcome =
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7d, false, false));
+        assert_eq!(
+            outcome,
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingBookPreferred {
+                applied_to: NativeVideoBookPreferredAppliedTo::Book,
+                edit: RatingEdit::Assign(5),
+            })
+        );
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 5);
+        assert_eq!(app.meta_undo.undo_len(), 2);
+        app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 5);
+        assert_eq!(app.meta_undo.undo_len(), 2);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 0);
+    }
+
+    #[test]
+    fn native_book_preferred_rating_unavailable_does_not_write_an_item_or_container() {
+        use super::super::book_materialization::{BookScope, ProjectionRecipe};
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\clips");
+        let other_book = PathBuf::from(r"C:\other-book");
+        app.current_folder = Some(folder.clone());
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(other_book.clone()));
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingBookPreferred5 = F13\n");
+        let item_key = app.rating_path_key(idx).unwrap();
+        let outcome =
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7c, false, false));
+        assert_eq!(
+            outcome,
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingBookPreferred {
+                applied_to: NativeVideoBookPreferredAppliedTo::Unavailable,
+                edit: crate::keymap::RatingEdit::Assign(5),
+            })
+        );
+        for key in [
+            item_key,
+            crate::adjustment_db::normalize_path(&folder),
+            crate::adjustment_db::normalize_path(&other_book),
+        ] {
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+        }
+        assert_eq!(app.meta_undo.undo_len(), 0);
     }
 
     #[test]
@@ -17412,6 +17923,35 @@ mod native_video_key_observation_tests {
             (
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingContainer(5)),
                 "action:rating_container_5",
+            ),
+            (
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Book,
+                        edit: crate::keymap::RatingEdit::Assign(4),
+                    },
+                ),
+                "action:rating_book_preferred_book_Assign(4)",
+            ),
+            (
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Item,
+                        edit: crate::keymap::RatingEdit::Step(
+                            crate::keymap::RatingStepDirection::Up,
+                        ),
+                    },
+                ),
+                "action:rating_book_preferred_item_Step(Up)",
+            ),
+            (
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::RatingBookPreferred {
+                        applied_to: NativeVideoBookPreferredAppliedTo::Unavailable,
+                        edit: crate::keymap::RatingEdit::Assign(5),
+                    },
+                ),
+                "action:rating_book_preferred_unavailable_Assign(5)",
             ),
             (NativeVideoKeyOutcome::NoMatch, "no_match"),
         ];

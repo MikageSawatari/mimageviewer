@@ -280,17 +280,11 @@ mod tests {
     use super::*;
     use comic_core::{AnnotationObject, Orientation, Rgba, TextBlock};
 
-    fn tmp_db() -> (ComicDb, std::path::PathBuf) {
-        let p = std::env::temp_dir().join(format!(
-            "mimageviewer_comic_db_test_{}_{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&p);
-        (ComicDb::open_at(&p).expect("open"), p)
+    // Bind the directory before the connection so the connection drops first.
+    fn tmp_db() -> (tempfile::TempDir, ComicDb) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = ComicDb::open_at(&temp.path().join("test.db")).expect("open");
+        (temp, db)
     }
 
     fn sample_objects() -> Vec<AnnotationObject> {
@@ -309,17 +303,16 @@ mod tests {
 
     #[test]
     fn set_and_get_roundtrip() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let objs = sample_objects();
         db.set("c:/foo/img.png", &objs).unwrap();
         let got = db.get("c:/foo/img.png").expect("get");
         assert_eq!(got, objs);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn load_existing_comic_keys_returns_only_requested_exact_keys() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         db.set_raw("c:/a.jpg", DOC_VERSION, "[]").unwrap();
         db.set_raw("c:/b.jpg", DOC_VERSION, "[]").unwrap();
         let loaded = db.load_existing_comic_keys(&["c:/b.jpg", "c:/missing.jpg"]);
@@ -327,23 +320,21 @@ mod tests {
             loaded,
             std::collections::HashSet::from(["c:/b.jpg".to_string()])
         );
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn empty_objects_deletes() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         db.set("k", &sample_objects()).unwrap();
         assert!(db.get("k").is_some());
         // 空注釈で set すると削除される (no-row = 空注釈)。
         db.set("k", &[]).unwrap();
         assert!(db.get("k").is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn edit_bundle_bulk_comic_strict_reader_rejects_corrupt_json() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         db.set_raw("k", DOC_VERSION, "{ this is not valid json ]")
             .unwrap();
         // 壊れ JSON はクラッシュせず None (空注釈扱い)。
@@ -354,38 +345,34 @@ mod tests {
             Some("{ this is not valid json ]")
         );
         assert!(db.get_checked_strict("k").is_err());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn edit_bundle_bulk_comic_strict_reader_rejects_unknown_document_version() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         db.set_raw("k", DOC_VERSION + 1, "[]").unwrap();
         assert_eq!(db.get("k"), Some(Vec::new()));
         assert!(db.get_checked_strict("k").is_err());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn missing_key_is_none() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         assert!(db.get("nope").is_none());
         assert!(db.get_raw("nope").is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn delete_removes_entry() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         db.set("k", &sample_objects()).unwrap();
         db.delete("k").unwrap();
         assert!(db.get("k").is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_raw_roundtrip_with_doc_version() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let json = serde_json::to_string(&sample_objects()).unwrap();
         db.set_raw("k", 7, &json).unwrap();
         let (ver, got_json) = db.get_raw("k").expect("get_raw");
@@ -393,12 +380,11 @@ mod tests {
         assert_eq!(got_json, json);
         // get() でパースして等価。
         assert_eq!(db.get("k").unwrap(), sample_objects());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn load_comic_keys_by_prefix() {
-        let (db, p) = tmp_db();
+        let (_temp, db) = tmp_db();
         let objs = sample_objects();
         db.set("c:/foo/img1.png", &objs).unwrap();
         db.set("c:/foo/img2.png", &objs).unwrap();
@@ -407,6 +393,5 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains("c:/foo/img1.png"));
         assert!(keys.contains("c:/foo/img2.png"));
-        let _ = std::fs::remove_file(&p);
     }
 }

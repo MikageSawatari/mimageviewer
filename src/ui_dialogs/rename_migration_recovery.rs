@@ -31,7 +31,7 @@ pub(super) fn draw_rename_recovery_dialog(
     let mut cancel = false;
     let response = super::show_startup_modal(
         ctx,
-        egui::Id::new("rename_migration_recovery_dialog"),
+        egui::Id::unique("rename_migration_recovery_dialog"),
         |ui| {
             ui.set_width(520.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
             ui.heading("名前変更の復旧記録");

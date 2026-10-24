@@ -159,6 +159,11 @@ fn completed_dataset_publishes_rows_stamps_identity_and_source_at_one_ready_boun
         SearchAccepted::Metadata
     ));
     assert!(app.everything_search_progress_visible());
+    assert_eq!(
+        app.everything_search_entry_availability(),
+        EverythingSearchEntryAvailability::OtherOperation
+    );
+    assert!(!app.everything_search_entry_allowed());
     app.release_search_ready_for_test();
     poll_until(&mut app, &ctx, "Ready did not adopt", |app| {
         app.global_search.pending.is_none()

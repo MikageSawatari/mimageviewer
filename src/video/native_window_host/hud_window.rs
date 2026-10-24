@@ -1219,8 +1219,8 @@ mod tests {
     use crate::video::native_window::{NativeWindowEventReceiver, native_window_event_route};
     use std::sync::atomic::AtomicBool;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GW_HWNDNEXT, GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowRect, HWND_TOP,
-        IsWindowVisible, SetWindowPos,
+        GW_HWNDNEXT, GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowRect, HWND_BOTTOM,
+        HWND_NOTOPMOST, HWND_TOP, IsWindowVisible,
     };
 
     // Use the production class/wndproc and methods, but never ShowWindow or activate
@@ -1308,7 +1308,13 @@ mod tests {
         for _ in 0..3 {
             editor.raise_to_top();
             assert!(precedes(editor.hwnd(), hud.hwnd()));
+            let notifications = hud.position_notifications_for_test();
             hud.raise_to_top();
+            assert_eq!(
+                hud.position_notifications_for_test(),
+                notifications,
+                "self raise must suppress WM_WINDOWPOSCHANGING itself"
+            );
             assert_eq!(
                 raise_requests(&events),
                 0,
@@ -1351,45 +1357,52 @@ mod tests {
             }
         );
 
-        // Ordinary external SetWindowPos must still reach the actual HUD wndproc.
-        for insert_after in [HWND_TOP, HWND_TOPMOST] {
-            // Test both ignored insert-after values through the production handler.
-            let mut notification = WINDOWPOS {
-                hwnd: hud.hwnd(),
-                hwndInsertAfter: insert_after,
-                flags: SWP_NOZORDER | SWP_NOACTIVATE,
-                ..Default::default()
-            };
-            unsafe {
-                hud_wnd_proc(
+        // Exercise the production handler and event route with the exact incoming
+        // fields. USER32 can normalize a real SetWindowPos request (e.g. add
+        // NOZORDER for an already-frontmost HUD), so its requested insert-after
+        // is not a deterministic notification fixture. The sibling-order test
+        // above separately checks actual Win32 recovery through raise_to_top().
+        for insert_after in [
+            HWND_TOP,
+            HWND_TOPMOST,
+            HWND_BOTTOM,
+            HWND_NOTOPMOST,
+            hud.hwnd(),
+        ] {
+            for no_zorder in [true, false] {
+                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+                let mut notification = WINDOWPOS {
+                    hwnd: hud.hwnd(),
+                    hwndInsertAfter: insert_after,
+                    flags: if no_zorder {
+                        flags | SWP_NOZORDER
+                    } else {
+                        flags
+                    },
+                    ..Default::default()
+                };
+                let expected =
+                    usize::from(!no_zorder && [HWND_TOP, HWND_TOPMOST].contains(&insert_after));
+                unsafe {
+                    hud_wnd_proc(
+                        hud.hwnd(),
+                        WM_WINDOWPOSCHANGING,
+                        WPARAM(0),
+                        LPARAM((&mut notification as *mut WINDOWPOS) as isize),
+                    );
+                }
+                assert_eq!(
+                    raise_requests(&events),
+                    expected,
+                    "incoming hwnd={:?} insertAfter={insert_after:?} flags={:#x}",
                     hud.hwnd(),
-                    WM_WINDOWPOSCHANGING,
-                    WPARAM(0),
-                    LPARAM((&mut notification as *mut WINDOWPOS) as isize),
+                    if no_zorder {
+                        (flags | SWP_NOZORDER).0
+                    } else {
+                        flags.0
+                    },
                 );
             }
-            assert_eq!(
-                raise_requests(&events),
-                0,
-                "NOZORDER must ignore insert-after"
-            );
-            unsafe {
-                SetWindowPos(
-                    hud.hwnd(),
-                    Some(insert_after),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                )
-            }
-            .expect("external z-order notification");
-            assert_eq!(
-                raise_requests(&events),
-                1,
-                "external recovery route must remain"
-            );
         }
         assert!(!unsafe { IsWindowVisible(hud.hwnd()) }.as_bool());
     }

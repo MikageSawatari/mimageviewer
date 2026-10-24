@@ -331,8 +331,8 @@ impl PanoStaticGpu {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("miv_panorama_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("miv_panorama_pipeline"),
@@ -356,7 +356,7 @@ impl PanoStaticGpu {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         // U 方向は経度ラップ (Repeat)、V 方向は極でクランプ (ClampToEdge)。
@@ -368,7 +368,7 @@ impl PanoStaticGpu {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         // 水平方向が欠けたpartial panoramaでは、低LODでもそのmip level自身の端に
@@ -380,7 +380,7 @@ impl PanoStaticGpu {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         Self {
@@ -668,8 +668,8 @@ impl SettleOverlayGpu {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("miv_panorama_settle_pl"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("miv_panorama_settle_pipeline"),
@@ -693,7 +693,7 @@ impl SettleOverlayGpu {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -703,7 +703,7 @@ impl SettleOverlayGpu {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self {
@@ -994,6 +994,77 @@ mod tests {
 
 /// `Params` uniform のバイト長 (3 × vec4<f32> = 12 floats)。
 pub const PANO_UNIFORM_BYTES: usize = 48;
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use crate::egui037_stage4_gpu_tests::{FORMAT, OffscreenGpu, assert_rgba, callback};
+    use crate::panorama::{PanoPose, PanoProjection, PanoUvTransform};
+
+    #[test]
+    fn panorama_offscreen_callbacks_composite_settle_alpha_zero_half_and_one() {
+        let mut gpu = OffscreenGpu::new();
+        let base_gpu = PanoStaticGpu::new(&gpu.device, FORMAT);
+        let uploaded = Arc::new(base_gpu.create_uploaded_texture(
+            &gpu.device,
+            &gpu.queue,
+            "stage4-panorama".to_owned(),
+            41,
+            8,
+            4,
+            &[20, 40, 80, 255].repeat(32),
+        ));
+        gpu.renderer.callback_resources.insert(base_gpu);
+        gpu.renderer
+            .callback_resources
+            .insert(UploadedPanoTextureRef(uploaded));
+        let settle_gpu = SettleOverlayGpu::new(&gpu.device, FORMAT);
+        let overlay = Arc::new(settle_gpu.create_uploaded_overlay(
+            &gpu.device,
+            &gpu.queue,
+            4,
+            4,
+            &[220, 140, 40, 255].repeat(16),
+        ));
+        gpu.renderer.callback_resources.insert(settle_gpu);
+        let pose = PanoPose::new(0.0, 0.0, 1.0, PanoProjection::Perspective);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(4.0, 4.0));
+        for (alpha, expected) in [
+            (0.0, [20, 40, 80, 255]),
+            (0.5, [120, 90, 60, 255]),
+            (1.0, [220, 140, 40, 255]),
+        ] {
+            let jobs = [
+                callback(
+                    rect,
+                    PanoramaShaderCallback {
+                        source_key: "stage4-panorama".to_owned(),
+                        cache_key: 41,
+                        pose,
+                        aspect: 1.0,
+                        uv_transform: PanoUvTransform::IDENTITY,
+                        target_format: FORMAT,
+                    },
+                ),
+                callback(
+                    rect,
+                    SettleOverlayCallback {
+                        source_key: "stage4-panorama".to_owned(),
+                        cache_key: 41,
+                        pose,
+                        alpha,
+                        target_format: FORMAT,
+                        gpu: overlay.clone(),
+                    },
+                ),
+            ];
+            let pixels = gpu.render(&jobs, [4, 4], [0, 0, 0, 0]);
+            for pixel in pixels {
+                assert_rgba(pixel, expected);
+            }
+        }
+    }
+}
 
 /// `Params` uniform 用バイト列 (3 × vec4<f32> = 12 floats、48 bytes)。
 ///

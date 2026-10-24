@@ -213,7 +213,8 @@ mod adjust_scope_selector_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 72.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -223,7 +224,7 @@ mod adjust_scope_selector_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let mut measured = measured_in_ui.lock().unwrap();
                         measured.clear();
                         for max_chars in [7, 8] {
@@ -254,7 +255,8 @@ mod adjust_scope_selector_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 180.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -264,7 +266,7 @@ mod adjust_scope_selector_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let mut measured = measured_in_ui.lock().unwrap();
                         measured.clear();
                         for label in [
@@ -280,11 +282,109 @@ mod adjust_scope_selector_tests {
             });
         harness.run();
 
+        let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+        std::fs::create_dir_all(dir).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(dir.join("adjust-scope-actions.png"))
+            .unwrap();
         let sizes = measured.lock().unwrap();
+        std::fs::write(
+            dir.join("adjust-scope-actions-sizes.txt"),
+            format!("{sizes:?}"),
+        )
+        .unwrap();
         assert_eq!(sizes.len(), 5, "all action labels were rendered");
         for (label, size) in sizes.iter() {
             assert!(size.x <= 258.0, "{label} was {}px wide", size.x);
-            assert!(size.y <= 24.0, "{label} was {}px high", size.y);
+            // 0.37 の日本語 Button 行高 21pt + 縦 padding 2pt × 2。
+            assert_eq!(size.y, 25.0, "{label} action height changed");
+        }
+    }
+
+    #[test]
+    fn adjust_scope_actions_fit_or_scroll_to_the_last_action() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+
+        for height in [180.0, 80.0] {
+            let observed = Arc::new(Mutex::new(None));
+            let rendered = Arc::clone(&observed);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(300.0, 240.0))
+                .build_ui(move |ui| {
+                    let output = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(258.0, height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .max_height(height)
+                                    .show(ui, |ui| {
+                                        let mut last = None;
+                                        for label in [
+                                            "共通の標準からコピー",
+                                            "現在の設定値を標準に反映",
+                                            ADJUST_ALIGN_ALL_STANDARD_LABEL,
+                                            ADJUST_ALIGN_ALL_PAGE_LABEL,
+                                            "個別設定を解除 [Q]",
+                                        ] {
+                                            let response = ui.button(label);
+                                            assert!(response.rect.width() <= 258.0);
+                                            last = Some((response.id, response.rect));
+                                        }
+                                        last.unwrap()
+                                    })
+                            },
+                        )
+                        .inner;
+                    *rendered.lock().unwrap() =
+                        Some((ScrollLayout::from_output(&output), output.inner));
+                });
+            harness.run();
+            let (before, _) = observed.lock().unwrap().unwrap();
+            before.assert_height(
+                if height == 180.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                harness.ctx.content_rect(),
+                harness.ctx.pixels_per_point(),
+            );
+            if height == 80.0 {
+                harness.event(egui::Event::PointerMoved(before.inner.center()));
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -4000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.run_steps(40);
+                let (after, (id, rect)) = observed.lock().unwrap().unwrap();
+                after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+                assert!(
+                    after.inner.contains_rect(rect),
+                    "last action clipped: {rect:?}"
+                );
+                harness.hover_at(rect.center());
+                harness.run_steps(1);
+                assert!(harness.ctx.read_response(id).unwrap().contains_pointer());
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    harness.run_steps(1);
+                }
+                assert!(harness.ctx.read_response(id).unwrap().clicked());
+            }
         }
     }
 }
@@ -1623,43 +1723,46 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 200.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
-                    let mut add_layer_dialog_open = false;
-                    let mut select_layer: Option<usize> = None;
-                    let mut set_enabled: Option<(usize, bool)> = None;
-                    let mut update_layer: Option<(
-                        usize,
-                        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
-                    )> = None;
-                    let mut move_layer: Option<(usize, usize)> = None;
-                    let mut duplicate_layer: Option<usize> = None;
-                    let mut delete_layer: Option<usize> = None;
-                    let mut preview_to_selected_layer = false;
-                    super::draw_local_adjust_layer_list(
-                        ui,
-                        260.0,
-                        &layers,
-                        0,
-                        (1920, 1080),
-                        None,
-                        &mut add_layer_dialog_open,
-                        &mut select_layer,
-                        &mut set_enabled,
-                        &mut update_layer,
-                        &mut move_layer,
-                        &mut duplicate_layer,
-                        &mut delete_layer,
-                        &mut preview_to_selected_layer,
-                    );
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
+                        let mut add_layer_dialog_open = false;
+                        let mut select_layer: Option<usize> = None;
+                        let mut set_enabled: Option<(usize, bool)> = None;
+                        let mut update_layer: Option<(
+                            usize,
+                            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                        )> = None;
+                        let mut move_layer: Option<(usize, usize)> = None;
+                        let mut duplicate_layer: Option<usize> = None;
+                        let mut delete_layer: Option<usize> = None;
+                        let mut preview_to_selected_layer = false;
+                        super::draw_local_adjust_layer_list(
+                            ui,
+                            260.0,
+                            &layers,
+                            0,
+                            (1920, 1080),
+                            None,
+                            &mut add_layer_dialog_open,
+                            &mut select_layer,
+                            &mut set_enabled,
+                            &mut update_layer,
+                            &mut move_layer,
+                            &mut duplicate_layer,
+                            &mut delete_layer,
+                            &mut preview_to_selected_layer,
+                        );
+                    });
                 });
             });
 
@@ -1672,20 +1775,23 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 90.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut params = crate::colorize::ColorizeParams::default();
-                    let mut slots = crate::colorize::ColorizePresetSlots {
-                        slots: std::array::from_fn(|_| Some(params.clone())),
-                    };
-                    super::draw_colorize_preset_slots(ui, &mut params, &mut slots);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut params = crate::colorize::ColorizeParams::default();
+                        let mut slots = crate::colorize::ColorizePresetSlots {
+                            slots: std::array::from_fn(|_| Some(params.clone())),
+                        };
+                        super::draw_colorize_preset_slots(ui, &mut params, &mut slots);
+                    });
                 });
             });
 
@@ -1698,19 +1804,22 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 92.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut params = crate::colorize::ColorizeParams::default();
-                    params.palette = crate::colorize::ColorizePalette::Custom;
-                    params.luminance_weight = 35;
-                    super::draw_colorize_gradient_preview(ui, &params);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut params = crate::colorize::ColorizeParams::default();
+                        params.palette = crate::colorize::ColorizePalette::Custom;
+                        params.luminance_weight = 35;
+                        super::draw_colorize_gradient_preview(ui, &params);
+                    });
                 });
             });
 
@@ -1744,44 +1853,49 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let layers = std::sync::Arc::new(layers);
         let layers_for_render = std::sync::Arc::clone(&layers);
-        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut add_layer_dialog_open = false;
-                let mut select_layer: Option<usize> = None;
-                let mut set_enabled: Option<(usize, bool)> = None;
-                let mut update_layer: Option<(
-                    usize,
-                    crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
-                )> = None;
-                let mut move_layer: Option<(usize, usize)> = None;
-                let mut duplicate_layer: Option<usize> = None;
-                let mut delete_layer: Option<usize> = None;
-                let mut preview_flag = preview_to_selected_layer;
-                super::draw_local_adjust_layer_list(
-                    ui,
-                    260.0,
-                    &layers_for_render,
-                    selected_layer,
-                    (1920, 1080),
-                    None,
-                    &mut add_layer_dialog_open,
-                    &mut select_layer,
-                    &mut set_enabled,
-                    &mut update_layer,
-                    &mut move_layer,
-                    &mut duplicate_layer,
-                    &mut delete_layer,
-                    &mut preview_flag,
-                );
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut add_layer_dialog_open = false;
+                        let mut select_layer: Option<usize> = None;
+                        let mut set_enabled: Option<(usize, bool)> = None;
+                        let mut update_layer: Option<(
+                            usize,
+                            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                        )> = None;
+                        let mut move_layer: Option<(usize, usize)> = None;
+                        let mut duplicate_layer: Option<usize> = None;
+                        let mut delete_layer: Option<usize> = None;
+                        let mut preview_flag = preview_to_selected_layer;
+                        super::draw_local_adjust_layer_list(
+                            ui,
+                            260.0,
+                            &layers_for_render,
+                            selected_layer,
+                            (1920, 1080),
+                            None,
+                            &mut add_layer_dialog_open,
+                            &mut select_layer,
+                            &mut set_enabled,
+                            &mut update_layer,
+                            &mut move_layer,
+                            &mut duplicate_layer,
+                            &mut delete_layer,
+                            &mut preview_flag,
+                        );
+                    });
+                });
             });
-        });
 
         harness.run();
         harness.snapshot(name);
@@ -1896,27 +2010,30 @@ mod local_adjust_segmentation_tests {
         );
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 590.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_min_width(300.0);
-                    ui.set_max_width(300.0);
-                    crate::local_adjust_effect_ui::draw_effect_params(
-                        ui,
-                        &mut layer,
-                        (1920, 1080),
-                        false,
-                        None,
-                        None,
-                        false,
-                        true,
-                    );
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_min_width(300.0);
+                        ui.set_max_width(300.0);
+                        crate::local_adjust_effect_ui::draw_effect_params(
+                            ui,
+                            &mut layer,
+                            (1920, 1080),
+                            false,
+                            None,
+                            None,
+                            false,
+                            true,
+                        );
+                    });
                 });
             });
 
@@ -3299,6 +3416,7 @@ mod local_adjust_fold_audit {
                 && (trimmed.starts_with("fn ")
                     || trimmed.starts_with("pub fn ")
                     || trimmed.starts_with("pub(crate) fn ")
+                    || trimmed.starts_with("pub(super) fn ")
                     || trimmed.starts_with("async fn ")
                     || trimmed.starts_with("pub(crate) async fn "));
             if is_fn_header {
@@ -3457,28 +3575,65 @@ mod local_adjust_fold_audit {
     /// 到達可能性は実行時テストでは見えないので、位置をソースで固定する。
     #[test]
     fn the_key_run_settle_runs_before_the_embedded_fullscreen_early_return() {
-        let source = std::fs::read_to_string("src/app.rs").unwrap();
-        let update = source
-            .split("fn update_frame(&mut self, ctx: &egui::Context")
-            .nth(1)
-            .expect("App::update_frame が見つからない");
-        let settle = update
-            .find("self.settle_local_adjust_shape_key_edit()")
-            .expect("無操作判定が `App::update_frame` から呼ばれていない");
-        let poll = update
-            .find("self.poll_local_adjust_write_results()")
-            .expect("保存結果の回収が `App::update_frame` から呼ばれていない");
-        let gate = update
-            .find("if embedded_fs_active || embedded_fs_pending {")
-            .expect("in-window フルスクリーンの gate が見つからない");
-        assert!(
-            settle < gate,
-            "無操作判定が in-window フルスクリーンの early return より後ろにある"
-        );
-        assert!(
-            poll < gate,
-            "保存結果の回収が in-window フルスクリーンの early return より後ろにある"
-        );
+        assert!(key_run_settle_precedes_embedded_return(
+            include_str!("app.rs"),
+            include_str!("app/update_phases.rs"),
+        ));
+    }
+
+    fn key_run_settle_precedes_embedded_return(app: &str, phases: &str) -> bool {
+        let method = |source: &str, name: &str| {
+            enclosing_functions(source)
+                .into_iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, lines)| {
+                    lines
+                        .into_iter()
+                        .map(|(_, line)| line)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        };
+        let Some(update) = method(app, "update_frame") else {
+            return false;
+        };
+        let Some(service) = method(phases, "service_edit_completions") else {
+            return false;
+        };
+        let Some(call) = update.find("self.service_edit_completions(ctx, now);") else {
+            return false;
+        };
+        let Some(gate) = update.find("if embedded_fs_active || embedded_fs_pending {") else {
+            return false;
+        };
+        let Some(poll) = service.find("self.poll_local_adjust_write_results()") else {
+            return false;
+        };
+        let Some(settle) = service.find("self.settle_local_adjust_shape_key_edit()") else {
+            return false;
+        };
+        call < gate && poll < settle
+    }
+
+    #[test]
+    fn the_key_run_audit_rejects_late_service_and_missing_work() {
+        let app = include_str!("app.rs");
+        let phases = include_str!("app/update_phases.rs");
+        let call = "self.service_edit_completions(ctx, now);";
+        let gate = "if embedded_fs_active || embedded_fs_pending {";
+        let late = app
+            .replace(call, "")
+            .replace(gate, &format!("{gate}\n{call}"));
+        assert!(!key_run_settle_precedes_embedded_return(&late, phases));
+        for missing in [
+            "self.poll_local_adjust_write_results()",
+            "self.settle_local_adjust_shape_key_edit()",
+        ] {
+            assert!(!key_run_settle_precedes_embedded_return(
+                app,
+                &phases.replace(missing, "REMOVED_WORK"),
+            ));
+        }
     }
 
     /// 確定と取り消しは、保留の種類を同じだけ**扱う** (同じ結末にする、ではない)。
@@ -3847,7 +4002,12 @@ fn draw_local_adjust_layer_list(
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.set_min_width(42.0);
                         let mut enabled = layer.enabled;
-                        if ui.checkbox(&mut enabled, "").changed() {
+                        let enabled_response = ui.checkbox(&mut enabled, "");
+                        crate::ui_helpers::set_accessibility_label(
+                            &enabled_response,
+                            layer.effect.display_label(),
+                        );
+                        if enabled_response.changed() {
                             *set_enabled = Some((idx, enabled));
                         }
                         ui.horizontal(|ui| {
@@ -9299,7 +9459,7 @@ fn draw_header_icon_button(
     disabled_tooltip: Option<&str>,
     icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
 ) -> egui::Response {
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let resp = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
     let bg = if !enabled {
         egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
     } else if active {
@@ -9392,7 +9552,7 @@ fn draw_left_panel_tab_button(
 fn draw_left_panel_close_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
     let response = ui.interact(
         rect,
-        egui::Id::new("left_panel_close"),
+        egui::Id::unique("left_panel_close"),
         egui::Sense::click(),
     );
     if response.hovered() {
@@ -9452,6 +9612,7 @@ macro_rules! slider_with_reset {
         } else {
             $ui.add(slider)
         };
+        crate::ui_helpers::set_accessibility_label(&r, $label);
         if r.changed() {
             $changed = true;
         }
@@ -9486,6 +9647,7 @@ macro_rules! slider_log_with_reset {
         } else {
             $ui.add(slider)
         };
+        crate::ui_helpers::set_accessibility_label(&r, $label);
         if r.changed() {
             $changed = true;
         }
@@ -9628,7 +9790,7 @@ fn draw_colorize_settings(
     // OFF にした時点で対象の選択が消える。有効な間の値をセッション内に控えておき、ON に戻す
     // ときに復元する。有効な間は毎フレーム上書きするため、スロット読み込みなど UI 以外の
     // 書き手が mode を変えても追随し、控えが実態からずれない (= 対象の正本は常に mode)。
-    let restore_mode_id = egui::Id::new("colorize_last_enabled_mode");
+    let restore_mode_id = egui::Id::unique("colorize_last_enabled_mode");
     if params.colorize.mode != ColorizeMode::Disabled {
         let mode = params.colorize.mode;
         ui.data_mut(|data| data.insert_temp(restore_mode_id, mode));
@@ -9694,6 +9856,7 @@ fn draw_colorize_settings(
             });
             let mut tolerance = params.colorize.mono_tolerance as f32;
             let response = ui.add(egui::Slider::new(&mut tolerance, 1.0..=64.0).step_by(1.0));
+            crate::ui_helpers::set_accessibility_label(&response, "色味の許容量");
             if response.changed() {
                 params.colorize.mono_tolerance = tolerance as u8;
                 changed = true;
@@ -9775,12 +9938,13 @@ fn draw_colorize_settings(
                     if ui.color_edit_button_srgb(&mut point.color).changed() {
                         changed = true;
                     }
-                    ui.label("強さ");
+                    let strength_label = ui.label("強さ");
                     let response = ui.add(
                         egui::DragValue::new(&mut point.strength)
                             .range(0.0..=10.0)
                             .speed(0.05),
                     );
+                    let response = response.labelled_by(strength_label.id);
                     if response.changed() {
                         changed = true;
                     }
@@ -9853,6 +10017,7 @@ fn draw_colorize_settings(
                 .step_by(1.0)
                 .suffix("%"),
         );
+        crate::ui_helpers::set_accessibility_label(&response, "元画像の明るさを保持");
         if response.changed() {
             params.colorize.luminance_weight = luminance_weight as u8;
             changed = true;
@@ -9928,6 +10093,7 @@ fn draw_colorize_settings(
                     .step_by(1.0)
                     .suffix("%"),
             );
+            crate::ui_helpers::set_accessibility_label(&response, "変換の強さ");
             if response.changed() {
                 params.colorize.tone_strength = strength as u8;
                 changed = true;
@@ -10117,6 +10283,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "黒点");
             if r.changed() {
                 params.black_point = bp as u8;
                 changed = true;
@@ -10151,6 +10318,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "白点");
             if r.changed() {
                 params.white_point = wp as u8;
                 changed = true;
@@ -10185,6 +10353,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "中間点");
             if r.changed() {
                 changed = true;
             }
@@ -10346,6 +10515,7 @@ fn draw_sliders(
                 );
             }
             let r = ui.add(egui::Slider::new(&mut strength, 0.0..=100.0).step_by(1.0));
+            crate::ui_helpers::set_accessibility_label(&r, "シャープ化");
             if r.changed() {
                 params.smart_sharpen = strength as u8;
                 changed = true;
@@ -10396,6 +10566,7 @@ fn draw_sliders(
                             .map(|value| value / 100.0)
                     }),
             );
+            crate::ui_helpers::set_accessibility_label(&response, "適用量");
             changed |= response.changed();
             dragging |= response.dragged();
 
@@ -10729,7 +10900,7 @@ fn draw_image_creative_lut_combo(
             }
         });
     let before = *selected_id;
-    egui::ComboBox::from_id_salt("image_creative_lut")
+    let response = egui::ComboBox::from_id_salt("image_creative_lut")
         .selected_text(selected_name)
         .width(ui.available_width().max(120.0))
         .height(420.0)
@@ -10751,6 +10922,7 @@ fn draw_image_creative_lut_combo(
                     .on_hover_text(hover);
             }
         });
+    crate::ui_helpers::set_accessibility_label(&response.response, "Creative LUT");
     *selected_id != before
 }
 
@@ -10767,22 +10939,25 @@ mod creative_lut_ui_tests {
         let creative_luts = crate::creative_lut::builtin_creative_lut_entries();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(380.0, 520.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
-                    .show(ctx, |ui| {
-                        crate::os_theme::apply_dark_ui(ui);
-                        ui.set_max_width(320.0);
-                        ui.label("Creative LUT");
-                        draw_image_creative_lut_combo(ui, &mut selected_id, &creative_luts);
-                    });
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
+                        .show(root_ui, |ui| {
+                            crate::os_theme::apply_dark_ui(ui);
+                            ui.set_max_width(320.0);
+                            ui.label("Creative LUT");
+                            draw_image_creative_lut_combo(ui, &mut selected_id, &creative_luts);
+                        });
+                });
             });
 
         harness.get_by_role(egui::accesskit::Role::ComboBox).click();
@@ -10797,12 +10972,12 @@ mod creative_lut_ui_tests {
             harness.ctx.options(|options| options.theme_preference),
             egui::ThemePreference::Light
         );
-        assert!(!harness.ctx.style().visuals.dark_mode);
+        assert!(!harness.ctx.global_style().visuals.dark_mode);
     }
 }
 
 pub(crate) fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
-    egui::Id::new("book_bookmark_title_edit").with(bookmark_id)
+    egui::Id::unique("book_bookmark_title_edit").with(bookmark_id)
 }
 
 fn draw_bookmark_title_edit(
@@ -10873,25 +11048,34 @@ mod bookmark_title_edit_tests {
     }
 
     fn draw_editor(
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
         title: &mut String,
         request_focus: &mut bool,
         enter_pressed: bool,
     ) -> (egui::Id, bool) {
         let mut output = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let (response, submit) =
-                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
-            output = Some((response.id, submit));
-        });
+        {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let (response, submit) =
+                    draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
+                output = Some((response.id, submit));
+            })
+        };
         output.expect("bookmark title editor response")
     }
 
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn ime_commit_and_enter_input() -> egui::RawInput {
         egui::RawInput {
             events: vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("\u{3042}".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "\u{3042}".to_owned(),
+                    active_range_chars: None,
+                }),
                 egui::Event::Ime(egui::ImeEvent::Commit("\u{3042}".to_owned())),
                 key_event(egui::Key::Enter),
             ],
@@ -10904,14 +11088,24 @@ mod bookmark_title_edit_tests {
         let ctx = egui::Context::default();
         let mut title = String::new();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
 
         let mut editor_id = None;
-        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-        });
+        let _ = ctx
+            .run_pass(ime_commit_and_enter_input(), |ctx| {
+                editor_id = Some(
+                    ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    })
+                    .0,
+                );
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "\u{3042}");
         assert_eq!(ctx.memory(|memory| memory.focused()), editor_id);
@@ -10922,21 +11116,31 @@ mod bookmark_title_edit_tests {
         let ctx = egui::Context::default();
         let mut title = String::new();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::Text("\u{7d9a}".to_owned())],
-                ..Default::default()
-            },
-            |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-            },
-        );
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(ime_commit_and_enter_input(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![egui::Event::Text("\u{7d9a}".to_owned())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "\u{3042}\u{7d9a}");
     }
@@ -10947,25 +11151,40 @@ mod bookmark_title_edit_tests {
         let mut title = String::from("title");
         let mut request_focus = true;
         let mut submit_count = 0;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::Enter)],
-                ..Default::default()
-            },
-            |ctx| {
-                if draw_editor(ctx, &mut title, &mut request_focus, true).1 {
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::Enter)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    if ctx
+                        .root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, true)
+                        })
+                        .1
+                    {
+                        submit_count += 1;
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                if ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false))
+                    .1
+                {
                     submit_count += 1;
                 }
-            },
-        );
-        let _ = ctx.run(Default::default(), |ctx| {
-            if draw_editor(ctx, &mut title, &mut request_focus, false).1 {
-                submit_count += 1;
-            }
-        });
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(submit_count, 1);
     }
@@ -10976,45 +11195,76 @@ mod bookmark_title_edit_tests {
         let mut title = String::from("bookmark");
         let mut request_focus = true;
         let mut ids = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ids.push(
+                    ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    })
+                    .0,
+                );
+            })
+            .drop_without_applying_deltas();
 
-        let _ = ctx.run(
-            egui::RawInput {
-                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                events: vec![key_event_with_modifiers(
-                    egui::Key::A,
-                    egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                )],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::Backspace)],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: std::iter::once(egui::Event::ModifiersChanged(
+                        egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    ))
+                    .chain(vec![key_event_with_modifiers(
+                        egui::Key::A,
+                        egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    )])
+                    .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::Backspace)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(title.is_empty());
         assert_eq!(ctx.memory(|memory| memory.focused()), ids.last().copied());
 
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "a");
         assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
@@ -11026,27 +11276,31 @@ mod bookmark_title_edit_tests {
         let mut title = String::new();
         let mut request_focus = false;
         let mut editor_id = None;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for row_id in order {
-                    if *row_id == target {
-                        editor_id = Some(
-                            draw_bookmark_title_edit(
-                                ui,
-                                *row_id,
-                                &mut title,
-                                &mut request_focus,
-                                false,
-                            )
-                            .0
-                            .id,
-                        );
-                    } else {
-                        let _ = ui.button(format!("row-{row_id}"));
-                    }
-                }
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        for row_id in order {
+                            if *row_id == target {
+                                editor_id = Some(
+                                    draw_bookmark_title_edit(
+                                        ui,
+                                        *row_id,
+                                        &mut title,
+                                        &mut request_focus,
+                                        false,
+                                    )
+                                    .0
+                                    .id,
+                                );
+                            } else {
+                                let _ = ui.button(format!("row-{row_id}"));
+                            }
+                        }
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         editor_id.expect("target bookmark row")
     }
 
@@ -11207,7 +11461,7 @@ impl App {
         // Reject UndoAppend before lending the document, then invalidate only
         // an Applied edit in this same call, before any render/save publication.
         if self.book_append_undo_in_progress() {
-            self.show_feedback_toast("本への追加を取り消しています".to_string());
+            self.show_feedback_warning("本への追加を取り消しています".to_string());
             return false;
         }
         if !self.begin_local_page_edit(fs_idx) {
@@ -11337,7 +11591,7 @@ impl App {
         norm: [f32; 2],
     ) {
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -11345,7 +11599,7 @@ impl App {
         };
         let image_dims = local_adjust_image_dims(self, fs_idx);
         if source.size != [image_dims.0, image_dims.1] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
@@ -11394,7 +11648,7 @@ impl App {
             });
         match outcome {
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
             }
@@ -11403,7 +11657,7 @@ impl App {
                 if let Some(message) = crate::ui_helpers::bucket_shape_fit_failed_message(
                     self.local_adjust_bucket_region,
                 ) {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
             }
             crate::mask_db::BucketFillOutcome::Filled
@@ -12414,12 +12668,18 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         if !self.local_adjust_mode {
             return;
         }
         if !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::LaToolBucket)
         {
             self.set_local_adjust_mask_tool_from_shortcut(LocalAdjustMaskTool::Bucket);
@@ -12439,7 +12699,7 @@ impl App {
         };
         if !self.ensure_local_adjust_masks_match_source_dims(fs_idx) {
             let bucket_canvas_click = self.local_adjust_mask_tool == LocalAdjustMaskTool::Bucket
-                && ctx.input(|input| input.pointer.primary_pressed())
+                && ctx.input(|input| primary_allowed && input.pointer.primary_pressed())
                 && ctx
                     .input(|input| input.pointer.interact_pos())
                     .is_some_and(|pos| {
@@ -12448,7 +12708,7 @@ impl App {
                             && !self.local_adjust_tool_panel_rect(full_rect).contains(pos)
                     });
             if bucket_canvas_click {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                         .to_string(),
                 );
@@ -12464,10 +12724,12 @@ impl App {
             pointer_pos,
         ) = ctx.input(|i| {
             (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.pointer.secondary_pressed(),
+                primary_allowed && i.pointer.primary_pressed(),
+                primary_allowed && i.pointer.primary_down(),
+                primary_allowed
+                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                    && i.pointer.primary_released(),
+                secondary_allowed && i.pointer.secondary_pressed(),
                 i.modifiers,
                 i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
             )
@@ -13849,6 +14111,9 @@ impl App {
         reset_all_params: bool,
     ) {
         let was_dragging = self.adjustment_dragging;
+        if self.book_structural_op.is_some() && (changed || is_dragging) {
+            return;
+        }
         if (changed || is_dragging || was_dragging) && self.book_append_undo_in_progress() {
             self.admit_book_append_followup_mutation();
             return;
@@ -14008,6 +14273,9 @@ impl App {
         clear_layers: bool,
         effect_requests: LocalEffectPanelRequests,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         let changes_document = add_layer_mask.is_some()
             || change_layer_mask.is_some()
             || set_layer_effect.is_some()
@@ -14161,7 +14429,7 @@ impl App {
                     self.show_feedback_toast(format!("加工パラメータをペースト: {}", kind.label()));
                 }
             } else {
-                self.show_feedback_toast("コピー済みの加工パラメータがありません".to_string());
+                self.show_feedback_warning("コピー済みの加工パラメータがありません".to_string());
             }
         }
         if let Some(layer_idx) = effect_requests.reset_effect
@@ -14233,7 +14501,7 @@ impl App {
             self.local_adjust_selective_color_pick_active = true;
             self.local_adjust_rgb_pick_active = None;
             self.local_adjust_repair_point_pick_active = None;
-            self.show_feedback_toast("画像上の色をクリックして対象色を選択します".to_string());
+            self.show_feedback_warning("画像上の色をクリックして対象色を選択します".to_string());
         }
         if effect_requests.cancel_rgb_pick {
             self.local_adjust_rgb_pick_active = None;
@@ -14251,7 +14519,7 @@ impl App {
             self.local_adjust_repair_point_pick_active = Some(target);
             self.local_adjust_selective_color_pick_active = false;
             self.local_adjust_rgb_pick_active = None;
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "画像上をクリックして{}を指定します",
                 target.label()
             ));
@@ -14273,8 +14541,11 @@ impl App {
     }
 
     fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         if self.local_adjust_lut_pending.is_some() {
-            self.show_feedback_toast("LUT読み込み中です".to_string());
+            self.show_feedback_warning("LUT読み込み中です".to_string());
             return;
         }
         if !self
@@ -14283,7 +14554,7 @@ impl App {
             .and_then(|layers| layers.get(layer_idx))
             .is_some_and(|layer| matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_)))
         {
-            self.show_feedback_toast("3D LUT レイヤーを選択してください".to_string());
+            self.show_feedback_warning("3D LUT レイヤーを選択してください".to_string());
             return;
         }
         let Some(path) = rfd::FileDialog::new()
@@ -14329,10 +14600,10 @@ impl App {
                     path: path.clone(),
                     rx,
                 });
-                self.show_feedback_toast(format!("LUT読み込み中: {}", path.display()));
+                self.show_feedback_warning(format!("LUT読み込み中: {}", path.display()));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("LUT読み込み worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("LUT読み込み worker 起動失敗: {err}"));
             }
         }
     }
@@ -14353,7 +14624,7 @@ impl App {
                     || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
                         != pending.document
                 {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "LUT読み込み結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
@@ -14364,7 +14635,7 @@ impl App {
                 if !layers.get(pending.layer_idx).is_some_and(|layer| {
                     matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_))
                 }) {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "LUT読み込み結果を破棄しました。対象レイヤーが変更されています".to_string(),
                     );
                     return;
@@ -14385,21 +14656,25 @@ impl App {
                     "補正レイヤーLUT読み込み".to_string(),
                 );
                 self.show_feedback_toast(format!(
-                    "LUT読み込み完了: {name} ({size}^3) / {}",
-                    pending.path.display()
+                    "LUT読み込み: {name} ({size}^3) / {}",
+                    pending
+                        .path
+                        .file_name()
+                        .unwrap_or(pending.path.as_os_str())
+                        .to_string_lossy()
                 ));
                 ctx.request_repaint();
             }
             Ok(Err(err)) => {
                 self.local_adjust_lut_pending = None;
-                self.show_feedback_toast(format!("LUT読み込み失敗: {err}"));
+                self.show_feedback_error(format!("LUT読み込み失敗: {err}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.local_adjust_lut_pending = None;
-                self.show_feedback_toast("LUT読み込み worker が停止しました".to_string());
+                self.show_feedback_warning("LUT読み込み worker が停止しました".to_string());
             }
         }
     }
@@ -14480,7 +14755,7 @@ impl App {
             return;
         }
         if self.local_adjust_segmentation_pending.is_some() {
-            self.show_feedback_toast("マスク生成中です".to_string());
+            self.show_feedback_warning("マスク生成中です".to_string());
             return;
         }
         if !self
@@ -14489,7 +14764,7 @@ impl App {
             .and_then(|layers| layers.get(layer_idx))
             .is_some_and(|layer| matches!(layer.mask, local_adjust_core::LocalMask::Subject(_)))
         {
-            self.show_feedback_toast("被写体マスクのレイヤーを選択してください".to_string());
+            self.show_feedback_warning("被写体マスクのレイヤーを選択してください".to_string());
             return;
         }
         self.ensure_ai_runtime();
@@ -14497,13 +14772,13 @@ impl App {
         // 被写体マットモデル (BiRefNet) は編集用追加パックから供給される。
         // App 構造体に毎フレーム I/O を避けてキャッシュしてあるパスを使う。
         let Some(model_path) = self.subject_matte_path.clone() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "被写体マットモデルが見つかりません (編集用追加ファイル未導入)".to_string(),
             );
             return;
         };
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast("被写体マスク生成用の画像を取得できません".to_string());
+            self.show_feedback_warning("被写体マスク生成用の画像を取得できません".to_string());
             return;
         };
         if !self.admit_book_append_followup_mutation() {
@@ -14552,10 +14827,10 @@ impl App {
                         cancel,
                         rx,
                     });
-                self.show_feedback_toast("被写体マスク生成中...".to_string());
+                self.show_feedback_warning("被写体マスク生成中...".to_string());
             }
             Err(err) => {
-                self.show_feedback_toast(format!("被写体マスク worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("被写体マスク worker 起動失敗: {err}"));
             }
         }
     }
@@ -14567,7 +14842,7 @@ impl App {
         scope: LocalAdjustRegionSegmentationScope,
     ) {
         if self.local_adjust_segmentation_pending.is_some() {
-            self.show_feedback_toast("マスク生成中です".to_string());
+            self.show_feedback_warning("マスク生成中です".to_string());
             return;
         }
         if !self
@@ -14578,11 +14853,11 @@ impl App {
                 matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_))
             })
         {
-            self.show_feedback_toast("領域分割マスクのレイヤーを選択してください".to_string());
+            self.show_feedback_warning("領域分割マスクのレイヤーを選択してください".to_string());
             return;
         }
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast("領域分割用の画像を取得できません".to_string());
+            self.show_feedback_warning("領域分割用の画像を取得できません".to_string());
             return;
         };
         let subject = if scope.requires_subject() {
@@ -14591,7 +14866,7 @@ impl App {
             None
         };
         if scope.requires_subject() && subject.is_none() {
-            self.show_feedback_toast("利用できる被写体マスクがありません".to_string());
+            self.show_feedback_warning("利用できる被写体マスクがありません".to_string());
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -14642,7 +14917,7 @@ impl App {
                 self.show_feedback_toast(scope.pending_label().to_string());
             }
             Err(err) => {
-                self.show_feedback_toast(format!("領域分割 worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("領域分割 worker 起動失敗: {err}"));
             }
         }
     }
@@ -14663,7 +14938,7 @@ impl App {
                     || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
                         != pending.document
                 {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "マスク生成結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
@@ -14672,7 +14947,7 @@ impl App {
                     self.local_page_edit_document_for_producer(&pending.owner, &pending.document);
                 let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
                 let Some(layer) = Arc::make_mut(&mut layers).get_mut(pending.layer_idx) else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "マスク生成結果を破棄しました。対象レイヤーがありません".to_string(),
                     );
                     return;
@@ -14699,7 +14974,7 @@ impl App {
                         format!("領域分割完了: {label_count} 領域")
                     }
                     _ => {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "マスク生成結果を破棄しました。対象レイヤーが変更されています"
                                 .to_string(),
                         );
@@ -14722,14 +14997,14 @@ impl App {
             }
             Ok(Err(err)) => {
                 self.local_adjust_segmentation_pending = None;
-                self.show_feedback_toast(format!("マスク生成失敗: {err}"));
+                self.show_feedback_error(format!("マスク生成失敗: {err}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.local_adjust_segmentation_pending = None;
-                self.show_feedback_toast("マスク生成 worker が停止しました".to_string());
+                self.show_feedback_warning("マスク生成 worker が停止しました".to_string());
             }
         }
     }
@@ -14745,7 +15020,7 @@ impl App {
         }
         let mut open = self.local_adjust_add_layer_dialog_open;
         let mut add_requested = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14753,6 +15028,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("補正レイヤーを追加")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
@@ -14772,6 +15048,10 @@ impl App {
                 );
                     ui.separator();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(320.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -14844,7 +15124,7 @@ impl App {
         let mut open = self.local_adjust_change_mask_dialog_open;
         let mut keep_manual_override = self.local_adjust_change_mask_keep_manual_override;
         let mut selected_kind = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14852,6 +15132,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("マスク種類変更")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(70.0, 54.0))
@@ -14872,6 +15153,10 @@ impl App {
                     );
                     ui.separator();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(320.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -14937,7 +15222,7 @@ impl App {
         }
         let mut open = self.local_adjust_effect_picker_dialog_open;
         let mut picked_effect = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14945,6 +15230,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("加工内容を選択")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
@@ -14974,6 +15260,10 @@ impl App {
                     ui.separator();
                     let query = effect_query.trim();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(440.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -15170,14 +15460,17 @@ impl App {
         let mut effect_requests = LocalEffectPanelRequests::default();
         let mut bitmap_mask_op = None;
 
-        egui::Area::new(egui::Id::new("local_adjust_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("local_adjust_panel_click_sink"),
+                    egui::Id::unique("local_adjust_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -15260,6 +15553,10 @@ impl App {
                                 ui.set_max_width(LOCAL_ADJUST_PANEL_W);
                                 ui.set_min_height(body_height);
                                 egui::ScrollArea::vertical()
+                                    .scroll_source(egui::scroll_area::ScrollSource {
+                                        drag: egui::scroll_area::DragScroll::Always,
+                                        ..Default::default()
+                                    })
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
@@ -15344,14 +15641,17 @@ impl App {
                     });
             });
 
-        egui::Area::new(egui::Id::new("local_adjust_tool_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_tool_panel"))
             .fixed_pos(tool_panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     tool_sink_rect,
-                    egui::Id::new("local_adjust_tool_panel_click_sink"),
+                    egui::Id::unique("local_adjust_tool_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -15370,6 +15670,10 @@ impl App {
                         ui.set_min_height(body_height);
                         ui.set_max_height(body_height);
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .max_height(body_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
@@ -15588,6 +15892,7 @@ impl App {
         fs_idx: usize,
         body_width: f32,
         body_height: f32,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         if self.current_book_bookmark_draft(fs_idx).is_none() {
             ui.add_space(12.0);
@@ -15669,6 +15974,10 @@ impl App {
         let mut save_title = None;
         let mut cancel_title_edit = false;
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .auto_shrink([false, false])
             .max_height(body_height - 32.0)
             .show(ui, |ui| {
@@ -15828,11 +16137,21 @@ impl App {
                         });
                         control_clicked
                     });
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::unique(("fs_bookmark_row_test_rect", bookmark.id)),
+                            inner.response.rect,
+                        )
+                    });
                     // 行全体の click widget を子ボタンの後から重ねると、後勝ちの
                     // interaction が「名前を編集」「削除」の click を奪う。Frame は
                     // hover のままにして、行内の生 click を読み、子 control が処理した
                     // click だけを除外する。
-                    let row_primary_clicked = ui.input(|input| input.pointer.primary_clicked());
+                    let row_primary_clicked = !overflow_pointer_input
+                        .owns(egui::PointerButton::Primary)
+                        && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                        && ui.input(|input| input.pointer.primary_clicked());
                     if bookmark_row_should_jump(
                         inner.response.contains_pointer(),
                         row_primary_clicked,
@@ -15987,6 +16306,7 @@ impl App {
         let mut canceled = false;
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("このお気に入りの標準設定が削除されます")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .collapsible(false)
@@ -16029,6 +16349,7 @@ impl App {
         ui: &mut egui::Ui,
         panel_rect: egui::Rect,
         image_dims: Option<(u32, u32)>,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         // フルスクリーン対象のページ idx
         let Some(fs_root_idx) = self.fullscreen_idx else {
@@ -16067,6 +16388,9 @@ impl App {
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel_rect));
         child.set_clip_rect(panel_rect);
+        if self.book_structural_op.is_some() {
+            child.disable();
+        }
         // ⚠ テーマ非依存で常に DARK visuals を適用。Light テーマで slider/DragValue
         // の bg が near-white になり「白の上に白文字」で読めなくなる問題への対応
         // (= 消しゴム / 隠蔽パネルと同じ方針、CLAUDE.md「フルスクリーン内は黒背景
@@ -16427,7 +16751,7 @@ impl App {
                         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                         return;
                     }
-                    Err(error) => self.show_feedback_toast(error.message().to_string()),
+                    Err(error) => self.show_feedback_error(error.message().to_string()),
                 }
             }
             if activate_export {
@@ -16476,6 +16800,7 @@ impl App {
                         fs_root_idx,
                         content_width,
                         body_height,
+                        overflow_pointer_input,
                     );
                 },
             );
@@ -16578,7 +16903,7 @@ impl App {
                 // ScrollArea は親 UI の available_rect を上限にするため、body_rect と
                 // 同じ高さの親領域を明示確保してから置く。これでコンテンツが短い
                 // 場合もパネル下端近くまで暗背景 + 操作領域が伸びる。
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .max_height(body_height)
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, false])
@@ -16984,6 +17309,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("画像補正保存スロット名")
+            .drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))

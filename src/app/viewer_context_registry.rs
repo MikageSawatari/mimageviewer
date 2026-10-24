@@ -1,6 +1,37 @@
 use super::*;
 use std::collections::HashMap;
 
+impl App {
+    /// Terminal ownership boundary, shared by accepted viewer closes and context retirement.
+    /// Content-only close/reopen never comes here. Workers/list adoption remain alive.
+    pub(super) fn retire_viewer_reopen_requests(&mut self, id: ViewerContextId) {
+        if id == self.projected_viewer_context_id() {
+            self.retire_book_deferred_open();
+            if let Some(state) = self.epub_convert.as_mut() {
+                state.retire_fullscreen_reopen();
+            }
+        } else {
+            #[cfg(windows)]
+            if let Some(bundle) = self.viewer_contexts.table.retiring_slot_mut(id) {
+                bundle.book_composition_permission.retire_deferred_open();
+                if let Some(state) = bundle.epub_convert.as_mut() {
+                    state.retire_fullscreen_reopen();
+                }
+            }
+        }
+        // This state is App-global, unlike the book permission in the context bundle.
+        // Do not release the currently projected sibling's navigation lock/holdover.
+        if self
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.deferred_fullscreen.as_ref())
+            .is_some_and(|deferred| deferred.owner_context == id)
+        {
+            self.archive_convert.as_mut().unwrap().deferred_fullscreen = None;
+        }
+    }
+}
+
 /// A payload's identity, independent of its window and of the current main binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ViewerContextId(u64);
@@ -716,6 +747,31 @@ fn reset_audio_art_terminal_rows(
 }
 
 impl App {
+    /// Includes buffered read results; inspection never mounts a context or drains it.
+    pub(super) fn has_tag_prewarm_work(&self) -> bool {
+        if self
+            .tag_prewarm_pending
+            .as_ref()
+            .is_some_and(|p| p.is_busy())
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if bundle
+                .tag_prewarm_pending
+                .as_ref()
+                .is_some_and(|p| p.is_busy())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(super) fn take_parked_page_edit_commits(&mut self) -> Vec<page_edit_owner::PageEditCommit> {
         let mut commits = Vec::new();
         #[cfg(windows)]
@@ -833,7 +889,7 @@ impl App {
             crate::logger::log(format!(
                 "local-adjust producer superseded by content change: key={key}"
             ));
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "LUT／マスク生成結果を破棄しました。レイヤーが変更されています".to_owned(),
             );
         }
@@ -1576,7 +1632,7 @@ pub(in crate::app) struct ViewerContextBundle {
     rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
     rating_session_write_seen_generation: u64,
-    metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
+    metadata_import_refresh_index: Option<MetadataImportRefreshState>,
     current_folder_rating_cache: Option<u8>,
     current_folder_last_mtime: Option<std::time::SystemTime>,
     current_folder_signature: Option<folder_scan::FolderScanSignature>,
@@ -1760,7 +1816,7 @@ pub(in crate::app) struct ViewerContextBundle {
     zip_enumerate_pending: Option<ZipEnumeratePending>,
     fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
     pending_auto_fs_open: bool,
-    pending_return_to_parent: bool,
+    pending_return_to_parent: super::FullscreenCloseContinuation,
     pdf_placeholder_count: Option<u32>,
     viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches,
     fs_nav_locked_gen: Option<u64>,
@@ -1840,7 +1896,7 @@ pub(in crate::app) struct ViewerContextBundle {
     adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
     erase_preview_cache: std::collections::HashMap<usize, ErasePreviewCacheEntry>,
-    erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    erase_base_cache: std::collections::HashMap<usize, super::EraseBaseSource>,
     conceal_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
     comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
@@ -2178,7 +2234,7 @@ impl ContextAsyncOwner {
             Self::SimilarPreview => {
                 let passwords = app.pdf_passwords.clone();
                 if let Some(notice) = app.similar_panel.preview.poll_background(ctx, &passwords) {
-                    app.show_feedback_toast(notice);
+                    app.show_feedback_warning(notice);
                 }
             }
             Self::FolderNavigation | Self::FolderPaneScan => {}
@@ -2971,7 +3027,7 @@ impl ViewerContextBundle {
             zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
-            pending_return_to_parent: false,
+            pending_return_to_parent: Default::default(),
             pdf_placeholder_count: None,
             viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
             fs_nav_locked_gen: None,
@@ -3078,7 +3134,7 @@ impl App {
         self.fs_seek_gesture.interrupt();
         self.fs_seek_overlay_visible = false;
         self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
+        self.pending_return_to_parent.cancel_live_request();
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
@@ -3109,7 +3165,7 @@ impl App {
         self.last_viewer_sync_stamp = None;
         self.fs_open_intent_from_grid = false;
         self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
+        self.pending_return_to_parent.cancel_live_request();
         self.pdf_prefetch_grace_until = None;
     }
 
@@ -4956,33 +5012,6 @@ impl App {
         }
     }
 
-    /// Page mappings update retained pairing identities. A book-root rename follows the
-    /// released reload behavior and leaves every accepted context payload at its old source.
-    pub(in crate::app) fn migrate_at_rest_spread_shifts(
-        &mut self,
-        mappings: &[crate::books::BookPathMapping],
-        root_move: Option<(&std::path::Path, &std::path::Path)>,
-    ) {
-        if root_move.is_some() {
-            return;
-        }
-        for slot in self.viewer_contexts.table.slots.values_mut() {
-            let bundle = match slot {
-                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
-            };
-            if super::spread_shift_live_mappings::migrate(&mut bundle.spread_shift, mappings) {
-                bundle.fullscreen_navigator_interaction.invalidate();
-                bundle.similar_panel.preview.invalidate();
-            }
-            if let Some(snapshot) = bundle.snapshot.as_mut() {
-                super::spread_shift_live_mappings::migrate(
-                    &mut snapshot.saved_viewing_state.shift,
-                    mappings,
-                );
-            }
-        }
-    }
-
     pub(crate) fn locate_window_context(
         &self,
         window_id: u64,
@@ -5217,6 +5246,26 @@ impl App {
         }
     }
 
+    /// Access only the editor state belonging to the still-current operation.
+    pub(super) fn with_composition_editor_owner_state<R>(
+        &mut self,
+        owner: &super::book_composition_editor::CompositionEditorOwner,
+        f: impl FnOnce(&mut super::book_composition_editor::CompositionEditorState) -> R,
+    ) -> Option<R> {
+        if self.composition_editor_operations.owner.as_ref() != Some(owner) {
+            return None;
+        }
+        match self.viewer_contexts.table.residence(owner.context_id) {
+            ContextResidence::Mounted => Some(f(&mut self.composition_editor)),
+            ContextResidence::AtRest => self
+                .viewer_contexts
+                .table
+                .at_rest_mut(owner.context_id)
+                .map(|bundle| f(&mut bundle.composition_editor)),
+            _ => None,
+        }
+    }
+
     #[track_caller]
     pub(in crate::app) fn bind_window(
         &mut self,
@@ -5287,22 +5336,51 @@ impl App {
         id: ViewerContextId,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, MountError> {
+        if self.viewer_contexts.table.mounted_id().is_none() {
+            return Err(MountError {
+                id,
+                residence: self.viewer_contexts.table.residence(id),
+            });
+        }
+        self.publish_mounted_context_rating_writes_at_boundary("mount_outgoing");
+        let result = self.with_viewer_context_state(id, |app| {
+            app.publish_mounted_context_rating_writes_at_boundary("mount_incoming");
+            if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+                app.poll_page_edit_reconciliation(&ctx);
+            }
+            app.consume_metadata_import_display_reconciliation();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(app)));
+            app.publish_mounted_context_rating_writes_at_boundary("return_outgoing");
+            result
+        })?;
+        self.publish_mounted_context_rating_writes_at_boundary("return_incoming");
+        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+            self.poll_page_edit_reconciliation(&ctx);
+        }
+        self.consume_metadata_import_display_reconciliation();
+        match result {
+            Ok(value) => Ok(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Exchange the existing payloads without adopting any display publication.
+    /// Service callbacks must themselves perform only owner-scoped state work.
+    pub(in crate::app) fn with_viewer_context_state<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
         let Some(original) = self.viewer_contexts.table.mounted_id() else {
             return Err(MountError {
                 id,
                 residence: self.viewer_contexts.table.residence(id),
             });
         };
-        self.publish_mounted_context_rating_writes_at_boundary("mount_outgoing");
         let ops = self.viewer_contexts.table.plan_mount(id)?;
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
-        self.publish_mounted_context_rating_writes_at_boundary("mount_incoming");
-        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
-            self.poll_page_edit_reconciliation(&ctx);
-        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-        self.publish_mounted_context_rating_writes_at_boundary("return_outgoing");
         let ops = self
             .viewer_contexts
             .table
@@ -5310,10 +5388,6 @@ impl App {
             .expect("mounted viewer-context owner disappeared");
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
-        self.publish_mounted_context_rating_writes_at_boundary("return_incoming");
-        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
-            self.poll_page_edit_reconciliation(&ctx);
-        }
         match result {
             Ok(value) => Ok(value),
             Err(payload) => std::panic::resume_unwind(payload),
@@ -5331,16 +5405,29 @@ impl App {
         self.with_viewer_context(id, f)
     }
 
+    pub(crate) fn with_window_viewer_context_state<R>(
+        &mut self,
+        window_id: u64,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
+        let (id, _) = self
+            .locate_window_context(window_id)
+            .unwrap_or_else(|| panic!("window {window_id} has no viewer-context binding"));
+        self.with_viewer_context_state(id, f)
+    }
+
     pub(in crate::app) fn build_viewer_context(
         &mut self,
         reason: &'static str,
         f: impl FnOnce(&mut Self, ViewerContextId) -> BuildOutcome,
     ) -> Option<ViewerContextId> {
+        let return_origin = self.close_return_origin();
         self.publish_mounted_context_rating_writes_at_boundary("build_outgoing");
         let (reserved, ops) = self.viewer_contexts.table.plan_begin_build();
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_begin_build();
         self.set_items_generation(Self::items_generation_for_viewer_context(reserved));
+        self.install_close_return_origin(return_origin);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, reserved)));
         match result {
             Ok(outcome) => self.finish_viewer_context_build(reserved, reason, outcome),
@@ -5440,6 +5527,7 @@ impl App {
                 .find(|candidate| self.page_path_key(*candidate).as_ref() == Some(key))
                 .expect("materialized fork target must remain installed during publication");
         }
+        let return_origin = self.close_return_origin();
         let source = self.projected_viewer_context_id();
         let scan_candidate = self.normalize_state.as_ref().and_then(|state| {
             (state.owner_context_id == source).then(|| (state.fs_idx, state.file_path.clone()))
@@ -5453,6 +5541,8 @@ impl App {
         self.execute_viewer_context_ops(ops, Some(spec));
         let finished = self.viewer_contexts.table.finish_fork();
         assert_eq!(finished, id);
+        self.with_viewer_context_state(id, |app| app.install_close_return_origin(return_origin))
+            .expect("new fork retains its return owner");
         self.publish_mounted_context_rating_writes_at_boundary("fork_incoming");
         // Music analysis lives on App, outside the viewer bundle. Transfer its exact
         // source and worker inbox only when the same player and applied track moved.
@@ -5574,6 +5664,11 @@ impl App {
         self.close_composition_editor_for_context(id);
         self.cancel_image_folder_zip_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
+        self.retire_viewer_reopen_requests(id);
+        if let Some(window_id) = retiring_window {
+            self.detached_window_manager
+                .transfer_viewport_retirement(window_id);
+        }
         let commits = self
             .viewer_contexts
             .table
@@ -5623,7 +5718,7 @@ impl App {
         finish: impl FnOnce(&mut Self),
         digest: impl FnOnce(ContextMut<'_>) -> D,
     ) -> Result<D, RetireContextError> {
-        self.with_viewer_context(id, finish)
+        self.with_viewer_context_state(id, finish)
             .map_err(RetireContextError::Mount)?;
         self.retire_context(id, reason, digest)
             .map_err(RetireContextError::Retire)
@@ -5648,6 +5743,24 @@ impl App {
 
 #[cfg(not(windows))]
 impl App {
+    pub(super) fn with_composition_editor_owner_state<R>(
+        &mut self,
+        owner: &super::book_composition_editor::CompositionEditorOwner,
+        f: impl FnOnce(&mut super::book_composition_editor::CompositionEditorState) -> R,
+    ) -> Option<R> {
+        (self.composition_editor_operations.owner.as_ref() == Some(owner)
+            && owner.context_id == ViewerContextId::single_context())
+        .then(|| f(&mut self.composition_editor))
+    }
+
+    pub(in crate::app) fn with_viewer_context_state<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
+        self.with_viewer_context(id, f)
+    }
+
     pub(in crate::app) fn viewer_context_main(&self) -> ViewerContextId {
         ViewerContextId::single_context()
     }
@@ -5686,6 +5799,27 @@ impl App {
 
 #[cfg(all(test, windows))]
 impl App {
+    pub(super) fn start_rating_boundary_trace_for_test() {
+        VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(super) fn take_rating_boundary_trace_for_test() -> Vec<(&'static str, ViewerContextId)> {
+        VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| {
+            trace
+                .borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|event| (event.boundary, event.owner))
+                .collect()
+        })
+    }
+
+    pub(super) fn stop_rating_boundary_trace_for_test() {
+        VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| *trace.borrow_mut() = None);
+    }
+
     pub(in crate::app) fn begin_mounted_detached_session_for_test(
         &mut self,
         window_id: u64,
@@ -7167,7 +7301,7 @@ mod tests {
             from: source.join("3.jpg"),
             to: target.join("renamed.jpg"),
         }];
-        app.migrate_at_rest_spread_shifts(&mappings, Some((source, target)));
+        app.adopt_book_path_metadata(&mappings, &[], Some((source, target)));
         assert_eq!(payload!(&app), main_before);
         assert_eq!(
             payload!(app.viewer_contexts.table.at_rest(matching).unwrap()),
@@ -7181,7 +7315,7 @@ mod tests {
         // While F12 owns the mounted projection, the parked main payload stays intact too.
         app.with_window_viewer_context(9821, |owner| {
             assert_eq!(payload!(&*owner), matching_before);
-            owner.migrate_at_rest_spread_shifts(&mappings, Some((source, target)));
+            owner.adopt_book_path_metadata(&mappings, &[], Some((source, target)));
             assert_eq!(payload!(&*owner), matching_before);
             assert_eq!(
                 payload!(owner.viewer_contexts.table.at_rest(main).unwrap()),
@@ -7259,18 +7393,19 @@ mod tests {
                 GridItem::Image(PathBuf::from(format!("{prefix}/failed.jpg"))),
                 GridItem::Video(PathBuf::from(format!("{prefix}/loaded.mp4"))),
             ];
-            let pixels = ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            let pixels = ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     prefix,
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some((13, 17)),
-                layout_dims: None,
-            };
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((13, 17)),
+                None,
+            );
             owner.thumbnails = vec![
                 ThumbnailState::NoArt,
                 ThumbnailState::Failed,
@@ -7809,7 +7944,10 @@ mod tests {
         );
         // The cache manager must rely on RAII owners rather than a post-hoc UI sweep.
         let sync_name = concat!("sync_epub", "_ui_read_leases");
-        assert!(!include_str!("../app.rs").contains(sync_name));
+        assert!(
+            !concat!(include_str!("../app.rs"), include_str!("update_phases.rs"))
+                .contains(sync_name)
+        );
         assert!(!include_str!("../ui_dialogs/archive_cache_manager.rs").contains(sync_name));
     }
 
@@ -7941,7 +8079,9 @@ mod tests {
         let retained = app
             .with_viewer_context(stashed, |app| {
                 let ctx = egui::Context::default();
-                let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+                let _ = ctx
+                    .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+                    .drop_without_applying_deltas();
                 assert_eq!(
                     std::ptr::from_ref(ContextRef::mounted(app).epub_convert().unwrap()),
                     allocation
@@ -9091,6 +9231,66 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn pdf_rerender_identity_moves_with_pending_and_does_not_cancel_sibling() {
+        use std::sync::{Arc, atomic::Ordering};
+        let mut app = crate::app::setup_app_for_test();
+        let main_path = app.tmp.path().join("main-rerender.pdf");
+        let other_path = app.tmp.path().join("other-rerender.pdf");
+        app.items.push(GridItem::PdfPage {
+            pdf_path: main_path,
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+        });
+        let probe = crate::app::PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender_at_target(0, 1702, true);
+        let main = Arc::clone(&app.fs_pending.get(&0).unwrap().cancel);
+        let main_source = app.metadata_cache_key(0).unwrap();
+        let mut parked = ViewerContextBundle::empty();
+        parked.items.push(GridItem::PdfPage {
+            pdf_path: other_path,
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+        });
+        app.swap_viewer_context_bundle(&mut parked);
+        app.request_pdf_rerender_at_target(0, 1702, true);
+        let other = Arc::clone(&app.fs_pending.get(&0).unwrap().cancel);
+        let other_source = app.metadata_cache_key(0).unwrap();
+        assert_ne!(main_source, other_source);
+        app.swap_viewer_context_bundle(&mut parked);
+        for _ in 0..8 {
+            app.request_pdf_rerender_at_target(0, 1702, true);
+        }
+        assert_eq!(probe.take_requests(), vec![(0, 1702), (0, 1702)]);
+        assert_eq!(
+            app.fs_pending
+                .get(&0)
+                .unwrap()
+                .pdf_rerender
+                .as_ref()
+                .unwrap()
+                .source,
+            main_source
+        );
+        assert_eq!(
+            parked
+                .fs_pending
+                .get(&0)
+                .unwrap()
+                .pdf_rerender
+                .as_ref()
+                .unwrap()
+                .source,
+            other_source
+        );
+        assert!(!main.load(Ordering::Relaxed));
+        assert!(!other.load(Ordering::Relaxed));
+        drop(parked);
+        assert!(other.load(Ordering::Relaxed));
+        assert!(!main.load(Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn specified_pdf_metadata_and_demand_move_with_the_owning_bundle() {
         let mut app = crate::app::setup_app_for_test();
         let main_path = app.tmp.path().join("main.pdf");
@@ -9347,7 +9547,7 @@ mod tests {
         assert_eq!(app.last_viewer_sync_stamp, None);
         assert!(!app.fs_open_intent_from_grid);
         assert!(!app.pending_auto_fs_open);
-        assert!(!app.pending_return_to_parent);
+        assert!(!app.pending_return_to_parent.is_pending());
         assert_eq!(app.pdf_prefetch_grace_until, None);
     }
 

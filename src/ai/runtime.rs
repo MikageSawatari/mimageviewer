@@ -950,10 +950,8 @@ mod tests {
         if let Some(case) = std::env::var_os(CHILD_ENV) {
             match case.to_string_lossy().as_ref() {
                 "missing" => {
-                    let missing = std::env::temp_dir().join(format!(
-                        "miv-missing-onnxruntime-{}.dll",
-                        std::process::id()
-                    ));
+                    let temp = tempfile::tempdir().unwrap();
+                    let missing = temp.path().join("missing-onnxruntime.dll");
                     let error = match ort::init_from(&missing) {
                         Ok(_) => panic!("missing DLL must fail"),
                         Err(error) => error,

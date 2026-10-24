@@ -10,7 +10,11 @@ mod clock_tests;
 #[cfg(test)]
 mod cover_tests;
 #[cfg(test)]
+mod coverage_lifecycle_tests;
+#[cfg(test)]
 mod draw_submit_tests;
+#[cfg(test)]
+mod final_prepare_tests;
 #[cfg(test)]
 mod input_regression_tests;
 #[cfg(test)]
@@ -124,7 +128,7 @@ struct PointerPresses {
 
 fn observe_pointer_transaction(ctx: &egui::Context) {
     let viewport = ctx.viewport_id();
-    let id = egui::Id::new(("page_turn_pointer_transaction", viewport));
+    let id = egui::Id::unique(("page_turn_pointer_transaction", viewport));
     let frame = ctx.cumulative_frame_nr();
     if ctx
         .data(|d| d.get_temp::<PointerTransaction>(id))
@@ -134,7 +138,7 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
     }
     let mut facts = Vec::new();
     let batch = next_operation_batch();
-    let press_id = egui::Id::new(("page_turn_pointer_presses", viewport));
+    let press_id = egui::Id::unique(("page_turn_pointer_presses", viewport));
     let mut presses = ctx
         .data(|d| d.get_temp::<PointerPresses>(press_id))
         .unwrap_or_default();
@@ -245,7 +249,7 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
 }
 
 pub(crate) fn install(ctx: &egui::Context) {
-    let id = egui::Id::new("page_turn_pointer_tracking_installed");
+    let id = egui::Id::unique("page_turn_pointer_tracking_installed");
     if ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false) {
         return;
     }
@@ -255,7 +259,7 @@ pub(crate) fn install(ctx: &egui::Context) {
         "page_turn_pointer_tracking",
         Arc::new(|ctx| {
             if ctx
-                .data(|d| d.get_temp::<bool>(egui::Id::new("page_turn_input_enabled")))
+                .data(|d| d.get_temp::<bool>(egui::Id::unique("page_turn_input_enabled")))
                 .unwrap_or(false)
             {
                 observe_pointer_transaction(ctx);
@@ -531,10 +535,12 @@ impl egui::Plugin for SubmissionPlugin {
     fn debug_name(&self) -> &'static str {
         "page_turn_submitted_output"
     }
-    fn on_begin_pass(&mut self, ctx: &egui::Context) {
+    fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx();
         self.pending.remove(&ctx.viewport_id());
     }
-    fn on_end_pass(&mut self, ctx: &egui::Context) {
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx();
         let viewport = ctx.viewport_id();
         self.output = Some((
             viewport,
@@ -542,7 +548,7 @@ impl egui::Plugin for SubmissionPlugin {
             ctx.options(|o| o.max_passes.get()),
         ));
     }
-    fn output_hook(&mut self, output: &mut egui::FullOutput) {
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
         let Some((viewport, pending, max_passes)) = self.output.take() else {
             return;
         };
@@ -886,6 +892,7 @@ impl PaintedUnit {
                     && a.resource.paint_texture_id() == b.resource.paint_texture_id()
                     && a.resource.source_generation() == b.resource.source_generation()
                     && a.resource.visible_source_uv_rect() == b.resource.visible_source_uv_rect()
+                    && a.resource.source_coverage() == b.resource.source_coverage()
                     && a.transform.paint_quad() == b.transform.paint_quad()
                     && a.transform.uv_rect == b.transform.uv_rect
                     && a.transform.fit_input == b.transform.fit_input
@@ -963,7 +970,9 @@ fn page_turn_pin_limit(budget: crate::vram_budget::VramPoolBudget) -> u64 {
 fn page_turn_budget(app: &App, ctx: &egui::Context) -> crate::vram_budget::VramPoolBudget {
     #[cfg(test)]
     if let Some(budget) = ctx.data(|data| {
-        data.get_temp::<crate::vram_budget::VramPoolBudget>(egui::Id::new("page_turn_test_budget"))
+        data.get_temp::<crate::vram_budget::VramPoolBudget>(egui::Id::unique(
+            "page_turn_test_budget",
+        ))
     }) {
         return budget;
     }
@@ -1420,6 +1429,126 @@ pub(crate) fn take_test_events() -> Vec<(ViewerOperationFact, &'static str, &'st
 }
 
 impl App {
+    #[cfg(test)]
+    pub(crate) fn page_turn_gpu_fingerprint_for_test(&self) -> String {
+        let unit = |unit: &Arc<PaintedUnit>| {
+            format!(
+                "{:p}:{}:{}",
+                Arc::as_ptr(unit),
+                unit.reserved_bytes.load(Ordering::Relaxed),
+                unit.material_diagnostics()
+            )
+        };
+        let state = match &self.page_turn_presentation.state {
+            PresentationState::Inactive => "inactive".to_owned(),
+            PresentationState::Flat(u) => format!("flat:{}", unit(u)),
+            PresentationState::Offered { outgoing, offer } => format!(
+                "offered:{}:{:p}:{:p}",
+                unit(outgoing),
+                Arc::as_ptr(&offer.ready_sources),
+                Arc::as_ptr(&offer.submission)
+            ),
+            PresentationState::Turning {
+                outgoing,
+                incoming,
+                offer,
+                ..
+            } => format!(
+                "turning:{}:{}:{:p}:{:p}",
+                unit(outgoing),
+                unit(incoming),
+                Arc::as_ptr(&offer.ready_sources),
+                Arc::as_ptr(&offer.submission)
+            ),
+            PresentationState::Completing {
+                incoming,
+                completion,
+                diagnostics,
+                ..
+            } => {
+                let receipt = match completion {
+                    FlatCompletion::NeedFlat => "need".to_owned(),
+                    FlatCompletion::Submitted(r) => format!(
+                        "{}:{}:{}:{:?}",
+                        r.frame,
+                        r.pass,
+                        r.was_accepted(),
+                        r.pages()
+                    ),
+                };
+                format!(
+                    "completing:{}:{}:{:p}",
+                    unit(incoming),
+                    receipt,
+                    Arc::as_ptr(&diagnostics.tracker)
+                )
+            }
+        };
+        format!(
+            "{}:leases={}",
+            state,
+            self.page_turn_leases.reserved_bytes()
+        )
+    }
+
+    /// Existing accepted output, never CPU readiness or a newly registered
+    /// texture, authorizes background work for the following unit.
+    pub(crate) fn page_turn_current_unit_presented(&self) -> bool {
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Flat(unit) if unit.evidence.was_accepted() => unit,
+            PresentationState::Turning {
+                incoming,
+                clock: MotionClock::Running { .. },
+                ..
+            } => incoming,
+            PresentationState::Completing { incoming, .. } if incoming.evidence.was_accepted() => {
+                incoming
+            }
+            _ => return false,
+        };
+        unit.destination == self.page_turn_destination()
+            && unit.items == self.items_generation
+            && unit.mode == self.spread_mode
+            && unit.slice == self.fullscreen_page_slice
+            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+            && self.fullscreen_idx.is_some_and(|idx| {
+                unit.pages
+                    .iter()
+                    .any(|page| page.occurrence.navigation_anchor_idx == idx)
+            })
+    }
+
+    /// Accepted output evidence is independent of current cache quality. Match
+    /// the exact held occurrence/source/paint and binding before final publication.
+    pub(super) fn page_turn_receipt_matches_held(&self, receipt: &SubmittedUnitReceipt) -> bool {
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Turning { incoming: unit, .. }
+            | PresentationState::Completing { incoming: unit, .. } => unit,
+            _ => return false,
+        };
+        receipt.was_accepted()
+            && receipt.has_presentation_binding()
+            && receipt.content_matches(self)
+            && receipt.destination() == self.page_turn_destination()
+            && unit.destination == receipt.destination()
+            && unit.items == self.items_generation
+            && unit.mode == self.spread_mode
+            && unit.slice == self.fullscreen_page_slice
+            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+            && unit.pages.len() == receipt.pages().len()
+            && unit.pages.iter().all(|page| {
+                receipt
+                    .pages()
+                    .iter()
+                    .any(|(occurrence, source, paint, area)| {
+                        *occurrence == page.occurrence
+                            && *source == page.resource.source_texture_id()
+                            && *paint == page.resource.paint_texture_id()
+                            && *area > 0.0
+                    })
+            })
+    }
+
     /// Preferences and HUD adopt the same global setting before any next turn.
     pub(crate) fn adopt_page_turn_animation_settings(&mut self, enabled: bool, duration_ms: u32) {
         if self.settings.page_turn_animation_enabled != enabled
@@ -1433,16 +1562,17 @@ impl App {
     }
 
     pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
+        self.service_final_prepare_before_lookup(ctx);
         self.flush_submitted_page_turn_ready(ctx);
         if !self.settings.page_turn_animation_enabled && !self.page_turn_completion_active() {
-            let enabled_id = egui::Id::new("page_turn_input_enabled");
+            let enabled_id = egui::Id::unique("page_turn_input_enabled");
             if ctx.data(|d| d.get_temp::<bool>(enabled_id)) == Some(true) {
                 ctx.data_mut(|d| d.insert_temp(enabled_id, false));
             }
             self.page_turn_presentation.deactivate("disabled");
             return;
         }
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
         // The ordinary key handler resolves this same pass owner. Resolve it
         // before observing its immutable edges too: an absent cached owner is
         // deliberately fail-closed, not evidence that this pass blocks keys.
@@ -1482,9 +1612,9 @@ impl App {
         if key_admission_blocked {
             facts.clear();
         }
-        let id = egui::Id::new(("page_turn_pointer_transaction", source));
+        let id = egui::Id::unique(("page_turn_pointer_transaction", source));
         if let Some(mut transaction) = ctx.data(|d| d.get_temp::<PointerTransaction>(id)) {
-            let press_id = egui::Id::new(("page_turn_pointer_presses", source));
+            let press_id = egui::Id::unique(("page_turn_pointer_presses", source));
             let mut presses = ctx
                 .data(|d| d.get_temp::<PointerPresses>(press_id))
                 .unwrap_or_default();
@@ -1559,7 +1689,7 @@ impl App {
         let mut facts = Vec::with_capacity(operations.len());
         for &(operation_id, phase, cause) in operations {
             if let ViewerOperationId::Pad { batch, .. } = operation_id {
-                let id = egui::Id::new("page_turn_pad_destination");
+                let id = egui::Id::unique("page_turn_pad_destination");
                 let original = ctx.data(|d| d.get_temp::<(u64, PresentationDestination)>(id));
                 if original.is_some_and(|(old_batch, d)| old_batch == batch && d != destination) {
                     continue;
@@ -1569,7 +1699,7 @@ impl App {
                 }
             }
             if let ViewerOperationId::Slideshow(batch) = operation_id {
-                let id = egui::Id::new("page_turn_slideshow_ingress");
+                let id = egui::Id::unique("page_turn_slideshow_ingress");
                 if ctx.data(|d| d.get_temp::<u64>(id)) != Some(batch) {
                     crate::key_input::trace_page_turn_operation_ingress(
                         || format!("{operation_id:?}"),
@@ -1724,7 +1854,12 @@ impl App {
 
     /// Resident-only counterpart of ordinary processed + fallback selection.
     /// Incomplete final output is displayable; this never invokes a producer.
-    fn page_turn_resident_source(&self, idx: usize) -> Option<(egui::TextureHandle, &'static str)> {
+    fn page_turn_resident_source(
+        &self,
+        idx: usize,
+    ) -> Option<(FullscreenPaintResource, &'static str)> {
+        #[cfg(test)]
+        crate::app::final_prepare_tests::observe_lookup(self);
         let edit_key = self.current_edit_result_key(idx);
         let final_entry = self
             .final_composite_cache
@@ -1740,7 +1875,7 @@ impl App {
             })
             .map(|(_, entry)| entry);
         let selected = if self.raw_development_blocked(idx) {
-            self.resolve_original_preview_tex(idx)
+            self.resolve_original_preview_material(idx)
                 .map(|t| (t, "preview"))
         } else if let Some(entry) = final_entry {
             let comic = self.comic_cache.get(&idx).filter(|comic| {
@@ -1750,10 +1885,23 @@ impl App {
                     && Arc::ptr_eq(&comic.base, &entry.pixels)
             });
             if let Some(comic) = comic {
-                Some((comic.texture.clone(), "comic"))
+                Some((
+                    self.fs_resource_for_accepted_texture(
+                        idx,
+                        comic.texture.clone(),
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        comic.display_basis,
+                    ),
+                    "comic",
+                ))
             } else {
                 Some((
-                    entry.texture.clone(),
+                    self.fs_resource_for_accepted_texture(
+                        idx,
+                        entry.texture.clone(),
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        entry.display_basis,
+                    ),
                     if entry.complete {
                         "final"
                     } else {
@@ -1764,10 +1912,10 @@ impl App {
         } else if self.colorize_display_requires_final_effect(idx) {
             // Ordinary waiting display also uses a faithful catalog rendition.
             // Never create the rendition at acceptance.
-            self.cached_passthrough_rendition(idx)
+            self.cached_passthrough_material(idx)
                 .map(|t| (t, "faithful_preview"))
         } else {
-            self.resolve_original_preview_tex(idx)
+            self.resolve_original_preview_material(idx)
                 .map(|t| {
                     let quality = if matches!(
                         self.fs_cache.get(&idx),
@@ -1780,18 +1928,19 @@ impl App {
                     (t, quality)
                 })
                 .or_else(|| {
-                    self.fs_thumbnail_texture_for_display(idx)
+                    self.fs_thumbnail_resource_for_display(idx)
+                        .ok()
                         .map(|t| (t, "thumbnail"))
                 })
         }?;
-        self.display_texture_matches_page(&selected.0, idx)
+        self.display_texture_matches_page(selected.0.source_texture(), idx)
             .then_some(selected)
     }
 
     #[cfg(test)]
     fn page_turn_normal_ready_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
         self.page_turn_resident_source(idx)
-            .map(|(texture, _)| texture)
+            .map(|(resource, _)| resource.source_texture().clone())
     }
 
     /// The immutable accepted source owns the turn until its canonical flat is
@@ -1942,7 +2091,26 @@ impl App {
             return true;
         }
         resource.visible_source_uv_rect().is_none_or(|roi| {
-            canonical_roi_uv(canonical_source_uv(transform), roi, resource.size()).is_ok()
+            let Some(coverage) = resource.source_coverage().source_uv_rect() else {
+                return false;
+            };
+            let requested = coverage.intersect(transform.uv_rect);
+            if requested.width() <= 0.0 || requested.height() <= 0.0 {
+                return true;
+            }
+            let uv = [
+                requested.left_top(),
+                requested.right_top(),
+                requested.right_bottom(),
+                requested.left_bottom(),
+            ]
+            .map(|p| {
+                egui::pos2(
+                    (p.x - coverage.left()) / coverage.width(),
+                    (p.y - coverage.top()) / coverage.height(),
+                )
+            });
+            canonical_roi_uv(uv, roi, resource.size()).is_ok()
         })
     }
 
@@ -2047,13 +2215,18 @@ impl App {
             emit(&fact, "skip", reason, &[]);
             return;
         }
+        let material_view = if occurrences.len() == 2 {
+            crate::material_display_basis::MaterialDisplayView::Spread
+        } else {
+            crate::material_display_basis::MaterialDisplayView::Single
+        };
         let mut ready_sources = Vec::with_capacity(occurrences.len());
         for occurrence in occurrences {
             if !self.page_turn_view_eligible(occurrence.idx) {
                 emit(&fact, "skip", "ineligible_companion", &[]);
                 return;
             }
-            let Some((texture, quality)) = self.page_turn_resident_source(occurrence.idx) else {
+            let Some((resource, quality)) = self.page_turn_resident_source(occurrence.idx) else {
                 emit(
                     &fact,
                     "skip",
@@ -2076,9 +2249,29 @@ impl App {
             let source_mipmapped = ctx
                 .tex_manager()
                 .read()
-                .meta(texture.id())
+                .meta(resource.source_texture_id())
                 .is_some_and(|meta| meta.options.mipmap_mode.is_some());
-            let resource = self.fullscreen_paint_payload_for_texture(occurrence.idx, texture);
+            let resource = self.fullscreen_paint_payload_for_resource(occurrence.idx, resource);
+            // A held source must be drawable under the current fit policy. In
+            // particular, legacy thumbnails may have a usable sampler but lack
+            // the source/PDF metadata required by Specified Scale. Reject before
+            // pinning so later producer metadata can become the ordinary source.
+            if let Err(reason) = self.fs_material_fit_input(
+                self.effective_fullscreen_fit_mode(),
+                &resource,
+                material_view,
+            ) {
+                emit(
+                    &fact,
+                    "skip",
+                    "fit_basis_unavailable",
+                    &[
+                        ("idx", occurrence.idx.into()),
+                        ("basis_unavailable", format!("{reason:?}").into()),
+                    ],
+                );
+                return;
+            }
             ready_sources.push(AcceptedSource {
                 occurrence,
                 resource,
@@ -2092,7 +2285,10 @@ impl App {
             &fact,
             "opportunity",
             "ready_at_accept",
-            &[("target", target.into())],
+            &[
+                ("target", target.into()),
+                ("resolved_forward", forward.into()),
+            ],
         );
         let old = std::mem::replace(
             &mut self.page_turn_presentation.state,
@@ -2217,6 +2413,7 @@ impl App {
                 ("incoming_inputs", ready_sources.diagnostics()),
             ],
         );
+        self.note_page_turn_gpu_activity();
         self.page_turn_presentation.state = PresentationState::Offered {
             outgoing,
             offer: AcceptedOffer {
@@ -2723,6 +2920,9 @@ impl App {
             }
             self.record_page_turn_completion_flat(&receipt);
         }
+        if curl {
+            self.note_page_turn_gpu_activity();
+        }
         queue_submission(ctx, receipt.clone(), submission_event);
         Some(receipt)
     }
@@ -2851,20 +3051,8 @@ pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
         &page.painter,
         &page.resource,
     );
-    if let Some(roi) = page.resource.visible_source_uv_rect() {
-        page.transform.paint_texture_source_region(
-            &page.painter,
-            page.resource.paint_texture_id(),
-            roi,
-            egui::Color32::WHITE,
-        );
-    } else {
-        page.transform.paint_texture(
-            &page.painter,
-            page.resource.paint_texture_id(),
-            egui::Color32::WHITE,
-        );
-    }
+    page.resource
+        .paint_texture(&page.transform, &page.painter, egui::Color32::WHITE);
     #[cfg(all(windows, feature = "test-script"))]
     crate::test_script::record_drawn_paint(
         &page.painter,
@@ -3166,20 +3354,7 @@ fn canonical_unit(
             return Err("free_rotation");
         }
         let quad = page.transform.paint_quad();
-        let uv = canonical_source_uv(&page.transform);
-        let material = if let Some(roi) = page.resource.visible_source_uv_rect() {
-            PageMaterial::Texture {
-                texture_id: page.resource.paint_texture_id(),
-                uv: canonical_roi_uv(uv, roi, page.resource.size())?,
-                available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            }
-        } else {
-            PageMaterial::Texture {
-                texture_id: page.resource.paint_texture_id(),
-                uv,
-                available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            }
-        };
+        let material = canonical_page_material(page)?;
         let underlay = match &page.underlay {
             FsBgStyle::Solid(color) => PageMaterial::Blank { color: *color },
             FsBgStyle::Checker(tex) => PageMaterial::Texture {
@@ -3302,6 +3477,108 @@ fn canonical_unit(
         normalize_spread_window(canonical, window).map_err(|e| e.sub_check())
     } else {
         Ok(canonical)
+    }
+}
+
+fn canonical_page_material(
+    page: &PreparedPagedPage,
+) -> Result<crate::page_turn_animation::PageMaterial, &'static str> {
+    use crate::page_turn_animation::PageMaterial;
+    let coverage = page
+        .resource
+        .source_coverage()
+        .source_uv_rect()
+        .ok_or("unknown_source_coverage")?;
+    let unit = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    if coverage == unit {
+        let uv = canonical_source_uv(&page.transform);
+        return Ok(PageMaterial::Texture {
+            texture_id: page.resource.paint_texture_id(),
+            uv: if let Some(roi) = page.resource.visible_source_uv_rect() {
+                canonical_roi_uv(uv, roi, page.resource.size())?
+            } else {
+                uv
+            },
+            available_uv: unit,
+        });
+    }
+    let requested = coverage.intersect(page.transform.uv_rect);
+    // The page/underlay still constitute a presented leaf when no source
+    // pixels are available for its display request. Do not make it Vacant.
+    if requested.width() <= 0.0 || requested.height() <= 0.0 {
+        return Ok(PageMaterial::Blank {
+            color: egui::Color32::TRANSPARENT,
+        });
+    }
+    let roi = page.resource.visible_source_uv_rect();
+    if let Some(roi) = roi {
+        // Native ROI must cover all requested material. Partial source
+        // provenance is intentional; an incomplete prepared ROI remains an error.
+        let sampler_uv = [
+            requested.left_top(),
+            requested.right_top(),
+            requested.right_bottom(),
+            requested.left_bottom(),
+        ]
+        .map(|p| {
+            egui::pos2(
+                (p.x - coverage.min.x) / coverage.width(),
+                (p.y - coverage.min.y) / coverage.height(),
+            )
+        });
+        canonical_roi_uv(sampler_uv, roi, page.resource.size())?;
+    }
+    let Some(material) = page.transform.material_quad(coverage, roi) else {
+        return Ok(PageMaterial::Blank {
+            color: egui::Color32::TRANSPARENT,
+        });
+    };
+    let material_rect = material
+        .positions
+        .iter()
+        .fold(egui::Rect::NOTHING, |rect, p| {
+            rect.union(egui::Rect::from_min_max(*p, *p))
+        });
+    // The pure helper's vertices follow source-axis order. Canonical materials
+    // follow screen-axis order so all four saved quarter rotations are retained.
+    let uv = [
+        material_rect.left_top(),
+        material_rect.right_top(),
+        material_rect.right_bottom(),
+        material_rect.left_bottom(),
+    ]
+    .map(|corner| {
+        let index = material
+            .positions
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.distance_sq(corner).total_cmp(&b.distance_sq(corner)))
+            .unwrap()
+            .0;
+        material.uv[index]
+    });
+    let full = page.transform.paint_rect;
+    if material_rect == full {
+        Ok(PageMaterial::Texture {
+            texture_id: page.resource.paint_texture_id(),
+            uv,
+            available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        })
+    } else {
+        Ok(PageMaterial::PartialTexture {
+            texture_id: page.resource.paint_texture_id(),
+            uv,
+            domain: egui::Rect::from_min_max(
+                egui::pos2(
+                    (material_rect.left() - full.left()) / full.width(),
+                    (material_rect.top() - full.top()) / full.height(),
+                ),
+                egui::pos2(
+                    (material_rect.right() - full.left()) / full.width(),
+                    (material_rect.bottom() - full.top()) / full.height(),
+                ),
+            ),
+        })
     }
 }
 
@@ -3479,6 +3756,138 @@ mod tests {
             evidence: AcceptanceEvidence::Immediate,
             content: Vec::new(),
         })
+    }
+
+    #[test]
+    fn source_coverage_canonical_keeps_page_underlay_and_animation_in_all_rotations() {
+        use crate::displayed_image_transform::*;
+        use crate::page_turn_animation::*;
+        use crate::rotation_db::Rotation;
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "coverage-turn",
+            egui::ColorImage::filled([16, 24], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let coverage = crate::source_coverage::SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(32, 32),
+                (32, 32),
+                (8, 4, 16, 24),
+            )
+            .unwrap(),
+        );
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            for empty in [false, true] {
+                let mut painted = unit(&ctx, texture.clone(), 1);
+                let page = &mut Arc::get_mut(&mut painted).unwrap().pages[0];
+                let resource = FullscreenPaintResource::resampleable(
+                    0,
+                    texture.clone(),
+                    crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 1, input: 0 },
+                )
+                .with_source_coverage(coverage);
+                page.resource = resource.into();
+                let frame = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 320.0));
+                page.painter = ctx.debug_painter().with_clip_rect(frame);
+                page.transform = DisplayedImageTransform::from_resolved_rect(
+                    DisplayedImageTransformInput {
+                        page_idx: 0,
+                        viewport_rect: frame,
+                        source_size: egui::vec2(32.0, 32.0),
+                        texture_size: page.resource.full_source_size_vec2(),
+                        rotation,
+                        free_rotation_rad: 0.0,
+                        content_bbox: empty.then(|| {
+                            egui::Rect::from_min_max(egui::pos2(0.8, 0.0), egui::pos2(1.0, 1.0))
+                        }),
+                        fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                        fit_scale_limits: FullscreenFitScaleLimits::default(),
+                        pixels_per_point: 1.375,
+                        placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                        pixel_fit: RectPixelFit::Proportional,
+                    },
+                    frame,
+                )
+                .unwrap();
+                let expected_frame = page.transform.paint_rect;
+                let canonical = canonical_unit(&painted).unwrap();
+                assert_eq!(canonical.pages[0].rect, expected_frame);
+                assert!(canonical.pages[0].underlay.is_some());
+                assert!(canonical.pages[0].occurrence.is_some());
+                if empty {
+                    assert!(
+                        matches!(canonical.pages[0].material, PageMaterial::Blank { color } if color == egui::Color32::TRANSPARENT)
+                    );
+                } else {
+                    let PageMaterial::PartialTexture { domain, uv, .. } =
+                        &canonical.pages[0].material
+                    else {
+                        panic!("partial material expected");
+                    };
+                    assert!(domain.width() < 1.0 && domain.height() < 1.0);
+                    assert!(uv.iter().all(|p| {
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+                            .contains(*p)
+                    }));
+                }
+                let receipt = flat_receipt(destination(1), &ctx, &painted.pages, true);
+                assert_eq!(receipt.pages().len(), 1);
+                for forward in [false, true] {
+                    let direction = TurnDirection {
+                        reading_rtl: false,
+                        forward,
+                    };
+                    let recipe = prepare_turn(&canonical, &canonical, direction).unwrap();
+                    let final_projection =
+                        project_prepared(&canonical, &canonical, direction, recipe, 1.0, false)
+                            .unwrap();
+                    assert!(
+                        final_projection.finished,
+                        "empty material still completes navigation"
+                    );
+                    assert!(!final_projection.visibility.incoming.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_coverage_does_not_relax_incomplete_native_roi_rejection() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "coverage-incomplete-native",
+            egui::ColorImage::filled([16, 24], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut painted = unit(&ctx, texture.clone(), 1);
+        let coverage = crate::source_coverage::SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(32, 32),
+                (32, 32),
+                (8, 4, 16, 24),
+            )
+            .unwrap(),
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            texture,
+            crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        Arc::get_mut(&mut painted).unwrap().pages[0].resource =
+            crate::gpu_lanczos::test_native_resource_with_region(
+                resource,
+                [16, 24],
+                egui::Rect::from_min_max(egui::pos2(0.1, 0.1), egui::pos2(0.9, 0.9)),
+            )
+            .into();
+        assert_eq!(canonical_unit(&painted).unwrap_err(), "partial_roi");
     }
 
     #[test]
@@ -3751,13 +4160,15 @@ mod tests {
             pos: egui::pos2(30.0, 40.0),
             force: None,
         };
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![touch(egui::TouchPhase::Start)],
-                ..Default::default()
-            },
-            |ctx| app.page_turn_pre_draw(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![touch(egui::TouchPhase::Start)],
+                    ..Default::default()
+                },
+                |ctx| app.page_turn_pre_draw(ctx),
+            )
+            .drop_without_applying_deltas();
         let start = app
             .page_turn_presentation
             .transaction
@@ -3766,13 +4177,15 @@ mod tests {
             .find(|f| f.cause == "touch")
             .copied()
             .unwrap();
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![touch(egui::TouchPhase::End)],
-                ..Default::default()
-            },
-            |ctx| app.page_turn_pre_draw(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![touch(egui::TouchPhase::End)],
+                    ..Default::default()
+                },
+                |ctx| app.page_turn_pre_draw(ctx),
+            )
+            .drop_without_applying_deltas();
         let end = app
             .page_turn_presentation
             .transaction
@@ -3783,13 +4196,15 @@ mod tests {
             .unwrap();
         assert!(same_operation(&start, &end));
         assert_eq!(start.destination, end.destination);
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![touch(egui::TouchPhase::End)],
-                ..Default::default()
-            },
-            |ctx| app.page_turn_pre_draw(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![touch(egui::TouchPhase::End)],
+                    ..Default::default()
+                },
+                |ctx| app.page_turn_pre_draw(ctx),
+            )
+            .drop_without_applying_deltas();
         assert!(
             !app.page_turn_presentation
                 .transaction
@@ -3817,38 +4232,105 @@ mod tests {
         install(&ctx);
         let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         let mut receipts = Vec::new();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let proof = receipt(ctx, 1);
-            queue_submission(
-                ctx,
-                proof.clone(),
-                Some(event(&tracker, SubmissionKind::Curl)),
-            );
-            receipts.push(proof);
-            if ctx.current_pass_index() == 0 {
-                ctx.request_discard("test replay");
-            }
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                let proof = receipt(ctx, 1);
+                queue_submission(
+                    ctx,
+                    proof.clone(),
+                    Some(event(&tracker, SubmissionKind::Curl)),
+                );
+                receipts.push(proof);
+                if ctx.current_pass_index() == 0 {
+                    ctx.request_discard("test replay");
+                }
+            })
+            .drop_without_applying_deltas();
         assert_eq!(receipts.len(), 2);
         assert!(!receipts[0].was_accepted());
         assert!(receipts[1].was_accepted());
         assert_eq!(tracker.status(), SubmissionStatus::Started);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(
-                ctx,
-                receipt(ctx, 1),
-                Some(event(&tracker, SubmissionKind::Canonical)),
-            )
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(
+                    ctx,
+                    receipt(ctx, 1),
+                    Some(event(&tracker, SubmissionKind::Canonical)),
+                )
+            })
+            .drop_without_applying_deltas();
         assert_eq!(tracker.status(), SubmissionStatus::Finished);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(
-                ctx,
-                receipt(ctx, 1),
-                Some(event(&tracker, SubmissionKind::Curl)),
-            )
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(
+                    ctx,
+                    receipt(ctx, 1),
+                    Some(event(&tracker, SubmissionKind::Curl)),
+                )
+            })
+            .drop_without_applying_deltas();
         assert_eq!(tracker.status(), SubmissionStatus::Finished);
+    }
+
+    #[test]
+    fn egui037_continuation_submission_plugin_discard_texture_delivery_is_not_acceptance() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        for delivery in [false, true] {
+            let ctx = egui::Context::default();
+            install(&ctx);
+            let tracker = Arc::new(SubmissionTracker::new(fact(1)));
+            let receipts = Rc::new(RefCell::new(Vec::<SubmittedUnitReceipt>::new()));
+            let deliveries = Rc::new(Cell::new(0));
+            let scope = delivery.then(|| {
+                let tracker = tracker.clone();
+                let receipts = receipts.clone();
+                let deliveries = deliveries.clone();
+                ctx.enter_discard_texture_delivery(move |mut delta| {
+                    assert!(!delta.is_empty());
+                    assert_eq!(tracker.status(), SubmissionStatus::Offered);
+                    assert!(
+                        receipts
+                            .borrow()
+                            .iter()
+                            .all(|receipt| !receipt.was_accepted())
+                    );
+                    deliveries.set(deliveries.get() + 1);
+                    delta.clear(); // Explicit headless consumer; no renderer/present occurs.
+                })
+            });
+            let texture = ctx.load_texture(
+                "submission-delta",
+                egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+                Default::default(),
+            );
+            let output = ctx.run_ui(Default::default(), |ui| {
+                let proof = receipt(ui.ctx(), 1);
+                queue_submission(
+                    ui.ctx(),
+                    proof.clone(),
+                    Some(event(&tracker, SubmissionKind::Curl)),
+                );
+                receipts.borrow_mut().push(proof);
+                if ui.ctx().current_pass_index() == 0 {
+                    ui.ctx().request_discard("submission delivery regression");
+                }
+            });
+            assert_eq!(deliveries.get(), usize::from(delivery));
+            let receipts = receipts.borrow();
+            assert_eq!(receipts.len(), 2);
+            assert!(!receipts[0].was_accepted());
+            assert!(receipts[1].was_accepted());
+            assert_eq!(tracker.status(), SubmissionStatus::Started);
+            assert_eq!(
+                output.textures_delta.set.contains_key(&texture.id()),
+                !delivery
+            );
+            output.drop_without_applying_deltas();
+            drop(receipts);
+            drop(scope);
+        }
     }
     #[test]
     fn discarded_canonical_completion_requires_same_actual_next_flat_output() {
@@ -3857,18 +4339,20 @@ mod tests {
             install(&ctx);
             let tracker = Arc::new(SubmissionTracker::new(fact(1)));
             tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                if ctx.current_pass_index() == 0 {
-                    queue_submission(
-                        ctx,
-                        receipt(ctx, 1),
-                        Some(event(&tracker, SubmissionKind::Canonical)),
-                    );
-                    ctx.request_discard("canonical replay");
-                } else {
-                    queue_submission(ctx, receipt(ctx, if matching { 1 } else { 2 }), None);
-                }
-            });
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    if ctx.current_pass_index() == 0 {
+                        queue_submission(
+                            ctx,
+                            receipt(ctx, 1),
+                            Some(event(&tracker, SubmissionKind::Canonical)),
+                        );
+                        ctx.request_discard("canonical replay");
+                    } else {
+                        queue_submission(ctx, receipt(ctx, if matching { 1 } else { 2 }), None);
+                    }
+                })
+                .drop_without_applying_deltas();
             assert_eq!(
                 tracker.status(),
                 if matching {
@@ -3886,22 +4370,24 @@ mod tests {
         let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
         tracker.end();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            if ctx.current_pass_index() == 0 {
-                queue_submission(
-                    ctx,
-                    receipt(ctx, 1),
-                    Some(event(&tracker, SubmissionKind::Canonical)),
-                );
-                ctx.request_discard("cancel flat replay");
-            } else {
-                let ledger = tracker.ledger.lock().unwrap();
-                assert!(!ledger.canonical_visible);
-                assert_eq!(ledger.visible_pages, 0);
-                drop(ledger);
-                queue_submission(ctx, receipt(ctx, 1), None);
-            }
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                if ctx.current_pass_index() == 0 {
+                    queue_submission(
+                        ctx,
+                        receipt(ctx, 1),
+                        Some(event(&tracker, SubmissionKind::Canonical)),
+                    );
+                    ctx.request_discard("cancel flat replay");
+                } else {
+                    let ledger = tracker.ledger.lock().unwrap();
+                    assert!(!ledger.canonical_visible);
+                    assert_eq!(ledger.visible_pages, 0);
+                    drop(ledger);
+                    queue_submission(ctx, receipt(ctx, 1), None);
+                }
+            })
+            .drop_without_applying_deltas();
         let ledger = tracker.ledger.lock().unwrap();
         assert!(ledger.canonical_visible);
         assert_eq!(ledger.visible_pages, 1);
@@ -3937,7 +4423,7 @@ mod tests {
         inventory.account(&mut accountant);
         assert_eq!(accountant.finish().total_bytes(), bytes);
         let weak = Arc::downgrade(&old);
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -3950,7 +4436,7 @@ mod tests {
                 paint_flat_page(&old.pages[0]);
                 crate::gpu_lanczos::retain_owner_for_fullscreen_paint_batch(&painter, old.clone());
             },
-        );
+        ));
         drop(old);
         assert!(weak.upgrade().is_some());
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
@@ -3974,17 +4460,21 @@ mod tests {
         let mut outgoing = unit(&ctx, texture, 1);
         let proof = receipt(&ctx, 0);
         Arc::make_mut(&mut outgoing).evidence = proof.accepted.clone();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            if ctx.current_pass_index() == 0 {
-                queue_submission(ctx, proof.clone(), None);
-                ctx.request_discard("never shown outgoing");
-            }
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                if ctx.current_pass_index() == 0 {
+                    queue_submission(ctx, proof.clone(), None);
+                    ctx.request_discard("never shown outgoing");
+                }
+            })
+            .drop_without_applying_deltas();
         assert!(!outgoing.evidence.was_accepted());
         // The runtime Offered -> Turning guard reads this exact shared proof.
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(ctx, proof.clone(), None)
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(ctx, proof.clone(), None)
+            })
+            .drop_without_applying_deltas();
         assert!(outgoing.evidence.was_accepted());
     }
 
@@ -4006,9 +4496,11 @@ mod tests {
         assert!(previous.same_material_and_geometry(&next));
         let selected = PaintedUnit::select_flat(previous, &next);
         assert!(Arc::ptr_eq(&selected, &next));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(ctx, adopted.clone(), None)
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(ctx, adopted.clone(), None)
+            })
+            .drop_without_applying_deltas();
         assert!(selected.evidence.was_accepted());
         assert!(!discarded.was_accepted());
         assert!(Arc::ptr_eq(
@@ -4119,13 +4611,16 @@ mod tests {
                 rect,
             )
             .unwrap();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                transform.paint_texture(
-                    &ctx.debug_painter(),
-                    egui::TextureId::User(19),
-                    egui::Color32::WHITE,
-                )
-            });
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput::default(),
+                |ctx| {
+                    transform.paint_texture(
+                        &ctx.debug_painter(),
+                        egui::TextureId::User(19),
+                        egui::Color32::WHITE,
+                    )
+                },
+            ));
             let mesh = output
                 .shapes
                 .iter()
@@ -4147,6 +4642,8 @@ mod tests {
             assert!(canonical_source_uv(&transform).iter().all(|uv| {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)).contains(*uv)
             }));
+
+            output.drop_without_applying_deltas();
         }
     }
     #[test]
@@ -4165,6 +4662,8 @@ mod tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(image),
                 source_dims: Some([4, 4]),
@@ -4174,18 +4673,20 @@ mod tests {
         );
         assert!(app.resolve_fs_display_tex(0, false).is_some());
         assert!(app.page_turn_normal_ready_texture(0).is_some());
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 73,
-                    ordinal: 0,
-                },
-                OperationPhase::Press,
-                "test",
-            );
-            app.offer_page_turn(ctx, 0, true);
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 73,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Press,
+                    "test",
+                );
+                app.offer_page_turn(ctx, 0, true);
+            })
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.page_turn_presentation.state,
             PresentationState::Inactive
@@ -4196,6 +4697,418 @@ mod tests {
     }
 
     #[test]
+    fn resident_source_keeps_selected_producer_basis_when_thumbnail_and_final_share_an_allocation()
+    {
+        use crate::material_display_basis::MaterialDisplayBasis;
+        use crate::source_coverage::SourceCoverage;
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "C:/material/alias.png",
+        ))];
+        let pixels = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+        let texture = ctx.load_texture(
+            "resident-shared",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails = vec![ThumbnailState::loaded_raster(
+            texture.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            12,
+            SourceCoverage::FullSource,
+            Some((6000, 9000)),
+            None,
+        )];
+        let thumbnail_basis = app
+            .fs_thumbnail_resource_for_display(0)
+            .unwrap()
+            .display_basis();
+        let (thumbnail, quality) = app.page_turn_resident_source(0).unwrap();
+        assert_eq!(quality, "thumbnail");
+        assert_eq!(thumbnail.display_basis(), thumbnail_basis);
+
+        let final_basis =
+            MaterialDisplayBasis::from_sampler(texture.size(), SourceCoverage::FullSource);
+        assert_ne!(
+            final_basis, thumbnail_basis,
+            "logical producers retain their own accepted fit facts"
+        );
+        let key = app.final_composite_key_for_pixels(
+            app.current_edit_result_key(0),
+            pixels.size,
+            app.effective_params(0),
+        );
+        app.final_composite_cache.insert(
+            key,
+            crate::app::FinalCompositeEntry {
+                display_basis: final_basis,
+                canonical_dims: None,
+                source_size: pixels.size,
+                pixels,
+                texture: texture.clone(),
+                texture_options: egui::TextureOptions::LINEAR,
+                complete: true,
+            },
+        );
+        let (selected, quality) = app.page_turn_resident_source(0).unwrap();
+        assert_eq!(quality, "final");
+        assert_eq!(selected.source_texture_id(), thumbnail.source_texture_id());
+        assert_eq!(selected.display_basis(), final_basis);
+        app.final_composite_cache.clear();
+        app.thumbnails[0] = ThumbnailState::Evicted;
+        let payload = app.fullscreen_paint_payload_for_resource(0, selected);
+        assert_eq!(
+            payload.display_basis(),
+            final_basis,
+            "accepted source remains a material through offer payload conversion"
+        );
+        assert_eq!(thumbnail.display_basis(), thumbnail_basis);
+    }
+
+    fn draw_single_with_current_fit(
+        app: &mut App,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+    ) -> SubmittedUnitReceipt {
+        let idx = app.fullscreen_idx.unwrap();
+        let decision = app.fs_page_turn_decision_for_frame(ctx, idx);
+        let composition = app.spread_display_composition_for_anchor(idx);
+        let pages = composition.pages_in_screen_order(app.spread_mode);
+        assert_eq!(pages.len(), 1);
+        let selected = app.resolve_fs_processed_material(ctx, idx, false);
+        let payload = app.fullscreen_paint_payload_for_page(idx, selected, false);
+        let thumbnail = app.fs_thumbnail_resource_for_display(idx).ok();
+        let mut sources = FsNavigatorTextureSources::default();
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Single);
+        let transform = app
+            .draw_fs_image_with_receipt(
+                ui,
+                ui.max_rect(),
+                idx,
+                app.fs_page_coordinate_source_size(idx),
+                FsPageLayoutSource::CurrentItem,
+                None,
+                None,
+                composition.singleton_placement(),
+                payload.as_ref(),
+                thumbnail.as_ref(),
+                false,
+                false,
+                false,
+                crate::rotation_db::Rotation::None,
+                None,
+                0.0,
+                &FsBgStyle::Solid(egui::Color32::WHITE),
+                "",
+                false,
+                app.effective_fullscreen_fit_mode(),
+                app.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+                None,
+                Some(&mut sources),
+                true,
+            )
+            .expect("accepted fit metadata permits ordinary drawing");
+        app.fullscreen_page_layout
+            .push_occurrence(transform, pages[0]);
+        assert!(sources.rebind_occurrences(&pages));
+        let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+            panic!("ordinary draw must submit its page-turn receipt");
+        };
+        let receipt = receipt.clone();
+        app.emit_fs_page_turn_ready_for_display_unit(ctx, &composition, decision, &sources);
+        receipt
+    }
+
+    fn specified_thumbnail_admission_app(
+        ctx: &egui::Context,
+        pdf: bool,
+    ) -> crate::app::AppTestEnvForTest {
+        use crate::ui_fullscreen::page_turn_submission_tests::ready_app;
+        install(ctx);
+        let mut app = ready_app(ctx, SpreadMode::Single);
+        // ready_app seeds samplers with its synthetic items generation. Exercise
+        // the worker receipt protocol under an actual synchronized generation.
+        let resident_sources: Vec<_> = (0..app.items.len())
+            .map(|idx| (idx, app.fs_cache.remove(&idx).unwrap()))
+            .collect();
+        app.bump_items_generation();
+        for (idx, entry) in resident_sources {
+            app.fs_cache.insert(idx, entry);
+            app.record_page_dims_for_spread(idx, (80, 120));
+        }
+        app.settings.page_turn_animation_enabled = true;
+        app.settings.page_turn_animation_duration_ms = 200;
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        app.settings.fullscreen_specified_scale = crate::settings::FullscreenSpecifiedScale {
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(1000),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                crate::settings::SpecifiedScaleAxis::LogicalPixels(100),
+            ),
+        };
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        let item_count = app.items.len();
+        app.image_metas.resize(item_count, None);
+        app.details_order = app.visible_indices.clone();
+        app.fs_cache.remove(&1).unwrap();
+        if pdf {
+            app.items[1] = GridItem::PdfPage {
+                pdf_path: app.tmp.path().join("missing-fit-metadata.pdf"),
+                page_num: 0,
+                content_type: None,
+            };
+        }
+        app.keep_range = (0, app.items.len());
+        app.keep_set.insert(1);
+        app.requested.insert(1, false);
+        // Exercise real thumbnail acceptance: a legacy catalog row lacks source
+        // dimensions; the initial PDF thumbnail has a page box but no content type.
+        let initial = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            1,
+            Some(egui::ColorImage::filled([8, 12], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            None,
+            pdf.then_some((80, 120)),
+            pdf.then_some((80_000, 120_000)),
+            false,
+            false,
+            0,
+            app.items_generation,
+        );
+        app.poll_thumbnail_result_for_test(ctx, initial);
+        app
+    }
+
+    #[test]
+    fn specified_pdf_metadata_missing_skips_pin_and_adoption_restores_canonical_ready() {
+        use crate::material_display_basis::MaterialBasisUnavailable;
+        use crate::ui_fullscreen::page_turn_submission_tests::frame;
+        let ctx = egui::Context::default();
+        let mut app = specified_thumbnail_admission_app(&ctx, true);
+        let initial = app.fs_thumbnail_resource_for_display(1).unwrap();
+        let unavailable = MaterialBasisUnavailable::PdfMetadataUnavailable;
+        assert_eq!(initial.display_basis().specified(), Err(unavailable));
+        let mut outgoing = None;
+        frame(&ctx, |ui, ctx| {
+            outgoing = Some(draw_single_with_current_fit(&mut app, ui, ctx));
+        });
+        assert!(outgoing.unwrap().was_accepted());
+        assert!(app.page_turn_current_unit_presented());
+        take_test_events();
+        let leases_before = app.page_turn_leases.sources.len();
+        let reserved_before = app.page_turn_leases.reserved_bytes();
+        frame(&ctx, |_, ctx| {
+            let operation = ViewerOperationId::Pad {
+                batch: next_operation_batch(),
+                ordinal: 0,
+            };
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 1, true, Some(operation));
+        });
+        assert!(matches!(
+            app.page_turn_presentation.state,
+            PresentationState::Flat(_)
+        ));
+        assert!(app.page_turn_held_resource(1).is_none());
+        assert_eq!(app.page_turn_leases.sources.len(), leases_before);
+        assert_eq!(app.page_turn_leases.reserved_bytes(), reserved_before);
+        let events = take_test_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, kind, reason)| *kind == "skip" && *reason == "fit_basis_unavailable")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|(_, kind, _)| *kind == "offered"));
+
+        app.fullscreen_idx = Some(1);
+        // The actual fullscreen worker result republishes the thumbnail's
+        // descriptor. The old immutable material must remain unchanged.
+        let generation = app.items_generation;
+        assert!(app.fs_upload_backlog.push_for_generation(
+            generation,
+            crate::app::FsUploadResult::new(
+                1,
+                crate::fs_animation::FsLoadResult::StaticPdf {
+                    ci: egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+                    source_dims: [80, 120],
+                    page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                        width: 80.0,
+                        height: 120.0,
+                    },
+                    content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                },
+                1,
+                crate::app::FsLoadPurpose::for_page(true),
+            ),
+        ));
+        app.poll_prefetch(&ctx, crate::app::PollPrefetchOrigin::TopLevel);
+        let adopted = app.fs_thumbnail_resource_for_display(1).unwrap();
+        assert_eq!(adopted.source_texture_id(), initial.source_texture_id());
+        assert!(adopted.display_basis().specified().is_ok());
+        assert_eq!(initial.display_basis().specified(), Err(unavailable));
+        let mut recovered = None;
+        frame(&ctx, |ui, ctx| {
+            recovered = Some(draw_single_with_current_fit(&mut app, ui, ctx));
+        });
+        let recovered = recovered.unwrap();
+        assert!(recovered.was_accepted());
+        assert!(!recovered.curl);
+        assert!(app.page_turn_current_unit_presented());
+        assert!(app.page_turn_held_resource(1).is_none());
+        frame(&ctx, |_, ctx| {
+            let operation = ViewerOperationId::Pad {
+                batch: next_operation_batch(),
+                ordinal: 0,
+            };
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 2, true, Some(operation));
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Offered { .. }
+            ));
+            assert!(app.page_turn_held_resource(2).is_some());
+        });
+    }
+
+    #[test]
+    fn specified_legacy_catalog_without_source_dimensions_completes_and_accepts_next_page() {
+        use crate::ui_fullscreen::page_turn_submission_tests::frame;
+        let origin = Instant::now();
+        let clock = super::clock_tests::TestClock::at(origin);
+        let ctx = egui::Context::default();
+        let mut app = specified_thumbnail_admission_app(&ctx, false);
+        let initial = app.fs_thumbnail_resource_for_display(1).unwrap();
+        assert!(matches!(
+            app.thumbnails[1],
+            ThumbnailState::Loaded {
+                source_dims: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            initial.display_basis().specified().unwrap(),
+            crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                egui::vec2(8.0, 12.0),
+                egui::vec2(8.0, 12.0),
+            )
+            .unwrap(),
+            "the accepted legacy row keeps its released sampler stand-in basis",
+        );
+        frame(&ctx, |ui, ctx| {
+            draw_single_with_current_fit(&mut app, ui, ctx);
+        });
+        assert!(app.page_turn_current_unit_presented());
+        take_test_events();
+        let operation = ViewerOperationId::Pad {
+            batch: next_operation_batch(),
+            ordinal: 0,
+        };
+        let mut first = None;
+        frame(&ctx, |ui, ctx| {
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 1, true, Some(operation));
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Offered { .. }
+            ));
+            let held = app.page_turn_held_resource(1).unwrap();
+            assert_eq!(held.source_texture_id(), initial.source_texture_id());
+            assert_eq!(held.display_basis(), initial.display_basis());
+            app.fullscreen_idx = Some(1);
+            let receipt = draw_single_with_current_fit(&mut app, ui, ctx);
+            assert!(receipt.curl);
+            assert!(!receipt.was_accepted());
+            first = Some(receipt);
+        });
+        assert!(first.unwrap().was_accepted());
+        let tracker = match &app.page_turn_presentation.state {
+            PresentationState::Turning { offer, .. } => offer.submission.clone(),
+            _ => panic!("legacy catalog material must enter the ordinary turn"),
+        };
+        assert_eq!(tracker.status(), SubmissionStatus::Started);
+        clock.set(tracker.started_at().unwrap() + Duration::from_secs(1));
+        let mut flat = None;
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let receipt = draw_single_with_current_fit(&mut app, ui, ctx);
+            assert!(!receipt.curl);
+            flat = Some(receipt);
+        });
+        assert!(flat.unwrap().was_accepted());
+        assert_eq!(tracker.status(), SubmissionStatus::Finished);
+        let mut next_receipt = None;
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(app.page_turn_current_unit_presented());
+            assert!(!app.page_turn_barrier_active());
+            assert!(!app.fs_navigation_sequence_blocks_new_target());
+            assert!(app.pending_fs_page_turn_ready.is_none());
+            let next = ViewerOperationId::Pad {
+                batch: next_operation_batch(),
+                ordinal: 0,
+            };
+            app.page_turn_external_operation(ctx, next, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 2, true, Some(next));
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Offered { .. }
+            ));
+            assert!(app.page_turn_held_resource(2).is_some());
+            app.fullscreen_idx = Some(2);
+            let receipt = draw_single_with_current_fit(&mut app, ui, ctx);
+            assert!(receipt.curl);
+            next_receipt = Some(receipt);
+        });
+        assert!(next_receipt.unwrap().was_accepted());
+        let next_tracker = match &app.page_turn_presentation.state {
+            PresentationState::Turning { offer, .. } => offer.submission.clone(),
+            _ => panic!("the next page must also submit its ordinary turn"),
+        };
+        clock.set(next_tracker.started_at().unwrap() + Duration::from_secs(1));
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert!(!draw_single_with_current_fit(&mut app, ui, ctx).curl);
+        });
+        assert_eq!(next_tracker.status(), SubmissionStatus::Finished);
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert!(!draw_single_with_current_fit(&mut app, ui, ctx).curl);
+            assert!(!app.page_turn_barrier_active());
+            assert!(!app.fs_navigation_sequence_blocks_new_target());
+        });
+        assert!(app.page_turn_current_unit_presented());
+        let events: Vec<_> = take_test_events()
+            .into_iter()
+            .filter(|(fact, _, _)| fact.operation_id == operation)
+            .collect();
+        for expected in ["opportunity", "offered", "start", "finish", "fully_visible"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(_, kind, _)| *kind == expected)
+                    .count(),
+                1,
+                "{expected}: {events:?}",
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|(_, kind, _)| matches!(*kind, "skip" | "cancel")),
+            "{events:?}",
+        );
+    }
+
+    #[test]
     fn source_texture_sharing_native_roi_keeps_only_output_after_all_source_owners_drop() {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
@@ -4203,9 +5116,8 @@ mod tests {
             "C:/shared/native.png",
         ))];
         let id = crate::app::source_texture_test_support::seed(&mut app, &ctx, 0);
-        let final_texture = app.ensure_final_composite_texture(&ctx, 0).unwrap();
-        assert_eq!(final_texture.id(), id);
-        let input = app.fullscreen_paint_resource_for_texture(0, final_texture);
+        let input = app.ensure_final_composite_material(&ctx, 0).unwrap();
+        assert_eq!(input.source_texture_id(), id);
         let native = crate::gpu_lanczos::test_native_resource_with_region(
             input,
             [2, 3],
@@ -4228,64 +5140,68 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.page_turn_animation_enabled = true;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 91,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "test",
-            );
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 91,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "replay_metadata",
-            );
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-        });
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operations(
-                ctx,
-                &[
-                    (
-                        ViewerOperationId::Pad {
-                            batch: 92,
-                            ordinal: 0,
-                        },
-                        OperationPhase::Press,
-                        "test",
-                    ),
-                    (
-                        ViewerOperationId::Pad {
-                            batch: 92,
-                            ordinal: 1,
-                        },
-                        OperationPhase::Press,
-                        "test",
-                    ),
-                ],
-            );
-            app.page_turn_excluded_navigation(ctx, "ambiguous");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 91,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "test",
+                );
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 91,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "replay_metadata",
+                );
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operations(
+                    ctx,
+                    &[
+                        (
+                            ViewerOperationId::Pad {
+                                batch: 92,
+                                ordinal: 0,
+                            },
+                            OperationPhase::Press,
+                            "test",
+                        ),
+                        (
+                            ViewerOperationId::Pad {
+                                batch: 92,
+                                ordinal: 1,
+                            },
+                            OperationPhase::Press,
+                            "test",
+                        ),
+                    ],
+                );
+                app.page_turn_excluded_navigation(ctx, "ambiguous");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+            })
+            .drop_without_applying_deltas();
     }
 
     #[test]
@@ -4302,77 +5218,81 @@ mod tests {
         let incoming = unit(&ctx, texture, 1);
         let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 110,
-                    ordinal: 0,
-                },
-                OperationPhase::Press,
-                "test",
-            );
-            let old_fact = app.page_turn_presentation.take_candidate().unwrap();
-            app.page_turn_presentation.state = PresentationState::Turning {
-                projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
-                clock: MotionClock::AwaitingAcceptedOutput,
-                outgoing: outgoing.clone(),
-                incoming: incoming.clone(),
-                offer: AcceptedOffer {
-                    fact: old_fact,
-                    ready_sources: Arc::new(AcceptedSources(Vec::new())),
-                    resident_bytes: 0,
-                    pin_bytes: 0,
-                    accepted_at: presentation_now(),
-                    duration: Duration::from_millis(200),
-                    forward: true,
-                    submission: tracker.clone(),
-                },
-            };
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 110,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Press,
+                    "test",
+                );
+                let old_fact = app.page_turn_presentation.take_candidate().unwrap();
+                app.page_turn_presentation.state = PresentationState::Turning {
+                    projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
+                    clock: MotionClock::AwaitingAcceptedOutput,
+                    outgoing: outgoing.clone(),
+                    incoming: incoming.clone(),
+                    offer: AcceptedOffer {
+                        fact: old_fact,
+                        ready_sources: Arc::new(AcceptedSources(Vec::new())),
+                        resident_bytes: 0,
+                        pin_bytes: 0,
+                        accepted_at: presentation_now(),
+                        duration: Duration::from_millis(200),
+                        forward: true,
+                        submission: tracker.clone(),
+                    },
+                };
+            })
+            .drop_without_applying_deltas();
         // The active turn originated in a previous frame. Distinct operations
         // in one physical frame are intentionally an ambiguous transaction.
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 111,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "test",
-            );
-            assert!(matches!(
-                app.page_turn_presentation.state,
-                PresentationState::Completing { .. }
-            ));
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Cancelled
-            );
-            assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-            assert!(app.page_turn_presentation.take_candidate().is_none());
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 111,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "replay_metadata",
-            );
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-            assert!(app.page_turn_presentation.take_candidate().is_none());
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 111,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "test",
+                );
+                assert!(matches!(
+                    app.page_turn_presentation.state,
+                    PresentationState::Completing { .. }
+                ));
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Cancelled
+                );
+                assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+                assert!(app.page_turn_presentation.take_candidate().is_none());
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 111,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "replay_metadata",
+                );
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+                assert!(app.page_turn_presentation.take_candidate().is_none());
+            })
+            .drop_without_applying_deltas();
         assert!(app.fullscreen_idx.is_none()); // Observer never navigates or queues a target.
     }
 

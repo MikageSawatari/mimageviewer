@@ -285,16 +285,17 @@ fn loaded_thumbnail(ctx: &egui::Context, label: &str) -> ThumbnailState {
         egui::ColorImage::filled([2, 3], egui::Color32::WHITE),
         egui::TextureOptions::LINEAR,
     );
-    ThumbnailState::Loaded {
-        tex: texture,
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+    ThumbnailState::loaded_raster(
+        texture,
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
             evaluated_display_px: 64,
         },
-        from_edit_preview: false,
-        rendered_at_px: 64,
-        source_dims: Some((2, 3)),
-        layout_dims: None,
-    }
+        false,
+        64,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((2, 3)),
+        None,
+    )
 }
 
 fn similar_query_hit(
@@ -422,9 +423,10 @@ fn run_root_app_update(
     frame: &mut eframe::Frame,
     input: egui::RawInput,
 ) -> egui::FullOutput {
-    ctx.run(input, |ctx| {
-        <App as eframe::App>::update(app, ctx, frame);
-    })
+    crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
+        <App as eframe::App>::logic(app, ctx, frame);
+        ctx.root_ui(|ui| <App as eframe::App>::ui(app, ui, frame));
+    }))
 }
 
 #[cfg(windows)]
@@ -485,6 +487,8 @@ fn install_embedded_update_scene(app: &mut App, ctx: &egui::Context, pages: &[Pa
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([4, 6]),

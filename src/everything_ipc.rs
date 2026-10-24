@@ -223,7 +223,7 @@ static NEXT_REPLY_ID: AtomicU32 = AtomicU32::new(1);
 fn next_reply_id() -> Result<u32, EverythingError> {
     // Never wrap: destroyed HWND reuse cannot alias any earlier run's correlation ID.
     NEXT_REPLY_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| EverythingError::RequestIdsExhausted)
 }
 

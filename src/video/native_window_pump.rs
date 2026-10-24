@@ -15,11 +15,12 @@ use super::native_cursor::{
     reduce_cursor_routing_batch,
 };
 use super::native_diagnostics::{DiagnosticSample, NativeDiagnostics};
+#[cfg(any(test, feature = "test-script"))]
+use super::native_window::NativeVideoMouseButton;
 use super::native_window::{
-    NativeCursorOwnershipEdge, NativeRaiseSample, NativeVideoMouseButton, NativeVideoTouchPhase,
-    NativeVideoWindowEvent, NativeVideoWindowEventEnvelope, NativeVideoWindowSource,
-    NativeWindowEventReceiver, NativeWindowEventRoute, native_window_event_route,
-    post_typed_pump_quit,
+    NativeCursorOwnershipEdge, NativeRaiseSample, NativeVideoTouchPhase, NativeVideoWindowEvent,
+    NativeVideoWindowEventEnvelope, NativeVideoWindowSource, NativeWindowEventReceiver,
+    NativeWindowEventRoute, native_window_event_route, post_typed_pump_quit,
 };
 use super::native_window_host::{
     NativeHudWindowRequest, NativeRenderTargetTransfer, NativeWindowHost, NativeWindowHostConfig,
@@ -216,6 +217,9 @@ enum PumpCommand {
     CursorActivity {
         epoch: u64,
     },
+    InterruptImeComposition {
+        epoch: u64,
+    },
     RenderFault {
         request: u64,
         message: String,
@@ -241,7 +245,8 @@ impl PumpCommand {
             | Self::RaisePresenter { .. }
             | Self::RaiseHud { .. }
             | Self::SetZOrderRecoveryPermit { .. }
-            | Self::CursorActivity { .. } => None,
+            | Self::CursorActivity { .. }
+            | Self::InterruptImeComposition { .. } => None,
         }
     }
 }
@@ -496,7 +501,19 @@ impl NativeWindowPumpRenderClient {
         let _ = self.send_control(PumpCommand::Shutdown { request });
     }
 
-    pub(crate) fn publish_visual(&self, update: NativeWindowVisualUpdate) {
+    pub(crate) fn publish_visual(&self, mut update: NativeWindowVisualUpdate) {
+        // One-shot commands cannot live in the replaceable visual snapshot.
+        // A failed send uses the existing channel-fault terminal, without retry.
+        update.window_intents.retain(|intent| {
+            if matches!(intent, NativeWindowIntent::InterruptImeComposition) {
+                let _ = self.send_control(PumpCommand::InterruptImeComposition {
+                    epoch: update.epoch,
+                });
+                false
+            } else {
+                true
+            }
+        });
         if let Ok(mut latest) = self.latest.visual.try_lock() {
             *latest = Some(update);
         }
@@ -971,6 +988,11 @@ impl PumpRuntime {
                         visibility: requested_visibility,
                     }))?;
                 }
+            }
+            PumpCommand::InterruptImeComposition { epoch } => {
+                apply_ime_interrupt_to_epoch(&self.hosts, WindowEpoch(epoch), |host| {
+                    host.apply_render_intents(&[NativeWindowIntent::InterruptImeComposition]);
+                });
             }
             PumpCommand::CursorActivity { epoch } => {
                 let key = WindowEpoch(epoch);
@@ -2318,6 +2340,17 @@ fn active_epoch(state: WindowHostState) -> Option<WindowEpoch> {
     }
 }
 
+// The lookup is shared with fake-host regressions; retired epochs are never retargeted.
+fn apply_ime_interrupt_to_epoch<T>(
+    hosts: &HashMap<WindowEpoch, T>,
+    epoch: WindowEpoch,
+    apply: impl FnOnce(&T),
+) {
+    if let Some(host) = hosts.get(&epoch) {
+        apply(host);
+    }
+}
+
 fn cursor_input_epoch(state: WindowHostState) -> Option<WindowEpoch> {
     match state {
         WindowHostState::Visible { host, .. } => Some(host.epoch),
@@ -2342,6 +2375,136 @@ mod tests {
         WS_POPUP,
     };
     use windows::core::w;
+
+    #[test]
+    fn native_ime_interrupt_real_focus_output_survives_visual_replacement_and_epoch_retirement() {
+        use std::cell::Cell;
+        let context = egui::Context::default();
+        let id = egui::Id::unique("native-interrupt-source");
+        let destination = egui::Id::unique("native-interrupt-destination");
+        let mut text = "日本語 sample".to_owned();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        // Prime the actual TextEdit, then move focus after it emitted its IME metadata.
+        for _ in 0..2 {
+            let output = context.run_ui(raw(), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(id))
+                    .request_focus();
+            });
+            crate::egui_output::discard_headless_output(output);
+        }
+        let output = context.run_ui(raw(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut text).id(id));
+            ui.add(egui::TextEdit::singleline(&mut String::new()).id(destination))
+                .request_focus();
+        });
+        let ime = output
+            .platform_output
+            .ime
+            .expect("actual focused TextEdit IME metadata");
+        let mut intents = Vec::new();
+        super::super::native_presenter::append_native_platform_window_intents(
+            &output.platform_output,
+            1.5,
+            false,
+            &mut intents,
+        );
+        crate::egui_output::discard_headless_output(output);
+        assert!(ime.should_interrupt_composition);
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| matches!(intent, NativeWindowIntent::InterruptImeComposition))
+                .count(),
+            1
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|intent| matches!(intent, NativeWindowIntent::UpdateImeCursorArea { .. }))
+        );
+
+        let (command_tx, command_rx) = crossbeam_channel::bounded(8);
+        let (_, lifecycle_rx) = crossbeam_channel::bounded(8);
+        let channel_fault = Arc::new(AtomicBool::new(false));
+        let (_, render_events) = native_window_event_route(8, Arc::clone(&channel_fault));
+        let latest = Arc::new(LatestPumpValues::default());
+        let client = NativeWindowPumpRenderClient {
+            command_tx,
+            lifecycle_rx,
+            render_events,
+            latest: Arc::clone(&latest),
+            channel_fault: Arc::clone(&channel_fault),
+        };
+        let update = |epoch, window_intents| NativeWindowVisualUpdate {
+            epoch,
+            window_intents,
+            hud_regions: None,
+            toast_active: false,
+            fullscreen_overlay_active: false,
+            debug_description: None,
+        };
+        // A later logical pass and visual overwrite cannot erase or duplicate the command.
+        client.publish_visual(update(7, intents));
+        client.publish_visual(update(7, Vec::new()));
+        assert!(
+            latest
+                .visual
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .window_intents
+                .is_empty()
+        );
+        let hosts = HashMap::from([
+            (WindowEpoch(7), Cell::new(0)),
+            (WindowEpoch(8), Cell::new(0)),
+        ]);
+        let mut deliveries = 0;
+        while let Ok(command) = command_rx.try_recv() {
+            let PumpCommand::InterruptImeComposition { epoch } = command else {
+                panic!("unexpected control command")
+            };
+            apply_ime_interrupt_to_epoch(&hosts, WindowEpoch(epoch), |host| {
+                host.set(host.get() + 1);
+                deliveries += 1;
+            });
+        }
+        assert_eq!(deliveries, 1);
+        assert_eq!(hosts[&WindowEpoch(7)].get(), 1);
+        assert_eq!(hosts[&WindowEpoch(8)].get(), 0);
+        // try_lock misses also leave the pulse in the reliable existing control channel.
+        let visual_guard = latest.visual.lock().unwrap();
+        client.publish_visual(update(7, vec![NativeWindowIntent::InterruptImeComposition]));
+        drop(visual_guard);
+        let PumpCommand::InterruptImeComposition { epoch } = command_rx.try_recv().unwrap() else {
+            panic!("interrupt control")
+        };
+        let successor_only = HashMap::from([(WindowEpoch(8), Cell::new(0))]);
+        apply_ime_interrupt_to_epoch(&successor_only, WindowEpoch(epoch), |host| {
+            host.set(host.get() + 1)
+        });
+        assert_eq!(successor_only[&WindowEpoch(8)].get(), 0);
+        assert!(command_rx.try_recv().is_err());
+        assert!(!channel_fault.load(Ordering::Acquire));
+
+        // Delivery does not make the next actual run emit the old pulse again.
+        let output = context.run_ui(raw(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut text).id(destination));
+        });
+        let ime = output.platform_output.ime;
+        crate::egui_output::discard_headless_output(output);
+        assert!(
+            !ime.expect("new owner IME output")
+                .should_interrupt_composition
+        );
+    }
 
     const STALL_TEST: &str = "video::native_window_pump::tests::production_parent_destroy_remains_bounded_during_render_stall";
     const STALL_CHILD_ENV: &str = "MIV_STAGE4_PRODUCTION_STALL_CHILD";
@@ -3137,9 +3300,13 @@ mod tests {
     }
 
     fn run_hud_focus_child(owner_raw: u64) {
+        use windows::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, NULLREGION, SetWindowRgn,
+        };
+
         let module = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let create = |owner| {
-            unsafe {
+            let hwnd = unsafe {
                 CreateWindowExW(
                     WS_EX_NOACTIVATE,
                     w!("STATIC"),
@@ -3155,15 +3322,35 @@ mod tests {
                     None,
                 )
             }
-            .expect("create popup")
+            .expect("create popup");
+            // Negative coordinates can still be on a monitor. An empty region
+            // prevents pixels on every layout while retaining HWND visibility.
+            let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+            assert!(!region.is_invalid(), "create empty popup region");
+            let assigned = unsafe { SetWindowRgn(hwnd, Some(region), false) };
+            if assigned == 0 {
+                let _ = unsafe { DeleteObject(region.into()) };
+            }
+            assert_ne!(assigned, 0, "assign empty region before showing popup");
+            // SetWindowRgn transfers region ownership to the window on success.
+            hwnd
         };
         let editor = create(Some(HWND(owner_raw as *mut _)));
         let unregistered_owned = create(Some(HWND(owner_raw as *mut _)));
         let external = create(None);
         unsafe {
-            let _ = ShowWindow(editor, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(unregistered_owned, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(external, SW_SHOWNOACTIVATE);
+            for hwnd in [editor, unregistered_owned, external] {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                assert!(IsWindowVisible(hwnd).as_bool());
+                let copy = CreateRectRgn(0, 0, 0, 0);
+                assert!(!copy.is_invalid());
+                let kind = GetWindowRgn(hwnd, copy);
+                let _ = DeleteObject(copy.into());
+                assert_eq!(
+                    kind, NULLREGION,
+                    "shown fixture must have no drawable pixels"
+                );
+            }
         }
         println!(
             "MIV_FOCUS_WINDOWS {} {} {}",

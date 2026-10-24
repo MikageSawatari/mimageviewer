@@ -32,9 +32,12 @@ impl App {
                     )
                 })
             });
+        let options = ctx.options(|options| options.input_options);
         let scrolling = grid_touch_scroll_intent
             || ctx.input(|i| {
-                i.raw_scroll_delta.length() > 0.1
+                crate::wheel_input::remaining_wheel_inputs(i, options)
+                    .iter()
+                    .any(|wheel| wheel.delta.length() > 0.1)
                     || i.key_pressed(egui::Key::ArrowDown)
                     || i.key_pressed(egui::Key::ArrowUp)
                     || i.key_pressed(egui::Key::PageDown)

@@ -31,6 +31,8 @@ fn book(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels: Arc::new(image),
                 source_dims: Some(dims),

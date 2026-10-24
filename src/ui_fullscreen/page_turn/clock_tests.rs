@@ -194,42 +194,48 @@ fn discarded_output_replay_and_late_cancelled_or_mismatched_hooks_cannot_set_ori
     install(&ctx);
     let fact = super::tests::fact(1);
     let tracker = Arc::new(SubmissionTracker::new(fact));
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        let receipt = super::tests::receipt(ctx, 1);
-        queue_submission(
-            ctx,
-            receipt,
-            Some(super::tests::event(&tracker, SubmissionKind::Curl)),
-        );
-        if ctx.current_pass_index() == 0 {
-            ctx.request_discard("clock-test");
-            clock.set(origin + Duration::from_secs(3));
-        } else {
-            assert_eq!(tracker.started_at(), None, "discard did not publish");
-        }
-    });
+    let _ = ctx
+        .run_pass(egui::RawInput::default(), |ctx| {
+            let receipt = super::tests::receipt(ctx, 1);
+            queue_submission(
+                ctx,
+                receipt,
+                Some(super::tests::event(&tracker, SubmissionKind::Curl)),
+            );
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("clock-test");
+                clock.set(origin + Duration::from_secs(3));
+            } else {
+                assert_eq!(tracker.started_at(), None, "discard did not publish");
+            }
+        })
+        .drop_without_applying_deltas();
     let start_at = origin + Duration::from_secs(3);
     assert_eq!(tracker.started_at(), Some(start_at));
     clock.set(start_at + Duration::from_millis(50));
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        queue_submission(
-            ctx,
-            super::tests::receipt(ctx, 1),
-            Some(super::tests::event(&tracker, SubmissionKind::Curl)),
-        );
-    });
+    let _ = ctx
+        .run_pass(egui::RawInput::default(), |ctx| {
+            queue_submission(
+                ctx,
+                super::tests::receipt(ctx, 1),
+                Some(super::tests::event(&tracker, SubmissionKind::Curl)),
+            );
+        })
+        .drop_without_applying_deltas();
     assert_eq!(tracker.started_at(), Some(start_at));
     for cancel in [false, true] {
         let tracker = Arc::new(SubmissionTracker::new(fact));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let mut event = super::tests::event(&tracker, SubmissionKind::Curl);
-            if cancel {
-                tracker.end();
-            } else {
-                event.fact.operation_id = ViewerOperationId::Slideshow(999);
-            }
-            queue_submission(ctx, super::tests::receipt(ctx, 1), Some(event));
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                let mut event = super::tests::event(&tracker, SubmissionKind::Curl);
+                if cancel {
+                    tracker.end();
+                } else {
+                    event.fact.operation_id = ViewerOperationId::Slideshow(999);
+                }
+                queue_submission(ctx, super::tests::receipt(ctx, 1), Some(event));
+            })
+            .drop_without_applying_deltas();
         assert_eq!(tracker.started_at(), None);
         assert_eq!(
             tracker.ledger.lock().unwrap().motion,
@@ -237,15 +243,17 @@ fn discarded_output_replay_and_late_cancelled_or_mismatched_hooks_cannot_set_ori
         );
     }
     let tracker = Arc::new(SubmissionTracker::new(fact));
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        let mut receipt = super::tests::receipt(ctx, 1);
-        receipt.destination = super::tests::destination(2);
-        queue_submission(
-            ctx,
-            receipt,
-            Some(super::tests::event(&tracker, SubmissionKind::Curl)),
-        );
-    });
+    let _ = ctx
+        .run_pass(egui::RawInput::default(), |ctx| {
+            let mut receipt = super::tests::receipt(ctx, 1);
+            receipt.destination = super::tests::destination(2);
+            queue_submission(
+                ctx,
+                receipt,
+                Some(super::tests::event(&tracker, SubmissionKind::Curl)),
+            );
+        })
+        .drop_without_applying_deltas();
     assert_eq!(
         tracker.started_at(),
         None,

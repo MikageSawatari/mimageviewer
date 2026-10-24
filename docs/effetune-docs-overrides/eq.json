@@ -45,5 +45,11 @@
     "anchor": "無音時の省電力による停止から処理が再開したときも、測定は最初からやり直しになります。",
     "replacement": "",
     "reason": "Codex P3 対応: bundled vst-audio-manager.js:1296 disables the standalone silence power policy in startPowerPolicyController(); retain the explicit Reset operation."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "モバイルでは、5Band PEQ、5Band FIR PEQ、Group Delay PEQ、Room EQのAdditional EQ、Tonal Balance EQのTarget Adjustは、選択した1バンドの設定だけを表示します。番号付きのバンドボタンをタップして、編集するバンドを切り替えてください。切り替えても、各バンドの設定は保持されます。",
+    "replacement": "",
+    "reason": "Codex P3 対応: v0.14.0 vst-bootstrap.js:399 defines window.electronAPI, so electron-integration.js:19 reports Electron and layout-mode-manager.js:59 always selects desktop mode; the mobile single-band editor is unreachable in the VST."
   }
 ]

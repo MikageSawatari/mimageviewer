@@ -226,7 +226,7 @@ A Windows 11 native image viewer built in Rust. Inspired by ViX (legacy 32-bit v
 modernized with GPU acceleration and AI upscaling. Single-window design replacing ViX's
 dual-window approach.
 
-Rust (edition 2024、MSVC) + eframe / egui 0.33 (wgpu)。画像は `image` crate・TurboJPEG・WIC・LibRaw、
+Rust (edition 2024、MSVC) + eframe / egui 0.37 (wgpu 30)。画像は `image` crate・TurboJPEG・WIC・LibRaw、
 キャッシュは SQLite + WebP、動画は FFmpeg LGPL shared DLL (launcher が内包して展開)、PDF は PDFium の
 マルチプロセスワーカー、AI は ONNX Runtime (DirectML / TensorRT)。詳細とファイル構成は
 [docs/project-reference.md](docs/project-reference.md)。

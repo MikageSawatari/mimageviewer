@@ -76,6 +76,90 @@ basename / full-path key で持つため、ドライブ文字を落とすと `C:
 → ファイル: {cache_dir}/3f/3f8ac1b2d4e5....db
 ```
 
+### 2.4 クリアの接続所有権と削除単位（backlog §2.12、2026-10-19）
+
+調査基点は `be318299f`。利用者の2026-08-20実測は、クリア＋再起動後に対応DBのない
+WAL 1,410件（1,394.8 MB）とSHM 1,410件（44.1 MB）が残ったというもの。
+この実測環境そのものは今回再現していない。
+
+旧実装（`ca57742a1` の親）の `cache_manager.rs` は削除前に
+`App::evict_all_catalog_cache` を呼んでいたが、これはApp側LRUのArcを外すだけで、
+thumbnail worker / queued request / Remoteの保持接続のcloseを保証しなかった。
+`cache_maintenance::spawn` の全件・期限指定は `catalog::delete_all_cache` /
+`delete_old_cache`、フォルダ指定はworker内の `remove_file(db_path)` で、いずれもDB本体だけを削除していた。
+したがって「全所有者のcloseを保証せずDB本体の削除を試みる」コード経路は確認できるが、
+実測の各孤児をどの接続が残したかまでは確定できない。
+
+現行では音声画像対応（`ca57742a1`、`921f1e457`）で、全catalogを
+`CatalogAccess` の登録接続・epoch・SQL leaseに統合済み。接続を閉じずにDBを消す
+catalog経路は調査基点では見つからなかった。残る問題は削除単位がDB本体のみで、
+旧版の孤児を列挙せず、SQLiteのclose後に残った補助ファイルも処理しないこと。
+
+| 入口・対象 | 接続の実所有者 | 削除順序（現行の共通境界を維持） |
+| --- | --- | --- |
+| 設定→サムネイルキャッシュ管理→すべて削除 | Appのcatalog LRU / 色取得、thumbnail・重I/O・details-metaのworker/LRU、PDF catch-up・cache creator、Remote container等の `CatalogDb`。実接続は登録済み `CatalogConnection` が所有 | UIで `begin_delete(All)` → `cache-maint` workerでSQL/open/close leaseをdrain → 全登録接続をRetiredへ移しclose → DBと兄弟WAL/SHMを削除 → 孤児も削除 → token解放 → UI結果 |
+| 同画面の指定日数以上古いキャッシュ削除 | 同上（期限外の接続も従来どおり退役） | `begin_delete(OlderThan)` → 同じdrain/close → DB本体のmtimeで選択したDBと兄弟WAL/SHMだけ削除 → token解放。DBのない孤児は年齢が分からないため対象外 |
+| 同画面の現在フォルダ削除 | 同上＋worker内で開く排他的な短命保守接続 | `begin_delete(Folder)` → 同じdrain/close → 対象DBの一般行と対象driveのaudio scopeをSQL削除 → 保守接続close → 他driveのaudio行/absenceがなければDBと兄弟WAL/SHMを削除。DBが元からなければ対象hashの孤児だけ削除 |
+| `catalog::delete_all_cache` / `delete_old_cache` の公開helper | 同じcache-dirの `CatalogAccess` | helper自体がbegin/drain/close/tokenを所有し、上記と同じファイル削除へ接続。製品の呼出元は管理worker内の専用under-delete経路。公開helperの直接利用はテスト |
+| 起動時・容量上限でのcatalog DB削除 | 該当なし | catalog DBを物理削除する自動経路はない。`delete_missing` / audio scope pruneは行単位SQLで、DBファイルは消さない |
+
+削除単位は `.db` とその名前へ `-wal` / `-shm` を付けた3ファイル。
+必ず所有者によるcloseを先に済ませ、DB削除が失敗したときは兄弟を消さない。
+全削除の孤児回収も同じ排他期間・同じworker・既存の1階層のhashディレクトリ走査で行い、
+対応DBの不存在を確認できた `*.db-wal` / `*.db-shm` だけを消す。
+走査ではreparse pointを辿らない。失敗は既存reportのログと管理画面エラーへ返し、再試行しない。
+削除DB件数は補助ファイルを数えず、従来の意味を維持する。永続schema変更・移行はない。
+
+簡素化の判断: 既存のcache-dir単位排他でopen/SQL/closeを止められるため、専用worker、
+新しい待機状態、UI全体のmodal化、起動時孤児掃除は追加しない。まれな失敗は割り切り
+（ログ＋既存エラー通知）。
+
+他キャッシュの横断確認:
+
+| 対象 | 削除と所有権の確認結果 |
+| --- | --- |
+| 類似索引（`similar_db.rs` / `similar_index.rs`） | 行のSQL DELETEと `similar.base` 等の派生配列ファイル更新。SQLite DBの物理削除は見つからず、同型ではない |
+| ZIP変換（`archive_cache.rs`） | 保守lock下でconverted ZIPと対応SQL行を削除。保持SQLite DBは消さない |
+| EPUB/PDF変換（`epub_cache.rs`） | 世代leaseで保護した変換PDF等のpayloadとSQL行を削除。保持SQLite DBは消さない |
+| PDFページ数・動画長さ等のメタ情報 | catalogのtableなので上記close/削除境界の対象 |
+| 検索メタ索引（`search_index_db.rs` / `indexer_manager.rs`） | SQLite tableのresetと派生Tantivy directoryの再構築。SQLite DB本体を消す同型経路は見つからず |
+| 編集preview・Auto比率 | SQL DELETE＋preview画像等のpayload削除。SQLite DB本体は保持 |
+| 動画タイル（`video/tile_thumb_cache.rs` / `cache_maintenance.rs`） | 通常はmutex下のSQL DELETE/VACUUM。`Some(cache).clear_all()` 失敗時の `erase_db_files()` fallbackはApp/workerのArcが接続を保持したままDB/WAL/SHMを削除するため同型の欠陥。今回のcatalog修正の範囲外として報告。修正にはtile workerを含む接続所有境界の設計が必要。`None` のopen失敗時fallbackとは区別する |
+
+なお、`catalog::cache_stats` の容量は従来からDB本体だけの集計で、WAL/SHMは含めない。
+容量表示の仕様変更は今回含めない。
+
+検証記録（`be318299f`＋本節の未コミット差分、通常feature / test profile）:
+
+- 新規4テストは全件成功（nextest run `680ab91a-9d7b-44f3-9d62-a9c740be50d3`）。
+  全件/期限/フォルダの実WAL DB、SQLiteのPERSIST_WALでclose後も残る補助ファイル、
+  旧版の孤児と削除scope、別cache-dirの開いたDB、Windowsの外部接続で削除できないDBを検査。
+- catalog全体＋管理worker＋Remote/drive CacheOnlyの関連94テスト（新規4件を含む）が成功
+  （nextest run `3f91c43a-dfd8-4c89-9820-bf519fdbc026`、失敗0、実行1.766秒）。
+  コマンドと結果のログは `target/section212-focused.log` / `target/section212-regression.log`。
+
+```powershell
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(/catalog_clear_/)' --no-fail-fast
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(/^catalog::tests::/) | test(/^cache_maintenance::tests::/) | test(/drive_cache_only_pins_do_not_resurrect_old_map_after_clear_or_cancel/) | test(/review2_cache_only/) | test(/keep_admission_across_delete_before_decode/) | test(/source_only_remote_zip_and_pdf_pages_do_not_require_catalog_during_delete/)' --no-fail-fast
+```
+
+- `cargo fmt`（引数なし、workspace全体）/ `cargo fmt --check` / `git diff --check` が成功。
+  `python scripts/check_ui_glyphs.py` は危険glyph 0件。アプリの見た目・UI文言は変更していない。
+- 初回コンパイルはworktreeのLibRaw不足とTurboJPEGの並列MSBuild失敗で未実行だった。
+  LibRaw 0.22.2を既存worktreeからreparse pointのない実体として復元し、
+  `MSBUILDDISABLENODEREUSE=1` と `--build-jobs 1` で上記の成功結果を得た。
+  前提準備の失敗は製品テストの失敗数へ含めない。
+- 本体lib全件は依頼どおりClaudeCodeが最後に実行するため未実施。
+  実アプリ起動、独立レビュー・検収は未実施（別担当）。
+- `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` が成功（exit 0）。
+  通常feature / dev-runtime profileでcore・Remote・EPUB converterを生成し、
+  VCRT配置検査も成功（runtime=4、PE=3）。ログは `target/section212-build-dev.log`、
+  出力は `target/dev-runtime/mimageviewer-core.exe` ほか同ディレクトリのcompanion。
+  環境は `MSBUILDDISABLENODEREUSE=1`、native依存の準備はbuild jobs 1、
+  生成済み依存を再利用した最終script実行は `CARGO_BUILD_JOBS=4`。
+  Ninjaのcompiler検出で停止した試行は中断し、標準MSBuildへ戻した成功結果のみを採用した。
+  通常profileの成果物をエージェントから起動していない。
+
 ---
 
 ## 3. ファイル形式の選定

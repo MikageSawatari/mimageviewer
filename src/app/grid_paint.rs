@@ -812,6 +812,8 @@ fn paint_cell(
             | ThumbnailState::Evicted
             | ThumbnailState::NoArt
             | ThumbnailState::Failed => {
+                // Icon-only folders own the same inner display area used for drawing.
+                record(inner);
                 if is_drive_list {
                     record(draw_drive_icon(painter, inner, dark));
                 } else {
@@ -1012,6 +1014,7 @@ fn paint_cell(
                     | ThumbnailState::Evicted
                     | ThumbnailState::NoArt
                     | ThumbnailState::Failed => {
+                        record(inner);
                         record(paint_lower_caption(
                             painter,
                             inner.center() - egui::vec2(0.0, 14.0),
@@ -1527,18 +1530,20 @@ mod book_resume_meter_tests {
         dims: [usize; 2],
         color: egui::Color32,
     ) -> ThumbnailState {
-        ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        ThumbnailState::loaded_raster(
+            crate::ui_helpers::load_snapshot_texture(
+                ctx,
                 format!("meter-solid-{dims:?}-{color:?}"),
                 egui::ColorImage::new(dims, vec![color; dims[0] * dims[1]]),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_dims: Some((999, 17)),
-            layout_dims: None,
-        }
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((999, 17)),
+            None,
+        )
     }
 
     #[test]
@@ -1561,7 +1566,7 @@ mod book_resume_meter_tests {
                     for fraction in [None, Some(0.4), Some(1.0)] {
                         let mut output = None;
                         for _ in 0..2 {
-                            output=Some(ctx.run(egui::RawInput::default(),|ctx| {egui::CentralPanel::default().show(ctx,|ui| {
+                            output=Some(crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(),|ctx| {ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui,|ui| {
                             let cell=egui::Rect::from_min_size(egui::pos2(20.3,20.7),egui::vec2(width,width));
                             let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None,false,
                                 VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true);
@@ -1576,10 +1581,10 @@ mod book_resume_meter_tests {
                             draw_cell(ui,cell,false,false,false,&layout,&item,&ThumbnailState::Pending,crate::rotation_db::Rotation::None,None,false,
                                 VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,fraction);
                             if width==140.0 && fraction==Some(0.4) && matches!(item,GridItem::Video(_)) {eprintln!("reserved-meter-measure dpi={dpi} cell={cell:?} meter={meter:?} pixels={}",meter.height()*dpi);}
-                        });}));
+                        }));})));
                         }
                         let palette = crate::os_theme::book_resume_meter_palette(
-                            ctx.style().visuals.dark_mode,
+                            ctx.global_style().visuals.dark_mode,
                         );
                         let tracks=output.unwrap().shapes.iter().filter(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.fill==palette.track)).count();
                         assert_eq!(tracks, usize::from(fraction.is_some()));
@@ -1619,49 +1624,55 @@ mod book_resume_meter_tests {
                 for enabled in [false, true] {
                     let mut output = None;
                     for _ in 0..2 {
-                        output = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                let cell = egui::Rect::from_min_size(
-                                    egui::pos2(20.0, 20.0),
-                                    egui::vec2(240.0, 190.0),
-                                );
-                                let thumb = solid_thumbnail(ctx, [3, 5], egui::Color32::WHITE);
-                                let layout = layout_cell_overlays(
-                                    ui.painter(),
-                                    cell,
-                                    EditBadgeFlags::default(),
-                                    0,
-                                    &item,
-                                    &thumb,
-                                    &[],
-                                    None,
-                                    false,
-                                    VideoThumbnailIndicator::Hidden,
-                                    AudioThumbnailIndicator::default(),
-                                    false,
-                                    None,
-                                    None,
-                                    enabled,
-                                );
-                                draw_cell(
-                                    ui,
-                                    cell,
-                                    false,
-                                    false,
-                                    false,
-                                    &layout,
-                                    &item,
-                                    &thumb,
-                                    crate::rotation_db::Rotation::None,
-                                    None,
-                                    false,
-                                    VideoThumbnailIndicator::Hidden,
-                                    AudioThumbnailIndicator::default(),
-                                    false,
-                                    None,
-                                );
-                            });
-                        }));
+                        output = Some(crate::test_ui::headless_paint_output(ctx.run_pass(
+                            egui::RawInput::default(),
+                            |ctx| {
+                                ctx.root_ui(|root_ui| {
+                                    egui::CentralPanel::default().show(root_ui, |ui| {
+                                        let cell = egui::Rect::from_min_size(
+                                            egui::pos2(20.0, 20.0),
+                                            egui::vec2(240.0, 190.0),
+                                        );
+                                        let thumb =
+                                            solid_thumbnail(ctx, [3, 5], egui::Color32::WHITE);
+                                        let layout = layout_cell_overlays(
+                                            ui.painter(),
+                                            cell,
+                                            EditBadgeFlags::default(),
+                                            0,
+                                            &item,
+                                            &thumb,
+                                            &[],
+                                            None,
+                                            false,
+                                            VideoThumbnailIndicator::Hidden,
+                                            AudioThumbnailIndicator::default(),
+                                            false,
+                                            None,
+                                            None,
+                                            enabled,
+                                        );
+                                        draw_cell(
+                                            ui,
+                                            cell,
+                                            false,
+                                            false,
+                                            false,
+                                            &layout,
+                                            &item,
+                                            &thumb,
+                                            crate::rotation_db::Rotation::None,
+                                            None,
+                                            false,
+                                            VideoThumbnailIndicator::Hidden,
+                                            AudioThumbnailIndicator::default(),
+                                            false,
+                                            None,
+                                        );
+                                    })
+                                });
+                            },
+                        )));
                     }
                     let texts: Vec<_> = output
                         .unwrap()
@@ -1714,59 +1725,65 @@ mod book_resume_meter_tests {
         for clipped in [false, true] {
             let mut output = None;
             for _ in 0..2 {
-                output = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        if clipped {
-                            ui.set_clip_rect(egui::Rect::from_min_max(
-                                egui::pos2(0.0, 100.0),
-                                egui::pos2(400.0, 200.0),
-                            ));
-                        }
-                        let cell = egui::Rect::from_min_size(
-                            egui::pos2(20.0, 20.0),
-                            egui::vec2(180.0, 94.0),
-                        );
-                        let item = GridItem::CollectionPlaceholder {
-                            path: "missing.png".into(),
-                            last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
-                            reason: crate::grid_item::CollectionPlaceholderReason::Missing,
-                        };
-                        let layout = layout_cell_overlays(
-                            ui.painter(),
-                            cell,
-                            EditBadgeFlags::default(),
-                            0,
-                            &item,
-                            &ThumbnailState::Pending,
-                            &[],
-                            None,
-                            false,
-                            VideoThumbnailIndicator::Hidden,
-                            AudioThumbnailIndicator::default(),
-                            false,
-                            None,
-                            None,
-                            true,
-                        );
-                        draw_cell(
-                            ui,
-                            cell,
-                            false,
-                            false,
-                            false,
-                            &layout,
-                            &item,
-                            &ThumbnailState::Pending,
-                            crate::rotation_db::Rotation::None,
-                            None,
-                            false,
-                            VideoThumbnailIndicator::Hidden,
-                            AudioThumbnailIndicator::default(),
-                            false,
-                            None,
-                        );
-                    });
-                }));
+                output = Some(crate::test_ui::headless_paint_output(ctx.run_pass(
+                    egui::RawInput::default(),
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                if clipped {
+                                    ui.set_clip_rect(egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 100.0),
+                                        egui::pos2(400.0, 200.0),
+                                    ));
+                                }
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(20.0, 20.0),
+                                    egui::vec2(180.0, 94.0),
+                                );
+                                let item = GridItem::CollectionPlaceholder {
+                                    path: "missing.png".into(),
+                                    last_known_kind:
+                                        crate::collection_store::CollectionResolvedKind::Image,
+                                    reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+                                };
+                                let layout = layout_cell_overlays(
+                                    ui.painter(),
+                                    cell,
+                                    EditBadgeFlags::default(),
+                                    0,
+                                    &item,
+                                    &ThumbnailState::Pending,
+                                    &[],
+                                    None,
+                                    false,
+                                    VideoThumbnailIndicator::Hidden,
+                                    AudioThumbnailIndicator::default(),
+                                    false,
+                                    None,
+                                    None,
+                                    true,
+                                );
+                                draw_cell(
+                                    ui,
+                                    cell,
+                                    false,
+                                    false,
+                                    false,
+                                    &layout,
+                                    &item,
+                                    &ThumbnailState::Pending,
+                                    crate::rotation_db::Rotation::None,
+                                    None,
+                                    false,
+                                    VideoThumbnailIndicator::Hidden,
+                                    AudioThumbnailIndicator::default(),
+                                    false,
+                                    None,
+                                );
+                            })
+                        });
+                    },
+                )));
             }
             assert!(
                 output
@@ -1809,49 +1826,54 @@ mod book_resume_meter_tests {
             ] {
                 let mut output = None;
                 for _ in 0..2 {
-                    output = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            let cell = egui::Rect::from_min_size(
-                                egui::pos2(20.0, 20.0),
-                                egui::vec2(180.0, height),
-                            );
-                            let thumb = solid_thumbnail(ctx, [3, 5], egui::Color32::WHITE);
-                            let layout = layout_cell_overlays(
-                                ui.painter(),
-                                cell,
-                                EditBadgeFlags::default(),
-                                0,
-                                &item,
-                                &thumb,
-                                &[],
-                                None,
-                                false,
-                                VideoThumbnailIndicator::Hidden,
-                                AudioThumbnailIndicator::default(),
-                                false,
-                                None,
-                                None,
-                                true,
-                            );
-                            draw_cell(
-                                ui,
-                                cell,
-                                false,
-                                false,
-                                false,
-                                &layout,
-                                &item,
-                                &thumb,
-                                crate::rotation_db::Rotation::None,
-                                None,
-                                false,
-                                VideoThumbnailIndicator::Hidden,
-                                AudioThumbnailIndicator::default(),
-                                false,
-                                None,
-                            );
-                        });
-                    }));
+                    output = Some(crate::test_ui::headless_paint_output(ctx.run_pass(
+                        egui::RawInput::default(),
+                        |ctx| {
+                            ctx.root_ui(|root_ui| {
+                                egui::CentralPanel::default().show(root_ui, |ui| {
+                                    let cell = egui::Rect::from_min_size(
+                                        egui::pos2(20.0, 20.0),
+                                        egui::vec2(180.0, height),
+                                    );
+                                    let thumb = solid_thumbnail(ctx, [3, 5], egui::Color32::WHITE);
+                                    let layout = layout_cell_overlays(
+                                        ui.painter(),
+                                        cell,
+                                        EditBadgeFlags::default(),
+                                        0,
+                                        &item,
+                                        &thumb,
+                                        &[],
+                                        None,
+                                        false,
+                                        VideoThumbnailIndicator::Hidden,
+                                        AudioThumbnailIndicator::default(),
+                                        false,
+                                        None,
+                                        None,
+                                        true,
+                                    );
+                                    draw_cell(
+                                        ui,
+                                        cell,
+                                        false,
+                                        false,
+                                        false,
+                                        &layout,
+                                        &item,
+                                        &thumb,
+                                        crate::rotation_db::Rotation::None,
+                                        None,
+                                        false,
+                                        VideoThumbnailIndicator::Hidden,
+                                        AudioThumbnailIndicator::default(),
+                                        false,
+                                        None,
+                                    );
+                                })
+                            });
+                        },
+                    )));
                 }
                 let mut marker = None;
                 let mut captions = Vec::new();
@@ -2018,53 +2040,64 @@ mod book_resume_meter_tests {
                             let mut band = None;
                             let mut output = None;
                             for _ in 0..2 {
-                                output = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                                    egui::CentralPanel::default().show(ctx, |ui| {
-                                        let thumb = if loaded {
-                                            solid_thumbnail(ctx, [3, 5], egui::Color32::WHITE)
-                                        } else {
-                                            ThumbnailState::Pending
-                                        };
-                                        let duration =
-                                            matches!(item, GridItem::Video(_) | GridItem::Audio(_))
+                                output = Some(crate::test_ui::headless_paint_output(ctx.run_pass(
+                                    egui::RawInput::default(),
+                                    |ctx| {
+                                        ctx.root_ui(|root_ui| {
+                                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                                let thumb = if loaded {
+                                                    solid_thumbnail(
+                                                        ctx,
+                                                        [3, 5],
+                                                        egui::Color32::WHITE,
+                                                    )
+                                                } else {
+                                                    ThumbnailState::Pending
+                                                };
+                                                let duration = matches!(
+                                                    item,
+                                                    GridItem::Video(_) | GridItem::Audio(_)
+                                                )
                                                 .then_some("22:35");
-                                        let layout = layout_cell_overlays(
-                                            ui.painter(),
-                                            cell,
-                                            EditBadgeFlags::default(),
-                                            4,
-                                            item,
-                                            &thumb,
-                                            &[],
-                                            None,
-                                            false,
-                                            VideoThumbnailIndicator::PlayIcon,
-                                            AudioThumbnailIndicator::default(),
-                                            false,
-                                            None,
-                                            duration,
-                                            enabled,
-                                        );
-                                        band = layout.book_resume_meter;
-                                        draw_cell(
-                                            ui,
-                                            cell,
-                                            false,
-                                            false,
-                                            false,
-                                            &layout,
-                                            item,
-                                            &thumb,
-                                            crate::rotation_db::Rotation::None,
-                                            None,
-                                            false,
-                                            VideoThumbnailIndicator::PlayIcon,
-                                            AudioThumbnailIndicator::default(),
-                                            false,
-                                            fraction,
-                                        );
-                                    });
-                                }));
+                                                let layout = layout_cell_overlays(
+                                                    ui.painter(),
+                                                    cell,
+                                                    EditBadgeFlags::default(),
+                                                    4,
+                                                    item,
+                                                    &thumb,
+                                                    &[],
+                                                    None,
+                                                    false,
+                                                    VideoThumbnailIndicator::PlayIcon,
+                                                    AudioThumbnailIndicator::default(),
+                                                    false,
+                                                    None,
+                                                    duration,
+                                                    enabled,
+                                                );
+                                                band = layout.book_resume_meter;
+                                                draw_cell(
+                                                    ui,
+                                                    cell,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    &layout,
+                                                    item,
+                                                    &thumb,
+                                                    crate::rotation_db::Rotation::None,
+                                                    None,
+                                                    false,
+                                                    VideoThumbnailIndicator::PlayIcon,
+                                                    AudioThumbnailIndicator::default(),
+                                                    false,
+                                                    fraction,
+                                                );
+                                            })
+                                        });
+                                    },
+                                )));
                             }
                             let texts: Vec<_> = output
                                 .unwrap()
@@ -2133,58 +2166,64 @@ mod book_resume_meter_tests {
         ] {
             let mut output = None;
             for _ in 0..2 {
-                output = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let cell = egui::Rect::from_min_size(
-                            egui::pos2(20.0, 20.0),
-                            egui::vec2(32.0, 32.0),
-                        );
-                        let thumb = solid_thumbnail(ctx, [1, 1], egui::Color32::BLACK);
-                        let layout = layout_cell_overlays(
-                            ui.painter(),
-                            cell,
-                            EditBadgeFlags::default(),
-                            0,
-                            &item,
-                            &thumb,
-                            &[],
-                            None,
-                            false,
-                            VideoThumbnailIndicator::PlayIcon,
-                            AudioThumbnailIndicator::default(),
-                            false,
-                            None,
-                            None,
-                            true,
-                        );
-                        draw_cell(
-                            ui,
-                            cell,
-                            false,
-                            false,
-                            false,
-                            &layout,
-                            &item,
-                            &thumb,
-                            crate::rotation_db::Rotation::None,
-                            None,
-                            false,
-                            VideoThumbnailIndicator::PlayIcon,
-                            AudioThumbnailIndicator::default(),
-                            cut,
-                            Some(0.5),
-                        );
-                    });
-                }));
+                output = Some(crate::test_ui::headless_paint_output(ctx.run_pass(
+                    egui::RawInput::default(),
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(20.0, 20.0),
+                                    egui::vec2(32.0, 32.0),
+                                );
+                                let thumb = solid_thumbnail(ctx, [1, 1], egui::Color32::BLACK);
+                                let layout = layout_cell_overlays(
+                                    ui.painter(),
+                                    cell,
+                                    EditBadgeFlags::default(),
+                                    0,
+                                    &item,
+                                    &thumb,
+                                    &[],
+                                    None,
+                                    false,
+                                    VideoThumbnailIndicator::PlayIcon,
+                                    AudioThumbnailIndicator::default(),
+                                    false,
+                                    None,
+                                    None,
+                                    true,
+                                );
+                                draw_cell(
+                                    ui,
+                                    cell,
+                                    false,
+                                    false,
+                                    false,
+                                    &layout,
+                                    &item,
+                                    &thumb,
+                                    crate::rotation_db::Rotation::None,
+                                    None,
+                                    false,
+                                    VideoThumbnailIndicator::PlayIcon,
+                                    AudioThumbnailIndicator::default(),
+                                    cut,
+                                    Some(0.5),
+                                );
+                            })
+                        });
+                    },
+                )));
             }
             let shapes = output.unwrap().shapes;
-            let track = crate::os_theme::book_resume_meter_palette(ctx.style().visuals.dark_mode)
-                .track
-                .gamma_multiply(if cut {
-                    crate::cut_clipboard::CUT_CONTENT_OPACITY
-                } else {
-                    1.0
-                });
+            let track =
+                crate::os_theme::book_resume_meter_palette(ctx.global_style().visuals.dark_mode)
+                    .track
+                    .gamma_multiply(if cut {
+                        crate::cut_clipboard::CUT_CONTENT_OPACITY
+                    } else {
+                        1.0
+                    });
             let meter = shapes
                 .iter()
                 .position(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == track))
@@ -2211,50 +2250,55 @@ mod book_resume_meter_tests {
         let cell = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(140.0, 94.0));
         let mut output = None;
         for _ in 0..2 {
-            output = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let item = GridItem::Video(std::path::PathBuf::from("v.mp4"));
-                    let layout = layout_cell_overlays(
-                        ui.painter(),
-                        cell,
-                        EditBadgeFlags::default(),
-                        0,
-                        &item,
-                        &ThumbnailState::Pending,
-                        &[],
-                        None,
-                        false,
-                        VideoThumbnailIndicator::default(),
-                        AudioThumbnailIndicator::default(),
-                        true,
-                        None,
-                        Some("1:02:03"),
-                        true,
-                    );
-                    assert!(layout.book_resume_meter.is_some());
-                    draw_cell(
-                        ui,
-                        cell,
-                        false,
-                        true,
-                        true,
-                        &layout,
-                        &item,
-                        &ThumbnailState::Pending,
-                        crate::rotation_db::Rotation::None,
-                        None,
-                        false,
-                        VideoThumbnailIndicator::default(),
-                        AudioThumbnailIndicator::default(),
-                        false,
-                        Some(0.5),
-                    );
-                });
-            }));
+            output = Some(crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput::default(),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let item = GridItem::Video(std::path::PathBuf::from("v.mp4"));
+                            let layout = layout_cell_overlays(
+                                ui.painter(),
+                                cell,
+                                EditBadgeFlags::default(),
+                                0,
+                                &item,
+                                &ThumbnailState::Pending,
+                                &[],
+                                None,
+                                false,
+                                VideoThumbnailIndicator::default(),
+                                AudioThumbnailIndicator::default(),
+                                true,
+                                None,
+                                Some("1:02:03"),
+                                true,
+                            );
+                            assert!(layout.book_resume_meter.is_some());
+                            draw_cell(
+                                ui,
+                                cell,
+                                false,
+                                true,
+                                true,
+                                &layout,
+                                &item,
+                                &ThumbnailState::Pending,
+                                crate::rotation_db::Rotation::None,
+                                None,
+                                false,
+                                VideoThumbnailIndicator::default(),
+                                AudioThumbnailIndicator::default(),
+                                false,
+                                Some(0.5),
+                            );
+                        })
+                    });
+                },
+            )));
         }
         let shapes = output.unwrap().shapes;
         let fill_color =
-            crate::os_theme::book_resume_meter_palette(ctx.style().visuals.dark_mode).fill;
+            crate::os_theme::book_resume_meter_palette(ctx.global_style().visuals.dark_mode).fill;
         let meter = shapes
             .iter()
             .position(|s| {
@@ -2306,19 +2350,25 @@ mod book_resume_meter_tests {
                     egui::pos2(24.0, 80.0),
                     egui::vec2(92.0, pixels / dpi),
                 );
-                let output = ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        paint_thumbnail_resume_meter(
-                            ui,
-                            meter.expand(4.0),
-                            Some(meter),
-                            Some(1.0),
-                            false,
-                        );
-                    });
-                });
-                let palette =
-                    crate::os_theme::book_resume_meter_palette(ctx.style().visuals.dark_mode);
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                    egui::RawInput::default(),
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                paint_thumbnail_resume_meter(
+                                    ui,
+                                    meter.expand(4.0),
+                                    Some(meter),
+                                    Some(1.0),
+                                    false,
+                                );
+                            })
+                        });
+                    },
+                ));
+                let palette = crate::os_theme::book_resume_meter_palette(
+                    ctx.global_style().visuals.dark_mode,
+                );
                 assert!(output.shapes.iter().any(|s| matches!(&s.shape,
                     egui::Shape::Rect(r) if r.fill == palette.fill && r.rect == meter)));
                 assert!(!output.shapes.iter().any(|s| matches!(&s.shape,
@@ -2337,7 +2387,7 @@ mod book_resume_meter_tests {
                     egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(100.0, 80.0));
                 let meter =
                     egui::Rect::from_min_max(egui::pos2(24.0, 93.0), egui::pos2(116.0, 96.0));
-                let output = ctx.run(
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -2347,17 +2397,19 @@ mod book_resume_meter_tests {
                     },
                     |ctx| {
                         crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            paint_thumbnail_resume_meter(
-                                ui,
-                                cell,
-                                Some(meter),
-                                Some(fraction),
-                                cut,
-                            );
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                paint_thumbnail_resume_meter(
+                                    ui,
+                                    cell,
+                                    Some(meter),
+                                    Some(fraction),
+                                    cut,
+                                );
+                            })
                         });
                     },
-                );
+                ));
                 let color = crate::os_theme::book_resume_meter_palette(true).fill;
                 let expected = if cut {
                     color.gamma_multiply(crate::cut_clipboard::CUT_CONTENT_OPACITY)
@@ -2384,20 +2436,27 @@ mod book_resume_meter_tests {
     fn thumbnail_resume_meter_paint_has_no_track_without_value_or_layout() {
         for has_value in [false, true] {
             let ctx = egui::Context::default();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let rect =
-                        egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 80.0));
-                    paint_thumbnail_resume_meter(
-                        ui,
-                        rect,
-                        (!has_value).then_some(rect),
-                        has_value.then_some(1.0),
-                        false,
-                    );
-                });
-            });
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput::default(),
+                |ctx| {
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(10.0, 10.0),
+                                egui::vec2(100.0, 80.0),
+                            );
+                            paint_thumbnail_resume_meter(
+                                ui,
+                                rect,
+                                (!has_value).then_some(rect),
+                                has_value.then_some(1.0),
+                                false,
+                            );
+                        })
+                    });
+                },
+            ));
             let track = crate::os_theme::book_resume_meter_palette(true).track;
             assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
                 egui::epaint::Shape::Rect(rect) if rect.fill == track)));
@@ -2437,18 +2496,20 @@ mod book_resume_meter_tests {
         duration: Option<&str>,
     ) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        let thumb = ThumbnailState::Loaded {
-            tex: ui.ctx().load_texture(
+        let thumb = ThumbnailState::loaded_raster(
+            crate::ui_helpers::load_snapshot_texture(
+                ui.ctx(),
                 format!("resume-fixture-{}-{}", rect.min.x, rect.min.y),
                 egui::ColorImage::new([1, 1], vec![color]),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-        };
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        );
         let tags = if dense {
             vec!["#本".to_owned()]
         } else {
@@ -2791,15 +2852,18 @@ mod book_resume_meter_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(580.0, 1190.0))
             .with_pixels_per_point(dpi)
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, reserved_meter_fixture);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, reserved_meter_fixture);
+                });
             });
         harness.run();
         harness.snapshot(name);
@@ -2847,15 +2911,18 @@ mod book_resume_meter_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 400.0))
             .with_pixels_per_point(dpi)
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| build_ui(ui));
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| build_ui(ui));
+                });
             });
         harness.run();
         harness.snapshot(name);
@@ -2980,7 +3047,7 @@ mod cut_content_paint_tests {
     fn cut_opacity_fades_cell_content_but_keeps_selection_and_check_opaque() {
         let ctx = egui::Context::default();
         let cell = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 90.0));
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -2989,32 +3056,36 @@ mod cut_content_paint_tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        draw_cell(
-                            ui,
-                            cell,
-                            true,
-                            true,
-                            false,
-                            &ThumbnailOverlayLayout {
-                                check: Some(crate::thumb_overlay_layout::check_overlay_rect(cell)),
-                                ..Default::default()
-                            },
-                            &GridItem::Image(PathBuf::from(r"C:\cut.jpg")),
-                            &ThumbnailState::Pending,
-                            crate::rotation_db::Rotation::None,
-                            None,
-                            false,
-                            VideoThumbnailIndicator::default(),
-                            AudioThumbnailIndicator::default(),
-                            true,
-                            None,
-                        );
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            draw_cell(
+                                ui,
+                                cell,
+                                true,
+                                true,
+                                false,
+                                &ThumbnailOverlayLayout {
+                                    check: Some(crate::thumb_overlay_layout::check_overlay_rect(
+                                        cell,
+                                    )),
+                                    ..Default::default()
+                                },
+                                &GridItem::Image(PathBuf::from(r"C:\cut.jpg")),
+                                &ThumbnailState::Pending,
+                                crate::rotation_db::Rotation::None,
+                                None,
+                                false,
+                                VideoThumbnailIndicator::default(),
+                                AudioThumbnailIndicator::default(),
+                                true,
+                                None,
+                            );
+                        })
+                });
             },
-        );
+        ));
         let mut shapes = Vec::new();
         for clipped in &output.shapes {
             collect_shapes(&clipped.shape, &mut shapes);
@@ -3065,7 +3136,7 @@ mod cut_content_paint_tests {
     fn cut_badge_is_vector_at_small_size_and_replaces_video_play_indicator() {
         fn paint_video(is_cut: bool) -> Vec<egui::epaint::Shape> {
             let ctx = egui::Context::default();
-            let output = ctx.run(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -3074,32 +3145,34 @@ mod cut_content_paint_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            draw_cell(
-                                ui,
-                                egui::Rect::from_min_size(
-                                    egui::pos2(10.0, 10.0),
-                                    egui::vec2(48.0, 36.0),
-                                ),
-                                false,
-                                false,
-                                false,
-                                &ThumbnailOverlayLayout::default(),
-                                &GridItem::Video(PathBuf::from(r"C:\cut.mp4")),
-                                &ThumbnailState::Pending,
-                                crate::rotation_db::Rotation::None,
-                                None,
-                                false,
-                                VideoThumbnailIndicator::PlayIcon,
-                                AudioThumbnailIndicator::default(),
-                                is_cut,
-                                None,
-                            );
-                        });
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                draw_cell(
+                                    ui,
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(10.0, 10.0),
+                                        egui::vec2(48.0, 36.0),
+                                    ),
+                                    false,
+                                    false,
+                                    false,
+                                    &ThumbnailOverlayLayout::default(),
+                                    &GridItem::Video(PathBuf::from(r"C:\cut.mp4")),
+                                    &ThumbnailState::Pending,
+                                    crate::rotation_db::Rotation::None,
+                                    None,
+                                    false,
+                                    VideoThumbnailIndicator::PlayIcon,
+                                    AudioThumbnailIndicator::default(),
+                                    is_cut,
+                                    None,
+                                );
+                            })
+                    });
                 },
-            );
+            ));
             let mut shapes = Vec::new();
             for clipped in &output.shapes {
                 collect_shapes(&clipped.shape, &mut shapes);
@@ -3313,18 +3386,20 @@ fn snapshot_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
             pixels.push(color);
         }
     }
-    ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    ThumbnailState::loaded_raster(
+        crate::ui_helpers::load_snapshot_texture(
+            ctx,
             name,
             egui::ColorImage::new(size, pixels),
             Default::default(),
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        rendered_at_px: 128,
-        source_dims: Some((1920, 1080)),
-        layout_dims: None,
-    }
+        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        128,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((1920, 1080)),
+        None,
+    )
 }
 
 /// Snapshot fixture that routes every cell through the production grid layout and paint helpers.
@@ -3452,20 +3527,21 @@ mod bottom_left_content_tests {
 
     fn loaded() -> ThumbnailState {
         let ctx = egui::Context::default();
-        ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "dummy",
                 egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 128,
             },
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_dims: None,
-            layout_dims: None,
-        }
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )
     }
 
     #[test]
