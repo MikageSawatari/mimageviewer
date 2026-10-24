@@ -75,9 +75,40 @@
   `rust-toolchain.toml` で Rust 1.99.0 に固定したのは egui 0.37 更新のとき。`bench_search` は tantivy と rusqlite を直接呼ぶ独立の bin で、mIV の検索コードを通らない。
   PC の負荷による差ではないことは、同じ条件で続けて測った値がビルドの種類だけで分かれ、英語の同規模のクエリが全ビルドで同じだったことから判断した。
 - 利用者決定 (2026-10-24): v4.8.0 はこのまま公開し、別件で調べる。`vendor/bench_baseline.json` は更新していない (更新すると基準が今の遅い値に変わる)。
-- 調べること: tantivy のどの処理が遅くなったか (取り出しの collector / 転置リストの復号など)、tantivy 0.27 (依存更新の確認で出ている) で戻るか、`codegen-units`・`target-cpu` 等のビルド設定で戻るか、
-  Rust 1.95〜1.98 のどこから遅くなったか。実際の索引 (数十万件) での体感差も測る。
-- 規模 / 優先度: 調査後に見積り / P2 (よく出てくる語の検索が遅くなる、出荷済みの版で起きる)。
+- 調査結果 (2026-10-24、ClaudeCode の計測。`bench_search` の検索部分だけを抜いた独立 crate を、同じ release profile・同じ `vendor/tantivy` でビルドして比較):
+  - **遅くなったのは 2 語 (bigram 2 個) の AND の採点 `Intersection<TermScorer, _>::score` だけ**。交差の走査だけ (Count / DocSetCollector)、頻度の復号、
+    1 語の採点、4 語の AND ("photo") の採点は Rust 1.94.1 と 1.99.0 で同じ速さ。採点器を直接回すと、カメラ 0.25ms → 3.4ms、夕焼け 0.05ms → 0.5ms (約 10〜13 倍)。
+    「カメラ」「夕焼け」はどちらも bigram 2 個になる。製品のクエリ (`build_bigram_and_query`: 対象フィールドごとの bigram AND をフィールド間の OR で束ねる) も同じ関数を通る。
+  - 遅くなったのは **Rust 1.95.0 から** (1.94.1 だけ速く、1.95.0〜1.99.0 はすべて遅い)。
+  - 仕組み: LTO 後、左右 2 語の BM25 (`tf / (tf + norm)`) が SIMD の 2 レーンにまとめて計算される。1.94 は使わない上位レーンを 0 にしていたが、
+    1.95 以降は `cvtsi2ss xmm1` を xmm1 を 0 にせずに使い、上位レーンに前の処理の残り値が残る。それが非正規化数として読める値のとき、
+    `addps`/`divps` が毎回非正規化数の例外処理 (microcode assist) を起こす。計算結果は変わらず、速さだけが落ちる。
+    裏付け: MXCSR の FTZ/DAZ を立てると 1.99 でも 1.94 の速さに戻る (ページ取得 87ms → 17.6ms)。
+- 戻す手段の比較 (1.99、カメラの 20 ページ取得 / 2 語採点。1.94.1 は 22ms / 0.27ms、修正前の 1.99 は 80ms / 3.1ms):
+  | 案 | 結果 | 判断 |
+  | --- | --- | --- |
+  | toolchain を 1.94 に戻す | — | 不可。egui 0.37 系 (vendor の egui / eframe / egui-wgpu / egui-winit) が `rust-version = "1.95"`、遅くなるのも 1.95 から |
+  | `codegen-units = 1` / `lto = "fat"` / incremental なし | 80ms / 3.1〜3.4ms | 効果なし |
+  | `lto = "off"` | 22ms / 0.7ms | 戻るが製品全体の最適化を落とす。不採用 |
+  | `target-cpu = x86-64-v3` | 17ms / 0.28ms | 戻るが AVX2 の無い CPU で起動できなくなる。不採用 |
+  | tantivy 0.27 へ更新 | 34ms / 2.9ms | collector 側が速くなっただけで採点は遅いまま。0.27 と upstream main の `Intersection::score` も同じコード |
+  | **右側の採点を `#[inline(never)]` の関数経由にする** | **21ms / 0.30ms** | 採用。右側の BM25 の展開を止め、左右 2 つが同じ関数内で SIMD 化されないようにする (ClaudeCode の独立 crate 計測) |
+  明示ループ案は bench の bin では効いたが、ClaudeCode が製品 exe を逆アセンブルすると問題の SIMD 化が残っていたため、不採用。
+  旧明示ループ案の bench 全体 (各 3 回の最良値): カメラ 113ms → 22ms、夕焼け 12.9ms → 8.5ms。ほかのクエリはばらつきの範囲で同じ。製品と同じ形のクエリでもカメラ 78ms → 17ms だったが、製品 exe での改善を保証するものではなかった。
+- 方針 (2026-10-24): upstream の元の式を保ち、右側の採点だけ `#[inline(never)]` の関数経由にする。値・足し算の順序・呼び出し順を変えず、v4.8.1 に入れる候補にする。`vendor/tantivy/MIV-PATCH.md` に手元の変更として記録する。
+  `#[inline(never)]` を維持し、toolchain や tantivy を上げるときは bench 回帰チェックと製品本体の逆アセンブル確認 (リリース手順 9.5) で確かめ直す。
+  `#[inline(never)]` は仕様上ヒントなので、将来のコンパイラでも SIMD 化されないとは言い切れない。
+- 最終形の確認 (2026-10-24、ClaudeCode。ブランチ `claude/search-slow-1424-88bb45`):
+  - 製品本体 (`mimageviewer-core`、Rust 1.99、`CARGO_INCREMENTAL=0` の release を strip なしでビルドして dumpbin で逆アセンブル) の
+    `Intersection<TermScorer, Box<dyn Scorer>>::score` と `score_out_of_line<TermScorer>` は `addss`/`divss`/`mulss` のスカラー演算だけ。修正前・明示ループ案にあった `unpcklps`/`addps`/`divps` が無い。
+  - 本物の `bench_search --docs 50000` を修正前と交互に 5 回 (最良値): カメラ 90.3ms → 23.8ms、夕焼け 16.0ms → 6.6ms、ほかは同じ。
+    `scripts/check_bench_regression.py vendor/bench_baseline.json` は修正後 3 回分で全クエリ OK (baseline は更新していない)。計測中は別の作業ツリーのビルドが並行していた。
+  - tantivy の lib テスト (workspace 外なので crate のコピーで実行) 1054 passed / 1 failed。失敗は `test_managed_directory_gc_while_mmapped` で、修正前のコードでも同じく失敗する。
+    追加テスト 5 件は、初期値 +0.0・左右の呼び出し順の入れ替え・括り替えのそれぞれで対応する 1 件が落ちることを確認した。
+  - 本体 lib 全件 (`scripts/test-lib-full.ps1`) 14208 passed / 64 skipped。
+  - 独立レビュー (GPT-6.1 Sol / xhigh、2 回): P1・P2 なし、v4.8.1 に入れてよいとの判断。
+  - 実際の索引 (数十万件) での体感差は未確認。
+- 規模 / 優先度: Small / P2 (よく出てくる語の検索が遅くなる、出荷済みの版で起きる)。
 
 ### 1.423 画像を WIC が開いている最中にごみ箱へ送ると、削除が一時的に失敗し得る — テスト基盤の作業中のコード調査 (2026-10-23)
 

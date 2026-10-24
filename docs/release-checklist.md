@@ -272,11 +272,16 @@
     ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
       不足していると `cargo build` が復旧手順付きで止まるようになっている。
 
-9.5. **bench 回帰チェック** (検索周りに変更を入れたリリースで実施):
+9.5. **bench 回帰チェック** (検索周りに変更を入れたリリース、または Rust toolchain (`rust-toolchain.toml`) や tantivy を上げたリリースで実施):
    ```bash
    cargo run --release --features dev-tools --bin bench_search -- --docs 50000 --json /tmp/bench_new.json
    python scripts/check_bench_regression.py vendor/bench_baseline.json /tmp/bench_new.json
    ```
+   - 経緯: [backlog §1.424](next-release-backlog.md) で Rust 1.95 以降の 2 語の AND の採点が遅くなったため、toolchain・tantivy 更新時も確認する。
+   - toolchain・tantivy を上げたときは、bench に加えて製品本体の生成コードも確かめる (bench の bin と製品 exe で展開のされ方が違い、bench だけでは見落とすため)。
+     `CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --bin mimageviewer-core --target-dir target/core-sym` の後、
+     `dumpbin /disasm:nobytes target/core-sym/release/mimageviewer-core.exe` で `tantivy::query::intersection::impl$3::score<tantivy::query::term_query::term_scorer::TermScorer,...>` を探し、
+     `unpcklps`/`addps`/`divps` (左右 2 語を SIMD でまとめた形) が無いことを確かめる。
    - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
      `python scripts/check_bench_regression.py --save vendor/bench_baseline.json /tmp/bench_new.json`
    - 既存 baseline と比較して **+30% 超 かつ +1.0ms 超の劣化**で exit 1。原因を切り分けてから先に進む。
