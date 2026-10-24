@@ -6121,14 +6121,14 @@ fn prepared_converted_archive_path(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::app) struct PreparedVideoFolderPinSeed {
-    pub(in crate::app) cache_key: String,
-    pub(in crate::app) video_path: PathBuf,
-    pub(in crate::app) mtime: i64,
-    pub(in crate::app) file_size: i64,
+pub(crate) struct PreparedVideoFolderPinSeed {
+    pub(crate) cache_key: String,
+    pub(crate) video_path: PathBuf,
+    pub(crate) mtime: i64,
+    pub(crate) file_size: i64,
 }
 
-pub(in crate::app) fn prepare_video_folder_pin_seeds(
+pub(crate) fn prepare_video_folder_pin_seeds(
     items: &[GridItem],
     folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     folder_pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,

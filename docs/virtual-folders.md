@@ -90,14 +90,13 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 F12の複製はaccepted sessionだけを受け取り、保存要求・復元receiverを共有しない。
 ## Everything 検索からの本open/back（§1.374、実装中・検証待ち）
 
-Everythingは外側の実ファイルだけを検索し、ZIP内部entry/PDFページを列挙しない。
+Everythingは外側の実ファイル・実フォルダを検索し、ZIP内部entry/PDFページを列挙しない。
 対応・表示設定に合うZIP/CBZ、PDF/EPUB、変換対象書庫をworkerで分類・statしてSearchのflat行へ採用する。
 元EPUB/変換書庫のidentityを維持し、検索時に変換や内部probeを先行実行しない。
 本openは既存通常open/enumerate/password/convert経路へ渡す。取消/失敗はaccepted位置を変更せず、
 物理表示の成功adoptionだけが `EverythingPosition::PhysicalChild` にlogical source/return anchor/routeを記録する。
 
-ZIP内部の親移動は通常zip navを使い、本の外側では保持したimmutable検索datasetを
-既存Search prepareで再投影してRootへ戻る。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
+ParentはZIP内部なら通常zip navを使い、それ以外でeffective_folderがlogical_sourceの厳密な物理子孫なら通常の物理親へ戻る。起点からは保持したimmutable検索datasetを既存Search prepareで再投影してRootへ戻る。Resultsボタンは階層を飛ばしてRootへ直帰する。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
 同contextのitems/metasとthumbnail requestsは共通adoptionに従い、同pathを読むdetached兄弟の
 PDF ticket/queue/cacheを失効しない。先行PDF ownership改修 `4510346f5` / master `c1e66f589` を前提とする。
 F12は既存open/fork/park/promoteを維持し、Everything datasetを兄弟viewerの一覧ownerにしない。

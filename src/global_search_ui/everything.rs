@@ -1,6 +1,6 @@
 //! Everything is a producer of the shared Search surface, not a second list owner.
 use super::*;
-mod metadata;
+pub(super) mod metadata;
 mod shortcut;
 pub(super) use metadata::prepare as prepare_everything_metadata;
 pub(super) use metadata::{SearchMetadataInstall, SearchMetadataResources};
@@ -78,6 +78,13 @@ pub(crate) enum SearchProducer {
 pub(crate) enum EverythingIntent {
     Query,
     Return,
+}
+
+/// An operation passed to the return router; no additional session state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EverythingReturn {
+    Parent,
+    Results,
 }
 
 impl From<SearchHandle> for SearchProducer {
@@ -369,6 +376,11 @@ impl App {
             },
         };
         let view = GlobalSearchView::Flat;
+        // Physical child installs replace the thumbnail owner without replacing the
+        // retained search dataset/worker. Each reprojection must target the current owner.
+        let _ = prepare.tx.send(SearchPrepareCommand::MetadataResources(
+            SearchMetadataResources::for_app(self),
+        ));
         let adoption = self.capture_search_view_adoption(&view);
         prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
         prepare.desired = Some(SearchViewWish {
@@ -479,11 +491,11 @@ impl App {
             return false;
         };
         if matches!(position, EverythingPosition::Root) {
-            if !dataset.rows.iter().any(|row| {
-                row.item
-                    .file_operation_path()
-                    .is_some_and(|p| crate::folder_tree::path_eq(p, path))
-            }) {
+            // The accepted dataset owns physical identity for both files and folders.
+            // file_operation_path intentionally excludes Folder (checkable file policy).
+            if !crate::path_key::physical_path_spelling(path)
+                .is_some_and(|key| dataset.rows.iter().any(|row| row.physical_key == key))
+            {
                 return true;
             }
             let route = self
@@ -501,19 +513,38 @@ impl App {
         true
     }
 
-    pub(super) fn return_from_everything_child(&mut self) -> bool {
+    pub(super) fn return_from_everything_child(&mut self, operation: EverythingReturn) -> bool {
         let SearchAccepted::Everything {
             dataset, position, ..
         } = &self.global_search.accepted
         else {
             return false;
         };
-        let EverythingPosition::PhysicalChild { return_anchor, .. } = position else {
+        let EverythingPosition::PhysicalChild {
+            logical_source,
+            return_anchor,
+            ..
+        } = position
+        else {
             return true;
         };
-        if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
-            self.zip_nav_back();
-            return true;
+        if operation == EverythingReturn::Parent {
+            if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
+                self.zip_nav_back();
+                return true;
+            }
+            if self.effective_folder().is_some_and(|current| {
+                crate::path_key::physical_path_is_within(&current, logical_source)
+                    && crate::path_key::physical_path_spelling(&current)
+                        != crate::path_key::physical_path_spelling(logical_source)
+            }) {
+                // Resolve reserves selection of the child. Dispatch directly rather than
+                // re-entering handle_grid_parent_folder_action's active-search gate.
+                if let Some(nav) = self.resolve_grid_parent_nav() {
+                    self.apply_fullscreen_close_nav_immediate(nav);
+                }
+                return true;
+            }
         }
         let anchor = return_anchor.clone();
         let dataset = Arc::clone(dataset);
@@ -600,7 +631,7 @@ impl App {
                 if self.everything_has_physical_child() { back = ui.button("← 結果へ戻る").clicked(); }
                 match &self.global_search.accepted {
                     SearchAccepted::Everything {submitted,dataset,..} => {
-                        ui::draw_everything_status(ui,ui::EverythingStatus {total:dataset.stats.total_items,raw_returned:dataset.stats.raw_returned,displayed:dataset.rows.len(),unreadable:dataset.stats.unreadable,limit_reached:dataset.stats.limit_reached,query_changed:submitted.query != self.global_search.query,error:self.global_search.reject_message.as_deref()});
+                        ui::draw_everything_status(ui,ui::EverythingStatus {total:dataset.stats.total_items,raw_returned:dataset.stats.raw_returned,displayed:dataset.rows.len(),outside:dataset.stats.unsupported + dataset.stats.excluded,duplicates:dataset.stats.duplicates,unreadable:dataset.stats.unreadable,limit_reached:dataset.stats.limit_reached,query_changed:submitted.query != self.global_search.query,error:self.global_search.reject_message.as_deref()});
                     }
                     SearchAccepted::Metadata if self.items_are_global_search_view => { ui.label("表示中: アイテム検索の結果。Everything の条件はまだ適用されていません。"); }
                     _ => {}
@@ -620,7 +651,7 @@ impl App {
         if close {
             self.close_global_search();
         } else if back {
-            self.return_from_everything_child();
+            self.return_from_everything_child(EverythingReturn::Results);
         } else if send {
             self.send_everything_search(ctx);
         }

@@ -64955,7 +64955,7 @@ impl App {
     }
 
     #[cfg(all(windows, test))]
-    fn start_active_detached_book_context_from_scanned_folder(
+    pub(crate) fn start_active_detached_book_context_from_scanned_folder(
         &mut self,
         path: PathBuf,
         scan: ScannedDir,

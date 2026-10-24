@@ -9,8 +9,8 @@ Everythingは新しい最上位surfaceを増やさず `TopLevelGridView::Search`
 取得/prepare中はmainだけのmodalとし、完成payloadだけを既存adoption closureで一回公開する。
 
 Everythingのaccepted位置は `Root` / `PhysicalChild { logical_source, return_anchor, route }`。
-Rootからの物理ZIP/PDF/EPUB/変換書庫openは通常経路へ委譲し、実際に物理表示が採用された境界でだけ
-childへ進む。内部ZIP階層は既存zip navを使い、外側の帰路は保持datasetを共通prepareで再投影する。
+Rootからの実フォルダ・画像フォルダ本・物理ZIP/PDF/EPUB/変換書庫のmain openは通常経路へ委譲し、実際に物理表示が採用された境界でだけ
+childへ進む。Parentは内部ZIP階層を既存zip navで戻り、effective_folderがlogical_sourceの厳密な物理子孫なら通常の親移動、起点なら保持datasetを共通prepareで再投影する。Resultsボタンは途中階層を飛ばして結果へ直帰する。独立viewer openではmainのRootを維持する。
 その復帰でIPC、元queryの再実行、新しいorigin captureをしない。検索終了は既存close/restoreを通す。
 
 sort/★/tag/編集準備の入力はimmutable datasetと送信時stampであり、表示中itemsを第二の正本にしない。

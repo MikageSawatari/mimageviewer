@@ -38,6 +38,18 @@ impl SearchMetadataResources {
             pin_db: app.folder_thumb_pin_db.clone(),
             tags_db_path: app.tags_db.as_ref().map(|db| db.read_path().to_path_buf()),
             video_pins: app.video_pin_db.as_ref().and_then(|db| db.read_source()),
+            folder_thumbnails: app
+                .current_color_cache_map
+                .as_ref()
+                .zip(app.current_color_catalog.as_ref())
+                .map(
+                    |(cache, catalog)| everything::metadata::FolderThumbnailResources {
+                        cache: Arc::clone(cache),
+                        catalog: Arc::clone(catalog),
+                        sort: app.settings.folder_thumb_sort,
+                        depth: app.settings.folder_thumb_depth,
+                    },
+                ),
         }
     }
 }
@@ -317,6 +329,7 @@ enum SearchItemsRebuild {
 }
 
 enum SearchPrepareCommand {
+    MetadataResources(SearchMetadataResources),
     Everything(String, crate::everything_ipc::CancelHandle),
     Batch(u64, Vec<GlobalHit>),
     Mtime(MtimeLookupResult),
@@ -1695,7 +1708,7 @@ fn search_prepare_worker(
     available: crate::app::page_edit_snapshot::PageEditAvailability,
     visibility: crate::file_type_visibility::FileTypeVisibility,
     sidecar_settings: crate::settings::Settings,
-    resources: SearchMetadataResources,
+    mut resources: SearchMetadataResources,
 ) {
     let mut state = GlobalSearchState::default();
     let mut archive_visibility =
@@ -1723,6 +1736,7 @@ fn search_prepare_worker(
             break;
         }
         match command {
+            SearchPrepareCommand::MetadataResources(current) => resources = current,
             SearchPrepareCommand::Everything(query, request_cancel) => {
                 let query_started = Instant::now();
                 let result = crate::everything_ipc::query(&query, &request_cancel);
@@ -2121,6 +2135,8 @@ fn search_prepare_worker(
                                 &items,
                                 &image_metas,
                                 &resources,
+                                &cancel,
+                                &wish.visibility,
                             ) {
                                 Ok(metadata) => metadata,
                                 Err(error) => {
@@ -3438,6 +3454,13 @@ impl App {
                 wish.rating_write_generation = self.rating_session_write_generation;
                 wish.rating_preview = self.rating_preview_recipe();
                 wish.done = self.global_search.done;
+                if matches!(wish.source, SearchProjection::Everything { .. }) {
+                    // A pin refresh can replace the thumbnail owner while Ready is
+                    // pending. Retry against that owner, not the rejected one's snapshot.
+                    let _ = prepare.tx.send(SearchPrepareCommand::MetadataResources(
+                        SearchMetadataResources::for_app(self),
+                    ));
+                }
                 let _ = prepare.tx.send(SearchPrepareCommand::RatingWrites {
                     updates: self.rating_session_writes_after(0),
                     through_generation: self.rating_session_write_generation,
@@ -3990,7 +4013,7 @@ impl App {
     /// - current_path == container_root: Aggregated ビューに戻る
     /// - container_root の下に居る: 親フォルダに戻る
     pub(crate) fn drill_back_one_level(&mut self) {
-        if self.return_from_everything_child() {
+        if self.return_from_everything_child(everything::EverythingReturn::Parent) {
             return;
         }
         let Some(d) = self.global_search.drill.clone() else {

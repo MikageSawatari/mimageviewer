@@ -523,7 +523,7 @@ fullscreen/native側からROOTへの新しい転送は加えない。
 |---|---|
 | <kbd>Ctrl</kbd>+<kbd>R</kbd> | main の一覧から Everything ファイル名検索バーを開く。Action: `GlobalEverythingSearch`。閉じる操作は×/Esc。取得・準備中は取消可能なmainのモーダルを使い、完成した一覧だけを採用する |
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
-| <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
+| <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ。Everything (Ctrl+R) 中は開いたフォルダ・本の内部を 1 段戻り、起点からは結果一覧へ戻る。検索の最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
 | 既定キーなし (`GridRename`) | 選択中の実ファイル / 実フォルダ 1 項目の名前を変更する。複数チェック中は実行せず通知する。Grid 文脈だけで、画像 / 動画フルスクリーンには入れない |
 | 既定キーなし (`GridReload`) | 現在の一覧を、その一覧種別の再読み込み / 再スキャン / 再クエリ経路で更新する。スマートフォルダ / サブ展開の走査中は二重起動せず、★固定中は何もしない。表示中のフォルダツリーペインも同時に再読み込みする |

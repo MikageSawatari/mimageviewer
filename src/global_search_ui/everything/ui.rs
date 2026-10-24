@@ -100,7 +100,7 @@ pub(super) fn draw_everything_controls(
     });
     ui.label(
         egui::RichText::new(
-            "Everything クライアントの起動が必要です。先頭10,000件を取得し、対応形式だけ表示します。",
+            "Everything クライアントの起動が必要です。先頭10,000件を取得し、フォルダと対応ファイルを表示します。",
         )
         .small()
         .color(ui.visuals().weak_text_color()),
@@ -112,6 +112,8 @@ pub(super) struct EverythingStatus<'a> {
     pub(super) total: u32,
     pub(super) raw_returned: usize,
     pub(super) displayed: usize,
+    pub(super) outside: usize,
+    pub(super) duplicates: usize,
     pub(super) unreadable: usize,
     pub(super) limit_reached: bool,
     pub(super) query_changed: bool,
@@ -119,18 +121,22 @@ pub(super) struct EverythingStatus<'a> {
 }
 
 pub(super) fn draw_everything_status(ui: &mut egui::Ui, status: EverythingStatus<'_>) {
+    use crate::ui_helpers::HoverTipExt;
     if let Some(error) = status.error {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
     ui.label(format!(
-        "{} 件中 {} 件取得 / mIV 表示対象 {} 件 / 読めなかった項目 {} 件",
-        status.total, status.raw_returned, status.displayed, status.unreadable
+        "全 {} 件 / 取得件数 {} 件 / 表示対象 {} 件 / 対象外 {} 件 / 読めなかった {} 件",
+        status.total, status.raw_returned, status.displayed, status.outside, status.unreadable
+    )).hover_tip(format!(
+        "対象外は非対応・非表示の種類、安全でないパス、作業用・内部フォルダです。重複 {} 件は対象外に含めません。表示対象は★・タグなどで絞り込む前の件数です。",
+        status.duplicates
     ));
     if status.displayed == 0 {
         if status.raw_returned == 0 {
-            ui.label("検索条件に一致するファイルがありません。");
+            ui.label("検索条件に一致する項目がありません。");
         } else {
-            ui.label("取得した結果に表示できるファイルがありません。ファイル種類の設定や検索条件を確認してください。");
+            ui.label("取得した結果に表示できる項目がありません。ファイル種類の設定や検索条件を確認してください。");
             if status.limit_reached {
                 ui.label("フォルダや非対応ファイルも取得上限に含まれます。ext:jpg;png などで条件を絞って再検索してください。");
             }
@@ -190,6 +196,8 @@ pub fn draw_everything_search_snapshot_fixture(ui: &mut egui::Ui) {
             total: 32_145,
             raw_returned: 10_000,
             displayed: 6_789,
+            outside: 3_195,
+            duplicates: 4,
             unreadable: 12,
             limit_reached: true,
             query_changed: true,
@@ -206,6 +214,40 @@ pub fn draw_everything_progress_snapshot_fixture(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn everything_status_reports_outside_separately_from_duplicates_and_uses_items() {
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(900.0, 400.0))
+            .build_ui(move |ui| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts_ready = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                super::draw_everything_status(
+                    ui,
+                    super::EverythingStatus {
+                        total: 30,
+                        raw_returned: 20,
+                        displayed: 0,
+                        outside: 14,
+                        duplicates: 2,
+                        unreadable: 4,
+                        limit_reached: false,
+                        query_changed: false,
+                        error: None,
+                    },
+                );
+            });
+        harness.run();
+        harness.get_by_label(
+            "全 30 件 / 取得件数 20 件 / 表示対象 0 件 / 対象外 14 件 / 読めなかった 4 件",
+        );
+        harness.get_by_label("取得した結果に表示できる項目がありません。ファイル種類の設定や検索条件を確認してください。");
+    }
 
     #[test]
     fn everything_search_bar_not_responding_narrow_dark() {

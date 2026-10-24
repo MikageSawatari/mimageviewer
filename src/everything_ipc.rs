@@ -44,6 +44,10 @@ pub struct EverythingRow {
 }
 
 impl EverythingRow {
+    pub fn is_folder(&self) -> bool {
+        self.flags & ITEM_ROOT == 0 && self.flags & ITEM_FOLDER != 0
+    }
+
     /// Indexed file claims only. The prepare worker still validates physical identity
     /// and stats the supported candidate; this must never authorize metadata purges.
     pub fn is_file(&self) -> bool {
