@@ -2641,8 +2641,14 @@ mod tests {
         );
         assert!(test_files.is_empty());
         assert_eq!(violations.len(), 1);
-        assert!(manifest_roots("[[bin]]\nname = \"implicit\"", true).is_err());
-        assert!(manifest_roots("[[\"bin\"]]", true).is_err());
+        assert!(
+            manifest_roots(
+                "[package]\nautobins = false\n[[bin]]\nname = \"implicit\"",
+                true
+            )
+            .unwrap_err()
+            .contains("requires an explicit string path")
+        );
     }
 
     #[test]
@@ -2681,15 +2687,17 @@ mod tests {
             "autobins = true",
             "autobins = false\nautolib = false",
             "autobins = false\nautoexamples = false",
-            "\"autobins\" = false",
+            "autobins = \"false\"",
+            "autobins = false\nautolib = \"true\"",
         ] {
             let error = manifest_roots(&format!("[package]\n{settings}"), true).unwrap_err();
-            assert!(
-                error.contains("auto-discovery") || error.contains("unsupported Cargo.toml key"),
-                "{error}"
-            );
+            assert!(error.contains("auto-discovery"), "{error}");
         }
-        for settings in ["autobins = false", "autobins = false\nautolib = true"] {
+        for settings in [
+            "autobins = false",
+            "autobins = false\nautolib = true",
+            "\"autobins\" = false",
+        ] {
             let manifest = format!("[package]\n{settings}\n[lib]\nname = \"library\"");
             assert_eq!(manifest_roots(&manifest, true).unwrap(), vec!["src/lib.rs"]);
             assert!(manifest_roots(&manifest, false).unwrap().is_empty());
@@ -2697,20 +2705,83 @@ mod tests {
     }
 
     #[test]
-    fn a6_rejects_top_level_inline_and_dotted_root_declarations() {
-        for root in [
-            r#"lib = { path = "src/custom_lib.rs" }"#,
-            r#"bin = [{ path = "src/probe.rs" }]"#,
-            r#"lib.path = "src/custom_lib.rs""#,
-            r#""lib" = { path = "src/custom_lib.rs" }"#,
+    fn a6_honors_inline_dotted_and_quoted_root_declarations() {
+        for (root, expected) in [
+            (
+                r#"lib = { path = "src/custom_lib.rs" }"#,
+                vec!["src/custom_lib.rs"],
+            ),
+            (
+                r#"bin = [{ path = "src/probe.rs" }]"#,
+                vec!["src/lib.rs", "src/probe.rs"],
+            ),
+            (
+                r#"lib.path = "src/custom_lib.rs""#,
+                vec!["src/custom_lib.rs"],
+            ),
+            (
+                r#""lib" = { path = "src/custom_lib.rs" }"#,
+                vec!["src/custom_lib.rs"],
+            ),
+            (
+                "[package]\nautobins = false\n[[\"bin\"]]\npath = \"src/probe.rs\"",
+                vec!["src/lib.rs", "src/probe.rs"],
+            ),
         ] {
-            let manifest = format!("{root}\n[package]\nautobins = false");
-            let error = manifest_roots(&manifest, true).unwrap_err();
-            assert!(
-                error.contains("unsupported top-level Cargo.toml assignment"),
-                "{error}"
-            );
+            let manifest = if root.starts_with("[package]") {
+                root.to_owned()
+            } else {
+                format!("{root}\n[package]\nautobins = false")
+            };
+            assert_eq!(manifest_roots(&manifest, true).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn a6_rejects_invalid_target_value_shapes() {
+        for target in [
+            "lib = false",
+            "lib = { path = false }",
+            "lib = { path = { value = 'src/p.rs' } }",
+            "bin = {}",
+            "bin = [false]",
+            "bin = [{ name = 'implicit' }]",
+            "bin = [{ path = false }]",
+        ] {
+            let manifest = format!("{target}\n[package]\nautobins = false");
+            assert!(manifest_roots(&manifest, true).is_err(), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn a6_ignores_fake_library_tables_inside_multiline_manifest_strings() {
+        let manifest = r#"
+            [package]
+            autobins = false
+            description = """"
+            [lib]
+            path = "src/test_entry.rs"
+            """"
+        "#;
+        let roots = manifest_roots(manifest, true).unwrap();
+        assert_eq!(roots, vec!["src/lib.rs"]);
+        let roots = roots.iter().map(String::as_str).collect::<Vec<_>>();
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/lib.rs", "mod shared; #[cfg(test)] mod test_entry;"),
+                (
+                    "src/test_entry.rs",
+                    r#"#[cfg(test)] #[path = "shared.rs"] mod shared;"#,
+                ),
+                ("src/shared.rs", TEST_API_CALL),
+            ],
+            &roots,
+        );
+        assert!(test_files.contains("src/test_entry.rs"));
+        assert!(!test_files.contains("src/shared.rs"));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].file, "src/shared.rs");
+        assert_eq!(violations[0].rule, Rule::A6);
     }
 
     #[test]
@@ -2724,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn a6_strips_toml_comments_outside_quoted_root_paths() {
+    fn a6_parses_root_paths_with_comments_and_escaped_quotes() {
         let roots = manifest_roots(
             r##"
             [package] # comment
@@ -2752,7 +2823,7 @@ mod tests {
         assert!(
             manifest_roots("[package]\nautobins = false\n[lib]\npath = \"\"\"", true)
                 .unwrap_err()
-                .contains("unsupported multiline")
+                .contains("cannot parse Cargo.toml")
         );
     }
 

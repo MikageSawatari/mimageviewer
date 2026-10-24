@@ -62,127 +62,71 @@ fn file_route(file: String, test: bool, root: bool) -> SourceRoute {
     }
 }
 
-/// The repository declares explicit bin paths (autobins=false, autolib=true/default).
-/// Read those declarations and the explicit/default library path
-/// without adding a TOML dependency to this source-only tool. Reject unsupported path
-/// syntax/missing paths instead of silently omitting a possible production crate root.
+/// The repository uses explicit bin paths and automatic/default library discovery.
+/// TOML syntax is handled by the parser; unsupported target shapes/settings fail
+/// explicitly instead of silently omitting a possible production crate root.
 pub(super) fn crate_roots(
     manifest: &str,
     sources: &BTreeMap<String, String>,
 ) -> Result<Vec<String>, String> {
-    let mut roots = BTreeSet::new();
-    let mut section = String::new();
-    let mut bin_path = None;
-    let mut lib_path = None;
-    let mut autobins = None;
-    let mut autolib = None;
-    for line in manifest.lines().chain(std::iter::once("[end]")) {
-        let line = strip_toml_comment(line)?.trim();
-        if line.starts_with('[') {
-            let header = line;
-            if header.starts_with("[[")
-                && !header.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || "[]_.-".contains(c) || c.is_ascii_whitespace()
-                })
-            {
-                return Err(format!("unsupported Cargo.toml table header: {header}"));
-            }
-            if section == "[[bin]]" {
-                roots.insert(bin_path.take().ok_or("[[bin]] requires an explicit path")?);
-            }
-            section = header
-                .chars()
-                .filter(|c| !c.is_ascii_whitespace())
-                .collect::<String>();
-            // Quoted keys could disguise package/lib settings from this limited
-            // reader. The repository needs quoted keys only under target tables.
-            if header.contains(['\'', '"']) && !section.starts_with("[target.") {
-                return Err(format!("unsupported Cargo.toml table header: {header}"));
-            }
-        } else if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            if section.is_empty() {
-                return Err(format!(
-                    "unsupported top-level Cargo.toml assignment: {key}"
-                ));
-            }
-            if matches!(section.as_str(), "[package]" | "[lib]" | "[[bin]]")
-                && key.contains(['\'', '"'])
-            {
-                return Err(format!("unsupported Cargo.toml key in {section}: {key}"));
-            }
-            match (section.as_str(), key) {
-                ("[[bin]]" | "[lib]", "path") => {
-                    let path = syn::parse_str::<syn::LitStr>(value)
-                        .map_err(|error| format!("unsupported {section} path: {error}"))?;
-                    let slot = if section == "[lib]" {
-                        &mut lib_path
-                    } else {
-                        &mut bin_path
-                    };
-                    if slot.replace(join("", &path.value())).is_some() {
-                        return Err(format!("duplicate {section} path"));
-                    }
-                }
-                ("[package]", "autobins") => {
-                    if autobins.replace(value).is_some() || value != "false" {
-                        return Err(
-                            "unsupported auto-discovery: require explicit autobins = false".into(),
-                        );
-                    }
-                }
-                ("[package]", "autolib") => {
-                    if autolib.replace(value).is_some() || value != "true" {
-                        return Err(
-                            "unsupported auto-discovery: require autolib = true or its default"
-                                .into(),
-                        );
-                    }
-                }
-                ("[package]", key) if key.starts_with("auto") => {
-                    return Err(format!("unsupported auto-discovery setting: {key}"));
-                }
-                ("[lib]" | "[[bin]]", key) if key.starts_with("path.") => {
-                    return Err(format!("unsupported {section} path key: {key}"));
-                }
-                _ => {}
-            }
-        }
-    }
-    if autobins.is_none() {
+    let manifest = manifest
+        .parse::<toml::Table>()
+        .map_err(|error| format!("cannot parse Cargo.toml: {error}"))?;
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or("unsupported Cargo.toml: expected a package table")?;
+    if package.get("autobins").and_then(toml::Value::as_bool) != Some(false) {
         return Err("unsupported auto-discovery: require explicit autobins = false".into());
     }
-    if let Some(path) = lib_path {
-        roots.insert(path);
+    if package
+        .get("autolib")
+        .is_some_and(|value| value.as_bool() != Some(true))
+    {
+        return Err("unsupported auto-discovery: require autolib = true or its default".into());
+    }
+    for key in package.keys() {
+        if key.starts_with("auto") && !matches!(key.as_str(), "autobins" | "autolib") {
+            return Err(format!("unsupported auto-discovery setting: {key}"));
+        }
+    }
+
+    let mut roots = BTreeSet::new();
+    let library = manifest
+        .get("lib")
+        .map(|value| {
+            value
+                .as_table()
+                .ok_or("unsupported [lib]: expected a table")
+        })
+        .transpose()?;
+    if let Some(path) = library.and_then(|library| library.get("path")) {
+        let path = path
+            .as_str()
+            .ok_or("unsupported [lib] path: expected a string")?;
+        roots.insert(join("", path));
     } else {
         check_path_case(sources, "src/lib.rs")?;
         if sources.contains_key("src/lib.rs") {
             roots.insert("src/lib.rs".into());
         }
     }
-    Ok(roots.into_iter().collect())
-}
-
-/// A small single-line TOML reader: quoted # belongs to the value, an unquoted
-/// # starts a comment. Reject multiline strings rather than misreading settings.
-fn strip_toml_comment(line: &str) -> Result<&str, String> {
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if character == '\\' => escaped = true,
-            Some(delimiter) if character == delimiter => quote = None,
-            None if character == '#' => return Ok(&line[..index]),
-            None if matches!(character, '\'' | '"') => quote = Some(character),
-            _ => {}
+    if let Some(binaries) = manifest.get("bin") {
+        let binaries = binaries
+            .as_array()
+            .ok_or("unsupported [[bin]]: expected an array of tables")?;
+        for binary in binaries {
+            let binary = binary
+                .as_table()
+                .ok_or("unsupported [[bin]]: expected a table")?;
+            let path = binary
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .ok_or("[[bin]] requires an explicit string path")?;
+            roots.insert(join("", path));
         }
     }
-    if quote.is_some() {
-        return Err("unsupported multiline or unterminated Cargo.toml string".into());
-    }
-    Ok(line)
+    Ok(roots.into_iter().collect())
 }
 
 pub(super) fn check_path_case(
