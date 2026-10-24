@@ -1,6 +1,6 @@
 # 音響調整の派生版 (Mixwright の mIV 用別名ビルド) 計画
 
-状態: **設計初版。独立設計レビュー前、実装未着手**。2026-10-24。
+状態: **第 2 版。第 1 回独立設計レビュー (REJECT、§15) の指摘を反映、再レビュー待ち。実装未着手**。2026-10-24。
 Coordinator は ClaudeCode。実装は Codex (GPT-6.1 Sol / high)、独立レビューは別の Sol / xhigh (AGENTS.md)。
 
 ## 0. 目的と利用者の決定
@@ -64,7 +64,7 @@ mIV は v4.3.0 から EffeTune Mixwright (VST3、MIT、作者 Frieve-A) を**無
 | --- | --- | --- |
 | バンドル・DLL 名 | 上流 `CMakeLists.txt:44-52` の `EFFETUNE_PLUGIN_PACKAGE_NAME`、`src/plugin/CMakeLists.txt:20-22`, `:59` | `<NAME>` |
 | 工場情報 (host に見える) | `src/plugin/factory.cpp:11-22` (vendor "Frieve"、URL、クラス名 "EffeTune Mixwright") | vendor = "mImageViewer"、URL = mIV のサイト、クラス名 = `<NAME>`。作者の製品と取り違えさせない |
-| 版 | `src/plugin/version.h`、`CMakeLists.txt:3`、`src/engine/pipeline_model.h:103` (状態に書く appVersion) | 上流の版 + mIV の連番 (例 `0.15.0-miv.1`)。状態の appVersion は上流の版のままでよいか §4 で確かめる |
+| 版 | `src/plugin/version.h`、`CMakeLists.txt:3`、`src/engine/pipeline_model.h:103` (状態に書く appVersion) | 上流の版・派生版の表示用の版・数値の版の 3 種類に分ける (§7.2) |
 | 画面の表記 | `tools/build-ui-assets.mjs:8` の `productName` と `applyProductBranding()` (`:44-48`、HTML・About・locale 10 言語)、初回の案内 (`:9-26`)、`ui-shim/vst-bootstrap.js` (About・ヘルプ・GitHub のリンク `:315-338`, `:383-400`, `:713-763`)、native の文言 (`webview_host.cpp:99-111`, `:210`、`native_file_dialog.cpp:67-71`、`message_router.cpp:662`, `:687`) | `productName` を `<NAME>` にし、既存の置換の仕組みに乗せる。ヘルプのリンクは mIV のマニュアルへ。GitHub のリンクは外すか上流へのクレジットにする |
 | 検証の固定値 | `tools/verify-ui-assets.mjs:108-168`, `:299-302`, `:353-357`、`tests/webview/webview_smoke.cpp:530-545`, `:2045`, `:2057`、`tests/CMakeLists.txt:218-243` | 名前と同時に直す |
 | 上流のまま残る文言 | 上流の JS の約 25 か所 (`ui-manager.js:400` "Starting EffeTune…" など)。多くはデスクトップ版の機能用 | 画面に出るものだけ置換に加える。出ないものは残す (差分を増やさない) |
@@ -83,7 +83,7 @@ mIV は v4.3.0 から EffeTune Mixwright (VST3、MIT、作者 Frieve-A) を**無
 
 ### 2.3 クレジット (残す)
 
-- 同梱の通知 (`THIRD-PARTY-NOTICES.txt` など) に、上流の二つの著作権表示をそのまま残す:
+- 同梱の通知 (`THIRD-PARTY-NOTICES.txt` など) に、上流の二つの著作権表示と、MIT の許諾文・免責文をそのまま残す (About のクレジットだけでは代わりにならない):
   Mixwright `LICENSE` (Copyright (c) 2026, Yoshiyuki Kobayashi) と EffeTune `external/effetune/LICENSE` (Copyright (c) 2025-2026)。
   先頭行の製品名だけ `<NAME>` にし、直後に「EffeTune Mixwright (Frieve) を元にした改変版」と書く。
 - プラグインの About と、画面下の「(C) Frieve 2025, 2026」(`effetune.html:344`、`electron-integration.js:417`) は残し、
@@ -112,7 +112,7 @@ mIV は v4.3.0 から EffeTune Mixwright (VST3、MIT、作者 Frieve-A) を**無
   plugin\                       (新設: 旧 %APPDATA%\Frieve\EffeTunePlugin と %APPDATA%\effetune の役)
     config.json  effetune_presets.json  effetune_plugin_presets.json  sfz-references.json (+ .lock / .tmp)
   webview\                      (新設: 旧 %APPDATA%\mimageviewer-vst3-host.exe の役。WebView2 の user data folder)
-  migration-v1.done             (§5 の移行が成功した印)
+  migration-v1.done / migration-v1.not-applicable   (§5 の移行の判断の印)
 ```
 
 `<data_dir>` は通常版が `%APPDATA%\mimageviewer`、ポータブル版が `<exe_dir>\data` (`src/data_dir.rs:321-323`)。
@@ -127,8 +127,9 @@ mIV は v4.3.0 から EffeTune Mixwright (VST3、MIT、作者 Frieve-A) を**無
   2. `PresetStore::resolvePresetPath()` (`preset_store.cpp:40-66`): `<dir>\plugin\...`。デスクトップ版の `%APPDATA%\effetune` を使う分岐は消す。
   3. WebView2 の user data folder: CHOC の生成器 `tools/build-choc-webview-header.mjs` に置換を 1 つ足し、`Options` に
      `userDataFolder` を加えて `getUserDataFolder()` より優先させる。`webview_host.cpp:647-713` で `<dir>\webview` を渡す。
-  これらはプラグインのコンストラクタ (`plugin_processor.cpp:353-354`) と `initialize()` (`:398-401`) で使われ、IHostApplication より先なので、
-  環境変数が一番単純で確実 (`IHostApplication` 経由は間に合わない)。
+  設定・プリセット・SFZ のストアはプラグインのコンストラクタ (`plugin_processor.cpp:353-354`、`plugin_processor.h:554-556`) で作られ、
+  host の context が届く `initialize(context)` より前に場所が決まる (SfzLibrary は作り直せない)。WebView は `initialize()` の中 (`:398-401`) で
+  すぐに作られる。どちらにも間に合い、作り直しも要らないので、環境変数が一番単純で確実。
 - **環境変数が無いときは起動に失敗させる** (エラーとして mIV に返す)。APPDATA へ黙って戻ると §1 の問題が戻る。
   派生版は DAW で使うことを想定しない。
 - `WEBVIEW2_USER_DATA_FOLDER` (プロセス全体の環境変数) は使わない。同じ host の中の他の WebView にも効いてしまう。
@@ -141,18 +142,60 @@ mIV は v4.3.0 から EffeTune Mixwright (VST3、MIT、作者 Frieve-A) を**無
 ## 5. 出荷済みのデータの移行
 
 v4.3.0〜v4.8.0 の利用者が音響調整で作ったデータは、保存先を変えると派生版から見えなくなる。CLAUDE.md の
-「利用者が作ったデータが失われる」場合に当たるので、**最初に一度だけ写す**。
+「利用者が作ったデータが失われる」場合に当たるので、**最初に一度だけ写す**。出荷済みの同梱版は v4.3〜v4.5 が Mixwright v0.12、
+v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin はどれも同じ (第 1 回レビューで確認)。
 
-- **何を**: (a) `%APPDATA%\Frieve\EffeTunePlugin` の 4 ファイル (と、デスクトップ版のフォルダ `%APPDATA%\effetune` にプリセットがあればそちらの 2 ファイル)、
-  (b) `%APPDATA%\mimageviewer-vst3-host.exe` (WebView2 の user data folder) の中身全体。
-- **いつ・誰が**: mIV の core が、音響調整の bridge を初めて起動する前に、worker で写す (UI スレッドでは行わない)。
-  ユーザー VST の bridge より前に行う (WebView のフォルダを使っている最中に写さない)。起動中の bridge があれば移行は次回に回す。
-- **どう**: 新しい場所が空のときだけ写す。原本は消さない・変えない。成功したら `migration-v1.done` を置く。
-  失敗したら印を置かず、ログと通知を出して空のまま起動する。次回の起動で再び試す (まれな失敗は割り切り。原本が残るので失われない)。
-- **ポータブル版**: 移行しない (これまで使えなかったので移すデータが無い)。
-- **DAW・デスクトップ版との共有はなくなる**。移行の後に DAW 側で作ったプリセットは mIV に出てこない。これはリリース済みの挙動の変更なので、
-  更新履歴・マニュアル・privacy.html に書く。必要なら、プリセットの書き出し・読み込み (拡張子は互換のまま) で行き来できると案内する。
-- WebView のフォルダには、ユーザー VST の他のプラグインのデータも入っている。まとめて写しても害はない (使わないものが残るだけ)。
+### 5.1 対象と判断の印
+
+- **対象は通常のデータフォルダ (`%APPDATA%\mimageviewer`) だけ**。`--data-dir` で隔離したフォルダとポータブル版は、
+  旧データを取り込まない (隔離のつもりの検証用フォルダへ普段のデータが流れ込まないように。ポータブル版はこれまで使えなかった)。
+- 判断は `<data_dir>\effetune\` の中の**印**で行い、フォルダが空かどうかでは判断しない
+  (既存の利用者は `mixwright-state.json` を持っているので「空」にならない。第 1 回レビュー P1)。
+  - `migration-v1.done`: 写し終えた。
+  - `migration-v1.not-applicable`: 対象外 (隔離・ポータブル、または写す元が 1 つも無い新規の利用者)。
+  - どちらも無い: 未判断。
+- 印が無い限り、**派生版を起動しない**。新しい保存先 (`plugin\`、`webview\`) を移行の前に作らせないため
+  (先に作られると、次の起動で写す先に新しいデータが混ざる。第 1 回レビュー P1)。
+
+### 5.2 いつ・どの順で
+
+- mIV の起動時に、ユーザー VST の起動 (`src/app.rs:31590` 付近) と音響調整の起動の**両方より前**に、移行の判断と実行を 1 回だけ行う。
+  worker で行い、UI スレッドでは行わない。移行が終わるまで、ユーザー VST と音響調整の起動はこの結果を待つ
+  (旧 WebView 領域はユーザー VST 用の host も使うので、両方を止めてから写す。第 1 回レビュー P2)。
+- 旧 WebView 領域は、`--data-dir` の違う別の mIV が同時に使っていることがある (`src/single_instance.rs:204`)。
+  写す前に、`mimageviewer-vst3-host.exe` の名前のプロセス (どのデータフォルダの mIV のものでも) が動いていないことを確かめる。
+  動いていれば、今回は写さない (5.4 の失敗と同じ扱い)。
+
+### 5.3 何をどこから
+
+| 写す元 | 写す先 | 規則 |
+| --- | --- | --- |
+| `%APPDATA%\Frieve\EffeTunePlugin\config.json`、`sfz-references.json` | `<data_dir>\effetune\plugin\` | あるものだけ |
+| プリセット `effetune_presets.json`、`effetune_plugin_presets.json` | 同上 | **旧コードと同じ規則で 1 つのフォルダを選ぶ**: `%APPDATA%\effetune` フォルダが存在すればそこ、無ければ `%APPDATA%\Frieve\EffeTunePlugin` (上流 `src/bridge/preset_store.cpp:40-66`)。2 つのフォルダを混ぜない (第 1 回レビュー P2) |
+| `%APPDATA%\mimageviewer-vst3-host.exe\` の中身全体 (WebView2 の user data folder) | `<data_dir>\effetune\webview\` | origin を変えないので、Visualizer のプリセットと画像 (IndexedDB)、IR (OPFS)、測定 (IndexedDB)、UI の状態 (localStorage) がそのまま読める見込み。5.5 の確認で確かめる |
+
+原本は消さない・変えない。ユーザー VST の他のプラグインのデータも WebView 領域に入っているが、まとめて写しても害はない。
+
+### 5.4 失敗したとき
+
+- 写す途中で失敗した、または 5.2 で旧 WebView 領域が使用中だった場合は、印を置かず、写しかけたものを消して、
+  **その起動では音響調整を使えない状態にする** (「データの引き継ぎができませんでした。mIV を再起動してください」と通知し、ログに理由を残す)。
+  ユーザー VST は旧 WebView 領域を使えるので起動してよい。次の起動で再び試す。
+- まれな失敗は割り切り (CLAUDE.md)。原本が残るので、利用者のデータは失われない。再試行の仕組みや部分的な取り込みは作らない。
+
+### 5.5 確かめること (F2 の受け入れ条件)
+
+- 使い捨ての旧プロファイル (旧版の mIV を隔離した場所で使って作ったもの。停止した状態) を写し、派生版で
+  ユーザープリセット・Visualizer の画像とプリセット・IR・測定を読み込み、保存し直し、mIV を再起動しても残っていることを確かめる
+  (状態ファイルの読み込みのテストだけでは IndexedDB・OPFS の移行は確かめられない。第 1 回レビュー P2)。
+  エージェントは隔離した data-dir でだけ操作できるので、旧データは隔離した場所に置いて行う。
+
+### 5.6 DAW・デスクトップ版との共有がなくなること
+
+- 移行の後に DAW 側やデスクトップ版で作ったプリセットは、mIV に自動では出てこない。行き来はプリセットの書き出し・読み込み
+  (拡張子は互換のまま) で行う。これはリリース済みの挙動の変更 (日常の操作が増える)。
+- 2026-10-24 に ClaudeCode が利用者へ「DAW やデスクトップ版とのプリセット共有はなくなる。リリース済みの挙動の変更なので、
+  マニュアルと更新履歴に書く」と説明し、利用者は保存先を分ける方針で進めると回答した (§11 に記録)。更新履歴・マニュアル・privacy.html に書く。
 
 ## 6. ポータブル版での有効化
 
@@ -165,6 +208,8 @@ v4.3.0〜v4.8.0 の利用者が音響調整で作ったデータは、保存先�
   一覧は実装の最初に全部数え直す。
 - ポータブル版は launcher を通らないので、世代の公開 (`runtime/<ver>/effetune/`) は無い。平らな配置のまま使う。
 - WebView2 Runtime が必要な点は通常版と同じ。
+- 音響調整は APPDATA を使わなくなるが、ポータブル版で使えるようになるユーザー VST (利用者が入れた任意のプラグイン) が APPDATA を使わないとは言えない。
+  マニュアル・privacy.html ではそう書き分ける。
 - privacy.html・製品ページ・マニュアルの「ポータブル版では使えない」を直す (`docs/portable-build-plan.md` も)。
 
 ## 7. 派生版のソースとビルド
@@ -173,69 +218,88 @@ v4.3.0〜v4.8.0 の利用者が音響調整で作ったデータは、保存先�
 
 - 上流の `effetune-mixwright` を元にした git リポジトリを `G:\home\miv-sound` (名前は製品名に合わせる) に作る。
   `upstream` に作者のリポジトリ、作業ブランチ `miv` に mIV の変更を積む。上流の新しいタグを取り込むときは merge する。
-- 変更は小さく保つ。名前・クラス ID・保存先・(後の段階で) 歌詞と位置の受け取り。上流の流儀
+- 変更は小さく保つ。名前・クラス ID・保存先・Counter を外すこと (§8)・(後の段階で) 位置と歌詞の受け取り。上流の流儀
   (`tools/build-ui-assets.mjs` の置換と、外れたらビルドを止める検査) に合わせる。
 - ソースを公開するか (例: GitHub に置く) は利用者が決める (§11)。MIT は公開を求めないが、改変版を配るなら公開しておくと
   問い合わせに答えやすい。
 
-### 7.2 ビルド
+### 7.2 版の三つの表し方
 
-- `G:\home\effetune-mixwright-trial` の試作で、VS 2026 BuildTools + 同梱 Ninja + CMake 4.3 + Node 22 でビルドと ctest が通ることを確かめ済み
-  (`docs/effetune-lyrics-trial-plan.md` §0.1)。MSVC 14.50 の C4458 は configure の `/wd4458` で避ける。v0.15.0 でビルド要件は変わっていない。
-- 派生版のリポジトリに ASCII の `build-miv.bat` (試作の `build-trial.bat` を元に) を置き、configure → build → ctest まで行う。
-- mIV 側に `scripts/build-miv-sound.ps1` (ASCII) を足し、派生版のビルドを呼んで、成果物を `vendor/miv-sound/` へ置き、
-  承認用の manifest と出どころの記録を作る (§7.3)。
+| 用途 | 例 | 置き場所 |
+| --- | --- | --- |
+| 上流の版 | `0.15.0` | `PROVENANCE.md`、更新の検査 (`scripts/check-dependency-updates.ps1:170` は文字列の完全一致なので、上流のタグとはこれを比べる) |
+| 派生版の表示用の版 | `0.15.0-miv.1` | `version.h` の文字列 (`EFFETUNE_PLUGIN_VERSION_STR`)、工場情報の版、画面の版、`third_party/miv-sound/<ver>/VERSION` |
+| 数値の版 | `0.15.0.1` | `CMakeLists.txt:3` の `project(VERSION ...)` (数値しか受け付けない)、PE の版情報 |
 
-### 7.3 配布の検査の作り替え
+状態に書く `appVersion` (`src/engine/pipeline_model.h:103`) はコンストラクタで上書きされ (上流 `plugin_processor.cpp:345`)、codec の互換判定には使われない
+(上流 `state_codec.cpp:410`、第 1 回レビューで確認) ので、表示用の版でよい。
 
-今は「承認した公式 ZIP の各ファイルの hash」と照合している (`scripts/effetune-distribution.ps1`、
-`third_party/effetune-mixwright/v0.14.0/manifest.sha256`、`crates/launcher/build_effetune*.rs`)。これを次に変える。
+### 7.3 ビルド・確認・承認を分ける
 
-- `third_party/miv-sound/<ver>/`: `VERSION` (`0.15.0-miv.1` など)、`manifest.sha256` (承認した**派生版のビルド成果物**の全ファイル)、
-  通知 3 本、`PROVENANCE.md` (派生版リポジトリの commit、上流のタグと commit、submodule の commit、ビルドに使った道具の版)。
-- 承認するのは「ある 1 回のビルド成果物」。ビルドの再現でバイトまで一致することは求めない (DLL に時刻が入り得る)。
-  承認した成果物そのものを `C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\` に保存する。
+第 1 回レビュー P2 を受け、「1 回のビルド成果物を確かめてから、その成果物だけを承認する」順にする。
+
+1. **ビルド**: 派生版のリポジトリの ASCII の `build-miv.bat` (試作の `build-trial.bat` を元に、configure の `/wd4458` を含む) で configure → build → ctest。
+   `scripts/build-miv-sound.ps1` (mIV 側、ASCII) がこれを呼び、成果物を**候補置き場** (`target\miv-sound-candidate\`) へ写し、
+   出どころの記録を作る。**未コミットの差分や submodule のずれがあれば止める**。記録するのは、派生版の commit、上流のタグと commit、
+   submodule の commit、CMake の構成 (preset と渡した `-D` の値)、道具の版 (MSVC・CMake・Node・vst3sdk の pin)。
+2. **確認**: 候補を `build-dev.ps1` の確認用ビルドに置いて (`-EffetuneBundle` のような候補を指定する引数を足す) 自動テストと実機確認をし、
+   独立レビューを通す。確認したのはこの候補の中身そのもの。
+3. **承認**: `scripts/build-miv-sound.ps1 -Approve` が、候補の全ファイルの hash から `third_party/miv-sound/<ver>/manifest.sha256` と
+   `PROVENANCE.md`・`VERSION`・通知 3 本を作り、候補を `vendor/miv-sound/` へ置く。承認物そのものを
+   `C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\` に保存する。承認はこの明示の操作のときだけ行う。
+4. **配布ビルド**: `build-release.ps1` / `build-dist.ps1` は、今と同じく承認済みの manifest と照合するだけで、**manifest を作り直さない**
+   (今の `scripts/effetune-distribution.ps1:46` が承認 manifest の作り直しを禁じているのと同じ考え)。
+
+再現ビルドでバイトまで一致することは求めない (DLL に時刻が入り得る)。承認した成果物そのものを保存しておく。
+
+### 7.4 配布の検査の作り替え
+
+- `third_party/miv-sound/<ver>/`: `VERSION`、`manifest.sha256`、通知 3 本 (上流の著作権表示・許諾文・免責文をそのまま含む。§2.3)、`PROVENANCE.md`。
 - 検査の仕組み (ファイル集合・hash・署名だけの変化・stage・世代の公開・パス長) はそのまま使い、固定値 (バンドル名・版・manifest の場所) を
-  一か所の定義から読むようにする。調査で見つかった固定値の場所: `effetune-distribution.ps1:37`, `:41`, `:52`, `:94-95`, `:123`, `:129-135`, `:187`、
-  `build_effetune.rs:12-17`, `:23`, `:37`, `:43`, `:61`、`build_effetune_source.rs:11`, `:75`, `:78`, `:173`、`src/effetune/mod.rs:23`、
-  `src/runtime_cleanup.rs:166`、`about.rs:103-126`, `:599-606`、`test-effetune-distribution.ps1`、`check-dependency-updates.ps1:268-273`、
-  `gen-effetune-docs.py:29`, `:608-611`, `:762`、`installer/readme.txt`。
-- 世代の名前は manifest から決まる (`effetune_bundle.rs:198-209`) ので、名前が変われば新しい世代になる。古い世代の掃除は
-  `runtime_cleanup.rs:166` がバンドル名を固定で見ているので、新旧どちらの名前も掃除できるように直す。
+  **一か所の定義から読む**ようにする。調査とレビューで見つかった固定値の場所:
+  - `scripts/effetune-distribution.ps1:37`, `:41`, `:52`, `:94-95`, `:123`, `:129-135`, `:187`
+  - `scripts/build-dev.ps1:137`、`scripts/build-release.ps1:105`, `:316`、`scripts/build-dist.ps1:220`
+  - `crates/launcher/build_effetune.rs:12-17`, `:23`, `:37`, `:43`, `:61`、`build_effetune_source.rs:11`, `:75`, `:78`, `:173`、
+    `crates/launcher/src/main.rs:922` 付近 (テスト)、`crates/launcher/src/effetune_bundle.rs` のテスト (`:386`, `:481`)
+  - `src/effetune/mod.rs:23`、`src/runtime_cleanup.rs:166` (固定中のバンドルの認識条件)、`src/ui_dialogs/about.rs:103-126`, `:599-606`
+  - `scripts/test-effetune-distribution.ps1`、`scripts/check-dependency-updates.ps1:268-273`、`scripts/gen-effetune-docs.py:29`, `:608-611`, `:762`
+  - `installer/readme.txt`、`htdocs/mimageviewer/.htaccess:27`、テスト (`src/video/dsp/bridge.rs:1734`, `:2023`、`src/app/tests.rs:9320`、
+    `crates/vst3-host/tests/path_boundaries.cpp:84-152`)
+- **改行の保護**: `.gitattributes` は今、旧通知のパスと旧マニュアルのパスだけを守っている (`.gitattributes:26`, `:31`)。新しいパス
+  (`third_party/miv-sound/**` の `-text`、新しいマニュアルの HTML の LF) を同時に足す。足さないと Windows の checkout で通知のバイト一致や
+  生成物の検査が壊れる (第 1 回レビュー P2)。
+- 古い世代の掃除: 削除の候補は世代の名前で列挙するので (`src/runtime_cleanup.rs:184`)、バンドル名ごとの掃除の経路を増やす必要はない。
+  `:166` は「今固定しているバンドルを認識する」条件なので、新しい名前に合わせる (第 1 回レビューで補正)。
 
-### 7.4 上流への追従
+### 7.5 上流への追従
 
 - 方針は「**常に派生版**」(利用者決定)。上流の新しい版は、価値がある変更のときに取り込む。mIV のリリース前に
-  `scripts/check-dependency-updates.ps1` で上流の版を確かめる (今もある仕組み)。
-- 取り込みの手順: 上流のタグを merge → 置換の検査が外れていないか確かめる → ビルドと ctest → 独立レビュー → `build-miv-sound.ps1` で
-  承認 → マニュアルを生成し直す。
+  `scripts/check-dependency-updates.ps1` で上流の版 (`PROVENANCE.md` の上流の版と比べる) を確かめる。
+- 取り込みの手順: 上流のタグを merge → 置換の検査が外れていないか確かめる → 7.3 の 1〜3 → マニュアルを生成し直す。
 
-## 8. ProcessContext に曲の位置を入れる
+## 8. Counter (上流 v0.15.0 の新機能) の扱い
 
-v0.15.0 の Counter (§1-4) のために必要。派生版の初版を v0.15.0 元にするので、同じリリースに入れる。
+- 上流 v0.15.0 の Visualizer Counter は、ProcessContext の `projectTimeSamples` / `sampleRate` / `kPlaying` を表示に使う (§1-4)。
+  mIV の host は処理サンプル数を入れているので、そのままでは曲の位置にならない。
+- 初版の計画では、ブロックごとの曲の位置を共有メモリで渡して ProcessContext に入れる案を書いた。第 1 回レビューで、
+  時間伸縮・ユーザー VST・入力リミッターの後の位置、1 回の処理要求の分割、予熱・リセット時の無音の押し出し・EOS の tail、
+  一時停止中の先読み (処理位置と聞こえる位置が違う) で、どれも正しく扱うには定義が多いと指摘された (P2-5〜7)。
+- **決定 (初版を改める)**: 派生版の最初のリリースでは、**Counter を外す**。上流がプラグイン版で Lyrics を外しているのと同じ方法で、
+  Visualizer の追加メニューから Counter を、内蔵プリセットから Counter Gallery を外す (保存済みのレイアウトの Counter は編集できるが、表示は 0 のまま)。
+  ProcessContext と共有メモリには手を入れない。
+- 曲の位置は §9 の段階で、歌詞の試作で作った「再生時計の位置を通知で送る仕組み」(方式 A) を入れ、**Counter と歌詞の両方に使う**。
+  Counter が示すのは「聞こえている曲の位置」(再生表示の位置) とする。方式 A は一時停止・シーク・速度・曲の切り替えを時計の状態として
+  1 か所で拾うので、ProcessContext に位置を入れる案より扱う組み合わせが少ない (CLAUDE.md「設計の簡素化」)。
+- そのとき派生版の `build-ui-assets.mjs` の `counters()` の差し替え (上流 `:374-389`) を、ホストの位置を読む形に変える。
 
-- host が音響調整の bridge に渡す ProcessContext を、**そのブロックの先頭の曲の位置** (host のサンプルレートのサンプル数) と、
-  **再生中かどうか**にする。`sampleRate` は今も設定している。
-- 位置は Rust 側がブロックごとに知っている (`src/video/audio.rs` の `raw.pts_secs` と `seek_serial`、EffeTune 段 `:2686-2760`)。
-  音声の受け渡しは 480 フレームずつの同期往復 (`src/video/dsp/bridge.rs:1501`, `:1554`) なので、**送る前に共有メモリの header へ
-  そのブロックの位置と再生状態を書き、C++ がその往復の処理で ProcessContext に入れる**。リングの形式はそのまま、header の欄を足すだけ
-  (protocol の版を上げる)。
-- 一時停止中はブロックが届かない (`audio.rs:3838-3850`) ので、Counter は最後の位置で止まる (表示として正しい)。kPlaying を落とす機会は
-  無いが、Counter は再生状態をアニメーションの判断にしか使わない (上流 `visualizer-counter.js:54-68`)。
-- 再生速度を変えているときは、プラグインに届く音は出力の時間で進むが、位置は曲の位置を入れる。Mixwright はこの不連続を見て自動化の時刻を
-  合わせ直す (`automationBlockStart`) が、mIV は自動化を使わないので影響しない見込み (実装時に確かめる)。
-- ユーザー VST の bridge は今のまま (この段階では対象外。利用者の VST が位置を使う例が出たら別に検討する)。
-- Remote 配信は端末より先を処理するので、位置は端末の再生位置にならない。Remote 中は音響調整の窓が開けない
-  (`src/effetune/mod.rs:914`) ので、表示上の問題は出ない。
-- 歌詞の試作で比べた「方式 B」(`docs/effetune-lyrics-trial-plan.md` §3) と同じ経路になる。歌詞の同期の精度は §9 で別に扱う。
+## 9. 位置と歌詞の受け取り (後の段階)
 
-## 9. 歌詞連携の位置付け
-
-- 派生版の後の段階にする。派生版なので、作者に頼まずに mIV が歌詞と位置の受け取りを入れられる。
-- 試作 (`G:\home\mimageviewer-lyrics` ブランチ `effetune-lyrics-trial`、`G:\home\effetune-mixwright-trial` ブランチ `miv-lyrics-trial`) の
-  方式 A (再生時計の位置を通知で送る) をそのまま派生版へ移すか、§8 の ProcessContext の位置 (方式 B) を使うかは、その段階で決める。
-  試作の測定 (§13: オフセット 0 で歌詞が音より約 58 ms 早い、原因は出力側) から、どちらでも出力側の遅れの補正が論点になる。
-- 歌詞を入れたら、作者の Lyrics 項目と Lyric Stage を派生版で表示する (上流は「ホストに歌詞が無い」ため外している)。
+- 派生版の最初のリリースの後に行う。派生版なので、作者に頼まずに mIV が入れられる。
+- 試作 (`G:\home\mimageviewer-lyrics` ブランチ `effetune-lyrics-trial`、2026-10-24 に master v4.8.0 を merge 済み。
+  `G:\home\effetune-mixwright-trial` ブランチ `miv-lyrics-trial`) の方式 A を派生版のリポジトリへ移し、Counter (§8) と歌詞の両方に使う。
+- 試作の測定 (`docs/effetune-lyrics-trial-plan.md` §13: オフセット 0 で歌詞が音より約 58 ms 早い、原因は cpal より後の出力側) から、
+  出力側の遅れを位置に含める補正が論点になる。
+- 歌詞を入れたら、上流の Lyrics 項目と Lyric Stage を派生版で表示する。
 
 ## 10. マニュアル・製品ページ・公開文書
 
@@ -265,6 +329,15 @@ v0.15.0 の Counter (§1-4) のために必要。派生版の初版を v0.15.0 �
 
 ## 11. 利用者に決めてもらうこと
 
+決定済み (2026-10-24):
+
+- 派生版にする。名称・クラス ID・保存先をすべて変え、保存先を mIV のデータフォルダへ移す。ポータブル版でも使えるようにする。
+- **DAW・デスクトップ版とのプリセット共有がなくなること**: ClaudeCode が「プリセット共有はなくなる。リリース済みの挙動の変更なので、
+  マニュアルと更新履歴に書く」と説明し、利用者は「その方針で進めたい」と回答した。行き来は書き出し・読み込みで行う (§5.6)。
+- 利用者に見える EffeTune の語は消し、著作権表示とクレジットは残す。マニュアルを作り直す。作者へは一度だけ連絡する。
+
+未決定 (設計レビューの後にまとめて聞く):
+
 1. **製品名** (§2.1。推奨は mIV Sound)。
 2. **派生版のソースを公開するか** (§7.1)。公開する場合の置き場 (GitHub の mIV のアカウントなど)。
 3. **ポータブル版での有効化を同じリリースに入れるか** (§6)。入れない場合も保存先の切り替えは先に入れる。
@@ -275,17 +348,15 @@ v0.15.0 の Counter (§1-4) のために必要。派生版の初版を v0.15.0 �
 
 | 段階 | 内容 | 担当 |
 | --- | --- | --- |
-| F1 | 派生版リポジトリ (v0.15.0 元): 名前・クラス ID・保存先の環境変数・WebView の user data folder・クレジット・アイコン、上流のテストの更新、出荷済みの状態ファイルを読むテスト、`build-miv.bat` | Codex (派生版リポジトリ) |
-| F2 | mIV: 配布の検査の作り替え (§7.3)、`build-miv-sound.ps1`、bridge の環境変数、§5 の移行、名前の固定値、host の窓タイトル・FileDescription、About・設定画面の表記 | Codex (mIV の worktree) |
-| F3 | ProcessContext に曲の位置 (§8)。host の C++ と Rust、protocol の版 | Codex (mIV、F2 の後) |
-| F4 | マニュアルの生成器と公開文書 (§10) | Codex |
-| F5 | ポータブル版での有効化 (§6) | Codex。§11-3 の決定による |
-| F6 | 作者への連絡 (§13)。F1〜F4 が揃い、リリースの前 | 利用者 |
-| 後 | 歌詞連携 (§9) | 別計画 |
+| F1 | 派生版リポジトリ (v0.15.0 元): 名前・クラス ID・3 種類の版・保存先の環境変数・WebView の user data folder・クレジットと通知・アイコン・Counter を外す (§8)、上流のテストの更新、出荷済みの状態ファイルを読むテスト、`build-miv.bat` | Codex (派生版リポジトリ) |
+| F2 | mIV: ビルド・確認・承認の手順 (§7.3)、配布の検査の作り替えと固定値の一本化・`.gitattributes` (§7.4)、bridge の環境変数、移行 (§5、受け入れ条件 §5.5)、host の窓タイトル・FileDescription、About・設定画面の表記 | Codex (mIV の worktree) |
+| F3 | マニュアルの生成器と公開文書 (§10) | Codex |
+| F4 | ポータブル版での有効化 (§6) | Codex。§11 の未決定 3 による |
+| F5 | 作者への連絡 (§13)。F1〜F3 が揃い、リリースの前 | 利用者 |
+| 後 | 位置と歌詞の受け取り (§9)。Counter をそこで戻す | 別計画 |
 
-F1〜F4 は同じリリースに入れる (名前が変わるのが一度で済むように)。各段階は独立レビューを通す。F1 と F2 は触るリポジトリが違うので並行できる。
-F2 の前に、F1 で作った試作の成果物で mIV 側をつなぐ (`build-dev.ps1` に試作のバンドルを置く仕組みは歌詞の試作で作った
-`-EffetuneBundle` の考えを使う)。
+F1〜F3 は同じリリースに入れる (名前が変わるのが一度で済むように)。各段階は独立レビューを通す。F1 と F2 は触るリポジトリが違うので並行できる。
+F2 は F1 の候補の成果物 (§7.3 の 1) を確認用ビルドに置いてつなぐ。
 
 ## 13. 作者への連絡文の下書き (送るのは利用者。内容は事実の確認後に直す)
 
@@ -305,9 +376,41 @@ F2 の前に、F1 で作った試作の成果物で mIV 側をつなぐ (`build-
 1. **内部の名前を変えない**: 採用。通知 ID・キー・origin・ファイル拡張子・mIV の設定名・状態ファイル名をそのままにし、
    互換と上流への追従の手間を減らす (§2.2)。
 2. **保存先は環境変数 1 つで渡す**: 採用。IPC の命令や設定ファイルの受け渡しを作らない (§4.2)。
-3. **移行は一度だけ写す**: 採用。DAW 側との同期や差分の取り込みは作らない。原本を残すので失敗しても失われない (§5)。
-4. **環境変数が無ければ失敗させる**: 採用。APPDATA への黙った戻り先を持たない (§4.2)。
-5. **再現ビルドでの一致を求めない**: 採用。承認した成果物そのものを保存し、その hash で検査する (§7.3)。
-6. **ポータブル版も平らな配置**: 採用。世代の公開をポータブル版に持ち込まない (§6)。
+3. **移行は印で判断し、終わるまで派生版を起動しない**: 採用 (第 1 回レビュー P1 を受けて改めた)。新旧のデータが混ざる組み合わせを作らない。
+   失敗したらその起動では音響調整を使わず、次の起動でやり直す。DAW 側との同期や差分の取り込みは作らない (§5)。
+4. **移行は通常のデータフォルダだけ**: 採用。隔離とポータブル版の組み合わせを移行から外す (§5.1)。
+5. **環境変数が無ければ失敗させる**: 採用。APPDATA への黙った戻り先を持たない (§4.2)。
+6. **ビルド・確認・承認を分け、再現ビルドでの一致は求めない**: 採用。確認した成果物そのものを承認・保存する (§7.3)。
+7. **Counter を最初のリリースでは外す**: 採用 (第 1 回レビュー P2-5〜7 を受けて改めた)。ProcessContext に位置を入れる案は、
+   時間伸縮・分割・予熱・無音の押し出し・EOS・一時停止の先読みの組み合わせが多い。位置は後の段階で方式 A の 1 つの仕組みにまとめ、
+   Counter と歌詞の両方に使う (§8, §9)。
+8. **ポータブル版も平らな配置**: 採用。世代の公開をポータブル版に持ち込まない (§6)。
 
 まれな失敗 (移行の書き込み失敗、承認物の破損など) は割り切り (ログ + 通知、移行は次回の起動で再試行)。
+
+## 15. レビュー記録
+
+### 15.1 第 1 回独立設計レビュー (2026-10-24、GPT-6.1 Sol / xhigh、read-only)
+
+対象は初版 (a12b420c8)。Codex SID `01a16d0e-0324-71d3-95b8-eb48c03cab13`。判定 **REJECT**。保存先の分離と環境変数の採用は成立。
+移行の条件と曲の位置の扱いに、通常の操作で破綻する経路があるという理由。ClaudeCode が根拠を読み、すべて妥当と判断して第 2 版に反映した。
+
+| 指摘 | 内容 | 反映先 |
+| --- | --- | --- |
+| P1 | 「新しい場所が空」の判断では既存の利用者が対象外になり、移行を先送りした後に新しい保存先が使われると移行できなくなる | §5.1 (印で判断、移行が終わるまで派生版を起動しない)、§14-3 |
+| P2 | 移行をユーザー VST の起動より前に置く仕組みが無い。別の data-dir の mIV が旧 WebView 領域を使っている場合。隔離フォルダへの取り込み | §5.1 (通常のデータフォルダだけ)、§5.2 (両方の起動より前に 1 回、host のプロセスが動いていれば写さない) |
+| P2 | プリセットの移行元の選び方が旧コード (フォルダがあればそちら) と違う | §5.3 |
+| P2 | origin が同じというだけでは、IndexedDB・OPFS の移行が成り立つ証拠にならない | §5.5 (使い捨ての旧プロファイルでの受け入れ確認) |
+| P2 | `raw.pts_secs` では音響調整の入力の位置にならない (時間伸縮・ユーザー VST・リミッター・分割) | §8 (Counter を外し、ProcessContext の案をやめる) |
+| P2 | 予熱・リセット時の無音・EOS の tail も ProcessContext を作る | 同上 |
+| P2 | 一時停止中も先読みで処理が進むので、最後の処理位置は聞こえる位置ではない | 同上、§8 (Counter は聞こえる位置。方式 A で後に入れる) |
+| P2 | ビルドと承認の境界が曖昧。未コミットの差分や構成の記録 | §7.3 (ビルド・確認・承認を分ける、dirty なら止める、構成を記録) |
+| P2 | 固定値の一覧の漏れと、`.gitattributes` の改行の保護 | §7.4 |
+| P2 | 版を 1 種類にすると `project(VERSION)` と更新の検査が壊れる | §7.2 (3 種類に分ける) |
+| P2 | DAW との共有がなくなることを、相談済みとして記録していない | §5.6、§11 (2026-10-24 の説明と回答を記録) |
+
+ほかに確認された前提: 環境変数はコンストラクタと `initialize()` に間に合う (ただし `initialize(context)` には host の context が渡るので、
+§4.2 の説明を補正した)。通常の同期転送は 1 組の値で対応できる。クラス ID を変えても状態の復元は妨げない。通常の永続の書き込みは 3 か所の
+保存先の変更で捕まえられる (バックアップの一時退避は利用者が選んだ出力先の隣、automation trace は明示の環境変数の指定先)。MIT の通知は
+著作権表示に加えて許諾文と免責文を残す必要がある。ポータブル版の平らな配置は既存の resolver と合う。ただし、利用者が入れた任意の
+ユーザー VST が APPDATA を使わないとは言えない (§6 に追記)。
