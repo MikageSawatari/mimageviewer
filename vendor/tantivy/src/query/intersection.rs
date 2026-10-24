@@ -231,7 +231,7 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
 // An explicit loop still did this in the product exe. With this helper, the
 // Rust 1.99 product release build has scalar code only (checked by disassembly).
 // `#[inline(never)]` is a hint, so recheck after toolchain/Tantivy updates.
-// See docs/next-release-backlog.md §1.424 and docs/release-checklist.md §9.5.
+// See vendor/tantivy/MIV-PATCH.md (2026-10-24) and docs/release-checklist.md §9.5.
 #[inline(never)]
 fn score_out_of_line<TScorer: Scorer>(scorer: &mut TScorer) -> Score {
     scorer.score()

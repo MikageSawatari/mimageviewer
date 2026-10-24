@@ -81,7 +81,8 @@ is a hint, not a guarantee, so keep it and recheck the product function after
 toolchain or Tantivy updates. The original sum and addition/call order are
 unchanged.
 Tests cover two- and four-term Must AND scores, negative zero, call order and
-rounding. Upstream 0.27 and main still use the original expression. See
-`docs/next-release-backlog.md` §1.424; rerun the bench regression check and the
+rounding. Upstream 0.27 and main still use the original expression. The full investigation (measurements and rejected
+options) is backlog §1.424 in `docs/next-release-backlog.md` at commit
+`94017f82e`; the section was removed after v4.8.1 shipped. Rerun the bench regression check and the
 product disassembly check (`docs/release-checklist.md` §9.5) when updating the
 Rust toolchain or Tantivy.

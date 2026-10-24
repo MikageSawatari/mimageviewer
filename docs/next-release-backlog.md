@@ -52,23 +52,6 @@
   合格基準の変更なので独立レビューを通す。
 - 規模 / 優先度: Small / P2 (リリースの合否が、操作のタイミングで偶然 FAIL になる)。
 
-### 1.426 全画面の画像・動画より Windows のタスクバーが前面に出る — 5ch >>610 (2026-10-24)
-
-- 状態: **修正済み・利用者の実機確認で解消 (2026-10-24)、v4.8.1 で出荷予定**。v4.8.0の依存更新による影要求を除き、v4.7.1の影なし契約へ戻した (`47341ac89`)。
-  利用者が確認用ビルド (`build-dev.ps1`) で、静止画・動画の両方、F12 切り離しのあり/なし、複数ウィンドウで、全画面のタスクバー前面表示が解消し、
-  他ウィンドウとの切り替えも問題ないことを確認した。HUD の点滅は利用者の環境では元から再現しないため未確認。
-  動画でも解消した仕組み (presenter popup が前面になる経路で、egui 側の影がどう効いていたか) はコードからは説明できておらず、未解明のまま残す。
-- 出典 (報告者、v4.8.0): >>609 の点滅への追加対策の案内に対し、>>610 で「UIの点滅は解消しました」と回答。一方、画像・動画の両方をフルスクリーンにすると Windows のタスクバーが画像/映像の上 (前面) に表示されるようになったとの新規報告。報告者は「今回からの不具合なのか」としており、発生し始めた版は断定していない。
-- 開発側の観測: 利用者本人もタスクバーが前面に出る状態を確認済み。「今回の開発中に入ったよう」との所感。本セッションのエージェントは非表示のテスト用HWNDだけを検査し、製品の実画面試験は未実施。§1.387の点滅解消と、この新しいタスクバー問題は別の観測として追跡する。
-- 期待する動作: 画像・動画の全画面が操作対象になっている通常閲覧中に、タスクバーが意図せず前面へ残らないこと。Windows キー/Alt+Tab 等で OS や別アプリへ切り替える操作、タスクバーの自動非表示、通常ウィンドウへ戻した後の表示・フォーカスは維持する。
-- 調査・修正: `vendor/egui-winit/src/lib.rs`の生成とDecorations更新が、本家#8169/#8449に従ってwinit fullscreen指定のない枠なし窓へ影を要求していた。winit 0.30.13の`WM_NCCALCSIZE`はそのmarkerでclientのtop/bottomを各+1pxする。mIVの通常全画面・PDF/ZIP内部reopen・F12 borderless・詳細thumbnail tooltipは影が不要で、生成builder 4箇所／更新command 2箇所を共通のvendor境界で影なしへ戻した（通常枠付き窓のOS標準影は変更しない）。per-viewport状態や独自fullscreen通知は追加しない。
-- 動画の確認: `src/video/mod.rs::native_window_mode_for_placement`はFullscreenBorderlessをWS_POPUPのBorderlessへ写像し、ownerは既存のmain HWND。`show_no_activate`のSW_SHOWNOACTIVATE/SWP_NOACTIVATEは表示時の規約で、`NativeWindowHost::raise_presenter_to_front`→`claim_foreground`はpresenter自身へforeground/active/focusを移す。HUDはpresenter所有のWS_EX_NOACTIVATE窓。したがって「egui全画面viewportがforegroundなので影で動画も説明できる」とは認定できない。v4.7.1..masterのpresenter/host/HUDと`ensure_native_video_front`を照合し、owner/style・前面移譲の変更は確認されず、§1.387 A1は診断追加、A2は同一HUD実矩形時のSetWindowPos省略（不一致時のflagsは維持）、A3はDComp可視性を最終batchへ集約する変更だった。動画のタスクバー症状へ結び付く原因は未確認のため、今回presenter側は変更していない。
-- 自動検証 (2026-10-24): 非表示実HWNDの新回帰は修正前の生成・Decorations更新とも原点不一致でexit 101。修正後の`cargo test --offline --manifest-path vendor/egui-winit/Cargo.toml --lib`は44件成功、同`--doc`は0件・exit 0。`cargo check --offline -j 1 -p mimageviewer --bin mimageviewer-core`はexit 0。`CARGO_BUILD_JOBS=1`で`test-focused.ps1 -Path src/app/detached_placement.rs`は21件成功・exit 0（`target/test-focused/runs/20261024T084543718Z-ae705583`）。既定の`test-focused.ps1`はvendorを広域と判定して実行せずexit 2。本体check／明示焦点の初回はturbojpeg-sysのMSBuildでexit 101、同じ生成物を1並列でビルドすると成功し、上記の1並列で再検証した。製品テスト失敗とは区別する。root／vendorのfmt check・git diff --checkは成功。完成差分の独立レビューはACCEPT。lib全件は依頼どおりClaudeCodeが別途実行する。
-- 確認用ビルド (2026-10-24): `CARGO_BUILD_JOBS=1`で`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`がexit 0。通常feature setのcore・remote service・EPUB workerを生成し、依存DLL配置とvcrt PE検査（runtime=4、pe=3）も成功。`target/dev-runtime/mimageviewer-core.exe`は起動していない。通常の`%APPDATA%/mimageviewer`を使う確認用であり、利用者がインストール版／常駐tray版を閉じてから起動する。製品のタスクバー表示・HUDの実機確認は未実施。
-- 点滅改善をまとめて撤回したり、「常に最前面」の強制、タスクバーの全体非表示、時間待ち/反復 raise で症状を隠したりしない。正しい全画面の所有/前面化を既存の境界へ揃える。detached へ触れる実装は [構造リワークの規則](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-最重要) に従い、構造的修正の合意と記録を得る。
-- 検証: 画像/動画、メインから F11・F12→F11・複数ウィンドウ、全画面への入退場/Alt+Tab/復帰、タスクバーの通常表示/自動非表示、モニター移動・DPI、上下 HUD の表示/固定と点滅の再発を確認する。再現条件を確定して対応する回帰テストを追加し、実画面試験は隔離 portable と当該 run の承認を別途得る。既に再現できているため、報告者へ追加の環境確認や試験を重ねない。
-- 関連: [表示パイプライン](display-pipeline.md)、[動画アーキテクチャ](video-architecture.md)、[点滅の調査・対策記録](video-secondary-monitor-flicker-investigation.md)。既存の F12 往復中のタスクバー明滅とは、条件や原因が一致する証拠なしに同一視しない。規模 / 優先度: 調査後に見積り / **P2・早期修正**。
-
 ### 1.425 通常フォルダにも既定のページ構成を適用する設定を追加する — X の要望 (2026-10-24)
 
 - 状態: **未着手・対応方針決定 (利用者 2026-10-24)**。本として扱わない通常フォルダでも、保存済みのページ構成がない場合に環境設定の「デフォルトのページ構成」を使えるようにする。収録時期は未定。
@@ -80,49 +63,6 @@
 - 対象外・所有: ZIP/PDF 等の既存の本の既定・個別設定、抽出結果 (検索・タグ・レーティング・コレクション等) の初期表示規則を変えない。実フォルダかどうかは列挙/採用済みの分類を使い、拡張子だけで判断したり UI で再走査したりしない (§1.418 と整合)。設定による初期構成の解決を所有 context 内で揃え、メインの別フォルダや兄弟窓へ設定を流さない。表示中の全窓を新しい独自の live rebuild 経路で作り直す機能は追加しない。
 - 検証: ON/OFF、未訪問/個別構成ありのフォルダ、左右開き・表紙あり/なし、画像のみ/混在、ツリー/一覧/アドレス経由、フル機能/F12/複数ウィンドウでの初期構成とメイン一覧の保持、既存の本扱い ON の動作を確認する。抽出結果や書庫、本を優先する評価の分類、保存済み連結方式へ波及しないことも回帰対象。実画面での確認は隔離 portable と当該 run の承認を別途得る。
 - 関連: [表示パイプライン](display-pipeline.md)、[仮想フォルダと直接ページ表示](virtual-folders.md#23-自動-1-ページ目フルスクリーン-auto_fullscreen_zip_pdf)、[本の items 生成境界](architecture-overview.md#本のitems生成境界1242-g1)。実装時に環境設定・マニュアルの「既定の適用対象」の説明も更新する。規模 / 優先度: Small〜Medium (設計時に精査) / P3。
-
-### 1.424 Rust 1.99 でビルドすると、多くの項目に当たる日本語の語の Ctrl+G 検索が遅くなる — v4.8.0 の公開前 bench で判明 (2026-10-24)
-
-- 観測 (ClaudeCode の計測、`bench_search --docs 50000`、各 3 回): 「カメラ」(約 8 割に当たり、取り出し上限の 1 万件に達する) が v4.7.1 の約 24ms から約 74ms (約 3 倍)、
-  「夕焼け」(2〜3 割) が約 7ms から約 13〜15ms (約 2 倍)。当たる件数の少ない語・複数語の AND・英語の語は変わらない。後段の絞り込み (`post_ms` 3〜6ms) も変わらず、遅いのは tantivy の検索・取り出しの部分。
-- 原因 (計測で切り分け済み): **コードではなくコンパイラ**。v4.7.1 のコードを Rust 1.99.0 でビルドすると v4.8.0 と同じ 74ms になり、v4.7.1 のビルド (この PC の既定 Rust 1.94.1) は 24ms。
-  `rust-toolchain.toml` で Rust 1.99.0 に固定したのは egui 0.37 更新のとき。`bench_search` は tantivy と rusqlite を直接呼ぶ独立の bin で、mIV の検索コードを通らない。
-  PC の負荷による差ではないことは、同じ条件で続けて測った値がビルドの種類だけで分かれ、英語の同規模のクエリが全ビルドで同じだったことから判断した。
-- 利用者決定 (2026-10-24): v4.8.0 はこのまま公開し、別件で調べる。`vendor/bench_baseline.json` は更新していない (更新すると基準が今の遅い値に変わる)。
-- 調査結果 (2026-10-24、ClaudeCode の計測。`bench_search` の検索部分だけを抜いた独立 crate を、同じ release profile・同じ `vendor/tantivy` でビルドして比較):
-  - **遅くなったのは 2 語 (bigram 2 個) の AND の採点 `Intersection<TermScorer, _>::score` だけ**。交差の走査だけ (Count / DocSetCollector)、頻度の復号、
-    1 語の採点、4 語の AND ("photo") の採点は Rust 1.94.1 と 1.99.0 で同じ速さ。採点器を直接回すと、カメラ 0.25ms → 3.4ms、夕焼け 0.05ms → 0.5ms (約 10〜13 倍)。
-    「カメラ」「夕焼け」はどちらも bigram 2 個になる。製品のクエリ (`build_bigram_and_query`: 対象フィールドごとの bigram AND をフィールド間の OR で束ねる) も同じ関数を通る。
-  - 遅くなったのは **Rust 1.95.0 から** (1.94.1 だけ速く、1.95.0〜1.99.0 はすべて遅い)。
-  - 仕組み: LTO 後、左右 2 語の BM25 (`tf / (tf + norm)`) が SIMD の 2 レーンにまとめて計算される。1.94 は使わない上位レーンを 0 にしていたが、
-    1.95 以降は `cvtsi2ss xmm1` を xmm1 を 0 にせずに使い、上位レーンに前の処理の残り値が残る。それが非正規化数として読める値のとき、
-    `addps`/`divps` が毎回非正規化数の例外処理 (microcode assist) を起こす。計算結果は変わらず、速さだけが落ちる。
-    裏付け: MXCSR の FTZ/DAZ を立てると 1.99 でも 1.94 の速さに戻る (ページ取得 87ms → 17.6ms)。
-- 戻す手段の比較 (1.99、カメラの 20 ページ取得 / 2 語採点。1.94.1 は 22ms / 0.27ms、修正前の 1.99 は 80ms / 3.1ms):
-  | 案 | 結果 | 判断 |
-  | --- | --- | --- |
-  | toolchain を 1.94 に戻す | — | 不可。egui 0.37 系 (vendor の egui / eframe / egui-wgpu / egui-winit) が `rust-version = "1.95"`、遅くなるのも 1.95 から |
-  | `codegen-units = 1` / `lto = "fat"` / incremental なし | 80ms / 3.1〜3.4ms | 効果なし |
-  | `lto = "off"` | 22ms / 0.7ms | 戻るが製品全体の最適化を落とす。不採用 |
-  | `target-cpu = x86-64-v3` | 17ms / 0.28ms | 戻るが AVX2 の無い CPU で起動できなくなる。不採用 |
-  | tantivy 0.27 へ更新 | 34ms / 2.9ms | collector 側が速くなっただけで採点は遅いまま。0.27 と upstream main の `Intersection::score` も同じコード |
-  | **右側の採点を `#[inline(never)]` の関数経由にする** | **21ms / 0.30ms** | 採用。右側の BM25 の展開を止め、左右 2 つが同じ関数内で SIMD 化されないようにする (ClaudeCode の独立 crate 計測) |
-  明示ループ案は bench の bin では効いたが、ClaudeCode が製品 exe を逆アセンブルすると問題の SIMD 化が残っていたため、不採用。
-  旧明示ループ案の bench 全体 (各 3 回の最良値): カメラ 113ms → 22ms、夕焼け 12.9ms → 8.5ms。ほかのクエリはばらつきの範囲で同じ。製品と同じ形のクエリでもカメラ 78ms → 17ms だったが、製品 exe での改善を保証するものではなかった。
-- 方針 (2026-10-24): upstream の元の式を保ち、右側の採点だけ `#[inline(never)]` の関数経由にする。値・足し算の順序・呼び出し順を変えず、v4.8.1 に入れる候補にする。`vendor/tantivy/MIV-PATCH.md` に手元の変更として記録する。
-  `#[inline(never)]` を維持し、toolchain や tantivy を上げるときは bench 回帰チェックと製品本体の逆アセンブル確認 (リリース手順 9.5) で確かめ直す。
-  `#[inline(never)]` は仕様上ヒントなので、将来のコンパイラでも SIMD 化されないとは言い切れない。
-- 最終形の確認 (2026-10-24、ClaudeCode。ブランチ `claude/search-slow-1424-88bb45`):
-  - 製品本体 (`mimageviewer-core`、Rust 1.99、`CARGO_INCREMENTAL=0` の release を strip なしでビルドして dumpbin で逆アセンブル) の
-    `Intersection<TermScorer, Box<dyn Scorer>>::score` と `score_out_of_line<TermScorer>` は `addss`/`divss`/`mulss` のスカラー演算だけ。修正前・明示ループ案にあった `unpcklps`/`addps`/`divps` が無い。
-  - 本物の `bench_search --docs 50000` を修正前と交互に 5 回 (最良値): カメラ 90.3ms → 23.8ms、夕焼け 16.0ms → 6.6ms、ほかは同じ。
-    `scripts/check_bench_regression.py vendor/bench_baseline.json` は修正後 3 回分で全クエリ OK (baseline は更新していない)。計測中は別の作業ツリーのビルドが並行していた。
-  - tantivy の lib テスト (workspace 外なので crate のコピーで実行) 1054 passed / 1 failed。失敗は `test_managed_directory_gc_while_mmapped` で、修正前のコードでも同じく失敗する。
-    追加テスト 5 件は、初期値 +0.0・左右の呼び出し順の入れ替え・括り替えのそれぞれで対応する 1 件が落ちることを確認した。
-  - 本体 lib 全件 (`scripts/test-lib-full.ps1`) 14208 passed / 64 skipped。
-  - 独立レビュー (GPT-6.1 Sol / xhigh、2 回): P1・P2 なし、v4.8.1 に入れてよいとの判断。
-  - 実際の索引 (数十万件) での体感差は未確認。
-- 規模 / 優先度: Small / P2 (よく出てくる語の検索が遅くなる、出荷済みの版で起きる)。
 
 ### 1.423 画像を WIC が開いている最中にごみ箱へ送ると、削除が一時的に失敗し得る — テスト基盤の作業中のコード調査 (2026-10-23)
 
@@ -212,7 +152,7 @@
 
 ### 1.387 サブモニターの動画全画面で HUD の点滅が残る — 5ch >>557〜570 (2026-10-16)
 
-- 状態更新 (2026-10-24): **v4.8.0 で先行対策 A1〜A3 と描画基盤の更新を出荷し、報告者が UI の点滅解消を確認 (5ch >>610)**。開発側では元の点滅は未再現で、どの変更が解消に寄与したかは未確定。残り候補の実施要否はこの結果を踏まえて再判定する。以下は当初の段階的な対策候補と受入条件であり、すべてが未着手の必須修正という意味ではない。実装・検証の正本は [点滅調査 §8](video-secondary-monitor-flicker-investigation.md) を参照。新規に報告されたタスクバーの前面表示は §1.426 で別途早期修正する。
+- 状態更新 (2026-10-24): **v4.8.0 で先行対策 A1〜A3 と描画基盤の更新を出荷し、報告者が UI の点滅解消を確認 (5ch >>610)**。開発側では元の点滅は未再現で、どの変更が解消に寄与したかは未確定。残り候補の実施要否はこの結果を踏まえて再判定する。以下は当初の段階的な対策候補と受入条件であり、すべてが未着手の必須修正という意味ではない。実装・検証の正本は [点滅調査 §8](video-secondary-monitor-flicker-investigation.md) を参照。新規に報告されたタスクバーの前面表示は §1.426 として v4.8.1 で修正した。
 - 既知条件 (報告者): F11 / F12→F11 の両方、拡張表示の FHD 側だけ、同一 GPU の DVI-D / HDMI、100% / 60Hz。カーソル位置に関係なく UI 全体が点滅し、一時停止・上 HUD 固定で収まるが下固定は無効。720p は OS 拡大で収まるが 1080p は収まらない。これらを再質問しない。
 - v4.7.0 の `27fa289ee` は自前 raise の `SWP_NOSENDCHANGING` と NOZORDER 通知の除外を実装済み。>>570 は「完全な解消は難しかったよう」との返信で、未解消の趣旨だが改善量・再試験条件は不明。修正漏れやドライバー原因と断定せず、自己循環の修正を未着手へ戻さない。
 

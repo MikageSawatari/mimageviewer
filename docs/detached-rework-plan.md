@@ -6269,4 +6269,5 @@ per-viewport opt-out、detached述語・状態・placement保存先・同期経�
 修正前は両方の原点不一致で回帰が失敗し、修正後はvendor lib 44件が成功した。
 画像のtaskbar前面表示との因果と解消は実機確認待ち。native動画はpresenter自身へforeground/active/focusを渡すため、
 egui viewportの影だけで説明できない。v4.7.1..masterのowner・前面移譲と§1.387 A1〜A3も照合し、動画の原因は未特定として残す。
-presenter/host/HUDと点滅対策は変更しない。調査の詳細と残りの確認は[backlog §1.426](next-release-backlog.md#1426-全画面の画像動画より-windows-のタスクバーが前面に出る--5ch-610-2026-10-24)に記録する。
+presenter/host/HUDと点滅対策は変更しない。調査の詳細は backlog §1.426 に記録した (v4.8.1 で出荷後に削除。全文は commit `94017f82e` の `docs/next-release-backlog.md`)。
+利用者が確認用ビルドで、静止画・動画・F12 の有無・複数ウィンドウとも解消を確認した (2026-10-24)。動画で効いた仕組みは未解明。
