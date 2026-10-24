@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; connect-src 'none'">
+<title>Disposable WebView2 lockfile probe</title>
+<p id="status">Starting disposable storage probe...</p>
+<script>
+'use strict';
+(async () => {
+  const send = value => chrome.webview.postMessage(JSON.stringify(value));
+  const params = new URLSearchParams(location.search);
+  const mode = params.get('mode');
+  const token = params.get('token');
+  send({kind: 'page_started', origin: location.origin, mode});
+  try {
+    if (location.origin !== 'https://effetune-mixwright.localhost') throw Error('Wrong origin');
+    if (!/^[a-zA-Z0-9-]+$/.test(token)) throw Error('Invalid token');
+    const expected = 'miv-lockfile-probe:' + token + ':ASCII-and-\u65e5\u672c\u8a9e';
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('miv-lockfile-probe', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('values');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(Error('IndexedDB blocked'));
+    });
+    const root = await navigator.storage.getDirectory();
+    if (mode === 'write' || mode === 'churn') {
+      localStorage.setItem('miv-lockfile-probe', expected);
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('values', 'readwrite');
+        tx.objectStore('values').put({text: expected, bytes: new Uint8Array([0,1,127,128,255])}, 'fixture');
+        tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error);
+      });
+      const file = await root.getFileHandle('miv-lockfile-probe.bin', {create: true});
+      const writer = await file.createWritable();
+      await writer.write(new Blob([expected, new Uint8Array([0,1,127,128,255])]));
+      await writer.close();
+    } else if (mode !== 'read') throw Error('Invalid mode');
+    const local = localStorage.getItem('miv-lockfile-probe');
+    const indexed = await new Promise((resolve, reject) => {
+      const tx = db.transaction('values', 'readonly');
+      const request = tx.objectStore('values').get('fixture');
+      request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    });
+    const file = await (await root.getFileHandle('miv-lockfile-probe.bin')).getFile();
+    const actual = new Uint8Array(await file.arrayBuffer());
+    const wanted = new Uint8Array(await new Blob([expected, new Uint8Array([0,1,127,128,255])]).arrayBuffer());
+    const checks = {
+      localStorage: local === expected,
+      indexedDB: indexed?.text === expected && Array.from(indexed?.bytes || []).join(',') === '0,1,127,128,255',
+      opfs: actual.length === wanted.length && actual.every((v, i) => v === wanted[i])
+    };
+    const pass = Object.values(checks).every(Boolean);
+    document.getElementById('status').textContent = pass ? 'Storage verified.' : 'Storage mismatch.';
+    requestAnimationFrame(() => requestAnimationFrame(() => send({kind: 'storage_result', mode, token,
+      origin: location.origin, checks, pass, opfs_bytes: actual.length})));
+    if (mode !== 'churn' || !pass) { db.close(); return; }
+    // Three independent stores, deliberately no cross-store transaction. A kill
+    // can leave different final sequences; that alone is not data corruption.
+    let sequence = 0, lastProgress = -Infinity;
+    const began = performance.now();
+    for (;;) {
+      const cycleStart = performance.now();
+      const value = {token, sequence: ++sequence, page_ms: cycleStart};
+      localStorage.setItem('miv-lockfile-probe-churn', JSON.stringify(value));
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('values', 'readwrite');
+        tx.objectStore('values').put(value, 'churn');
+        tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error);
+      });
+      const churnFile = await root.getFileHandle('miv-lockfile-probe-churn.json', {create: true});
+      const writer = await churnFile.createWritable();
+      await writer.write(JSON.stringify(value));
+      await writer.close();
+      const completed = performance.now();
+      if (completed - lastProgress >= 50) {
+        send({kind: 'churn_progress', token, completed_sequence: sequence,
+          localStorage_sequence: sequence, indexedDB_sequence: sequence, opfs_sequence: sequence,
+          page_ms: completed, cycle_ms: completed - cycleStart, elapsed_ms: completed - began, requested_pause_ms: 3});
+        lastProgress = completed;
+      }
+      await new Promise(resolve => setTimeout(resolve, 3));
+    }
+  } catch (error) {
+    send({kind: 'storage_result', mode, token, pass: false, error: String(error), stack: error.stack});
+  }
+})();
+</script>
