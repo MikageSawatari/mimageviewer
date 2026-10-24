@@ -119,9 +119,12 @@ Assert-True (-not $cacheGuardThen.Contains('Remove-Item')) 'preserve-runtime cac
 Assert-True ($cacheGuardElse.Contains('Remove-Item -LiteralPath $path')) 'default VST3 cache invalidation was removed'
 
 Assert-OrderedText $buildDist @(
+    'if ($sign)',
+    'Assert-MivSignReady',
     "if (`$running.Count -gt 0)",
     "if (`$PreserveRuntime) { `$testArgs += '-SuppressCrashDialogs' }",
     "& cargo clean --release -p mimageviewer",
+    '& cargo clean --release --target-dir $portableTargetDir',
     "if (`$PreserveRuntime) { `$releaseArgs += '-PreserveRuntime' }",
     "& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path `$scripts 'build-release.ps1')",
     "& `$isccPath (Join-Path `$repoRoot 'installer\mimageviewer.iss')",
@@ -131,8 +134,12 @@ Assert-OrderedText $buildDist @(
 ) 'build-dist gate/clean/build/sign/package flow'
 
 Assert-OrderedText $buildRelease @(
+    'if ($Sign)',
+    'Assert-MivSignReady',
     'if ($PreserveRuntime -and $candidates.Count -gt 0)',
     'Stop-Process -Id $p.Id -Force -ErrorAction Stop',
+    '& cmake -S $vst3SourceDir',
+    '& cmake --build $vst3BuildDir',
     'Invoke-MivSign -Files $vendorEmbedTargets',
     '$coreExit = Invoke-ReleaseCargo -Args $coreCmd',
     '$remoteExit = Invoke-ReleaseCargo -Args $remoteCmd',
@@ -146,6 +153,8 @@ Assert-OrderedText $buildRelease @(
 
 Assert-OrderedText $buildPortable @(
     'if ($KeepRunning -and $PreserveRuntime)',
+    'if ($Sign)',
+    'Assert-MivSignReady',
     'if ($KeepRunning)',
     'Stop-Process -Id $_.Id -Force -ErrorAction Stop',
     '& cargo build --release --bin mimageviewer-core',
