@@ -369,6 +369,7 @@ fullscreen／通過／animation には共通 typed policy で使わない。詳�
 | `rename_key_migration.rs` | アプリ内リネーム後の path-keyed 永続データ移行と回復ジャーナル、および content-identity 復元用の非破壊 copy。rename / hard purge / copy は同じ `STORES` descriptor を正本とし、copy は `unique: true` のストアだけを `INSERT OR IGNORE` で複製する。copy の generic SQL は store 非依存のまま、`rating.source_path`、`reading_history.path`、edit-preview の所有 WebP + path 列を per-store fixup する。descriptor transaction の成功境界は path-keyed snapshot の共通 mutation effect も生成し、`edit_origin.file_key` の rewrite / delete 完了時は App が旧 content-identity index を Loading で gate して Low-priority cancellable worker から全件再読込する。未完了 rename 集合の正本は App の in-flight + FIFO queue + boot-retry に置き、ジャーナル書き出しは App-global の単一 latest-value worker が直列化する。起動時の初回 enqueue / poll 前だけ同期 load し、終了時は最新 revision の完了まで flush する |
 | `metadata_cleanup.rs` | 明示操作の孤児メタデータ整理。`rename_key_migration::STORES` を正本に全 path-keyed DB を worker で走査し、親フォルダ到達可能な missing だけを確認後に transaction DELETE する。切断ドライブ、本棚、逆引き不能キーは非破壊側へ倒す。mIV 削除後の purge 最終失敗は `delete_purge_journal.json` に path 単位で残し、同じ孤児安全判定 + 共通 hard-purge を起動時 / idle 時にピンポイント再実行する |
 | `logger.rs` | ファイルロガー (`mimageviewer.log`)。常時記録 + 16 MiB ローテーション |
+| `native_exception_log.rs` | Windows first-chance 例外を専用 sink へ best-effort 記録。起動時に open、handler は CAS・固定バッファ・core 整形・raw WriteFile 1回。ヒープ・Rust TLS・ロック・スタック取得なし |
 | `diagnostics.rs` | 診断 zip 書き出し (`export_diagnostics_zip`)。logs ディレクトリのログ群 + システム情報をまとめてデスクトップに保存。環境設定「開発者」タブから呼ばれる |
 | `stats.rs` | 読み込み統計の集計 |
 
@@ -650,6 +651,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `models/*.onnx` | 初回起動時に exe から展開 | `ai/model_manager.rs` |
 | `mimageviewer.log` | **常時記録** (旧 `--log` ゲートは撤廃、`--log` 引数は no-op)。起動ごとに truncate し、前回分を `mimageviewer.log.prev` に退避。実行中は 16 MiB 超で `mimageviewer.log.bak` にローテーション。非blocking facade、単一writerが各batchを直ちにflush | `logger.rs` / `log_writer.rs` |
 | `logs/panic.log` | Rust panic フックが backtrace 付きで append。セッションを跨いで蓄積するため 4 MiB 超で `panic.log.bak` に 1 世代退避 | `lib.rs` (`append_panic_log_entry`) |
+| `logs/native-exception.log` | Windows native first-chance 例外。起動時のみ1 MiB超で `.bak` へ1世代退避、256行/sessionで停止。sink初期化・VEH登録失敗はlogger初期化後に通常ログ＋既存診断ログ失敗トースト。記録とWER dumpは保証しない | `native_exception_log.rs` |
 | `logs/settings.log` | 設定復旧経路の永続診断ログ。**logger の初期化状態に依存しない独立 sink** なので起動ごく初期の復旧フェーズでも残る。SQLite open 時の primary code + extended code、bak 復旧の経路、quarantine、preupgrade snapshot、save 抑止のイベントが残る。再現が難しい設定リセット系報告の事後解析用 | `settings.rs` (`settings_diag_log`) + `settings_db.rs` (`log_diag`) |
 | `logs/perf_events.jsonl` | 構造化イベントログ (JSON Lines)。`--perf-log` 引数または環境設定「開発者」タブの「性能ログを記録する」が ON のときだけ生成。起動ごとに rotate (`perf_events.1..4.jsonl`)。単一writer、250ms周期flushと完了checkpoint | `perf.rs` / `log_writer.rs` |
 | デスクトップ `mImageViewer_diag_<日時>.zip` | 環境設定「開発者」→「ログを zip にする」で生成する診断 zip。workerの完了barrierで両ログの固定prefixを取得し、補助ログ + `system_info.txt` + `delivery_manifest.json` をまとめる。過去dropは証拠不完全と知らせ保存 | `diagnostics.rs` / `log_writer.rs` |

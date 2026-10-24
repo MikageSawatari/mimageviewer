@@ -2892,6 +2892,10 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
   `show_scroll` / `content_is_too_large` 状態を描画フレーム単位で記録する。環境変数がない
   通常時は入口で無効化し、ログ量と描画負荷を増やさない。詳細一覧本体と下部の選択情報バーは
   `surface` で区別する。
+- **native 例外ログ**: Windows first-chance 例外は専用 `logs/native-exception.log` に記録を試みる。
+  起動時のみ 1 MiB 超で `native-exception.log.bak` に退避し、1 セッション 256 行で停止する。
+  SEH で処理される例外も含み、クラッシュ・記録・WER dump を保証するものではない。
+  初期化・ハンドラ登録失敗は通常ログと既存の診断ログ失敗通知へ渡す。Rust panic・UI hang は `panic.log` のまま。
 - **`panic.log` のローテーション**: panic フックが書く `panic.log` は
   セッションを跨いで append し続けるため、同じ panic の連発で無制限に膨らみ得た。
   4 MiB 超で `panic.log.bak` に 1 世代退避してから作り直す (`main.rs`
@@ -2914,7 +2918,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - **環境設定「開発者」タブ** (`PreferencesPage::Developer`): 上記 `perf_log_enabled`
   のトグルと、「ログを zip にする」ボタンを置く。
 - **診断 zip 書き出し** (`diagnostics.rs` `export_diagnostics_zip`): logs ディレクトリの
-  ログ群 (動作ログ・`panic.log`・`settings.log`・worker ログ・現行 `perf_events.jsonl`)
+  ログ群 (動作ログ・`panic.log`・`native-exception.log` とその `.bak`・`settings.log`・worker ログ・現行 `perf_events.jsonl`)
   と `system_info.txt` (バージョン/OS/GPU) を 1 つの zip にまとめ、デスクトップ
   (`SHGetKnownFolderPath(FOLDERID_Desktop)` で解決) に
   `mImageViewer_diag_<日時>.zip` として保存する。rotate 済みの perf 世代
