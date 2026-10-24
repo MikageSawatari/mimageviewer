@@ -6217,3 +6217,41 @@ cache の失効は main の既存 reload 対象だけに限定し、別窓・Sna
 設計担当の明示決定と Codex の独立レビュー（Sol / xhigh）は、BA-7 の所有境界へ戻す構造修正であり、
 症状パッチではないと合意した。別窓の再読込設計はリワーク側の範囲に残す。
 本操作以外のメタデータ publication・通常入力・既存 refresh は今回変更しない。検証結果は同計画 §8.6 を参照。
+
+### §11 追補: viewer context 監査の cfg(test) 判定と API 台帳の同期（2026-10-24）
+
+A6 はファイル名による推測をやめ、crate root から mod 宣言と literal include の到達経路を解決する。
+すべての到達経路が cfg(test) を通るファイルだけをテスト専用とし、通常経路と共有するファイルや
+未到達ファイルは本番として監査する。式・match arm・文 macro・struct field value の cfg(test) も
+配下へ引き継ぎ、後続の通常文は引き続き検出する。A3 の監査範囲は変えない。
+
+A4 は関数と呼出し元の所有境界を確認し、egui 0.37 段1b（9481bc344）の
+with_viewer_context_state / with_window_viewer_context_state / with_composition_editor_owner_state、
+§1.232（48e2ddff4）の retire_viewer_reopen_requests、§1.272/§1.245（a6a0b3a49）の
+has_tag_prewarm_work の正確な fingerprint を登録した。状態 mount は元 owner へ unwind 時も戻り、
+editor と再開予約の更新は対象 owner だけに限る。tag prewarm は読み取りだけである。
+段1b の根拠は [更新計画](egui-0.37-update-plan.md)の状態 mount 設計と
+[段1b 検証記録](egui-0.37-stage1b-verification.md)、再開予約と本操作の根拠は本書の各記録を参照。
+§1.272 で削除済みの migrate_at_rest_spread_shifts は古い登録とコメントを取り除いた。
+変更は監査ツールと本書だけで、src/ は変更していない。
+
+独立レビューの指摘を反映し、crate root は target 種別による免除を設けず、
+lib / bin / example / test / bench と build script をすべて非テスト経路として扱う。
+明示 path と、src/lib.rs・src/main.rs・src/bin/・examples/・tests/・benches/ の自動探索を
+共通の target 定義表から処理する。対応する auto* が false の場合も明示 target は残す。
+test / bench target を非テスト扱いにするのは、A6 のテスト専用判定を緩めないための保守的な規則である。
+required-features や test / bench / harness の指定で root を除外しない。
+package.build の明示 path と、無効化されていない既存 build.rs も同じ経路へ加える。
+未対応の target key・値の型・解決できない明示 path の省略は、明示エラーで止める。
+Cargo.toml は `toml` 1.1.3 の `Table` として解析し、手書きの行読み取りとコメント処理は撤去した。
+コメント・引用符・複数行文字列・inline/dotted table は TOML の解析結果に従い、文字列内の
+`[lib]` / `path` を root 宣言にしない。反例の回帰では `src/lib.rs` と production の shared を保ち、
+`_for_test` 呼出しを検出する。自動探索設定は真偽値だけを受け入れ、未知の auto* は明示エラーにする。
+依存は `parse` / `serde` feature だけを有効にし、既存 lock のバージョンは変えず依存辺だけ追加した。
+Windows で同じファイルを指す大小文字違いは、到達経路とディスク読み込みの両方で拒否する。
+src/ 外への既存参照（`tests/support/ui_harness.rs`、`tests/support/scroll_layout.rs`、
+`crates/susie-worker/src/protocol.rs`）があるため loader は維持し、通常の mod 宣言では
+`name.rs` と `name/mod.rs` の両候補を確認する。両方あれば曖昧としてエラーにする。
+root discovery の inventory は examples/・tests/・benches/ と package 直下の Rust ファイルも含み、
+大小文字違いや source link を黙って落とさずエラーにする。監査対象自体は従来の src/**/*.rs を維持する。
+明示 example、自動探索 example、build.rs の path 経路で shared が production と共有される反例を回帰に加えた。
