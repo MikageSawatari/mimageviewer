@@ -69,3 +69,12 @@ real automatic end-merge rejection during 20 upsert commits, with complete and
 partial source removal, verify exact live/reopened contents and unchanged
 scan/rebuild/notification state, preserve the explicit Future error, and prove
 that an identical-text InvalidArgument from another origin still reports.
+
+2026-10-24: `src/query/intersection.rs`: replace the iterator sum in
+`Intersection::score` with an explicit loop to avoid Rust 1.95+ SIMD codegen
+whose stale upper lanes cause denormal assists and slow two-term AND scoring.
+Keep the `-0.0` accumulator and addition/call order for bit-for-bit score
+compatibility, covered by two- and four-term Must AND tests. Upstream 0.27 and
+main still use the original expression. See `docs/next-release-backlog.md`
+§1.424; rerun the bench regression check (`docs/release-checklist.md` §9.5)
+when updating the Rust toolchain or Tantivy, since codegen may change.

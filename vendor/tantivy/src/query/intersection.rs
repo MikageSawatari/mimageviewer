@@ -233,9 +233,17 @@ where
 {
     #[inline]
     fn score(&mut self) -> Score {
-        self.left.score()
-            + self.right.score()
-            + self.others.iter_mut().map(Scorer::score).sum::<Score>()
+        // Keep this loop: iter().sum() triggers Rust 1.95+ SIMD codegen with stale
+        // upper lanes causing denormal assists. -0.0 and the addition/call order
+        // preserve the original sum bit-for-bit. See docs/next-release-backlog.md
+        // §1.424 and docs/release-checklist.md §9.5 for bench regression checks.
+        let left = self.left.score();
+        let right = self.right.score();
+        let mut others = -0.0;
+        for other in &mut self.others {
+            others += other.score();
+        }
+        left + right + others
     }
 }
 
@@ -247,9 +255,84 @@ mod tests {
     use crate::collector::Count;
     use crate::docset::{DocSet, TERMINATED};
     use crate::postings::tests::test_skip_against_unoptimized;
-    use crate::query::{QueryParser, VecDocSet};
-    use crate::schema::{Schema, TEXT};
-    use crate::Index;
+    use crate::query::term_query::TermScorer;
+    use crate::query::{
+        BooleanQuery, EnableScoring, Occur, Query, QueryParser, Scorer, TermQuery, VecDocSet,
+    };
+    use crate::schema::{IndexRecordOption, Schema, TEXT};
+    use crate::{Index, Score, Term};
+
+    fn assert_intersection_score_bits(terms: &[&str], expected_docs: &[u32]) -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+        for content in [
+            "a b c d",
+            "a a b c c d d d",
+            "a b b c d extra extra",
+            "a b",
+            "a",
+            "b c",
+        ] {
+            writer.add_document(doc!(text => content))?;
+        }
+        writer.commit()?;
+
+        let query = BooleanQuery::new(
+            terms
+                .iter()
+                .map(|term| {
+                    let query = TermQuery::new(
+                        Term::from_field_text(text, term),
+                        IndexRecordOption::WithFreqs,
+                    );
+                    (Occur::Must, Box::new(query) as Box<dyn Query>)
+                })
+                .collect(),
+        );
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        let intersection = scorer
+            .downcast_mut::<Intersection<TermScorer>>()
+            .expect("Must terms should use the specialized Intersection<TermScorer>");
+        assert_eq!(intersection.others.len(), terms.len() - 2);
+        assert!(intersection
+            .others
+            .iter()
+            .all(|other| other.is::<TermScorer>()));
+        for &doc in expected_docs {
+            assert_eq!(intersection.doc(), doc);
+            // Use the original expression in the scorer's cost-sorted order.
+            let expected = intersection.left.score()
+                + intersection.right.score()
+                + intersection
+                    .others
+                    .iter_mut()
+                    .map(Scorer::score)
+                    .sum::<Score>();
+            assert_eq!(
+                intersection.score().to_bits(),
+                expected.to_bits(),
+                "doc {doc}"
+            );
+            intersection.advance();
+        }
+        assert_eq!(intersection.doc(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    fn test_intersection_score_bits_two_must_terms() -> crate::Result<()> {
+        assert_intersection_score_bits(&["a", "b"], &[0, 1, 2, 3])
+    }
+
+    #[test]
+    fn test_intersection_score_bits_four_must_terms() -> crate::Result<()> {
+        assert_intersection_score_bits(&["a", "b", "c", "d"], &[0, 1, 2])
+    }
 
     #[test]
     fn test_intersection() {
