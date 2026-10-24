@@ -431,12 +431,41 @@ def folder_load_errors(evidence: dict, case_id: str) -> list[str]:
     return errors
 
 
+def proven_wait_intervals(events: list[dict]) -> list[tuple[float, float, str]]:
+    """Fail closed for the entire witness stream; never reorder bad records.
+
+    A callback-invalidated record is well formed but earns no sleep credit.
+    Validate the original interval before clipping at the requested deadline.
+    """
+    waits, previous_end = [], None
+    for event in events:
+        if not isinstance(event, dict) or (event.get("cat"), event.get("kind")) != ("eventloop", "wait"):
+            continue
+        start, end = number(event.get("wait_start_t")), number(event.get("wait_end_t"))
+        resume = number(event.get("requested_resume_t"))
+        cause = event.get("cause")
+        if (number(event.get("t")) is None or start is None or end is None or start < 0 or end < start
+                or "requested_resume_t" not in event
+                or (event["requested_resume_t"] is not None and (resume is None or resume < 0))
+                or cause not in ("cancelled", "resume_time_reached")
+                or (cause == "resume_time_reached" and resume is None)
+                or type(event.get("callback_during_wait")) is not bool
+                or (previous_end is not None and start < previous_end)):
+            return []
+        previous_end = end
+        credited_end = min(end, resume) if resume is not None else end
+        if not event["callback_during_wait"] and start < credited_end:
+            waits.append((start, credited_end, cause))
+    return waits
+
+
 def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
                        case_id: str = "perf-smoke", evidence: dict | None = None,
                        load_errors: list[str] | None = None) -> dict:
     result = report(case_id)
     errors = result["environment_errors"]
     errors.extend(load_errors or [])
+    waits = proven_wait_intervals(events)
     valid_events = []
     for event in events:
         if not isinstance(event, dict) or number(event.get("t")) is None:
@@ -535,6 +564,10 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
         elif ms > updates[n]["total_ms"]:
             # Inner is a partial measure but still exposes a real >100ms update.
             updates[n]["total_ms"] = ms
+    # Contradictory witnesses cannot prove sleep, even outside the target W.
+    if any(start < update["end_t"] and end > update["start_t"]
+           for start, end, _ in waits for update in updates.values()):
+        waits = []
     startup_begins = sorted([e for e in events if (e.get("cat"), e.get("kind")) == ("nav", "load_folder_begin")],
                             key=lambda e: e.get("t", 0))
     startup = startup_begins[0] if startup_begins else None
@@ -669,6 +702,21 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
                 gap["categories"] = ["normal-idle-upgrade-wake"]
             else:
                 gap["categories"] = ["unexplained"]
+                next_update = updates.get(gap["next_n"])
+                if delay is not None and delay > 0 and 0 <= wake < delay - 20 and next_update:
+                    # frame.begin is inside update; W ends at the next actual
+                    # update start, measured by the following frame (or inner).
+                    start, end = updates[n]["end_t"], next_update["start_t"]
+                    clipped = [(max(a, start), min(b, end), cause) for a, b, cause in waits
+                               if a < end and b > start]
+                    credited = sum(b - a for a, b, _ in clipped) * 1000
+                    non_wait = (end - start) * 1000 - credited
+                    if (end >= start and credited > 0 and non_wait <= 20 + 1e-9
+                            and gap["gap_ms"] - credited <= HITCH_MS + 1e-9):
+                        gap.update(categories=["normal-proven-wait"], wake_ms=wake,
+                                   idle_upgrade_delay_ms=delay, credited_wait_ms=credited,
+                                   non_wait_ms=non_wait, wait_records=len(clipped),
+                                   ending_cause=clipped[-1][2])
         else:
             gap["categories"] = ["unexplained"]
     unexplained_frames = sorted({r["n"] for r in gaps + slow_updates if "unexplained" in r["categories"]})
@@ -698,7 +746,7 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
                                 "stages_ms": {k: v for k, v in e.items() if k.endswith("_ms") and k != "total_ms"}}
                                for e in pre_grid if e["total_ms"] > .3]
     classification_stats = {}
-    for category in ("normal-sleep", "normal-idle-upgrade-wake", "known-startup-first-frame",
+    for category in ("normal-sleep", "normal-idle-upgrade-wake", "normal-proven-wait", "known-startup-first-frame",
                      "known-startup-scan", "known-first-ai", "unexplained"):
         matching_gaps = [g for g in gaps if category in g["categories"]]
         matching_updates = [u for u in slow_updates if category in u["categories"]]
@@ -1058,7 +1106,14 @@ def release_record(result: dict) -> str:
             lines.append("  known形の最大値 / scan / viewport " + json.dumps(
                 {k: v for k, v in metrics.get("classifications", {}).items() if k.startswith("known-")},
                 ensure_ascii=False) + "。")
+            lines.append(f"  normal-proven-wait {metrics['gap_categories'].get('normal-proven-wait', 0)}件。")
             for gap in evidence.get("gaps", []):
+                if "normal-proven-wait" in gap.get("categories", []):
+                    lines.append(f"  normal-proven-wait: frame {gap['n']}→{gap['next_n']}、"
+                                 f"gap {gap['gap_ms']:.3f}ms、wake {gap['wake_ms']:.3f}ms、"
+                                 f"scheduled delay {gap['idle_upgrade_delay_ms']:.3f}ms、"
+                                 f"credited wait {gap['credited_wait_ms']:.3f}ms、non-wait {gap['non_wait_ms']:.3f}ms、"
+                                 f"wait records {gap['wait_records']}、ending cause {gap['ending_cause']}。")
                 if "known-startup-first-frame" in gap.get("categories", []):
                     lines.append(f"  known-startup-first-frame: frame 1→2、{gap['gap_ms']:.3f}ms "
                                  f"(t={gap['start_t']}→{gap['end_t']}、上限 {gap['upper_bound_ms']}ms、"
