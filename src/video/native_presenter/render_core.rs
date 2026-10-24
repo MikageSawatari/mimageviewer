@@ -16379,32 +16379,305 @@ mod chrome_suppression_interaction_tests {
         #[test]
         fn seek_terminal_egui_strip_escape_is_cancel_not_native_close() {
             for escape_first in [false, true] {
-                let mut target = target(true);
-                let pos = start_drag(&mut target.state, true, false);
+                for release_below_strip in [false, true] {
+                    let mut target = target(true);
+                    let pos = start_drag(&mut target.state, true, false);
+                    let drag = target.state.seek_strip_drag.unwrap();
+                    let last = drag.last_moved_center.unwrap();
+                    let strip_bottom = target
+                        .state
+                        .egui_ctx
+                        .read_response(egui::Id::unique("native_video_seek_strip_drag"))
+                        .unwrap()
+                        .rect
+                        .bottom();
+                    let release = if release_below_strip {
+                        egui::pos2(drag.origin.pointer.x, strip_bottom + 1.0)
+                    } else {
+                        pos + egui::vec2(100.0, 0.0)
+                    };
+                    let release_center =
+                        crate::video::seek_strip::seek_strip_center_at_drag_pointer(
+                            drag.origin,
+                            release,
+                        )
+                        .unwrap();
+                    assert_ne!(
+                        release_center, last,
+                        "an ordinary release must have a different outcome"
+                    );
+                    // Text ownership bypasses native strip Escape, letting egui receive it.
+                    target.state.tag_picker_open = true;
+                    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let observed = passes.clone();
+                    target.after_logical_pass = Some(Box::new(move |state, output| {
+                        let pass = observed.fetch_add(1, Ordering::Relaxed);
+                        assert!(pass < 2, "exactly one pass per terminal event");
+                        assert!(
+                            state.seek_strip_drag.is_none(),
+                            "the first terminal immediately retires ownership"
+                        );
+                        let commands = terminal_commands(&output.commands);
+                        if pass == 1 {
+                            assert!(
+                                commands.is_empty(),
+                                "the later terminal must emit nothing: {commands:?}"
+                            );
+                        } else if escape_first {
+                            assert!(
+                                matches!(commands.as_slice(), [NativeOverlayCommand::CommitSeekStrip { center, .. }] if *center == last)
+                            );
+                        } else if release_below_strip {
+                            assert!(matches!(
+                                commands.as_slice(),
+                                [NativeOverlayCommand::CloseSeekStrip {
+                                    cause:
+                                        crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
+                                    ..
+                                }]
+                            ));
+                        } else {
+                            assert!(
+                                matches!(commands.as_slice(), [NativeOverlayCommand::CommitSeekStrip { center, .. }] if *center == release_center)
+                            );
+                        }
+                    }));
+                    let events = if escape_first {
+                        vec![escape(), up(release)]
+                    } else {
+                        vec![up(release), escape()]
+                    };
+                    let run = run_native_event_batch(&mut target, &events).unwrap();
+                    assert_eq!(passes.load(Ordering::Relaxed), 2);
+                    assert_eq!(terminal_commands(&run.commands).len(), 1);
+                    assert_one_present(&target, 2);
+                    assert!(target.state.seek_strip_drag.is_none());
+                }
+            }
+        }
+
+        fn assert_one_present(target: &CpuOverlayBatchTarget, passes: usize) {
+            assert_eq!(target.logical_visibility.len(), passes);
+            assert_eq!(
+                target
+                    .gpu
+                    .operations
+                    .iter()
+                    .filter(|op| **op == "Present")
+                    .count(),
+                1
+            );
+        }
+
+        fn focused_hud_routing(pointer: bool) -> NativeOverlayInputRouting {
+            NativeOverlayInputRouting {
+                wants_pointer_input: pointer,
+                wants_keyboard_input: true,
+                text_input_active: false,
+                modal_dialog_active: false,
+                hud_dimmed: false,
+                consumed_wheel: false,
+                video_region: None,
+            }
+        }
+
+        fn press_focused_hud_control(target: &mut CpuOverlayBatchTarget, name: &str) -> egui::Pos2 {
+            let id = egui::Id::unique(name);
+            let pos = target
+                .state
+                .egui_ctx
+                .read_response(id)
+                .expect("real HUD control")
+                .rect
+                .center()
+                .round();
+            // A HUD control can retain keyboard focus while normal viewer shortcut
+            // keys still belong to the App. Include that existing ownership case.
+            target
+                .state
+                .egui_ctx
+                .memory_mut(|memory| memory.request_focus(id));
+            pointer(&mut target.state, pos);
+            frame(&mut target.state);
+            button(&mut target.state, pos, true);
+            frame(&mut target.state);
+            let response = target.state.egui_ctx.read_response(id).unwrap();
+            assert!(response.has_focus());
+            assert!(response.is_pointer_button_down_on());
+            pos
+        }
+
+        #[test]
+        fn seek_terminal_hud_button_click_then_move_preserves_command_and_routing() {
+            let mut target = target(false);
+            let pos = press_focused_hud_control(&mut target, "native_video_play");
+            let outside = egui::pos2(640.0, 360.0);
+            let was_playing = target.state.video_is_playing;
+            let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = passes.clone();
+            target.after_logical_pass = Some(Box::new(move |state, output| {
+                let pass = observed.fetch_add(1, Ordering::Relaxed);
+                assert!(pass < 2);
+                assert_eq!(state.input_routing(), focused_hud_routing(pass == 0));
+                let response = state
+                    .egui_ctx
+                    .read_response(egui::Id::unique("native_video_play"))
+                    .unwrap();
+                assert_eq!(response.clicked(), pass == 0);
+                assert!(!response.is_pointer_button_down_on());
+                assert_eq!(
+                    state.pointer_pos,
+                    Some(if pass == 0 { pos } else { outside })
+                );
+                assert!(!state.egui_ctx.input(|input| input.pointer.any_down()));
+                if pass == 0 {
+                    assert!(matches!(
+                        output.commands.as_slice(),
+                        [NativeOverlayCommand::TogglePlay]
+                    ));
+                } else {
+                    assert!(output.commands.is_empty());
+                }
+                assert_eq!(
+                    state.video_is_playing, was_playing,
+                    "the App owns applying TogglePlay"
+                );
+            }));
+            let run = run_native_event_batch(&mut target, &[up(pos), moved(outside)]).unwrap();
+            assert!(matches!(
+                run.commands.as_slice(),
+                [NativeOverlayCommand::TogglePlay]
+            ));
+            assert_eq!(
+                run.event_dispositions,
+                [
+                    NativeOverlayInputDisposition::Routing(focused_hud_routing(true)),
+                    NativeOverlayInputDisposition::Routing(focused_hud_routing(false)),
+                ]
+            );
+            assert_eq!(run.routing, focused_hud_routing(false));
+            assert_eq!(passes.load(Ordering::Relaxed), 2);
+            assert_one_present(&target, 2);
+        }
+
+        #[test]
+        fn seek_terminal_hud_volume_release_then_wheel_preserves_persist_and_dirty_boundary() {
+            for still_dirty in [false, true] {
+                let mut target = target(false);
+                let pressed = press_focused_hud_control(&mut target, "native_video_volume");
+                let pos = pressed + egui::vec2(20.0, 0.0);
+                pointer(&mut target.state, pos);
+                frame(&mut target.state);
                 let last = target
                     .state
-                    .seek_strip_drag
-                    .unwrap()
-                    .last_moved_center
-                    .unwrap();
-                // Text ownership bypasses native strip Escape, letting egui receive it.
-                target.state.tag_picker_open = true;
-                let events = if escape_first {
-                    vec![escape(), up(pos)]
-                } else {
-                    vec![up(pos), escape()]
-                };
-                let run = run_native_event_batch(&mut target, &events).unwrap();
-                assert!(
-                    !run.commands
-                        .iter()
-                        .any(|cmd| matches!(cmd, NativeOverlayCommand::CloseSeekStrip { .. }))
+                    .last_volume_target
+                    .expect("real slider drag sent a value");
+                let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let observed = passes.clone();
+                target.after_logical_pass = Some(Box::new(move |state, output| {
+                    let pass = observed.fetch_add(1, Ordering::Relaxed);
+                    assert!(
+                        pass < 2,
+                        "release and wheel need only two passes even when release leaves dirty state"
+                    );
+                    assert!(state.last_volume_target.is_none());
+                    assert_eq!(state.input_routing(), focused_hud_routing(pass == 0));
+                    assert!(!state.egui_ctx.input(|input| input.pointer.any_down()));
+                    if pass == 0 {
+                        assert!(
+                            matches!(output.commands.as_slice(), [NativeOverlayCommand::SetVolume { volume, persist: true }] if *volume == last)
+                        );
+                        if still_dirty {
+                            // Model another presenter update needing a draw after the release.
+                            // This makes a stale ownership_commit_pending observable before wheel.
+                            state.dirty = true;
+                            assert!(state.needs_render());
+                        }
+                    } else {
+                        assert!(matches!(
+                            output.commands.as_slice(),
+                            [NativeOverlayCommand::NormalWheel { delta: 120 }]
+                        ));
+                    }
+                }));
+                // Keep the release at the last Move: volume's separate release-position
+                // limitation is outside ?1.192, and this test preserves its existing result.
+                let run =
+                    run_native_event_batch(&mut target, &[up(pos), visibility_wheel(360)]).unwrap();
+                assert!(matches!(run.commands.as_slice(), [
+                    NativeOverlayCommand::SetVolume { volume, persist: true },
+                    NativeOverlayCommand::NormalWheel { delta: 120 },
+                ] if *volume == last));
+                assert_eq!(
+                    run.event_dispositions,
+                    [
+                        NativeOverlayInputDisposition::Routing(focused_hud_routing(true)),
+                        NativeOverlayInputDisposition::Command,
+                    ]
                 );
-                assert!(
-                    matches!(terminal_commands(&run.commands).as_slice(), [NativeOverlayCommand::CommitSeekStrip { center, .. }] if *center == last)
-                );
-                assert!(target.state.seek_strip_drag.is_none());
+                assert_eq!(run.routing, focused_hud_routing(false));
+                assert!(target.state.last_volume_target.is_none());
+                assert_eq!(passes.load(Ordering::Relaxed), 2);
+                assert_one_present(&target, 2);
             }
+        }
+
+        #[test]
+        fn seek_terminal_hud_menu_click_then_key_preserves_popup_and_shortcut_routing() {
+            let mut target = target(false);
+            let pos = press_focused_hud_control(&mut target, "native_video_speed");
+            assert!(!target.state.video_speed_popup_open);
+            let outside = egui::pos2(640.0, 360.0);
+            let mut key = native_clipboard_key(0x4B, false);
+            key.ctrl = false;
+            key.shift = false;
+            let key = NativeVideoWindowEvent::KeyDown(key);
+            let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = passes.clone();
+            target.after_logical_pass = Some(Box::new(move |state, output| {
+                let pass = observed.fetch_add(1, Ordering::Relaxed);
+                assert!(pass < 2);
+                assert!(
+                    output.commands.is_empty(),
+                    "opening the menu does not set a playback speed"
+                );
+                assert!(
+                    state.video_speed_popup_open,
+                    "the click is applied before subsequent keyboard input"
+                );
+                assert!(state.last_drawn_speed_popup_rect.is_some());
+                assert_eq!(state.input_routing(), focused_hud_routing(pass == 0));
+                let response = state
+                    .egui_ctx
+                    .read_response(egui::Id::unique("native_video_speed"))
+                    .unwrap();
+                assert_eq!(response.clicked(), pass == 0);
+                assert!(!response.is_pointer_button_down_on());
+                assert!(response.has_focus());
+            }));
+            let run = run_native_event_batch(&mut target, &[up(pos), moved(outside), key.clone()])
+                .unwrap();
+            assert!(run.commands.is_empty());
+            assert!(target.state.video_speed_popup_open);
+            assert_eq!(
+                run.event_dispositions,
+                [
+                    NativeOverlayInputDisposition::Routing(focused_hud_routing(true)),
+                    NativeOverlayInputDisposition::Routing(focused_hud_routing(false)),
+                    NativeOverlayInputDisposition::Routing(focused_hud_routing(false)),
+                ]
+            );
+            assert_eq!(run.routing, focused_hud_routing(false));
+            let NativeOverlayInputDisposition::Routing(key_routing) = run.event_dispositions[2]
+            else {
+                unreachable!()
+            };
+            assert!(
+                key_routing.should_forward_to_ui(&key),
+                "viewer K remains an App shortcut despite button focus"
+            );
+            assert_eq!(passes.load(Ordering::Relaxed), 2);
+            assert_one_present(&target, 2);
         }
 
         #[test]
@@ -16442,6 +16715,7 @@ mod chrome_suppression_interaction_tests {
                 gpu: RecordingOverlayGpu::default(),
                 logical_visibility: Vec::new(),
                 logical_repaint_deadlines: Vec::new(),
+                after_logical_pass: None,
                 texture_sets: 0,
                 texture_frees: 0,
             }
@@ -18388,6 +18662,8 @@ mod chrome_suppression_interaction_tests {
         gpu: RecordingOverlayGpu,
         logical_visibility: Vec<bool>,
         logical_repaint_deadlines: Vec<Option<Instant>>,
+        after_logical_pass:
+            Option<Box<dyn FnMut(&mut NativeEguiOverlayState, &NativeOverlayLogicalOutput)>>,
         texture_sets: usize,
         texture_frees: usize,
     }
@@ -18409,6 +18685,7 @@ mod chrome_suppression_interaction_tests {
                 },
                 logical_visibility: Vec::new(),
                 logical_repaint_deadlines: Vec::new(),
+                after_logical_pass: None,
                 texture_sets: 0,
                 texture_frees: 0,
             }
@@ -18448,6 +18725,9 @@ mod chrome_suppression_interaction_tests {
             preserve: bool,
         ) -> Result<NativeOverlayLogicalOutput, String> {
             let output = self.state.render_logical_once(preserve, true)?;
+            if let Some(observer) = &mut self.after_logical_pass {
+                observer(&mut self.state, &output);
+            }
             self.logical_visibility.push(output.overlay_visible);
             self.logical_repaint_deadlines
                 .push(self.state.next_repaint_deadline);
