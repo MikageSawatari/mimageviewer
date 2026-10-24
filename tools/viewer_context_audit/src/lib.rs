@@ -479,12 +479,42 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
         .map_err(|error| format!("cannot read {REGISTRY_PATH}: {error}"))?;
     let bundle_fields = extract_bundle_fields(&registry_source)?;
 
-    let mut files = Vec::new();
-    collect_rust_files(&root.join("src"), &mut files)?;
-    files.sort();
+    let mut inventory = Vec::new();
+    for entry in
+        fs::read_dir(root).map_err(|error| format!("cannot inspect repository: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("cannot inspect repository entry: {error}"))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let source_directory = ["src", "examples", "tests", "benches"]
+            .iter()
+            .find(|directory| name.to_uppercase() == directory.to_uppercase());
+        if let Some(directory) = source_directory {
+            reject_source_link(&entry, &kind)?;
+            if name != *directory {
+                return Err(format!(
+                    "module path case differs from file on disk: {directory} (actual: {name})"
+                ));
+            }
+            if !kind.is_dir() {
+                return Err(format!("unsupported target source directory: {name}"));
+            }
+            collect_rust_files(&entry.path(), &mut inventory)?;
+        } else if is_rust_source_path(&entry.path())? {
+            reject_source_link(&entry, &kind)?;
+            if !kind.is_file() {
+                return Err(format!("unsupported linked/non-file target source: {name}"));
+            }
+            inventory.push(entry.path());
+        }
+    }
+    inventory.sort();
 
     let mut sources = BTreeMap::new();
-    for path in &files {
+    for path in &inventory {
         let relative = relative_path(root, path)?;
         let source =
             fs::read_to_string(path).map_err(|error| format!("cannot read {relative}: {error}"))?;
@@ -504,8 +534,13 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
     })?;
 
     let mut violations = audit_public_api(&registry_source, PUBLIC_API_ALLOWLIST)?;
-    for path in files {
+    // Root discovery also inventories examples/tests/benches/build scripts; the
+    // audit's file scope itself remains src/**/*.rs (including unreachable files).
+    for path in inventory {
         let relative = relative_path(root, &path)?;
+        if !relative.starts_with("src/") {
+            continue;
+        }
         let source = &sources[&relative];
         violations.extend(analyze_source(
             &relative,
@@ -594,6 +629,10 @@ fn read_module_source(root: &Path, relative: &str) -> Result<Option<String>, Str
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name == component {
+                let kind = entry
+                    .file_type()
+                    .map_err(|error| format!("cannot inspect module {relative}: {error}"))?;
+                reject_source_link(&entry, &kind)?;
                 exact = Some(entry.path());
             } else if name.to_uppercase() == component.to_uppercase() {
                 case_variant = Some(entry.path());
@@ -615,6 +654,38 @@ fn read_module_source(root: &Path, relative: &str) -> Result<Option<String>, Str
         .map_err(|error| format!("cannot read module {relative}: {error}"))
 }
 
+fn is_rust_source_path(path: &Path) -> Result<bool, String> {
+    match path.extension().and_then(OsStr::to_str) {
+        Some("rs") => Ok(true),
+        Some(extension) if extension.to_uppercase() == "RS" => Err(format!(
+            "module path case differs from file on disk: expected .rs extension: {}",
+            path.display()
+        )),
+        _ => Ok(false),
+    }
+}
+
+fn reject_source_link(entry: &fs::DirEntry, kind: &fs::FileType) -> Result<(), String> {
+    #[cfg(windows)]
+    let reparse = {
+        use std::os::windows::fs::MetadataExt as _;
+        fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("cannot inspect source {}: {error}", entry.path().display()))?
+            .file_attributes()
+            & 0x400
+            != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = false;
+    if kind.is_symlink() || reparse {
+        return Err(format!(
+            "unsupported linked/reparse source inventory entry: {}",
+            entry.path().display()
+        ));
+    }
+    Ok(())
+}
+
 fn collect_rust_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = fs::read_dir(directory)
         .map_err(|error| format!("cannot read directory {}: {error}", directory.display()))?;
@@ -628,9 +699,10 @@ fn collect_rust_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(),
         let file_type = entry
             .file_type()
             .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+        reject_source_link(&entry, &file_type)?;
         if file_type.is_dir() {
             collect_rust_files(&entry.path(), output)?;
-        } else if file_type.is_file() && entry.path().extension().is_some_and(|ext| ext == "rs") {
+        } else if file_type.is_file() && is_rust_source_path(&entry.path())? {
             output.push(entry.path());
         }
     }
@@ -2681,26 +2753,253 @@ mod tests {
     }
 
     #[test]
-    fn a6_accepts_only_the_repository_auto_discovery_policy() {
-        for settings in [
-            "",
-            "autobins = true",
-            "autobins = false\nautolib = false",
-            "autobins = false\nautoexamples = false",
-            "autobins = \"false\"",
-            "autobins = false\nautolib = \"true\"",
+    fn a6_auto_discovery_flags_accept_booleans_and_reject_unknown_shapes() {
+        for key in [
+            "autolib",
+            "autobins",
+            "autoexamples",
+            "autotests",
+            "autobenches",
         ] {
-            let error = manifest_roots(&format!("[package]\n{settings}"), true).unwrap_err();
-            assert!(error.contains("auto-discovery"), "{error}");
+            for value in ["true", "false"] {
+                let manifest = format!("[package]\n{key} = {value}");
+                assert!(manifest_roots(&manifest, true).is_ok(), "{manifest}");
+            }
+            for value in ["\"false\"", "{}", "0"] {
+                let manifest = format!("[package]\n{key} = {value}");
+                assert!(
+                    manifest_roots(&manifest, true)
+                        .unwrap_err()
+                        .contains("auto-discovery")
+                );
+            }
         }
-        for settings in [
-            "autobins = false",
-            "autobins = false\nautolib = true",
-            "\"autobins\" = false",
+        assert!(manifest_roots("[package]", true).is_ok());
+        assert!(
+            manifest_roots("[package]\nautofuture = false", true)
+                .unwrap_err()
+                .contains("unsupported auto-discovery")
+        );
+        assert!(
+            manifest_roots("[package]\nautolib = false", true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            manifest_roots("[package]\nautolib = false\n[lib]", true).unwrap(),
+            vec!["src/lib.rs"]
+        );
+    }
+
+    fn target_fixture(
+        manifest: &str,
+        entries: &[(&str, &str)],
+    ) -> (Vec<String>, BTreeSet<String>, Vec<Violation>) {
+        let sources = entries
+            .iter()
+            .map(|(path, source)| (path.to_string(), source.to_string()))
+            .collect();
+        let roots = module_tree::crate_roots(manifest, &sources).unwrap();
+        let root_refs = roots.iter().map(String::as_str).collect::<Vec<_>>();
+        let (test_only, violations) = module_fixture(entries, &root_refs);
+        (roots, test_only, violations)
+    }
+
+    #[test]
+    fn a6_every_explicit_target_kind_is_a_production_root() {
+        for kind in ["lib", "bin", "example", "test", "bench"] {
+            let header = if kind == "lib" {
+                "[lib]".to_owned()
+            } else {
+                format!("[[{kind}]]")
+            };
+            let manifest = format!(
+                "[package]\nauto{plural} = false\n{header}\npath = 'targets/entry.rs'\ntest = false\nbench = false\nharness = false\nrequired-features = ['unselected']",
+                plural = match kind {
+                    "lib" => "lib",
+                    "bin" => "bins",
+                    "example" => "examples",
+                    "test" => "tests",
+                    _ => "benches",
+                }
+            );
+            let (roots, test_only, violations) = target_fixture(
+                &manifest,
+                &[
+                    ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                    ("src/shared.rs", TEST_API_CALL),
+                    (
+                        "targets/entry.rs",
+                        r#"#[path = "../src/shared.rs"] mod shared;"#,
+                    ),
+                ],
+            );
+            assert!(
+                roots.iter().any(|root| root == "targets/entry.rs"),
+                "{kind}"
+            );
+            assert!(!test_only.contains("src/shared.rs"), "{kind}");
+            assert_eq!(violations.len(), 1, "{kind}: {violations:#?}");
+            assert_eq!(violations[0].file, "src/shared.rs");
+        }
+    }
+
+    #[test]
+    fn a6_auto_discovered_targets_are_production_unless_their_auto_flag_is_false() {
+        for (auto, entry) in [
+            ("autobins", "src/main.rs"),
+            ("autobins", "src/bin/probe.rs"),
+            ("autobins", "src/bin/multi/main.rs"),
+            ("autoexamples", "examples/probe.rs"),
+            ("autoexamples", "examples/multi/main.rs"),
+            ("autotests", "tests/probe.rs"),
+            ("autotests", "tests/multi/main.rs"),
+            ("autobenches", "benches/probe.rs"),
+            ("autobenches", "benches/multi/main.rs"),
         ] {
-            let manifest = format!("[package]\n{settings}\n[lib]\nname = \"library\"");
-            assert_eq!(manifest_roots(&manifest, true).unwrap(), vec!["src/lib.rs"]);
-            assert!(manifest_roots(&manifest, false).unwrap().is_empty());
+            let relative = format!("{}src/shared.rs", "../".repeat(entry.matches('/').count()));
+            let body = format!("#[path = {relative:?}] mod shared;");
+            let entries = [
+                ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                ("src/shared.rs", TEST_API_CALL),
+                (entry, body.as_str()),
+            ];
+            for setting in ["", "true", "false"] {
+                let manifest = if setting.is_empty() {
+                    "[package]".to_owned()
+                } else {
+                    format!("[package]\n{auto} = {setting}")
+                };
+                let (roots, test_only, violations) = target_fixture(&manifest, &entries);
+                let enabled = setting != "false";
+                assert_eq!(
+                    roots.iter().any(|root| root == entry),
+                    enabled,
+                    "{entry}: {setting}"
+                );
+                assert_eq!(
+                    test_only.contains("src/shared.rs"),
+                    !enabled,
+                    "{entry}: {setting}"
+                );
+                assert_eq!(
+                    violations.len(),
+                    usize::from(enabled),
+                    "{entry}: {setting}: {violations:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a6_build_script_default_and_explicit_path_routes_are_production() {
+        for setting in ["", "build = true", "build = 'build.rs'", "build = false"] {
+            let (roots, test_only, violations) = target_fixture(
+                &format!("[package]\n{setting}"),
+                &[
+                    ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                    ("src/shared.rs", TEST_API_CALL),
+                    ("build.rs", r#"#[path = "src/shared.rs"] mod shared;"#),
+                ],
+            );
+            let enabled = setting != "build = false";
+            assert_eq!(roots.iter().any(|root| root == "build.rs"), enabled);
+            assert_eq!(test_only.contains("src/shared.rs"), !enabled);
+            assert_eq!(violations.len(), usize::from(enabled));
+        }
+        let (roots, test_only, violations) = target_fixture(
+            "[package]\nbuild = 'scripts/custom.rs'",
+            &[
+                ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                ("src/shared.rs", TEST_API_CALL),
+                (
+                    "scripts/custom.rs",
+                    r#"#[path = "../src/shared.rs"] mod shared;"#,
+                ),
+                ("build.rs", ""),
+            ],
+        );
+        assert!(roots.iter().any(|root| root == "scripts/custom.rs"));
+        assert!(!roots.iter().any(|root| root == "build.rs"));
+        assert!(!test_only.contains("src/shared.rs"));
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn a6_auto_discovery_ignores_support_files_below_the_target_root_level() {
+        let (roots, _, _) = target_fixture(
+            "[package]\nautolib = false",
+            &[
+                ("examples/support/helper.rs", ""),
+                ("tests/common/mod.rs", ""),
+                ("benches/deep/nested/main.rs", ""),
+                ("src/bin/common/helper.rs", ""),
+            ],
+        );
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn a6_rejects_case_variants_of_auto_discovered_paths() {
+        for entry in [
+            "Examples/probe.rs",
+            "src/Bin/probe.rs",
+            "benches/probe/Main.rs",
+            "Build.rs",
+            "Build.RS",
+            "src/Lib.RS",
+            "tests/probe/main.RS",
+            "examples/probe.RS",
+            "examples/probe.rſ",
+            "tests/probe/main.rſ",
+        ] {
+            let sources = BTreeMap::from([(entry.to_owned(), String::new())]);
+            let error = module_tree::crate_roots("[package]", &sources).unwrap_err();
+            assert!(
+                error.contains("module path case differs from file on disk"),
+                "{entry}: {error}"
+            );
+        }
+        for path in [
+            "Build.RS",
+            "src/lib.RS",
+            "tests/probe/main.RS",
+            "examples/probe.rS",
+            "examples/probe.rſ",
+        ] {
+            assert!(
+                is_rust_source_path(Path::new(path))
+                    .unwrap_err()
+                    .contains("module path case differs")
+            );
+        }
+        assert!(is_rust_source_path(Path::new("examples/probe.rs")).unwrap());
+    }
+
+    #[test]
+    fn a6_rejects_unsupported_target_fields_for_every_kind() {
+        for kind in ["lib", "bin", "example", "test", "bench"] {
+            let header = if kind == "lib" {
+                "[lib]".to_owned()
+            } else {
+                format!("[[{kind}]]")
+            };
+            for field in [
+                "unknown_target_setting = true",
+                "test = 'false'",
+                "required-features = [false]",
+                "path = false",
+            ] {
+                let manifest = format!("[package]\n{header}\n{field}");
+                assert!(manifest_roots(&manifest, true).is_err(), "{manifest}");
+            }
+        }
+        for value in ["0", "{}", "[]", "''"] {
+            assert!(
+                manifest_roots(&format!("[package]\nbuild = {value}"), true)
+                    .unwrap_err()
+                    .contains("package.build")
+            );
         }
     }
 

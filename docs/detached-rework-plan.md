@@ -6235,15 +6235,23 @@ editor と再開予約の更新は対象 owner だけに限る。tag prewarm は
 §1.272 で削除済みの migrate_at_rest_spread_shifts は古い登録とコメントを取り除いた。
 変更は監査ツールと本書だけで、src/ は変更していない。
 
-独立レビューの指摘を反映し、crate root は明示 bin と `[lib] path`（未指定なら既存の
-`src/lib.rs`）から決める。自動探索は本リポジトリの `autobins = false`、
-`autolib = true` またはその既定値だけを受け入れ、未対応の形は明示エラーで止める。
+独立レビューの指摘を反映し、crate root は target 種別による免除を設けず、
+lib / bin / example / test / bench と build script をすべて非テスト経路として扱う。
+明示 path と、src/lib.rs・src/main.rs・src/bin/・examples/・tests/・benches/ の自動探索を
+共通の target 定義表から処理する。対応する auto* が false の場合も明示 target は残す。
+test / bench target を非テスト扱いにするのは、A6 のテスト専用判定を緩めないための保守的な規則である。
+required-features や test / bench / harness の指定で root を除外しない。
+package.build の明示 path と、無効化されていない既存 build.rs も同じ経路へ加える。
+未対応の target key・値の型・解決できない明示 path の省略は、明示エラーで止める。
 Cargo.toml は `toml` 1.1.3 の `Table` として解析し、手書きの行読み取りとコメント処理は撤去した。
 コメント・引用符・複数行文字列・inline/dotted table は TOML の解析結果に従い、文字列内の
 `[lib]` / `path` を root 宣言にしない。反例の回帰では `src/lib.rs` と production の shared を保ち、
-`_for_test` 呼出しを検出する。未対応の target 値の型と自動探索設定は引き続き明示エラーにする。
+`_for_test` 呼出しを検出する。自動探索設定は真偽値だけを受け入れ、未知の auto* は明示エラーにする。
 依存は `parse` / `serde` feature だけを有効にし、既存 lock のバージョンは変えず依存辺だけ追加した。
 Windows で同じファイルを指す大小文字違いは、到達経路とディスク読み込みの両方で拒否する。
 src/ 外への既存参照（`tests/support/ui_harness.rs`、`tests/support/scroll_layout.rs`、
 `crates/susie-worker/src/protocol.rs`）があるため loader は維持し、通常の mod 宣言では
 `name.rs` と `name/mod.rs` の両候補を確認する。両方あれば曖昧としてエラーにする。
+root discovery の inventory は examples/・tests/・benches/ と package 直下の Rust ファイルも含み、
+大小文字違いや source link を黙って落とさずエラーにする。監査対象自体は従来の src/**/*.rs を維持する。
+明示 example、自動探索 example、build.rs の path 経路で shared が production と共有される反例を回帰に加えた。

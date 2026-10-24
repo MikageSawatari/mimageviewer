@@ -62,9 +62,58 @@ fn file_route(file: String, test: bool, root: bool) -> SourceRoute {
     }
 }
 
-/// The repository uses explicit bin paths and automatic/default library discovery.
-/// TOML syntax is handled by the parser; unsupported target shapes/settings fail
-/// explicitly instead of silently omitting a possible production crate root.
+// Target kind affects only manifest/filesystem layout, never A6's test gating.
+// All discovered paths enter the module resolver through the same non-test route.
+struct TargetLayout {
+    key: &'static str,
+    auto: &'static str,
+    singleton: bool,
+    default_file: Option<&'static str>,
+    directory: Option<&'static str>,
+}
+
+const TARGET_LAYOUTS: &[TargetLayout] = &[
+    TargetLayout {
+        key: "lib",
+        auto: "autolib",
+        singleton: true,
+        default_file: Some("src/lib.rs"),
+        directory: None,
+    },
+    TargetLayout {
+        key: "bin",
+        auto: "autobins",
+        singleton: false,
+        default_file: Some("src/main.rs"),
+        directory: Some("src/bin"),
+    },
+    TargetLayout {
+        key: "example",
+        auto: "autoexamples",
+        singleton: false,
+        default_file: None,
+        directory: Some("examples"),
+    },
+    TargetLayout {
+        key: "test",
+        auto: "autotests",
+        singleton: false,
+        default_file: None,
+        directory: Some("tests"),
+    },
+    TargetLayout {
+        key: "bench",
+        auto: "autobenches",
+        singleton: false,
+        default_file: None,
+        directory: Some("benches"),
+    },
+];
+
+/// Sources include a complete inventory of the conventional target directories and
+/// package-root .rs files. Extra explicit paths are subsequently read by the loader.
+/// Test/bench targets and feature-selected targets are deliberately non-test roots:
+/// over-approximating Cargo's target set can only make the A6 exemption stricter.
 pub(super) fn crate_roots(
     manifest: &str,
     sources: &BTreeMap<String, String>,
@@ -76,57 +125,132 @@ pub(super) fn crate_roots(
         .get("package")
         .and_then(toml::Value::as_table)
         .ok_or("unsupported Cargo.toml: expected a package table")?;
-    if package.get("autobins").and_then(toml::Value::as_bool) != Some(false) {
-        return Err("unsupported auto-discovery: require explicit autobins = false".into());
-    }
-    if package
-        .get("autolib")
-        .is_some_and(|value| value.as_bool() != Some(true))
-    {
-        return Err("unsupported auto-discovery: require autolib = true or its default".into());
-    }
-    for key in package.keys() {
-        if key.starts_with("auto") && !matches!(key.as_str(), "autobins" | "autolib") {
-            return Err(format!("unsupported auto-discovery setting: {key}"));
+    for (key, value) in package {
+        if key.starts_with("auto") {
+            if !TARGET_LAYOUTS.iter().any(|layout| layout.auto == key) {
+                return Err(format!("unsupported auto-discovery setting: {key}"));
+            }
+            if !value.is_bool() {
+                return Err(format!(
+                    "unsupported auto-discovery setting {key}: expected a boolean"
+                ));
+            }
         }
     }
 
     let mut roots = BTreeSet::new();
-    let library = manifest
-        .get("lib")
-        .map(|value| {
-            value
-                .as_table()
-                .ok_or("unsupported [lib]: expected a table")
-        })
-        .transpose()?;
-    if let Some(path) = library.and_then(|library| library.get("path")) {
-        let path = path
-            .as_str()
-            .ok_or("unsupported [lib] path: expected a string")?;
-        roots.insert(join("", path));
-    } else {
-        check_path_case(sources, "src/lib.rs")?;
-        if sources.contains_key("src/lib.rs") {
-            roots.insert("src/lib.rs".into());
+    for layout in TARGET_LAYOUTS {
+        let mut declarations = Vec::new();
+        if let Some(value) = manifest.get(layout.key) {
+            if layout.singleton {
+                declarations.push(value);
+            } else {
+                declarations.extend(value.as_array().ok_or_else(|| {
+                    format!(
+                        "unsupported target {}: expected an array of tables",
+                        layout.key
+                    )
+                })?);
+            }
         }
-    }
-    if let Some(binaries) = manifest.get("bin") {
-        let binaries = binaries
-            .as_array()
-            .ok_or("unsupported [[bin]]: expected an array of tables")?;
-        for binary in binaries {
-            let binary = binary
+        for declaration in &declarations {
+            let table = declaration
                 .as_table()
-                .ok_or("unsupported [[bin]]: expected a table")?;
-            let path = binary
+                .ok_or_else(|| format!("unsupported target {}: expected a table", layout.key))?;
+            validate_target_fields(layout.key, table)?;
+            let path = table
                 .get("path")
                 .and_then(toml::Value::as_str)
-                .ok_or("[[bin]] requires an explicit string path")?;
+                .or_else(|| layout.singleton.then_some(layout.default_file).flatten())
+                .ok_or_else(|| format!("target {} requires an explicit string path", layout.key))?;
+            if path.is_empty() {
+                return Err(format!("unsupported target {}: empty path", layout.key));
+            }
             roots.insert(join("", path));
         }
+        // An explicit singleton replaces its inferred default. For array targets
+        // retain all auto candidates, even when a same-name declaration overrides
+        // one in Cargo; the deliberate superset cannot hide a production route.
+        let automatic = package
+            .get(layout.auto)
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true);
+        if automatic && !(layout.singleton && !declarations.is_empty()) {
+            if let Some(path) = layout.default_file {
+                add_existing_root(sources, path, &mut roots)?;
+            }
+            if let Some(directory) = layout.directory {
+                let prefix = format!("{directory}/");
+                let folded = prefix.to_uppercase();
+                for path in sources.keys() {
+                    if path.to_uppercase().starts_with(&folded) {
+                        let relative = path
+                            .split('/')
+                            .skip(prefix.matches('/').count())
+                            .collect::<Vec<_>>();
+                        let candidate = match relative.as_slice() {
+                            [file]
+                                if file.rsplit_once('.').is_some_and(|(_, extension)| {
+                                    extension.to_uppercase() == "RS"
+                                }) =>
+                            {
+                                Some(format!("{prefix}{}.rs", file.rsplit_once('.').unwrap().0))
+                            }
+                            [name, file] if file.to_uppercase() == "MAIN.RS" => {
+                                Some(format!("{prefix}{name}/main.rs"))
+                            }
+                            _ => None,
+                        };
+                        if let Some(candidate) = candidate {
+                            add_existing_root(sources, &candidate, &mut roots)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match package.get("build") {
+        Some(toml::Value::Boolean(false)) => {}
+        None | Some(toml::Value::Boolean(true)) => {
+            add_existing_root(sources, "build.rs", &mut roots)?
+        }
+        Some(toml::Value::String(path)) if !path.is_empty() => {
+            roots.insert(join("", path));
+        }
+        _ => return Err("unsupported package.build: expected a path string or boolean".into()),
     }
     Ok(roots.into_iter().collect())
+}
+
+fn add_existing_root(
+    sources: &BTreeMap<String, String>,
+    path: &str,
+    roots: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    check_path_case(sources, path)?;
+    if sources.contains_key(path) {
+        roots.insert(path.to_owned());
+    }
+    Ok(())
+}
+
+fn validate_target_fields(kind: &str, target: &toml::Table) -> Result<(), String> {
+    for (key, value) in target {
+        let valid = match key.as_str() {
+            "name" | "path" | "edition" => value.is_str(),
+            "test" | "bench" | "doc" | "doctest" | "harness" | "proc-macro" | "plugin" => {
+                value.is_bool()
+            }
+            "crate-type" | "required-features" => value
+                .as_array()
+                .is_some_and(|values| values.iter().all(toml::Value::is_str)),
+            _ => return Err(format!("unsupported target {kind} field: {key}")),
+        };
+        if !valid {
+            return Err(format!("unsupported target {kind} field type: {key}"));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn check_path_case(
