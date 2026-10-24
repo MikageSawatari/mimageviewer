@@ -1980,12 +1980,16 @@ server 最終 redaction は維持する。
 
 ### 12.27 混在フォルダの本判定と seek overlay parity (protocol v43, 2026-08-11)
 
-通常フォルダの保存値が無い見開き既定は、本体と同じ
-`crate::app::physical_page_order_locked` を `spread_payload` から直接呼んで決める。remote 側に
-画像のみ・自動フルスクリーン等の条件を再記述しない。本と判定された場合だけ端末共通の
-`default_spread_mode` / `default_reading_direction` を使い、それ以外は本体の
-`SpreadRestoreDefaults::NON_BOOK` と同じ Single / LTR とする。明示 request と `spread.db` の保存値は
-従来どおり既定より優先する。ZIP / PDF は `is_open_as_container` により本のままである。
+通常フォルダの保存値が無い見開き既定は、設定 OFF 時の既存動作では列挙した全項目が画像である
+`canonical_image_book` を基準にする（`physical_page_order_locked` と同一ではない）。画像だけなら
+端末共通の `default_spread_mode` / `default_reading_direction`、混在なら Single / LTR を使う。
+`apply_default_spread_to_plain_folders`（既定 OFF）が ON なら、directory scan に成功した folder
+列挙から `SpreadDefaultSource::Directory` と採用済み `sort_locked` を渡し、App と共通の
+`SpreadRestoreDefaults::for_physical_folder` で解決する。本扱いなら本の既定、非本の実フォルダなら
+既定 mode（旧 Vertical は Single）と LTR fallback を使い、mode の埋め込み方向を優先する。
+各要求の `RemoteReadingSettings` は bool と既定値を共有 settings_kv から一括で読み、engine の
+起動時 Settings を使わない。明示 request と `spread.db` の保存値は従来どおり既定より優先する。
+ZIP/PDF/EPUB の本用既定、Collection の NON_BOOK は変更しない。IPC wire 形式・protocol 版は不変。
 
 folder container は画像 entry / page group へ絞る前の materialized items をこの判定へ渡す。
 同じ full items から本体 seek overlay の nav item 分類を通して画像・動画・その他の件数を作り、

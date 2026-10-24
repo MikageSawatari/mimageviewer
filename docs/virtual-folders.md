@@ -751,6 +751,12 @@ context epoch による解放は行わない。
 
 ### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
 
+「通常フォルダにも既定のページ構成を使う」(`apply_default_spread_to_plain_folders`、既定 OFF) は
+この直接表示・本扱い設定と独立する。ON でも `ProjectionRecipe`、ページ順固定、自動 fullscreen、
+一覧/ツリー/アドレス指定・F12/複数窓の開き方と帰路は変えない。走査済みの実フォルダに保存された
+ページ構成がないときだけ実効 `default_spread_mode` を使い、非本の flow は Paged のまま。
+保存値を優先し、既定を DB に書き込まない。抽出一覧・ZIP/PDF/EPUB の規則は維持する。
+
 環境設定のフル機能ウィンドウで「本をページ表示で開く」が ON、または複数ウィンドウモードが
 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く、または
 起動引数 / SendTo / 外部ファイラから ZIP/PDF/対応アーカイブを直接開くと、ページ一覧

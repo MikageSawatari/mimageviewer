@@ -13521,6 +13521,36 @@ impl SpreadRestoreDefaults {
         self.spread_mode
     }
 
+    /// Resolve initial defaults only; stored folder values win at the restore boundary.
+    pub(crate) fn for_physical_folder(
+        book_locked: bool,
+        is_real_directory: bool,
+        apply_to_plain_folders: bool,
+        default_spread_mode: crate::settings::SpreadMode,
+        default_reading_flow: crate::settings::ReadingFlow,
+        default_reading_direction: crate::settings::ReadingDirection,
+    ) -> Self {
+        if book_locked {
+            Self {
+                spread_mode: default_spread_mode,
+                reading_flow: default_reading_flow,
+                reading_direction: default_reading_direction,
+            }
+        } else if apply_to_plain_folders && is_real_directory {
+            Self {
+                // Legacy Vertical encodes flow, which this preference must not change.
+                spread_mode: if default_spread_mode == crate::settings::SpreadMode::Vertical {
+                    crate::settings::SpreadMode::Single
+                } else {
+                    default_spread_mode
+                },
+                ..Self::NON_BOOK
+            }
+        } else {
+            Self::NON_BOOK
+        }
+    }
+
     pub(crate) fn reading_direction(self) -> crate::settings::ReadingDirection {
         self.reading_direction
     }
@@ -42142,12 +42172,16 @@ impl App {
         // `install_new_items_inner` は view flags と `self.items` を差し替えるため、今回の
         // 読み込みが本かどうかは、確定済みの target source/items から先に決める。
         let page_order_view_kind = PageOrderViewKind::for_loading_source(&source_path);
-        let spread_restore_defaults =
-            if self.page_order_locked_for_items(&source_path, &items, page_order_view_kind) {
-                SpreadRestoreDefaults::for_book(&self.settings)
-            } else {
-                SpreadRestoreDefaults::NON_BOOK
-            };
+        // A signature comes from an accepted directory scan (also retained by Stack).
+        // Physical view kind or the path extension alone does not prove a directory.
+        let spread_restore_defaults = SpreadRestoreDefaults::for_physical_folder(
+            self.page_order_locked_for_items(&source_path, &items, page_order_view_kind),
+            folder_signature.is_some() && page_order_view_kind == PageOrderViewKind::Physical,
+            self.settings.apply_default_spread_to_plain_folders,
+            self.settings.default_spread_mode,
+            self.settings.default_reading_flow,
+            self.settings.default_reading_direction,
+        );
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
@@ -42363,8 +42397,7 @@ impl App {
                 ],
             );
         }
-        // 表示モード: DB から読み込み、なければ読み込み対象が本のときだけ settings の既定値。
-        // 本でないビューは単ページ + ページ単位 + 左→右へ戻す。明示保存値はどちらでも優先する。
+        // 保存値を優先し、未保存なら採用済み分類と通常フォルダ設定から既定を解決する。
         // 旧実装の SpreadMode::Vertical は「単ページ + 縦連結」として解釈する。
         // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
         // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
@@ -48142,20 +48175,49 @@ impl App {
             self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
-            let preferred_direction = container
-                .spread
-                .direction
-                .unwrap_or(self.settings.default_reading_direction);
-            let stored_spread = container.spread.resolve_mode(
-                self.settings
-                    .default_spread_mode
-                    .with_reading_direction(preferred_direction),
-                preferred_direction,
-            );
-            self.reading_flow = container
-                .spread
-                .flow
-                .unwrap_or(self.settings.default_reading_flow);
+            // Reuse this context's accepted directory scan, without another stat or scan.
+            let physical_folder_defaults = self.folder_observation.as_ref().and_then(|scan| {
+                (scan.generation == self.items_generation
+                    && self.current_folder.as_ref() == Some(&scan.source)
+                    && self.extracted_result_surface().is_none())
+                .then(|| {
+                    SpreadRestoreDefaults::for_physical_folder(
+                        self.page_order_locked_for_items(
+                            &scan.source,
+                            &self.items,
+                            PageOrderViewKind::Physical,
+                        ),
+                        true,
+                        self.settings.apply_default_spread_to_plain_folders,
+                        self.settings.default_spread_mode,
+                        self.settings.default_reading_flow,
+                        self.settings.default_reading_direction,
+                    )
+                })
+            });
+            let (stored_spread, preferred_direction, default_flow) =
+                if let Some(defaults) = physical_folder_defaults {
+                    let resolved = container.spread.resolve_reading(
+                        defaults.spread_mode,
+                        defaults.reading_direction,
+                        false,
+                        None,
+                    );
+                    (resolved.mode, resolved.direction, defaults.reading_flow)
+                } else {
+                    let direction = container
+                        .spread
+                        .direction
+                        .unwrap_or(self.settings.default_reading_direction);
+                    let mode = container.spread.resolve_mode(
+                        self.settings
+                            .default_spread_mode
+                            .with_reading_direction(direction),
+                        direction,
+                    );
+                    (mode, direction, self.settings.default_reading_flow)
+                };
+            self.reading_flow = container.spread.flow.unwrap_or(default_flow);
             self.reading_direction = preferred_direction;
             if stored_spread == crate::settings::SpreadMode::Vertical {
                 self.spread_mode = crate::settings::SpreadMode::Single;

@@ -48,6 +48,9 @@ mod pdf_render_epoch;
 #[path = "tests/notification_duration.rs"]
 mod notification_duration;
 
+#[path = "tests/plain_folder_spread.rs"]
+mod plain_folder_spread;
+
 #[path = "tests/startup_notices.rs"]
 pub(super) mod startup_notices;
 
