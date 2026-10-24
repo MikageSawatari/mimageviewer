@@ -410,7 +410,14 @@ pub(crate) enum SubfolderExpansionEvent {
     Cancelled,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubfolderInstallPurpose {
+    New,
+    Return,
+}
+
 pub(crate) struct SubfolderExpansionAdoption {
+    purpose: SubfolderInstallPurpose,
     navigation: MainListNavigation,
     removed_paths: HashSet<String>,
 }
@@ -1823,6 +1830,7 @@ impl App {
     ) {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            SubfolderInstallPurpose::New,
             HashSet::new(),
             self.copied_destination_source_proof(),
         );
@@ -1842,11 +1850,13 @@ impl App {
     fn capture_subfolder_expansion_adoption(
         &mut self,
         history: MainHistoryOperation,
+        purpose: SubfolderInstallPurpose,
         removed_paths: HashSet<String>,
         proof: MainListSourceProof,
     ) -> Option<SubfolderExpansionAdoption> {
         self.main_folder_history_available()
             .then(|| SubfolderExpansionAdoption {
+                purpose,
                 navigation: self.capture_main_list_navigation(history, proof),
                 removed_paths,
             })
@@ -2104,6 +2114,7 @@ impl App {
     ) {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            SubfolderInstallPurpose::New,
             HashSet::new(),
             MainListSourceProof::Row,
         );
@@ -2150,6 +2161,7 @@ impl App {
     ) {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            SubfolderInstallPurpose::New,
             HashSet::new(),
             MainListSourceProof::Row,
         );
@@ -2208,6 +2220,7 @@ impl App {
         };
         let navigation = self.capture_subfolder_expansion_adoption(
             operation,
+            SubfolderInstallPurpose::New,
             self.subfolder_expansion_removed_paths.clone(),
             MainListSourceProof::Row,
         );
@@ -2247,17 +2260,21 @@ impl App {
             &snapshot.roots,
             Some(&snapshot.scan_filter),
         );
+        let destination_view =
+            self.favorite_view_state_for_path(&subfolder_expansion_synthetic_path());
+        let mut listing_settings = self.settings.clone();
+        listing_settings.sort_order = destination_view.sort_order;
+        let request = if crate::books::is_direct_book_folder(&self.book_root_path(), &snapshot.root)
+        {
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::Numeric)
+        } else {
+            crate::rating_sort::ListingOrderRequest::from_settings(&listing_settings)
+        };
         let options = SubfolderExpansionPrepareOptions {
-            request: if self.book_sort_order_for_path(&snapshot.root) != self.settings.sort_order {
-                crate::rating_sort::ListingOrderRequest::Standard(
-                    self.book_sort_order_for_path(&snapshot.root),
-                )
-            } else {
-                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
-            },
+            request,
             rating_write_generation: self.rating_session_write_generation,
             order: self.settings.subfolder_expansion_order,
-            display_order: self.settings.grid_display_order.clone(),
+            display_order: destination_view.grid_display_order,
             load_ratings: self.rating_db.is_some(),
             load_tags: self.tags_db.is_some(),
             load_local_adjust: self.local_adjust_db.is_some(),
@@ -2461,6 +2478,7 @@ impl App {
         );
         self.cancel_pending_folder_nav();
         let owned = Some(SubfolderExpansionAdoption {
+            purpose: SubfolderInstallPurpose::Return,
             navigation,
             removed_paths,
         });
@@ -2491,6 +2509,7 @@ impl App {
         if let Some(state) = state {
             let owned = self.capture_subfolder_expansion_adoption(
                 MainHistoryOperation::Restore { route: None },
+                SubfolderInstallPurpose::Return,
                 state.removed_paths,
                 if state.snapshot.is_some() {
                     MainListSourceProof::Row
@@ -2519,7 +2538,14 @@ impl App {
         if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
             return false;
         }
-        if self.reinstall_subfolder_expansion_snapshot() {
+        if let Some(snapshot) = self.subfolder_expansion_snapshot.clone() {
+            let owned = self.capture_subfolder_expansion_adoption(
+                MainHistoryOperation::Restore { route: None },
+                SubfolderInstallPurpose::Return,
+                self.subfolder_expansion_removed_paths.clone(),
+                MainListSourceProof::Row,
+            );
+            self.start_subfolder_expansion_prepare_owned(snapshot, false, None, owned);
             return true;
         }
         if let Some(root) = self
@@ -2534,6 +2560,7 @@ impl App {
             };
             let navigation = self.capture_subfolder_expansion_adoption(
                 MainHistoryOperation::Restore { route: None },
+                SubfolderInstallPurpose::Return,
                 self.subfolder_expansion_removed_paths.clone(),
                 self.copied_destination_source_proof(),
             );
@@ -2618,10 +2645,15 @@ impl App {
                 app.stack_view = None;
                 app.stack_return_state = None;
                 app.stack_showing_flat = false;
-                app.install_prepared_subfolder_expansion_memory(prepared, ctx, token)
+                app.install_prepared_subfolder_expansion_memory(prepared, ctx, token, owned.purpose)
             });
         } else {
-            let hydration = self.install_prepared_subfolder_expansion_memory(prepared, ctx, token);
+            let hydration = self.install_prepared_subfolder_expansion_memory(
+                prepared,
+                ctx,
+                token,
+                SubfolderInstallPurpose::New,
+            );
             self.hydrate_installed_main_list(hydration);
         }
     }
@@ -2631,6 +2663,7 @@ impl App {
         prepared: PreparedSubfolderExpansion,
         ctx: Option<&egui::Context>,
         token: PreparedVisibleInstall,
+        purpose: SubfolderInstallPurpose,
     ) -> MainListHydration {
         self.capture_main_list_restore_cursor();
         let install_t0 = Instant::now();
@@ -2672,7 +2705,7 @@ impl App {
         let start_loading_t0 = Instant::now();
         let local_search =
             (ctx.is_some() && self.show_search_bar).then(|| self.search_query.clone());
-        let hydration = self.install_loading_items_inner(
+        let mut hydration = self.install_loading_items_inner(
             subfolder_expansion_synthetic_path(),
             items,
             image_metas,
@@ -2691,6 +2724,19 @@ impl App {
             },
             token,
         );
+        let position_key =
+            super::top_level_grid_view::SubfolderExpansionPositionKey::new(&root, &roots);
+        let position = (purpose == SubfolderInstallPurpose::Return)
+            .then(|| {
+                self.top_level_grid_view
+                    .subfolder_expansion_position(&position_key)
+                    .cloned()
+            })
+            .flatten();
+        if let Some((continuation, _)) = hydration.as_mut() {
+            continuation.auto_aspect_seed =
+                position.as_ref().and_then(|position| position.aspect_seed);
+        }
         if let Some(generation) = rating_write_generation {
             self.overlay_rating_session_writes_since(generation);
             self.rebuild_visible_indices_after_rating_publication();
@@ -2745,10 +2791,21 @@ impl App {
                 )],
             );
         }
-        if let Some(&idx) = self.visible_indices.first() {
-            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+        let restored = position
+            .as_ref()
+            .and_then(|position| position.selected_key.as_deref())
+            .and_then(|key| {
+                self.visible_indices
+                    .iter()
+                    .copied()
+                    .find(|&index| self.rating_path_key(index).as_deref() == Some(key))
+            });
+        if restored.is_some() {
+            self.scroll_offset_y = position.as_ref().unwrap().scroll_offset_y;
         }
+        let selected = restored.or_else(|| self.visible_indices.first().copied());
+        self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
+        self.scroll_to_selected = selected.is_some();
         if perf_on {
             crate::perf::event(
                 "subfolder",
