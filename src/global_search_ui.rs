@@ -599,9 +599,7 @@ impl Default for GlobalSearchState {
     fn default() -> Self {
         Self {
             source: SearchSource::Metadata,
-            accepted: SearchAccepted::Metadata {
-                applied: MetadataAppliedSpec::default(),
-            },
+            accepted: SearchAccepted::Metadata { applied: None },
             active: false,
             metadata_draft: String::new(),
             everything_draft: String::new(),
@@ -701,8 +699,7 @@ impl GlobalSearchState {
             && !self.done
             && self.reject_message.is_none()
             && !self.metadata_draft.trim().is_empty()
-            && (self.pending.is_some()
-                || (self.last_change_at.is_some() && self.metadata_draft != self.last_executed))
+            && (self.pending.is_some() || self.metadata_draft != self.last_executed)
     }
 
     /// 実効ビューを `aggregate` / `drill` から導出する (§4.3.1)。
@@ -739,9 +736,7 @@ impl GlobalSearchState {
         // SearchHandle は Drop で cancel するので、take() だけで OK
         self.pending = None;
         self.page_edit_prepare = None;
-        self.accepted = SearchAccepted::Metadata {
-            applied: MetadataAppliedSpec::default(),
-        };
+        self.accepted = SearchAccepted::Metadata { applied: None };
         self.containers.clear();
         self.all_hits.clear();
         // 新クエリは一覧から開始し、自動切替を再有効化、drill state もリセット (§4.3.2)。
@@ -2704,6 +2699,11 @@ impl App {
         self.global_search.active = true;
         self.global_search.source = SearchSource::Metadata;
         self.global_search.last_change_at = None;
+        // A retained draft is idle until edited/submitted. Empty legacy sessions
+        // keep their existing initial state; neither case publishes applied conditions.
+        if !self.global_search.metadata_draft.is_empty() {
+            self.global_search.done = true;
+        }
         self.global_search.focus_request = true;
         if let Some(origin) = transferred_origin {
             self.global_search.saved_folder = origin.restore.legacy_path().or(fallback_origin);
@@ -3300,6 +3300,17 @@ impl App {
                         && prepared.rating_provenance.session_generation
                             == wish.rating_write_generation
                     {
+                        // Adoption already proved this exact source/run/query. Read its
+                        // validation facts here: Done can precede the initial empty Ready,
+                        // so the earlier view wish must not freeze an unvalidated outcome.
+                        let metadata_applied = (matches!(wish.source, SearchProjection::Metadata)
+                            && self.global_search.reject_message.is_none()
+                            && self.global_search.last_executed == wish.query
+                            && (self.global_search.done || prepare.raw_batch_sequence > 0))
+                            .then(|| MetadataAppliedSpec {
+                                query: wish.query.clone(),
+                                filters: wish.filters.clone(),
+                            });
                         let accept_started = Instant::now();
                         #[cfg(test)]
                         {
@@ -3361,7 +3372,7 @@ impl App {
                                 prepared.metadata,
                             );
                             app.install_prepared_page_edits(prepared.page_edits);
-                            app.accept_search_projection(&wish);
+                            app.accept_search_projection(&wish, metadata_applied);
                             if let Some(viewer) = viewer {
                                 app.finish_rating_membership_viewer_swap(viewer);
                             }
@@ -4226,9 +4237,9 @@ impl App {
             return;
         }
         let query = match &self.global_search.accepted {
-            SearchAccepted::Metadata { applied } if !applied.query.is_empty() => {
-                applied.query.clone()
-            }
+            SearchAccepted::Metadata {
+                applied: Some(applied),
+            } => applied.query.clone(),
             SearchAccepted::Metadata { .. } if !self.global_search.last_executed.is_empty() => {
                 self.global_search.last_executed.clone()
             }
@@ -4579,7 +4590,7 @@ impl App {
                             )
                         )),
                     ))
-                } else if self.global_search.done {
+                } else if self.global_search.done && matches!(self.global_search.accepted, SearchAccepted::Metadata { applied: Some(_) }) {
                     let (text, color, hover) = if self.global_search.truncated {
                         let text =
                             format!("ヒット {} 件で打ち切り", self.global_search.total_valid);
@@ -4717,6 +4728,166 @@ impl App {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn section1409_metadata_stream(
+        app: &mut App,
+        ctx: &egui::Context,
+        query: &str,
+    ) -> crossbeam_channel::Sender<SearchStreamEvent> {
+        app.open_global_search();
+        app.global_search.metadata_draft = query.into();
+        app.reset_global_search_for_query_change(ctx);
+        app.global_search.last_executed = query.into();
+        app.global_search.last_sort_at = None;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(SearchProducer::Metadata(SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        }));
+        tx
+    }
+
+    fn section1409_settle_metadata(
+        app: &mut App,
+        ctx: &egui::Context,
+        ready: impl Fn(&App) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.poll_global_search_events(ctx);
+            if ready(app)
+                && app
+                    .global_search
+                    .page_edit_prepare
+                    .as_ref()
+                    .is_none_or(|prepare| prepare.in_flight.is_none() && prepare.desired.is_none())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Metadata projection did not settle: query={} done={} rejected={:?} applied={}",
+                app.global_search.metadata_draft,
+                app.global_search.done,
+                app.global_search.reject_message,
+                app.global_search.accepted.applied_query()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn section1409_metadata_only_validated_results_publish_applied_conditions() {
+        use crate::ui_pinned_search::{
+            PinnedSearchAction as Action, PinnedSearchKind as Kind, PinnedSearchState as State,
+        };
+        for outcome in ["unvalidated", "rejected", "zero", "streaming"] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.show_toolbar_search_metadata = true;
+            app.settings.show_toolbar_search_everything = true;
+            let ctx = egui::Context::default();
+            let previous = section1409_metadata_stream(&mut app, &ctx, "previous valid");
+            app.hold_next_search_ready_for_test();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !app.search_ready_is_held_for_test() {
+                app.poll_search_page_edit_prepare(&ctx);
+                assert!(
+                    Instant::now() < deadline,
+                    "initial unvalidated Ready missing"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            previous
+                .send(SearchStreamEvent::Done {
+                    truncated: false,
+                    reason: DoneReason::Complete,
+                })
+                .unwrap();
+            app.poll_global_search_events(&ctx);
+            assert!(
+                app.global_search.done,
+                "Complete precedes adoption of the initial empty list"
+            );
+            app.release_search_ready_for_test();
+            section1409_settle_metadata(
+                &mut app,
+                &ctx,
+                |app| matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied: Some(spec) } if spec.query == "previous valid"),
+            );
+            assert_eq!(app.pinned_search_state(Kind::Metadata), State::Applied);
+
+            let query = if outcome == "rejected" {
+                "あ"
+            } else {
+                "new query"
+            };
+            let stream = section1409_metadata_stream(&mut app, &ctx, query);
+            section1409_settle_metadata(&mut app, &ctx, |app| {
+                matches!(
+                    app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: None }
+                )
+            });
+            assert_ne!(app.pinned_search_state(Kind::Metadata), State::Applied);
+            match outcome {
+                "rejected" => stream
+                    .send(SearchStreamEvent::Done {
+                        truncated: false,
+                        reason: DoneReason::RejectedQuery(
+                            crate::global_search::RejectReason::TooShort(vec![query.into()]),
+                        ),
+                    })
+                    .unwrap(),
+                "zero" => stream
+                    .send(SearchStreamEvent::Done {
+                        truncated: false,
+                        reason: DoneReason::Complete,
+                    })
+                    .unwrap(),
+                "streaming" => stream
+                    .send(SearchStreamEvent::Batch {
+                        hits: Vec::new(),
+                        scanned_candidates: 0,
+                        valid_hits: 0,
+                        visibility_notice: None,
+                    })
+                    .unwrap(),
+                _ => {}
+            }
+            let applied = matches!(outcome, "zero" | "streaming");
+            section1409_settle_metadata(&mut app, &ctx, |app| {
+                let has_applied = matches!(
+                    app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: Some(_) }
+                );
+                has_applied == applied
+                    && (outcome != "rejected" || app.global_search.reject_message.is_some())
+            });
+            assert_eq!(app.applied_owner(), applied.then_some(Kind::Metadata));
+            if outcome == "rejected" {
+                assert_eq!(app.pinned_search_state(Kind::Metadata), State::Inactive);
+                app.update_global_search_address();
+                assert!(app.address.contains(query));
+                assert!(!app.address.contains("previous valid"));
+            }
+            if outcome == "zero" {
+                assert_eq!(app.pinned_search_state(Kind::Metadata), State::Applied);
+            }
+            app.ensure_search_session(Kind::Everything);
+            assert_eq!(app.applied_owner(), applied.then_some(Kind::Metadata));
+            app.handle_pinned_search_actions(&ctx, vec![Action::Clear(Kind::Everything)]);
+            assert_eq!(
+                app.global_search.active, applied,
+                "{outcome}: no return to a rejected/unvalidated query"
+            );
+            assert_eq!(app.global_search.metadata_draft, query);
+            if applied {
+                assert_eq!(app.global_search.source, SearchSource::Metadata);
+                app.handle_pinned_search_actions(&ctx, vec![Action::Clear(Kind::Metadata)]);
+                assert!(!app.global_search.active);
+            }
+        }
+    }
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
 

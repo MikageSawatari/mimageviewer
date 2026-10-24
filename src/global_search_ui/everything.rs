@@ -125,7 +125,7 @@ pub(crate) struct MetadataAppliedSpec {
 
 pub(crate) enum SearchAccepted {
     Metadata {
-        applied: MetadataAppliedSpec,
+        applied: Option<MetadataAppliedSpec>,
     },
     Everything {
         submitted: SubmittedEverything,
@@ -137,7 +137,10 @@ pub(crate) enum SearchAccepted {
 impl SearchAccepted {
     pub(crate) fn applied_query(&self) -> &str {
         match self {
-            Self::Metadata { applied } => &applied.query,
+            Self::Metadata {
+                applied: Some(applied),
+            } => &applied.query,
+            Self::Metadata { applied: None } => "",
             Self::Everything { submitted, .. } => &submitted.query,
         }
     }
@@ -201,9 +204,7 @@ impl App {
     pub(crate) fn retire_search_accepted(&mut self) {
         let accepted = std::mem::replace(
             &mut self.global_search.accepted,
-            SearchAccepted::Metadata {
-                applied: MetadataAppliedSpec::default(),
-            },
+            SearchAccepted::Metadata { applied: None },
         );
         self.retire_smart_folder_payloads([
             Box::new(accepted) as crate::app::smart_folder::RetiredSmartFolderPayload
@@ -265,6 +266,7 @@ impl App {
         self.global_search.source = source;
         self.global_search.last_executed.clear();
         self.global_search.last_change_at = None;
+        self.global_search.done = true; // Source selection alone has no unfinished query.
         self.global_search.reject_message = None;
         self.global_search.focus_request = true;
         // Accepted data and its source still explain the visible rows after a failed send.
@@ -469,16 +471,17 @@ impl App {
         }
     }
 
-    pub(super) fn accept_search_projection(&mut self, wish: &SearchViewWish) {
+    pub(super) fn accept_search_projection(
+        &mut self,
+        wish: &SearchViewWish,
+        metadata_applied: Option<MetadataAppliedSpec>,
+    ) {
         self.retire_search_accepted();
         match wish.source.clone() {
             SearchProjection::Metadata => {
                 self.global_search.accepted = SearchAccepted::Metadata {
-                    applied: MetadataAppliedSpec {
-                        query: wish.query.clone(),
-                        filters: wish.filters.clone(),
-                    },
-                }
+                    applied: metadata_applied,
+                };
             }
             SearchProjection::Everything { submitted, dataset } => {
                 let old_hits = std::mem::take(&mut self.global_search.all_hits);
@@ -668,7 +671,7 @@ impl App {
                     SearchAccepted::Everything {submitted,dataset,..} => {
                         ui::draw_everything_status(ui,ui::EverythingStatus {total:dataset.stats.total_items,raw_returned:dataset.stats.raw_returned,displayed:dataset.rows.len(),outside:dataset.stats.unsupported + dataset.stats.excluded,duplicates:dataset.stats.duplicates,unreadable:dataset.stats.unreadable,limit_reached:dataset.stats.limit_reached,query_changed:submitted.query != self.global_search.everything_draft,error:self.global_search.reject_message.as_deref()});
                     }
-                    SearchAccepted::Metadata { .. } if self.items_are_global_search_view => { ui.label("表示中: アイテム検索の結果。Everything の条件はまだ適用されていません。"); }
+                    SearchAccepted::Metadata { applied: Some(_) } if self.items_are_global_search_view => { ui.label("表示中: アイテム検索の結果。Everything の条件はまだ適用されていません。"); }
                     _ => {}
                 }
                 if matches!(self.global_search.accepted,SearchAccepted::Metadata { .. }) {

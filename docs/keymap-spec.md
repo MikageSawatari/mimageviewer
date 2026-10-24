@@ -1074,3 +1074,7 @@ Escは全検索バー描画後の単一routerが一度だけ消費する。modal
 適用結果または有効sessionの順。非active欄ではfocus解除だけ。検索終了時に固定欄のdraftは
 保持し、Everything実行中は取消だけを行う。egui begin_passでfocusが消えたときは既存recoveryの
 viewport/pass/pointer優先条件に従って入力Idを捕捉し、描画後のhas_focusで選び直さない。
+
+固定OFFの一時バーのEscは、そのバーの×と同じく共通検索sessionを終了して元一覧へ戻る。
+別sourceの結果を残したまま未送信入力を閉じて入力先だけ戻す(b)は、固定欄に限る。
+全OFFとG/Rの片方だけ固定の場合も、この入力ownerの区別を保つ。

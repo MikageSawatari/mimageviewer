@@ -31318,3 +31318,74 @@ mod section292_tests {
         facet_sort_snapshot("facet_sort_narrow_dark", 320.0);
     }
 }
+
+#[cfg(test)]
+mod pinned_search_review_tests {
+    use super::*;
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+    use egui_kittest::kittest::Queryable;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    #[test]
+    fn section1409_search_label_secondary_click_opens_settings_with_drag_disabled() {
+        for kind in Kind::ALL {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.toolbar_section_drag_enabled = false;
+            set_toolbar_section_visible(&mut app.settings, kind.section(), true);
+            let app = Rc::new(RefCell::new(app));
+            let render = app.clone();
+            let label_rect = Rc::new(Cell::new(egui::Rect::NOTHING));
+            let rect = label_rect.clone();
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(640.0, 260.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let mut app = render.borrow_mut();
+                            let response = app.draw_pinned_search_section(ui, kind);
+                            rect.set(response.inner.label.rect);
+                            app.finish_toolbar_section_lead(
+                                ui,
+                                response.inner.label,
+                                kind.section(),
+                                &mut Vec::new(),
+                                &[],
+                            );
+                        });
+                    });
+                });
+            harness.run();
+            let pos = label_rect.get().center();
+            harness.hover_at(pos);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.run();
+            harness.get_by_label("行頭に表示").click();
+            harness.run();
+            assert!(
+                app.borrow()
+                    .settings
+                    .toolbar_section_new_row
+                    .contains(&kind.section()),
+                "{kind:?}"
+            );
+            assert!(!app.borrow().settings.toolbar_section_drag_enabled);
+        }
+    }
+}

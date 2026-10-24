@@ -254,7 +254,7 @@ pub fn draw_pinned_search(
                         label = Some(ui.add(egui::Label::new(kind.label()).sense(if drag {
                             egui::Sense::click_and_drag()
                         } else {
-                            egui::Sense::hover()
+                            egui::Sense::click()
                         })));
                         if !width.stacked {
                             input = Some(draw_input(ui, &mut actions));

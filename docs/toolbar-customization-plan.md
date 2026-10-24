@@ -245,7 +245,8 @@ Phase 3 (右クリックカスタマイズ + ドラッグ並べ替え + 環境�
 - `applied_owner` は表示結果、`edit_owner(kind)` は入力先、`closable_owner` は適用結果→
   有効session の順で導く。×は (a) 適用結果を終了して元一覧へ戻す、(b) 入力先だけなら
   保持結果の入力先へ戻す/保持結果がなければ終了、(c) 他の欄は draft の消去だけ。
-  Esc は同じ終了規則で draft を保持し、非active欄ならfocusだけを外す。
+  固定欄のEscは同じ終了規則で draft を保持し、非active欄ならfocusだけを外す。
+  一時バーのEscは従来の×と同じ共通検索終了・元一覧復帰であり、固定欄の(b)へ渡さない。
 - Esc は toolbar と全検索バーの後の `route_search_escape` が一度だけ処理・消費する。
   `EscapeClaim` は当該frameだけの値。modal/IME→描画前に捕捉した入力owner→closable owner。
   Everything running は取消だけ。入力ownerは egui-ime recovery の viewport/pass 有効範囲と
@@ -269,10 +270,12 @@ Everythingは既存の専用availabilityで判定する。`projected_viewer_sess
 §1.406の受付拡張やdetached述語・viewport lifecycle自体は変更しない。この境界もpure回帰で検証する。
 
 固定draftを残しても、終了済みのdebounce意図は残さない。Globalのopen/dismiss/Snapshot終了で
-`last_change_at`を解除し、Runningは実producerまたは変更時刻のあるdebounceから導く。
-未実行の保持draftや、source切替だけを検索中と表示しない。Metadataの空queryは検索実行時に
-拒否されるため、初期化用の空applied specは適用結果ownerにしない。実際のacceptedがない間の
-アドレス表示は従来の実行/入力条件を使い、採用後はimmutableなapplied条件を使う。
+`last_change_at`を解除する。未確定の有効queryは従来どおりdraftと実行済み条件の差でも検索中と
+判定する。保持draftを開く/sourceを選ぶだけの入口では、その未実行入力をidleとして扱う。
+Metadataの`applied`はOptionで、未検証/拒否/失敗した投影はNone。正常Batchまたは正常Doneのある
+同じrun/queryの一覧を採用するときだけSomeにする。正常0件も成立した検索として区別する。
+最初の空一覧準備より先にDoneが届く場合があるため、古いview wishに拒否/成立を固定しない。
+アドレスは採用済みの適用条件を使い、まだ適用条件がなければ従来の実行/入力条件を使う。
 ×(b)でaccepted側へ入力先を戻す場合は、その適用queryを`last_executed`へ戻す。
 PhysicalChildのacceptedも保持し、入力先だけの終了で元の検索全体を失わない。
 
@@ -316,6 +319,33 @@ PhysicalChildのacceptedも保持し、入力先だけの終了で元の検索�
   成果物は起動していない。通常feature setのため既定は実利用中の `%APPDATA%\mimageviewer` を使う。
 - full lib suite・製品起動・対話操作・コミットは実施していない。実機確認と独立completion reviewは
   設計leadへ引き継ぐ。設計v1〜v4/d4の範囲で実装し、結果ownerやpending workerを追加していない。
+
+#### 独立レビュー・全lib指摘の修正（32bc933c1後）
+
+- 一時バーのEscは固定欄の(b)と分離し、既存×と同じ終了transactionへ渡す。全OFF/片方だけ固定の
+  G→R/R→G、期限切れの描画前入力ownerを検証する。
+- Smart Folderの`SmartFolderPreparedGrid`は非固定時のtemporary queryだけを退避する。
+  固定Local draftはAppの入力に残し、子から戻っても上書きしない。復元時の固定切替も確認する。
+  非同期再適用は捕捉済み検索条件を実行し、現在の固定draftには代入しない。
+- Metadataの適用条件は一覧採用時の検証事実から公開する。拒否/未検証と正常0件を区別し、
+  初回空Readyを保持してDoneを先に受ける順序も回帰に含める。
+- 並べ替えOFFのラベルもclick senseを持つ。4欄すべての右クリック→「行頭に表示」を合成ポインター入力で検証する。
+- 未確定queryのアドレス「検索中」は製品側を修正し、既存テストの期待は変更しない。
+- Settings転送は4flagの既存除外分類を維持し、総数470/Preferences149/除外321へ件数を更新する。
+  4flag個別の除外分類も明示検証する。公開wire key 147件は変更しない。
+
+検証（2026-10-25、製品実行なし）:
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/section1409/) | test(/global_search_ui::/) | test(/smart_folder/) | test(/settings_transfer::/) | test(/phase_c_drill_address_tests/) | test(/phase_c_key_tests/)'`
+  は408件成功。報告された既存2件の失敗も含む。全libは設計leadが別途実行する。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt`（引数なし）、
+  `cargo fmt --check`、`python scripts/check_ui_glyphs.py`は成功（危険グリフ0件）。
+- `cargo test --test ui_snapshot -- --test-threads=4`は197件成功。
+  `toolbar_pinned_search_light.png` / `toolbar_pinned_search_narrow_dark.png`の2枚だけを更新した。
+  click senseに伴う検索ラベルのテーマ標準の操作可能文字色への変更を目視確認済み。
+  配置は維持し、ほかの既存PNGはbyte単位で不変。
+- `.\scripts\build-dev.ps1 -PreserveRuntime`は成功。本体/Remote/EPUB補助を生成し、
+  VCRT/PE検査はruntime=4/pe=3で成功。通常profileの確認用バイナリは起動していない。
 
 ## 3. 表示形式の一般化
 

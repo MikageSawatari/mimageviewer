@@ -172,7 +172,8 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 Escは全検索共通routerへ移し、IME/modalと描画前input ownerを優先して一度だけ消費する。
 Everything実行中のEscは取消のみで、次のEscが未送信/取消後/PhysicalChildのsessionを閉じる。
 ×はaccepted結果ownerと編集ownerを区別し、別sourceの保持結果をその欄から解除できる。
-Metadata acceptedにも適用条件を保持し、未送信Everything draftで表示結果の説明を上書きしない。
+Metadata acceptedにも成立した検索の適用条件をOptionで保持し、未送信Everything draftで表示結果の説明を上書きしない。
+未検証/拒否は適用条件を持たず、正常0件と区別する。一時バーのEscは従来の×と同じく共通sessionを終了する。
 
 
 全 interleaving の rollback／部分採用／resume を作る案を比較し、明示送信＋準備中の target-context modal を推奨した。変更するのは新機能の待機中だけで、Ctrl+G の streaming／debounce／集約を遅らせない。

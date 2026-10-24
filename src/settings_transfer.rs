@@ -1923,7 +1923,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 466);
+        assert_eq!(entries.len(), 470);
         assert_eq!(
             entries
                 .iter()
@@ -1936,10 +1936,23 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            317
+            321
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
+        for key in [
+            "show_toolbar_search_container",
+            "show_toolbar_search_local",
+            "show_toolbar_search_metadata",
+            "show_toolbar_search_everything",
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(field, reason)| *field == key && reason.is_some()),
+                "toolbar state must remain classified outside Preferences: {key}"
+            );
+        }
         assert!(
             entries
                 .iter()

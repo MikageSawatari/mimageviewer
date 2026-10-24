@@ -47,10 +47,10 @@ mod tests {
         app.ensure_search_session(Kind::Metadata);
         app.global_search.metadata_draft = "accepted metadata".into();
         app.global_search.accepted = SearchAccepted::Metadata {
-            applied: MetadataAppliedSpec {
+            applied: Some(MetadataAppliedSpec {
                 query: "accepted metadata".into(),
                 filters: app.global_search.filters.clone(),
-            },
+            }),
         };
         app.items_are_global_search_view = true;
         app.global_search.done = true;
@@ -351,6 +351,72 @@ mod tests {
         );
         assert!(!app.search_focus_request);
         end_pass(&ctx);
+    }
+
+    #[test]
+    fn section1409_temporary_escape_matches_close_button_with_all_off_or_one_global_pin() {
+        for metadata in [true, false] {
+            for accepted_pin in [false, true] {
+                for escape_key in [false, true] {
+                    let mut app = super::super::setup_app_for_test();
+                    let ctx = egui::Context::default();
+                    app.settings.show_toolbar_search_metadata = metadata && accepted_pin;
+                    app.settings.show_toolbar_search_everything = !metadata && accepted_pin;
+                    let (accepted, editing) = if metadata {
+                        metadata_result(&mut app, &ctx);
+                        (Kind::Metadata, Kind::Everything)
+                    } else {
+                        adopt_everything_for_test(
+                            &mut app,
+                            &ctx,
+                            "accepted Everything",
+                            everything_dataset_for_test(Vec::new()),
+                        );
+                        (Kind::Everything, Kind::Metadata)
+                    };
+                    app.ensure_search_session(editing);
+                    assert!(!editing.pinned(&app.settings));
+                    if escape_key {
+                        escape(&ctx);
+                        app.route_search_escape(
+                            &ctx,
+                            Some(SearchInputId::TemporaryBar(editing)),
+                            &mut EscapeClaim::default(),
+                        );
+                        assert!(!app.dialog_escape_pressed(&ctx));
+                        end_pass(&ctx);
+                    } else {
+                        app.close_global_search(); // Existing temporary × transaction.
+                    }
+                    assert!(
+                        !app.global_search.active,
+                        "{metadata}/{accepted_pin}/{escape_key}"
+                    );
+                    assert!(!app.items_are_global_search_view);
+                    assert_eq!(!app.search_draft(accepted).is_empty(), accepted_pin);
+                    assert!(app.top_level_grid_view.return_to().is_none());
+                }
+            }
+        }
+        // A pre-draw owner may have ended during this pass. It must not take the
+        // new session's return origin through a stale temporary close transaction.
+        for (stale, current) in [
+            (Kind::Container, Kind::Metadata),
+            (Kind::Metadata, Kind::Container),
+        ] {
+            let mut app = super::super::setup_app_for_test();
+            let ctx = egui::Context::default();
+            app.ensure_search_session(stale);
+            app.ensure_search_session(current);
+            escape(&ctx);
+            app.route_search_escape(
+                &ctx,
+                Some(SearchInputId::TemporaryBar(stale)),
+                &mut EscapeClaim::default(),
+            );
+            assert!(app.edit_owner(current));
+            end_pass(&ctx);
+        }
     }
 }
 
@@ -754,10 +820,8 @@ impl App {
             return None;
         }
         match &self.global_search.accepted {
-            // Empty Metadata queries are rejected; the default spec has never produced results.
-            SearchAccepted::Metadata { applied } => {
-                (!applied.query.trim().is_empty()).then_some(Kind::Metadata)
-            }
+            SearchAccepted::Metadata { applied: Some(_) } => Some(Kind::Metadata),
+            SearchAccepted::Metadata { applied: None } => None,
             SearchAccepted::Everything { .. } => Some(Kind::Everything),
         }
     }
@@ -843,7 +907,7 @@ impl App {
             }),
             Kind::Container => self.favsearch.query == self.favsearch.last_executed,
             Kind::Metadata => {
-                matches!(&self.global_search.accepted, SearchAccepted::Metadata { applied } if applied.query == self.global_search.metadata_draft && applied.filters == self.global_search.filters)
+                matches!(&self.global_search.accepted, SearchAccepted::Metadata { applied: Some(applied) } if applied.query == self.global_search.metadata_draft && applied.filters == self.global_search.filters)
             }
             Kind::Everything => self.accepted_everything_query_matches_draft(),
         };
@@ -998,7 +1062,16 @@ impl App {
             .map(SearchInputId::kind)
             .or_else(|| self.closable_owner());
         if let Some(kind) = owner {
-            self.end_search_input(ctx, kind);
+            if matches!(input_owner, Some(SearchInputId::TemporaryBar(_)))
+                || (input_owner.is_none() && !kind.pinned(&self.settings))
+            {
+                // Temporary bars retain their original ×/Esc close transaction.
+                if self.edit_owner(kind) || self.applied_owner() == Some(kind) {
+                    self.close_owned_search(ctx, kind);
+                }
+            } else {
+                self.end_search_input(ctx, kind);
+            }
             if let Some(input) = input_owner {
                 ctx.memory_mut(|memory| memory.surrender_focus(input.id()));
             }

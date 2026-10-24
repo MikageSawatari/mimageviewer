@@ -136,9 +136,13 @@ facet のタグ値は表示 `#タグ` ではなく、`tags.db` と同じ `tag_ke
 G/Rは `metadata_draft / everything_draft` を個別に持ち、wish比較はMetadata draft、
 Everything採用はimmutable submittedを参照する。`SearchAccepted::Metadata { applied }` は
 採用時のquery/filtersを保持し、source切替後もアドレスと適用表示の正本となる。
+`applied`はOptionであり、正常Batch/正常Doneで成立を確認したrunの一覧採用時だけSomeを公開する。
+未検証/拒否/失敗はNoneとし、成立した0件の結果と区別する。
 終了/切替/install/Snapshotでは固定ONのdraftを保持し、×のみが対象draftを明示消去する。
-固定OFFの終了時消去は維持する。×/Escは適用結果の終了、未送信入力先から保持結果への復帰、
-非active欄の順に所有確認する。全バーのEscは描画前の入力ownerを捕捉し、描画後の単一routerが
+Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、固定Local draftをtake/復元しない。
+非同期の再適用も検索条件と現在入力を分け、入力を上書きしない。
+固定OFFの終了時消去は維持する。固定欄の×/Escは適用結果の終了、未送信入力先から保持結果への復帰、
+非active欄の順に所有確認する。一時バーのEscは従来の×と同じ共通検索終了・元一覧復帰とする。全バーのEscは描画前の入力ownerを捕捉し、描画後の単一routerが
 消費する。初回未送信/取消後/PhysicalChildにもclosable ownerで終了先を持つ。
 詳細な幅・フォーカス・簡素化の判断は [ツールバー計画 §2.5](toolbar-customization-plan.md#25-検索欄の個別固定-1409)。
 
