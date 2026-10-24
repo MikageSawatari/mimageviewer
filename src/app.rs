@@ -66546,10 +66546,11 @@ impl App {
         #[cfg(feature = "test-script")]
         let test_script_content_proof = (!last_painted_is_holdover)
             .then(|| {
+                let texture = base_texture.source_texture();
                 self.test_script_content_proof(
                     idx,
-                    &texture,
-                    self.test_script_paint_source_kind(idx, &texture),
+                    texture,
+                    self.test_script_paint_source_kind(idx, texture),
                 )
             })
             .flatten();
