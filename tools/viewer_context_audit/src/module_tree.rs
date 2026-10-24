@@ -6,6 +6,9 @@ use super::*;
 pub(super) struct ModuleTree {
     pub test_only: BTreeSet<String>,
     pub missing: BTreeSet<String>,
+    // The disk adapter must probe both alternatives, even if one is already in
+    // the source map, before accepting the resolver's final classification.
+    pub module_candidates: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -59,17 +62,24 @@ fn file_route(file: String, test: bool, root: bool) -> SourceRoute {
     }
 }
 
-/// The repository declares explicit bin paths (autobins=false). Read those declarations
+/// The repository declares explicit bin paths (autobins=false, autolib=true/default).
+/// Read those declarations and the explicit/default library path
 /// without adding a TOML dependency to this source-only tool. Reject unsupported path
 /// syntax/missing paths instead of silently omitting a possible production crate root.
-pub(super) fn crate_roots(manifest: &str) -> Result<Vec<String>, String> {
+pub(super) fn crate_roots(
+    manifest: &str,
+    sources: &BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
     let mut roots = BTreeSet::new();
-    let mut in_bin = false;
+    let mut section = String::new();
     let mut bin_path = None;
+    let mut lib_path = None;
+    let mut autobins = None;
+    let mut autolib = None;
     for line in manifest.lines().chain(std::iter::once("[end]")) {
-        let line = line.trim();
+        let line = strip_toml_comment(line)?.trim();
         if line.starts_with('[') {
-            let header = line.split('#').next().unwrap().trim();
+            let header = line;
             if header.starts_with("[[")
                 && !header.chars().all(|c| {
                     c.is_ascii_alphanumeric() || "[]_.-".contains(c) || c.is_ascii_whitespace()
@@ -77,27 +87,118 @@ pub(super) fn crate_roots(manifest: &str) -> Result<Vec<String>, String> {
             {
                 return Err(format!("unsupported Cargo.toml table header: {header}"));
             }
-            if in_bin {
+            if section == "[[bin]]" {
                 roots.insert(bin_path.take().ok_or("[[bin]] requires an explicit path")?);
             }
-            in_bin = header
+            section = header
                 .chars()
                 .filter(|c| !c.is_ascii_whitespace())
-                .collect::<String>()
-                == "[[bin]]";
-        } else if in_bin
-            && let Some((key, value)) = line.split_once('=')
-            && key.trim() == "path"
-        {
-            // syn accepts quoted strings and trailing comments, as used by Cargo.toml.
-            let path = syn::parse_str::<syn::LitStr>(value.trim())
-                .map_err(|error| format!("unsupported [[bin]] path: {error}"))?;
-            if bin_path.replace(join("", &path.value())).is_some() {
-                return Err("duplicate [[bin]] path".into());
+                .collect::<String>();
+            // Quoted keys could disguise package/lib settings from this limited
+            // reader. The repository needs quoted keys only under target tables.
+            if header.contains(['\'', '"']) && !section.starts_with("[target.") {
+                return Err(format!("unsupported Cargo.toml table header: {header}"));
+            }
+        } else if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            if section.is_empty() {
+                return Err(format!(
+                    "unsupported top-level Cargo.toml assignment: {key}"
+                ));
+            }
+            if matches!(section.as_str(), "[package]" | "[lib]" | "[[bin]]")
+                && key.contains(['\'', '"'])
+            {
+                return Err(format!("unsupported Cargo.toml key in {section}: {key}"));
+            }
+            match (section.as_str(), key) {
+                ("[[bin]]" | "[lib]", "path") => {
+                    let path = syn::parse_str::<syn::LitStr>(value)
+                        .map_err(|error| format!("unsupported {section} path: {error}"))?;
+                    let slot = if section == "[lib]" {
+                        &mut lib_path
+                    } else {
+                        &mut bin_path
+                    };
+                    if slot.replace(join("", &path.value())).is_some() {
+                        return Err(format!("duplicate {section} path"));
+                    }
+                }
+                ("[package]", "autobins") => {
+                    if autobins.replace(value).is_some() || value != "false" {
+                        return Err(
+                            "unsupported auto-discovery: require explicit autobins = false".into(),
+                        );
+                    }
+                }
+                ("[package]", "autolib") => {
+                    if autolib.replace(value).is_some() || value != "true" {
+                        return Err(
+                            "unsupported auto-discovery: require autolib = true or its default"
+                                .into(),
+                        );
+                    }
+                }
+                ("[package]", key) if key.starts_with("auto") => {
+                    return Err(format!("unsupported auto-discovery setting: {key}"));
+                }
+                ("[lib]" | "[[bin]]", key) if key.starts_with("path.") => {
+                    return Err(format!("unsupported {section} path key: {key}"));
+                }
+                _ => {}
             }
         }
     }
+    if autobins.is_none() {
+        return Err("unsupported auto-discovery: require explicit autobins = false".into());
+    }
+    if let Some(path) = lib_path {
+        roots.insert(path);
+    } else {
+        check_path_case(sources, "src/lib.rs")?;
+        if sources.contains_key("src/lib.rs") {
+            roots.insert("src/lib.rs".into());
+        }
+    }
     Ok(roots.into_iter().collect())
+}
+
+/// A small single-line TOML reader: quoted # belongs to the value, an unquoted
+/// # starts a comment. Reject multiline strings rather than misreading settings.
+fn strip_toml_comment(line: &str) -> Result<&str, String> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some(delimiter) if character == delimiter => quote = None,
+            None if character == '#' => return Ok(&line[..index]),
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return Err("unsupported multiline or unterminated Cargo.toml string".into());
+    }
+    Ok(line)
+}
+
+pub(super) fn check_path_case(
+    sources: &BTreeMap<String, String>,
+    path: &str,
+) -> Result<(), String> {
+    let folded = path.to_uppercase();
+    if let Some(existing) = sources
+        .keys()
+        .find(|existing| existing.as_str() != path && existing.to_uppercase() == folded)
+    {
+        return Err(format!(
+            "module path case differs from file on disk: {path} (actual: {existing})"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn resolve(
@@ -111,7 +212,9 @@ pub(super) fn resolve(
     let mut visited = BTreeSet::new();
     let mut reachability = BTreeMap::<String, bool>::new();
     let mut missing = BTreeSet::new();
+    let mut module_candidates = BTreeSet::new();
     while let Some(mut route) = pending.pop() {
+        check_path_case(sources, &route.file)?;
         if !visited.insert(route.clone()) {
             continue;
         }
@@ -134,6 +237,7 @@ pub(super) fn resolve(
             path_dir: route.path_dir.clone(),
             cfg_test_depth: usize::from(route.test),
             pending: &mut pending,
+            module_candidates: &mut module_candidates,
             error: None,
         };
         visitor.visit_file(&file);
@@ -147,6 +251,7 @@ pub(super) fn resolve(
             .filter_map(|(file, test)| test.then_some(file))
             .collect(),
         missing,
+        module_candidates,
     })
 }
 
@@ -157,6 +262,7 @@ struct ModuleVisitor<'a> {
     path_dir: String,
     cfg_test_depth: usize,
     pending: &'a mut Vec<SourceRoute>,
+    module_candidates: &'a mut BTreeSet<String>,
     error: Option<String>,
 }
 
@@ -202,6 +308,13 @@ impl<'ast> Visit<'ast> for ModuleVisitor<'_> {
                 let stem = join(&self.module_dir, &node.ident.to_string());
                 let flat = format!("{stem}.rs");
                 let nested = format!("{stem}/mod.rs");
+                self.module_candidates
+                    .extend([flat.clone(), nested.clone()]);
+                for path in [&flat, &nested] {
+                    if let Err(error) = check_path_case(self.sources, path) {
+                        self.error = Some(error);
+                    }
+                }
                 if self.sources.contains_key(&flat) && self.sources.contains_key(&nested) {
                     self.error = Some(format!(
                         "ambiguous module {}: {flat} and {nested}",

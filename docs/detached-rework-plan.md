@@ -6234,3 +6234,12 @@ editor と再開予約の更新は対象 owner だけに限る。tag prewarm は
 [段1b 検証記録](egui-0.37-stage1b-verification.md)、再開予約と本操作の根拠は本書の各記録を参照。
 §1.272 で削除済みの migrate_at_rest_spread_shifts は古い登録とコメントを取り除いた。
 変更は監査ツールと本書だけで、src/ は変更していない。
+
+独立レビューの指摘を反映し、crate root は明示 bin と `[lib] path`（未指定なら既存の
+`src/lib.rs`）から決める。自動探索は本リポジトリの `autobins = false`、
+`autolib = true` またはその既定値だけを受け入れ、未対応の形は明示エラーで止める。
+root の path 値に続く TOML コメントは文字列の外だけ取り除く。
+Windows で同じファイルを指す大小文字違いは、到達経路とディスク読み込みの両方で拒否する。
+src/ 外への既存参照（`tests/support/ui_harness.rs`、`tests/support/scroll_layout.rs`、
+`crates/susie-worker/src/protocol.rs`）があるため loader は維持し、通常の mod 宣言では
+`name.rs` と `name/mod.rs` の両候補を確認する。両方あれば曖昧としてエラーにする。

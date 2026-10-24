@@ -492,33 +492,16 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
     }
     let manifest = fs::read_to_string(root.join("Cargo.toml"))
         .map_err(|error| format!("cannot read Cargo.toml: {error}"))?;
-    let mut roots = module_tree::crate_roots(&manifest)?;
-    roots.extend(
-        ["src/main.rs", "src/lib.rs"]
-            .into_iter()
-            .filter(|path| sources.contains_key(*path))
-            .map(str::to_owned),
-    );
-    let module_tree = loop {
-        let tree = module_tree::resolve(&sources, &roots)?;
-        if tree.missing.is_empty() {
-            break tree;
+    let roots = module_tree::crate_roots(&manifest, &sources)?;
+    let module_tree = resolve_module_sources(&mut sources, &roots, |relative| {
+        // src/**/*.rs was fully inventoried above. External support modules need
+        // disk discovery, including both candidates for an ordinary mod declaration.
+        if relative.starts_with("src/") {
+            Ok(None)
+        } else {
+            read_module_source(root, relative)
         }
-        // #[path] can reach support modules outside src. Load only actual edges;
-        // the pure resolver itself always operates on an in-memory source map.
-        for relative in tree.missing {
-            if relative.starts_with("../")
-                || relative.starts_with('/')
-                || relative.as_bytes().get(1) == Some(&b':')
-                || Path::new(&relative).is_absolute()
-            {
-                return Err(format!("module path escapes repository: {relative}"));
-            }
-            let source = fs::read_to_string(root.join(&relative))
-                .map_err(|error| format!("cannot read module {relative}: {error}"))?;
-            sources.insert(relative, source);
-        }
-    };
+    })?;
 
     let mut violations = audit_public_api(&registry_source, PUBLIC_API_ALLOWLIST)?;
     for path in files {
@@ -545,6 +528,91 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
         ))
     });
     classify_findings(violations, ALLOWLIST_ENTRIES, KNOWN_FINDINGS, use_allowlist)
+}
+
+/// The loader is injectable so candidate discovery and insertion are exercised by
+/// in-memory fixtures using the same loop as the disk adapter.
+fn resolve_module_sources(
+    sources: &mut BTreeMap<String, String>,
+    roots: &[String],
+    mut load: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<module_tree::ModuleTree, String> {
+    loop {
+        let tree = module_tree::resolve(sources, roots)?;
+        let before = sources.len();
+        for path in tree.missing.union(&tree.module_candidates) {
+            module_tree::check_path_case(sources, path)?;
+            if !sources.contains_key(path)
+                && let Some(source) = load(path)?
+            {
+                // The disk adapter checks actual directory-entry spelling too.
+                module_tree::check_path_case(sources, path)?;
+                sources.insert(path.clone(), source);
+            }
+        }
+        if sources.len() == before {
+            if let Some(path) = tree.missing.first() {
+                return Err(format!("cannot find module source: {path}"));
+            }
+            return Ok(tree);
+        }
+    }
+}
+
+fn read_module_source(root: &Path, relative: &str) -> Result<Option<String>, String> {
+    if relative.starts_with("../")
+        || relative.starts_with('/')
+        || relative.as_bytes().get(1) == Some(&b':')
+        || Path::new(relative).is_absolute()
+    {
+        return Err(format!("module path escapes repository: {relative}"));
+    }
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect module directory {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let mut exact = None;
+        let mut case_variant = None;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("cannot inspect module {relative}: {error}"))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == component {
+                exact = Some(entry.path());
+            } else if name.to_uppercase() == component.to_uppercase() {
+                case_variant = Some(entry.path());
+            }
+        }
+        if let Some(actual) = case_variant {
+            return Err(format!(
+                "module path case differs from file on disk: {relative} (actual: {})",
+                actual.display()
+            ));
+        } else if let Some(exact) = exact {
+            path = exact;
+        } else {
+            return Ok(None);
+        }
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|error| format!("cannot read module {relative}: {error}"))
 }
 
 fn collect_rust_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -2345,6 +2413,15 @@ mod tests {
         assert!(has_rule(&violations, Rule::A6), "{violations:#?}");
     }
 
+    fn manifest_roots(manifest: &str, has_default_lib: bool) -> Result<Vec<String>, String> {
+        let sources = if has_default_lib {
+            BTreeMap::from([("src/lib.rs".into(), String::new())])
+        } else {
+            BTreeMap::new()
+        };
+        module_tree::crate_roots(manifest, &sources)
+    }
+
     fn module_fixture(
         entries: &[(&str, &str)],
         roots: &[&str],
@@ -2538,7 +2615,7 @@ mod tests {
 
     #[test]
     fn a6_reads_declared_bin_roots_as_independent_production_paths() {
-        let roots = module_tree::crate_roots(
+        let roots = manifest_roots(
             r#"
             [package]
             name = "fixture"
@@ -2550,10 +2627,10 @@ mod tests {
             [target.'cfg(windows)'.dependencies]
             example = "1"
         "#,
+            true,
         )
         .unwrap();
-        let mut roots = roots.iter().map(String::as_str).collect::<Vec<_>>();
-        roots.push("src/lib.rs");
+        let roots = roots.iter().map(String::as_str).collect::<Vec<_>>();
         let (test_files, violations) = module_fixture(
             &[
                 ("src/lib.rs", "#[cfg(test)] mod shared;"),
@@ -2564,8 +2641,231 @@ mod tests {
         );
         assert!(test_files.is_empty());
         assert_eq!(violations.len(), 1);
-        assert!(module_tree::crate_roots("[[bin]]\nname = \"implicit\"").is_err());
-        assert!(module_tree::crate_roots("[[\"bin\"]]").is_err());
+        assert!(manifest_roots("[[bin]]\nname = \"implicit\"", true).is_err());
+        assert!(manifest_roots("[[\"bin\"]]", true).is_err());
+    }
+
+    #[test]
+    fn a6_honors_an_explicit_library_root_instead_of_the_default() {
+        let roots = manifest_roots(
+            r#"
+            [package]
+            autobins = false
+            [lib]
+            path = "src/custom_lib.rs"
+            [[bin]]
+            path = "src/main.rs"
+        "#,
+            true,
+        )
+        .unwrap();
+        assert!(!roots.iter().any(|path| path == "src/lib.rs"));
+        let roots = roots.iter().map(String::as_str).collect::<Vec<_>>();
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/custom_lib.rs", "mod shared;"),
+                ("src/main.rs", "#[cfg(test)] mod shared;"),
+                ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                ("src/shared.rs", TEST_API_CALL),
+            ],
+            &roots,
+        );
+        assert!(test_files.is_empty());
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn a6_accepts_only_the_repository_auto_discovery_policy() {
+        for settings in [
+            "",
+            "autobins = true",
+            "autobins = false\nautolib = false",
+            "autobins = false\nautoexamples = false",
+            "\"autobins\" = false",
+        ] {
+            let error = manifest_roots(&format!("[package]\n{settings}"), true).unwrap_err();
+            assert!(
+                error.contains("auto-discovery") || error.contains("unsupported Cargo.toml key"),
+                "{error}"
+            );
+        }
+        for settings in ["autobins = false", "autobins = false\nautolib = true"] {
+            let manifest = format!("[package]\n{settings}\n[lib]\nname = \"library\"");
+            assert_eq!(manifest_roots(&manifest, true).unwrap(), vec!["src/lib.rs"]);
+            assert!(manifest_roots(&manifest, false).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a6_rejects_top_level_inline_and_dotted_root_declarations() {
+        for root in [
+            r#"lib = { path = "src/custom_lib.rs" }"#,
+            r#"bin = [{ path = "src/probe.rs" }]"#,
+            r#"lib.path = "src/custom_lib.rs""#,
+            r#""lib" = { path = "src/custom_lib.rs" }"#,
+        ] {
+            let manifest = format!("{root}\n[package]\nautobins = false");
+            let error = manifest_roots(&manifest, true).unwrap_err();
+            assert!(
+                error.contains("unsupported top-level Cargo.toml assignment"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a6_rejects_a_case_variant_automatic_library_before_omitting_the_root() {
+        let sources = BTreeMap::from([("src/Lib.rs".into(), TEST_API_CALL.into())]);
+        let error = module_tree::crate_roots("[package]\nautobins = false", &sources).unwrap_err();
+        assert!(
+            error.contains("module path case differs from file on disk"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a6_strips_toml_comments_outside_quoted_root_paths() {
+        let roots = manifest_roots(
+            r##"
+            [package] # comment
+            autobins = false # explicitly disabled
+            [lib]
+            path = "library/#part.rs" # comment after library path
+            [[bin]]
+            path = "src/main.rs" # ordinary comment
+            [[bin]]
+            path = "src/bin/escaped\"#part.rs" # escaped quote, then literal hash
+            [target.'cfg(feature = "#hash")'.dependencies]
+            example = "1"
+        "##,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                "library/#part.rs",
+                "src/bin/escaped\"#part.rs",
+                "src/main.rs"
+            ]
+        );
+        assert!(
+            manifest_roots("[package]\nautobins = false\n[lib]\npath = \"\"\"", true)
+                .unwrap_err()
+                .contains("unsupported multiline")
+        );
+    }
+
+    #[test]
+    fn a6_rejects_case_variant_module_and_include_routes() {
+        for production in [
+            r#"#[path = "Shared.rs"] mod p;"#,
+            r#"include!("Shared.rs");"#,
+            "mod Shared;",
+        ] {
+            let root = format!(r#"#[cfg(test)] #[path = "shared.rs"] mod t; {production}"#);
+            let sources = BTreeMap::from([
+                ("src/lib.rs".into(), root),
+                ("src/shared.rs".into(), TEST_API_CALL.into()),
+            ]);
+            let error = module_tree::resolve(&sources, &["src/lib.rs".into()])
+                .err()
+                .unwrap();
+            assert!(
+                error.contains("module path case differs from file on disk"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a6_rejects_exact_keys_that_collide_on_windows() {
+        let sources = BTreeMap::from([
+            (
+                "src/lib.rs".into(),
+                r#"#[cfg(test)] #[path = "shared.rs"] mod t;
+                #[path = "Shared.rs"] mod p;"#
+                    .into(),
+            ),
+            ("src/shared.rs".into(), TEST_API_CALL.into()),
+            ("src/Shared.rs".into(), String::new()),
+        ]);
+        let error = module_tree::resolve(&sources, &["src/lib.rs".into()])
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("module path case differs from file on disk"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a6_loader_rejects_a_case_variant_before_inserting_or_reading_it() {
+        let mut sources = BTreeMap::from([
+            (
+                "src/lib.rs".into(),
+                r#"#[path = "../outside/Shared.rs"] mod p;"#.into(),
+            ),
+            ("outside/shared.rs".into(), TEST_API_CALL.into()),
+        ]);
+        let error = resolve_module_sources(&mut sources, &["src/lib.rs".into()], |_| {
+            panic!("a known case variant must never reach the disk loader");
+        })
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("module path case differs from file on disk"),
+            "{error}"
+        );
+        assert!(!sources.contains_key("outside/Shared.rs"));
+    }
+
+    #[test]
+    fn a6_external_modules_probe_both_file_candidates() {
+        for child in ["outside/x/child.rs", "outside/x/child/mod.rs"] {
+            let mut sources = BTreeMap::from([(
+                "src/lib.rs".into(),
+                r#"#[cfg(test)] #[path = "../outside/parent.rs"] mod parent;"#.into(),
+            )]);
+            let disk = BTreeMap::from([
+                ("outside/x.rs".to_owned(), "mod child;".to_owned()),
+                (child.to_owned(), TEST_API_CALL.to_owned()),
+            ]);
+            // #[path] owns its physical directory, so use an ordinary nested mod
+            // to exercise non-mod-rs children outside the initial src inventory.
+            let disk = disk
+                .into_iter()
+                .chain([("outside/parent.rs".into(), "mod x;".into())])
+                .collect::<BTreeMap<_, _>>();
+            let mut probes = BTreeSet::new();
+            let tree = resolve_module_sources(&mut sources, &["src/lib.rs".into()], |path| {
+                probes.insert(path.to_owned());
+                module_tree::check_path_case(&disk, path)?;
+                Ok(disk.get(path).cloned())
+            })
+            .unwrap();
+            assert!(tree.test_only.contains(child));
+            assert!(probes.contains("outside/x/child.rs"));
+            assert!(probes.contains("outside/x/child/mod.rs"));
+        }
+    }
+
+    #[test]
+    fn a6_external_modules_reject_ambiguous_candidates_even_if_one_was_loaded() {
+        let mut sources = BTreeMap::from([
+            (
+                "src/lib.rs".into(),
+                r#"#[path = "../outside/parent.rs"] mod parent;"#.into(),
+            ),
+            ("outside/parent.rs".into(), "mod x;".into()),
+            ("outside/x.rs".into(), TEST_API_CALL.into()),
+        ]);
+        let error = resolve_module_sources(&mut sources, &["src/lib.rs".into()], |path| {
+            Ok((path == "outside/x/mod.rs").then(|| TEST_API_CALL.to_owned()))
+        })
+        .err()
+        .unwrap();
+        assert!(error.contains("ambiguous module x"), "{error}");
     }
 
     #[test]
