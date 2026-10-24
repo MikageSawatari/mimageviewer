@@ -11,7 +11,7 @@ function Assert-True([bool] $Condition, [string] $Message) {
 
 function Get-ProbeCalls {
     $arguments = $null
-    foreach ($line in Get-Content -LiteralPath $env:MIV_SIGN_PROBE_LOG -Encoding ASCII) {
+    foreach ($line in Get-Content -LiteralPath $env:MIV_SIGN_PROBE_LOG -Encoding UTF8) {
         if ($line -eq 'BEGIN') {
             $arguments = New-Object 'System.Collections.Generic.List[string]'
         } elseif ($line.StartsWith('ARG:')) {
@@ -77,6 +77,10 @@ try {
     @'
 @echo off
 setlocal
+rem Log paths as UTF-8 so a non-ASCII TEMP (e.g. a Japanese user name) round-trips.
+rem chcp changes the shared console, so the original code page is restored on exit.
+for /f "tokens=2 delims=:." %%c in ('chcp') do set "savedcp=%%c"
+chcp 65001 >nul
 set "subcommand=%~1"
 >>"%MIV_SIGN_PROBE_LOG%" echo BEGIN
 :args
@@ -88,10 +92,12 @@ goto args
 >>"%MIV_SIGN_PROBE_LOG%" echo END
 echo stub stdout %subcommand%
 echo stub stderr %subcommand% 1>&2
-if /i "%subcommand%"=="sign" exit /b %MIV_SIGN_PROBE_SIGN_EXIT%
-if /i "%subcommand%"=="timestamp" exit /b %MIV_SIGN_PROBE_TIMESTAMP_EXIT%
-if /i "%subcommand%"=="verify" exit /b %MIV_SIGN_PROBE_VERIFY_EXIT%
-exit /b 99
+set "code=99"
+if /i "%subcommand%"=="sign" set "code=%MIV_SIGN_PROBE_SIGN_EXIT%"
+if /i "%subcommand%"=="timestamp" set "code=%MIV_SIGN_PROBE_TIMESTAMP_EXIT%"
+if /i "%subcommand%"=="verify" set "code=%MIV_SIGN_PROBE_VERIFY_EXIT%"
+chcp %savedcp% >nul
+exit /b %code%
 '@ | Set-Content -LiteralPath $env:MIV_SIGNTOOL -Encoding ASCII
 
     $calls = @(Invoke-ProbeCase 0 0 0 '')
