@@ -48175,18 +48175,22 @@ impl App {
             self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
+            // Limit the opt-in to plain directories. Keep the pre-1.425 import calculation
+            // for OFF, books and other sources, including its existing differences from open.
             // Reuse this context's accepted directory scan, without another stat or scan.
             let physical_folder_defaults = self.folder_observation.as_ref().and_then(|scan| {
-                (scan.generation == self.items_generation
+                (self.settings.apply_default_spread_to_plain_folders
+                    && scan.generation == self.items_generation
                     && self.current_folder.as_ref() == Some(&scan.source)
-                    && self.extracted_result_surface().is_none())
+                    && self.extracted_result_surface().is_none()
+                    && !self.page_order_locked_for_items(
+                        &scan.source,
+                        &self.items,
+                        PageOrderViewKind::Physical,
+                    ))
                 .then(|| {
                     SpreadRestoreDefaults::for_physical_folder(
-                        self.page_order_locked_for_items(
-                            &scan.source,
-                            &self.items,
-                            PageOrderViewKind::Physical,
-                        ),
+                        false,
                         true,
                         self.settings.apply_default_spread_to_plain_folders,
                         self.settings.default_spread_mode,

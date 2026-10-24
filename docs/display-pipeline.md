@@ -1001,8 +1001,10 @@ ON の実ディレクトリだけ、mode を実効 `default_spread_mode` へ置�
 
 実ディレクトリの証拠は、directory scan が生成して既存 loader/Stack が運ぶ
 `FolderScanSignature`。Physical 分類や拡張子、UI での stat から推定しない。
-メタ情報取り込み後の既存復元は同 context の source/世代が一致する `FolderObservation` を使い、
-対象の既定を再解決する。main/detached は共通 loader を使い、兄弟の読書状態を変更しない。
+メタ情報取り込み後の既存復元で新 resolver を使うのは、設定 ON・非本の実フォルダだけとする。
+同 context の source/世代が一致する `FolderObservation` を使って対象を確認し、既定を再解決する。
+OFF・本扱い・その他の対象は §1.425 導入前の計算を維持する（通常 open との既存不整合も今回の修正対象外）。
+main/detached は共通 loader を使い、兄弟の読書状態を変更しない。
 抽出結果の early-return と保存 flow の優先順、書庫・文書の専用 `for_book` 経路は保つ。
 
 簡素化として、新しい pending/worker/live rebuild は設けず、既存の一覧採用と取り込み後復元へ
