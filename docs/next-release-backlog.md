@@ -1312,7 +1312,7 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 - **(B) の TLS 依存は修正済み** (2026-08-25、`7e16fadde`、v3.3.0)。`logger::current_thread_id_num()` は
   Windows では `GetCurrentThreadId()` を直接呼ぶ。この変更だけでは、ハンドラ内の String 整形や
   panic.log のパス生成・open・ローテーションによるヒープ使用は残っていた。
-- **(B) の残りを実装 (2026-10-25、独立レビュー・検収待ち)**:
+- **(B) の残りを実装 (2026-10-25、branch claude/bugs-328-135-123-192-86051c、未 merge)**:
   [native_exception_log.rs](../src/native_exception_log.rs) が起動時に専用 `logs/native-exception.log` を開き、
   ハンドラは CAS・飽和カウンタ・固定 2048 byte バッファ・core の整形と raw `WriteFile` 1 回だけで記録を試みる。
   ヒープ・Rust TLS・ロック・スタック取得は使わない。起動時のみ 1 MiB **超**で `.bak` に置換し、
@@ -1332,19 +1332,12 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
   Application Verifier / full page heap を設定する。page heap はイメージ名に対する永続設定なので、通常版と同名には掛けない。
   既存設定の確認・試験後の解除を含め、対象・時間・desktop 使用範囲について利用者の明示了承が必要。
   書き込み位置で全ての破壊を捕まえられるとは限らない。今回この実機試験は行っていない。
-- **(B) 自動検証 (2026-10-25、未コミット差分)**: `cargo fmt`（引数なし）／`cargo fmt --check` と
-  `cargo check -p mimageviewer --bin mimageviewer-core` は exit 0。
-  `cargo nextest run -p mimageviewer --lib -E 'test(/native_exception|panic_log|log_writer/)'` は
-  最終 44 成功／0 失敗（14,276 件は filter 等で未実行、run ID `223de674-ee72-42a0-a694-146c352b8b3d`）。
-  新規13件は整形4件、recorder3件、rotation／共有／初期化失敗各1件、実AV／SO子プロセス各1件、
-  診断失敗通知1件。子も試験専用recorderを使い、本番staticには触れない。
-  子はダイアログを抑止し20秒で打ち切る。実AVは終了 `0xC0000005` と
-  `access=read target=0x0`、SOは終了 `0xC00000FD` と専用ログ1行を確認した（最終runの各テスト約0.21秒）。
-  既存のUI可視時だけ一度通知するAppテストも成功。full lib／test-full・実アプリ起動・page heapは未実施。
-  formatter は設計担当の上書き指示どおり既存crate内の core だけのmoduleで、新規no_std crateは作っていない。
-  現ツールチェーンでは `fetch_update` が非推奨のため、同義の `try_update` で飽和カウンタを実装した。
-  `scripts/build-dev.ps1 -PreserveRuntime` も最終 exit 0、通常featureのcore／remote／EPUB workerを用意
-  （vcrt-pe: runtime=4、pe=3、成功）。起動・コミットは行っていない。
+- **(B) の検証 (2026-10-25)**: 実装担当 (Codex) のコミット前検証で、焦点テスト
+  (`cargo nextest run -p mimageviewer --lib -E 'test(/native_exception|panic_log|log_writer/)'`) が成功した。
+  新規テストは整形・recorder・起動時ローテーション・共有モード・初期化失敗・診断失敗通知と、子プロセスで実際に
+  AV (終了 `0xC0000005`) と stack overflow (終了 `0xC00000FD`) を起こして専用ログに 1 行残ることを見る試験。
+  独立レビュー (`8c366103e`) は ACCEPT WITH CHANGES で、長い `--data-dir` で sink を開けない P2 を受けて
+  起動時の open を std 経由に直した。実アプリでの確認・page heap は未実施。
 - 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
 
 ### 1.135 動画レンダースレッドがパニックすると、以後どの動画も再生できなくなる — 修正済み (2026-10-24、branch claude/bugs-328-135-123-192-86051c、`1759db212`、未 merge)

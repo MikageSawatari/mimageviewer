@@ -286,7 +286,6 @@ libraw-sys = { path = "crates/libraw-sys" }
 libavif-sys = { path = "crates/libavif-sys" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
-    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
