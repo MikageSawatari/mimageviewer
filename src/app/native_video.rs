@@ -3427,9 +3427,7 @@ impl App {
             self.fs_cache
                 .get(&from_idx)
                 .is_some_and(|entry| match entry {
-                    FsCacheEntry::Video { player, .. } => {
-                        player.native_committed_generation().is_some()
-                    }
+                    FsCacheEntry::Video { player, .. } => player.reusable_for_swap(),
                     _ => false,
                 });
         if !source_output_available {
@@ -3930,7 +3928,7 @@ impl App {
             return;
         }
 
-        if pending.native_output.is_closed() {
+        if !pending.native_output.reusable_for_swap() {
             if let Some(pending) = self.native_video_source_swap_pending.take() {
                 pending.native_output.set_navigation_preview(None);
             }
@@ -15292,9 +15290,7 @@ impl App {
             self.fs_cache
                 .get(&from_idx)
                 .is_some_and(|entry| match entry {
-                    FsCacheEntry::Video { player, .. } => {
-                        player.native_committed_generation().is_some()
-                    }
+                    FsCacheEntry::Video { player, .. } => player.reusable_for_swap(),
                     _ => false,
                 });
         if !source_output_available {
@@ -19419,5 +19415,332 @@ mod seek_strip_range_persist_audit {
                 "レンジを触っていない開閉でも毎回 SQLite transaction が走る。"
             )
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod native_video_fault_swap_tests {
+    use super::*;
+    use crate::app::tests::phase_c_support::{AppTestEnv, setup_app};
+    use crate::video::VideoPlayer;
+
+    fn fixture() -> AppTestEnv {
+        let mut app = setup_app();
+        let paths = [
+            app.tmp.path().join("from.mp4"),
+            app.tmp.path().join("target.mp4"),
+        ];
+        app.items = paths.iter().cloned().map(GridItem::Video).collect();
+        app.thumbnails = vec![crate::app::ThumbnailState::Pending; 2];
+        app.image_metas = vec![None; 2];
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        app.settings.audio_normalize_enabled = false;
+        app.settings.video_hw_decode = false;
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(VideoPlayer::stream_ready_disconnected_for_test(
+                    paths[0].clone(),
+                )),
+                load_seq: 0,
+            },
+        );
+        app
+    }
+
+    fn player(app: &crate::app::App, idx: usize) -> &VideoPlayer {
+        match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player,
+            _ => panic!("missing player at {idx}"),
+        }
+    }
+
+    fn add_siblings(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+    ) -> Vec<(crate::app::ViewerContextId, usize)> {
+        let configure = |viewer: &mut crate::app::App| {
+            viewer.items = vec![GridItem::Video(PathBuf::from("sibling.mp4"))];
+            viewer.thumbnails = vec![crate::app::ThumbnailState::Pending];
+            viewer.image_metas = vec![None];
+            viewer.fullscreen_idx = Some(0);
+            viewer.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(VideoPlayer::stream_ready_disconnected_for_test(
+                        PathBuf::from("sibling.mp4"),
+                    )),
+                    load_seq: 135,
+                },
+            );
+            viewer.fs_cache.insert(99, FsCacheEntry::Failed);
+        };
+        let active = app.build_active_context_for_test(
+            Some(11351),
+            crate::app::DetachedSource::Video,
+            configure,
+        );
+        let parked = app.push_window_context_for_test(ctx, 11352, configure);
+        app.transition_detached_window_state(
+            11352,
+            crate::app::DetachedWindowState::ParkedLive,
+            "fault_swap_test",
+        );
+        [active, parked]
+            .into_iter()
+            .map(|owner| {
+                let identity = app
+                    .with_viewer_context_state(owner, |viewer| {
+                        player(viewer, 0).native_output_identity_for_test().unwrap()
+                    })
+                    .unwrap();
+                (owner, identity)
+            })
+            .collect()
+    }
+
+    fn assert_siblings_unchanged(
+        app: &mut crate::app::App,
+        siblings: &[(crate::app::ViewerContextId, usize)],
+    ) {
+        for &(owner, identity) in siblings {
+            app.with_viewer_context_state(owner, |viewer| {
+                assert_eq!(viewer.fullscreen_idx, Some(0));
+                assert_eq!(viewer.fs_cache.len(), 2);
+                assert!(matches!(
+                    viewer.fs_cache.get(&99),
+                    Some(FsCacheEntry::Failed)
+                ));
+                assert!(matches!(
+                    viewer.fs_cache.get(&0),
+                    Some(FsCacheEntry::Video { load_seq: 135, .. })
+                ));
+                assert_eq!(
+                    player(viewer, 0).native_output_identity_for_test(),
+                    Some(identity)
+                );
+                assert!(player(viewer, 0).reusable_for_swap());
+            })
+            .unwrap();
+        }
+    }
+
+    fn reject_faulted_swap(route: &str) {
+        let mut app = fixture();
+        let ctx = egui::Context::default();
+        let siblings = add_siblings(&mut app, &ctx);
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
+        let identity = player(&app, 0).native_output_identity_for_test();
+        player(&app, 0).mark_native_output_faulted_for_test();
+        let (started, opens) = VideoPlayer::with_disconnected_opens_for_test(|| match route {
+            "fast" => app.try_start_native_video_fast_swap(
+                &ctx,
+                1,
+                None,
+                false,
+                crate::app::HistoryTrigger::UserChosen,
+            ),
+            "tile" => {
+                app.video_tile_mode_active = true;
+                app.try_start_video_tile_fast_swap(&ctx, 1)
+            }
+            "deferred" => app.defer_native_video_source_swap_until_decoder_free(
+                &ctx,
+                1,
+                None,
+                false,
+                false,
+                "navigation",
+                crate::app::HistoryTrigger::UserChosen,
+            ),
+            _ => unreachable!(),
+        });
+        assert!(
+            !started,
+            "faulted {route} must use the existing cannot-swap result"
+        );
+        assert!(
+            opens.is_empty(),
+            "rejection must not build a decoder/player"
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            player(&app, 0).native_output_identity_for_test(),
+            identity,
+            "must not take the old output"
+        );
+        assert!(!player(&app, 0).reusable_for_swap());
+        assert!(app.native_video_source_swap_pending.is_none());
+        assert!(app.native_video_fast_swap_pending.is_none());
+        assert!(app.video_tile_swap_pending.is_none());
+        assert_eq!(
+            app.settings.video_seek_strip_state,
+            crate::settings::VideoSeekStripState::Waveform
+        );
+        assert_siblings_unchanged(&mut app, &siblings);
+    }
+
+    #[test]
+    fn faulted_fast_swap_leaves_output_attached_and_sibling_caches_unchanged() {
+        reject_faulted_swap("fast");
+    }
+
+    #[test]
+    fn faulted_tile_swap_leaves_output_attached_and_sibling_caches_unchanged() {
+        reject_faulted_swap("tile");
+    }
+
+    #[test]
+    fn faulted_deferred_swap_leaves_output_attached_and_sibling_caches_unchanged() {
+        reject_faulted_swap("deferred");
+    }
+
+    #[test]
+    fn deferred_swap_fault_before_completion_never_builds_or_attaches_successor() {
+        let mut app = fixture();
+        let ctx = egui::Context::default();
+        let siblings = add_siblings(&mut app, &ctx);
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
+        assert!(app.defer_native_video_source_swap_until_decoder_free(
+            &ctx,
+            1,
+            None,
+            false,
+            false,
+            "navigation",
+            crate::app::HistoryTrigger::UserChosen
+        ));
+        app.native_video_source_swap_pending
+            .as_ref()
+            .unwrap()
+            .native_output
+            .mark_faulted_for_test();
+        let (_, opens) = VideoPlayer::with_disconnected_opens_for_test(|| {
+            app.poll_native_video_source_swap_pending(&ctx)
+        });
+        assert!(
+            opens.is_empty(),
+            "fault check must precede successor creation"
+        );
+        assert!(app.native_video_source_swap_pending.is_none());
+        assert!(
+            !app.fs_cache.contains_key(&1),
+            "no successor may own the faulted output"
+        );
+        assert!(app.fullscreen_idx.is_none());
+        assert_eq!(
+            app.settings.video_seek_strip_state,
+            crate::settings::VideoSeekStripState::Waveform
+        );
+        assert_siblings_unchanged(&mut app, &siblings);
+    }
+
+    #[test]
+    fn healthy_fast_and_tile_swap_transfer_the_same_output_identity() {
+        for tile in [false, true] {
+            let mut app = fixture();
+            let ctx = egui::Context::default();
+            let identity = player(&app, 0).native_output_identity_for_test();
+            let (started, opens) = VideoPlayer::with_disconnected_opens_for_test(|| {
+                app.video_tile_mode_active = tile;
+                if tile {
+                    app.try_start_video_tile_fast_swap(&ctx, 1)
+                } else {
+                    let started = app.try_start_native_video_fast_swap(
+                        &ctx,
+                        1,
+                        None,
+                        false,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
+                    // Navigation always coalesces through deferred swap, even with a free
+                    // decoder slot. Its completion must preserve the same output too.
+                    assert!(started);
+                    let pending = app.native_video_source_swap_pending.as_mut().unwrap();
+                    assert_eq!(Some(pending.native_output.identity_for_test()), identity);
+                    pending.requested_at -= std::time::Duration::from_secs(1);
+                    app.poll_native_video_source_swap_pending(&ctx);
+                    started
+                }
+            });
+            assert!(started);
+            assert_eq!(
+                opens,
+                [false],
+                "swap builds a decoder without a fresh presenter"
+            );
+            assert_eq!(player(&app, 1).native_output_identity_for_test(), identity);
+            assert!(player(&app, 1).reusable_for_swap());
+            assert!(!app.fs_cache.contains_key(&0));
+        }
+    }
+
+    #[test]
+    fn healthy_deferred_swap_transfers_the_same_output_identity() {
+        let mut app = fixture();
+        let ctx = egui::Context::default();
+        let identity = player(&app, 0).native_output_identity_for_test();
+        assert!(app.defer_native_video_source_swap_until_decoder_free(
+            &ctx,
+            1,
+            None,
+            false,
+            false,
+            "navigation",
+            crate::app::HistoryTrigger::UserChosen
+        ));
+        let pending = app.native_video_source_swap_pending.as_mut().unwrap();
+        assert_eq!(Some(pending.native_output.identity_for_test()), identity);
+        pending.requested_at -= std::time::Duration::from_secs(1);
+        let (_, opens) = VideoPlayer::with_disconnected_opens_for_test(|| {
+            app.poll_native_video_source_swap_pending(&ctx)
+        });
+        assert_eq!(opens, [false]);
+        assert!(app.native_video_source_swap_pending.is_none());
+        assert_eq!(player(&app, 1).native_output_identity_for_test(), identity);
+        assert!(player(&app, 1).reusable_for_swap());
+    }
+
+    #[test]
+    fn explicit_open_after_fault_uses_fresh_output_and_preserves_seek_strip_and_siblings() {
+        let mut app = fixture();
+        let ctx = egui::Context::default();
+        let siblings = add_siblings(&mut app, &ctx);
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
+        player(&app, 0).mark_native_output_faulted_for_test();
+        // A weak reference retains the allocation's identity without keeping the output alive.
+        let old_lifetime = player(&app, 0).native_output_lifetime_for_test();
+        // Use the normal fullscreen load boundary with a null owner. Monitor lookup is read-only;
+        // the scoped open fixture never creates an HWND, starts audio, or decodes real media.
+        app.main_hwnd = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.fullscreen_idx = Some(1);
+        let old_identity = player(&app, 0).native_output_identity_for_test();
+        let (_, opens) = VideoPlayer::with_disconnected_opens_for_test(|| app.start_fs_load(1));
+        assert_eq!(
+            opens,
+            [true],
+            "normal explicit open must request a new native output"
+        );
+        assert!(
+            !app.fs_cache.contains_key(&0),
+            "normal open drops the faulted player"
+        );
+        assert!(player(&app, 1).reusable_for_swap());
+        assert!(player(&app, 1).native_output_identity_for_test().is_some());
+        assert!(
+            old_lifetime.upgrade().is_none(),
+            "the faulted output was dropped"
+        );
+        assert_ne!(
+            player(&app, 1).native_output_identity_for_test(),
+            old_identity
+        );
+        assert_eq!(
+            app.settings.video_seek_strip_state,
+            crate::settings::VideoSeekStripState::Waveform
+        );
+        assert_siblings_unchanged(&mut app, &siblings);
     }
 }

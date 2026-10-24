@@ -2579,6 +2579,16 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 
 ## ライフサイクル管理
 
+- **native output の故障と source swap (§1.135)**: render thread の panic / terminal error と pump の
+  `record_fault` は、output lifetime で共有する一方向の `faulted` を詳細ログ・通知より先に立てる。
+  panic payload の `&str` / `String` またはエラー詳細は最初の故障ログに残し、`init_error` には
+  利用者向けの固定文言を渡す。通知を take しても故障印は残る。`reusable_for_swap` は
+  `!closed && !faulted` とし、source swap の即時開始、deferred 開始・完了で確認する。
+  通常ナビの `try_start_native_video_fast_swap` は decoder 枠が空いていても deferred で集約する。
+  故障後は既存の BackendFault close / shutdown に任せ、自動再試行はしない。次に利用者が動画を
+  開いたときの通常 `start_fs_load` → `VideoPlayer::open(Some(config))` で新しい output を作る。
+  まれな失敗はログと通知で割り切り、故障種別・専用の回復状態・poll 終端の統合は追加しない。
+  永続 `video_seek_strip_state` は消さず、detached 述語 / viewport 経路も変更しない。
 - **VideoPlayer の Drop**: `cancel.store(true)` → decoder thread が exit、`audio.take()` で cpal stream 停止
 - **VideoPlayer.shutdown() の用途**: 動画切替時に Drop より早く audio を切るため (= 残音を防ぐ)
 - **GpuVideoDevice の Drop**: D3D11 リソース全解放、fence の NT shared handle を `CloseHandle`
