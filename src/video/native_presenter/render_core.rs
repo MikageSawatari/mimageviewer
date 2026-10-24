@@ -50,6 +50,7 @@ use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
 pub(crate) use crate::video::native_cursor::cursor_move_is_activity;
+use crate::video::native_touch::NativePointerTermination;
 use crate::video::native_window_health::NativeRenderOperation;
 use crate::video::native_window_host::{
     NativeCursorIcon, NativeRenderTarget, NativeRenderTargets, NativeWindowIntent,
@@ -1041,6 +1042,99 @@ fn consume_seek_strip_wheel(
     steps
 }
 
+#[cfg(test)]
+fn test_pointer_termination(ctx: &egui::Context) -> Option<NativePointerTermination> {
+    ctx.input(|input| {
+        if input.key_pressed(egui::Key::Escape) {
+            return Some(NativePointerTermination::Cancelled { button: None });
+        }
+        input.events.iter().find_map(|event| match event {
+            egui::Event::PointerButton {
+                button,
+                pos,
+                pressed: false,
+                ..
+            } => Some(NativePointerTermination::Released {
+                button: *button,
+                pos: *pos,
+            }),
+            _ => None,
+        })
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeSeekStripDrag {
+    origin: crate::video::seek_strip::SeekStripDragOrigin,
+    /// Updated only when MoveSeekStrip is actually sent, including an unchanged center.
+    last_moved_center: Option<crate::video::seek_strip::SeekStripCenter>,
+}
+
+impl From<crate::video::seek_strip::SeekStripDragOrigin> for NativeSeekStripDrag {
+    fn from(origin: crate::video::seek_strip::SeekStripDragOrigin) -> Self {
+        Self {
+            origin,
+            last_moved_center: None,
+        }
+    }
+}
+
+fn finish_native_seek_strip_drag(
+    drag: NativeSeekStripDrag,
+    termination: NativePointerTermination,
+    strip_bottom: f32,
+    stamp: crate::video::seek_strip::SeekStripRenderStamp,
+    center_at: impl FnOnce(
+        crate::video::seek_strip::SeekStripDragOrigin,
+        egui::Pos2,
+    ) -> Option<crate::video::seek_strip::SeekStripCenter>,
+) -> Option<NativeOverlayCommand> {
+    let center = match termination {
+        NativePointerTermination::Released { pos, .. } => {
+            if crate::video::seek_strip::strip_drag_closes_downward(
+                drag.origin.pointer,
+                pos,
+                strip_bottom,
+            ) {
+                return Some(NativeOverlayCommand::CloseSeekStrip {
+                    cause: crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
+                    stamp,
+                });
+            }
+            center_at(drag.origin, pos)
+        }
+        NativePointerTermination::Cancelled { .. } => drag.last_moved_center,
+    };
+    center.map(|center| NativeOverlayCommand::CommitSeekStrip { center, stamp })
+}
+
+fn finish_native_seek_row(
+    mut gesture: crate::video::seek_strip::SeekRowGesture,
+    termination: NativePointerTermination,
+    target_at: impl FnOnce(egui::Pos2) -> f64,
+    last_seek_target_secs: Option<f64>,
+    can_open_strip: bool,
+) -> Option<NativeOverlayCommand> {
+    let NativePointerTermination::Released { pos, .. } = termination else {
+        return None;
+    };
+    use crate::video::seek_strip::{SeekRowDecision, SeekRowGesture};
+    let was_open = matches!(gesture, SeekRowGesture::OpenStrip { .. });
+    match gesture.update(pos) {
+        SeekRowDecision::OpenStrip => {
+            (!was_open && can_open_strip).then_some(NativeOverlayCommand::OpenSeekStrip)
+        }
+        SeekRowDecision::Scrub => {
+            let target_secs = target_at(pos);
+            (last_seek_target_secs != Some(target_secs))
+                .then_some(NativeOverlayCommand::Seek { target_secs })
+        }
+        SeekRowDecision::Undecided => Some(NativeOverlayCommand::Seek {
+            target_secs: target_at(pos),
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_native_seek_strip(
     ctx: &egui::Context,
@@ -1053,7 +1147,8 @@ fn draw_native_seek_strip(
     lock_suppressed: bool,
     texture_ids: &HashMap<usize, egui::TextureId>,
     wave_texture_id: Option<egui::TextureId>,
-    drag_origin: &mut Option<crate::video::seek_strip::SeekStripDragOrigin>,
+    drag_origin: &mut Option<NativeSeekStripDrag>,
+    termination: Option<NativePointerTermination>,
     commands: &mut Vec<NativeOverlayCommand>,
     painted_rect_out: Option<&mut Option<egui::Rect>>,
 ) -> NativeSeekStripPreviewHover {
@@ -1067,23 +1162,23 @@ fn draw_native_seek_strip(
     {
         // 0 領域で max(1) の画像・波形要求を作らない。commit 済み request key は
         // successful present の owner だけが更新する。
-        if ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
-            && let Some(origin) = drag_origin.take()
-            && let Some(pointer) = ctx
-                .input(|input| input.pointer.latest_pos())
-                .or(cursor_hover_pos)
+        if let Some(
+            termination @ (NativePointerTermination::Released {
+                button: egui::PointerButton::Primary,
+                ..
+            }
+            | NativePointerTermination::Cancelled {
+                button: Some(egui::PointerButton::Primary) | None,
+            }),
+        ) = termination
+            && let Some(drag) = drag_origin.take()
         {
-            if crate::video::seek_strip::strip_drag_closes_downward(
-                origin.pointer,
-                pointer,
+            commands.extend(finish_native_seek_strip_drag(
+                drag,
+                termination,
                 strip_rect.max.y,
-            ) {
-                commands.push(NativeOverlayCommand::CloseSeekStrip {
-                    cause: crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
-                    stamp: strip.stamp,
-                });
-            } else {
-                let center = match layout.span {
+                strip.stamp,
+                |origin, pointer| match layout.span {
                     SeekStripSpan::Window => {
                         crate::video::seek_strip::seek_strip_center_at_drag_pointer(origin, pointer)
                     }
@@ -1092,14 +1187,8 @@ fn draw_native_seek_strip(
                             origin, pointer,
                         )
                     }
-                };
-                if let Some(center) = center {
-                    commands.push(NativeOverlayCommand::CommitSeekStrip {
-                        center,
-                        stamp: strip.stamp,
-                    });
-                }
-            }
+                },
+            ));
         }
         return NativeSeekStripPreviewHover::Outside;
     }
@@ -1434,16 +1523,18 @@ fn draw_native_seek_strip(
             }
             if response.drag_started()
                 && let Some(pointer) = response.interact_pointer_pos()
-                && seek_strip_body_accepts_pointer(lock_rect, pointer)
+                && let origin = pointer - response.total_drag_delta().unwrap_or_default()
+                && seek_strip_body_accepts_pointer(lock_rect, origin)
             {
                 *drag_origin = crate::video::seek_strip::SeekStripDragOrigin::new(
                     strip.center,
-                    pointer,
+                    origin,
                     cell_width,
                     local_rect.width(),
                     strip.waveform_span_secs,
                     axis_origin_x,
-                );
+                )
+                .map(NativeSeekStripDrag::from);
             }
             // 全体表示では帯が動かないので、押した場所からの相対移動ではなく
             // **いまポインタが指している時刻**が答えになる。周辺表示は従来どおり
@@ -1482,12 +1573,21 @@ fn draw_native_seek_strip(
                     SeekStripSpan::Whole => center_at_pointer(pointer),
                 }
             };
-            if response.dragged()
+            let finishing = termination.is_some() && drag_origin.is_some();
+            if finishing {
+                commands.extend(finish_native_seek_strip_drag(
+                    drag_origin.take().expect("owned drag"),
+                    termination.expect("terminal pass"),
+                    strip_rect.max.y,
+                    strip.stamp,
+                    dragged_center,
+                ));
+            } else if response.dragged()
                 && let Some(pointer) = response.interact_pointer_pos()
-                && let Some(origin) = *drag_origin
+                && let Some(drag) = drag_origin.as_mut()
             {
                 if crate::video::seek_strip::strip_drag_closes_downward(
-                    origin.pointer,
+                    drag.origin.pointer,
                     pointer,
                     strip_rect.max.y,
                 ) {
@@ -1497,26 +1597,22 @@ fn draw_native_seek_strip(
                         stamp: strip.stamp,
                     });
                 } else if layout.span == SeekStripSpan::Window
-                    && let Some(center) = dragged_center(origin, pointer)
+                    && let Some(center) = dragged_center(drag.origin, pointer)
                 {
                     // 全体表示では中身を動かさないので、ドラッグ中に送るものが無い。
                     commands.push(NativeOverlayCommand::MoveSeekStrip {
                         center,
                         stamp: strip.stamp,
                     });
+                    drag.last_moved_center = Some(center);
                 }
             }
-            if response.drag_stopped()
-                && let Some(origin) = drag_origin.take()
-                && let Some(pointer) = response.interact_pointer_pos()
-            {
-                if let Some(center) = dragged_center(origin, pointer) {
-                    commands.push(NativeOverlayCommand::CommitSeekStrip {
-                        center,
-                        stamp: strip.stamp,
-                    });
-                }
-            } else if response.clicked()
+            if !finishing
+                && response.clicked()
+                && !matches!(
+                    termination,
+                    Some(NativePointerTermination::Cancelled { .. })
+                )
                 && let Some(pointer) = response.interact_pointer_pos()
                 && seek_strip_body_accepts_pointer(lock_rect, pointer)
             {
@@ -2729,6 +2825,7 @@ struct NativeEguiOverlayState {
     last_text_input_focus_claim_at: Option<Instant>,
     started_at: Instant,
     pending_events: Vec<egui::Event>,
+    pending_pointer_termination: Option<NativePointerTermination>,
     native_touch: crate::video::native_touch::NativeTouchAdapter,
     panorama_pose: Option<PanoPose>,
     video_zoom_scale: Option<f32>,
@@ -2883,7 +2980,7 @@ struct NativeEguiOverlayState {
     seek_strip_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     seek_strip_wave_texture: Option<(u64, egui::TextureHandle)>,
     seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
-    seek_strip_drag_origin: Option<crate::video::seek_strip::SeekStripDragOrigin>,
+    seek_strip_drag: Option<NativeSeekStripDrag>,
     last_seek_strip_window_request: Option<SeekStripWindowRequestKey>,
     seek_strip_committed_inventory: crate::video::seek_strip::SeekStripPresentedInventory,
     seek_strip_pending_inventory: Option<crate::video::seek_strip::SeekStripPresentedUpdate>,
@@ -4041,6 +4138,7 @@ struct NativeOverlayEventBatchRun {
 }
 
 trait NativeLogicalBatchTarget {
+    fn batch_has_pointer_termination(&self) -> bool;
     fn batch_needs_render(&self) -> bool;
     fn batch_hover_tooltip_repaint_needed(&self) -> bool;
     fn batch_prepare(&mut self) -> Result<(), String>;
@@ -4159,6 +4257,17 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
     let mut segment_routing = NativeOverlaySegmentRouting::new(target.batch_input_routing());
     target.batch_prepare()?;
 
+    // Source reset can enqueue a synthetic release outside this batch. Close its pass
+    // before any new input changes the pointer or starts another gesture.
+    if target.batch_has_pointer_termination() {
+        logical_batch.append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
+        logical_pass_count += 1;
+        let routing = native_routing_after_segment(target, segment_routing);
+        assign_native_routing_segment(&mut event_dispositions, 0..0, routing);
+        segment_routing = NativeOverlaySegmentRouting::new(target.batch_input_routing());
+        logical_input_pending = false;
+    }
+
     for (event_index, event) in events.iter().enumerate() {
         if let NativeEvent::MouseWheel(wheel) = event {
             if ownership_commit_pending && target.batch_needs_render() {
@@ -4200,6 +4309,21 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
             segment_routing.observe(target.batch_input_routing());
             ownership_commit_pending |= native_event_requires_ownership_commit(event);
             logical_input_pending |= target.batch_needs_render();
+            if target.batch_has_pointer_termination() {
+                logical_batch
+                    .append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
+                logical_pass_count += 1;
+                let routing = native_routing_after_segment(target, segment_routing);
+                assign_native_routing_segment(
+                    &mut event_dispositions,
+                    segment_start..event_index + 1,
+                    routing,
+                );
+                segment_start = event_index + 1;
+                segment_routing = NativeOverlaySegmentRouting::new(target.batch_input_routing());
+                ownership_commit_pending = false;
+                logical_input_pending = false;
+            }
         }
     }
 
@@ -4228,6 +4352,9 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
 }
 
 impl NativeLogicalBatchTarget for NativeEguiOverlay {
+    fn batch_has_pointer_termination(&self) -> bool {
+        self.pending_pointer_termination.is_some()
+    }
     fn batch_needs_render(&self) -> bool {
         self.needs_render()
     }
@@ -8892,7 +9019,7 @@ impl NativeRenderCore {
         };
         (
             !overlay.egui_ctx.input(|input| input.pointer.any_down()),
-            overlay.seek_row_gesture.is_none() && overlay.seek_strip_drag_origin.is_none(),
+            overlay.seek_row_gesture.is_none() && overlay.seek_strip_drag.is_none(),
         )
     }
 
@@ -9401,6 +9528,7 @@ impl NativeEguiOverlayState {
             last_text_input_focus_claim_at: None,
             started_at: Instant::now(),
             pending_events: Vec::new(),
+            pending_pointer_termination: None,
             native_touch: crate::video::native_touch::NativeTouchAdapter::default(),
             panorama_pose: None,
             video_zoom_scale: None,
@@ -9510,7 +9638,7 @@ impl NativeEguiOverlayState {
             seek_strip_textures: HashMap::new(),
             seek_strip_wave_texture: None,
             seek_row_gesture: None,
-            seek_strip_drag_origin: None,
+            seek_strip_drag: None,
             last_seek_strip_window_request: None,
             seek_strip_committed_inventory:
                 crate::video::seek_strip::SeekStripPresentedInventory::Absent,
@@ -9913,7 +10041,7 @@ impl NativeEguiOverlayState {
             [touch.x, touch.y],
             output.pos,
         );
-        self.enqueue_native_pointer_events(output.egui_events);
+        self.enqueue_native_pointer_events(output.egui_events, output.termination);
         let touch_commands = self.native_touch.take_commands();
         let motion_view_active = self.side_panels_suppressed_by_motion_view();
         let dismiss_touch_panels = touch_commands.iter().copied().any(|command| {
@@ -9969,7 +10097,32 @@ impl NativeEguiOverlayState {
         self.dirty = true;
     }
 
-    fn enqueue_native_pointer_events(&mut self, events: Vec<egui::Event>) {
+    fn record_pointer_termination(&mut self, termination: NativePointerTermination) {
+        // Escape wins if it shares a pass with a release. The batch driver closes
+        // every terminal pass immediately, so two releases cannot normally meet.
+        if self.pending_pointer_termination
+            == Some(NativePointerTermination::Cancelled { button: None })
+        {
+            return;
+        }
+        if termination == (NativePointerTermination::Cancelled { button: None }) {
+            self.pending_pointer_termination = Some(termination);
+        } else if self.pending_pointer_termination.is_some() {
+            log::error!("multiple pointer releases in one native overlay logical pass");
+            debug_assert!(false, "multiple pointer releases in one logical pass");
+        } else {
+            self.pending_pointer_termination = Some(termination);
+        }
+    }
+
+    fn enqueue_native_pointer_events(
+        &mut self,
+        events: Vec<egui::Event>,
+        termination: Option<NativePointerTermination>,
+    ) {
+        if let Some(termination) = termination {
+            self.record_pointer_termination(termination);
+        }
         for event in &events {
             match event {
                 egui::Event::PointerMoved(pos) => self.pointer_pos = Some(*pos),
@@ -10242,6 +10395,7 @@ impl NativeEguiOverlayState {
                             cause: crate::video::seek_strip::SeekStripCloseCause::Escape,
                             stamp: self.seek_strip.as_ref().expect("checked above").stamp,
                         });
+                    self.seek_strip_drag = None;
                     self.side_panel_escape_consumed = true;
                     self.dirty = true;
                     return;
@@ -10337,6 +10491,11 @@ impl NativeEguiOverlayState {
                 }
                 if let Some(egui_key) = egui_key_from_virtual_key(key.virtual_key) {
                     let pressed = matches!(event, NativeEvent::KeyDown(_));
+                    if pressed && egui_key == egui::Key::Escape {
+                        self.record_pointer_termination(NativePointerTermination::Cancelled {
+                            button: None,
+                        });
+                    }
                     self.pending_events.push(egui::Event::Key {
                         key: egui_key,
                         physical_key: Some(egui_key),
@@ -10474,6 +10633,22 @@ impl NativeEguiOverlayState {
                     NativeVideoMouseButton::Extra1 => egui::PointerButton::Extra1,
                     NativeVideoMouseButton::Extra2 => egui::PointerButton::Extra2,
                 };
+                if !button.down {
+                    let termination = if matches!(
+                        button.receipt.origin,
+                        crate::mouse_seek_debug::NativeVideoInputOrigin::Win32MouseCleanup { .. }
+                    ) {
+                        NativePointerTermination::Cancelled {
+                            button: Some(egui_button),
+                        }
+                    } else {
+                        NativePointerTermination::Released {
+                            button: egui_button,
+                            pos,
+                        }
+                    };
+                    self.record_pointer_termination(termination);
+                }
                 self.pending_events.push(egui::Event::PointerButton {
                     pos,
                     button: egui_button,
@@ -10962,7 +11137,7 @@ impl NativeEguiOverlayState {
     fn reset_side_panel_session(&mut self) {
         let touch_reset = self.native_touch.reset_for_source_swap();
         let touch_changed = touch_reset.changed;
-        self.enqueue_native_pointer_events(touch_reset.egui_events);
+        self.enqueue_native_pointer_events(touch_reset.egui_events, touch_reset.termination);
         let changed = self.left_panel_open.is_open()
             || self.right_panel_hover_latched
             || self.jump_panel_hover_latched
@@ -11271,7 +11446,7 @@ impl NativeEguiOverlayState {
         if seek_strip.is_none() {
             self.seek_strip_textures.clear();
             self.seek_strip_wave_texture = None;
-            self.seek_strip_drag_origin = None;
+            self.seek_strip_drag = None;
             self.last_seek_strip_window_request = None;
             self.seek_strip_committed_inventory =
                 crate::video::seek_strip::SeekStripPresentedInventory::Absent;
@@ -12267,7 +12442,7 @@ impl NativeEguiOverlayState {
             self.audio_track_menu_open,
             self.video_speed_popup_open,
             self.seek_row_gesture.is_some(),
-            self.seek_strip_drag_origin.is_some(),
+            self.seek_strip_drag.is_some(),
         ) {
             return true;
         }
@@ -12967,7 +13142,7 @@ impl NativeEguiOverlayState {
         let seek_strip_height_values = self.seek_strip_height_values;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
-        let mut seek_strip_drag_origin = self.seek_strip_drag_origin;
+        let mut seek_strip_drag = self.seek_strip_drag;
         // 実機修正 (2026-05-12 P1 #2): 実描画した preview_rect を記録して
         // `compute_hud_regions` に渡す (= region を draw rect と完全同期させる)。
         let mut last_drawn_preview_rect: Option<egui::Rect> = None;
@@ -13000,6 +13175,7 @@ impl NativeEguiOverlayState {
         // previous pass's state, so Commit/Disabled must be projected from this queue.
         // Only ongoing composition suppresses the tag picker's Enter/Escape handlers.
         let tag_picker_enter_allowed = !self.ime_composing();
+        let pointer_termination = self.pending_pointer_termination.take();
         let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -13502,7 +13678,8 @@ impl NativeEguiOverlayState {
                         bottom_lock.strip_locked() && !resolved_chrome.bottom_lock.strip_locked(),
                         &seek_strip_texture_ids,
                         seek_strip_wave_texture_id,
-                        &mut seek_strip_drag_origin,
+                        &mut seek_strip_drag,
+                        pointer_termination,
                         &mut commands,
                         record_draw_rects.then_some(&mut draw_facts.strip_rect),
                     );
@@ -13687,12 +13864,29 @@ impl NativeEguiOverlayState {
                                 duration_secs * frac as f64
                             };
                             if seek_resp.drag_started()
-                                && let Some(origin) = seek_resp.interact_pointer_pos()
+                                && let Some(pointer) = seek_resp.interact_pointer_pos()
+                                && let origin =
+                                    pointer - seek_resp.total_drag_delta().unwrap_or_default()
                             {
                                 seek_row_gesture =
                                     Some(crate::video::seek_strip::SeekRowGesture::new(origin));
                             }
-                            if seek_resp.clicked()
+                            if let Some(termination) = pointer_termination
+                                && let Some(gesture) = seek_row_gesture.take()
+                            {
+                                commands.extend(finish_native_seek_row(
+                                    gesture,
+                                    termination,
+                                    target_at,
+                                    last_seek_target_secs,
+                                    seek_strip_material_available && !seek_strip_visible,
+                                ));
+                                last_seek_target_secs = None;
+                            } else if seek_resp.clicked()
+                                && !matches!(
+                                    pointer_termination,
+                                    Some(NativePointerTermination::Cancelled { .. })
+                                )
                                 && let Some(pos) = seek_resp.interact_pointer_pos()
                             {
                                 let target_secs = target_at(pos);
@@ -13729,21 +13923,6 @@ impl NativeEguiOverlayState {
                                     }
                                     crate::video::seek_strip::SeekRowDecision::Undecided => {}
                                 }
-                            }
-                            if seek_resp.drag_stopped() {
-                                if matches!(
-                                    seek_row_gesture,
-                                    Some(
-                                        crate::video::seek_strip::SeekRowGesture::Undecided { .. }
-                                    )
-                                ) && let Some(pos) = seek_resp.interact_pointer_pos()
-                                {
-                                    commands.push(NativeOverlayCommand::Seek {
-                                        target_secs: target_at(pos),
-                                    });
-                                }
-                                seek_row_gesture = None;
-                                last_seek_target_secs = None;
                             }
                         } else {
                             seek_row_gesture = None;
@@ -14179,7 +14358,7 @@ impl NativeEguiOverlayState {
             // widgets. Do not carry a pre-hide drag/gesture into a later visible presentation.
             // The accepted RequestWindow dedup and decoded cells remain session resources.
             seek_row_gesture = None;
-            seek_strip_drag_origin = None;
+            seek_strip_drag = None;
         }
         self.seek_strip_menu_open = seek_strip_menu_open;
         self.last_drawn_seek_strip_menu_rect = seek_strip_menu_rect;
@@ -14188,7 +14367,7 @@ impl NativeEguiOverlayState {
         self.panorama_projection_popup_open = panorama_projection_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
-        self.seek_strip_drag_origin = seek_strip_drag_origin;
+        self.seek_strip_drag = seek_strip_drag;
         self.bookmark_title_edit = bookmark_title_edit;
         self.bulk_bookmark_dialog = bulk_bookmark_dialog;
         self.video_left_panel_tab = video_left_panel_tab;
@@ -15936,6 +16115,935 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
 
 #[cfg(test)]
 mod chrome_suppression_interaction_tests {
+    mod seek_terminal_tests {
+        // GPU-free regressions using the production overlay and logical batch driver.
+        use super::*;
+
+        #[test]
+        fn seek_terminal_zero_area_preserves_primary_gate_and_press_axis() {
+            use crate::video::seek_strip::{
+                seek_strip_center_at_drag_pointer, seek_strip_center_at_press_axis_pointer,
+            };
+            use crate::video::seek_strip_layout::{
+                SeekStripHeight, SeekStripHeightValues, SeekStripLayout,
+            };
+            for waveform in [false, true] {
+                for whole in [false, true] {
+                    for end in 0..4 {
+                        let mut target = target(true);
+                        configure_strip(&mut target.state, waveform, whole);
+                        start_drag(&mut target.state, true, false);
+                        let drag = target.state.seek_strip_drag.unwrap();
+                        let strip = target.state.seek_strip.as_ref().unwrap();
+                        let bottom = target
+                            .state
+                            .egui_ctx
+                            .read_response(egui::Id::unique("native_video_seek_strip_drag"))
+                            .unwrap()
+                            .rect
+                            .bottom();
+                        let layout = SeekStripLayout::resolve(
+                            egui::Rect::from_min_size(
+                                egui::pos2(0.0, bottom),
+                                egui::vec2(640.0, 0.0),
+                            ),
+                            SeekStripHeight::Small,
+                            SeekStripHeightValues::default(),
+                            strip.span,
+                            strip.cell_aspect,
+                        );
+                        let pos = drag.origin.pointer + egui::vec2(70.0, 0.0);
+                        let termination = match end {
+                            0 => NativePointerTermination::Released {
+                                button: egui::PointerButton::Primary,
+                                pos,
+                            },
+                            1 => NativePointerTermination::Released {
+                                button: egui::PointerButton::Primary,
+                                pos: egui::pos2(drag.origin.pointer.x, bottom + 1.0),
+                            },
+                            2 => NativePointerTermination::Cancelled {
+                                button: Some(egui::PointerButton::Primary),
+                            },
+                            _ => NativePointerTermination::Cancelled { button: None },
+                        };
+                        let mut owned = Some(drag);
+                        let mut commands = Vec::new();
+                        let mut draw = |termination| {
+                            draw_native_seek_strip(
+                                &target.state.egui_ctx,
+                                layout,
+                                crate::video::seek_strip_layout::SeekStripMarker::Center,
+                                Some(egui::pos2(-999.0, -999.0)),
+                                true,
+                                strip,
+                                false,
+                                false,
+                                &HashMap::new(),
+                                None,
+                                &mut owned,
+                                Some(termination),
+                                &mut commands,
+                                None,
+                            );
+                        };
+                        draw(NativePointerTermination::Released {
+                            button: egui::PointerButton::Secondary,
+                            pos,
+                        });
+                        draw(termination);
+                        assert!(owned.is_none());
+                        let expected = match end {
+                            0 => {
+                                if whole {
+                                    seek_strip_center_at_press_axis_pointer(drag.origin, pos)
+                                } else {
+                                    seek_strip_center_at_drag_pointer(drag.origin, pos)
+                                }
+                            }
+                            1 => None,
+                            _ => drag.last_moved_center,
+                        };
+                        if end == 1 {
+                            assert!(matches!(
+                                commands.as_slice(),
+                                [NativeOverlayCommand::CloseSeekStrip { .. }]
+                            ));
+                        } else if let Some(expected) = expected {
+                            assert!(
+                                matches!(commands.as_slice(), [NativeOverlayCommand::CommitSeekStrip { center, .. }] if *center == expected),
+                                "{commands:?}"
+                            );
+                        } else {
+                            assert!(commands.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn seek_terminal_undecided_keeps_seek_and_open_strip_does_not_reopen() {
+            use crate::video::seek_strip::SeekRowGesture;
+            let origin = egui::pos2(50.0, 50.0);
+            let termination = NativePointerTermination::Released {
+                button: egui::PointerButton::Primary,
+                pos: origin,
+            };
+            assert!(matches!(
+                finish_native_seek_row(
+                    SeekRowGesture::new(origin),
+                    termination,
+                    |_| 5.0,
+                    Some(5.0),
+                    true
+                ),
+                Some(NativeOverlayCommand::Seek { target_secs: 5.0 })
+            ));
+            assert!(
+                finish_native_seek_row(
+                    SeekRowGesture::OpenStrip { origin },
+                    termination,
+                    |_| 5.0,
+                    None,
+                    true
+                )
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn seek_terminal_touch_end_uses_final_position() {
+            for strip in [false, true] {
+                let mut target = target(strip);
+                let pos = start_drag(&mut target.state, strip, true) + egui::vec2(100.0, 0.0);
+                let seek = seek_target(&target.state, pos);
+                let center = target.state.seek_strip_drag.and_then(|drag| {
+                    crate::video::seek_strip::seek_strip_center_at_drag_pointer(drag.origin, pos)
+                });
+                let run = run_native_event_batch(
+                    &mut target,
+                    &[NativeVideoWindowEvent::Touch(NativeVideoTouchEvent {
+                        source: NativeVideoWindowSource::Hud,
+                        pointer_id: 1,
+                        x: pos.x as i32,
+                        y: pos.y as i32,
+                        phase: NativeVideoTouchPhase::End,
+                        suppress_widget_primary: false,
+                    })],
+                )
+                .unwrap();
+                if let Some(expected) = center {
+                    assert!(
+                        matches!(terminal_commands(&run.commands).as_slice(), [NativeOverlayCommand::CommitSeekStrip { center, .. }] if *center == expected)
+                    );
+                } else {
+                    assert_seek(&run.commands, seek);
+                }
+                assert!(
+                    target.state.pointer_pos.is_none(),
+                    "touch End ends the emulated stream"
+                );
+            }
+        }
+
+        #[test]
+        fn seek_terminal_mouse_receipts_classify_all_buttons_and_escape_wins() {
+            for source in [
+                NativeVideoWindowSource::Hud,
+                NativeVideoWindowSource::Presenter,
+            ] {
+                for button in [
+                    NativeVideoMouseButton::Left,
+                    NativeVideoMouseButton::Right,
+                    NativeVideoMouseButton::Middle,
+                    NativeVideoMouseButton::Extra1,
+                    NativeVideoMouseButton::Extra2,
+                ] {
+                    for cleanup in [false, true] {
+                        let mut target = target(false);
+                        let mut event = mouse(egui::pos2(20.0, 30.0), false, button, cleanup);
+                        if let NativeVideoWindowEvent::MouseButton(event) = &mut event {
+                            event.receipt.origin = if cleanup {
+                                crate::mouse_seek_debug::NativeVideoInputOrigin::Win32MouseCleanup {
+                                    window_source: source,
+                                    receiver_hwnd: 1,
+                                    cause_message: 0x1F,
+                                }
+                            } else {
+                                crate::mouse_seek_debug::NativeVideoInputOrigin::Win32MouseButton {
+                                    window_source: source,
+                                    receiver_hwnd: 1,
+                                    message: 0x202,
+                                    button_code: 0,
+                                }
+                            };
+                        }
+                        target.state.push_native_event(event);
+                        assert!(matches!(
+                            (cleanup, target.state.pending_pointer_termination),
+                            (
+                                true,
+                                Some(NativePointerTermination::Cancelled { button: Some(_) })
+                            ) | (
+                                false,
+                                Some(NativePointerTermination::Released {
+                                    pos: egui::Pos2 { x: 20.0, y: 30.0 },
+                                    ..
+                                })
+                            )
+                        ));
+                        frame(&mut target.state);
+                        assert!(target.state.pending_pointer_termination.is_none());
+                    }
+                }
+            }
+            let mut target = target(false);
+            target.state.push_native_event(escape());
+            target.state.push_native_event(up(egui::pos2(20.0, 30.0)));
+            assert_eq!(
+                target.state.pending_pointer_termination,
+                Some(NativePointerTermination::Cancelled { button: None })
+            );
+            frame(&mut target.state);
+            assert!(target.state.pending_pointer_termination.is_none());
+        }
+
+        #[test]
+        fn seek_terminal_lock_press_does_not_become_body_drag() {
+            let mut target = target(true);
+            let body = target
+                .state
+                .egui_ctx
+                .read_response(egui::Id::unique("native_video_seek_strip_drag"))
+                .unwrap()
+                .rect;
+            let lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(body)
+                .center()
+                .round();
+            pointer(&mut target.state, lock);
+            frame(&mut target.state);
+            button(&mut target.state, lock, true);
+            frame(&mut target.state);
+            pointer(&mut target.state, body.center());
+            let output = frame(&mut target.state);
+            assert!(target.state.seek_strip_drag.is_none());
+            assert!(
+                !output
+                    .commands
+                    .iter()
+                    .any(|cmd| matches!(cmd, NativeOverlayCommand::MoveSeekStrip { .. }))
+            );
+        }
+
+        #[test]
+        fn seek_terminal_egui_strip_escape_is_cancel_not_native_close() {
+            for escape_first in [false, true] {
+                let mut target = target(true);
+                let pos = start_drag(&mut target.state, true, false);
+                let last = target
+                    .state
+                    .seek_strip_drag
+                    .unwrap()
+                    .last_moved_center
+                    .unwrap();
+                // Text ownership bypasses native strip Escape, letting egui receive it.
+                target.state.tag_picker_open = true;
+                let events = if escape_first {
+                    vec![escape(), up(pos)]
+                } else {
+                    vec![up(pos), escape()]
+                };
+                let run = run_native_event_batch(&mut target, &events).unwrap();
+                assert!(
+                    !run.commands
+                        .iter()
+                        .any(|cmd| matches!(cmd, NativeOverlayCommand::CloseSeekStrip { .. }))
+                );
+                assert!(
+                    matches!(terminal_commands(&run.commands).as_slice(), [NativeOverlayCommand::CommitSeekStrip { center, .. }] if *center == last)
+                );
+                assert!(target.state.seek_strip_drag.is_none());
+            }
+        }
+
+        #[test]
+        fn seek_terminal_escape_release_key_resets_segment_protection() {
+            let mut target = target(false);
+            let pos = start_drag(&mut target.state, false, false);
+            let mut key = native_clipboard_key(0x4B, false);
+            key.ctrl = false;
+            key.shift = false;
+            let run = run_native_event_batch(
+                &mut target,
+                &[escape(), up(pos), NativeVideoWindowEvent::KeyDown(key)],
+            )
+            .unwrap();
+            assert_eq!(target.logical_visibility.len(), 3);
+            assert_eq!(
+                target
+                    .gpu
+                    .operations
+                    .iter()
+                    .filter(|op| **op == "Present")
+                    .count(),
+                1
+            );
+            assert!(terminal_commands(&run.commands).is_empty());
+            assert!(
+                matches!(run.event_dispositions[2], NativeOverlayInputDisposition::Routing(routing) if !routing.modal_dialog_active && !routing.text_input_active)
+            );
+        }
+
+        fn target(strip: bool) -> CpuOverlayBatchTarget {
+            let (state, _) = fixture(strip);
+            CpuOverlayBatchTarget {
+                state,
+                gpu: RecordingOverlayGpu::default(),
+                logical_visibility: Vec::new(),
+                logical_repaint_deadlines: Vec::new(),
+                texture_sets: 0,
+                texture_frees: 0,
+            }
+        }
+
+        fn mouse(
+            pos: egui::Pos2,
+            down: bool,
+            button: NativeVideoMouseButton,
+            cleanup: bool,
+        ) -> NativeVideoWindowEvent {
+            let mut receipt = crate::mouse_seek_debug::test_receipt(1);
+            if cleanup {
+                receipt.origin =
+                    crate::mouse_seek_debug::NativeVideoInputOrigin::Win32MouseCleanup {
+                        window_source: NativeVideoWindowSource::Hud,
+                        receiver_hwnd: 1,
+                        cause_message: 0x0215,
+                    };
+            }
+            NativeVideoWindowEvent::MouseButton(NativeVideoMouseButtonEvent {
+                receipt,
+                owner: crate::video::native_window::test_mouse_input_owner(),
+                button,
+                down,
+                double_click: false,
+                x: pos.x as i32,
+                y: pos.y as i32,
+                shift: false,
+                ctrl: false,
+                #[cfg(feature = "test-script")]
+                smoke_metadata: None,
+            })
+        }
+
+        fn up(pos: egui::Pos2) -> NativeVideoWindowEvent {
+            mouse(pos, false, NativeVideoMouseButton::Left, false)
+        }
+
+        fn moved(pos: egui::Pos2) -> NativeVideoWindowEvent {
+            NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent {
+                x: pos.x as i32,
+                y: pos.y as i32,
+                shift: false,
+                ctrl: false,
+            })
+        }
+
+        fn escape() -> NativeVideoWindowEvent {
+            let mut key = native_clipboard_key(0x1B, false);
+            key.ctrl = false;
+            NativeVideoWindowEvent::KeyDown(key) // Shift+Escape reaches egui when no strip is open.
+        }
+
+        fn terminal_commands(commands: &[NativeOverlayCommand]) -> Vec<&NativeOverlayCommand> {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command,
+                        NativeOverlayCommand::Seek { .. }
+                            | NativeOverlayCommand::CommitSeekStrip { .. }
+                            | NativeOverlayCommand::CloseSeekStrip { .. }
+                            | NativeOverlayCommand::OpenSeekStrip
+                    )
+                })
+                .collect()
+        }
+
+        fn seek_target(state: &NativeEguiOverlayState, pos: egui::Pos2) -> f64 {
+            let rect = state
+                .egui_ctx
+                .read_response(egui::Id::unique("native_video_seek_hit"))
+                .unwrap()
+                .rect;
+            state.video_duration_secs
+                * ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64
+        }
+
+        fn assert_seek(commands: &[NativeOverlayCommand], expected: f64) {
+            let commands = terminal_commands(commands);
+            assert_eq!(commands.len(), 1, "{commands:?}");
+            assert!(
+                matches!(commands[0], NativeOverlayCommand::Seek { target_secs } if (*target_secs - expected).abs() < 1e-6),
+                "{commands:?}, expected {expected}"
+            );
+        }
+
+        fn begin_undecided(state: &mut NativeEguiOverlayState) -> egui::Pos2 {
+            let origin = state
+                .egui_ctx
+                .read_response(egui::Id::unique("native_video_seek_hit"))
+                .unwrap()
+                .rect
+                .center()
+                .round();
+            pointer(state, origin);
+            frame(state);
+            button(state, origin, true);
+            frame(state);
+            pointer(state, origin - egui::vec2(0.0, 8.0));
+            frame(state);
+            assert_eq!(
+                state.seek_row_gesture,
+                Some(crate::video::seek_strip::SeekRowGesture::Undecided { origin })
+            );
+            origin
+        }
+
+        #[test]
+        fn seek_terminal_scrub_final_move_ignores_throttle_and_deduplicates() {
+            for same in [false, true] {
+                let mut target = target(false);
+                let pos = start_drag(&mut target.state, false, false) + egui::vec2(90.0, 0.0);
+                let expected = seek_target(&target.state, pos);
+                target.state.last_seek_target_secs =
+                    Some(if same { expected } else { expected - 0.05 });
+                let run = run_native_event_batch(&mut target, &[moved(pos), up(pos)]).unwrap();
+                if same {
+                    assert!(terminal_commands(&run.commands).is_empty());
+                } else {
+                    assert_seek(&run.commands, expected);
+                }
+                assert!(target.state.seek_row_gesture.is_none());
+                assert!(target.state.last_seek_target_secs.is_none());
+                assert_eq!(target.logical_visibility.len(), 1);
+                assert_eq!(
+                    target
+                        .gpu
+                        .operations
+                        .iter()
+                        .filter(|op| **op == "Present")
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn seek_terminal_undecided_resolves_release_direction_and_open_gate() {
+            use crate::video::seek_strip::{
+                SeekStripMaterialAvailability, StripAxisUnavailableReason,
+            };
+            for strip_visible in [false, true] {
+                for available in [false, true] {
+                    for upward in [false, true] {
+                        let mut target = target(strip_visible);
+                        target.state.seek_strip_material_availability = if available {
+                            SeekStripMaterialAvailability::Unknown
+                        } else {
+                            SeekStripMaterialAvailability::Unavailable(
+                                StripAxisUnavailableReason::KeyframesTooSparse,
+                            )
+                        };
+                        let origin = begin_undecided(&mut target.state);
+                        let pos = origin
+                            + if upward {
+                                egui::vec2(0.0, -30.0)
+                            } else {
+                                egui::vec2(30.0, 0.0)
+                            };
+                        let expected = seek_target(&target.state, pos);
+                        let run =
+                            run_native_event_batch(&mut target, &[moved(pos), up(pos)]).unwrap();
+                        if upward {
+                            assert_eq!(
+                                terminal_commands(&run.commands).len(),
+                                usize::from(available && !strip_visible),
+                                "{:#?}",
+                                run.commands
+                            );
+                            assert!(
+                                run.commands
+                                    .iter()
+                                    .all(|cmd| !matches!(cmd, NativeOverlayCommand::Seek { .. }))
+                            );
+                        } else {
+                            assert_seek(&run.commands, expected);
+                        }
+                        assert!(target.state.seek_row_gesture.is_none());
+                    }
+                }
+            }
+        }
+
+        fn configure_strip(state: &mut NativeEguiOverlayState, waveform: bool, whole: bool) {
+            let strip = state.seek_strip.as_mut().unwrap();
+            strip.span = if whole {
+                crate::video::seek_strip_layout::SeekStripSpan::Whole
+            } else {
+                crate::video::seek_strip_layout::SeekStripSpan::Window
+            };
+            if waveform {
+                strip.center = crate::video::seek_strip::SeekStripCenter::Waveform {
+                    center_time_secs: 150.0,
+                };
+            }
+            for _ in 0..4 {
+                frame(state);
+            }
+        }
+
+        #[test]
+        fn seek_terminal_strip_release_closes_or_commits_in_all_modes() {
+            use crate::video::seek_strip::{
+                SeekStripCloseCause, seek_strip_center_at_drag_pointer,
+                seek_strip_center_at_press_axis_pointer,
+            };
+            for waveform in [false, true] {
+                for whole in [false, true] {
+                    for close in [false, true] {
+                        let mut target = target(true);
+                        configure_strip(&mut target.state, waveform, whole);
+                        let moved_pos = start_drag(&mut target.state, true, false);
+                        let drag = target.state.seek_strip_drag.unwrap();
+                        assert_eq!(drag.origin.pointer, moved_pos - egui::vec2(35.0, 0.0));
+                        let rect = target
+                            .state
+                            .egui_ctx
+                            .read_response(egui::Id::unique("native_video_seek_strip_drag"))
+                            .unwrap()
+                            .rect;
+                        let pos = if close {
+                            egui::pos2(drag.origin.pointer.x, rect.bottom() + 1.0)
+                        } else {
+                            moved_pos + egui::vec2(70.0, 0.0)
+                        };
+                        let expected = if whole {
+                            seek_strip_center_at_press_axis_pointer(drag.origin, pos)
+                        } else {
+                            seek_strip_center_at_drag_pointer(drag.origin, pos)
+                        }
+                        .unwrap();
+                        let run =
+                            run_native_event_batch(&mut target, &[moved(pos), up(pos)]).unwrap();
+                        let commands = terminal_commands(&run.commands);
+                        assert_eq!(commands.len(), 1, "{commands:?}");
+                        if close {
+                            assert!(matches!(
+                                commands[0],
+                                NativeOverlayCommand::CloseSeekStrip {
+                                    cause: SeekStripCloseCause::DownwardDrag,
+                                    ..
+                                }
+                            ));
+                        } else {
+                            assert!(
+                                matches!(commands[0], NativeOverlayCommand::CommitSeekStrip { center, .. } if *center == expected),
+                                "{commands:?}, expected {expected:?}"
+                            );
+                        }
+                        assert!(target.state.seek_strip_drag.is_none());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn seek_terminal_release_boundary_preserves_position_and_next_press() {
+            for new_press in [false, true] {
+                let mut target = target(false);
+                let pos = start_drag(&mut target.state, false, false) + egui::vec2(50.0, 0.0);
+                let expected = seek_target(&target.state, pos);
+                let next = pos - egui::vec2(200.0, 0.0);
+                let mut events = vec![up(pos)];
+                if new_press {
+                    events.push(mouse(next, true, NativeVideoMouseButton::Left, false));
+                }
+                events.push(moved(next - egui::vec2(0.0, 8.0)));
+                let run = run_native_event_batch(&mut target, &events).unwrap();
+                assert_seek(&run.commands, expected);
+                assert_eq!(target.logical_visibility.len(), 2);
+                assert_eq!(
+                    target
+                        .gpu
+                        .operations
+                        .iter()
+                        .filter(|op| **op == "Present")
+                        .count(),
+                    1
+                );
+                assert!(
+                    run.event_dispositions
+                        .iter()
+                        .all(|d| matches!(d, NativeOverlayInputDisposition::Routing(_)))
+                );
+                if new_press {
+                    // Move in the next batch crosses egui's drag threshold for the new press.
+                    pointer(&mut target.state, next - egui::vec2(0.0, 12.0));
+                    frame(&mut target.state);
+                    assert!(target.state.seek_row_gesture.is_some());
+                }
+            }
+        }
+
+        #[test]
+        fn seek_terminal_cleanup_and_touch_cancel_never_use_synthetic_position() {
+            for touch_input in [false, true] {
+                for strip in [false, true] {
+                    for waveform in [false, true] {
+                        for whole in [false, true] {
+                            let mut target = target(strip);
+                            if strip {
+                                configure_strip(&mut target.state, waveform, whole);
+                            }
+                            start_drag(&mut target.state, strip, touch_input);
+                            let last_moved = target
+                                .state
+                                .seek_strip_drag
+                                .and_then(|drag| drag.last_moved_center);
+                            let event = if touch_input {
+                                NativeVideoWindowEvent::Touch(NativeVideoTouchEvent {
+                                    source: NativeVideoWindowSource::Hud,
+                                    pointer_id: 1,
+                                    x: 0,
+                                    y: 0,
+                                    phase: NativeVideoTouchPhase::Cancel,
+                                    suppress_widget_primary: false,
+                                })
+                            } else {
+                                mouse(egui::Pos2::ZERO, false, NativeVideoMouseButton::Left, true)
+                            };
+                            let run = run_native_event_batch(&mut target, &[event]).unwrap();
+                            let commands = terminal_commands(&run.commands);
+                            assert_eq!(
+                                commands.len(),
+                                usize::from(last_moved.is_some()),
+                                "{commands:?}"
+                            );
+                            if let Some(expected) = last_moved {
+                                assert!(
+                                    matches!(commands[0], NativeOverlayCommand::CommitSeekStrip { center, .. } if *center == expected)
+                                );
+                            }
+                            assert!(target.state.seek_strip_drag.is_none());
+                            assert!(target.state.seek_row_gesture.is_none());
+                        }
+                    }
+                }
+            }
+            let mut target = target(false);
+            begin_undecided(&mut target.state);
+            let run = run_native_event_batch(
+                &mut target,
+                &[mouse(
+                    egui::Pos2::ZERO,
+                    false,
+                    NativeVideoMouseButton::Left,
+                    true,
+                )],
+            )
+            .unwrap();
+            assert!(terminal_commands(&run.commands).is_empty());
+        }
+
+        #[test]
+        fn seek_terminal_cancel_before_strip_move_emits_nothing() {
+            let mut target = target(true);
+            let pos = start_drag(&mut target.state, true, false);
+            // Pure ownership boundary also covers cancellation before the first emitted Move.
+            target
+                .state
+                .seek_strip_drag
+                .as_mut()
+                .unwrap()
+                .last_moved_center = None;
+            let run = run_native_event_batch(
+                &mut target,
+                &[mouse(pos, false, NativeVideoMouseButton::Left, true)],
+            )
+            .unwrap();
+            assert!(terminal_commands(&run.commands).is_empty());
+        }
+
+        #[test]
+        fn seek_terminal_source_reset_flushes_before_empty_or_new_batch() {
+            for strip in [false, true] {
+                for next_input in [false, true] {
+                    let mut target = target(strip);
+                    start_drag(&mut target.state, strip, true);
+                    let expected = target
+                        .state
+                        .seek_strip_drag
+                        .and_then(|drag| drag.last_moved_center);
+                    target.state.reset_side_panel_session();
+                    assert!(matches!(
+                        target.state.pending_pointer_termination,
+                        Some(NativePointerTermination::Cancelled {
+                            button: Some(egui::PointerButton::Primary)
+                        })
+                    ));
+                    let events = if next_input {
+                        vec![moved(egui::pos2(5.0, 5.0))]
+                    } else {
+                        vec![]
+                    };
+                    let run = run_native_event_batch(&mut target, &events).unwrap();
+                    let commands = terminal_commands(&run.commands);
+                    assert_eq!(commands.len(), usize::from(expected.is_some()));
+                    if let Some(expected) = expected {
+                        assert!(
+                            matches!(commands[0], NativeOverlayCommand::CommitSeekStrip { center, .. } if *center == expected)
+                        );
+                    }
+                    assert_eq!(target.logical_visibility.len(), 1 + usize::from(next_input));
+                    assert_eq!(
+                        target
+                            .gpu
+                            .operations
+                            .iter()
+                            .filter(|op| **op == "Present")
+                            .count(),
+                        1
+                    );
+                    assert!(target.state.pending_pointer_termination.is_none());
+                }
+            }
+        }
+
+        #[test]
+        fn seek_terminal_egui_escape_order_and_new_drag_do_not_leak_cancellation() {
+            for escape_first in [false, true] {
+                let mut target = target(false);
+                let pos = start_drag(&mut target.state, false, false) + egui::vec2(50.0, 0.0);
+                let expected = seek_target(&target.state, pos);
+                let events = if escape_first {
+                    vec![escape(), up(pos)]
+                } else {
+                    vec![up(pos), escape()]
+                };
+                let run = run_native_event_batch(&mut target, &events).unwrap();
+                if escape_first {
+                    assert!(terminal_commands(&run.commands).is_empty());
+                } else {
+                    assert_seek(&run.commands, expected);
+                }
+                assert_eq!(target.logical_visibility.len(), 2);
+                assert!(target.state.pending_pointer_termination.is_none());
+                assert!(target.state.seek_row_gesture.is_none());
+                run_native_event_batch(&mut target, &[escape()]).unwrap(); // no owner
+                let next = start_drag(&mut target.state, false, false) + egui::vec2(100.0, 0.0);
+                let expected = seek_target(&target.state, next);
+                let run = run_native_event_batch(&mut target, &[up(next)]).unwrap();
+                assert_seek(&run.commands, expected);
+            }
+        }
+
+        #[test]
+        fn seek_terminal_native_strip_escape_drops_owner_before_following_release() {
+            use crate::video::seek_strip::SeekStripCloseCause;
+            for escape_first in [false, true] {
+                let mut target = target(true);
+                let pos = start_drag(&mut target.state, true, false);
+                let events = if escape_first {
+                    vec![escape(), up(pos)]
+                } else {
+                    vec![up(pos), escape()]
+                };
+                let run = run_native_event_batch(&mut target, &events).unwrap();
+                assert_eq!(
+                    run.commands
+                        .iter()
+                        .filter(|command| matches!(
+                            command,
+                            NativeOverlayCommand::CloseSeekStrip {
+                                cause: SeekStripCloseCause::Escape,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    run.commands
+                        .iter()
+                        .filter(|command| matches!(
+                            command,
+                            NativeOverlayCommand::CommitSeekStrip { .. }
+                        ))
+                        .count(),
+                    usize::from(!escape_first)
+                );
+                assert!(target.state.seek_strip_drag.is_none());
+                assert!(
+                    matches!(run.event_dispositions[usize::from(!escape_first)], NativeOverlayInputDisposition::Routing(routing) if routing.modal_dialog_active)
+                );
+            }
+        }
+
+        #[test]
+        fn seek_terminal_any_button_normal_strip_retains_existing_ownership() {
+            for button in [
+                NativeVideoMouseButton::Right,
+                NativeVideoMouseButton::Middle,
+            ] {
+                let mut target = target(true);
+                configure_strip(&mut target.state, false, true);
+                let rect = target
+                    .state
+                    .egui_ctx
+                    .read_response(egui::Id::unique("native_video_seek_strip_drag"))
+                    .unwrap()
+                    .rect;
+                let pos = rect.center().round();
+                pointer(&mut target.state, pos);
+                frame(&mut target.state);
+                target
+                    .state
+                    .push_native_event(mouse(pos, true, button, false));
+                frame(&mut target.state);
+                pointer(&mut target.state, pos + egui::vec2(35.0, 0.0));
+                frame(&mut target.state);
+                assert!(target.state.seek_strip_drag.is_some());
+                let released = pos + egui::vec2(100.0, 0.0);
+                let expected = crate::video::seek_strip::seek_strip_center_at_press_axis_pointer(
+                    target.state.seek_strip_drag.unwrap().origin,
+                    released,
+                )
+                .unwrap();
+                let run =
+                    run_native_event_batch(&mut target, &[mouse(released, false, button, false)])
+                        .unwrap();
+                assert!(
+                    matches!(terminal_commands(&run.commands).as_slice(), [NativeOverlayCommand::CommitSeekStrip { center, .. }] if *center == expected)
+                );
+            }
+            let mut target = target(true);
+            let pos = start_drag(&mut target.state, true, false);
+            let run = run_native_event_batch(
+                &mut target,
+                &[mouse(pos, false, NativeVideoMouseButton::Right, false)],
+            )
+            .unwrap();
+            assert_eq!(terminal_commands(&run.commands).len(), 1);
+            assert!(target.state.seek_strip_drag.is_none());
+        }
+
+        #[test]
+        fn seek_terminal_discarded_pass_emits_one_terminal_command() {
+            for strip in [false, true] {
+                let mut target = target(strip);
+                let pos = start_drag(&mut target.state, strip, false) + egui::vec2(50.0, 0.0);
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen = calls.clone();
+                target.state.egui_ctx.on_end_pass(
+                    "terminal regression",
+                    Arc::new(move |ui| {
+                        if seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                            ui.ctx().request_discard("terminal regression");
+                        }
+                    }),
+                );
+                let run = run_native_event_batch(&mut target, &[up(pos)]).unwrap();
+                assert!(calls.load(Ordering::Relaxed) >= 2);
+                assert_eq!(
+                    terminal_commands(&run.commands).len(),
+                    1,
+                    "{:#?}",
+                    run.commands
+                );
+                assert!(target.state.seek_row_gesture.is_none());
+                assert!(target.state.seek_strip_drag.is_none());
+            }
+        }
+
+        #[test]
+        fn seek_terminal_release_then_wheel_has_no_empty_tail_and_preserves_repaint() {
+            let mut target = target(false);
+            let pos = start_drag(&mut target.state, false, false);
+            target
+                .state
+                .egui_ctx
+                .request_repaint_after(Duration::from_millis(1));
+            let run =
+                run_native_event_batch(&mut target, &[up(pos), visibility_wheel(10)]).unwrap();
+            assert_eq!(target.logical_visibility.len(), 2);
+            assert_eq!(
+                target
+                    .gpu
+                    .operations
+                    .iter()
+                    .filter(|op| **op == "Present")
+                    .count(),
+                1
+            );
+            assert!(target.state.next_repaint_deadline.is_some());
+            let first = target.logical_repaint_deadlines[0].expect("first pass requests repaint");
+            assert!(
+                target.logical_repaint_deadlines[1].is_some_and(|next| next <= first),
+                "later pass preserves the first deadline"
+            );
+            assert!(matches!(
+                run.event_dispositions[0],
+                NativeOverlayInputDisposition::Routing(_)
+            ));
+            assert!(!matches!(
+                run.event_dispositions[1],
+                NativeOverlayInputDisposition::Routing(_)
+            ));
+        }
+    }
+
     use super::*;
     use crate::video::native_window::{
         NativeVideoMouseButton, NativeVideoMouseButtonEvent, NativeVideoMouseEvent,
@@ -17279,6 +18387,7 @@ mod chrome_suppression_interaction_tests {
         state: NativeEguiOverlayState,
         gpu: RecordingOverlayGpu,
         logical_visibility: Vec<bool>,
+        logical_repaint_deadlines: Vec<Option<Instant>>,
         texture_sets: usize,
         texture_frees: usize,
     }
@@ -17299,6 +18408,7 @@ mod chrome_suppression_interaction_tests {
                     ..Default::default()
                 },
                 logical_visibility: Vec::new(),
+                logical_repaint_deadlines: Vec::new(),
                 texture_sets: 0,
                 texture_frees: 0,
             }
@@ -17306,6 +18416,9 @@ mod chrome_suppression_interaction_tests {
     }
 
     impl NativeLogicalBatchTarget for CpuOverlayBatchTarget {
+        fn batch_has_pointer_termination(&self) -> bool {
+            self.state.pending_pointer_termination.is_some()
+        }
         fn batch_needs_render(&self) -> bool {
             self.state.needs_render()
         }
@@ -17336,6 +18449,8 @@ mod chrome_suppression_interaction_tests {
         ) -> Result<NativeOverlayLogicalOutput, String> {
             let output = self.state.render_logical_once(preserve, true)?;
             self.logical_visibility.push(output.overlay_visible);
+            self.logical_repaint_deadlines
+                .push(self.state.next_repaint_deadline);
             Ok(output)
         }
         fn batch_present(
@@ -17840,7 +18955,7 @@ mod chrome_suppression_interaction_tests {
             "input creates seek owner"
         );
         assert_eq!(
-            overlay.seek_strip_drag_origin.is_some(),
+            overlay.seek_strip_drag.is_some(),
             strip,
             "input creates strip owner"
         );
@@ -17912,11 +19027,11 @@ mod chrome_suppression_interaction_tests {
                 for setting_change in [false, true] {
                     let (mut overlay, chrome) = fixture(strip);
                     let old_pointer = start_drag(&mut overlay, strip, touch_cancel);
-                    let origin = overlay.seek_strip_drag_origin;
+                    let origin = overlay.seek_strip_drag;
                     suppress_and_resize(&mut overlay, chrome, setting_change);
                     assert_eq!(overlay.seek_row_gesture.is_some(), !strip);
                     assert_eq!(
-                        overlay.seek_strip_drag_origin, origin,
+                        overlay.seek_strip_drag, origin,
                         "resize retains the original drag"
                     );
                     if touch_cancel {
@@ -17933,7 +19048,7 @@ mod chrome_suppression_interaction_tests {
                     }
                     let ended = frame(&mut overlay);
                     assert!(overlay.seek_row_gesture.is_none());
-                    assert!(overlay.seek_strip_drag_origin.is_none());
+                    assert!(overlay.seek_strip_drag.is_none());
                     assert!(!overlay.egui_ctx.input(|i| i.pointer.any_down()));
                     let commits = ended
                         .commands
@@ -17945,6 +19060,12 @@ mod chrome_suppression_interaction_tests {
                         usize::from(strip),
                         "termination commits exactly once"
                     );
+                    if strip && touch_cancel {
+                        let expected = origin.unwrap().last_moved_center.unwrap();
+                        assert!(ended.commands.iter().any(|command| matches!(command,
+                            NativeOverlayCommand::CommitSeekStrip { center, .. } if *center == expected
+                        )), "cancel commits the last sent Move center, not the synthetic position");
+                    }
                     overlay.push_native_event(NativeVideoWindowEvent::MouseLeave);
                     let hidden = frame(&mut overlay);
                     assert!(
@@ -17990,7 +19111,7 @@ mod chrome_suppression_interaction_tests {
                 "real hidden cleanup terminates seek"
             );
             assert!(
-                overlay.seek_strip_drag_origin.is_none(),
+                overlay.seek_strip_drag.is_none(),
                 "real hidden cleanup terminates strip"
             );
             button(&mut overlay, egui::pos2(-200.0, -200.0), false);
@@ -19245,6 +20366,7 @@ mod tests {
                         texture_ids,
                         wave_texture_id,
                         &mut drag_origin,
+                        test_pointer_termination(ctx),
                         &mut commands,
                         None,
                     );
@@ -19511,7 +20633,7 @@ mod tests {
         NativeOverlayLogicalOutput, NativeOverlaySeekStrip, NativeOverlaySeekStripCell,
         NativeOverlaySeekStripCellContent, NativeOverlaySeekStripWaveImage,
         NativeOverlaySegmentRouting, NativeOverlayTileThumbnail, NativePixelSample,
-        NativeRightPanelVisibilityInputs, NativeSeekPreviewVisualState,
+        NativePointerTermination, NativeRightPanelVisibilityInputs, NativeSeekPreviewVisualState,
         NativeTouchPanelHandleInputs, NativeWheelPlan, PreparedVideoScaleSettings,
         VideoOrientation, VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
         VideoVisualTargetRect, close_panorama_projection_popup_for_context, compare_pixel_probe,
@@ -19533,8 +20655,9 @@ mod tests {
         paint_fitted_strip_text_left_centered, paint_native_seek_preview, panorama_takes_the_wheel,
         plan_native_wheel, pointer_region_owns_wheel, reduce_native_click_side_panel_escape,
         run_native_event_batch, sample_cpu_rgba_pixel, seek_strip_reserves_space,
-        should_claim_text_input_focus, validate_prepared_video_scale_settings,
-        video_scale_signature_changed_fields, video_zoom_takes_the_wheel,
+        should_claim_text_input_focus, test_pointer_termination,
+        validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
+        video_zoom_takes_the_wheel,
     };
     #[cfg(feature = "test-script")]
     use super::{NativeUiSmokeChromeEligibility, native_ui_smoke_chrome_eligibility};
@@ -19611,6 +20734,7 @@ mod tests {
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
+                        test_pointer_termination(ctx),
                         &mut commands,
                         None,
                     );
@@ -20455,6 +21579,7 @@ mod tests {
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
+                        test_pointer_termination(ctx),
                         &mut commands,
                         None,
                     );
@@ -20570,6 +21695,7 @@ mod tests {
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
+                        test_pointer_termination(ctx),
                         &mut commands,
                         None,
                     );
@@ -20606,6 +21732,7 @@ mod tests {
                 &std::collections::HashMap::new(),
                 None,
                 &mut drag_origin,
+                None,
                 &mut commands,
                 None,
             ),
@@ -20620,7 +21747,8 @@ mod tests {
             640.0,
             600.0,
             320.0,
-        );
+        )
+        .map(super::NativeSeekStripDrag::from);
         let release = egui::pos2(480.0, 0.0);
         let output = ctx.run_ui(
             egui::RawInput {
@@ -20653,6 +21781,7 @@ mod tests {
                     &std::collections::HashMap::new(),
                     None,
                     &mut drag_origin,
+                    test_pointer_termination(ctx),
                     &mut commands,
                     None,
                 );
@@ -20693,6 +21822,7 @@ mod tests {
                     &std::collections::HashMap::new(),
                     None,
                     &mut drag_origin,
+                    test_pointer_termination(ctx),
                     &mut commands,
                     None,
                 );
@@ -21283,6 +22413,7 @@ mod tests {
                             &std::collections::HashMap::new(),
                             None,
                             &mut drag_origin.lock().unwrap(),
+                            test_pointer_termination(ctx),
                             &mut commands,
                             None,
                         );
@@ -21400,6 +22531,7 @@ mod tests {
                             &std::collections::HashMap::new(),
                             None,
                             &mut drag_origin.lock().unwrap(),
+                            test_pointer_termination(ctx),
                             &mut commands,
                             None,
                         );
@@ -21759,6 +22891,7 @@ let ctx = &root_ui.ctx().clone();
         ctx: egui::Context,
         routing: NativeOverlayInputRouting,
         pending_events: Vec<egui::Event>,
+        pending_pointer_termination: Option<NativePointerTermination>,
         pending_commands: Vec<NativeOverlayCommand>,
         strip_rect: Option<egui::Rect>,
         panel_rect: Option<egui::Rect>,
@@ -21790,6 +22923,7 @@ let ctx = &root_ui.ctx().clone();
                 ctx: egui::Context::default(),
                 routing: NativeOverlayInputRouting::default(),
                 pending_events: Vec::new(),
+                pending_pointer_termination: None,
                 pending_commands: Vec::new(),
                 strip_rect: None,
                 panel_rect: None,
@@ -21875,7 +23009,45 @@ let ctx = &root_ui.ctx().clone();
         }
     }
 
+    #[test]
+    fn headless_native_button_release_splits_before_wheel_and_translates_buttons() {
+        for button in [
+            NativeVideoMouseButton::Left,
+            NativeVideoMouseButton::Right,
+            NativeVideoMouseButton::Middle,
+        ] {
+            let mut target = HeadlessNativeBatchTarget::default();
+            let mut release = mouse_button(button);
+            if let NativeVideoWindowEvent::MouseButton(event) = &mut release {
+                event.down = false;
+                event.x = 123;
+            }
+            let run = run_native_event_batch(&mut target, &[release.clone()]).unwrap();
+            assert_eq!(target.logical_passes, 1);
+            assert_eq!(target.present_calls, 1);
+            assert_eq!(
+                target.ctx.input(|input| input.pointer.interact_pos()),
+                Some(egui::pos2(123.0, 100.0))
+            );
+            assert!(matches!(
+                run.event_dispositions[0],
+                NativeOverlayInputDisposition::Routing(_)
+            ));
+            let mut target = HeadlessNativeBatchTarget::default();
+            let run = run_native_event_batch(&mut target, &[release, wheel(false)]).unwrap();
+            assert_eq!(target.logical_passes, 2);
+            assert_eq!(target.present_calls, 1);
+            assert!(!matches!(
+                run.event_dispositions[1],
+                NativeOverlayInputDisposition::Routing(_)
+            ));
+        }
+    }
+
     impl NativeLogicalBatchTarget for HeadlessNativeBatchTarget {
+        fn batch_has_pointer_termination(&self) -> bool {
+            self.pending_pointer_termination.is_some()
+        }
         fn batch_needs_render(&self) -> bool {
             self.dirty
         }
@@ -21948,6 +23120,50 @@ let ctx = &root_ui.ctx().clone();
         }
 
         fn batch_push_event(&mut self, event: NativeVideoWindowEvent) {
+            if let NativeVideoWindowEvent::MouseButton(button) = &event {
+                let pos = egui::pos2(button.x as f32, button.y as f32);
+                let egui_button = match button.button {
+                    crate::video::native_window::NativeVideoMouseButton::Left => {
+                        egui::PointerButton::Primary
+                    }
+                    crate::video::native_window::NativeVideoMouseButton::Right => {
+                        egui::PointerButton::Secondary
+                    }
+                    crate::video::native_window::NativeVideoMouseButton::Middle => {
+                        egui::PointerButton::Middle
+                    }
+                    crate::video::native_window::NativeVideoMouseButton::Extra1 => {
+                        egui::PointerButton::Extra1
+                    }
+                    crate::video::native_window::NativeVideoMouseButton::Extra2 => {
+                        egui::PointerButton::Extra2
+                    }
+                };
+                self.pending_events.push(egui::Event::PointerMoved(pos));
+                self.pending_events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui_button,
+                    pressed: button.down,
+                    modifiers: super::egui_modifiers(button.shift, button.ctrl, false),
+                });
+                if !button.down {
+                    self.pending_pointer_termination = Some(
+                        if matches!(
+                            button.receipt.origin,
+                            crate::mouse_seek_debug::NativeVideoInputOrigin::Win32MouseCleanup { .. }
+                        ) {
+                            NativePointerTermination::Cancelled {
+                                button: Some(egui_button),
+                            }
+                        } else {
+                            NativePointerTermination::Released {
+                                button: egui_button,
+                                pos,
+                            }
+                        },
+                    );
+                }
+            }
             if let NativeVideoWindowEvent::KeyDown(key) = event {
                 if self.shortcut_help_open && (key.virtual_key == 0x1B || key.virtual_key == 0x70) {
                     self.shortcut_help_open = false;
@@ -22012,6 +23228,7 @@ let ctx = &root_ui.ctx().clone();
             let pass = self.logical_passes;
             self.logical_passes += 1;
             let events = std::mem::take(&mut self.pending_events);
+            self.pending_pointer_termination.take();
             let ctx = self.ctx.clone();
             let mut strip_steps = Vec::new();
             let mut panel_offset = None;
@@ -22777,6 +23994,7 @@ let ctx = &root_ui.ctx().clone();
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
+                        test_pointer_termination(ctx),
                         &mut commands,
                         None,
                     );
