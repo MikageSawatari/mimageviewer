@@ -1828,6 +1828,10 @@ pub enum ToolbarSectionId {
     SmartFolders,
     Tags,
     Folder,
+    SearchContainer,
+    SearchLocal,
+    SearchMetadata,
+    SearchEverything,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
     /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
@@ -1870,6 +1874,10 @@ impl ToolbarSectionId {
             Self::SmartFolders,
             Self::Tags,
             Self::Folder,
+            Self::SearchContainer,
+            Self::SearchLocal,
+            Self::SearchMetadata,
+            Self::SearchEverything,
         ]
     }
 
@@ -4859,6 +4867,14 @@ pub struct Settings {
     /// フォルダバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
+    #[serde(default)]
+    pub show_toolbar_search_container: bool,
+    #[serde(default)]
+    pub show_toolbar_search_local: bool,
+    #[serde(default)]
+    pub show_toolbar_search_metadata: bool,
+    #[serde(default)]
+    pub show_toolbar_search_everything: bool,
     /// ツールバーに「ツリー」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder_tree_button: bool,
@@ -7826,6 +7842,10 @@ impl Default for Settings {
             folder_tree_sort_order: FolderTreeSortOrder::default(),
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
+            show_toolbar_search_container: false,
+            show_toolbar_search_local: false,
+            show_toolbar_search_metadata: false,
+            show_toolbar_search_everything: false,
             show_toolbar_folder_tree_button: true,
             show_toolbar_effetune: true,
             show_toolbar_bookshelf: true,
@@ -10454,6 +10474,10 @@ impl Settings {
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
+        self.show_toolbar_search_container = src.show_toolbar_search_container;
+        self.show_toolbar_search_local = src.show_toolbar_search_local;
+        self.show_toolbar_search_metadata = src.show_toolbar_search_metadata;
+        self.show_toolbar_search_everything = src.show_toolbar_search_everything;
         self.show_address_bar_history_nav = src.show_address_bar_history_nav;
         self.show_address_bar_quick_folders = src.show_address_bar_quick_folders;
         self.show_toolbar_parent_button = src.show_toolbar_parent_button;
@@ -17504,7 +17528,10 @@ mod tests {
         assert!(!old.toolbar_folder_section_migrated);
         assert!(old.migrate_toolbar_folder_section());
         assert_eq!(&old.toolbar_section_order[..2], &[TS::Tags, TS::Cols]);
-        assert_eq!(old.toolbar_section_order.last(), Some(&TS::Folder));
+        assert_eq!(
+            old.toolbar_section_order.last(),
+            Some(&TS::SearchEverything)
+        );
         assert_eq!(
             old.toolbar_section_order
                 .iter()
@@ -17623,7 +17650,7 @@ mod tests {
         );
         assert_eq!(
             loaded.settings.toolbar_section_order.last(),
-            Some(&ToolbarSectionId::Folder)
+            Some(&ToolbarSectionId::SearchEverything)
         );
         assert_eq!(
             loaded.settings.toolbar_section_new_row,
@@ -19853,5 +19880,55 @@ impl<'de> serde::Deserialize<'de> for Settings {
             crate::same_name_folder_book::canonicalize(map).map_err(serde::de::Error::custom)?;
         }
         Settings::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod pinned_search_settings_tests {
+    use super::*;
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+    #[test]
+    fn section1409_settings_default_roundtrip_unknown_and_live_carry() {
+        let defaults = Settings::default();
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        for settings in [&defaults, &missing] {
+            assert!(Kind::ALL.into_iter().all(|kind| !kind.pinned(settings)));
+            assert!(
+                Kind::ALL
+                    .into_iter()
+                    .all(|kind| !settings.toolbar_section_new_row.contains(&kind.section()))
+            );
+        }
+        let order = ToolbarSectionId::default_order();
+        let folder = order
+            .iter()
+            .position(|id| *id == ToolbarSectionId::Folder)
+            .unwrap();
+        assert_eq!(&order[folder + 1..], &Kind::ALL.map(Kind::section));
+        let mut live = Settings::default();
+        live.show_toolbar_search_local = true;
+        live.show_toolbar_search_everything = true;
+        live.toolbar_section_order = Kind::ALL.map(Kind::section).into_iter().rev().collect();
+        live.toolbar_section_new_row = vec![ToolbarSectionId::SearchEverything];
+        let mut edited = defaults.preferences_snapshot();
+        edited.overwrite_non_preferences_from(&mut live);
+        let value = serde_json::to_value(&edited).unwrap();
+        let loaded: Settings = serde_json::from_value(value).unwrap();
+        assert!(loaded.show_toolbar_search_local && loaded.show_toolbar_search_everything);
+        assert!(!loaded.show_toolbar_search_container && !loaded.show_toolbar_search_metadata);
+        let future: Vec<ToolbarSectionId> = serde_json::from_str(
+            r#"["SearchLocal", "FutureSearch", "SearchEverything", "SearchLocal"]"#,
+        )
+        .unwrap();
+        assert_eq!(future[1], ToolbarSectionId::Unknown);
+        let complete = ToolbarSectionId::ordered_with_fallback(&future);
+        assert_eq!(
+            &complete[..2],
+            &[
+                ToolbarSectionId::SearchLocal,
+                ToolbarSectionId::SearchEverything
+            ]
+        );
+        assert_eq!(complete.len(), order.len());
     }
 }

@@ -1793,7 +1793,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -3682,7 +3682,7 @@ impl App {
         self.initialize_converted_archive_cache_paths();
         self.video_thumb_overrides = video_sidecars;
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
 
         self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = selected.is_some();

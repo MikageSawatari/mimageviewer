@@ -34,7 +34,7 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
   その場で判定する。構造アイテム (Folder / ZIP / PDF) もファイル名で一貫して
   絞り込む (§5.2)。
 
-4 つは UI 上で排他表示される (同時に 2 本開かない)。Ctrl+G/R は同じ検索ownerのsource切替。
+4 つの有効セッションは排他とする。ツールバーへ固定した入力欄は独立に表示できる。Ctrl+G/R は同じ検索ownerのsource切替。
 従来経路の回帰ガードは
 `src/app.rs::phase_c_key_tests`。
 
@@ -123,6 +123,24 @@ facet のタグ値は表示 `#タグ` ではなく、`tags.db` と同じ `tag_ke
 そのため `INDEX_VERSION` bump は不要で、モデル名の正規化規則は再構築なしに調整できる。
 
 ---
+
+### 1.5 ツールバーの常設検索入力 (§1.409)
+
+4欄はそれぞれ既定OFFの任意セクション。`ui_pinned_search` が単一入力・幅計測・描画操作、
+`app/pinned_search` が受付・開始/切替・明示消去・Escを所有する。
+入力/表示結果/終了先は `edit_owner / applied_owner / closable_owner` として既存stateから導く。
+開始は `ensure_search_session` に集約する。LocalはEnter、Containerは編集で即検索、Metadataは
+既存変更処理とdebounce、EverythingはSubmitのみ。表示/focusだけでは開始しない。
+固定時のshortcutは既存受付後、pending text-input focusでその欄へ移す。
+
+G/Rは `metadata_draft / everything_draft` を個別に持ち、wish比較はMetadata draft、
+Everything採用はimmutable submittedを参照する。`SearchAccepted::Metadata { applied }` は
+採用時のquery/filtersを保持し、source切替後もアドレスと適用表示の正本となる。
+終了/切替/install/Snapshotでは固定ONのdraftを保持し、×のみが対象draftを明示消去する。
+固定OFFの終了時消去は維持する。×/Escは適用結果の終了、未送信入力先から保持結果への復帰、
+非active欄の順に所有確認する。全バーのEscは描画前の入力ownerを捕捉し、描画後の単一routerが
+消費する。初回未送信/取消後/PhysicalChildにもclosable ownerで終了先を持つ。
+詳細な幅・フォーカス・簡素化の判断は [ツールバー計画 §2.5](toolbar-customization-plan.md#25-検索欄の個別固定-1409)。
 
 ## 2. モジュールマップ
 

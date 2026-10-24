@@ -166,6 +166,15 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 
 ### 6.3 簡素化と UI 入力
 
+§1.409: 入力は `metadata_draft / everything_draft` に分離し、固定ONの終了・source切替では
+各draftを保持する。固定Everything入力の編集/focusだけではsessionを開始せず、通常Enter/検索
+だけが既存入口→送信を通る。固定中は一時バーの入力を省き、状態と帰路の操作を残す。
+Escは全検索共通routerへ移し、IME/modalと描画前input ownerを優先して一度だけ消費する。
+Everything実行中のEscは取消のみで、次のEscが未送信/取消後/PhysicalChildのsessionを閉じる。
+×はaccepted結果ownerと編集ownerを区別し、別sourceの保持結果をその欄から解除できる。
+Metadata acceptedにも適用条件を保持し、未送信Everything draftで表示結果の説明を上書きしない。
+
+
 全 interleaving の rollback／部分採用／resume を作る案を比較し、明示送信＋準備中の target-context modal を推奨した。変更するのは新機能の待機中だけで、Ctrl+G の streaming／debounce／集約を遅らせない。
 
 バーは existing global-search top panel を source 別に描画する。TextEdit は `ime_focus::show_singleline` helper、Enter／Esc は `dialog_enter_pressed`／`dialog_escape_pressed`、context menu は既存 singleline helper。未確定文字の確定 Enter で検索を送信しない。Esc は実行中なら取消、Editing／Ready なら検索を閉じる。query draft の変更は表示済み結果を再実行せず、「検索」を押すまで保持する。
@@ -174,7 +183,7 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 
 主一覧の open／navigation／history／F12 switch／Remote acquire はこの modal admission を共有する。取消・Window ×・shutdown は常に受理。既存 detached の独立閲覧は停止しない。UI frame は bounded `try_recv` と小さい状態遷移だけを行い、worker wake は ROOT を明示。idle で毎 frame repaint しない。待機 backstop が必要なら既存の再武装規約を使い、競合解消の grace／sleep を足さない。
 
-古い Ready は `{source, run_sequence, context, source/items generation, adopted surface authority, policy snapshot}` を既存採用証明へ照合して捨てる。取消・切替後は query text が偶然同じでも受理しない。Everything の submitted query/options は Running／Ready の immutable run payload が所有する。バーの `query` は draft として別の意味を持ち、draft を変えただけで採用済み rows の sort／facet prepare を失効させない。現行 Metadata の `wish.query == self.global_search.query` 検査を Everything にそのまま適用せず、submitted spec 同士で比較する。公開前に失効した map は現行一覧へ先行書込みしない。
+古い Ready は `{source, run_sequence, context, source/items generation, adopted surface authority, policy snapshot}` を既存採用証明へ照合して捨てる。取消・切替後は query text が偶然同じでも受理しない。Everything の submitted query/options は Running／Ready の immutable run payload が所有する。バーの `query` は draft として別の意味を持ち、draft を変えただけで採用済み rows の sort／facet prepare を失効させない。現行 Metadata の `wish.query == self.global_search.metadata_draft` 検査を Everything にそのまま適用せず、submitted spec 同士で比較する。公開前に失効した map は現行一覧へ先行書込みしない。
 
 送信／source 切替／結果ソートなどで index 空間を替える前に、既存の編集終了・page-boundary 処理で保存先を旧 identity のまま確定し、idx-only Undo と editor draft を新一覧へ持ち越さない。Everything の一覧再投影では閲覧を閉じる必要がある場合もこの既存境界へまとめる。共通 editor を新規 owner 化したり、Ctrl+G の released 動作を変更して §1.372 を同時修正しない。既存境界だけで Everything の通常操作を安全にできないことが実装前検証で判明したら、追加設計の範囲・費用を報告して止める。
 

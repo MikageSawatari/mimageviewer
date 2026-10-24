@@ -48,7 +48,7 @@ fn accepted_dataset(app: &App) -> &Arc<EverythingDataset> {
     dataset
 }
 
-fn start_fake_run(
+pub(crate) fn start_fake_run(
     app: &mut App,
     ctx: &egui::Context,
     query: &str,
@@ -60,7 +60,7 @@ fn start_fake_run(
     app.global_search.pending = None;
     app.global_search.page_edit_prepare = None;
     app.global_search.run_sequence = app.global_search.run_sequence.wrapping_add(1);
-    app.global_search.query = query.into();
+    app.global_search.everything_draft = query.into();
     app.global_search.visibility = app.settings.file_type_visibility.clone();
     app.global_search.page_edit_prepare = Some(
         SearchPageEditPrepare::spawn(
@@ -166,7 +166,7 @@ fn completed_dataset_publishes_rows_stamps_identity_and_source_at_one_ready_boun
     assert_eq!(app.items, old_items);
     assert!(matches!(
         app.global_search.accepted,
-        SearchAccepted::Metadata
+        SearchAccepted::Metadata { .. }
     ));
     assert!(app.everything_search_progress_visible());
     assert_eq!(
@@ -293,7 +293,7 @@ fn stale_prepared_pins_and_tags_retry_before_any_metadata_is_published() {
     assert!(app.everything_search_progress_visible());
     assert!(matches!(
         app.global_search.accepted,
-        SearchAccepted::Metadata
+        SearchAccepted::Metadata { .. }
     ));
     crate::app::RATING_INSTALL_UI_TAG_PREWARMS.with(|calls| assert_eq!(calls.get(), 0));
     app.hold_next_search_ready_for_test();
@@ -373,7 +373,7 @@ fn failed_new_query_keeps_the_old_accepted_source_and_dataset() {
         .unwrap();
     app.poll_search_page_edit_prepare(&ctx);
     assert_eq!(app.items, rows);
-    assert_eq!(app.global_search.query, "new");
+    assert_eq!(app.global_search.everything_draft, "new");
     assert_eq!(app.global_search.last_executed, "old");
     assert_eq!(
         app.global_search.reject_message.as_deref(),
@@ -479,7 +479,7 @@ fn editing_draft_does_not_invalidate_sorting_of_the_submitted_dataset() {
         0,
         app.items_generation,
     ));
-    app.global_search.query = "draft only".into();
+    app.global_search.everything_draft = "draft only".into();
     app.settings.sort_order = SortOrder::FileNameDesc;
     app.hold_next_search_ready_for_test();
     app.rebuild_items_from_global_search();
@@ -504,7 +504,7 @@ fn editing_draft_does_not_invalidate_sorting_of_the_submitted_dataset() {
     assert_eq!(app.image_metas, vec![Some((10, 20)), Some((11, 21))]);
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     assert_eq!(app.global_search.last_executed, "submitted");
-    assert_eq!(app.global_search.query, "draft only");
+    assert_eq!(app.global_search.everything_draft, "draft only");
 }
 
 #[test]
@@ -1321,7 +1321,7 @@ fn search_dataset_and_worker_move_with_the_owner_during_registry_park_roundtrips
     let sibling = app.build_window_context_for_test(1377, |mounted| {
         assert!(matches!(
             mounted.global_search.accepted,
-            SearchAccepted::Metadata
+            SearchAccepted::Metadata { .. }
         ));
         assert!(mounted.global_search.pending.is_none());
         assert!(mounted.global_search.page_edit_prepare.is_none());
@@ -1330,7 +1330,7 @@ fn search_dataset_and_worker_move_with_the_owner_during_registry_park_roundtrips
         app.with_window_context_for_test(sibling, |mounted| {
             assert!(matches!(
                 mounted.global_search.accepted,
-                SearchAccepted::Metadata
+                SearchAccepted::Metadata { .. }
             ));
             assert!(mounted.global_search.pending.is_none());
             assert!(mounted.global_search.page_edit_prepare.is_none());

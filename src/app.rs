@@ -627,6 +627,7 @@ mod close_return;
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
+mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
@@ -28439,7 +28440,7 @@ impl App {
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.search_filter = None;
         self.search_filter_origin_folder = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.show_search_bar = false;
         self.checked.clear();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -32748,7 +32749,10 @@ impl App {
         if full_check_requested {
             self.request_index_full_check_shared();
         }
-        if self.global_search.active && !self.global_search.query.trim().is_empty() {
+        if self.global_search.active
+            && self.global_search.source == crate::global_search_ui::SearchSource::Metadata
+            && !self.global_search.metadata_draft.trim().is_empty()
+        {
             self.global_search.last_executed.clear();
         }
         stage.finish(if self.indexer_init.is_some() {
@@ -33144,7 +33148,7 @@ impl App {
         let mut transferred = self.dismiss_snapshot_with_origin();
         if !matches!(keep, SearchMode::LocalMeta) && self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -33225,7 +33229,7 @@ impl App {
         self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
-        self.favsearch.query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Container);
         self.favsearch.last_executed.clear();
         self.favsearch.nav_stack.clear();
         self.favsearch.results_paths.clear();
@@ -34038,7 +34042,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -37185,7 +37189,7 @@ impl App {
             }
             if app.show_search_bar {
                 app.show_search_bar = false;
-                app.search_query.clear();
+                app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
                 app.search_filter = None;
                 app.search_filter_origin_folder = None;
                 app.search_has_focus = false;
@@ -39081,7 +39085,7 @@ impl App {
         self.clear_tags_cache();
         // Ctrl+F フィルタの残留を解除 (旧レベルの entry 向けなので新レベルでは無効)。
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
@@ -42413,7 +42417,7 @@ impl App {
         self.search_filter = None;
         self.search_filter_origin_folder = None;
         if !detached_physical {
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
             // 検索結果インデックスが意味を失う)
             if let Some(pending) = self.search_pending.take() {
@@ -51606,7 +51610,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -97256,6 +97260,9 @@ impl App {
         // release/中断の各境界で対象キーのみ無効化済み。
         self.update_thumb_adjust_drag_state();
 
+        let escape_input_owner = self.capture_search_escape_input(ctx);
+        let mut search_escape_claim = pinned_search::EscapeClaim::for_frame(self);
+
         // ── メニューバー ─────────────────────────────────────────────
         let (fav_nav, _) = self.render_menubar(ui);
 
@@ -97328,7 +97335,7 @@ impl App {
             if self.show_search_bar {
                 self.cancel_pending_folder_nav();
                 self.show_search_bar = false;
-                self.search_query.clear();
+                self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
                 self.search_filter = None;
                 self.search_filter_origin_folder = None;
                 self.search_has_focus = false;
@@ -97366,6 +97373,8 @@ impl App {
         let mut pre_grid_perf = pre_grid_perf_start_with(perf_on, std::time::Instant::now);
 
         let (folder_pane_nav, folder_pane_rect) = self.render_main_bars(ui, &mut pre_grid_perf);
+        self.route_search_escape(ctx, escape_input_owner, &mut search_escape_claim);
+        self.record_search_input_focus(ctx);
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
         // wheel が背面のサムネイル一覧にも通り抜ける。
@@ -101087,7 +101096,7 @@ mod index_full_check_tests {
         app.window_visible = false;
         app.activity_gate.set_paused(true);
         app.global_search.active = true;
-        app.global_search.query = "latest query".into();
+        app.global_search.metadata_draft = "latest query".into();
         app.global_search.last_executed = "older query".into();
         let manager = crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
             &env.tmp.path().join("late-init"),
@@ -101103,7 +101112,7 @@ mod index_full_check_tests {
         assert!(app.indexer_init.is_terminal());
         let semaphore = app.indexer_init.as_ref().unwrap().io_sem();
         assert!(semaphore.is_throttled());
-        assert_eq!(app.global_search.query, "latest query");
+        assert_eq!(app.global_search.metadata_draft, "latest query");
         assert!(app.global_search.last_executed.is_empty());
         app.global_search.last_executed = "adopted only once".into();
         app.poll_startup_init();
@@ -101125,10 +101134,10 @@ mod index_full_check_tests {
             disposal_witness: None,
         });
         app.global_search.active = true;
-        app.global_search.query = "current text".into();
+        app.global_search.metadata_draft = "current text".into();
         app.global_search.filters.favorite = Some(uuid::Uuid::new_v4());
         app.spawn_global_search(&egui::Context::default());
-        assert_eq!(app.global_search.query, "current text");
+        assert_eq!(app.global_search.metadata_draft, "current text");
         assert!(app.global_search.filters.favorite.is_none());
         assert!(app.global_search.last_executed.is_empty());
         assert!(app.global_search.page_edit_prepare.is_none());

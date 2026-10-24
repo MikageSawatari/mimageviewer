@@ -1191,7 +1191,7 @@ fn visibility_staged_rating_handler_notifies_legacy_and_restores_after_regenerat
 fn visibility_search_notice_keeps_nonterminal_search_active() {
     let mut app = setup_app_for_test();
     app.global_search.active = true;
-    app.global_search.query = "pages".into();
+    app.global_search.metadata_draft = "pages".into();
     app.global_search.last_executed = "pages".into();
     app.global_search.done = false;
     let (tx, rx) = crossbeam_channel::unbounded();

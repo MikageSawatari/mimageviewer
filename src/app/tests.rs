@@ -6447,7 +6447,7 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
     let (mut app, first) = phase_b_masked_image();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
-    app.global_search.query = "old query".into();
+    app.global_search.metadata_draft = "old query".into();
     app.global_search.last_executed = "old query".into();
     app.rebuild_items_from_global_search();
     stream.send(phase_b_search_batch(&first, 1)).unwrap();
@@ -6467,7 +6467,7 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
     }
     assert_eq!(app.items.len(), 1);
     let old_prepare_cancel = app.search_prepare_cancel_for_test();
-    app.global_search.query = "new query".into();
+    app.global_search.metadata_draft = "new query".into();
     app.reset_global_search_for_query_change(&ctx);
     assert!(old_prepare_cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!std::sync::Arc::ptr_eq(
@@ -19895,7 +19895,7 @@ mod phase_c_key_tests {
         let bogus = uuid::Uuid::new_v4();
         app.global_search.active = true;
         app.global_search.filters.favorite = Some(bogus);
-        app.global_search.query = "x".to_string();
+        app.global_search.metadata_draft = "x".to_string();
         // 準備中/利用不能でも、reject_messageで戻る前にfilterの健全化を行う。
         app.spawn_global_search(&egui::Context::default());
         assert_eq!(
@@ -24319,7 +24319,7 @@ mod phase_c_folder_nav_history_tests {
                 app.search_query = "latest draft".into();
             } else if during_wait == 2 {
                 app.show_search_bar = false;
-                app.search_query.clear();
+                app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
                 app.search_filter = None;
                 app.cancel_search_pending();
                 submitted = None;
@@ -27948,7 +27948,7 @@ mod phase_c_folder_nav_history_tests {
             folder,
             GridItem::ZipFile(book.clone()),
         );
-        app.global_search.query = "book".into();
+        app.global_search.metadata_draft = "book".into();
         app.global_search.last_executed = "book".into();
         app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
             book,
@@ -34994,7 +34994,7 @@ mod phase_c_drill_address_tests {
     fn aggregated_address_marks_unsettled_results_as_searching() {
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "グルグル".to_string();
+        app.global_search.metadata_draft = "グルグル".to_string();
         app.global_search.last_executed.clear();
         app.update_global_search_address();
 
@@ -35010,8 +35010,8 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses -genshin".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses -genshin".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.done = false;
         app.items_are_global_search_view = true;
         let tx = install_search_receiver(&mut app);
@@ -35082,8 +35082,8 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.aggregate = true;
         app.global_search.aggregate_auto = false;
         app.items_are_global_search_view = true;
@@ -35120,7 +35120,7 @@ mod phase_c_drill_address_tests {
     fn debounce_owner_rearms_a_delayed_repaint_each_pass() {
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
+        app.global_search.metadata_draft = "glasses".to_string();
         app.global_search.last_executed.clear();
         app.global_search.last_change_at = Some(std::time::Instant::now());
 
@@ -35144,8 +35144,8 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.done = false;
         let _tx = install_search_receiver(&mut app);
 
@@ -35172,8 +35172,8 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.done = false;
         let tx = install_search_receiver(&mut app);
         for page in 1..=8 {
@@ -93989,7 +93989,7 @@ mod smart_folder_transition_tests {
         std::fs::write(source.join("page.jpg"), []).unwrap();
         let row = app.tmp.path().join("search-result.jpg");
         app.global_search.active = true;
-        app.global_search.query = "test".into();
+        app.global_search.metadata_draft = "test".into();
         app.global_search.last_executed = "test".into();
         app.top_level_grid_view
             .replace_surface(TopLevelGridSurface::Search(TopLevelSearchView::Global));
@@ -94297,7 +94297,7 @@ mod smart_folder_transition_tests {
             Some(TopLevelGridRestore::SmartFolder(root)),
         );
         app.global_search.active = true;
-        app.global_search.query = "result".into();
+        app.global_search.metadata_draft = "result".into();
         app.global_search.last_executed = "result".into();
         let row = app.tmp.path().join("result.jpg");
         app.items = vec![GridItem::Image(row.clone())];
@@ -95511,7 +95511,7 @@ mod smart_folder_transition_tests {
         std::fs::write(next.join("next.jpg"), []).unwrap();
         let row = app.tmp.path().join("search-result.jpg");
         app.global_search.active = true;
-        app.global_search.query = "test".into();
+        app.global_search.metadata_draft = "test".into();
         app.global_search.last_executed = "test".into();
         app.top_level_grid_view.replace_surface(
             crate::app::top_level_grid_view::TopLevelGridSurface::Search(

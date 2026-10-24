@@ -8701,7 +8701,7 @@ mod tests {
     fn virtual_list_route_state_survives_context_swap_without_sibling_leak() {
         let mut app = crate::app::setup_app_for_test();
         app.global_search.active = true;
-        app.global_search.query = "main search".into();
+        app.global_search.metadata_draft = "main search".into();
         app.rating_view_stars = 3;
         app.rating_view_request_sequence = 41;
         let mut sibling = ViewerContextBundle::empty();
@@ -8711,7 +8711,7 @@ mod tests {
         assert!(!app.global_search.active);
         assert_eq!(app.rating_view_stars, 5);
         assert_eq!(app.rating_view_request_sequence, 9);
-        assert_eq!(sibling.global_search.query, "main search");
+        assert_eq!(sibling.global_search.metadata_draft, "main search");
         app.swap_viewer_context_bundle(&mut sibling);
         assert!(app.global_search.active);
         assert_eq!(app.rating_view_stars, 3);

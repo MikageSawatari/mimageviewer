@@ -540,6 +540,10 @@ preferences_policy! {
         folder_tree_pane_visible => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_sort_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_pane_width_ratio => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_toolbar_search_container => "環境設定外のツールバー検索欄";
+        show_toolbar_search_local => "環境設定外のツールバー検索欄";
+        show_toolbar_search_metadata => "環境設定外のツールバー検索欄";
+        show_toolbar_search_everything => "環境設定外のツールバー検索欄";
         show_toolbar_folder => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_folder_tree_button => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_effetune => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";

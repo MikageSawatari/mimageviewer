@@ -761,8 +761,8 @@ impl App {
         }
         // Ctrl+G dirty (= query が last_executed と異なる、入力中で結果未確定)
         if self.global_search.active
-            && !self.global_search.query.is_empty()
-            && self.global_search.query != self.global_search.last_executed
+            && !self.global_search.draft().is_empty()
+            && self.global_search.draft() != self.global_search.last_executed
         {
             return Some("検索結果の確定後にお試しください (Ctrl+G)");
         }
@@ -1645,7 +1645,7 @@ impl App {
         if self.show_search_bar {
             had_active = true;
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.cancel_search_pending();
         }
 
@@ -1653,7 +1653,7 @@ impl App {
         if self.favsearch.active {
             had_active = true;
             self.favsearch.active = false;
-            self.favsearch.query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Container);
             self.favsearch.last_executed.clear();
             // FavSearchPending は take すれば drop で rx 閉じる (= cancel field は private、
             // 既存パターンも take で済ませている)
@@ -1664,7 +1664,9 @@ impl App {
         if self.global_search.active {
             had_active = true;
             self.global_search.active = false;
-            self.global_search.query.clear();
+            self.global_search.last_change_at = None;
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Metadata);
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Everything);
             self.global_search.last_executed.clear();
             self.global_search.containers.clear();
             self.global_search.all_hits.clear();

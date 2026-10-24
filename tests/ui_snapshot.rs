@@ -28,6 +28,28 @@
 use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
+#[test]
+fn toolbar_pinned_search_light() {
+    snapshot_with_theme_at_size(
+        "toolbar_pinned_search_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(1120.0, 180.0),
+        None,
+        mimageviewer::ui_pinned_search::draw_pinned_search_snapshot_fixture,
+    );
+}
+
+#[test]
+fn toolbar_pinned_search_narrow_dark() {
+    snapshot_with_theme_at_size(
+        "toolbar_pinned_search_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 300.0),
+        None,
+        mimageviewer::ui_pinned_search::draw_pinned_search_snapshot_fixture,
+    );
+}
+
 // Physical pixels above/below the hotspot. Never sample the desktop cursor in a fixture.
 const SNAPSHOT_CURSOR_EXTENT_PHYSICAL: (f32, f32) = (0.0, 34.0);
 

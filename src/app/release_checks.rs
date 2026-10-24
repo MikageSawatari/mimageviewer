@@ -133,7 +133,7 @@ impl App {
                 "loading_complete":complete,"index_settled":!self.initial_scan_settled_pending,
                 "interaction_ready":self.release_check_interaction_ready() && !snapshot.startup_open_pending,
                 "search_active":self.global_search.active,"search_focused":self.global_search.has_focus,
-                "search_query":self.global_search.query,"search_done":self.global_search.done,
+                "search_query":self.global_search.draft(),"search_done":self.global_search.done,
                 "search_searching":self.global_search.is_searching(),
                 "search_hits":self.global_search.all_hits.iter().map(|h|h.path.clone()).collect::<Vec<_>>(),
                 "is_fullscreen":snapshot.is_fullscreen,"cache_policy_off":matches!(self.settings.cache_policy,crate::settings::CachePolicy::Off),

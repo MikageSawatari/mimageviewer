@@ -79,7 +79,8 @@ pub(super) fn draw_everything_controls(
         let select_query = *focus_request && !crate::ime_focus::ime_input_active(ui.ctx());
         let mut output =
             crate::ime_focus::show_singleline(ui, query, Some(focus_request), |edit| {
-                edit.hint_text("ファイル名・Everything 構文 (ext:jpg;png など)")
+                edit.id(crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id())
+                    .hint_text("ファイル名・Everything 構文 (ext:jpg;png など)")
                     .desired_width(width)
             });
         if select_query {
@@ -98,6 +99,11 @@ pub(super) fn draw_everything_controls(
         controls.send = ui.button("検索").clicked();
         controls.close = ui.small_button("×").on_hover_text("検索を閉じる").clicked();
     });
+    draw_everything_hint(ui);
+    controls
+}
+
+pub(super) fn draw_everything_hint(ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new(
             "Everything クライアントの起動が必要です。先頭10,000件を取得し、フォルダと対応ファイルを表示します。",
@@ -105,7 +111,6 @@ pub(super) fn draw_everything_controls(
         .small()
         .color(ui.visuals().weak_text_color()),
     );
-    controls
 }
 
 pub(super) struct EverythingStatus<'a> {

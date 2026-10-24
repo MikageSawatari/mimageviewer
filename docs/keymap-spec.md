@@ -1062,3 +1062,15 @@ Explorer方式では選択を解除し、Check方式では維持する。
 環境設定の対象がONなら、既存 `FsToggleWindowMode` によるF11全画面の間だけ固定表示を自動表示へ投影する。
 HUD・native VK・カスタム割り当て・初回fullscreenも同じ表示先契約。新しい固定キーやKeyActionは追加しない。
 F12通常窓は抑制せず、その窓のF11拡大だけが対象。ナビゲータは既存 `FsNavigatorHold`（既定Alt）を使う。
+
+## ツールバーに固定した検索欄 (§1.409)
+
+既存 `GlobalFavSearch / GlobalLocalSearch / GlobalMetadataSearch / GlobalEverythingSearch` の
+受付条件を維持し、対象の固定がONなら同じ欄へpending text-input focusで移す。
+固定Ctrl+Gは終了toggleにせずfocusする。固定OFFの一時バーとCtrl+G toggleは従来どおり。
+新しいKeyActionは追加しない。Enter/EscはIME helperを通す固定の入力操作である。
+
+Escは全検索バー描画後の単一routerが一度だけ消費する。modal/IME→描画前の検索入力owner→
+適用結果または有効sessionの順。非active欄ではfocus解除だけ。検索終了時に固定欄のdraftは
+保持し、Everything実行中は取消だけを行う。egui begin_passでfocusが消えたときは既存recoveryの
+viewport/pass/pointer優先条件に従って入力Idを捕捉し、描画後のhas_focusで選び直さない。

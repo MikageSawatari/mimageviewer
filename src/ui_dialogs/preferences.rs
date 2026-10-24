@@ -4881,6 +4881,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn section1409_pins_survive_toolbar_ui_preferences_ok_save_reload() {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        use egui_kittest::kittest::Queryable;
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let env = crate::app::setup_app_for_test();
+        assert!(
+            crate::settings_db::boot_settings_db(env.tmp.path())
+                .db
+                .is_some()
+        );
+        let app = Rc::new(RefCell::new(env));
+        for expected in [true, false] {
+            let mut state = preferences_state_for_test(&app.borrow().settings);
+            app.borrow_mut().settings.toolbar_section_order =
+                Kind::ALL.into_iter().map(Kind::section).rev().collect();
+            app.borrow_mut().settings.toolbar_section_new_row = vec![Kind::Metadata.section()];
+            let order = app.borrow().settings.toolbar_section_order.clone();
+            let render = app.clone();
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(500.0, 800.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root, |ui| {
+                        render
+                            .borrow_mut()
+                            .draw_toolbar_visibility_menu(ui, false, false)
+                    });
+                });
+            harness.run();
+            for label in [
+                "コンテナ検索欄",
+                "現在地の絞り込み欄",
+                "アイテム検索欄",
+                "Everything 検索欄",
+            ] {
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            let mut app = app.borrow_mut();
+            assert!(
+                Kind::ALL
+                    .into_iter()
+                    .all(|kind| kind.pinned(&app.settings) == expected)
+            );
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.settings = state.settings;
+            app.settings.save();
+            let loaded = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            assert!(
+                Kind::ALL
+                    .into_iter()
+                    .all(|kind| kind.pinned(&loaded) == expected)
+            );
+            assert_eq!(loaded.toolbar_section_order, order);
+            assert_eq!(loaded.toolbar_section_new_row, [Kind::Metadata.section()]);
+        }
+    }
+
     pub(super) fn preferences_state_for_test(
         settings: &crate::settings::Settings,
     ) -> PreferencesState {

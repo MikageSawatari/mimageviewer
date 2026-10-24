@@ -2146,7 +2146,7 @@ impl App {
             TopLevelGridSurface::Search(view) => {
                 let (query, executed) = match view {
                     TopLevelSearchView::Global => (
-                        self.global_search.query.clone(),
+                        self.global_search.draft().to_owned(),
                         self.global_search.last_executed.clone(),
                     ),
                     TopLevelSearchView::Favorite => (
@@ -7651,7 +7651,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -11194,7 +11194,7 @@ mod tests {
         assert_eq!(names(&app), ["a", "c.zip"]);
 
         app.show_search_bar = false;
-        app.search_query.clear();
+        app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         app.search_filter = None;
         app.rebuild_visible_indices();
         assert_eq!(
