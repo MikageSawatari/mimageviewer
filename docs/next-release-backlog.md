@@ -38,6 +38,20 @@
 
 ## 1. 優先候補
 
+### 1.427 ReleaseChecks の perf 判定が、操作で予定より早く起きた待機を「説明のつかない止まり」にする — v4.8.1 の ReleaseChecks (2026-10-24)
+
+- 状態: **未着手・起票 (利用者 2026-10-24)**。v4.8.1 では判定を変えずに ReleaseChecks を流し直す (利用者決定)。
+- 観測 (ClaudeCode が記録を解析、run `release-checks-20261024-114649-efa4e0f4`): perf-cached が `unexplained >100ms gap/update in frames [1621, 3016]` で FAIL。
+  2 件とも、更新は約 1ms で終わり、直前の tail は `request_repaint_after_idle_upgrade` (`idle_upgrade_delay_ms` 約 346ms)。
+  待機は予約より早い 239ms / 191ms で終わり、次フレームの `prev_frame_causes` に `src\test_script.rs:4701` (自動操作の次の手順) がある。
+  同じ run の他の 6 件の idle upgrade wake は予約どおり約 348ms で起き、`normal-idle-upgrade-wake` に分類された。
+- 原因 (コード確認): `scripts/release_check_analysis.py` の gap 分類 (約 664〜671 行) は、idle upgrade の待機を「起きた時刻が予約 ±20ms」のときだけ正常とし、
+  それより早く外部入力で起こされた待機を `unexplained` にする。UI スレッドが就寝中に入力で起きた正常な待機であり、製品の止まりではないと判断している (実行時の別の観測はない)。
+- 直し方の方向: 予約より早く終わった待機は、次フレームの起点が外部入力 (test script の操作・OS 入力) だと記録から示せる場合に正常の就寝として扱う。
+  記録で示せない早い起床は従来どおり `unexplained` に残す。閾値の緩和で通さない。回帰には今回の run の 2 件と、起点の記録が無い早い起床の反例を入れる。
+  合格基準の変更なので独立レビューを通す。
+- 規模 / 優先度: Small / P2 (リリースの合否が、操作のタイミングで偶然 FAIL になる)。
+
 ### 1.426 全画面の画像・動画より Windows のタスクバーが前面に出る — 5ch >>610 (2026-10-24)
 
 - 状態: **修正済み・利用者の実機確認で解消 (2026-10-24)、v4.8.1 で出荷予定**。v4.8.0の依存更新による影要求を除き、v4.7.1の影なし契約へ戻した (`47341ac89`)。
