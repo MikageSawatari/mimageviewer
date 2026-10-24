@@ -444,11 +444,15 @@ def proven_wait_intervals(events: list[dict]) -> list[tuple[float, float, str]]:
         start, end = number(event.get("wait_start_t")), number(event.get("wait_end_t"))
         resume = number(event.get("requested_resume_t"))
         cause = event.get("cause")
-        if (number(event.get("t")) is None or start is None or end is None or start < 0 or end < start
+        t = number(event.get("t"))
+        # The perf row is written after new_events read `end`; its t is ms-rounded.
+        if (t is None or t < 0 or start is None or end is None or start < 0 or end < start
+                or t + .001 < end
                 or "requested_resume_t" not in event
                 or (event["requested_resume_t"] is not None and (resume is None or resume < 0))
                 or cause not in ("cancelled", "resume_time_reached")
-                or (cause == "resume_time_reached" and resume is None)
+                # winit reports ResumeTimeReached only once the deadline has passed.
+                or (cause == "resume_time_reached" and (resume is None or resume > end))
                 or type(event.get("callback_during_wait")) is not bool
                 or (previous_end is not None and start < previous_end)):
             return []
