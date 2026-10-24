@@ -70,11 +70,14 @@ partial source removal, verify exact live/reopened contents and unchanged
 scan/rebuild/notification state, preserve the explicit Future error, and prove
 that an identical-text InvalidArgument from another origin still reports.
 
-2026-10-24: `src/query/intersection.rs`: replace the iterator sum in
-`Intersection::score` with an explicit loop to avoid Rust 1.95+ SIMD codegen
-whose stale upper lanes cause denormal assists and slow two-term AND scoring.
-Keep the `-0.0` accumulator and addition/call order for bit-for-bit score
-compatibility, covered by two- and four-term Must AND tests. Upstream 0.27 and
-main still use the original expression. See `docs/next-release-backlog.md`
-§1.424; rerun the bench regression check (`docs/release-checklist.md` §9.5)
-when updating the Rust toolchain or Tantivy, since codegen may change.
+2026-10-24: `src/query/intersection.rs`: keep the upstream `Intersection::score`
+expression, routing only the right-hand score through `score_out_of_line` with
+`#[inline(never)]`. This separates the two BM25 bodies so Rust 1.95+ cannot
+combine them into SIMD whose stale upper lanes cause denormal assists and slow
+two-term AND scoring. An explicit loop improved the bench bin but still left
+the problematic SIMD in the product exe, as verified by ClaudeCode's disassembly.
+Keep `#[inline(never)]`; the original sum and addition/call order are unchanged.
+Tests cover two- and four-term Must AND scores, negative zero, call order and
+rounding. Upstream 0.27 and main still use the original expression. See
+`docs/next-release-backlog.md` §1.424; rerun the bench regression check
+(`docs/release-checklist.md` §9.5) when updating the Rust toolchain or Tantivy.

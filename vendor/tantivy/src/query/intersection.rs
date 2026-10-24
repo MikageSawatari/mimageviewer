@@ -226,6 +226,16 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
     }
 }
 
+// Keep #[inline(never)] on the right-hand score: Rust 1.95+ can fuse both BM25
+// evaluations into SIMD with stale upper lanes, triggering denormal assists.
+// An explicit loop still did this in the product exe. Separating the right
+// evaluation prevents the two BM25 bodies from being combined in one function.
+// See docs/next-release-backlog.md §1.424 and docs/release-checklist.md §9.5.
+#[inline(never)]
+fn score_out_of_line<TScorer: Scorer>(scorer: &mut TScorer) -> Score {
+    scorer.score()
+}
+
 impl<TScorer, TOtherScorer> Scorer for Intersection<TScorer, TOtherScorer>
 where
     TScorer: Scorer,
@@ -233,17 +243,9 @@ where
 {
     #[inline]
     fn score(&mut self) -> Score {
-        // Keep this loop: iter().sum() triggers Rust 1.95+ SIMD codegen with stale
-        // upper lanes causing denormal assists. -0.0 and the addition/call order
-        // preserve the original sum bit-for-bit. See docs/next-release-backlog.md
-        // §1.424 and docs/release-checklist.md §9.5 for bench regression checks.
-        let left = self.left.score();
-        let right = self.right.score();
-        let mut others = -0.0;
-        for other in &mut self.others {
-            others += other.score();
-        }
-        left + right + others
+        self.left.score()
+            + score_out_of_line(&mut self.right)
+            + self.others.iter_mut().map(Scorer::score).sum::<Score>()
     }
 }
 
