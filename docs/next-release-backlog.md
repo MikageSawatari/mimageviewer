@@ -1289,7 +1289,7 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 - ⚠ **guard / delay / retry で待ち時間を隠さない。**
 - 規模 / 優先度: Medium / P3 (残りは体感上実用域)。
 
-### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — 実機クラッシュ
+### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — (B) 実装済み、(A) 原因未確定
 
 - 出典: 2026-08-25、R2e ステージ④の smoke 準備中。タグを付けて上のフォルダへ移動した直後に
   `mimageviewer-core.exe` が **0xc0000005 で異常終了**。`panic.log` に記録なし
@@ -1326,16 +1326,42 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 
 - ⚠ **(B) を直しても (A) は直らない。だが (B) を直さないと (A) は永久に見えない。**
   例外ハンドラが証拠ごと消していたため、**(B) を先に直した。**
-- **(B) は修正済み** (2026-08-25、`7e16fadde`、v3.3.0)。`logger::current_thread_id_num()` は
-  Windows では `GetCurrentThreadId()` を直接呼ぶ (`std::thread::current()` は非 Windows 枝だけ)。
-  ハンドラが TLS に触れて自分で死ぬことはなくなり、(A) が起きればログに残る。
-- **(B) の残り**: ハンドラ経路はまだヒープを使う。[lib.rs](../src/lib.rs) の
-  `native_exception_handler` は `format!` と `append_panic_log_entry` を通り、同ファイルの
-  コメントがこれを残存リスクとして自認している。ヒープ破損の最中に走る以上、
-  **固定バッファ + `write!` + 起動時に開いた handle へ書く**のが本来の姿。
-- (A) の手掛かり: 一次例外は `RtlFreeHeap` の中。`Application Verifier` の page heap か
-  `_NT_GLOBAL_FLAG` の heap tail checking を有効にして再現すると、壊した側が特定できる。
-  ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
+- **(B) の TLS 依存は修正済み** (2026-08-25、`7e16fadde`、v3.3.0)。`logger::current_thread_id_num()` は
+  Windows では `GetCurrentThreadId()` を直接呼ぶ。この変更だけでは、ハンドラ内の String 整形や
+  panic.log のパス生成・open・ローテーションによるヒープ使用は残っていた。
+- **(B) の残りを実装 (2026-10-25、独立レビュー・検収待ち)**:
+  [native_exception_log.rs](../src/native_exception_log.rs) が起動時に専用 `logs/native-exception.log` を開き、
+  ハンドラは CAS・飽和カウンタ・固定 2048 byte バッファ・core の整形と raw `WriteFile` 1 回だけで記録を試みる。
+  ヒープ・Rust TLS・ロック・スタック取得は使わない。起動時のみ 1 MiB **超**で `.bak` に置換し、
+  セッション中は 256 行で停止 (最終行に注記)。sink 初期化・VEH 登録失敗は logger 初期化後にログへ出し、
+  既存 log writer の一度だけの診断ログ失敗トーストへ渡す。再試行・代替出力・回復処理の回復は加えない。
+  Rust panic・UI HANG・watchdog は従来どおり `panic.log`。診断 ZIP には専用ログと `.bak` も既存経路で入る。
+- **記録の限界**: `chance=first` は SEH で処理される例外も含む。常に `CONTINUE_SEARCH` を返し、
+  OS 側の既定処理を変更しないが、記録・WER dump は保証しない。STACK_OVERFLOW は best-effort
+  (外部 DLL 作成スレッドのスタック余裕は保証されない)。code/address/thread/version/exe・ntdll base が残れば、
+  exe/ntdll 内のアドレスの RVA を求められる。スタックは残さず、(A) と同じ原因での再発と断定はできない。
+- **(A) の設計時の調査結果**: 当時のフルダンプと直前の通常ログは残っていない。設計担当の調査では、
+  TLS 修正後の既定 data dir の `panic.log` に `NATIVE EXCEPTION` は 0 件 (最後の書込み 2026-10-19)。
+  唯一の記録は修正前の 2026-07-15 で、別件の可能性がある。ヒープ破損時に記録自体が失敗した可能性は排除できない。
+  保存されたスタックから分かるのはスレッド終了処理中の `RtlFreeHeap` での例外までで、
+  解放対象・破壊したスレッド・特定 FFI は分からない。二重解放や use-after-free も残るため、(A) は今回修正しない。
+- **(A) の次の手**: 再現調査を行うなら、使い捨ての**専用名**コピー (例: `miv-pageheap.exe`) にだけ
+  Application Verifier / full page heap を設定する。page heap はイメージ名に対する永続設定なので、通常版と同名には掛けない。
+  既存設定の確認・試験後の解除を含め、対象・時間・desktop 使用範囲について利用者の明示了承が必要。
+  書き込み位置で全ての破壊を捕まえられるとは限らない。今回この実機試験は行っていない。
+- **(B) 自動検証 (2026-10-25、未コミット差分)**: `cargo fmt`（引数なし）／`cargo fmt --check` と
+  `cargo check -p mimageviewer --bin mimageviewer-core` は exit 0。
+  `cargo nextest run -p mimageviewer --lib -E 'test(/native_exception|panic_log|log_writer/)'` は
+  最終 44 成功／0 失敗（14,276 件は filter 等で未実行、run ID `223de674-ee72-42a0-a694-146c352b8b3d`）。
+  新規13件は整形4件、recorder3件、rotation／共有／初期化失敗各1件、実AV／SO子プロセス各1件、
+  診断失敗通知1件。子も試験専用recorderを使い、本番staticには触れない。
+  子はダイアログを抑止し20秒で打ち切る。実AVは終了 `0xC0000005` と
+  `access=read target=0x0`、SOは終了 `0xC00000FD` と専用ログ1行を確認した（最終runの各テスト約0.21秒）。
+  既存のUI可視時だけ一度通知するAppテストも成功。full lib／test-full・実アプリ起動・page heapは未実施。
+  formatter は設計担当の上書き指示どおり既存crate内の core だけのmoduleで、新規no_std crateは作っていない。
+  現ツールチェーンでは `fetch_update` が非推奨のため、同義の `try_update` で飽和カウンタを実装した。
+  `scripts/build-dev.ps1 -PreserveRuntime` も最終 exit 0、通常featureのcore／remote／EPUB workerを用意
+  （vcrt-pe: runtime=4、pe=3、成功）。起動・コミットは行っていない。
 - 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
 
 ### 1.135 動画レンダースレッドがパニックすると、以後どの動画も再生できなくなる
