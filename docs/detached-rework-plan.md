@@ -6255,3 +6255,18 @@ src/ 外への既存参照（`tests/support/ui_harness.rs`、`tests/support/scro
 root discovery の inventory は examples/・tests/・benches/ と package 直下の Rust ファイルも含み、
 大小文字違いや source link を黙って落とさずエラーにする。監査対象自体は従来の src/**/*.rs を維持する。
 明示 example、自動探索 example、build.rs の path 経路で shared が production と共有される反例を回帰に加えた。
+
+### §11 追補: 2026-10-24 §1.426 Windows枠なしviewportの影なし契約の復元
+
+ClaudeCodeの設計案とCodexのコード確認・独立設計レビューで、症状パッチではなく統合境界の構造修正であることに合意した。
+`vendor/egui-winit/src/lib.rs`の窓生成とDecorations command適用でWindowsのundecorated shadow要求をfalseへ揃える。
+本家#8169/#8449ではwinit fullscreen指定のない枠なし窓へ影を要求するが、mIVはmonitor全域の独自borderlessであり、
+v4.8.0からclient原点が1pxずれる。F12 builderと`app/detached_placement`のborderless切替もこの境界を使うため対象になる。
+通常全画面、geometryなしPDF/ZIP再open、詳細thumbnail tooltipを含め、影を使う窓はなくv4.7.1の契約へ戻す。
+per-viewport opt-out、detached述語・状態・placement保存先・同期経路は増やさない。常時最前面、taskbar操作、待機、raise、repaintの追加もない。
+モーダル化やlive rebuildは不要で、生成・更新双方の同じ属性契約を直すだけで組合せを増やさない。
+非表示実HWNDの生成／Decorations(true→false)でclient原点・寸法とwindow原点・寸法の一致を固定した。
+修正前は両方の原点不一致で回帰が失敗し、修正後はvendor lib 44件が成功した。
+画像のtaskbar前面表示との因果と解消は実機確認待ち。native動画はpresenter自身へforeground/active/focusを渡すため、
+egui viewportの影だけで説明できない。v4.7.1..masterのowner・前面移譲と§1.387 A1〜A3も照合し、動画の原因は未特定として残す。
+presenter/host/HUDと点滅対策は変更しない。調査の詳細と残りの確認は[backlog §1.426](next-release-backlog.md#1426-全画面の画像動画より-windows-のタスクバーが前面に出る--5ch-610-2026-10-24)に記録する。

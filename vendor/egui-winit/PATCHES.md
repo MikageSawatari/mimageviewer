@@ -21,6 +21,7 @@ README、Cargo.toml.orig、同梱Cargo.lockと、元のclipboard等の他ソー�
 | 新modifierとclipboard API | (a) 本家を土台 | Stateのmodifier owner・イベント順・runtime OS判定を維持。0.37のclipboard_shortcuts設定とimage paste fallbackも維持し追加回帰で確認。modifier変換をprivate helperへ挙動不変で抽出 |
 | 旧has_sent_ime_enabled・合成通知 | (c) 不要 | 新TextEditと正規化はPreedit/Commitを直接処理する。旧enable latchやCommit後の合成Disabledを戻さず、実OS通知だけを互換配送する。新Preeditのactive_range_chars・Noneを維持 |
 | 旧300ms補正 | (c) 撤去済み | 時間窓・pending boolを復活させない |
+| Windows枠なし窓の影 (§1.426) | (b・新規) mIV固有契約の復元 | 本家 #8169 の常時影要求と #8449 のwinit fullscreen限定除外は、独自borderless全画面を使うmIVではv4.8.0からclient原点を1pxずらす回帰になる。生成時の `with_undecorated_shadow(false)` とDecorations時の `set_undecorated_shadow(false)` で全枠なしviewportをv4.7.1の影なしへ戻す。影を必要とする窓がないためper-viewport APIは追加しない。本家へは報告しない。非表示実HWNDで生成・true→false更新のclient/window原点・寸法一致を固定し、修正前は両方の原点不一致で失敗。タスクバーとの因果・native動画の解消は実機未確認 |
 
 新manifestの追加は共有crateの依存edgeと、headlessテスト専用egui default_fontsだけ。
 通常の共有crate依存から既定フォントは入れない。新版依存版・featureは原本を基準にする。
