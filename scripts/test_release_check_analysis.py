@@ -245,6 +245,17 @@ class PerfTests(unittest.TestCase):
                 events, start, end = self.early_wait_gap()
                 events.append(wait_event(start, end, **mutation))
                 self.assert_wait_failure(events)
+        # Codex review P2: a deadline after the wait end contradicts ResumeTimeReached
+        # and must not credit the whole wait; a row cannot be written before the wait
+        # ended, and a negative perf time is invalid.
+        for name, mutate in (("deadline-after-end", lambda s, e: {"cause": "resume_time_reached",
+                                                                     "requested_resume_t": e + .1}),
+                             ("row-before-end", lambda s, e: {"t": s}),
+                             ("negative-t", lambda s, e: {"t": -1})):
+            with self.subTest(contradiction=name):
+                events, start, end = self.early_wait_gap()
+                events.append(wait_event(start, end, **mutate(start, end)))
+                self.assert_wait_failure(events)
         for field in ("callback_during_wait", "requested_resume_t", "wait_start_t", "wait_end_t", "cause"):
             with self.subTest(missing=field):
                 events, start, end = self.early_wait_gap()
