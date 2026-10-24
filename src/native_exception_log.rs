@@ -96,12 +96,12 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use line::{Buffer, CAPACITY, ExceptionLine};
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::IntoRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_ALWAYS, WriteFile,
+    FILE_APPEND_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, WriteFile,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
@@ -271,23 +271,15 @@ fn open_sink(log_dir: &Path) -> io::Result<HANDLE> {
         }
         std::fs::rename(&path, backup)?;
     }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let sink = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            core::ptr::null(),
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            core::ptr::null_mut(),
-        )
-    };
-    if sink == INVALID_HANDLE_VALUE {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(sink)
-    }
+    // Keep std's Windows long-path handling at startup. The recorder owns the
+    // resulting handle; only the allocation-free raw write runs inside VEH.
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .access_mode(FILE_APPEND_DATA)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&path)?;
+    Ok(file.into_raw_handle())
 }
 
 pub(crate) fn install() -> Result<(), String> {
@@ -559,6 +551,42 @@ mod tests {
         assert!(contents(dir.path()).is_empty());
         record(&recorder, 0xC000_0005, 2);
         assert_eq!(contents(dir.path()).lines().count(), 1);
+    }
+
+    #[test]
+    fn native_exception_sink_supports_unprefixed_long_path_and_rotation() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut log_dir = dir.path().to_path_buf();
+        while log_dir
+            .join("native-exception.log")
+            .as_os_str()
+            .encode_wide()
+            .count()
+            <= 320
+        {
+            log_dir.push("native-exception-long-path-segment");
+        }
+        assert!(log_dir.is_absolute());
+        assert!(!log_dir.to_string_lossy().starts_with(r"\\?\"));
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let path = log_dir.join("native-exception.log");
+        let backup = log_dir.join("native-exception.log.bak");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(ROTATE_BYTES + 1)
+            .unwrap();
+        std::fs::write(&backup, "old backup").unwrap();
+
+        let recorder = recorder(&log_dir);
+        record(&recorder, 0xC000_0005, 2);
+        let text = contents(&log_dir);
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("code=0xC0000005"));
+        assert!(text.contains("access=write target=0x5678"));
+        assert_eq!(std::fs::metadata(backup).unwrap().len(), ROTATE_BYTES + 1);
     }
 
     #[test]
