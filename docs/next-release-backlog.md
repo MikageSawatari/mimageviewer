@@ -40,17 +40,19 @@
 
 ### 1.427 ReleaseChecks の perf 判定が、操作で予定より早く起きた待機を「説明のつかない止まり」にする — v4.8.1 の ReleaseChecks (2026-10-24)
 
-- 状態: **未着手・起票 (利用者 2026-10-24)**。v4.8.1 では判定を変えずに ReleaseChecks を流し直す (利用者決定)。
+- 状態: **このbranch (`claude/infra-427-512-e93d19`) で実装済み (2026-10-24)、実ReleaseChecks run待ち**。
 - 観測 (ClaudeCode が記録を解析、run `release-checks-20261024-114649-efa4e0f4`): perf-cached が `unexplained >100ms gap/update in frames [1621, 3016]` で FAIL。
   2 件とも、更新は約 1ms で終わり、直前の tail は `request_repaint_after_idle_upgrade` (`idle_upgrade_delay_ms` 約 346ms)。
   待機は予約より早い 239ms / 191ms で終わり、次フレームの `prev_frame_causes` に `src\test_script.rs:4701` (自動操作の次の手順) がある。
   同じ run の他の 6 件の idle upgrade wake は予約どおり約 348ms で起き、`normal-idle-upgrade-wake` に分類された。
-- 原因 (コード確認): `scripts/release_check_analysis.py` の gap 分類 (約 664〜671 行) は、idle upgrade の待機を「起きた時刻が予約 ±20ms」のときだけ正常とし、
-  それより早く外部入力で起こされた待機を `unexplained` にする。UI スレッドが就寝中に入力で起きた正常な待機であり、製品の止まりではないと判断している (実行時の別の観測はない)。
-- 直し方の方向: 予約より早く終わった待機は、次フレームの起点が外部入力 (test script の操作・OS 入力) だと記録から示せる場合に正常の就寝として扱う。
-  記録で示せない早い起床は従来どおり `unexplained` に残す。閾値の緩和で通さない。回帰には今回の run の 2 件と、起点の記録が無い早い起床の反例を入れる。
-  合格基準の変更なので独立レビューを通す。
-- 規模 / 優先度: Small / P2 (リリースの合否が、操作のタイミングで偶然 FAIL になる)。
+- 確認済みの判定経路: 旧分類はidle upgradeの予定±20msだけを正常とし、それより早い起床を `unexplained` にする。
+  causeの存在だけではUI threadの待機や起床源を証明できず、この2件の製品停止の有無は未確定。既存runの2件は判定を維持する。
+- 利用者変更2026-10-24: 合格基準を「外部入力」から**「証明された待機」**へ変更。起床源は制限しない。
+  設計Revision 3＋3.1（独立設計レビューr4の指摘反映）に従い、test-script限定のeframe wait witnessで
+  期限・callback介入・全update区間との非重複を検証する。W内の正の待機、非待機合計20ms以下、
+  gapから待機を除いた残り100ms以下を満たす早い起床だけ `normal-proven-wait` とする。
+  通常sleep・予定どおり／遅い起床の規則は不変。証跡なしへのfallbackなし。合成回帰とrelease-record詳細を追加。
+- 規模 / 優先度: Medium / P2 (待機の証跡と分類を追加。実装の独立レビューと実runでの採用確認は別途)。
 
 ### 1.426 全画面の画像・動画より Windows のタスクバーが前面に出る — 5ch >>610 (2026-10-24)
 

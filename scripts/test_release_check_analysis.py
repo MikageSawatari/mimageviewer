@@ -123,6 +123,12 @@ def frame_time(events: list[dict], n: int) -> float:
     return next(e["t"] for e in events if e.get("cat") == "frame" and e.get("n") == n + 1)
 
 
+def wait_event(start: float, end: float, **overrides) -> dict:
+    return {"cat": "eventloop", "kind": "wait", "t": end,
+            "cause": "cancelled", "wait_start_t": start, "wait_end_t": end,
+            "requested_resume_t": None, "callback_during_wait": False, **overrides}
+
+
 def slow_update(events: list[dict], n: int, ms: float, **stages: float) -> None:
     start = frame_time(events, n)
     for e in events:
@@ -151,6 +157,213 @@ def test_directory():
 
 
 class PerfTests(unittest.TestCase):
+    def early_wait_gap(self, gap=.239, delay=345.7085, frame=1):
+        events = perf_events({frame - 1: gap}, {frame - 1: "request_repaint_after_idle_upgrade"},
+                             frame_count=max(202, frame + 2))
+        next(e for e in events if e.get("kind") == "tail_repaint" and e["n"] == frame)["idle_upgrade_delay_ms"] = delay
+        # Keep the original cause-only evidence: it must never earn credit.
+        next(e for e in events if e.get("kind") == "tail_repaint" and e["n"] == frame + 1)["prev_frame_causes"] = [
+            "src\\app.rs:97500 ", "src\\test_script.rs:4701 "]
+        start = frame_time(events, frame - 1) + .001
+        end = frame_time(events, frame)
+        return events, start, end
+
+    def assert_wait_failure(self, events):
+        result = perf(events)
+        self.assertEqual(result["verdict"], "FAIL", result)
+        self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+
+    def test_v481_shapes_with_and_without_proven_wait(self):
+        for frame, gap, delay in ((1621, .239, 345.7085), (3016, .191, 345.9892)):
+            with self.subTest(frame=frame):
+                events, start, end = self.early_wait_gap(gap, delay, frame)
+                self.assert_wait_failure(events)
+                events.append(wait_event(start + .005, end - .001))
+                result = perf(events)
+                self.assertEqual(result["verdict"], "PASS", result)
+                self.assertEqual(result["metrics"]["gap_categories"], {"normal-proven-wait": 1})
+                row = result["evidence"]["gaps"][0]
+                self.assertAlmostEqual(row["wake_ms"], gap * 1000 - 1)
+                self.assertAlmostEqual(row["idle_upgrade_delay_ms"], delay)
+                self.assertAlmostEqual(row["credited_wait_ms"], gap * 1000 - 7)
+                self.assertAlmostEqual(row["non_wait_ms"], 6)
+                self.assertEqual(row["wait_records"], 1)
+                self.assertEqual(row["ending_cause"], "cancelled")
+                self.assertEqual(result["metrics"]["classifications"]["normal-proven-wait"]["frames"], 1)
+
+    def test_long_paint_then_one_ms_wait_is_not_sleep(self):
+        events, start, end = self.early_wait_gap(gap=.240)
+        events.append(wait_event(start + .238, end))
+        self.assert_wait_failure(events)
+
+    def test_proven_wait_does_not_require_a_runner_or_input_cause(self):
+        events, start, end = self.early_wait_gap()
+        for event in events:
+            if event.get("kind") == "tail_repaint":
+                event.pop("prev_frame_causes", None)
+        events.append(wait_event(start, end))
+        self.assertEqual(perf(events)["verdict"], "PASS")
+
+    def test_busy_time_split_by_short_waits_is_totalled(self):
+        events, start, end = self.early_wait_gap()
+        events.extend(wait_event(start + i * .04, start + i * .04 + .02) for i in range(5))
+        self.assert_wait_failure(events)
+
+    def test_expired_wait_until_and_deadline_clipping(self):
+        for deadline_offset in (-.001, 0, .01):
+            with self.subTest(deadline_offset=deadline_offset):
+                events, start, end = self.early_wait_gap()
+                events.append(wait_event(start, end, cause="resume_time_reached",
+                                         requested_resume_t=start + deadline_offset))
+                self.assert_wait_failure(events)
+        # Clipping is required, but a short post-deadline remainder is allowed.
+        events, start, end = self.early_wait_gap()
+        events.append(wait_event(start, end, cause="resume_time_reached", requested_resume_t=end - .01))
+        result = perf(events)
+        self.assertEqual(result["verdict"], "PASS", result)
+        self.assertAlmostEqual(result["evidence"]["gaps"][0]["non_wait_ms"], 10)
+
+    def test_wait_overlapping_any_update_is_contradictory(self):
+        for location in ("previous", "next", "other"):
+            with self.subTest(location=location):
+                events, start, end = self.early_wait_gap()
+                events.append(wait_event(start - (.001 if location == "previous" else 0),
+                                         end + (.001 if location == "next" else 0)))
+                if location == "other":
+                    events.append(wait_event(end + .005, end + .006))
+                self.assert_wait_failure(events)
+
+    def test_malformed_null_overlapping_out_of_order_wait_records(self):
+        mutations = ({"wait_start_t": None}, {"wait_end_t": None}, {"wait_start_t": "6"},
+                     {"wait_start_t": True}, {"wait_end_t": float("nan")},
+                     {"requested_resume_t": "bad"}, {"cause": "poll"},
+                     {"callback_during_wait": None}, {"callback_during_wait": 0},
+                     {"wait_start_t": -1}, {"wait_start_t": 100, "wait_end_t": 99},
+                     {"cause": "resume_time_reached", "requested_resume_t": None})
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                events, start, end = self.early_wait_gap()
+                events.append(wait_event(start, end, **mutation))
+                self.assert_wait_failure(events)
+        for field in ("callback_during_wait", "requested_resume_t", "wait_start_t", "wait_end_t", "cause"):
+            with self.subTest(missing=field):
+                events, start, end = self.early_wait_gap()
+                record = wait_event(start, end)
+                del record[field]
+                events.append(record)
+                self.assert_wait_failure(events)
+        for bad in ("overlap", "duplicate", "out-of-order", "malformed-elsewhere", "null-event-time"):
+            with self.subTest(bad=bad):
+                events, start, end = self.early_wait_gap()
+                if bad == "overlap":
+                    events.extend([wait_event(start, end - .001), wait_event(end - .002, end)])
+                elif bad == "duplicate":
+                    events.extend([wait_event(start, end), wait_event(start, end)])
+                elif bad == "out-of-order":
+                    events.extend([wait_event(start + .1, end), wait_event(start, start + .1)])
+                elif bad == "null-event-time":
+                    # seal() expects valid timestamps. Add corruption after
+                    # sealing so the analyzer, rather than fixture setup,
+                    # rejects this stream even though a valid wait precedes it.
+                    events = seal([*events, wait_event(start, end)])
+                    events.append(wait_event(end + .1, end + .2, t=None))
+                    result = analyze_perf_smoke(events, expected_pid=PID, case_id="perf-cached", evidence=operations())
+                    self.assertEqual(result["verdict"], "FAIL", result)
+                    self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+                    continue
+                else:
+                    events.extend([wait_event(start, end), wait_event(end + .1, end + .2, wait_end_t=None)])
+                self.assert_wait_failure(events)
+
+    def test_callbacks_and_resize_inline_paint_never_earn_wait_credit(self):
+        for inline_paint in (False, True):
+            with self.subTest(inline_paint=inline_paint):
+                events, start, end = self.early_wait_gap()
+                events.append(wait_event(start, end, callback_during_wait=True))
+                if inline_paint:
+                    # A resize callback can paint without any App update row.
+                    events.append({"cat": "eframe", "kind": "inline_paint", "t": start + .1, "ms": 100})
+                self.assert_wait_failure(events)
+
+    def test_multiple_waits_clip_to_window_and_keep_ending_cause(self):
+        events, start, end = self.early_wait_gap()
+        events.extend([wait_event(start, start + .1),
+                       wait_event(start + .105, end, cause="resume_time_reached", requested_resume_t=end)])
+        result = perf(events)
+        self.assertEqual(result["verdict"], "PASS", result)
+        gap = result["evidence"]["gaps"][0]
+        self.assertEqual(gap["wait_records"], 2)
+        self.assertEqual(gap["ending_cause"], "resume_time_reached")
+        self.assertAlmostEqual(gap["non_wait_ms"], 5)
+
+    def test_window_uses_next_update_start_not_mid_update_frame_begin(self):
+        events, start, end = self.early_wait_gap()
+        # Next frame.begin happens 50ms into its update. That busy time cannot
+        # be counted as W, nor may a witness cross the actual update start.
+        frame3 = next(e for e in events if e.get("cat") == "frame" and e.get("n") == 3)
+        frame3.update(prev_update_start_t=end - .05, prev_update_end_t=end + .001, prev_update_ms=51)
+        events.append(wait_event(start, end - .05))
+        result = perf(events)
+        self.assertEqual(result["verdict"], "PASS", result)
+        self.assertAlmostEqual(result["evidence"]["gaps"][0]["non_wait_ms"], 0)
+        events[-1]["wait_end_t"] = end - .001
+        self.assert_wait_failure(events)
+
+    def test_last_frame_window_uses_inner_update_start(self):
+        events = perf_events({200: .239}, {200: "request_repaint_after_idle_upgrade"})
+        next(e for e in events if e.get("kind") == "tail_repaint" and e["n"] == 201)["idle_upgrade_delay_ms"] = 345.7085
+        start, end = frame_time(events, 200) + .001, frame_time(events, 201)
+        events.extend([wait_event(start, end), {"cat": "ui", "kind": "update_breakdown", "n": 202,
+                      "t": end + .001, "start_t": end, "end_t": end + .001, "total_ms": 1}])
+        self.assertEqual(perf(events)["verdict"], "PASS")
+        events.pop()
+        self.assert_wait_failure(events)
+
+    def test_zero_wait_in_window_and_large_non_sleep_gap_stay_fail(self):
+        for wait_inside in (False, True):
+            with self.subTest(wait_inside=wait_inside):
+                events, _, end = self.early_wait_gap(gap=.160)
+                slow_update(events, 0, 80, grid_ms=70)
+                frame3 = next(e for e in events if e.get("cat") == "frame" and e.get("n") == 3)
+                # frame 1 starts at 6, ends 6.080, W=5ms, frame 2 update=76ms.
+                frame3.update(prev_update_start_t=6.085, prev_update_end_t=6.161, prev_update_ms=76)
+                events.append(wait_event(6.080, 6.085) if wait_inside else wait_event(5.9, 5.99))
+                self.assert_wait_failure(events)
+
+    def test_total_non_wait_20ms_boundary(self):
+        for non_wait, expected in ((.020, "PASS"), (.020001, "FAIL")):
+            with self.subTest(non_wait=non_wait):
+                events, start, end = self.early_wait_gap()
+                events.append(wait_event(start + non_wait, end))
+                self.assertEqual(perf(events)["verdict"], expected)
+
+    def test_late_wake_is_not_waived_and_on_time_sleep_are_unchanged(self):
+        events, start, end = self.early_wait_gap(gap=.4)
+        events.append(wait_event(start, end))
+        self.assert_wait_failure(events)
+        for action, delay, expected in (("request_repaint_after_idle_upgrade", 238, "normal-idle-upgrade-wake"),
+                                        ("none", 0, "normal-sleep"), ("request_repaint", 0, "unexplained")):
+            events, start, end = self.early_wait_gap()
+            tail = next(e for e in events if e.get("kind") == "tail_repaint" and e["n"] == 1)
+            tail.update(action=action, idle_upgrade_delay_ms=delay)
+            events.append(wait_event(start, end, callback_during_wait=True))
+            self.assertEqual(perf(events)["metrics"]["gap_categories"], {expected: 1})
+
+    def test_slow_update_is_not_waived_by_proven_wait(self):
+        events, _, end = self.early_wait_gap()
+        slow_update(events, 0, 101, grid_ms=100)
+        events.append(wait_event(6.101, end))
+        self.assert_wait_failure(events)
+
+    def test_proven_wait_release_record_count_and_detail(self):
+        events, start, end = self.early_wait_gap()
+        events.append(wait_event(start + .005, end - .001))
+        result = perf(events)
+        text = release_record({"verdict": result["verdict"], "cases": [result]})
+        self.assertIn("normal-proven-wait 1件", text)
+        self.assertIn("normal-proven-wait: frame 1→2、gap 239.000ms、wake 238.000ms、scheduled delay 345.709ms", text)
+        self.assertIn("credited wait 232.000ms、non-wait 6.000ms、wait records 1、ending cause cancelled", text)
+
     def startup_overlay_gap(self, seconds=.2, frame=1):
         events = perf_events({frame - 1: seconds})
         # Actual startup precedes the first folder_loads interval, unlike the

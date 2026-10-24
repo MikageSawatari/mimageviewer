@@ -334,6 +334,8 @@
      最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
      - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
      - `request_repaint_after_idle_upgrade` の遅延 wake → 予定遅延との一致を確認した場合は**正常**
+       （通常ビルドの手動 `perf_smoke` ログにはwait witnessがないため、予定より早い起床は `unexplained` のまま。
+       test-script診断版の `normal-proven-wait` は自動化計画§5の待機証跡が揃う場合だけ）
      - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
        (docs/ui-responsiveness.md §4)
    - 遅いupdate自体はtail=`none`でも検査する。既知startup gapを認める場合も、
