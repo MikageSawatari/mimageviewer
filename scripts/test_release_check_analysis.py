@@ -256,6 +256,35 @@ class PerfTests(unittest.TestCase):
                 events, start, end = self.early_wait_gap()
                 events.append(wait_event(start, end, **mutate(start, end)))
                 self.assert_wait_failure(events)
+        # Codex review r2 P2: the synchronous hook emits a record before the next
+        # wait or update can start, and a deadline-bearing Cancelled starts before it.
+        events, start, end = self.early_wait_gap()
+        events.extend([wait_event(start, start + .1, t=end - .001), wait_event(start + .105, end)])
+        self.assert_wait_failure(events)  # next wait began before the previous row was written
+        events, start, end = self.early_wait_gap()
+        events.append(wait_event(start, end, t=end + .1))
+        self.assert_wait_failure(events)  # row written after the next update had started
+        events, start, end = self.early_wait_gap()
+        events.extend([wait_event(start, end),
+                       wait_event(end + .2, end + .201, t=end + .201, requested_resume_t=end + .199)])
+        self.assert_wait_failure(events)  # Cancelled that began after its own deadline
+
+    def test_valid_rows_written_within_rounding_still_pass(self):
+        events, start, end = self.early_wait_gap()
+        # Row t is ms-rounded and may be up to 0.5ms below the true emission time.
+        events.extend([wait_event(start, start + .1, t=start + .1 - .0004),
+                       wait_event(start + .1001, end, t=end - .0004)])
+        self.assertEqual(perf(events)["verdict"], "PASS")
+
+    def test_witness_overlap_check_scales_to_a_full_run(self):
+        import time
+        events, start, end = self.early_wait_gap()
+        events.append(wait_event(start, end))
+        base = max(e["t"] for e in events) + 1
+        events.extend(wait_event(base + i * .006, base + i * .006 + .004) for i in range(8000))
+        began = time.perf_counter()
+        perf(events)
+        self.assertLess(time.perf_counter() - began, 20)
         for field in ("callback_during_wait", "requested_resume_t", "wait_start_t", "wait_end_t", "cause"):
             with self.subTest(missing=field):
                 events, start, end = self.early_wait_gap()

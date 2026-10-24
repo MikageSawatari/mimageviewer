@@ -431,13 +431,20 @@ def folder_load_errors(evidence: dict, case_id: str) -> list[str]:
     return errors
 
 
-def proven_wait_intervals(events: list[dict]) -> list[tuple[float, float, str]]:
+def proven_wait_intervals(events: list[dict]) -> tuple[list[tuple[float, float, str]], list[tuple[float, float]]]:
     """Fail closed for the entire witness stream; never reorder bad records.
 
     A callback-invalidated record is well formed but earns no sleep credit.
     Validate the original interval before clipping at the requested deadline.
+
+    The hook runs synchronously inside new_events on the event-loop thread, so
+    each record occupies one span from its wait start to its own emission. The
+    emission is at least max(end, t - 0.5ms) because perf t is ms-rounded.
+    Spans must follow each other in log order and never overlap an update;
+    any contradiction (including cause/deadline mismatches) rejects the stream.
+    Returns (credited waits, record spans).
     """
-    waits, previous_end = [], None
+    waits, spans, previous_emit = [], [], None
     for event in events:
         if not isinstance(event, dict) or (event.get("cat"), event.get("kind")) != ("eventloop", "wait"):
             continue
@@ -453,14 +460,31 @@ def proven_wait_intervals(events: list[dict]) -> list[tuple[float, float, str]]:
                 or cause not in ("cancelled", "resume_time_reached")
                 # winit reports ResumeTimeReached only once the deadline has passed.
                 or (cause == "resume_time_reached" and (resume is None or resume > end))
+                # A WaitCancelled with a deadline is only produced before that deadline.
+                or (cause == "cancelled" and resume is not None and start >= resume)
                 or type(event.get("callback_during_wait")) is not bool
-                or (previous_end is not None and start < previous_end)):
-            return []
-        previous_end = end
+                or (previous_emit is not None and start < previous_emit)):
+            return [], []
+        previous_emit = max(end, t - .0005)
+        spans.append((start, previous_emit))
         credited_end = min(end, resume) if resume is not None else end
         if not event["callback_during_wait"] and start < credited_end:
             waits.append((start, credited_end, cause))
-    return waits
+    return waits, spans
+
+
+def intervals_overlap(first: list[tuple[float, float]], second: list[tuple[float, float]]) -> bool:
+    """True if any open interval of first intersects any of second (sweep, O(n log n))."""
+    a, b = sorted(first), sorted(second)
+    i = j = 0
+    while i < len(a) and j < len(b):
+        if a[i][0] < b[j][1] and b[j][0] < a[i][1]:
+            return True
+        if a[i][1] <= b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return False
 
 
 def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
@@ -469,7 +493,7 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
     result = report(case_id)
     errors = result["environment_errors"]
     errors.extend(load_errors or [])
-    waits = proven_wait_intervals(events)
+    waits, wait_spans = proven_wait_intervals(events)
     valid_events = []
     for event in events:
         if not isinstance(event, dict) or number(event.get("t")) is None:
@@ -568,9 +592,9 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
         elif ms > updates[n]["total_ms"]:
             # Inner is a partial measure but still exposes a real >100ms update.
             updates[n]["total_ms"] = ms
-    # Contradictory witnesses cannot prove sleep, even outside the target W.
-    if any(start < update["end_t"] and end > update["start_t"]
-           for start, end, _ in waits for update in updates.values()):
+    # Contradictory witnesses cannot prove sleep, even outside the target W:
+    # no update can run between a wait start and that record's emission.
+    if intervals_overlap(wait_spans, [(u["start_t"], u["end_t"]) for u in updates.values()]):
         waits = []
     startup_begins = sorted([e for e in events if (e.get("cat"), e.get("kind")) == ("nav", "load_folder_begin")],
                             key=lambda e: e.get("t", 0))
