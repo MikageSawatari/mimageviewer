@@ -213,7 +213,7 @@ fn plain_folder_spread_extracted_surfaces_keep_single_and_stored_flow() {
 
 #[cfg(windows)]
 #[test]
-fn plain_folder_spread_install_and_import_refresh_preserve_sibling_context() {
+fn plain_folder_spread_import_refresh_limits_opt_in_and_preserves_sibling_context() {
     let mut app = phase_c_support::setup_app();
     let sibling_window = app.allocate_detached_viewer_window_id();
     let sibling = app.build_window_context_for_test(sibling_window, |viewer| {
@@ -223,12 +223,37 @@ fn plain_folder_spread_install_and_import_refresh_preserve_sibling_context() {
         viewer.set_detached_window_binding_for_test(Some(sibling_window));
     });
     let folder = make_folder(app.tmp.path(), "refresh");
-    for (enabled, book) in [(true, false), (false, false), (true, true)] {
+    // The three legacy cases must keep 8b9205743^'s RtlCover/Horizontal/Ltr calculation,
+    // even though initial open resolves the embedded Rtl direction differently.
+    for (enabled, book, expected) in [
+        (
+            false,
+            false,
+            (Mode::LtrCover, Flow::Horizontal, Direction::Ltr),
+        ),
+        (
+            false,
+            true,
+            (Mode::LtrCover, Flow::Horizontal, Direction::Ltr),
+        ),
+        (
+            true,
+            true,
+            (Mode::LtrCover, Flow::Horizontal, Direction::Ltr),
+        ),
+        (true, false, (Mode::RtlCover, Flow::Paged, Direction::Rtl)),
+    ] {
         configure(&mut app, enabled, book);
         app.load_folder(folder.clone());
         app.finish_page_identity_preparation_for_test();
         let initial = reading(&app);
-        for flow in [None, Some(Flow::Horizontal)] {
+        if enabled && !book {
+            assert_eq!(
+                initial, expected,
+                "opt-in plain folder must match normal open"
+            );
+        }
+        for flow in [None, Some(Flow::Vertical)] {
             let result = metadata_import_refresh::ContextResult {
                 container_state: Some(metadata_import_refresh::ContainerStateResult {
                     spread: crate::spread_db::StoredSpreadState {
@@ -252,7 +277,8 @@ fn plain_folder_spread_install_and_import_refresh_preserve_sibling_context() {
             ));
             assert_eq!(
                 reading(&app),
-                (initial.0, flow.unwrap_or(initial.1), initial.2)
+                (expected.0, flow.unwrap_or(expected.1), expected.2),
+                "enabled={enabled} book={book} stored_flow={flow:?}"
             );
             app.with_viewer_context(sibling, |viewer| {
                 assert_eq!(

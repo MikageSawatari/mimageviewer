@@ -6648,30 +6648,34 @@ impl ContainerEngine {
                 ..
             } => canonical_image_book,
         };
-        let (default_mode, default_direction) =
-            if let SpreadDefaultSource::Directory { book_locked, .. } = default_source
-                && reading_settings.apply_default_spread_to_plain_folders
-            {
-                let defaults = crate::app::SpreadRestoreDefaults::for_physical_folder(
-                    book_locked,
-                    true,
-                    reading_settings.apply_default_spread_to_plain_folders,
-                    reading_settings.default_spread_mode,
-                    reading_settings.default_reading_flow,
-                    reading_settings.default_reading_direction,
-                );
-                (defaults.spread_mode(), defaults.reading_direction())
-            } else if use_book_defaults {
-                (
-                    reading_settings.default_spread_mode,
-                    reading_settings.default_reading_direction,
-                )
-            } else {
-                (
-                    crate::settings::SpreadMode::Single,
-                    crate::settings::ReadingDirection::Ltr,
-                )
-            };
+        let (default_mode, default_direction) = if let SpreadDefaultSource::Directory {
+            book_locked: false,
+            canonical_image_book: true,
+        } = default_source
+            && reading_settings.apply_default_spread_to_plain_folders
+        {
+            // Folder responses omit non-images, so they cannot preserve mixed-media
+            // pairing boundaries. Only an all-image source may opt into this default.
+            let defaults = crate::app::SpreadRestoreDefaults::for_physical_folder(
+                false,
+                true,
+                reading_settings.apply_default_spread_to_plain_folders,
+                reading_settings.default_spread_mode,
+                reading_settings.default_reading_flow,
+                reading_settings.default_reading_direction,
+            );
+            (defaults.spread_mode(), defaults.reading_direction())
+        } else if use_book_defaults {
+            (
+                reading_settings.default_spread_mode,
+                reading_settings.default_reading_direction,
+            )
+        } else {
+            (
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingDirection::Ltr,
+            )
+        };
         // The open operation owns the target used for count, direction and dimensions.
         // A viewing classification does not override an inherited document direction.
         let document_direction = if composition.is_none()
@@ -18727,7 +18731,7 @@ pub(super) mod tests {
                         panic!("folder enumeration failed");
                     };
                     let locked = book && relative == "plain";
-                    let expected_mode = if mode == Mode::Vertical {
+                    let expected_mode = if relative == "mixed" || mode == Mode::Vertical {
                         Mode::Single
                     } else {
                         mode
@@ -18738,11 +18742,15 @@ pub(super) mod tests {
                     );
                     assert_eq!(
                         payload.reading_direction,
-                        remote_reading_direction(mode.reading_direction().unwrap_or(if locked {
-                            Direction::Rtl
-                        } else {
+                        remote_reading_direction(if relative == "mixed" {
                             Direction::Ltr
-                        }))
+                        } else {
+                            mode.reading_direction().unwrap_or(if locked {
+                                Direction::Rtl
+                            } else {
+                                Direction::Ltr
+                            })
+                        })
                     );
                     if relative == "mixed" {
                         assert_eq!(payload.video_count, 1);
@@ -18756,6 +18764,58 @@ pub(super) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn plain_folder_spread_remote_mixed_portrait_video_portrait_starts_single() {
+        use crate::settings::{ReadingFlow, SortOrder, SpreadMode};
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("mixed");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["001.png", "003.png"] {
+            image::RgbImage::new(8, 12).save(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("002.mp4"), b"video").unwrap();
+        let favorite = FavoriteEntry::new("mixed".to_owned(), root.clone());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            apply_default_spread_to_plain_folders: true,
+            auto_fullscreen_image_folders: false,
+            default_spread_mode: SpreadMode::Ltr,
+            default_reading_flow: ReadingFlow::Paged,
+            sort_order: SortOrder::FileName,
+            ..Default::default()
+        });
+        *engine.spread_db.lock().unwrap() = Ok(None);
+        let listing = engine.recompute_folder_listing(&root).unwrap();
+        assert!(!listing.sort_locked);
+        assert_eq!(
+            listing
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["001.png", "002.mp4", "003.png"]
+        );
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            address: favorite_address(&favorite, ""),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        }) else {
+            panic!("mixed folder enumeration failed");
+        };
+        assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Single);
+        assert_eq!(payload.image_count, 2);
+        assert_eq!(payload.video_count, 1);
+        assert_eq!(payload.page_groups.len(), 2);
+        assert!(
+            payload
+                .page_groups
+                .iter()
+                .all(|group| group.pages.len() == 1)
+        );
     }
 
     #[test]

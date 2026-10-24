@@ -1985,11 +1985,17 @@ server 最終 redaction は維持する。
 端末共通の `default_spread_mode` / `default_reading_direction`、混在なら Single / LTR を使う。
 `apply_default_spread_to_plain_folders`（既定 OFF）が ON なら、directory scan に成功した folder
 列挙から `SpreadDefaultSource::Directory` と採用済み `sort_locked` を渡し、App と共通の
-`SpreadRestoreDefaults::for_physical_folder` で解決する。本扱いなら本の既定、非本の実フォルダなら
-既定 mode（旧 Vertical は Single）と LTR fallback を使い、mode の埋め込み方向を優先する。
+`SpreadRestoreDefaults::for_physical_folder` で解決するのは、非本かつ元の全項目が画像である
+`canonical_image_book` の実フォルダだけとする。既定 mode（旧 Vertical は Single）と LTR fallback を使い、
+mode の埋め込み方向を優先する。本扱い・その他は従来の `canonical_image_book` による計算を維持する。
+画像以外を含むフォルダは ON でも既定 Single/LTR のまま。Remote の画像に絞った応答では PC の
+動画・音声などの pairing 境界を保持できないためで、PC 側の混在フォルダへの適用は変更しない。
 各要求の `RemoteReadingSettings` は bool と既定値を共有 settings_kv から一括で読み、engine の
 起動時 Settings を使わない。明示 request と `spread.db` の保存値は従来どおり既定より優先する。
 ZIP/PDF/EPUB の本用既定、Collection の NON_BOOK は変更しない。IPC wire 形式・protocol 版は不変。
+
+既知の制約として、Remote は本用の既定を含め、お気に入り専用の表示状態を解決していない。
+この設定でもお気に入り専用の既定ページ構成ではなく、共有設定の共通既定を使う。
 
 folder container は画像 entry / page group へ絞る前の materialized items をこの判定へ渡す。
 同じ full items から本体 seek overlay の nav item 分類を通して画像・動画・その他の件数を作り、
