@@ -220,6 +220,7 @@
 | [video-engine-redesign.md](video-engine-redesign.md) | エンジンの現行仕様 + 初期設計案 / 採否履歴。現行は `Arc<Mutex<EngineActor>>` + UI tick drain。未採用の `TransportController` / 専用 actor thread は将来候補として隔離 |
 | [audio-normalize-scan-bench.md](audio-normalize-scan-bench.md) | 音量ノーマライズ初回スキャン待ち時間の実測用 CLI (`normalize_scan_bench`) と、HDD 上の動画で逐次 / 並列スキャンを比較するときの読み方 |
 | [effetune-integration-plan.md](effetune-integration-plan.md) | 音響調整 (EffeTune Mixwright) の独立DSP段・GUI・状態保存・Remote共有と配布契約。§10は全bundle同梱・署名・CRT配置とportable非同梱、§17はタスクバー表示設定・native caption・通常矩形配送。§17.10は実機確認後の専用音符icon、ボタン入力の寿命、OFFでも通常captionを維持するShell登録と検証台帳。§17.11は最小化中のplugin allocation禁止とprotocol v7互換性判定、§17.12は利用者決定の表示・前面化専用ボタンと前面判定/Hide経路の撤去 |
+| [effetune-fork-plan.md](effetune-fork-plan.md) | 音響調整の派生版 (Mixwright を mIV 用の別名でビルドして配る) の計画。名前とクレジット、クラス ID、保存先を mIV のデータフォルダへ移す方法と出荷済みデータの移行、ポータブル版での有効化、派生版のソースとビルド・配布の検査、ProcessContext に曲の位置を入れる修正、マニュアルの作り直し、作者への連絡 |
 | [effetune-lyrics-trial-plan.md](effetune-lyrics-trial-plan.md) | 音響調整の Visualizer 歌詞 (Lyrics) をホストから渡す試作。同期方式の比較 (再生時計の通知 / ProcessContext)、mIV と Mixwright 試作ブランチの変更、確認手順。作者への相談前の検証用で配布しない |
 | [music-integration-plan.md](music-integration-plan.md) | **主要 Inc 実装完了**。`VideoPlayer` 再利用による音声再生、音楽ビュー、ブックマーク、VST3、動画→音声モードの統合契約と継続保守事項 |
 | [vst3-integration.md](vst3-integration.md) | VST3 統合 — 1 chain = 1 C++ bridge、音声 IPC 1 roundtrip、bridge 内 per-slot STA editor、Rust chain/GUI/persistence/audio hot-path ownership と現行負債 |
