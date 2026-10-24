@@ -5163,6 +5163,9 @@ pub struct Settings {
     /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// 通常フォルダでも未保存のページ構成に既定を使う。連結方式・本扱いは変えない。
+    #[serde(default)]
+    pub apply_default_spread_to_plain_folders: bool,
     /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
     #[serde(default)]
     pub follow_document_reading_direction: bool,
@@ -7741,6 +7744,7 @@ impl Default for Settings {
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
+            apply_default_spread_to_plain_folders: false,
             follow_document_reading_direction: false,
             remember_spread_shift_per_book: true,
             page_turn_animation_enabled: false,

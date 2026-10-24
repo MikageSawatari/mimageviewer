@@ -823,6 +823,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["単ページ", "見開き", "比較", "構成"]
     ),
     entry!(
+        "spread/page-layout-plain-folders",
+        SpreadMode,
+        "通常フォルダにも既定のページ構成を使う",
+        [
+            "通常フォルダ",
+            "見開き",
+            "既定",
+            "ページ構成",
+            "本として扱わない"
+        ]
+    ),
+    entry!(
         "spread/document-direction",
         SpreadMode,
         "PDF / EPUB の右開き指定に従う",
@@ -1707,6 +1719,18 @@ mod tests {
             .position(|candidate| *candidate == page)
             .unwrap();
         ("カテゴリ", 0, index)
+    }
+
+    #[test]
+    fn plain_folder_spread_search_reaches_its_anchor() {
+        for query in ["通常フォルダ", "見開き 既定", "ページ構成"] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.anchor == "spread/page-layout-plain-folders"
+                        && entry.page == PreferencesPage::SpreadMode)
+            );
+        }
     }
 
     #[test]

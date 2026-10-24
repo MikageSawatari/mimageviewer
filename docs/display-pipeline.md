@@ -989,6 +989,25 @@ Keepは要求を継続し、Moveは置換、Emptyや手動操作はその要求�
 v4.5.0で既存のSearch streaming idx-only誤配送は別件・本修正の対象外であり、利用者がバックログへ
 記載する。根拠と受入範囲は [編集範囲の利用者決定](rating-filter-fullscreen-plan.md#stage-2-の編集範囲限定--利用者決定-2026-10-11) を参照。
 
+### 2.1.2 通常フォルダの初期ページ構成（§1.425）
+
+初期の物理一覧採用は `SpreadRestoreDefaults::for_physical_folder` に本扱い・実ディレクトリの
+採用済み事実・実効設定の値を渡す。本扱いは従来の `for_book` と同じ mode/flow/direction、
+それ以外は原則 `NON_BOOK`（Single/Paged/Ltr）。`apply_default_spread_to_plain_folders`（既定 OFF）が
+ON の実ディレクトリだけ、mode を実効 `default_spread_mode` へ置き換える。
+この分岐だけ旧 Vertical を Single に正規化し、flow は Paged、方向の fallback は Ltr を保つ。
+`StoredSpreadState::resolve_reading` が保存値を優先し、未保存では mode の埋め込み方向を使う。
+保存済み flow と旧 Vertical の復元は従来どおり。既定の適用から `spread.db` へは書かない。
+
+実ディレクトリの証拠は、directory scan が生成して既存 loader/Stack が運ぶ
+`FolderScanSignature`。Physical 分類や拡張子、UI での stat から推定しない。
+メタ情報取り込み後の既存復元は同 context の source/世代が一致する `FolderObservation` を使い、
+対象の既定を再解決する。main/detached は共通 loader を使い、兄弟の読書状態を変更しない。
+抽出結果の early-return と保存 flow の優先順、書庫・文書の専用 `for_book` 経路は保つ。
+
+簡素化として、新しい pending/worker/live rebuild は設けず、既存の一覧採用と取り込み後復元へ
+純粋 resolver を接続する。設定変更を理由に表示中の全窓を組み直す経路は追加しない。
+
 ### 2.2 ロードスレッド
 
 `App::start_fs_load` (app.rs) が 1 枚ごとに worker を spawn し、worker は
