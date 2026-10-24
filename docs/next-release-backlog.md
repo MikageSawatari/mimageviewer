@@ -38,6 +38,29 @@
 
 ## 1. 優先候補
 
+### 1.432 フォルダのサムネイル要求を作るとき、代表画像のピン解決が UI スレッドでファイル・DB を読む — §1.410 の独立レビューで判明 (2026-10-25)
+
+- 状態: **未着手・起票 (2026-10-25)**。通常のフォルダ一覧から元々ある共通経路の課題で、§1.410 で Everything のフォルダ行も同じ経路を通るようになった (費用は通常一覧と同じ)。
+- 根拠 (コード読みのみ。実機・perf ログでは未確認): `make_load_request_with_visibility` → `apply_folder_thumb_pin` (`src/app.rs` 99031・99367 行付近、`8f4fdf02c` 時点) が、要求の生成時に cascade 解決の `fs::metadata`・ピン DB の照会・`VideoPinDb::lookup` (動画ピンの WebP を 1 件ずつ取得、99492 行付近) を UI スレッドで行う。要求は保持範囲・要求中判定で絞られるので一度に全件ではないが、UNC 上のピンでは止まり得る。
+- 直し方の方向: ピンの解決結果を worker 側 (一覧の準備、または thumbnail worker) で求めて要求に渡し、UI スレッドからは参照だけにする。`docs/ui-responsiveness.md` §4 のチェックリストを通し、区間に `perf::event` を入れて実測してから判断する。
+- 規模 / 優先度: Medium / P3。
+
+### 1.431 代表画像を設定していないドライブ一覧から Everything 検索すると、画像・ZIP・フォルダの結果にサムネイルが出ない — §1.410 の独立レビューで判明 (2026-10-25)
+
+- 状態: **未着手・起票 (2026-10-25)**。§1.410 (Everything の結果にフォルダを含める) より前からある問題で、§1.410 では直していない。
+- 根拠 (コード読みのみ。実機では未確認。独立レビュー担当が親コミット `8f4fdf02c~1` で確認): ドライブの代表画像を設定していないドライブ一覧は、catalog・cache を初期化せず通常のサムネイル queue を `None` にする (`src/app.rs` 28474・28539 行付近)。Everything の結果を採用しても通常の worker を作らず (`src/global_search_ui.rs` 2328 行付近)、要求処理は queue が無いと終わる (`src/app.rs` 55400 行付近)。動画は `respawn_search_video_thread` の別経路があるため影響しない。
+- 直し方の方向: 検索結果の採用時に、通常のサムネイル所有者 (catalog・cache・worker) が無ければ既存の初期化経路で作る。UI スレッドで DB を cold open しない (`docs/ui-responsiveness.md` §4)。Ctrl+G など他の検索の採用も同じ形か確認する。
+- 検証: 代表画像なしのドライブ一覧から Everything 検索 → 画像・ZIP・フォルダの結果にサムネイルが出る。検索を閉じたあとのドライブ一覧が変わらない。
+- 規模 / 優先度: Small / P3。
+
+### 1.430 本でない通常フォルダが、メタ情報の取り込み後に既定のページ構成へ変わり得る — §1.425 の独立レビューで判明 (2026-10-25)
+
+- 状態: **未着手・起票 (2026-10-25)**。§1.425 では直さず、取り込み後の経路は「通常フォルダにも既定のページ構成を使う」が ON の通常フォルダだけを新しい解決に通した (OFF と本は従来の計算のまま)。
+- 根拠 (コード読みのみ。実機では未確認): `App::apply_current_metadata_import_terminal_result` (`src/app.rs`、§1.425 前の HEAD `94017f82e` で 48144 行付近) は、spread の保存行が無くても worker が container state を返すと (`src/app/metadata_import_refresh.rs` 565 行付近)、`settings.default_spread_mode` / `default_reading_flow` / `default_reading_direction` をそのまま既定にする。通常 open は本でないフォルダを `SpreadRestoreDefaults::NON_BOOK` (単ページ・ページ単位・左→右) で開くため、設定 OFF の通常フォルダでも、トリムなどの取り込みの後に既定の見開き・連結方式へ変わり得る。本扱いのフォルダでも、方向の解決が通常 open (`resolve_reading`) と取り込み後 (`resolve_mode` + 既定方向) で違い、例えば既定 `RtlCover`・方向 `Ltr` では通常 open が `RtlCover`、取り込み後が `LtrCover` になり得る (§1.425 の独立コードレビューの指摘)。
+- 直し方の方向: 取り込み後の既定を、通常 open と同じ `SpreadRestoreDefaults::for_physical_folder` の解決に揃える。リリース済みの挙動の変更なので、変わる組み合わせ (OFF の通常フォルダ、本扱いのフォルダの方向) を一覧にして利用者に確認してから行う。
+- 検証: 保存行なしの通常フォルダ (OFF/ON)・本扱いのフォルダ・ZIP/PDF で、通常 open の直後と取り込み後の構成・連結方式・方向が一致すること。兄弟 context が変わらないこと。
+- 規模 / 優先度: Small / P3。
+
 ### 1.427 ReleaseChecks の perf 判定が、操作で予定より早く起きた待機を「説明のつかない止まり」にする — v4.8.1 の ReleaseChecks (2026-10-24)
 
 - 状態: **未着手・起票 (利用者 2026-10-24)**。v4.8.1 では判定を変えずに ReleaseChecks を流し直す (利用者決定)。
