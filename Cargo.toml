@@ -47,7 +47,7 @@ ort = { path = "crates/ort-patched" }
 # 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "4.8.0"
+version = "4.8.1"
 edition = "2024"
 # egui / eframe 0.37 の MSRV。開発 toolchain は 1.99 固定。
 rust-version = "1.95"
