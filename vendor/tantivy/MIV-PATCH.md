@@ -72,12 +72,16 @@ that an identical-text InvalidArgument from another origin still reports.
 
 2026-10-24: `src/query/intersection.rs`: keep the upstream `Intersection::score`
 expression, routing only the right-hand score through `score_out_of_line` with
-`#[inline(never)]`. This separates the two BM25 bodies so Rust 1.95+ cannot
-combine them into SIMD whose stale upper lanes cause denormal assists and slow
-two-term AND scoring. An explicit loop improved the bench bin but still left
-the problematic SIMD in the product exe, as verified by ClaudeCode's disassembly.
-Keep `#[inline(never)]`; the original sum and addition/call order are unchanged.
+`#[inline(never)]`. Rust 1.95+ combined the two BM25 bodies into SIMD whose
+stale upper lanes cause denormal assists and slow two-term AND scoring. An
+explicit loop improved the bench bin but still left the problematic SIMD in the
+product exe. With the helper, ClaudeCode's disassembly of the Rust 1.99 product
+release build (`mimageviewer-core`) shows scalar code only. `#[inline(never)]`
+is a hint, not a guarantee, so keep it and recheck the product function after
+toolchain or Tantivy updates. The original sum and addition/call order are
+unchanged.
 Tests cover two- and four-term Must AND scores, negative zero, call order and
 rounding. Upstream 0.27 and main still use the original expression. See
-`docs/next-release-backlog.md` §1.424; rerun the bench regression check
-(`docs/release-checklist.md` §9.5) when updating the Rust toolchain or Tantivy.
+`docs/next-release-backlog.md` §1.424; rerun the bench regression check and the
+product disassembly check (`docs/release-checklist.md` §9.5) when updating the
+Rust toolchain or Tantivy.

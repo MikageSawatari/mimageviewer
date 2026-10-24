@@ -75,11 +75,22 @@
   | `lto = "off"` | 22ms / 0.7ms | 戻るが製品全体の最適化を落とす。不採用 |
   | `target-cpu = x86-64-v3` | 17ms / 0.28ms | 戻るが AVX2 の無い CPU で起動できなくなる。不採用 |
   | tantivy 0.27 へ更新 | 34ms / 2.9ms | collector 側が速くなっただけで採点は遅いまま。0.27 と upstream main の `Intersection::score` も同じコード |
-  | **右側の採点を `#[inline(never)]` の関数経由にする** | **21ms / 0.30ms** | 採用。右側の BM25 の展開を止め、左右 2 つを同じ関数内で SIMD 化する余地をなくす (ClaudeCode の独立 crate 計測) |
+  | **右側の採点を `#[inline(never)]` の関数経由にする** | **21ms / 0.30ms** | 採用。右側の BM25 の展開を止め、左右 2 つが同じ関数内で SIMD 化されないようにする (ClaudeCode の独立 crate 計測) |
   明示ループ案は bench の bin では効いたが、ClaudeCode が製品 exe を逆アセンブルすると問題の SIMD 化が残っていたため、不採用。
   旧明示ループ案の bench 全体 (各 3 回の最良値): カメラ 113ms → 22ms、夕焼け 12.9ms → 8.5ms。ほかのクエリはばらつきの範囲で同じ。製品と同じ形のクエリでもカメラ 78ms → 17ms だったが、製品 exe での改善を保証するものではなかった。
 - 方針 (2026-10-24): upstream の元の式を保ち、右側の採点だけ `#[inline(never)]` の関数経由にする。値・足し算の順序・呼び出し順を変えず、v4.8.1 に入れる候補にする。`vendor/tantivy/MIV-PATCH.md` に手元の変更として記録する。
-  `#[inline(never)]` を維持し、toolchain や tantivy を上げるときは bench 回帰チェック (リリース手順 9.5) で確かめ直す。
+  `#[inline(never)]` を維持し、toolchain や tantivy を上げるときは bench 回帰チェックと製品本体の逆アセンブル確認 (リリース手順 9.5) で確かめ直す。
+  `#[inline(never)]` は仕様上ヒントなので、将来のコンパイラでも SIMD 化されないとは言い切れない。
+- 最終形の確認 (2026-10-24、ClaudeCode。ブランチ `claude/search-slow-1424-88bb45`):
+  - 製品本体 (`mimageviewer-core`、Rust 1.99、`CARGO_INCREMENTAL=0` の release を strip なしでビルドして dumpbin で逆アセンブル) の
+    `Intersection<TermScorer, Box<dyn Scorer>>::score` と `score_out_of_line<TermScorer>` は `addss`/`divss`/`mulss` のスカラー演算だけ。修正前・明示ループ案にあった `unpcklps`/`addps`/`divps` が無い。
+  - 本物の `bench_search --docs 50000` を修正前と交互に 5 回 (最良値): カメラ 90.3ms → 23.8ms、夕焼け 16.0ms → 6.6ms、ほかは同じ。
+    `scripts/check_bench_regression.py vendor/bench_baseline.json` は修正後 3 回分で全クエリ OK (baseline は更新していない)。計測中は別の作業ツリーのビルドが並行していた。
+  - tantivy の lib テスト (workspace 外なので crate のコピーで実行) 1054 passed / 1 failed。失敗は `test_managed_directory_gc_while_mmapped` で、修正前のコードでも同じく失敗する。
+    追加テスト 5 件は、初期値 +0.0・左右の呼び出し順の入れ替え・括り替えのそれぞれで対応する 1 件が落ちることを確認した。
+  - 本体 lib 全件 (`scripts/test-lib-full.ps1`) 14208 passed / 64 skipped。
+  - 独立レビュー (GPT-6.1 Sol / xhigh、2 回): P1・P2 なし、v4.8.1 に入れてよいとの判断。
+  - 実際の索引 (数十万件) での体感差は未確認。
 - 規模 / 優先度: Small / P2 (よく出てくる語の検索が遅くなる、出荷済みの版で起きる)。
 
 ### 1.423 画像を WIC が開いている最中にごみ箱へ送ると、削除が一時的に失敗し得る — テスト基盤の作業中のコード調査 (2026-10-23)

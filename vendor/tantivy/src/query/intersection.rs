@@ -228,8 +228,9 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
 
 // Keep #[inline(never)] on the right-hand score: Rust 1.95+ can fuse both BM25
 // evaluations into SIMD with stale upper lanes, triggering denormal assists.
-// An explicit loop still did this in the product exe. Separating the right
-// evaluation prevents the two BM25 bodies from being combined in one function.
+// An explicit loop still did this in the product exe. With this helper, the
+// Rust 1.99 product release build has scalar code only (checked by disassembly).
+// `#[inline(never)]` is a hint, so recheck after toolchain/Tantivy updates.
 // See docs/next-release-backlog.md §1.424 and docs/release-checklist.md §9.5.
 #[inline(never)]
 fn score_out_of_line<TScorer: Scorer>(scorer: &mut TScorer) -> Score {
