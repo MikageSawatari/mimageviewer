@@ -29,6 +29,7 @@ exclude = [
     "vendor/egui",
     "vendor/egui-wgpu",
     "vendor/egui-winit",
+    "vendor/epaint",
     "vendor/tantivy",
 ]
 
@@ -37,6 +38,7 @@ eframe = { path = "vendor/eframe" }
 egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
+epaint = { path = "vendor/epaint" }
 tantivy = { path = "vendor/tantivy" }
 ort = { path = "crates/ort-patched" }
 
