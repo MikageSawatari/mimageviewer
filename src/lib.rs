@@ -24,6 +24,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(test)]
 mod egui037_stage4_gpu_tests;
 mod egui_output;
+mod run_native_failure;
 #[cfg(test)]
 mod test_native_focus;
 #[cfg(test)]
@@ -1181,6 +1182,8 @@ pub fn run() -> eframe::Result {
     };
     #[cfg(all(feature = "test-script", windows))]
     let scripted_run = test_script_path.is_some();
+    #[cfg(not(all(feature = "test-script", windows)))]
+    let scripted_run = false;
     // run() 入口の Instant を起動時間計測の t=0 とする。
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
     // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。
@@ -2006,58 +2009,60 @@ pub fn run() -> eframe::Result {
             Ok(Box::new(app))
         }),
     );
-    native_trace.finish(if run_result.is_ok() {
-        miv_startup::Outcome::Ok
-    } else {
-        miv_startup::Outcome::Error
-    });
-    // Stop public admission before named-pipe workers, then close the only Remote collection
-    // producer before joining the actor. The App normally completed its drain in on_exit; this
-    // outer fallback also covers creator failure/panic and is deliberately idempotent.
-    if let Some(control) = remote_ipc_control.as_ref() {
-        control.begin_app_exit();
-    }
-    drop(remote_service_manager.take());
-    if let Some(handle) = remote_session_handle.as_ref() {
-        handle.retire_app_without_ui_owner();
-    }
-    drop(remote_ipc_server.take());
-    if let Some(producer) = collection_remote_producer.as_ref() {
-        producer.close_and_drain();
-    }
-    if let Ok(runtime) = collection_runtime {
-        runtime.shutdown_and_join();
-    }
-    if let Some(owner) = book_composition_owner.lock().unwrap().take() {
-        owner.shutdown_and_join();
-    }
-    if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
-        for result in owner.shutdown_and_join() {
-            if let Err(error) = result.status {
-                logger::log(format!("spread_shift: exit save failed: {error}"));
+    let run_succeeded = run_result.is_ok();
+    run_native_failure::finish_run_native(
+        run_result,
+        scripted_run,
+        &data_dir::get(),
+        || {
+            native_trace.finish(if run_succeeded {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            });
+            // Stop public admission before named-pipe workers, then close the only Remote collection
+            // producer before joining the actor. The App normally completed its drain in on_exit; this
+            // outer fallback also covers creator failure/panic and is deliberately idempotent.
+            if let Some(control) = remote_ipc_control.as_ref() {
+                control.begin_app_exit();
             }
-        }
-    }
-    // Rendering and normal shutdown are complete. Preserve the buffered tail for
-    // every perf category without adding another periodic log write on the UI.
-    perf::flush();
-    #[cfg(all(feature = "test-script", windows))]
-    if scripted_run && run_result.is_ok() {
-        miv_startup::terminal(if test_script::process_exit_code() == Some(0) {
-            miv_startup::Outcome::Ok
-        } else {
-            miv_startup::Outcome::Error
-        });
-        finish_logs();
-        test_script::exit_after_run_native();
-    }
-    miv_startup::terminal(if run_result.is_ok() {
-        miv_startup::Outcome::Ok
-    } else {
-        miv_startup::Outcome::Error
-    });
-    finish_logs();
-    run_result
+            drop(remote_service_manager.take());
+            if let Some(handle) = remote_session_handle.as_ref() {
+                handle.retire_app_without_ui_owner();
+            }
+            drop(remote_ipc_server.take());
+            if let Some(producer) = collection_remote_producer.as_ref() {
+                producer.close_and_drain();
+            }
+            if let Ok(runtime) = collection_runtime {
+                runtime.shutdown_and_join();
+            }
+            if let Some(owner) = book_composition_owner.lock().unwrap().take() {
+                owner.shutdown_and_join();
+            }
+            if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
+                for result in owner.shutdown_and_join() {
+                    if let Err(error) = result.status {
+                        logger::log(format!("spread_shift: exit save failed: {error}"));
+                    }
+                }
+            }
+            // Rendering and normal shutdown are complete. Preserve the buffered tail for
+            // every perf category without adding another periodic log write on the UI.
+            perf::flush();
+            #[cfg(all(feature = "test-script", windows))]
+            if scripted_run && run_succeeded {
+                miv_startup::terminal(if test_script::process_exit_code() == Some(0) {
+                    miv_startup::Outcome::Ok
+                } else {
+                    miv_startup::Outcome::Error
+                });
+                finish_logs();
+                test_script::exit_after_run_native();
+            }
+        },
+        run_native_failure::NativeExit,
+    )
 }
 
 /// `--window-size WxH` 引数をパース（例: `--window-size 1400x860`）。

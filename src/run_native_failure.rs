@@ -1,0 +1,429 @@
+//! The single post-run boundary, including failures before an App exists.
+use std::error::Error;
+use std::path::{Path, PathBuf};
+
+pub(crate) struct FailureReport {
+    pub kind: &'static str,
+    pub log_detail: String,
+    pub dialog_body: String,
+}
+
+/// No filesystem lookup: even a missing logs directory must be displayable.
+fn absolute_logs_dir(data_dir: &Path) -> std::io::Result<PathBuf> {
+    std::path::absolute(data_dir.join("logs"))
+}
+
+/// Classification and wording have no side effects. Both renderers are enabled
+/// in Cargo.toml; native-only variants follow eframe/egui-wgpu's target cfgs.
+fn run_native_failure_report(error: &eframe::Error, logs_dir_display: &str) -> FailureReport {
+    let (kind, graphics, inner): (&str, bool, Option<&dyn Error>) = match error {
+        eframe::Error::AppCreation(cause) => ("AppCreation", false, Some(cause.as_ref())),
+        #[cfg(not(target_arch = "wasm32"))]
+        eframe::Error::Winit(cause) => ("Winit", true, Some(cause)),
+        #[cfg(not(target_arch = "wasm32"))]
+        eframe::Error::WinitEventLoop(cause) => ("WinitEventLoop", false, Some(cause)),
+        #[cfg(not(target_arch = "wasm32"))]
+        eframe::Error::Glutin(cause) => ("Glutin", false, Some(cause)),
+        #[cfg(not(target_arch = "wasm32"))]
+        eframe::Error::NoGlutinConfigs(_, cause) => {
+            ("NoGlutinConfigs", false, Some(cause.as_ref()))
+        }
+        eframe::Error::OpenGL(cause) => ("OpenGL", false, Some(cause)),
+        eframe::Error::Wgpu(cause) => {
+            let (kind, inner): (&str, Option<&dyn Error>) = match cause {
+                #[cfg(windows)]
+                egui_wgpu::WgpuError::WindowSizeLimit(cause) => {
+                    ("Wgpu.WindowSizeLimit", Some(cause))
+                }
+                egui_wgpu::WgpuError::RequestAdapterError(cause) => {
+                    ("Wgpu.RequestAdapterError", Some(cause))
+                }
+                egui_wgpu::WgpuError::CustomNativeAdapterSelectionError(_) => {
+                    ("Wgpu.CustomNativeAdapterSelectionError", None)
+                }
+                egui_wgpu::WgpuError::NoSurfaceFormatsAvailable => {
+                    ("Wgpu.NoSurfaceFormatsAvailable", None)
+                }
+                egui_wgpu::WgpuError::RequestDeviceError(cause) => {
+                    ("Wgpu.RequestDeviceError", Some(cause))
+                }
+                egui_wgpu::WgpuError::CreateSurfaceError(cause) => {
+                    ("Wgpu.CreateSurfaceError", Some(cause))
+                }
+                egui_wgpu::WgpuError::HandleError(cause) => ("Wgpu.HandleError", Some(cause)),
+            };
+            (kind, true, inner)
+        }
+    };
+    // eframe::Error does not expose source(). Transparent WgpuError variants
+    // may also skip their contained error, so start from the explicit payload.
+    let mut detail = error.to_string();
+    let mut next = inner;
+    while let Some(cause) = next {
+        detail.push_str(&format!(" -> {cause}"));
+        next = cause.source();
+    }
+    let summary = error.to_string();
+    let mut chars = summary.chars().map(|c| {
+        if c.is_whitespace() || c == '\0' {
+            ' '
+        } else {
+            c
+        }
+    });
+    let mut short: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        short.push_str("...");
+    }
+    let first_line = if graphics {
+        "画面の表示処理に失敗したため、mImageViewer を終了します。"
+    } else {
+        "mImageViewer の実行中に問題が起きたため、終了します。"
+    };
+    let guidance = if graphics {
+        "グラフィックスドライバーを最新版に更新すると直ることがあります。\n直らない場合は、"
+    } else {
+        ""
+    };
+    FailureReport {
+        kind,
+        log_detail: format!("run_native failed: kind={kind} detail={detail}"),
+        dialog_body: format!(
+            "{first_line}\n\n{guidance}次のフォルダーのログを添えてお知らせください。\n{logs_dir_display}\n\n詳細: {kind}: {short}"
+        ),
+    }
+}
+
+// Effects are injected so tests exercise the same shutdown boundary without
+// starting eframe, touching process-global logs, or opening a native dialog.
+pub(crate) trait ExitEffects {
+    fn suspend_watchdog(&mut self);
+    fn record(&mut self, report: &FailureReport);
+    fn terminal(&mut self, outcome: miv_startup::Outcome);
+    fn finish_logs(&mut self);
+    fn show(&mut self, body: &str);
+}
+
+pub(crate) struct NativeExit;
+impl ExitEffects for NativeExit {
+    fn suspend_watchdog(&mut self) {
+        crate::set_ui_heartbeat_suspended(true, "run_native returned; shutting down".into());
+    }
+    fn record(&mut self, report: &FailureReport) {
+        crate::logger::log(&report.log_detail);
+        miv_startup::record_detail("run_native.failure.kind", report.kind);
+    }
+    fn terminal(&mut self, outcome: miv_startup::Outcome) {
+        miv_startup::terminal(outcome);
+    }
+    fn finish_logs(&mut self) {
+        crate::finish_logs();
+    }
+    fn show(&mut self, body: &str) {
+        crate::data_dir::show_fatal_messagebox(body);
+    }
+}
+
+pub(crate) fn finish_run_native(
+    result: eframe::Result,
+    scripted_run: bool,
+    data_dir: &Path,
+    cleanup: impl FnOnce(),
+    mut effects: impl ExitEffects,
+) -> eframe::Result {
+    let report = result.as_ref().err().map(|error| {
+        effects.suspend_watchdog();
+        // A rare path-resolution failure is recorded and notified, without
+        // turning the original rendering error into a panic or retrying I/O.
+        let logs_dir = absolute_logs_dir(data_dir);
+        let location = match &logs_dir {
+            Ok(path) => path.display().to_string(),
+            Err(_) => "ログフォルダーの場所を取得できませんでした。".into(),
+        };
+        let mut report = run_native_failure_report(error, &location);
+        if let Err(error) = logs_dir {
+            report
+                .log_detail
+                .push_str(&format!("; logs directory unavailable: {error}"));
+        }
+        effects.record(&report);
+        report
+    });
+    cleanup();
+    effects.terminal(if result.is_ok() {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
+    effects.finish_logs();
+    if let Some(report) = report
+        && !scripted_run
+    {
+        effects.show(&report.dialog_body);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct FakeExit<'a>(&'a RefCell<Vec<String>>);
+    impl ExitEffects for FakeExit<'_> {
+        fn suspend_watchdog(&mut self) {
+            self.0.borrow_mut().push("suspend".into());
+        }
+        fn record(&mut self, report: &FailureReport) {
+            assert!(report.log_detail.contains("injected failure"));
+            assert!(report.log_detail.starts_with("run_native failed: kind="));
+            self.0.borrow_mut().push(format!("record:{}", report.kind));
+        }
+        fn terminal(&mut self, outcome: miv_startup::Outcome) {
+            self.0.borrow_mut().push(format!("terminal:{outcome:?}"));
+        }
+        fn finish_logs(&mut self) {
+            self.0.borrow_mut().push("flushed".into());
+        }
+        fn show(&mut self, body: &str) {
+            assert_eq!(self.0.borrow().last().unwrap(), "flushed");
+            assert!(body.contains("injected failure"));
+            self.0.borrow_mut().push("show".into());
+        }
+    }
+
+    fn cleanup(events: &RefCell<Vec<String>>) {
+        events.borrow_mut().push("cleanup".into());
+    }
+
+    // Result injection exists only in this cfg(test) harness. The product calls
+    // this boundary with the unmodified result returned by eframe::run_native.
+    #[test]
+    fn failed_run_records_flushes_then_shows_and_returns_original_error() {
+        let events = RefCell::new(Vec::new());
+        let error = Box::new(std::io::Error::other("injected failure"));
+        let identity = &*error as *const std::io::Error;
+        let result = finish_run_native(
+            Err(eframe::Error::AppCreation(error)),
+            false,
+            Path::new("relative-data"),
+            || cleanup(&events),
+            FakeExit(&events),
+        );
+        assert_eq!(
+            *events.borrow(),
+            [
+                "suspend",
+                "record:AppCreation",
+                "cleanup",
+                "terminal:Error",
+                "flushed",
+                "show"
+            ]
+        );
+        let Err(eframe::Error::AppCreation(returned)) = result else {
+            panic!("original error lost")
+        };
+        assert_eq!(
+            returned.downcast_ref::<std::io::Error>().unwrap() as *const _,
+            identity
+        );
+    }
+
+    #[test]
+    fn scripted_failure_keeps_record_and_flush_but_suppresses_dialog() {
+        let events = RefCell::new(Vec::new());
+        assert!(
+            finish_run_native(
+                Err(eframe::Error::AppCreation(Box::new(std::io::Error::other(
+                    "injected failure"
+                )))),
+                true,
+                Path::new("relative-data"),
+                || cleanup(&events),
+                FakeExit(&events),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            *events.borrow(),
+            [
+                "suspend",
+                "record:AppCreation",
+                "cleanup",
+                "terminal:Error",
+                "flushed"
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_run_never_reports_or_shows() {
+        for scripted in [false, true] {
+            let events = RefCell::new(Vec::new());
+            finish_run_native(
+                Ok(()),
+                scripted,
+                Path::new("relative-data"),
+                || cleanup(&events),
+                FakeExit(&events),
+            )
+            .unwrap();
+            assert_eq!(*events.borrow(), ["cleanup", "terminal:Ok", "flushed"]);
+        }
+    }
+
+    #[derive(Debug)]
+    struct NestedError(&'static str, Option<Box<NestedError>>);
+    impl std::fmt::Display for NestedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl Error for NestedError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.1.as_deref().map(|source| source as &dyn Error)
+        }
+    }
+
+    #[test]
+    fn app_creation_keeps_the_deepest_source_without_gpu_advice() {
+        let error = eframe::Error::AppCreation(Box::new(NestedError(
+            "outer",
+            Some(Box::new(NestedError(
+                "middle",
+                Some(Box::new(NestedError("deepest cause", None))),
+            ))),
+        )));
+        let report = run_native_failure_report(&error, "C:\\app\\logs");
+        assert_eq!(report.kind, "AppCreation");
+        assert!(
+            report
+                .log_detail
+                .contains("outer -> middle -> deepest cause")
+        );
+        assert!(
+            report
+                .dialog_body
+                .starts_with("mImageViewer の実行中に問題が起きたため、終了します。")
+        );
+        assert!(!report.dialog_body.contains("ドライバー"));
+        assert!(report.dialog_body.contains("C:\\app\\logs"));
+    }
+
+    #[test]
+    fn representative_rendering_variants_include_driver_advice_and_detail() {
+        let mut cases = vec![
+            (
+                egui_wgpu::WgpuError::CustomNativeAdapterSelectionError(
+                    "adapter unavailable".into(),
+                ),
+                "Wgpu.CustomNativeAdapterSelectionError",
+                "adapter unavailable",
+            ),
+            (
+                egui_wgpu::WgpuError::NoSurfaceFormatsAvailable,
+                "Wgpu.NoSurfaceFormatsAvailable",
+                "no valid format",
+            ),
+            (
+                egui_wgpu::WgpuError::HandleError(eframe::wgpu::rwh::HandleError::Unavailable),
+                "Wgpu.HandleError",
+                "not available",
+            ),
+        ];
+        #[cfg(windows)]
+        cases.push((
+            egui_wgpu::WgpuError::WindowSizeLimit(std::io::Error::other("window size denied")),
+            "Wgpu.WindowSizeLimit",
+            "window size denied",
+        ));
+        for (error, kind, detail) in cases {
+            let report = run_native_failure_report(&eframe::Error::Wgpu(error), "C:\\app\\logs");
+            assert_eq!(report.kind, kind);
+            assert!(report.log_detail.contains(detail), "{}", report.log_detail);
+            assert!(
+                report
+                    .dialog_body
+                    .starts_with("画面の表示処理に失敗したため、mImageViewer を終了します。")
+            );
+            assert!(
+                report
+                    .dialog_body
+                    .contains("グラフィックスドライバーを最新版に更新")
+            );
+        }
+    }
+
+    #[test]
+    fn event_loop_and_other_errors_do_not_blame_the_gpu() {
+        for (error, kind) in [
+            (
+                eframe::Error::WinitEventLoop(winit::error::EventLoopError::ExitFailure(42)),
+                "WinitEventLoop",
+            ),
+            (
+                eframe::Error::OpenGL("painter failed".to_owned().into()),
+                "OpenGL",
+            ),
+        ] {
+            let report = run_native_failure_report(&error, "C:\\app\\logs");
+            assert_eq!(report.kind, kind);
+            assert!(
+                report
+                    .dialog_body
+                    .starts_with("mImageViewer の実行中に問題が起きたため、終了します。")
+            );
+            assert!(!report.dialog_body.contains("ドライバー"));
+            assert!(report.log_detail.contains(&error.to_string()));
+        }
+    }
+
+    #[test]
+    fn only_dialog_detail_is_shortened_and_made_single_line() {
+        let long = format!("\n\0{}tail detail", "長い理由".repeat(100));
+        let error = eframe::Error::AppCreation(Box::new(std::io::Error::other(long.clone())));
+        let report = run_native_failure_report(&error, "C:\\app\\logs");
+        assert!(report.log_detail.contains(&long));
+        let detail = report.dialog_body.split("詳細: ").nth(1).unwrap();
+        assert!(detail.ends_with("..."));
+        assert!(!detail.contains('\n'));
+        assert!(!detail.contains('\0'));
+        assert!(detail.chars().count() <= "AppCreation: ".len() + 203);
+    }
+
+    #[test]
+    fn normal_portable_and_relative_data_dirs_produce_absolute_log_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        for data in [
+            temp.path().join("Roaming/mimageviewer"),
+            temp.path().join("portable/data"),
+            PathBuf::from("target").join(temp.path().file_name().unwrap()),
+        ] {
+            let path = absolute_logs_dir(&data).unwrap();
+            assert!(path.is_absolute(), "{}", path.display());
+            assert_eq!(path.file_name().unwrap(), "logs");
+            assert!(
+                !path.exists(),
+                "the helper must not need/create the logs folder"
+            );
+            let report = run_native_failure_report(
+                &eframe::Error::Wgpu(egui_wgpu::WgpuError::NoSurfaceFormatsAvailable),
+                &path.display().to_string(),
+            );
+            assert!(report.dialog_body.contains(&path.display().to_string()));
+        }
+    }
+
+    #[test]
+    fn native_dialog_title_matches_the_build_flavor() {
+        assert_eq!(
+            crate::data_dir::FATAL_DIALOG_TITLE,
+            if cfg!(feature = "portable") {
+                "mImageViewer (ポータブル版)"
+            } else {
+                "mImageViewer"
+            }
+        );
+    }
+}
