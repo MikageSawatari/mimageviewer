@@ -1257,8 +1257,8 @@ impl App {
                         self.enter_drive_list_from_navigation(origin);
                         None
                     }
-                    crate::ui_main::AddressBarNav::ReadingHistory => {
-                        self.enter_reading_history_from_menu();
+                    crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
+                        self.enter_reading_history_with_entrance(entrance);
                         None
                     }
                     crate::ui_main::AddressBarNav::Bookmarks => {
@@ -1338,8 +1338,8 @@ impl App {
                                 self.enter_drive_list_from_navigation(origin);
                                 None
                             }
-                            crate::ui_main::AddressBarNav::ReadingHistory => {
-                                self.enter_reading_history();
+                            crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
+                                self.enter_reading_history_with_entrance(entrance);
                                 None
                             }
                             crate::ui_main::AddressBarNav::Bookmarks => {
@@ -1486,8 +1486,8 @@ impl App {
                         self.enter_drive_list_from_navigation(origin);
                         None
                     }
-                    Some(crate::ui_main::AddressBarNav::ReadingHistory) => {
-                        self.enter_reading_history();
+                    Some(crate::ui_main::AddressBarNav::ReadingHistory(entrance)) => {
+                        self.enter_reading_history_with_entrance(entrance);
                         None
                     }
                     Some(crate::ui_main::AddressBarNav::Bookmarks) => {

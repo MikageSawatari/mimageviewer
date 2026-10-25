@@ -274,7 +274,7 @@ pub(crate) enum AddressBarNav {
         restore_intent: crate::app::StartupListIntent,
     },
     DriveList(Option<PathBuf>),
-    ReadingHistory,
+    ReadingHistory(crate::app::ReadingHistoryEntrance),
     Bookmarks,
     RatingViewBack,
     BooksRoot,
@@ -14840,7 +14840,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(AddressBarNav::DriveList(None)) => {
                                         "ドライブ一覧へ [BS]".to_string()
                                     }
-                                    Some(AddressBarNav::ReadingHistory) => {
+                                    Some(AddressBarNav::ReadingHistory(_)) => {
                                         "閲覧履歴へ戻る [BS]".to_string()
                                     }
                                     Some(AddressBarNav::Bookmarks) => {
@@ -14977,7 +14977,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                     crate::known_folders::LocationMenuEntry::ReadingHistory => {
                                         if ui.button("閲覧履歴").clicked() {
-                                            result = Some(AddressBarNav::ReadingHistory);
+                                            result = Some(AddressBarNav::ReadingHistory(crate::app::ReadingHistoryEntrance::Menu));
                                             ui.close();
                                         }
                                     }

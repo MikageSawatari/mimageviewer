@@ -32160,11 +32160,15 @@ mod phase_c_drill_nav_tests {
         app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip"));
         assert!(matches!(
             app.reading_history_back_nav(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
         assert!(matches!(
             app.handle_grid_parent_folder_action(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
 
         // 本より深い階層 / 別の場所では通常の親フォルダ遷移 (= 閲覧履歴ではない)。
@@ -32247,7 +32251,9 @@ mod phase_c_drill_nav_tests {
         );
         assert!(matches!(
             app.reading_history_back_nav(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
     }
 
@@ -32395,7 +32401,9 @@ mod phase_c_drill_nav_tests {
         app.archive_source_override = Some(std::path::PathBuf::from("c:/books/a.rar"));
         assert!(matches!(
             app.reading_history_back_nav(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
 
         // ブックマーク一覧から開いた変換アーカイブも、cache ZIP ではなく元アーカイブを

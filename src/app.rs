@@ -961,8 +961,8 @@ enum BookmarkSurfaceEntrance {
     Restore,
 }
 
-#[derive(Clone, Copy)]
-enum ReadingHistoryEntrance {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReadingHistoryEntrance {
     Menu,
     Return,
 }
@@ -23793,8 +23793,9 @@ impl App {
         }
         let from = self.reading_history_return_from.as_ref()?;
         let cur = self.effective_folder()?;
-        crate::folder_tree::path_eq(&cur, from)
-            .then_some(crate::ui_main::AddressBarNav::ReadingHistory)
+        crate::folder_tree::path_eq(&cur, from).then_some(
+            crate::ui_main::AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Return),
+        )
     }
 
     /// 横断ブックマーク一覧から直接開いた本・動画・音声を閉じるときだけ、
@@ -24340,8 +24341,8 @@ impl App {
                 self.enter_drive_list_from_navigation(origin);
                 true
             }
-            crate::ui_main::AddressBarNav::ReadingHistory => {
-                self.enter_reading_history();
+            crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
+                self.enter_reading_history_with_entrance(entrance);
                 true
             }
             crate::ui_main::AddressBarNav::Bookmarks => {
@@ -33991,22 +33992,28 @@ impl App {
 
     /// メニュー操作で閲覧履歴を開く。
     ///
-    /// 履歴 ←/→ からの復元は `dispatch_synthetic_folder_history_target` が
-    /// `enter_reading_history` を直接呼ぶ。ここでだけ遷移を記録することで、メニュー起動時の
-    /// 直前フォルダは back stack に残しつつ、履歴復元時の二重記録を避ける。
+    /// メニュー起動時の直前フォルダを back stack に残し、保存位置を破棄する。
+    /// 親へ戻る操作・履歴復元は Return の入口で保存位置を引き継ぐ。
     pub(crate) fn enter_reading_history_from_menu(&mut self) {
-        self.adopt_synthetic_surface(
-            FolderNavHistoryTarget::Path(reading_history_synthetic_path()),
-            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
-            None,
-        );
+        self.enter_reading_history_with_entrance(ReadingHistoryEntrance::Menu);
     }
 
     /// 閲覧履歴ビューを開く。
     pub(crate) fn enter_reading_history(&mut self) {
+        self.enter_reading_history_with_entrance(ReadingHistoryEntrance::Return);
+    }
+
+    /// The producer owns menu/return intent; dispatchers must not infer it from the input lane.
+    fn enter_reading_history_with_entrance(&mut self, entrance: ReadingHistoryEntrance) {
+        let history = match entrance {
+            ReadingHistoryEntrance::Menu => {
+                MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
+            }
+            ReadingHistoryEntrance::Return => MainHistoryOperation::Restore { route: None },
+        };
         self.adopt_synthetic_surface(
             FolderNavHistoryTarget::Path(reading_history_synthetic_path()),
-            MainHistoryOperation::Restore { route: None },
+            history,
             None,
         );
     }
