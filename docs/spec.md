@@ -1,5 +1,15 @@
 # mimageviewer 仕様書
 
+### 表示処理の失敗による終了（§1.428）
+
+`run_native` が `Err` を返した場合は、失敗の種類と最深部までの原因連鎖を動作ログへ、
+種類を起動記録へ残す。watchdog休止・既存cleanup・終了記録・ログflushの後に、短い理由と
+ログフォルダーの絶対パスをnativeダイアログで知らせ、元のErrを返す。描画/ウィンドウ準備の
+失敗だけにドライバー更新を案内し、アプリ作成/イベントループ等の失敗ではGPUと断定しない。
+`test-script` featureの有無ではなく、自動script実行時だけ表示を抑止する。
+panic・backend再試行・依存ライブラリの保存ログ対象拡大は含まない。
+詳細は [描画失敗の報告設計](render-init-failure-report-plan.md)。
+
 ### Everything ファイル名検索（§1.374、実装中・検証待ち）
 
 - mainの一覧で `GlobalEverythingSearch`（Grid / Press / 既定Ctrl+R）、または

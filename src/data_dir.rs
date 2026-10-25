@@ -381,28 +381,33 @@ fn portable_fatal_unwritable(dir: &Path, detail: &str) {
     show_fatal_messagebox(&msg);
 }
 
-#[cfg(all(feature = "portable", not(test), windows))]
-fn show_fatal_messagebox(msg: &str) {
-    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+pub(crate) const FATAL_DIALOG_TITLE: &str = if cfg!(feature = "portable") {
+    "mImageViewer (ポータブル版)"
+} else {
+    "mImageViewer"
+};
+
+#[cfg(windows)]
+pub(crate) fn show_fatal_messagebox(msg: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+    };
     use windows::core::PCWSTR;
 
-    let title: Vec<u16> = "mImageViewer (ポータブル版)"
-        .encode_utf16()
-        .chain([0])
-        .collect();
+    let title: Vec<u16> = FATAL_DIALOG_TITLE.encode_utf16().chain([0]).collect();
     let body: Vec<u16> = msg.encode_utf16().chain([0]).collect();
     unsafe {
         let _ = MessageBoxW(
             None,
             PCWSTR(body.as_ptr()),
             PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONERROR,
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
         );
     }
 }
 
-#[cfg(all(feature = "portable", not(test), not(windows)))]
-fn show_fatal_messagebox(_msg: &str) {}
+#[cfg(not(windows))]
+pub(crate) fn show_fatal_messagebox(_msg: &str) {}
 
 /// `include_bytes!` で埋め込んだファイルを指定パスに展開する。
 ///

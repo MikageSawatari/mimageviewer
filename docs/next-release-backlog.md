@@ -38,6 +38,23 @@
 
 ## 1. 優先候補
 
+### 1.429 描画先 (surface) に対応しない GPU を選ぶと、エラーではなく panic で終わる経路がある — §1.428 の設計レビューで発見 (2026-10-25)
+
+- 状態: **未着手**。コード調査 (Codex 独立設計レビュー、§1.428 第 1 版への指摘)。実行時の観測は無い。
+- 内容: `src/lib.rs` の adapter selector は DX12、なければ Vulkan の adapter を選ぶが、描画先 (surface) との相性を確かめない。
+  選んだ adapter が surface に対応しないと、`vendor/egui-wgpu/src/winit.rs:165` 付近の `expect` で panic する (Err にならないので §1.428 の報告にも乗らない)。
+  ほかに wgpu の既定 uncaptured-error handler も panic で終わる。selector は v4.7.1 から同じだが、wgpu 30 で adapter の列挙や対応範囲が変わった可能性がある。
+- 対応の方向: selector で surface との相性を確かめてから選ぶ (対応する adapter が無ければ Err を返して §1.428 の報告に乗せる)。panic で終わる起動中の経路を、Err へ変えるか、最初の表示前の panic にも同じ通知を出すかを比べる。vendor の変更は PATCHES.md に記録する。
+- 規模 / 優先度: Small〜Medium / P2 (環境によっては起動しない原因になり得る)。
+
+### 1.428 起動時に描画の初期化に失敗すると、何も表示せずに終了し、理由も残らない — X の「4.8.0 から起動しない」投稿の調査 (2026-10-25)
+
+- 状態: **対応中 (利用者 2026-10-25、§1.425 と同じ次の版に入れる)**。設計の正本は [render-init-failure-report-plan.md](render-init-failure-report-plan.md)。ブランチ `render-init-1428`。
+- 出どころ: X の投稿 (症状・環境は不明、投稿者には連絡しない = 利用者決定)。v4.8.1 は Windows Sandbox (VC++ なし) の GPU あり / なしで起動に成功 (ClaudeCode の観測)。投稿の原因は未特定。
+- 内容 (コード確認): `eframe::run_native` が `Err` を返すと、メッセージも出さずに終了し、エラーの文は `mimageviewer.log` にも残らない。v4.7.1 から同じ作りだが、v4.8.0 の wgpu 30 / eframe 0.37 でこの経路に入る環境が増えた可能性がある。
+- 対応: 失敗の種類と文をログと起動記録に残し、終了前にメッセージボックスで理由とログの場所を知らせる。backend の自動再試行はしない (計画 §6)。
+- 規模 / 優先度: Small / P2。
+
 ### 1.427 ReleaseChecks の perf 判定が、操作で予定より早く起きた待機を「説明のつかない止まり」にする — v4.8.1 の ReleaseChecks (2026-10-24)
 
 - 状態: **未着手・起票 (利用者 2026-10-24)**。v4.8.1 では判定を変えずに ReleaseChecks を流し直す (利用者決定)。

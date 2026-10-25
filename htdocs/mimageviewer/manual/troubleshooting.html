@@ -221,6 +221,18 @@ start "" "C:\Tools\mImageViewer\mimageviewer.exe" --data-dir "C:\Tools\mImageVie
     <p>特に、A で「固まって強制終了もできない」状態になり、B では起きなくなるかどうかが重要です。
     B で起きなくなるなら、以後も同じショートカットを使うことで、画像は NAS のままデータだけを PC 内に置けます。</p>
 
+    <h3 id="display-failure">表示処理の失敗や、実行中の問題を知らせるメッセージが出て終了する</h3>
+    <p>メッセージにグラフィックスドライバーの更新案内がある場合は、ドライバーを最新版に更新してください。
+    更新しても直らない場合や、更新案内のないメッセージが出た場合は、表示された詳細と、問題が起きるまでの操作をお知らせください。</p>
+    <p>アプリを開けない場合も、メッセージに表示されたフォルダーのログをエクスプローラーから取り出せます。
+    通常版の既定の場所は <code>%APPDATA%\mimageviewer\logs</code>、ポータブル版は展開先の <code>data\logs</code> です。
+    保存先を指定して起動している場合は、指定したフォルダー内の <code>logs</code> にあります。
+    <code>mimageviewer.log</code> と、同じ名前で始まる過去のログがあれば一緒に添えて、
+    <a href="https://github.com/MikageSawatari/mimageviewer/issues">GitHub の不具合報告</a>へお送りください。</p>
+    <p>起動の経過を残す記録は別の場所にあります。通常版は <code>%LOCALAPPDATA%\mimageviewer\startup-logs</code>、
+    ポータブル版は展開先の <code>data\logs\startup</code> です。保存先を指定して起動している場合は、
+    指定したフォルダー内の <code>logs\startup</code> にあります。</p>
+
     <h3>画面が真っ黒 / 何も表示されない</h3>
     <ul>
       <li>GPU ドライバーを最新バージョンに更新してください</li>
