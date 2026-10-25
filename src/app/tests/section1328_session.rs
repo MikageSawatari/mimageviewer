@@ -217,6 +217,269 @@ fn section1328_session_reading_folder_back_bs_and_forward_back() {
     }
 }
 
+fn session1328_main_navigation() -> super::update_phases::MainFrameNavigation {
+    super::update_phases::MainFrameNavigation {
+        fav_nav: None,
+        toolbar_fav_nav: None,
+        fullscreen_close_nav: None,
+        keyboard_nav: None,
+        keyboard_nav_from_fullscreen_close: false,
+        gamepad_nav: None,
+        address_nav: None,
+        open_folder_nav: None,
+        context_nav: None,
+        folder_pane_nav: None,
+        grid_nav: None,
+    }
+}
+
+fn session1328_key_nav(
+    app: &mut App,
+    ctx: &egui::Context,
+    key: egui::Key,
+) -> Option<crate::ui_main::AddressBarNav> {
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+    let nav = app.handle_keyboard(ctx);
+    ctx.end_pass().drop_without_applying_deltas();
+    nav
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Session1328ReadingReturn {
+    Backspace,
+    HistoryBack,
+    CloseReturn,
+    ParentButton,
+    GamepadBack,
+}
+
+fn session1328_reading_zip_main_return(input: Session1328ReadingReturn) {
+    use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+    for slot in [None, Some(QuickFolderSlotId::A), Some(QuickFolderSlotId::B)] {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = slot;
+        let root = app.tmp.path().join("source");
+        let paths = session1328_reading(&mut app, &root, 6);
+        let zip = root.join("0004.zip");
+        write_1328_zip(&zip);
+        let db = app.reading_history_db.as_ref().unwrap();
+        db.remove_key(&crate::path_key::normalize_keep_drive(&paths[4]))
+            .unwrap();
+        let mut entry = ReadingHistoryEntry::new(
+            zip.clone(),
+            ReadingHistoryKind::Zip,
+            None,
+            "zip".into(),
+            None,
+            None,
+        );
+        entry.last_read_at_ms = 999_996;
+        db.upsert(entry, 1000).unwrap();
+        app.enter_reading_history_from_menu();
+        session1328_settle(&mut app);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.items[4].container_path(), Some(zip.as_path()));
+        app.selected = Some(4);
+        app.scroll_offset_y = 420.0;
+        let ctx = egui::Context::default();
+        let mut navigation = session1328_main_navigation();
+        navigation.grid_nav = Some(app.grid_physical_navigation(4, zip.clone(), false));
+        app.post_render_main_navigation(&ctx, navigation);
+        session1328_settle(&mut app);
+        assert!(!app.items_are_reading_history_view);
+        assert!(app.zip_nav.as_ref().is_some_and(|nav| nav.at_root()));
+        assert_eq!(app.reading_history_return_from.as_ref(), Some(&zip));
+        let saved_key = crate::path_key::normalize_keep_drive(&zip);
+        assert_eq!(
+            app.top_level_grid_view
+                .reading_history_position()
+                .and_then(|position| position.selected_key.as_deref()),
+            Some(saved_key.as_str()),
+        );
+        let mut navigation = session1328_main_navigation();
+        match input {
+            Session1328ReadingReturn::Backspace => {
+                // Include the real key handler AND the winning main-frame dispatcher.
+                // apply_fullscreen_close_nav_immediate bypasses the failing dispatcher.
+                navigation.keyboard_nav = session1328_key_nav(&mut app, &ctx, egui::Key::Backspace);
+                assert!(navigation.keyboard_nav.is_some());
+            }
+            Session1328ReadingReturn::HistoryBack => {
+                navigation.address_nav = Some(crate::ui_main::AddressBarNav::HistoryBack);
+            }
+            Session1328ReadingReturn::CloseReturn => {
+                // Esc auto-open direct return resolves through close_return.rs before dispatch.
+                app.pending_return_to_parent.request_live();
+                navigation.fullscreen_close_nav = app.take_close_return_navigation();
+                assert!(navigation.fullscreen_close_nav.is_some());
+            }
+            Session1328ReadingReturn::ParentButton => {
+                navigation.address_nav = app.resolve_grid_parent_nav();
+                assert!(navigation.address_nav.is_some());
+            }
+            Session1328ReadingReturn::GamepadBack => {
+                navigation.gamepad_nav = app.handle_gamepad_grid_back();
+                assert!(navigation.gamepad_nav.is_some());
+            }
+        }
+        app.post_render_main_navigation(&ctx, navigation);
+        session1328_settle(&mut app);
+        assert!(app.items_are_reading_history_view);
+        assert_eq!(app.selected, Some(4), "input={input:?} slot={slot:?}");
+        assert_eq!(
+            app.items[app.selected.unwrap()].container_path(),
+            Some(zip.as_path())
+        );
+        assert!(app.scroll_to_selected);
+        assert_eq!(app.scroll_offset_y, 420.0);
+
+        // Explicit location commands must still discard the saved row in every input lane.
+        for lane in 0..4 {
+            app.selected = Some(4);
+            let nav = app
+                .apply_location_navigation_key_action(
+                    &ctx,
+                    KeyAction::GridOpenLocationReadingHistory,
+                    "section1328-menu",
+                )
+                .expect("explicit reading-history command");
+            assert!(matches!(
+                nav,
+                crate::ui_main::AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Menu)
+            ));
+            let mut navigation = session1328_main_navigation();
+            match lane {
+                0 => navigation.keyboard_nav = Some(nav),
+                1 => navigation.address_nav = Some(nav),
+                2 => navigation.gamepad_nav = Some(nav),
+                _ => navigation.grid_nav = Some(nav),
+            }
+            app.post_render_main_navigation(&ctx, navigation);
+            session1328_settle(&mut app);
+            assert_eq!(app.selected, Some(0), "menu lane={lane}");
+        }
+    }
+}
+
+#[test]
+fn section1328_session_reading_zip_main_back_bs_restores_saved_row() {
+    session1328_reading_zip_main_return(Session1328ReadingReturn::Backspace);
+}
+
+#[test]
+fn section1328_session_reading_zip_main_toolbar_back_restores_saved_row() {
+    session1328_reading_zip_main_return(Session1328ReadingReturn::HistoryBack);
+}
+
+#[test]
+fn section1328_session_reading_zip_main_close_and_parent_returns_restore_saved_row() {
+    for input in [
+        Session1328ReadingReturn::CloseReturn,
+        Session1328ReadingReturn::ParentButton,
+        Session1328ReadingReturn::GamepadBack,
+    ] {
+        session1328_reading_zip_main_return(input);
+    }
+}
+
+#[test]
+fn section1328_session_zip_bs_preserves_physical_and_expansion_parent_meaning() {
+    for expanded in [false, true] {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let root = app.tmp.path().join("source");
+        let zip = if expanded {
+            session1328_expansion(&mut app, &root, 600)[309].clone()
+        } else {
+            std::fs::create_dir_all(root.join("a-first")).unwrap();
+            let zip = root.join("book.zip");
+            write_1328_zip(&zip);
+            app.load_folder(root.clone());
+            session1328_settle(&mut app);
+            zip
+        };
+        let index = app
+            .items
+            .iter()
+            .position(|item| item.container_path() == Some(zip.as_path()))
+            .unwrap();
+        session1328_open(&mut app, index, zip.clone());
+        let ctx = egui::Context::default();
+        let mut navigation = session1328_main_navigation();
+        navigation.keyboard_nav = session1328_key_nav(&mut app, &ctx, egui::Key::Backspace);
+        assert!(
+            matches!(navigation.keyboard_nav, Some(crate::ui_main::AddressBarNav::Direct(ref parent, _)) if crate::folder_tree::path_eq(parent, &root))
+        );
+        app.post_render_main_navigation(&ctx, navigation);
+        session1328_settle(&mut app);
+        assert!(!app.items_are_reading_history_view);
+        assert!(!app.items_are_subfolder_expansion_view);
+        assert_eq!(app.current_folder.as_ref(), Some(&root));
+        assert_eq!(
+            app.items[app.selected.unwrap()].container_path(),
+            Some(zip.as_path())
+        );
+        assert!(app.scroll_to_selected);
+    }
+}
+
+#[test]
+fn section1328_session_reading_deep_zip_parent_does_not_return_to_history() {
+    let mut app = setup_app();
+    app.active_quick_folder_slot = None;
+    app.settings.auto_fullscreen_zip_pdf = false;
+    let zip = app.tmp.path().join("nested.zip");
+    let file = std::fs::File::create(&zip).unwrap();
+    let mut writer = zip::ZipWriter::new(file);
+    for name in ["root.jpg", "A/cover.jpg", "A/sub/page.jpg"] {
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"page").unwrap();
+    }
+    writer.finish().unwrap();
+    app.load_folder(zip.clone());
+    session1328_settle(&mut app);
+    app.reading_history_return_from = Some(zip.clone());
+    app.zip_nav_enter("A/");
+    session1328_settle(&mut app);
+    app.zip_nav_enter("A/sub/");
+    session1328_settle(&mut app);
+    assert!(app.grid_item_input_allowed());
+    assert!(app.reading_history_back_nav().is_none());
+    let (close_nav, _) = app
+        .resolve_close_return_navigation()
+        .expect("existing physical close target");
+    assert!(matches!(
+        close_nav,
+        crate::ui_main::AddressBarNav::Direct(_, _)
+    ));
+    let ctx = egui::Context::default();
+    assert!(session1328_key_nav(&mut app, &ctx, egui::Key::Backspace).is_none());
+    assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+    assert!(app.reading_history_back_nav().is_none());
+    session1328_settle(&mut app);
+    assert!(session1328_key_nav(&mut app, &ctx, egui::Key::Backspace).is_none());
+    assert!(app.zip_nav.as_ref().unwrap().at_root());
+    assert!(matches!(
+        app.reading_history_back_nav(),
+        Some(crate::ui_main::AddressBarNav::ReadingHistory(
+            ReadingHistoryEntrance::Return
+        ))
+    ));
+    assert_eq!(app.reading_history_return_from.as_ref(), Some(&zip));
+}
+
 #[test]
 fn section1328_session_search_pending_saves_latest_reading_and_subfolder_rows() {
     for reading in [true, false] {

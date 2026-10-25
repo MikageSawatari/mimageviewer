@@ -76,8 +76,11 @@ Collection 採用、Drive 入場、★固定作成直前）で `save_departing_s
 固定解除時は surface が先に Folder に戻っても Snapshot の行が残り得るため、surface だけで判定しない。
 空の中間表示と detached physical context も保存しない。detached の述語・viewport 経路は変更しない。
 
-閲覧履歴は `ReadingHistoryEntrance::Menu / Return` を呼び出しの目的から運ぶ。検索中の history 操作の
-書換えより前に区別し、Menu は最後の保存後に位置を捨てて先頭に入る。Return は shell の hydration
+閲覧履歴は `ReadingHistoryEntrance::Menu / Return` を呼び出しの目的から運ぶ。
+`AddressBarNav::ReadingHistory(entrance)` も生成元で目的を確定し、main-frame / immediate dispatcher は
+同じ `enter_reading_history_with_entrance` へ渡す。BS・親ボタン・Pad B・Esc 直帰は Return、
+場所メニュー・明示コマンドは Menu。入力 lane からメニュー入場と推測しない（§1.328 の BS 退行）。
+検索中の history 操作の書換えより前に区別し、Menu は最後の保存後に位置を捨てて先頭に入る。Return は shell の hydration
 continuation に seed を渡し、実 rows の hydrate 後に可視な安定キーの行を選び offset と ensure-visible を戻す。
 履歴への入場時に Ctrl+F を閉じて取り消す既存仕様は維持する。shell 待ち中の検索再適用は変更しない。
 ブックマーク一覧の専用入口・位置 owner は変更しない。

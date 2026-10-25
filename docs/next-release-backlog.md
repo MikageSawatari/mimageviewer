@@ -1871,7 +1871,23 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   開いていた行が選ばれた (book_03・book_02 で確認)。サブ展開から本を開き ← で戻っても、開いていた行が選ばれた。
   **ただし閲覧履歴から開いた本で BS を押すと、閲覧履歴の一覧には戻るが先頭 (最新) が選ばれる** (book_02 で 2 回)。
   通常フォルダから開いた本では BS でも元の行に戻る。サブ展開から開いた本で BS を押すと、サブ展開が解除された親フォルダへ戻り、
-  その本が選ばれる (BS = 親フォルダへの既存の意味どおり)。閲覧履歴の BS 経路が、← と同じ保存・復元の境界を通っていないとみられる (コード未確認)。
+  その本が選ばれる (BS = 親フォルダへの既存の意味どおり)。
+  **原因と修正 (同日、branch histbs-1328、未 commit)**: 保存位置は残っていたが、main-frame dispatcher
+  (`post_render_main_navigation`) が BS / Esc 直帰の `AddressBarNav::ReadingHistory` をメニュー入場へ送り、
+  `install_reading_history_surface` の Menu 処理が位置を消していた。既存の Folder BS テストは immediate dispatcher を使い、
+  実アプリのこの経路を通っていなかった。ZIP を開き、BS キー処理と main-frame dispatcher まで通す追加テストで、
+  修正前に ← は成功・BS だけ先頭選択で失敗することを確認した。
+  `ReadingHistoryEntrance::Menu / Return` をナビゲーション値の生成元から運び、すべての dispatcher で共通入口へ渡す。
+  本からの BS / 親ボタン / Pad B / Esc 直帰は Return、場所メニュー・明示コマンドは Menu とし、← と同じ位置 owner と
+  Return の保存・復元境界を使用する。選択の後書き戻し・待機・再試行は追加しない。通常フォルダ・サブ展開からの BS、
+  ZIP の深い階層から一段ずつ戻る挙動と `close_return.rs` の深さ判定、detached の述語・viewport は変更しない。
+  独立 Sol / xhigh レビューは重要指摘なし。修正前の比較テストは ← 1成功・BS 1失敗。
+  修正後の `cargo test -p mimageviewer --lib section1328_` は55成功・0失敗、
+  `scripts/test-focused.ps1 -Path src/app/tests/section1328_session.rs` は20成功・0失敗、両方 exit 0。
+  `cargo fmt --check` も exit 0。途中の型import不足と、深いZIP fixtureがidentity準備を待たない不備は修正済み。
+  ログは `target/histbs-1328-section-final.log` / `target/histbs-1328-focused.log`。
+  `scripts/build-dev.ps1 -PreserveRuntime` も exit 0 (通常feature、core / remote / EPUB PDF worker、VCRT PE検査成功)。
+  full lib はClaudeCode担当。修正後の実アプリ確認は未実施 (製品 exe は起動しない)。
 - 残り: **閲覧履歴とサブフォルダ展開から開いた後の ←** でも、開いていた項目が選ばれず先頭が選ばれる (コード調査。別原因)。
   - 閲覧履歴: replay は `enter_reading_history` へ再入場し、一覧の install が先頭を選ぶ。返り先に opened-row anchor を持たない。
   - サブフォルダ展開: restore state は root / snapshot / tombstone を保持するが selection anchor / scroll を持たず、prepare 完了時に先頭を選ぶ。
