@@ -3,25 +3,24 @@
 use super::*;
 use crate::{FontFamily, FontId, Mesh, Pos2, Tessellator, TextShape, text::*};
 
-fn font_bytes(filename: &str) -> Option<Blob> {
+/// A missing font fails the test instead of skipping it: mIV is Windows-only and these
+/// fonts ship with Windows, so a skip would silently report a regression gate as passed.
+fn font_bytes(filename: &str) -> Blob {
     let path =
         std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:/Windows".into()))
             .join("Fonts")
             .join(filename);
     match std::fs::read(&path) {
-        Ok(bytes) => Some(Arc::new(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("SKIP: {} is not installed ({error})", path.display());
-            None
-        }
-        Err(error) => panic!("Cannot read {}: {error}", path.display()),
+        Ok(bytes) => Arc::new(bytes),
+        Err(error) => panic!(
+            "Cannot read {} ({error}); the §1.443 regression needs this Windows font",
+            path.display()
+        ),
     }
 }
 
 fn check_font(filename: &str, index: u32, name: &str, emoji: bool) {
-    let Some(bytes) = font_bytes(filename) else {
-        return;
-    };
+    let bytes = font_bytes(filename);
     let text = if emoji { "😀" } else { "A1あ日" };
     let mut face = FontFace::new(
         TextOptions::default(),

@@ -137,3 +137,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 ライトテーマで該当7フォントの `A1 あ日` が通常の文字色で読め、
 Meiryo とカラー絵文字 `😀` の色が保たれることが手動の確認対象。
+
+## 独立レビュー後の修正 (2026-10-25)
+
+- フォントが見つからないときに検査を飛ばして成功扱いにしていたのを、失敗にした (mIV は Windows 専用で、対象のフォントは Windows に同梱される)。
+- epaint は workspace の外なので、`scripts/test-full.ps1` に `vendor/epaint` の lib テスト (`default_fonts,color_fonts`) を足し、全体テストで必ず走るようにした。

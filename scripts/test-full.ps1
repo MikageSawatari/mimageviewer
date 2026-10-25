@@ -87,6 +87,14 @@ public static class MivTestErrorMode
         }
 
         if ($gateExit -eq 0) {
+            # vendor/epaint is workspace-excluded as well. Its 1.443 system-font color
+            # regressions only run here; keep the run unfiltered with color fonts enabled.
+            Write-Host '[test-full] cargo nextest run --manifest-path vendor/epaint/Cargo.toml --features default_fonts,color_fonts --lib'
+            & cargo nextest run --manifest-path vendor/epaint/Cargo.toml --features default_fonts,color_fonts --lib @nextestArgs
+            $gateExit = $LASTEXITCODE
+        }
+
+        if ($gateExit -eq 0) {
             # vendor/egui-winit is workspace-excluded. Exercise IME key routing and
             # trace regressions without a filter, including future tests.
             # Cargo requires this excluded package's standalone graph for its
