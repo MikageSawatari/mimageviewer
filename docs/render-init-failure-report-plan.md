@@ -103,3 +103,81 @@ P2 4 件・P3 4 件) を取り込んだ。実装は Codex、差分の独立レ�
 - `htdocs/mimageviewer/manual/troubleshooting.html` に、この表示が出たときの案内 (ドライバー更新・ログの場所・連絡方法) を足す。
   通常版の startup-logs (`%LOCALAPPDATA%`) とログ (`%APPDATA%\mimageviewer\logs`) の場所を混同しない。
 - 必要に応じて `docs/startup-diagnostics-plan.md` に参照を足す。detached 凍結規則には触れない (`run()` の終端・logger・native helper のみ)。
+
+## 9. 実装・検証記録（2026-10-25）
+
+対象は `render-init-1428`、開始HEAD `ebc4e1c67` の未コミット差分。製品exeの起動・commitはしない。
+§1.429のpanic、adapter selector、backend選択、依存ライブラリのログ保存対象は変更していない。
+
+### 実装と第2版からの具体化
+
+- `src/run_native_failure.rs` に分類・文面の純粋関数と、製品・fake共通の終了境界を置いた。
+  現在のCargo構成はglow/wgpuの両方を有効にするため、eframeの7種とWgpuErrorの7種を網羅し、
+  native/Windows専用variantには依存元と同じtarget cfgを付ける。
+- `run()` の既存cleanupを `FnOnce` としてそのまま渡す。新しいworkerや非同期状態は作らず、
+  event loop復帰後の直列処理に統一することで組み合わせを増やさない。既存script成功時の
+  exit code判定・terminal・flush・process exitはcleanupの末尾に残す。
+- 文面へ渡すログの場所は `std::path::absolute` で解決し、存在確認・canonicalizeを行わない。
+  解決自体のまれな失敗は、元Errをpanicで置き換えず、解決失敗をログと通知へ加えて終了する。
+  保存/解決失敗へのretry・同期fallbackは足さない（既定の割り切り）。
+- `data_dir::show_fatal_messagebox` を通常版でも使える共通helperにした。ownerなし・
+  `MB_OK | MB_ICONERROR | MB_SETFOREGROUND`、build flavorごとの題名を共有する。
+- 結果注入は `cfg(test)` のfake harnessで共通終了境界へErrを渡す方式を採った。
+  通常版/test-script版とも、実行引数・環境変数などの故障注入入口は追加していない。
+  そのため実ダイアログの外観を注入で確認するには、別途隔離テスト用の準備が必要。
+- 公開案内の起動記録パスは実装で照合した。ポータブル既定は `data/logs/startup`、
+  明示 `--data-dir` では指定先の `logs/startup`。通常版既定の `%LOCALAPPDATA%/mimageviewer/startup-logs`
+  と区別して記載した。
+
+### 回帰検出と独立レビュー
+
+- `failed_run_records_flushes_then_shows_and_returns_original_error` を、共通終了境界の本体が
+  旧動作相当（cleanup→terminal→flushだけ）の段階で実行し、**exit 101 / 1 failed** を確認。
+  実際のイベントは `[cleanup, terminal:Error, flushed]` で、要求する休止・記録・表示が無い。
+  コマンド: `cargo test -p mimageviewer --lib run_native_failure::tests::failed_run_records_flushes_then_shows_and_returns_original_error`。
+  記録: `target/render-init-red.log`。
+- 実装後の最初の9件は8成功/1失敗（exit 101）。HandleErrorの依存Displayが `not available` のところを
+  `unavailable` と期待したテスト側の誤りで、実際の全文記録・分類・案内は正しかった。
+  期待値を依存sourceどおり修正し、短縮テストの改行/NULを短縮より前へ移して検査を強化した。
+  記録: `target/render-init-tests.log`。
+- 独立レビュー: GPT-6.1 Sol / xhigh、最終コードと文書を確認して **ACCEPT / P1-P3追加指摘なし**。
+  テストは実装担当が所有し、レビュー担当は重複実行していない。
+- 最終scope確認で、watchdog休止はErrのreport構築先頭だけに限定した。§2の対象外である
+  Ok終了時のwatchdog動作は従来どおりとする最小調整で、独立レビュアーも同意。
+  関連23件の成功後にこの調整を行ったため、影響する新規9件だけを再実行して成功した。
+
+### 最終自動検証
+
+初回の依存ビルドは `ffmpeg-sys-the-third` のlibclangでアクセス違反
+（runner exit 1、build script STATUS_ACCESS_VIOLATION）になり、テストには未到達。
+`CARGO_BUILD_JOBS=2` に抑えた再実行で通過した。focusedテストも並列数2。
+テスト用FFmpeg DLLはこの作業ツリーの `vendor/ffmpeg/bin` から `target/debug/deps` へ実体コピーした。
+
+通常core checkの初回は `turbojpeg-sys` のCMake/MSBuildがexit 1で止まり、Cargoはexit 101。
+本体の型検査前で、詳しいコンパイルエラーは無い（`target/render-init-check-default-initial-failed.log`）。
+同じ生成済みbuild directoryで
+`cmake --build target/debug/build/turbojpeg-sys-4adae978226e4e06/out/build --target install --config Debug --parallel 1`
+を実行し、exit 0で完了した。停止理由は未特定。以後のcheck/buildは `CARGO_BUILD_JOBS=1` とする。
+最後のscope調整で成功テストのassertの行折りが変わり、fmt checkは一度exit 1。
+`cargo fmt` でその1箇所を揃え、最終 `cargo fmt --check` はexit 0。テストの意味は変更していない。
+
+| コマンド | 結果 | 記録 |
+| --- | --- | --- |
+| `.\scripts\test-focused.ps1 -Path @('src/run_native_failure.rs', 'src/data_dir.rs', 'src/logger.rs')` | exit 0、新規9件 + data_dir 9件 + logger 5件、計23件成功 | `target/render-init-focused.log`、`target/test-focused/runs/20261025T014218206Z-532481ef/` ほか同logのrun一覧 |
+| `.\scripts\test-focused.ps1 -Path src/run_native_failure.rs` | exit 0、scope調整後の新規9件成功。data_dir/loggerの成功結果は変更影響がないため再利用 | `target/render-init-focused-final.log`、`target/test-focused/runs/20261025T014522417Z-89bacc0b/` |
+| `cargo fmt --check` | exit 0 | command runner出力 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険glyph 0件 | command runner出力 |
+| `python scripts/check_site_cards.py` | exit 0、49枚、上限超過0件 | command runner出力 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0（依存の直列build後の再実行） | `target/render-init-check-default.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | exit 0 | `target/render-init-check-portable.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script` | exit 0 | `target/render-init-check-test-script.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、通常featureのcore・remote・EPUB workerを生成、FFmpeg/VC runtime DLLとEffeTune bundleを配置。PE検査runtime=4 / pe=3成功 | `target/render-init-build-dev.log`（phase transcript）、command runner出力、`target/vcrt-pe-reports/dev-runtime.json` |
+
+3構成のcheckコマンド/exit codeの機械可読記録は `target/render-init-check-results.json`。
+確認用buildはcold cache・並列数1で、core 38m53s / remote 3m30s / EPUB worker 2m11s。
+成果物は `target/dev-runtime/mimageviewer-core.exe` と同じ場所のcompanion 2本。
+`portable` featureは有効にしていない。`-PreserveRuntime` により稼働中アプリの停止は行わず、
+エージェントは生成した製品exeを起動していない。
+
+実機外観・前面化・実GPU障害での通知は未実施。製品exeは起動していない。
+lib全件は利用者指定どおりClaudeCodeが後で実施する。

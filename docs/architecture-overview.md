@@ -304,6 +304,7 @@ fullscreen／通過／animation には共通 typed policy で使わない。詳�
 | --- | --- |
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
+| `run_native_failure.rs` | `run_native` 復帰後の単一終了境界。watchdog休止、失敗分類・原因連鎖の記録、既存cleanup、terminal・flush後のnative通知を順序付ける。自動script実行は通知だけを抑止する。詳細は [描画失敗の報告設計](render-init-failure-report-plan.md) |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。非描画の`logic`と、root Uiを受ける`ui`へ状態遷移を接続する |
 | `app/update_phases.rs` | service・input・render・post-renderの既存順序を所有。表示採用とGPU uploadはUI側へ残す |
 | `app/close_return.rs` / `app/root_lifecycle.rs` | teardown前に捕捉したClose帰還を存続mainの既存navigation ownerへ移し、root Closeをlogic直後のbackend終了判定へ接続する |
