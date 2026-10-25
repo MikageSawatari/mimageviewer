@@ -286,6 +286,11 @@ libraw-sys = { path = "crates/libraw-sys" }
 libavif-sys = { path = "crates/libavif-sys" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_Graphics_Dwm",
     "Win32_System_Performance",
     "Win32_System_ProcessStatus",

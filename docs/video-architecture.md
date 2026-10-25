@@ -2180,6 +2180,44 @@ headless回帰はproductionと同じdriver / wheel planner、実eguiのstrip han
 fixtureの制御時計は単調に進めるが、実GPU出力・USER32配送や実処理時間を検証したことにはしない。
 検証の完了範囲は [v3.7.0 作業台帳](v3.7.0-priority-work.md) を参照。
 
+#### シーク操作の終端と論理pass（§1.192）
+
+pointer release、またはeguiへ配送するEscape押下を積んだ直後も、同じbatch driverで論理passを
+閉じる。後続move / press / wheelは次のpassへ送り、releaseの位置を後続入力で上書きしない。
+source resetがbatch外で積んだ終端は `batch_prepare` 直後に先に消費する。追加passを含めても
+外側batchのPresentは一回。新たな待機・再試行・入力制限は設けない。
+
+入力生成側が `NativePointerTermination` を記録し、pending eventsと同時にtakeする。
+実releaseは全ボタンの `Released { button, pos }`、capture loss / CANCELMODE / touch Cancel /
+認識器の非活性化 / source resetの合成releaseは `Cancelled { button: Some(...) }`、eguiへ届く
+Escapeは `Cancelled { button: None }`。Escapeを記録したpassでは実releaseよりCancelを優先する。
+通常のstrip表示中にnative側で消費するEscapeは、従来の `CloseSeekStrip { Escape }` と同時に
+drag所有を外す別経路であり、後続releaseからCommitを出さない。
+
+シーク行とstripはResponseの `drag_stopped` ではなく、所有中のgestureとこの終端事実で終了する。
+実releaseは最終位置でシーク／上払いopen／下ドラッグclose／commitを判定する。Scrubの最終
+Seekには0.10秒の間引きを適用せず、最後に送った値と同値なら重複送信しない。Undecidedのままなら
+従来どおりSeekを出す。Cancelではシーク行は何も出さず、stripは実際に送った最後の
+`MoveSeekStrip` 中心がある場合だけその中心でCommitする。
+通常帯はどのボタンでも終えるが、0面積の帯は従来どおりPrimaryの終端かEscapeだけで終える。
+0面積の全体表示は押下時の軸、通常帯の全体表示は現在の軸でrelease中心を求める。
+所有をtakeすることでeguiのdiscardによる複数passでも終端commandは一回だけになる。
+drag開始時の原点と鍵ボタンの除外判定は `pointer - total_drag_delta` で押下点を復元して使う。
+HUD hiddenの片付けは従来どおり所有を捨てるだけで、Cancel時のCommit規則を適用しない。
+
+音量slider、音楽HUD seek、減光HUDがbutton入力を捨てる既存経路、最初のbatch内で完結するgestureは
+本修正の対象外。GPU不要の実overlay fixtureとbatch targetで自動検証し、実HWND配送は別の実機確認とする。
+
+2026-10-25の未コミット§1.192差分での検証（通常feature、nextest default）:
+
+- `cargo fmt` と `cargo fmt --check`: 成功、整形差分なし。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: exit 0。ログ `target/check-1192-final.log`。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/render_core|seek_strip|native_window|native_touch|overlay/)'`:
+  exit 0、602成功・0失敗・13705対象外。新規22件と既存resize回帰のCancel中心検査を含む。
+  ログ `target/nextest-1192-focused.log`。full lib / test-fullは実行していない。
+- `.\scripts\build-dev.ps1 -PreserveRuntime`: exit 0、core / remote service / EPUB worker生成成功。
+  PE検査はruntime=4 / pe=3で成功。通常profileの成果物は起動しておらず、実機確認は未実施。
+
 #### `native_touch.rs` (`NativeTouchAdapter`)
 
 Win32 依存を持たない純粋部分を両 wndproc から分離する。bounded ownership state、
@@ -2579,6 +2617,16 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 
 ## ライフサイクル管理
 
+- **native output の故障と source swap (§1.135)**: render thread の panic / terminal error と pump の
+  `record_fault` は、output lifetime で共有する一方向の `faulted` を詳細ログ・通知より先に立てる。
+  panic payload の `&str` / `String` またはエラー詳細は最初の故障ログに残し、`init_error` には
+  利用者向けの固定文言を渡す。通知を take しても故障印は残る。`reusable_for_swap` は
+  `!closed && !faulted` とし、source swap の即時開始、deferred 開始・完了で確認する。
+  通常ナビの `try_start_native_video_fast_swap` は decoder 枠が空いていても deferred で集約する。
+  故障後は既存の BackendFault close / shutdown に任せ、自動再試行はしない。次に利用者が動画を
+  開いたときの通常 `start_fs_load` → `VideoPlayer::open(Some(config))` で新しい output を作る。
+  まれな失敗はログと通知で割り切り、故障種別・専用の回復状態・poll 終端の統合は追加しない。
+  永続 `video_seek_strip_state` は消さず、detached 述語 / viewport 経路も変更しない。
 - **VideoPlayer の Drop**: `cancel.store(true)` → decoder thread が exit、`audio.take()` で cpal stream 停止
 - **VideoPlayer.shutdown() の用途**: 動画切替時に Drop より早く audio を切るため (= 残音を防ぐ)
 - **GpuVideoDevice の Drop**: D3D11 リソース全解放、fence の NT shared handle を `CloseHandle`

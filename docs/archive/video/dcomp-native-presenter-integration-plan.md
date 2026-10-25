@@ -221,7 +221,8 @@ Status:
   `SetForegroundWindow` never targets a cloaked main HWND.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
-  `panic.log`, while an `App::update` heartbeat gap of more than five seconds is
+  `logs/native-exception.log` (separated from `panic.log` by §1.123 (B), 2026-10-25),
+  while an `App::update` heartbeat gap of more than five seconds is
   logged as a suspected UI hang so AppHang reports have a local breadcrumb even
   when no Rust panic occurs.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a

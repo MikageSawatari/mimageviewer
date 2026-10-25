@@ -1888,7 +1888,7 @@ impl App {
         restore: Option<CollectionGridRestore>,
         return_to: Option<TopLevelGridRestore>,
     ) {
-        self.save_leaving_rating_grid_position();
+        self.note_session_grid_positions();
         let perf_start = crate::perf::is_enabled().then(Instant::now);
         let restoring = restore.is_some();
         let retaining_binding = self.collection_root_installed_binding_matches(collection_id);
@@ -2267,7 +2267,7 @@ impl App {
         self.adopt_main_list_navigation(adoption, |app| {
             // The read-only admission above makes this native transfer non-rejecting.
             let _ = app.prepare_collection_main_context_change(identity.collection_id);
-            app.save_leaving_rating_grid_position();
+            app.save_departing_session_grid_positions();
             if !retaining_binding {
                 app.top_level_grid_view
                     .begin_with_origin(TopLevelGridSurface::Collection(identity), return_to);
@@ -2559,7 +2559,7 @@ impl App {
         }
         self.adopt_main_list_navigation(adoption, |app| {
             let _ = app.prepare_collection_main_context_change(session.identity.collection_id);
-            app.save_leaving_rating_grid_position();
+            app.save_departing_session_grid_positions();
             app.install_collection_history_child_session(session);
             app.pending_auto_fs_open = false;
             app.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
@@ -7956,7 +7956,7 @@ mod tests {
         app.top_level_grid_view
             .replace_surface(TopLevelGridSurface::Rating { stars: 3 });
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.selected = Some(4);
         app.scroll_offset_y = 700.0;
         let selected_key = app.rating_path_key(4).unwrap();

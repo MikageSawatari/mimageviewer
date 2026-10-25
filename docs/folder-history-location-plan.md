@@ -1,5 +1,70 @@
 # フォルダ履歴の現在地と表示位置 — §1.280 / §1.282 / §1.281
 
+### §1.328 閲覧履歴・サブ展開の位置境界（2026-10-25）
+
+閲覧履歴・サブ展開の行選択と scroll / Auto seed は、履歴地点や restore state へ追加せず、
+`TopLevelGridView` の session owner に保持する。暫定保存と rows 置換確定時の一度限りの保存を区別し、
+Snapshot 由来 rows を除く。戻り先の表示採用は初回 layout より前、サブ展開の並びの入力も宛先投影を使う。
+保存・復元の正本は [最上位一覧のセッション位置](top-level-grid-view.md#セッション内のグリッド位置1328)。
+閲覧履歴のメニュー入場は先頭、Ctrl+F は入場時に閉じる既存仕様を維持する。
+検索バー表示中の ←/→ は既存仕様どおり無効であり、検索カーソル方針・R9 は撤去した。
+他の入口から検索バーを開いたまま戻る場合も、検索再適用による先頭復帰を受け入れ、Ctrl+F 処理は変更しない。
+永続化、起動復元、ブックマークの位置 owner、detached predicates / viewport は変更しない。
+
+回帰テストは `src/app/tests/section1328_session.rs`（既存の履歴遷移 fixture を再利用）にまとめる。
+修正前の製品コードで最初の4テストを実行し、1成功・3失敗だった。閲覧履歴の Folder 往復と
+検索採用前の選択変更の2件は選択不一致の valid red。Snapshot 往復の失敗は固定一覧の非同期準備を
+待たない fixture の不備を含むため、valid red の証拠には数えない。メニュー入場・削除時の先頭復帰の対照1件は成功した。
+この red は閲覧履歴側で最初に失敗した結果であり、同じループの後半のサブ展開まで red を取得した証拠ではない。
+追加の回帰では ZIP pending、サブ展開の混在600行・再scan、通常/A/B・子favorite列数とAuto seed、
+宛先の並び投影、RatingのSnapshot除外、
+取消可能なRating closeの世代印（R13）、Clone・場所を忘れる・キー不一致を検査する。
+実アプリは起動せず、headless描画によるviewport内の選択位置を検証する。
+
+実装途中の focused 645件は641成功・4失敗（`target/1328-focused-2.log`）。R9は上記の設計判断で撤去。
+残る3件はfixtureを修正した。Rating固定では非同期のidentity準備完了を待ち、再scanでは画像フォルダ本の
+親スイッチ（ZIP/PDF自動表示）も有効にする。PDFは直接openの列挙ownerへprepared pagesを渡し、
+staged history用のhelperを誤用しない。ZIPも実際の列挙完了後に戻りを検査する。
+Rating固定の最終復帰は★設定時刻順で行順が変わり得るため、旧indexではなく安定キーで同じ項目を検査する。
+
+追加15テストの対応（名前の共通接頭辞 `section1328_session_` は省略）:
+
+| テスト名 | 検査対象 |
+| --- | --- |
+| `reading_folder_back_bs_and_forward_back` | R1: 通常/A/BでFolderを開き、←・BS・→後の←で元の行を選択 |
+| `reading_zip_pending_back_restores_saved_row` | R2: ZIP列挙待ちの空表示から←で元の行・offsetへ復元 |
+| `search_pending_saves_latest_reading_and_subfolder_rows` | R3/R7: Ctrl+G/S/Tの結果待ち中に変えた最新の選択・offsetを両一覧へ復元 |
+| `snapshot_return_preserves_source_row` | R4: 両一覧の固定前の位置を、直接解除・固定→検索→閉じるで復元 |
+| `subfolder_large_mixed_zip_pdf_folder_returns` | R5: 混在600行からZIP/PDF/Folderを開き、列挙後に←で元の行をviewport内に表示 |
+| `subfolder_return_rescans_without_retained_snapshot` | R6: 保存snapshotが無い再scan帰路でも安定キーで復元 |
+| `reading_tall_return_destination_layout_and_late_samples` | R8: 閲覧履歴の通常/A/B、共通10列・子6列、子Auto ON/OFF、初回layout・reconcile・後着sample後も可視 |
+| `subfolder_tall_return_destination_layout_and_late_samples` | R8: サブ展開で同じlayout・seed条件を検査 |
+| `subfolder_prepare_uses_destination_sort_and_category_order_for_new_and_return` | R10: New/Returnとも宛先の名前順・カテゴリ順で準備、元のfavorite表示は採用まで維持し、reconcileで再sortしない |
+| `rating_snapshot_rows_do_not_overwrite_position_before_or_after_unfix` | R11: 固定中・解除直後のSnapshot rowsがRatingの位置を上書きしない |
+| `r13_cancelled_rating_close_does_not_mark_current_rows_departed` | R13: Rating close後のサブ展開prepareを取消し、items世代と離れる印を直接検査 |
+| `reading_stable_key_tracks_mru_reorder` | C1: MRUで先頭へ移った同じ行をキーで選択 |
+| `reading_menu_always_first_and_missing_key_falls_back` | C2/C3: 履歴内・検索中のメニュー入場は先頭、削除済みキーは先頭へfallback |
+| `positions_are_not_cloned_and_forget_clears_all_owners` | C4/C6: Cloneは三種類の位置・印を非継承、「場所を忘れる」で消去、別rootのキーは不一致 |
+| `subfolder_new_reinstall_and_mismatched_root_start_first` | C5/C6: New/reinstallと異なるrootのReturnは先頭 |
+
+最終の自動検証（`e0276cdab` + 今回の未コミット差分、通常feature）:
+
+```powershell
+cargo fmt
+cargo fmt --check
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo nextest run -p mimageviewer --lib -E 'test(/section1328|reading_history|subfolder_expansion|rating_grid|grid_position|phase_c_folder_nav_history_tests|top_level_grid_view|snapshot_ops|global_search_ui|local_search|ctrl_f|submitted_search|collection_grid|phase_c_drill_nav_tests/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/start_loading_items|folder_history/) - test(/section1328|reading_history|subfolder_expansion|rating_grid|grid_position|phase_c_folder_nav_history_tests|top_level_grid_view|snapshot_ops|global_search_ui|local_search|ctrl_f|submitted_search|collection_grid|phase_c_drill_nav_tests/)'
+```
+
+fmt / fmt check / core check はすべて exit 0。focused は643成功・0失敗、共通install境界の補完は
+重複を除いた11成功・0失敗（合計654件）。ログは `target/1328-check-final.log`、
+`target/1328-focused-final.log`、`target/1328-install-boundary-final.log`。
+Ctrl+Fのsubmission / execute / 再適用 / 完了処理はHEADとのテキスト照合でも一致を確認した。
+full lib / test-full は利用者指示により実行せず、実アプリも起動していない。commitはleadへ委譲する。
+`.\scripts\build-dev.ps1 -PreserveRuntime` も exit 0。通常featureのcore / remote / EPUB PDF workerを
+`target/dev-runtime` へ作成し、VCRT PE検査は runtime=4 / pe=3 で成功。成果物は起動していない。
+
 > 2026-09-27、stage B 実装・自動 gate 完了（経過は §9）。設計担当の決定を §8 に反映し、独立 Sol reviewer が構造案と completion review を承認済み。実アプリ smoke は利用者承認後に別途実施する。本文の参照行は `history-nav` の stage A 調査時点。
 
 ## 1. 観測、原因、不変条件

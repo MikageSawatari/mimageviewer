@@ -42,6 +42,9 @@ pub(crate) fn detached_placement_with_logical_client_for_test(
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
 
+#[path = "tests/section1328_session.rs"]
+mod section1328_session;
+
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
 
@@ -23684,7 +23687,7 @@ mod phase_c_folder_nav_history_tests {
         panic!("Rating navigation worker did not settle");
     }
 
-    fn write_1328_zip(path: &std::path::Path) {
+    pub(super) fn write_1328_zip(path: &std::path::Path) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         for page in 0..4 {
@@ -25978,7 +25981,9 @@ mod phase_c_folder_nav_history_tests {
         rating_1328_folder_or_pdf_return(true, false, true);
     }
 
-    fn rating_1328_install_rows(app: &mut App) -> Vec<crate::rating_view::RatingViewRow> {
+    pub(super) fn rating_1328_install_rows(
+        app: &mut App,
+    ) -> Vec<crate::rating_view::RatingViewRow> {
         let GridItem::Image(previous) = &app.items[0] else {
             panic!("expected an image fixture");
         };
@@ -26029,7 +26034,7 @@ mod phase_c_folder_nav_history_tests {
         app.enter_rating_view(3);
         finish_rating_navigation_for_test(&mut app);
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.open_global_search();
         // These are still the adopted star-3 rows, although the surface is now Search.
         app.selected = Some(4);
@@ -26069,7 +26074,7 @@ mod phase_c_folder_nav_history_tests {
             app.install_rating_view_rows();
             app.selected = Some(0);
             let saved_key = app.rating_path_key(0).unwrap();
-            app.save_leaving_rating_grid_position();
+            app.note_session_grid_positions();
             app.enter_rating_view(3);
             finish_rating_navigation_for_test(&mut app);
             assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(saved_key));
@@ -26107,7 +26112,7 @@ mod phase_c_folder_nav_history_tests {
         app.rating_view_stars = 3;
         app.install_rating_view_rows();
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.open_global_search();
         // Until the first result arrives, the old Rating grid remains interactive.
         app.selected = Some(4);
@@ -26130,7 +26135,7 @@ mod phase_c_folder_nav_history_tests {
         app.rating_view_stars = 3;
         app.install_rating_view_rows();
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.selected = Some(4);
         app.scroll_offset_y = 700.0;
         let expected = app.rating_path_key(4).unwrap();
@@ -26241,7 +26246,7 @@ mod phase_c_folder_nav_history_tests {
         let selected_key = app.rating_view_rows[4].key.clone();
         app.top_level_grid_view.save_rating_grid_position(
             3,
-            super::top_level_grid_view::RatingGridPosition {
+            super::top_level_grid_view::SessionGridPosition {
                 scroll_offset_y: 200.0,
                 selected_key: Some(selected_key),
                 aspect_seed: Some(crate::auto_aspect_cache::AutoAspectCacheEntry {

@@ -1031,6 +1031,8 @@ impl App {
         // Step 2: close search (= mutual exclusion)
         let search_was_active = self.close_searches_for_snapshot();
 
+        self.save_departing_session_grid_positions();
+
         // Step 3: activate
         let generation_id = self.snapshot_next_generation_id;
         self.snapshot_next_generation_id = self.snapshot_next_generation_id.saturating_add(1);

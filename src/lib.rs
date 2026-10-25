@@ -244,6 +244,8 @@ pub mod name_bulk_indexer;
 pub mod name_index_manager;
 pub mod name_index_supervisor;
 pub mod native_context_menu;
+#[cfg(windows)]
+mod native_exception_log;
 mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
@@ -445,7 +447,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-static NATIVE_EXCEPTION_LOGGING: AtomicBool = AtomicBool::new(false);
 static UI_HEARTBEAT: OnceLock<Arc<UiHeartbeatState>> = OnceLock::new();
 
 struct UiHeartbeatState {
@@ -905,80 +906,6 @@ pub(crate) fn set_ui_heartbeat_suspended(suspended: bool, detail: String) {
     }
 }
 
-#[cfg(windows)]
-fn install_native_exception_log_hook() {
-    use windows::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
-
-    unsafe {
-        let handle = AddVectoredExceptionHandler(1, Some(native_exception_handler));
-        if handle.is_null() {
-            logger::log("native exception logger: AddVectoredExceptionHandler failed");
-        } else {
-            logger::log("native exception logger: installed vectored exception handler");
-        }
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn native_exception_handler(
-    info: *mut windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
-) -> i32 {
-    use windows::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
-
-    let Some(info) = (unsafe { info.as_ref() }) else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let Some(record) = (unsafe { info.ExceptionRecord.as_ref() }) else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let code = record.ExceptionCode.0 as u32;
-    if !matches!(
-        code,
-        0xC000_0005 // EXCEPTION_ACCESS_VIOLATION
-            | 0xC000_00FD // EXCEPTION_STACK_OVERFLOW
-            | 0x8000_0003 // EXCEPTION_BREAKPOINT
-            | 0xC000_001D // EXCEPTION_ILLEGAL_INSTRUCTION
-            | 0xC000_0094 // EXCEPTION_INT_DIVIDE_BY_ZERO
-            | 0xC000_0095 // EXCEPTION_FLT_OVERFLOW
-            | 0xC000_0374 // STATUS_HEAP_CORRUPTION
-    ) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-
-    if NATIVE_EXCEPTION_LOGGING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        // ⚠ このハンドラはスレッド終了処理の内側でも、ヒープが壊れている状態でも走る。
-        // スレッド ID は `logger::current_thread_id_num` が TLS を経由しないので安全だが、
-        // **下の `format!` と `append_panic_log_entry` はヒープを使う**。一次例外が
-        // `RtlFreeHeap` から来た場合、その thread がヒープロックを握ったまま来ている可能性が
-        // あり、ここでの確保が再入で詰まり得る。残存リスクとして backlog §1.123 に記録済み
-        // (固定バッファ + 起動時に開いた handle へ書く形が本来の姿)。
-        let tid = logger::current_thread_id_num()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".to_owned());
-        let mut details = format!(
-            "NATIVE EXCEPTION code=0x{code:08X} flags=0x{:08X} address={:p} thread={tid}",
-            record.ExceptionFlags, record.ExceptionAddress
-        );
-        if code == 0xC000_0005 {
-            let access_kind = match record.ExceptionInformation[0] {
-                0 => "read",
-                1 => "write",
-                8 => "execute",
-                _ => "unknown",
-            };
-            let access_address = record.ExceptionInformation[1] as *const core::ffi::c_void;
-            details.push_str(&format!(" access={access_kind} target={access_address:p}"));
-        }
-        append_panic_log_entry(&details);
-        NATIVE_EXCEPTION_LOGGING.store(false, Ordering::Release);
-    }
-
-    EXCEPTION_CONTINUE_SEARCH
-}
-
 /// `--version` / `-V` / `--help` / `-h` を処理する。該当すれば文面を親コンソールへ
 /// 出力して `true` を返す (呼び出し側は GUI を開かず exit する)。GUI アプリ
 /// (`windows_subsystem="windows"`) でも `mimageviewer-core.exe --version` でバージョンを
@@ -1324,7 +1251,7 @@ pub fn run() -> eframe::Result {
     install_panic_log_hook();
     install_texture_delta_ledger();
     #[cfg(windows)]
-    install_native_exception_log_hook();
+    let native_exception_log_result = native_exception_log::install();
 
     // 通常ログ (mimageviewer.log) は常時記録する。logger 側が 16MiB で
     // ローテーション (現行 + .bak の 2 世代) し、起動時に前回分を .prev へ
@@ -1333,6 +1260,8 @@ pub fn run() -> eframe::Result {
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     startup_operation(miv_startup::Stage::Logger, "Logger", || logger::init());
+    #[cfg(windows)]
+    native_exception_log::report_install_result(native_exception_log_result);
 
     #[cfg(all(windows, not(feature = "portable")))]
     {
