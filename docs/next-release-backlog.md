@@ -80,17 +80,19 @@
 
 ### 1.427 ReleaseChecks の perf 判定が、操作で予定より早く起きた待機を「説明のつかない止まり」にする — v4.8.1 の ReleaseChecks (2026-10-24)
 
-- 状態: **未着手・起票 (利用者 2026-10-24)**。v4.8.1 では判定を変えずに ReleaseChecks を流し直す (利用者決定)。
+- 状態: **このbranch (`claude/infra-427-512-e93d19`) で実装済み (2026-10-24)、実ReleaseChecks run待ち**。
 - 観測 (ClaudeCode が記録を解析、run `release-checks-20261024-114649-efa4e0f4`): perf-cached が `unexplained >100ms gap/update in frames [1621, 3016]` で FAIL。
   2 件とも、更新は約 1ms で終わり、直前の tail は `request_repaint_after_idle_upgrade` (`idle_upgrade_delay_ms` 約 346ms)。
   待機は予約より早い 239ms / 191ms で終わり、次フレームの `prev_frame_causes` に `src\test_script.rs:4701` (自動操作の次の手順) がある。
   同じ run の他の 6 件の idle upgrade wake は予約どおり約 348ms で起き、`normal-idle-upgrade-wake` に分類された。
-- 原因 (コード確認): `scripts/release_check_analysis.py` の gap 分類 (約 664〜671 行) は、idle upgrade の待機を「起きた時刻が予約 ±20ms」のときだけ正常とし、
-  それより早く外部入力で起こされた待機を `unexplained` にする。UI スレッドが就寝中に入力で起きた正常な待機であり、製品の止まりではないと判断している (実行時の別の観測はない)。
-- 直し方の方向: 予約より早く終わった待機は、次フレームの起点が外部入力 (test script の操作・OS 入力) だと記録から示せる場合に正常の就寝として扱う。
-  記録で示せない早い起床は従来どおり `unexplained` に残す。閾値の緩和で通さない。回帰には今回の run の 2 件と、起点の記録が無い早い起床の反例を入れる。
-  合格基準の変更なので独立レビューを通す。
-- 規模 / 優先度: Small / P2 (リリースの合否が、操作のタイミングで偶然 FAIL になる)。
+- 確認済みの判定経路: 旧分類はidle upgradeの予定±20msだけを正常とし、それより早い起床を `unexplained` にする。
+  causeの存在だけではUI threadの待機や起床源を証明できず、この2件の製品停止の有無は未確定。既存runの2件は判定を維持する。
+- 利用者変更2026-10-24: 合格基準を「外部入力」から**「証明された待機」**へ変更。起床源は制限しない。
+  設計Revision 3＋3.1（独立設計レビューr4の指摘反映）に従い、test-script限定のeframe wait witnessで
+  期限・callback介入・全update区間との非重複を検証する。W内の正の待機、非待機合計20ms以下、
+  gapから待機を除いた残り100ms以下を満たす早い起床だけ `normal-proven-wait` とする。
+  通常sleep・予定どおり／遅い起床の規則は不変。証跡なしへのfallbackなし。合成回帰とrelease-record詳細を追加。
+- 規模 / 優先度: Medium / P2 (待機の証跡と分類を追加。実装の独立レビューと実runでの採用確認は別途)。
 
 ### 1.425 通常フォルダにも既定のページ構成を適用する設定を追加する — X の要望 (2026-10-24)
 
@@ -2659,22 +2661,26 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
 
 ### 5.12 署名の事前チェックが、鍵の使えなさを検出できない
 
+- **実装済み (2026-10-24)、利用者による実SimplySign環境の確認待ち**。
 - 出典: v3.2.0 の配布ビルド (2026-08-23)。`Assert-MivSignReady` を通過したのに、
   実署名の 1 本目 (`vendor/pdfium/bin/pdfium.dll`) が
   `SignTool Error: No certificates were found that met all the given criteria.` で失敗した。
 - 機構: SimplySign のクラウド鍵セッションが切れると、**証明書の公開情報は
   `CurrentUser\My` に残ったまま秘密鍵だけが外れる**。`Assert-MivSignReady` は
-  証明書の存在を見るだけなので通過してしまう。
+  従来は証明書の存在を見るだけなので通過してしまった。
 - 実害: `build-dist.ps1` は clean からビルドしてから署名するので、
   **40 分ビルドしてから落ちる**。しかも中途半端な成果物は残らないので、
   丸ごとやり直しになる。
-- 直す方向: 事前チェックを「証明書が見えるか」から「**実際に署名できるか**」へ変える。
-  使い捨ての小さな PE を 1 本コピーして `Invoke-MivSign` し、成功したら消す。
-  数秒で済み、セッション切れならビルド前に分かる。
-  - 署名対象を汚さないよう、必ず一時ディレクトリのコピーに対して行う。
-  - タイムスタンプ取得でネットワークへ出るので、失敗理由を
-    「鍵が使えない」「TS サーバに届かない」で区別できると望ましい。
-- 回避策 (現状): 配布ビルドの前に手で 1 本署名してみる。
+- 実装: `Assert-MivSignReady` は証明書の存在確認後、実行中のPowerShell host exeを新規の一時ディレクトリへ
+  コピーし、タイムスタンプなし署名1回 → RFC3161タイムスタンプ取得（最大3回、間隔3秒）→ `verify /pa` を行う。
+  鍵の利用失敗とTSA到達失敗を診断出力付きで区別し、一時ディレクトリは失敗時も削除する。
+  証明書選択と最終成果物の署名・検証は維持。各build入口の事前チェックを維持し、手動コピーは不要。
+- 自動検証: `scripts/test-sign-files.ps1` のsigntool stubで成功、鍵失敗時の即停止、TSA失敗3回、検証失敗、
+  stdout／stderr収集（Windows PowerShell 5.1、`ErrorActionPreference=Stop`／StrictMode）、一時コピーへの限定・
+  後始末・原本hash不変を確認する。`scripts/test-release-build-safety.ps1` に3入口のclean／build前の順序検査を追加。
+  SimplySignや実際の署名は自動テストで使用しない。
+- 残る確認: 利用者のSimplySignログイン時の成功と、ログアウト後（証明書が残る状態）の鍵エラーでの停止。
+  通常は数秒だがsigntoolの数分停止実績があり時間上限はない。開始後の長時間build中に鍵が使えなくなる場合は防げない。
 - 規模 / 優先度: 小 / P2 (リリースのたびに 40 分を失うリスク)。
 
 ### 5.1 ネイティブ依存

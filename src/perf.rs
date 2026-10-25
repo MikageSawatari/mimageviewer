@@ -28,6 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod memory;
 pub(crate) mod stall;
+#[cfg(feature = "test-script")]
+mod wait_witness;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
@@ -80,6 +82,8 @@ pub fn init_with_path(
     }) {
         stall::init();
         ENABLED.store(true, Ordering::Release);
+        #[cfg(feature = "test-script")]
+        wait_witness::install();
         flush();
         memory::emit("perf_enabled", "milestone");
         memory::start_sampler();

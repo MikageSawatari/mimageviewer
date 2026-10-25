@@ -21,6 +21,7 @@
 | immediate子screenshot | (b) | 既存保留actionだけからその子のcallbackを取り出す。wgpuは子のpaintへ渡し、glowは子surfaceの画像でone-shot完了。親や兄弟のcallbackへ配送しない |
 | callback screenshot／RawInput等の新版基本処理 | (a) | 上流のUi callback、ScreenshotCallback、SurfaceConfig、App::logic/ui、250ms契約等を利用。新規2c-2〜4契約とは区別する |
 | test-script window witness／capture・focus診断 | (b) | callback-local Context／viewport／native allocation identityとTLS入れ子復帰を保持。基底wgpu_no_default_featuresへcfgを適応 |
+| test-script wait witness (§1.427、2026-10-24) | (b・新規) | 独立feature `miv-test-script-wait-witness`。new_eventsのStartCause待機区間・期限・callback介入をhookへ通知。callback全入口をstampし、featureなし／hook未登録時は動作不変。standalone試験: `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu,miv-test-script-wait-witness --lib miv_test_script_wait_witness` |
 | 通常版immediate計測 | (b) | 新規window・input・UI・tessellation・paint・outputの時間とdelta件数／RGBA bytes、既存の遅延ログを保持。常時I/Oを増やさない |
 | liveテスト隔離 | (b) | synchronous_damage_returns_before_outer_paint_gateはignoreを保持。子再実行の--ignoredも保持し、App::uiへAPI適応。今回はcompileだけ |
 | manifest／feature／Win32／standalone | (b) | 新manifestを基準にmiv feature、Gdi／Performance、Windows testのwgpu30 DX12を追加。patchは準備workspaceへ統一し、原本Cargo.toml.origを保持 |
