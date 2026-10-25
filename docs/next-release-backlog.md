@@ -1859,7 +1859,7 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
 
 - 状態: 通常フォルダ・レーティング一覧の修正は v4.4.0 で出荷し、報告者が期待どおりの動きを確認済み (2026-10-08、報告者のメール)。
   2026-10-21 に作業記録 (約 300 行) を整理した。経緯・原因の調査・検証記録は `git log -- docs/next-release-backlog.md` の整理前の版 (`4db8a8874` 時点) にある。
-- **残りの対応 (2026-10-25、branch claude/bugs-328-135-123-192-86051c、未 merge)**: 閲覧履歴とサブ展開にも、通常フォルダ・
+- **残りの対応 (2026-10-25、branch claude/bugs-328-135-123-192-86051c、master に merge 済み `af17ce453`、未リリース)**: 閲覧履歴とサブ展開にも、通常フォルダ・
   ★一覧と同じ保存・復元の境界を通す。`RatingGridPosition` を `SessionGridPosition` として共用し、TopLevelGridView が
   閲覧履歴の位置 1 つとサブ展開の位置 1 つ (root キー付き) を持つ (セッション内だけ。永続データは変えない)。離れるときの保存は
   items_generation ごとに 1 回で、戻るときだけキーで行を照合し、見つからなければ先頭 (従来どおり)。戻り先の列数・表示の採用を
@@ -1872,7 +1872,7 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   **ただし閲覧履歴から開いた本で BS を押すと、閲覧履歴の一覧には戻るが先頭 (最新) が選ばれる** (book_02 で 2 回)。
   通常フォルダから開いた本では BS でも元の行に戻る。サブ展開から開いた本で BS を押すと、サブ展開が解除された親フォルダへ戻り、
   その本が選ばれる (BS = 親フォルダへの既存の意味どおり)。
-  **原因と修正 (同日、branch histbs-1328、未 commit)**: 保存位置は残っていたが、main-frame dispatcher
+  **原因と修正 (同日、branch histbs-1328、commit `f36812d48`)**: 保存位置は残っていたが、main-frame dispatcher
   (`post_render_main_navigation`) が BS / Esc 直帰の `AddressBarNav::ReadingHistory` をメニュー入場へ送り、
   `install_reading_history_surface` の Menu 処理が位置を消していた。既存の Folder BS テストは immediate dispatcher を使い、
   実アプリのこの経路を通っていなかった。ZIP を開き、BS キー処理と main-frame dispatcher まで通す追加テストで、
@@ -1888,12 +1888,11 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   ログは `target/histbs-1328-section-final.log` / `target/histbs-1328-focused.log`。
   `scripts/build-dev.ps1 -PreserveRuntime` も exit 0 (通常feature、core / remote / EPUB PDF worker、VCRT PE検査成功)。
   full lib はClaudeCode担当。修正後の実アプリ確認は未実施 (製品 exe は起動しない)。
-- 残り: **閲覧履歴とサブフォルダ展開から開いた後の ←** でも、開いていた項目が選ばれず先頭が選ばれる (コード調査。別原因)。
+- 過去の記録 (2026-10-07 時点、上の 2026-10-25 の対応で解消): **閲覧履歴とサブフォルダ展開から開いた後の ←** でも、開いていた項目が選ばれず先頭が選ばれていた (コード調査)。
   - 閲覧履歴: replay は `enter_reading_history` へ再入場し、一覧の install が先頭を選ぶ。返り先に opened-row anchor を持たない。
   - サブフォルダ展開: restore state は root / snapshot / tombstone を保持するが selection anchor / scroll を持たず、prepare 完了時に先頭を選ぶ。
   - 報告者へは「同じく先頭が選ばれる作りで、引き続き対応する」と伝えている (2026-10-07)。
-- 対応の方向: それぞれの返り先 owner に opened-row anchor (と比率・位置) を持たせ、通常フォルダ (`save_leaving_folder_grid_position`) と同じ保存・復元の境界に乗せる。
-  検証は section1328 の回帰と RatingFolderBack 型の smoke を流用する。
+- 残り (2026-10-25): 修正後の本体 lib 全件と、修正後の実アプリでの BS の確認 (閲覧履歴から開いた本 → BS → 元の行)。
 - 規模 / 優先度: Small〜Medium / P2。
 
 ### 1.318 起動時の索引走査を HDD ごとに 1 本ずつ順に回す (D2) — 実測から保留 (2026-10-03)
