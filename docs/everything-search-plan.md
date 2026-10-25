@@ -89,7 +89,7 @@ WndProc はサイズ／request ID を確認し、上限内の payload を owned 
 
 提案上限は reply 16 MiB、query 32,768 UTF-16 code units（終端を含む）。割当前の byte／count 検査、checked add/mul、header／item table／offset／UTF-16 length と NUL の境界検査を行う。count が request 上限を越える、必須 full-path flag がない、offset が 0 でない等は malformed として log＋通知し、部分結果を公開しない。query の埋込み NUL は送信前に拒否する。
 
-実ファイル結果だけを採る。folder／drive／root flag は除外。relative path、URL、device namespace、制御文字／仮想 entry separator を含む値は physical-file identity にしない。drive absolute／UNC／通常の verbatim file path は既存 `path_key` の規則に沿って I/O なしで正規化・重複除去する。UNC を勝手に除外しない。存在・権限を IPC の主張だけで保証せず、読出し／open は既存 worker の検証を使う。欠落観測から metadata DB の purge を呼ばない。
+実ファイル・実フォルダの結果を採る。drive／root flag は除外し、未知の flag は従来どおり packet 不正とする。relative path、URL、device namespace、制御文字／仮想 entry separator を含む値は physical identity にしない。drive absolute／UNC／通常の verbatim path は既存 `path_key` の規則に沿って I/O なしで正規化・重複除去する。UNC を勝手に除外しない。bare drive／UNC share root は `C:\x\..` など正規化後に root になる表記も拒否する。存在・権限を IPC の主張だけで保証せず、読出し／open は既存 worker の検証を使う。欠落観測から metadata DB の purge を呼ばない。
 
 ## 5. query、形式、件数、paging
 
@@ -112,17 +112,18 @@ worker にファイル種類設定、EPUB／変換書庫設定、thumbnail sourc
 | ZIP／CBZ | `ZipFile` |
 | PDF／許可された EPUB | `PdfFile`（元 EPUB identity を保持） |
 | 許可された RAR／CBR／7z／CB7／LZH／LHA 等 | `ConvertibleArchive`（probe／変換は通常 open へ） |
-| folder、未対応形式、非表示種類 | 除外 |
+| 実フォルダ（拡張子らしい名前・画像なしも含む） | `Folder` |
+| drive／UNC share root、未対応形式、非表示種類、安全でないパス | 除外 |
 
 Everything は archive 内 entry／PDF page を列挙しない。検索結果の本タイルを開いた後は、その本の通常の全ページを閲覧する。選択した archive の内容だけ query で再フィルタしない。
 
 名前ヒットをそのまま示すため、親フォルダの代表への集約、別ファイル名の同 stem collapse、動画 sidecar 画像の自動省略は Everything 結果では行わない。query にヒットした画像は独立した結果である。動画／音声の補助画像選定は既存 source discovery worker を使い、画像の表示可否を補助画像の採否へ誤流用しない。
 
-**初版は対応形式へ絞った候補だけを、共通 Search prepare worker で一度 stat する。** IPC の全 raw 行に stat するのではなく、folder／非対応／非表示形式を先に除外する。これは thumbnail の既存契約を満たすための準備であり、新しい存在確認 worker ではない。metadata 成功から file 種別、mtime、size を確定し、`image_metas=Some((mtime,size))` と `ListingSortMetadata::new(mtime,Some(size))` を同じ prepared row に保持する。実 0-byte と取得失敗を同一視しない。分類・sort・source-discovery・stamp は採用前に worker で揃える。再 sort は採用済み stamp を再利用する。
+**初版は対応形式へ絞った候補だけを、共通 Search prepare worker で一度 stat する。** IPC の全 raw 行に stat するのではなく、root／非対応／非表示形式を先に除外する。フォルダは拡張子によらず分類し、作業用 suffix (`has_work_dir_suffix`) と内部 bundle 名 (`is_internal_app_entry_name`) だけを先に除外する。Everything の明示的な名前ヒットはファイル・フォルダとも hidden/system 設定で隠さない。これは thumbnail の既存契約を満たすための準備であり、新しい存在確認 worker ではない。metadata 成功から file 種別、mtime、size を確定し、`image_metas=Some((mtime,size))` と `ListingSortMetadata::new(mtime,Some(size))` を同じ prepared row に保持する。フォルダは `metadata.is_dir()` を必須とし、`image_metas=Some((mtime,0))`、`ListingSortMetadata::new(mtime,None)` を使う。再帰走査・画像有無の判定・総容量計算はしない。IPC の file/folder と現在の実体が異なる場合は再分類せず読取不能に数える。実 0-byte と取得失敗を同一視しない。分類・sort・source-discovery・stamp は採用前に worker で揃える。再 sort は採用済み stamp を再利用する。
 
 根拠: 現行 thumbnail enqueue は画像／ZIP／PDF の `image_metas=None` を skip し (`app.rs:52088` 付近)、convertible の None は Unavailable になる (`:40649` 付近)。`Some((0,0))` を捏造すると `thumb_loader.rs` の cache freshness 比較へそのまま入る。DetailsLazyMeta は日時／size を後から埋める一般 owner ではない。このため「full-path-only をそのまま採用し、既存 lazy thumbnail が stat してくれる」前提を却下した。unknown stamp を許す共通 thumbnail request の構造変更は初版に追加しない。
 
-stat に失敗した、または現在は file でない候補は今回の新しい結果から除外し、件数を集計して「読めなかった項目 N 件」を案内する。これを mIV DB の不在証明にせず、user data／metadata row を削除しない。採用後に消えた path は thumbnail／open の既存 failed 表示と通知で扱う。再検索は利用者の明示送信だけ。
+stat に失敗した、または現在の実体が IPC の file/folder と異なる候補は今回の新しい結果から除外し、件数を集計して「読めなかった項目 N 件」を案内する。これを mIV DB の不在証明にせず、user data／metadata row を削除しない。採用後に消えた path は thumbnail／open の既存 failed 表示と通知で扱う。再検索は利用者の明示送信だけ。
 
 decode・archive inspection／展開・全件 EXIF 読取は検索完了条件にしない。共有 I/O permit と各候補の cancel checkpoint を使い、UI は stat 終了を待たない。UNC 等の OS I/O 自体は強制中断できないため、cancel の UI 解除と旧完了の棄却を別に保証する。検索結果は stat 時点の snapshot であり、採用までの外部変更を完全同期するものではない。
 
@@ -132,7 +133,7 @@ decode・archive inspection／展開・全件 EXIF 読取は検索完了条件�
 
 1 query／1 reply、raw 上限 10,000、後段の表示行も最大 10,000。raw limit は Everything の並び順で切り、mIV のソートは **取得した部分集合内** で行う。Everything の `totitems` は全構文ヒット数であり、mIV 対応形式の総数ではない。
 
-表示例: `Everything: 52,340 件中、先頭 10,000 件を取得 / mIV 表示対象 1,246 件`。種類・★／tag facet でさらに隠れる件数と stat で読めなかった件数も取得件数とは別。上限で打ち切り、後段で 0 行になっても「対象がありません。取得上限に達したため検索条件を絞ってください」と案内し、「全体で 0 件」と表示しない。16 MiB を超える reply は一覧を採用せず条件を絞る案内とする。
+表示例: `Everything: 52,340 件中、先頭 10,000 件を取得 / mIV 表示対象 1,246 件`。取得件数／表示対象（★・tag facet 前の採用行数）／対象外（unsupported + excluded）／読めなかった件数を分けて表示する。対象外には root・安全でないパス・未対応／非表示形式・作業用／内部フォルダを含む。正規化キーの重複は別集計し、対象外には含めず、status の tooltip に件数を示す。種類・★／tag facet でさらに隠れる件数と stat で読めなかった件数も取得件数とは別。上限で打ち切り、後段で 0 行になっても「対象がありません。取得上限に達したため検索条件を絞ってください」と案内し、「全体で 0 件」と表示しない。16 MiB を超える reply は一覧を採用せず条件を絞る案内とする。
 
 offset paging は wire 上できるが、QUERY2 に同一結果 snapshot を保持する token の保証を今回の資料で確認できない。別 query で offset を進めると Everything の更新で行が飛ぶ／重なる可能性があり、local dedup は欠落を直せない。後続取得中の行再配置・編集・open/back の組合せも増える。初版は cap＋明示絞り込みで取り除く。将来 paging を入れるなら snapshot 契約と上限の意味を別設計で決める。
 
@@ -165,6 +166,16 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 
 ### 6.3 簡素化と UI 入力
 
+§1.409: 入力は `metadata_draft / everything_draft` に分離し、固定ONの終了・source切替では
+各draftを保持する。固定Everything入力の編集/focusだけではsessionを開始せず、通常Enter/検索
+だけが既存入口→送信を通る。固定中は一時バーの入力を省き、状態と帰路の操作を残す。
+Escは全検索共通routerへ移し、IME/modalと描画前input ownerを優先して一度だけ消費する。
+Everything実行中のEscは取消のみで、次のEscが未送信/取消後/PhysicalChildのsessionを閉じる。
+×はaccepted結果ownerと編集ownerを区別し、別sourceの保持結果をその欄から解除できる。
+Metadata acceptedにも成立した検索の適用条件をOptionで保持し、未送信Everything draftで表示結果の説明を上書きしない。
+未検証/拒否は適用条件を持たず、正常0件と区別する。一時バーのEscは従来の×と同じく共通sessionを終了する。
+
+
 全 interleaving の rollback／部分採用／resume を作る案を比較し、明示送信＋準備中の target-context modal を推奨した。変更するのは新機能の待機中だけで、Ctrl+G の streaming／debounce／集約を遅らせない。
 
 バーは existing global-search top panel を source 別に描画する。TextEdit は `ime_focus::show_singleline` helper、Enter／Esc は `dialog_enter_pressed`／`dialog_escape_pressed`、context menu は既存 singleline helper。未確定文字の確定 Enter で検索を送信しない。Esc は実行中なら取消、Editing／Ready なら検索を閉じる。query draft の変更は表示済み結果を再実行せず、「検索」を押すまで保持する。
@@ -173,7 +184,7 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 
 主一覧の open／navigation／history／F12 switch／Remote acquire はこの modal admission を共有する。取消・Window ×・shutdown は常に受理。既存 detached の独立閲覧は停止しない。UI frame は bounded `try_recv` と小さい状態遷移だけを行い、worker wake は ROOT を明示。idle で毎 frame repaint しない。待機 backstop が必要なら既存の再武装規約を使い、競合解消の grace／sleep を足さない。
 
-古い Ready は `{source, run_sequence, context, source/items generation, adopted surface authority, policy snapshot}` を既存採用証明へ照合して捨てる。取消・切替後は query text が偶然同じでも受理しない。Everything の submitted query/options は Running／Ready の immutable run payload が所有する。バーの `query` は draft として別の意味を持ち、draft を変えただけで採用済み rows の sort／facet prepare を失効させない。現行 Metadata の `wish.query == self.global_search.query` 検査を Everything にそのまま適用せず、submitted spec 同士で比較する。公開前に失効した map は現行一覧へ先行書込みしない。
+古い Ready は `{source, run_sequence, context, source/items generation, adopted surface authority, policy snapshot}` を既存採用証明へ照合して捨てる。取消・切替後は query text が偶然同じでも受理しない。Everything の submitted query/options は Running／Ready の immutable run payload が所有する。バーの `query` は draft として別の意味を持ち、draft を変えただけで採用済み rows の sort／facet prepare を失効させない。現行 Metadata の `wish.query == self.global_search.metadata_draft` 検査を Everything にそのまま適用せず、submitted spec 同士で比較する。公開前に失効した map は現行一覧へ先行書込みしない。
 
 送信／source 切替／結果ソートなどで index 空間を替える前に、既存の編集終了・page-boundary 処理で保存先を旧 identity のまま確定し、idx-only Undo と editor draft を新一覧へ持ち越さない。Everything の一覧再投影では閲覧を閉じる必要がある場合もこの既存境界へまとめる。共通 editor を新規 owner 化したり、Ctrl+G の released 動作を変更して §1.372 を同時修正しない。既存境界だけで Everything の通常操作を安全にできないことが実装前検証で判明したら、追加設計の範囲・費用を報告して止める。
 
@@ -185,11 +196,11 @@ media は一覧の exact physical identity から通常の fullscreen／native p
 
 現在の Ctrl+G は `SearchContainer` の hit-only drill と physical 本 open の双方がある。Flat から本を開く帰路も `commit_staged_search_navigation_effects` → `advance_drilled_current_path` (`global_search_ui.rs:3503` 付近) が一段の `DrillState` を作ることで成立している。`app.rs:53067` の BS は active search かつ drill=None で no-op になる。したがって Everything の本 open は、型付きの位置を持つ構造的変更が必要であり、現行 return を無変更で使えるとは判断しない。
 
-共通 session の source payload を `Metadata(existing drill/view)` と `Everything { submitted/accepted result, position }` に分け、後者の position は `Root | PhysicalChild { logical_source, return_anchor, route }` とする。logical_source は検索行の元 ZIP/PDF/EPUB/変換書庫であり、cache ZIP/PDF ではない。archive 内の現在 prefix は既存 `zip_nav`、本の現在ページは既存 reader が所有し、position に複製しない。origin の「検索前の場所」と、この position の「採用済み結果内の子」は異なる役割である。同じ戻り先の第二 owner は作らない。
+共通 session の source payload を `Metadata(existing drill/view)` と `Everything { submitted/accepted result, position }` に分け、後者の position は `Root | PhysicalChild { logical_source, return_anchor, route }` とする。logical_source は検索行の実フォルダまたは元 ZIP/PDF/EPUB/変換書庫であり、cache ZIP/PDF ではない。archive 内の現在 prefix は既存 `zip_nav`、本の現在ページは既存 reader が所有し、position に複製しない。origin の「検索前の場所」と、この position の「採用済み結果内の子」は異なる役割である。同じ戻り先の第二 owner は作らない。
 
-本 open の typed request は現在の search run/source と選択した logical identity を捕捉する。**実際の physical open の accepted closure**（ZIP/PDF の install、または変換後 alias を採用する境界）だけが Root→PhysicalChild を公開する。open の受付・変換開始・password 表示だけでは position を替えず、cancel/error/stale は Root のまま。common result dataset/query/stats は session に保持し、child の `App.items` へ検索 rows を同時に表示・再採用しない。
+本 open の typed request は現在の search run/source と選択した logical identity を捕捉する。実フォルダ・main で開く画像フォルダ本は既存 `install_prepared_scanned_folder_listing` → `commit_staged_search_navigation_effects` → `advance_drilled_current_path` の成功採用境界を共有する。独立 viewer へ開く場合はその viewer にだけ install し、main は Root に残す。context menu の「フォルダに移動」は従来の検索終了契約を維持する。**実際の physical open の accepted closure**（ZIP/PDF の install、または変換後 alias を採用する境界）だけが Root→PhysicalChild を公開する。open の受付・変換開始・password 表示だけでは position を替えず、cancel/error/stale は Root のまま。common result dataset/query/stats は session に保持し、child の `App.items` へ検索 rows を同時に表示・再採用しない。
 
-BS／親移動は Everything position を経由し、book 内の既存 prefix parent がある間は通常の内部移動へ渡す。book root からは保持済み result dataset を共通 Search prepare→accepted install で Root へ戻す。再 IPC は行わない。復帰成功時だけ position を Root にし、return_anchor の full path で選択・ensure-visible を行う。cancel/failed return は子の accepted view を保持する。Esc は fullscreen の通常終了を先に行い、grid の本階層では既存の検索終了 semantics を維持する（元結果への階層復帰は BS／親操作）。
+戻る操作値 `EverythingReturn::{Parent, Results}` を共通 router へ渡し、永続 state は増やさない。Parent（BS・grid 親操作・gamepad Back）は ZIP 内部階層なら既存 zip nav を一段戻す。それ以外は `effective_folder()` が logical_source の厳密な物理子孫かを `path_key` の component 境界・正規化 helper で判定し、子孫なら `resolve_grid_parent_nav()` → 通常 navigation dispatcher へ渡す（検索 gate に再入せず、子選択予約を維持）。起点なら保持済み result dataset を共通 Search prepare→accepted install で Root へ戻す。Results（「← 結果へ戻る」）は ZIP・物理階層の途中でも直接 Root へ再投影する。再 IPC は行わない。復帰成功時だけ position を Root にし、return_anchor の full path で選択・ensure-visible を行う。cancel/failed return は子の accepted view を保持する。Esc は fullscreen の通常終了を先に行い、grid の本階層では既存の検索終了 semantics を維持する（元結果への階層復帰は BS／親操作）。
 
 `commit_staged_search_navigation_effects`、`advance_drilled_current_path`、grid／fullscreen の parent・Ctrl+上下、converted alias、F12 direct-media／container open を source-aware routing の対象として列挙する。Everything Root では filesystem の sibling navigation をしない。PhysicalChild 内では本の通常 navigation を使い、外側 container を越える操作は検索結果集合の契約へ戻す。Metadata の hit-only drill はそのまま維持し、Everything 用に container hit count や偽の DrillState を作らない。
 
@@ -942,3 +953,51 @@ fixtureは明示寸法を渡す。製品のOS計測gateや実カーソル回避�
 
 workspace内TEMP/TMP/MSBUILDDEBUGPATH、`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`を使用。
 fixtureの再現性だけの変更なので確認用製品buildは行わず、製品起動・commitも行わない。
+
+
+## 21. §1.410 実フォルダ行（2026-10-25、実装済み・実機未検証）
+
+採用済み dataset／source／return owner を維持し、候補 kind と戻りの操作値だけを拡張する。
+新たな結果一覧・永続 state・IPC 経路は作らない。既存の取消可能な prepare modal で
+結果再投影との組合せを減らし、物理階層の親移動は通常 navigation を使う。
+まれな失敗は既定のログ＋通知で扱う。
+
+main の成功 install 後に呼ぶ既存 acceptance を維持する。採用行との照合には dataset の
+`physical_key` を使う。従来の `file_operation_path()` はチェック可能な実ファイル専用で
+Folder を返さないため、フォルダを含む検索行 identity の照合には使わない。
+
+Folder の代表サムネイルは既存 full-path cache key を使う。共通 Search prepare は
+直接 Video の WebP に加え、既存 `prepare_video_folder_pin_seeds` で Folder→Video／
+Folder→Folder→Video を解決し、捕捉した既存 thumbnail owner の catalog／cache map へ
+worker 上で seed する。UI から同期 seed は呼ばない。物理 child で thumbnail owner が
+替わるため、再投影ごとに `MetadataResources` を worker へ渡し、採用時もその identity を照合する。
+採用待ちにピン更新が cache map を置き換えた場合も、既存 prepare の再試行送信で現在の
+resources を取り直す。古い owner を参照したまま Ready の棄却を繰り返さない。
+兄弟 context の rows／世代／queue／cancel へは変更を発行しない。
+
+検証対象は `8b9205743`（§1.425）からの未コミット差分、branch は
+`claude/requests-425-410-409-4844f7`。新規12テストで、混在／フォルダのみ／画像なし／
+拡張子付き名／UNC、正規化後root拒否、hidden/system保持、実体種別不一致、内部名除外、
+取消／上限／重複、Folderのsize unknown・★・種類facet・タグ情報、main open／画像フォルダ本、
+Parent連鎖／gamepad Back、深いZIPからResults直帰、検索close／再検索、独立viewerのmain Root維持、
+動画pinのcold cache／cascade／結果復帰、Ready待ち中のthumbnail owner交換を検査する。
+既存ファイル形式、IPCの未知flag拒否、通常のCtrl+F／ドライブrootの親操作も対象に含めた。
+
+| 実行コマンド | 最終差分の結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib --test ui_snapshot -E 'test(/everything_results\|everything_ipc\|global_search_ui::everything\|^everything_search_\|ctrl_f_filter_.*backspace\|gamepad_back_(at_drive_root\|respects_ctrl_f)\|backspace_at_drive_root/)'` | **86 passed / 0 failed**、実行3.470s。更新指定なし。`target/1410-final-tests.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **成功**、17.55s。`target/1410-check.log`。既存warningあり |
+| `cargo fmt`、`cargo fmt --check` | **成功** |
+| `python scripts/check_ui_glyphs.py` | **成功**、危険グリフ0 |
+| `python scripts/check_site_cards.py` | **成功**、49 cards / 上限超過0 |
+| `git diff --check` | **成功** |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | **成功**、core 1m38s、remote 0.38s、EPUB worker 0.34s。normal feature set／dev-runtime、portableなし。PE検査runtime=4／pe=3成功。tool出力記録 `target/1410-build-dev-final.txt`。起動なし |
+
+検索バーのLight／Dark／狭幅Darkと応答なし狭幅Darkの4枚を更新し、文字・折り返し・
+件数の収まりを目視確認した（計226,931 bytes）。更新は
+`UPDATE_SNAPSHOTS=1 cargo nextest run -p mimageviewer --lib -E 'test(/everything_results|everything_ipc|global_search_ui::everything/)'`
+（72 passed）と、`UPDATE_SNAPSHOTS=1 cargo nextest run -p mimageviewer --test ui_snapshot -E 'test(/^everything_search_bar_(light|dark|narrow_dark)$/)'`
+（3 passed）。その後の所有者再取得修正を含む最終86件は、更新指定なしで同じPNGと比較して成功した。
+
+**未実施:** 実Everything／製品起動・実機操作、独立コードレビュー、full gate（今回の指示により実行しない）。
+backlog本文・バージョン・永続schema・検索受付条件は変更していない。コミットは実施しない。

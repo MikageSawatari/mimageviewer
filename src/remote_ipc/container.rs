@@ -2238,6 +2238,17 @@ struct RemotePartnerAutoTrimRequest {
     resolved: ResolvedPath,
 }
 
+/// Directory eligibility is supplied only by successful folder enumeration, never path sniffing.
+enum SpreadDefaultSource {
+    Legacy {
+        use_book_defaults: bool,
+    },
+    Directory {
+        book_locked: bool,
+        canonical_image_book: bool,
+    },
+}
+
 struct SpreadPayload {
     composition_managed: bool,
     composition_revision: Option<u64>,
@@ -6005,7 +6016,10 @@ impl ContainerEngine {
             &items,
             Some(&source_items),
             None,
-            canonical_image_book,
+            SpreadDefaultSource::Directory {
+                book_locked: listing.sort_locked,
+                canonical_image_book,
+            },
             complete_book_eligible,
             None,
             None,
@@ -6321,7 +6335,9 @@ impl ContainerEngine {
             &items,
             Some(&source_items),
             Some((&effective_segments, &resolved.logical)),
-            true,
+            SpreadDefaultSource::Legacy {
+                use_book_defaults: true,
+            },
             complete_book_eligible,
             None,
             None,
@@ -6495,7 +6511,9 @@ impl ContainerEngine {
             &items,
             None,
             None,
-            true,
+            SpreadDefaultSource::Legacy {
+                use_book_defaults: true,
+            },
             complete_book_eligible,
             Some(&read),
             Some(page_count),
@@ -6586,7 +6604,7 @@ impl ContainerEngine {
             items,
             source_items,
             zip_context,
-            use_book_defaults,
+            SpreadDefaultSource::Legacy { use_book_defaults },
             complete_book_eligible,
             None,
             None,
@@ -6603,7 +6621,7 @@ impl ContainerEngine {
         items: &[crate::grid_item::GridItem],
         source_items: Option<&[crate::grid_item::GridItem]>,
         zip_context: Option<(&[String], &Path)>,
-        use_book_defaults: bool,
+        default_source: SpreadDefaultSource,
         complete_book_eligible: bool,
         read: Option<&crate::pdf_loader::ReadTarget>,
         document_page_count: Option<u32>,
@@ -6623,7 +6641,31 @@ impl ContainerEngine {
         let (stored, final_cover_preference, singleton_placement_preference, page_alone_preference) =
             self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
         let source_items = source_items.unwrap_or(items);
-        let (default_mode, default_direction) = if use_book_defaults {
+        let use_book_defaults = match default_source {
+            SpreadDefaultSource::Legacy { use_book_defaults } => use_book_defaults,
+            SpreadDefaultSource::Directory {
+                canonical_image_book,
+                ..
+            } => canonical_image_book,
+        };
+        let (default_mode, default_direction) = if let SpreadDefaultSource::Directory {
+            book_locked: false,
+            canonical_image_book: true,
+        } = default_source
+            && reading_settings.apply_default_spread_to_plain_folders
+        {
+            // Folder responses omit non-images, so they cannot preserve mixed-media
+            // pairing boundaries. Only an all-image source may opt into this default.
+            let defaults = crate::app::SpreadRestoreDefaults::for_physical_folder(
+                false,
+                true,
+                reading_settings.apply_default_spread_to_plain_folders,
+                reading_settings.default_spread_mode,
+                reading_settings.default_reading_flow,
+                reading_settings.default_reading_direction,
+            );
+            (defaults.spread_mode(), defaults.reading_direction())
+        } else if use_book_defaults {
             (
                 reading_settings.default_spread_mode,
                 reading_settings.default_reading_direction,
@@ -9958,7 +10000,9 @@ pub(super) mod tests {
                 &items,
                 None,
                 Some((&[], &root)),
-                true,
+                SpreadDefaultSource::Legacy {
+                    use_book_defaults: true,
+                },
                 false,
                 None,
                 None,
@@ -10570,7 +10614,9 @@ pub(super) mod tests {
                     &items,
                     Some(&items),
                     None,
-                    true,
+                    SpreadDefaultSource::Legacy {
+                        use_book_defaults: true,
+                    },
                     true,
                     None,
                     None,
@@ -10737,7 +10783,9 @@ pub(super) mod tests {
                         &items,
                         Some(&items),
                         None,
-                        true,
+                        SpreadDefaultSource::Legacy {
+                            use_book_defaults: true
+                        },
                         true,
                         None,
                         None,
@@ -11089,7 +11137,9 @@ pub(super) mod tests {
                 &[],
                 Some(&[]),
                 Some((&[], &root)),
-                true,
+                SpreadDefaultSource::Legacy {
+                    use_book_defaults: true,
+                },
                 true,
                 None,
                 None,
@@ -18627,6 +18677,145 @@ pub(super) mod tests {
             reading_direction: RemoteReadingDirection::Rtl,
         };
         engine.validate_write_request(&mut write).unwrap();
+    }
+
+    #[test]
+    fn plain_folder_spread_payload_uses_live_defaults_and_accepted_book_classification() {
+        use crate::settings::{ReadingDirection as Direction, SpreadMode as Mode};
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let plain = root.join("plain");
+        let mixed = root.join("mixed");
+        for folder in [&plain, &mixed] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("001.jpg"), b"one").unwrap();
+            std::fs::write(folder.join("002.jpg"), b"two").unwrap();
+        }
+        std::fs::write(mixed.join("clip.mp4"), b"video").unwrap();
+        for book in [false, true] {
+            for mode in [
+                Mode::Single,
+                Mode::LtrCover,
+                Mode::RtlCover,
+                Mode::SplitRtl,
+                Mode::Vertical,
+            ] {
+                let favorite = FavoriteEntry::new("test".to_owned(), root.clone());
+                let mut engine = ContainerEngine::new(crate::settings::Settings {
+                    favorites: vec![favorite.clone()],
+                    auto_fullscreen_zip_pdf: true,
+                    auto_fullscreen_image_folders: book,
+                    // Startup values deliberately differ from the live reading snapshot.
+                    default_spread_mode: Mode::Ltr,
+                    ..Default::default()
+                });
+                engine.reading_settings = RemoteReadingSettingsSource::Snapshot(
+                    crate::settings_db::RemoteReadingSettings::from_settings(
+                        &crate::settings::Settings {
+                            apply_default_spread_to_plain_folders: true,
+                            default_spread_mode: mode,
+                            default_reading_direction: Direction::Rtl,
+                            ..Default::default()
+                        },
+                    ),
+                );
+                *engine.spread_db.lock().unwrap() = Ok(None);
+                for relative in ["plain", "mixed"] {
+                    let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                        address: favorite_address(&favorite, relative),
+                        spread_mode: None,
+                        reading_direction: None,
+                        force_single_page: false,
+                    }) else {
+                        panic!("folder enumeration failed");
+                    };
+                    let locked = book && relative == "plain";
+                    let expected_mode = if relative == "mixed" || mode == Mode::Vertical {
+                        Mode::Single
+                    } else {
+                        mode
+                    };
+                    assert_eq!(
+                        payload.configured_spread_mode,
+                        remote_spread_mode(expected_mode)
+                    );
+                    assert_eq!(
+                        payload.reading_direction,
+                        remote_reading_direction(if relative == "mixed" {
+                            Direction::Ltr
+                        } else {
+                            mode.reading_direction().unwrap_or(if locked {
+                                Direction::Rtl
+                            } else {
+                                Direction::Ltr
+                            })
+                        })
+                    );
+                    if relative == "mixed" {
+                        assert_eq!(payload.video_count, 1);
+                        assert!(payload.page_groups.iter().all(|group| {
+                            group
+                                .pages
+                                .iter()
+                                .all(|page| !page.path.ends_with("clip.mp4"))
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_folder_spread_remote_mixed_portrait_video_portrait_starts_single() {
+        use crate::settings::{ReadingFlow, SortOrder, SpreadMode};
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("mixed");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["001.png", "003.png"] {
+            image::RgbImage::new(8, 12).save(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("002.mp4"), b"video").unwrap();
+        let favorite = FavoriteEntry::new("mixed".to_owned(), root.clone());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            apply_default_spread_to_plain_folders: true,
+            auto_fullscreen_image_folders: false,
+            default_spread_mode: SpreadMode::Ltr,
+            default_reading_flow: ReadingFlow::Paged,
+            sort_order: SortOrder::FileName,
+            ..Default::default()
+        });
+        *engine.spread_db.lock().unwrap() = Ok(None);
+        let listing = engine.recompute_folder_listing(&root).unwrap();
+        assert!(!listing.sort_locked);
+        assert_eq!(
+            listing
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["001.png", "002.mp4", "003.png"]
+        );
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            address: favorite_address(&favorite, ""),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        }) else {
+            panic!("mixed folder enumeration failed");
+        };
+        assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Single);
+        assert_eq!(payload.image_count, 2);
+        assert_eq!(payload.video_count, 1);
+        assert_eq!(payload.page_groups.len(), 2);
+        assert!(
+            payload
+                .page_groups
+                .iter()
+                .all(|group| group.pages.len() == 1)
+        );
     }
 
     #[test]

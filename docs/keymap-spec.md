@@ -523,7 +523,7 @@ fullscreen/native側からROOTへの新しい転送は加えない。
 |---|---|
 | <kbd>Ctrl</kbd>+<kbd>R</kbd> | main の一覧から Everything ファイル名検索バーを開く。Action: `GlobalEverythingSearch`。閉じる操作は×/Esc。取得・準備中は取消可能なmainのモーダルを使い、完成した一覧だけを採用する |
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
-| <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
+| <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ。Everything (Ctrl+R) 中は開いたフォルダ・本の内部を 1 段戻り、起点からは結果一覧へ戻る。検索の最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
 | 既定キーなし (`GridRename`) | 選択中の実ファイル / 実フォルダ 1 項目の名前を変更する。複数チェック中は実行せず通知する。Grid 文脈だけで、画像 / 動画フルスクリーンには入れない |
 | 既定キーなし (`GridReload`) | 現在の一覧を、その一覧種別の再読み込み / 再スキャン / 再クエリ経路で更新する。スマートフォルダ / サブ展開の走査中は二重起動せず、★固定中は何もしない。表示中のフォルダツリーペインも同時に再読み込みする |
@@ -1062,3 +1062,19 @@ Explorer方式では選択を解除し、Check方式では維持する。
 環境設定の対象がONなら、既存 `FsToggleWindowMode` によるF11全画面の間だけ固定表示を自動表示へ投影する。
 HUD・native VK・カスタム割り当て・初回fullscreenも同じ表示先契約。新しい固定キーやKeyActionは追加しない。
 F12通常窓は抑制せず、その窓のF11拡大だけが対象。ナビゲータは既存 `FsNavigatorHold`（既定Alt）を使う。
+
+## ツールバーに固定した検索欄 (§1.409)
+
+既存 `GlobalFavSearch / GlobalLocalSearch / GlobalMetadataSearch / GlobalEverythingSearch` の
+受付条件を維持し、対象の固定がONなら同じ欄へpending text-input focusで移す。
+固定Ctrl+Gは終了toggleにせずfocusする。固定OFFの一時バーとCtrl+G toggleは従来どおり。
+新しいKeyActionは追加しない。Enter/EscはIME helperを通す固定の入力操作である。
+
+Escは全検索バー描画後の単一routerが一度だけ消費する。modal/IME→描画前の検索入力owner→
+適用結果または有効sessionの順。非active欄ではfocus解除だけ。検索終了時に固定欄のdraftは
+保持し、Everything実行中は取消だけを行う。egui begin_passでfocusが消えたときは既存recoveryの
+viewport/pass/pointer優先条件に従って入力Idを捕捉し、描画後のhas_focusで選び直さない。
+
+固定OFFの一時バーのEscは、そのバーの×と同じく共通検索sessionを終了して元一覧へ戻る。
+別sourceの結果を残したまま未送信入力を閉じて入力先だけ戻す(b)は、固定欄に限る。
+全OFFとG/Rの片方だけ固定の場合も、この入力ownerの区別を保つ。

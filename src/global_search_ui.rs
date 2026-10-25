@@ -30,6 +30,11 @@ use crate::grid_item::{ContainerRepresentative, GridItem, SearchContainerKind, T
 use crate::indexer_manager::SearchHandle;
 
 mod everything;
+#[cfg(test)]
+pub(crate) use everything::tests::{
+    adopt as adopt_everything_for_test, dataset as everything_dataset_for_test,
+    start_fake_run as start_everything_for_test,
+};
 use everything::{SearchMetadataInstall, SearchMetadataResources};
 
 impl SearchMetadataResources {
@@ -38,12 +43,25 @@ impl SearchMetadataResources {
             pin_db: app.folder_thumb_pin_db.clone(),
             tags_db_path: app.tags_db.as_ref().map(|db| db.read_path().to_path_buf()),
             video_pins: app.video_pin_db.as_ref().and_then(|db| db.read_source()),
+            folder_thumbnails: app
+                .current_color_cache_map
+                .as_ref()
+                .zip(app.current_color_catalog.as_ref())
+                .map(
+                    |(cache, catalog)| everything::metadata::FolderThumbnailResources {
+                        cache: Arc::clone(cache),
+                        catalog: Arc::clone(catalog),
+                        sort: app.settings.folder_thumb_sort,
+                        depth: app.settings.folder_thumb_depth,
+                    },
+                ),
         }
     }
 }
 pub(crate) use everything::SearchOpenOrigin;
-use everything::{
-    EverythingPosition, SearchAccepted, SearchProducer, SearchProjection, SearchSource,
+pub(crate) use everything::{
+    EverythingPosition, MetadataAppliedSpec, SearchAccepted, SearchProducer, SearchProjection,
+    SearchSource,
 };
 pub(crate) use everything::{EverythingSearchEntryAvailability, everything_search_menu_button};
 pub use everything::{
@@ -317,6 +335,7 @@ enum SearchItemsRebuild {
 }
 
 enum SearchPrepareCommand {
+    MetadataResources(SearchMetadataResources),
     Everything(String, crate::everything_ipc::CancelHandle),
     Batch(u64, Vec<GlobalHit>),
     Mtime(MtimeLookupResult),
@@ -488,7 +507,8 @@ pub struct GlobalSearchState {
     /// true のとき、トップバー表示 + 検索結果ビュー有効
     pub active: bool,
     /// クエリ入力テキスト
-    pub query: String,
+    pub metadata_draft: String,
+    pub everything_draft: String,
     /// 最後に実行したクエリ (変更検知用)
     pub last_executed: String,
     /// Changes on every new search intent, including the debounce interval.
@@ -579,9 +599,10 @@ impl Default for GlobalSearchState {
     fn default() -> Self {
         Self {
             source: SearchSource::Metadata,
-            accepted: SearchAccepted::Metadata,
+            accepted: SearchAccepted::Metadata { applied: None },
             active: false,
-            query: String::new(),
+            metadata_draft: String::new(),
+            everything_draft: String::new(),
             last_executed: String::new(),
             run_sequence: 0,
             visibility: Default::default(),
@@ -659,6 +680,13 @@ pub const SORT_MODES: &[ContainerSortMode] = &[
 ];
 
 impl GlobalSearchState {
+    pub(crate) fn draft(&self) -> &str {
+        match self.source {
+            SearchSource::Metadata => &self.metadata_draft,
+            SearchSource::Everything => &self.everything_draft,
+        }
+    }
+
     /// ユーザーに「まだ結果が確定していない」と見せるべき状態か。
     ///
     /// pending worker 実行中だけでなく、入力変更後の debounce 待ちも検索中として扱う。
@@ -670,8 +698,8 @@ impl GlobalSearchState {
         self.active
             && !self.done
             && self.reject_message.is_none()
-            && !self.query.trim().is_empty()
-            && (self.pending.is_some() || self.query != self.last_executed)
+            && !self.metadata_draft.trim().is_empty()
+            && (self.pending.is_some() || self.metadata_draft != self.last_executed)
     }
 
     /// 実効ビューを `aggregate` / `drill` から導出する (§4.3.1)。
@@ -708,7 +736,7 @@ impl GlobalSearchState {
         // SearchHandle は Drop で cancel するので、take() だけで OK
         self.pending = None;
         self.page_edit_prepare = None;
-        self.accepted = SearchAccepted::Metadata;
+        self.accepted = SearchAccepted::Metadata { applied: None };
         self.containers.clear();
         self.all_hits.clear();
         // 新クエリは一覧から開始し、自動切替を再有効化、drill state もリセット (§4.3.2)。
@@ -1695,7 +1723,7 @@ fn search_prepare_worker(
     available: crate::app::page_edit_snapshot::PageEditAvailability,
     visibility: crate::file_type_visibility::FileTypeVisibility,
     sidecar_settings: crate::settings::Settings,
-    resources: SearchMetadataResources,
+    mut resources: SearchMetadataResources,
 ) {
     let mut state = GlobalSearchState::default();
     let mut archive_visibility =
@@ -1723,6 +1751,7 @@ fn search_prepare_worker(
             break;
         }
         match command {
+            SearchPrepareCommand::MetadataResources(current) => resources = current,
             SearchPrepareCommand::Everything(query, request_cancel) => {
                 let query_started = Instant::now();
                 let result = crate::everything_ipc::query(&query, &request_cancel);
@@ -2121,6 +2150,8 @@ fn search_prepare_worker(
                                 &items,
                                 &image_metas,
                                 &resources,
+                                &cancel,
+                                &wish.visibility,
                             ) {
                                 Ok(metadata) => metadata,
                                 Err(error) => {
@@ -2426,7 +2457,7 @@ impl App {
         self.clear_tags_cache();
         // Ctrl+F フィルタの残留を解除 (Ctrl+G と共存させない)
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         // 選択を復元できたときは scroll_to_selected を立てて view を追従させる。
         // 復元できなかった (= 旧選択アイテムが消えた / 初回 install) ときは従来通り
         // 先頭にスクロール。
@@ -2667,6 +2698,12 @@ impl App {
         let transferred_origin = self.take_origin_for_search_entry(crate::app::SearchMode::Global);
         self.global_search.active = true;
         self.global_search.source = SearchSource::Metadata;
+        self.global_search.last_change_at = None;
+        // A retained draft is idle until edited/submitted. Empty legacy sessions
+        // keep their existing initial state; neither case publishes applied conditions.
+        if !self.global_search.metadata_draft.is_empty() {
+            self.global_search.done = true;
+        }
         self.global_search.focus_request = true;
         if let Some(origin) = transferred_origin {
             self.global_search.saved_folder = origin.restore.legacy_path().or(fallback_origin);
@@ -2743,6 +2780,7 @@ impl App {
         // 検索ビューを抜けたあとに SMB 越しの fs::metadata が裏で走り続けるのを止める。
         self.global_search.mtime_lookup_pending = None;
         self.global_search.active = false;
+        self.global_search.last_change_at = None;
         self.global_search.has_focus = false;
         // Ctrl+G 中に 0 で埋めたキャッシュを破棄して、復帰先フォルダの実値を再計算させる。
         self.current_folder_rating_cache = None;
@@ -2754,7 +2792,8 @@ impl App {
         self.global_search.drill = None;
         self.global_search.aggregate = false;
         self.global_search.aggregate_auto = true;
-        self.global_search.query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Metadata);
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Everything);
         self.global_search.last_executed.clear();
         self.global_search.reject_message = None;
         self.global_search.tag_bridge_suggestions.clear();
@@ -2789,7 +2828,7 @@ impl App {
             return;
         }
         // クエリが変わっていないならスキップ
-        if self.global_search.query == self.global_search.last_executed {
+        if self.global_search.metadata_draft == self.global_search.last_executed {
             return;
         }
         // debounce: 最後の変更から DEBOUNCE_MS 経過するまで待つ
@@ -2853,7 +2892,7 @@ impl App {
             self.global_search.reject_message = Some("検索の準備中".to_string());
             return;
         }
-        if self.global_search.query != self.global_search.last_executed {
+        if self.global_search.metadata_draft != self.global_search.last_executed {
             self.retire_main_list_requests_for_surface_switch();
         }
         self.retire_search_accepted();
@@ -2866,11 +2905,11 @@ impl App {
         if !self.restart_search_page_edit_prepare(ctx) {
             return;
         }
-        self.global_search.last_executed = self.global_search.query.clone();
+        self.global_search.last_executed = self.global_search.metadata_draft.clone();
         if let Some(db) = self.tags_db.as_ref() {
             self.global_search.tag_bridge_suggestions = tag_bridge_suggestions_for_query(
                 db,
-                &self.global_search.query,
+                &self.global_search.metadata_draft,
                 GLOBAL_SEARCH_TAG_BRIDGE_LIMIT,
             );
         }
@@ -2897,7 +2936,12 @@ impl App {
             // 進行中でも、current viewport ではなく ROOT を明示して起こす。
             repaint_ctx.request_repaint_of(egui::ViewportId::ROOT);
         });
-        let handle = mgr.spawn_search(self.global_search.query.clone(), favs, scope, Some(wake));
+        let handle = mgr.spawn_search(
+            self.global_search.metadata_draft.clone(),
+            favs,
+            scope,
+            Some(wake),
+        );
         self.global_search.pending = Some(SearchProducer::Metadata(handle));
         // items を空にして "検索中" 表示に切り替え
         self.rebuild_items_from_global_search();
@@ -3256,6 +3300,17 @@ impl App {
                         && prepared.rating_provenance.session_generation
                             == wish.rating_write_generation
                     {
+                        // Adoption already proved this exact source/run/query. Read its
+                        // validation facts here: Done can precede the initial empty Ready,
+                        // so the earlier view wish must not freeze an unvalidated outcome.
+                        let metadata_applied = (matches!(wish.source, SearchProjection::Metadata)
+                            && self.global_search.reject_message.is_none()
+                            && self.global_search.last_executed == wish.query
+                            && (self.global_search.done || prepare.raw_batch_sequence > 0))
+                            .then(|| MetadataAppliedSpec {
+                                query: wish.query.clone(),
+                                filters: wish.filters.clone(),
+                            });
                         let accept_started = Instant::now();
                         #[cfg(test)]
                         {
@@ -3317,7 +3372,7 @@ impl App {
                                 prepared.metadata,
                             );
                             app.install_prepared_page_edits(prepared.page_edits);
-                            app.accept_search_projection(wish.source.clone());
+                            app.accept_search_projection(&wish, metadata_applied);
                             if let Some(viewer) = viewer {
                                 app.finish_rating_membership_viewer_swap(viewer);
                             }
@@ -3438,6 +3493,13 @@ impl App {
                 wish.rating_write_generation = self.rating_session_write_generation;
                 wish.rating_preview = self.rating_preview_recipe();
                 wish.done = self.global_search.done;
+                if matches!(wish.source, SearchProjection::Everything { .. }) {
+                    // A pin refresh can replace the thumbnail owner while Ready is
+                    // pending. Retry against that owner, not the rejected one's snapshot.
+                    let _ = prepare.tx.send(SearchPrepareCommand::MetadataResources(
+                        SearchMetadataResources::for_app(self),
+                    ));
+                }
                 let _ = prepare.tx.send(SearchPrepareCommand::RatingWrites {
                     updates: self.rating_session_writes_after(0),
                     through_generation: self.rating_session_write_generation,
@@ -3781,7 +3843,7 @@ impl App {
                 adoption,
                 sequence: prepare.next_sequence,
                 run_sequence: self.global_search.run_sequence,
-                query: self.global_search.query.clone(),
+                query: self.global_search.metadata_draft.clone(),
                 filters: self.global_search.filters.clone(),
                 visibility: self.global_search.visibility.clone(),
                 source_generation: self.items_generation,
@@ -3990,7 +4052,7 @@ impl App {
     /// - current_path == container_root: Aggregated ビューに戻る
     /// - container_root の下に居る: 親フォルダに戻る
     pub(crate) fn drill_back_one_level(&mut self) {
-        if self.return_from_everything_child() {
+        if self.return_from_everything_child(everything::EverythingReturn::Parent) {
             return;
         }
         let Some(d) = self.global_search.drill.clone() else {
@@ -4174,10 +4236,15 @@ impl App {
         if !self.global_search.active {
             return;
         }
-        let query = if self.global_search.last_executed.is_empty() {
-            self.global_search.query.clone()
-        } else {
-            self.global_search.last_executed.clone()
+        let query = match &self.global_search.accepted {
+            SearchAccepted::Metadata {
+                applied: Some(applied),
+            } => applied.query.clone(),
+            SearchAccepted::Metadata { .. } if !self.global_search.last_executed.is_empty() => {
+                self.global_search.last_executed.clone()
+            }
+            SearchAccepted::Metadata { .. } => self.global_search.metadata_draft.clone(),
+            SearchAccepted::Everything { .. } => unreachable!(),
         };
         match self.global_search.view() {
             GlobalSearchView::Flat | GlobalSearchView::Aggregated => {
@@ -4268,6 +4335,11 @@ impl App {
     /// Ctrl+G トップパネルの描画 (既存 render_favsearch_bar と同パターン)。
     pub(crate) fn render_global_search_bar(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
+        if !self.settings.show_toolbar_search_metadata
+            && !self.settings.show_toolbar_search_everything
+        {
+            self.global_search.has_focus = false;
+        }
         if !self.global_search.active {
             return;
         }
@@ -4279,7 +4351,6 @@ impl App {
         let running = self.everything_search_progress_visible();
         self.show_everything_search_progress(ctx);
         let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
         let mut query_changed = false;
@@ -4321,6 +4392,7 @@ impl App {
                 });
             }
             ui.horizontal_wrapped(|ui| {
+                if !crate::ui_pinned_search::PinnedSearchKind::Metadata.pinned(&self.settings) {
                 ui.label("アイテム検索:").on_hover_text(
                     "Ctrl+G はお気に入りの「アイテム索引」を使い、画像 / PDF / 動画を\n\
                      ファイル名・EXIF・AI プロンプト等で横断検索します。\n\
@@ -4330,10 +4402,10 @@ impl App {
                 );
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
-                    &mut self.global_search.query,
+                    &mut self.global_search.metadata_draft,
                     Some(&mut self.global_search.focus_request),
                     |edit| {
-                        edit.hint_text(
+                        edit.id(crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id()).hint_text(
                             r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#,
                         )
                         .desired_width(320.0)
@@ -4343,10 +4415,10 @@ impl App {
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
-                    &mut self.global_search.query,
+                    &mut self.global_search.metadata_draft,
                 );
                 let response = output.response;
-                self.global_search.has_focus = response.has_focus();
+                self.global_search.has_focus |= response.has_focus();
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
@@ -4357,6 +4429,7 @@ impl App {
                     close_requested = true;
                 }
 
+                }
                 // ── 絞り込みドロップダウン (§19.7) ──
                 // お気に入り (auto_index_metadata=true のもののみ候補にする)
                 {
@@ -4517,7 +4590,7 @@ impl App {
                             )
                         )),
                     ))
-                } else if self.global_search.done {
+                } else if self.global_search.done && matches!(self.global_search.accepted, SearchAccepted::Metadata { applied: Some(_) }) {
                     let (text, color, hover) = if self.global_search.truncated {
                         let text =
                             format!("ヒット {} 件で打ち切り", self.global_search.total_valid);
@@ -4569,9 +4642,6 @@ impl App {
             ui.add_space(2.0);
         });
 
-        if !running && !self.any_dialog_open() && escape_pressed {
-            close_requested = true;
-        }
         if close_requested {
             self.close_global_search();
             return;
@@ -4588,7 +4658,7 @@ impl App {
             self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             // ドロップダウン変更は debounce せず即座に再実行する
             // (ユーザーの操作は明示的なので待つ必要がない)
-            if !self.global_search.query.trim().is_empty() {
+            if !self.global_search.metadata_draft.trim().is_empty() {
                 self.global_search.last_executed.clear(); // 強制再実行
                 self.spawn_global_search(ctx);
             }
@@ -4658,6 +4728,166 @@ impl App {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn section1409_metadata_stream(
+        app: &mut App,
+        ctx: &egui::Context,
+        query: &str,
+    ) -> crossbeam_channel::Sender<SearchStreamEvent> {
+        app.open_global_search();
+        app.global_search.metadata_draft = query.into();
+        app.reset_global_search_for_query_change(ctx);
+        app.global_search.last_executed = query.into();
+        app.global_search.last_sort_at = None;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(SearchProducer::Metadata(SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        }));
+        tx
+    }
+
+    fn section1409_settle_metadata(
+        app: &mut App,
+        ctx: &egui::Context,
+        ready: impl Fn(&App) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.poll_global_search_events(ctx);
+            if ready(app)
+                && app
+                    .global_search
+                    .page_edit_prepare
+                    .as_ref()
+                    .is_none_or(|prepare| prepare.in_flight.is_none() && prepare.desired.is_none())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Metadata projection did not settle: query={} done={} rejected={:?} applied={}",
+                app.global_search.metadata_draft,
+                app.global_search.done,
+                app.global_search.reject_message,
+                app.global_search.accepted.applied_query()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn section1409_metadata_only_validated_results_publish_applied_conditions() {
+        use crate::ui_pinned_search::{
+            PinnedSearchAction as Action, PinnedSearchKind as Kind, PinnedSearchState as State,
+        };
+        for outcome in ["unvalidated", "rejected", "zero", "streaming"] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.show_toolbar_search_metadata = true;
+            app.settings.show_toolbar_search_everything = true;
+            let ctx = egui::Context::default();
+            let previous = section1409_metadata_stream(&mut app, &ctx, "previous valid");
+            app.hold_next_search_ready_for_test();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !app.search_ready_is_held_for_test() {
+                app.poll_search_page_edit_prepare(&ctx);
+                assert!(
+                    Instant::now() < deadline,
+                    "initial unvalidated Ready missing"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            previous
+                .send(SearchStreamEvent::Done {
+                    truncated: false,
+                    reason: DoneReason::Complete,
+                })
+                .unwrap();
+            app.poll_global_search_events(&ctx);
+            assert!(
+                app.global_search.done,
+                "Complete precedes adoption of the initial empty list"
+            );
+            app.release_search_ready_for_test();
+            section1409_settle_metadata(
+                &mut app,
+                &ctx,
+                |app| matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied: Some(spec) } if spec.query == "previous valid"),
+            );
+            assert_eq!(app.pinned_search_state(Kind::Metadata), State::Applied);
+
+            let query = if outcome == "rejected" {
+                "あ"
+            } else {
+                "new query"
+            };
+            let stream = section1409_metadata_stream(&mut app, &ctx, query);
+            section1409_settle_metadata(&mut app, &ctx, |app| {
+                matches!(
+                    app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: None }
+                )
+            });
+            assert_ne!(app.pinned_search_state(Kind::Metadata), State::Applied);
+            match outcome {
+                "rejected" => stream
+                    .send(SearchStreamEvent::Done {
+                        truncated: false,
+                        reason: DoneReason::RejectedQuery(
+                            crate::global_search::RejectReason::TooShort(vec![query.into()]),
+                        ),
+                    })
+                    .unwrap(),
+                "zero" => stream
+                    .send(SearchStreamEvent::Done {
+                        truncated: false,
+                        reason: DoneReason::Complete,
+                    })
+                    .unwrap(),
+                "streaming" => stream
+                    .send(SearchStreamEvent::Batch {
+                        hits: Vec::new(),
+                        scanned_candidates: 0,
+                        valid_hits: 0,
+                        visibility_notice: None,
+                    })
+                    .unwrap(),
+                _ => {}
+            }
+            let applied = matches!(outcome, "zero" | "streaming");
+            section1409_settle_metadata(&mut app, &ctx, |app| {
+                let has_applied = matches!(
+                    app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: Some(_) }
+                );
+                has_applied == applied
+                    && (outcome != "rejected" || app.global_search.reject_message.is_some())
+            });
+            assert_eq!(app.applied_owner(), applied.then_some(Kind::Metadata));
+            if outcome == "rejected" {
+                assert_eq!(app.pinned_search_state(Kind::Metadata), State::Inactive);
+                app.update_global_search_address();
+                assert!(app.address.contains(query));
+                assert!(!app.address.contains("previous valid"));
+            }
+            if outcome == "zero" {
+                assert_eq!(app.pinned_search_state(Kind::Metadata), State::Applied);
+            }
+            app.ensure_search_session(Kind::Everything);
+            assert_eq!(app.applied_owner(), applied.then_some(Kind::Metadata));
+            app.handle_pinned_search_actions(&ctx, vec![Action::Clear(Kind::Everything)]);
+            assert_eq!(
+                app.global_search.active, applied,
+                "{outcome}: no return to a rejected/unvalidated query"
+            );
+            assert_eq!(app.global_search.metadata_draft, query);
+            if applied {
+                assert_eq!(app.global_search.source, SearchSource::Metadata);
+                app.handle_pinned_search_actions(&ctx, vec![Action::Clear(Kind::Metadata)]);
+                assert!(!app.global_search.active);
+            }
+        }
+    }
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
 
@@ -6496,11 +6726,12 @@ pub(crate) mod tests {
         state.active = true;
         assert!(!state.is_searching());
 
-        state.query = "グルグル".to_string();
+        state.metadata_draft = "グルグル".to_string();
+        state.last_change_at = Some(Instant::now());
         state.last_executed.clear();
         assert!(state.is_searching());
 
-        state.last_executed = state.query.clone();
+        state.last_executed = state.metadata_draft.clone();
         assert!(!state.is_searching());
 
         state.done = true;

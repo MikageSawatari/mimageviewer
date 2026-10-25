@@ -310,7 +310,8 @@ pub(crate) struct SmartFolderPreparedGrid {
     visible_indices: Vec<usize>,
     details_order: Vec<usize>,
     show_search_bar: bool,
-    search_query: String,
+    /// Pinned drafts belong to the input, never to this parked listing.
+    temporary_search_query: Option<String>,
     search_filter: Option<super::LocalSearchFilter>,
     search_filter_origin_folder: Option<PathBuf>,
     rating_cache: HashMap<usize, u8>,
@@ -2146,7 +2147,7 @@ impl App {
             TopLevelGridSurface::Search(view) => {
                 let (query, executed) = match view {
                     TopLevelSearchView::Global => (
-                        self.global_search.query.clone(),
+                        self.global_search.draft().to_owned(),
                         self.global_search.last_executed.clone(),
                     ),
                     TopLevelSearchView::Favorite => (
@@ -6121,14 +6122,14 @@ fn prepared_converted_archive_path(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::app) struct PreparedVideoFolderPinSeed {
-    pub(in crate::app) cache_key: String,
-    pub(in crate::app) video_path: PathBuf,
-    pub(in crate::app) mtime: i64,
-    pub(in crate::app) file_size: i64,
+pub(crate) struct PreparedVideoFolderPinSeed {
+    pub(crate) cache_key: String,
+    pub(crate) video_path: PathBuf,
+    pub(crate) mtime: i64,
+    pub(crate) file_size: i64,
 }
 
-pub(in crate::app) fn prepare_video_folder_pin_seeds(
+pub(crate) fn prepare_video_folder_pin_seeds(
     items: &[GridItem],
     folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     folder_pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
@@ -7651,7 +7652,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -8350,7 +8351,8 @@ impl App {
             visible_indices: std::mem::take(&mut self.visible_indices),
             details_order: std::mem::take(&mut self.details_order),
             show_search_bar: std::mem::take(&mut self.show_search_bar),
-            search_query: std::mem::take(&mut self.search_query),
+            temporary_search_query: (!self.settings.show_toolbar_search_local)
+                .then(|| std::mem::take(&mut self.search_query)),
             search_filter: self.search_filter.take(),
             search_filter_origin_folder: self.search_filter_origin_folder.take(),
             rating_cache: std::mem::take(&mut self.rating_cache),
@@ -8491,7 +8493,7 @@ impl App {
             visible_indices,
             details_order,
             show_search_bar,
-            search_query,
+            temporary_search_query,
             search_filter,
             search_filter_origin_folder,
             rating_cache,
@@ -8545,7 +8547,11 @@ impl App {
         self.visible_indices = visible_indices;
         self.details_order = details_order;
         self.show_search_bar = show_search_bar;
-        self.search_query = search_query;
+        if !self.settings.show_toolbar_search_local
+            && let Some(query) = temporary_search_query
+        {
+            self.search_query = query;
+        }
         self.search_filter = search_filter;
         self.search_filter_origin_folder = search_filter_origin_folder;
         self.rating_cache = rating_cache;
@@ -9467,13 +9473,22 @@ impl App {
             return;
         };
         self.show_search_bar = true;
-        self.search_query = query;
+        if !self.settings.show_toolbar_search_local {
+            self.search_query = query.clone();
+        }
         self.search_filter = None;
         self.search_filter_origin_folder = self.effective_folder();
-        if self.search_query.trim().is_empty() {
+        if query.trim().is_empty() {
             self.rebuild_visible_indices();
         } else {
-            self.reexecute_search_for_installed_list(ctx);
+            self.execute_submitted_local_search(
+                ctx,
+                Arc::new(super::LocalSearchSubmission {
+                    query,
+                    target: self.search_target.clone(),
+                    or_mode: self.search_or_mode,
+                }),
+            );
         }
     }
 
@@ -11194,7 +11209,7 @@ mod tests {
         assert_eq!(names(&app), ["a", "c.zip"]);
 
         app.show_search_bar = false;
-        app.search_query.clear();
+        app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         app.search_filter = None;
         app.rebuild_visible_indices();
         assert_eq!(
@@ -11906,6 +11921,61 @@ mod tests {
         assert_eq!(
             saved_child.resolve(&position),
             PositionResolution::HiddenIdentity
+        );
+    }
+
+    #[test]
+    fn section1409_smart_park_restore_keeps_pinned_local_draft_outside_listing_payload() {
+        for (pin_at_park, pin_at_return) in
+            [(false, false), (true, true), (false, true), (true, false)]
+        {
+            let mut app = crate::app::setup_app_for_test();
+            let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+            app.settings.show_toolbar_search_local = pin_at_park;
+            app.show_search_bar = true;
+            app.search_query = "root draft".into();
+            app.search_filter = Some(HashSet::from([0]).into());
+            let grid = app.take_visible_smart_folder_grid();
+            assert_eq!(
+                app.search_query,
+                if pin_at_park { "root draft" } else { "" }
+            );
+            assert_eq!(
+                grid.temporary_search_query.as_deref(),
+                (!pin_at_park).then_some("root draft")
+            );
+            park_smart_identity_test_root(&mut app, grid);
+            app.search_query = "child draft".into();
+            app.settings.show_toolbar_search_local = pin_at_return;
+            assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+            assert_eq!(
+                app.search_query,
+                if !pin_at_park && !pin_at_return {
+                    "root draft"
+                } else {
+                    "child draft"
+                }
+            );
+            assert!(app.show_search_bar);
+            assert!(app.search_filter.as_ref().unwrap().contains(&0));
+        }
+    }
+
+    #[test]
+    fn section1409_smart_reapply_keeps_current_pinned_draft_and_submitted_query_separate() {
+        let mut app = crate::app::setup_app_for_test();
+        install_smart_identity_test_root(&mut app, Default::default());
+        app.settings.show_toolbar_search_local = true;
+        app.search_query = "new child draft".into();
+        app.smart_folder_local_search_reapply = Some("root submission".into());
+        app.search_target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+        let ctx = egui::Context::default();
+        app.reapply_local_search_after_smart_folder_prepare(&ctx);
+        assert_eq!(app.search_query, "new child draft");
+        assert_eq!(
+            app.search_pending.as_ref().unwrap().submitted.query,
+            "root submission"
         );
     }
 

@@ -160,7 +160,7 @@ Phase 3 (右クリックカスタマイズ + ドラッグ並べ替え + 環境�
   セクションや入力欄が潰れるため、別パネルを維持していた。この問題を幅の所有境界で解決する。
 - フォルダバー全体を `ToolbarSectionId::Folder` 1 個にする。入力欄と付属ボタンを分解せず、
   ラベルのドラッグ、行頭指定、表示設定を既存のセクション経路へ接続する。
-- 既定は順序末尾・行頭 ON。通常のフォルダバーの文字スタイル、補助ボタン、入力動作を維持する。
+- 既定は既存操作セクションの末尾・行頭 ON（任意の検索欄はその後ろ、すべて既定非表示）。通常のフォルダバーの文字スタイル、補助ボタン、入力動作を維持する。
 - 移行は既存候補移行と同じ `toolbar_folder_section_migrated` bool を使う。
   serde 欠落は false、新規 default は true。load-time に保存済み順序を既存 fallback で補完し、
   Folder と行頭指定を重複なく追加して true にする。旧 JSON の取り込み・バックアップ復旧の
@@ -225,6 +225,127 @@ Phase 3 (右クリックカスタマイズ + ドラッグ並べ替え + 環境�
   詳細遅延ステータスバーは固定 (モード依存で出入りするため並べ替え対象にしない)。
 - **非採用 (重い形)**: どのバーも自由にドラッグで縦移動。render 戻り値の取り回し + 対象選別が増え
   割に合わない。
+
+### 2.5 検索欄の個別固定 (§1.409)
+
+- `SearchContainer / SearchLocal / SearchMetadata / SearchEverything` を Folder の後へ追加する。
+  表示 flag は4つとも既定 OFF、行頭も既定 OFF。既存の可視順・ドラッグ・行頭・リセット・
+  Preferences OK の live carry を使う。右クリックの表示名は「コンテナ検索欄」
+  「現在地の絞り込み欄」「アイテム検索欄」「Everything 検索欄」。
+- `PinnedSearchKind` が安定 input Id を定める。入力の正本は Local の `search_query`、
+  Container の `favsearch.query`、Global の `metadata_draft / everything_draft`。
+  固定時は一時バーの入力と×を省き、対象・状態・帰路等の操作は維持する。
+- 純粋描画 helper は owner 付き操作を返し、toolbar 後の単一 handler が
+  `ensure_search_session(kind)` を通して既存の入口へ渡す。focus/表示だけでは開始しない。
+  Local は Enter、Container は編集で即再検索、Metadata は変更処理→debounce、Everything は
+  Enter/検索ボタンのみ。既存 shortcut の受付条件を保ち、固定 ON では pending text-input
+  focus を要求する。Ctrl+G も固定時は toggle-close しない。
+- availability は PDF・閲覧・modal 等の既存制限だけ。別の検索の使用だけでは無効化しない。
+  終了/切替/install/Snapshot は pin-aware な消去 helper へ集約し、固定中の draft を保持する。
+- `applied_owner` は表示結果、`edit_owner(kind)` は入力先、`closable_owner` は適用結果→
+  有効session の順で導く。×は (a) 適用結果を終了して元一覧へ戻す、(b) 入力先だけなら
+  保持結果の入力先へ戻す/保持結果がなければ終了、(c) 他の欄は draft の消去だけ。
+  固定欄のEscは同じ終了規則で draft を保持し、非active欄ならfocusだけを外す。
+  一時バーのEscは従来の×と同じ共通検索終了・元一覧復帰であり、固定欄の(b)へ渡さない。
+- Esc は toolbar と全検索バーの後の `route_search_escape` が一度だけ処理・消費する。
+  `EscapeClaim` は当該frameだけの値。modal/IME→描画前に捕捉した入力owner→closable owner。
+  Everything running は取消だけ。入力ownerは egui-ime recovery の viewport/pass 有効範囲と
+  pointer/他widget優先を保ち、前frameの記録は有効な input Id を検索種別へ対応付けるだけ。
+- Metadata accepted は適用した query/filters を保持し、アドレスもその条件を使う。
+  欄の状態は Inactive / Applied / Edited / Running。Appliedだけテーマのaccent枠を出し、
+  Editedは「未適用」と表示する。
+- 幅の純関数にラベル・状態・ボタン・TextEdit余白・accent枠・spacingを含める。
+  入力は希望220pt/最小140pt。残り幅で最小幅を満たせなければセクション全体を次行へ送り、
+  全行幅でも足りなければ `[ラベル+ボタン] / [入力]`。その操作群自体も幅不足ならボタン単位で折り返す。Folderの行末所有を維持する。
+- 簡素化: 新しい結果一覧/pending/recovery ownerは作らず、4draft/既存session/単一handlerへ
+  集約する。launcherだけの案や他欄をfocus不能にする案は、常設入力・自由な検索切替の要求を
+  満たさないため不採用。検索実行時間・既存modalを変えないので追加のモーダル化は不要。
+  まれな失敗は既定のログ+通知に従う。
+
+#### 実装・非対話検証 (2026-10-25)
+
+受付は既存経路と同じ述語を使う。F/S/Gの閲覧制限は `viewer_session_blocks_main_window`、
+Everythingは既存の専用availabilityで判定する。`projected_viewer_session_open`で全種別を
+一括制限すると、従来許可されている連動別ウィンドウ中のF/S/Gにも新しい制限が入るため使わない。
+§1.406の受付拡張やdetached述語・viewport lifecycle自体は変更しない。この境界もpure回帰で検証する。
+
+固定draftを残しても、終了済みのdebounce意図は残さない。Globalのopen/dismiss/Snapshot終了で
+`last_change_at`を解除する。未確定の有効queryは従来どおりdraftと実行済み条件の差でも検索中と
+判定する。保持draftを開く/sourceを選ぶだけの入口では、その未実行入力をidleとして扱う。
+Metadataの`applied`はOptionで、未検証/拒否/失敗した投影はNone。正常Batchまたは正常Doneのある
+同じrun/queryの一覧を採用するときだけSomeにする。正常0件も成立した検索として区別する。
+最初の空一覧準備より先にDoneが届く場合があるため、古いview wishに拒否/成立を固定しない。
+アドレスは採用済みの適用条件を使い、まだ適用条件がなければ従来の実行/入力条件を使う。
+×(b)でaccepted側へ入力先を戻す場合は、その適用queryを`last_executed`へ戻す。
+PhysicalChildのacceptedも保持し、入力先だけの終了で元の検索全体を失わない。
+
+変更ファイル:
+
+- 入力欄・設定UI: `src/ui_pinned_search.rs`、`src/app/pinned_search.rs`、`src/ui_main.rs`、
+  `src/settings.rs`、`src/settings_transfer.rs`、`src/ui_dialogs/preferences.rs`、`src/lib.rs`。
+- 検索state・入口・消去/参照: `src/app.rs`、`src/global_search_ui.rs`、
+  `src/global_search_ui/everything.rs`、`src/global_search_ui/everything/shortcut.rs`、
+  `src/global_search_ui/everything/ui.rs`、`src/app/collection_grid.rs`、`src/app/release_checks.rs`、
+  `src/app/smart_folder.rs`、`src/app/snapshot_ops.rs`、`src/app/update_phases.rs`、
+  `src/app/viewer_context_registry.rs`、`src/filename_stack_ui.rs`。
+- 回帰・PNG: `src/app/tests.rs`、`src/app/tests/file_type_visibility_fixes.rs`、
+  `src/global_search_ui/everything/tests.rs`、`tests/ui_snapshot.rs`、
+  `tests/snapshots/toolbar_pinned_search_light.png`、`tests/snapshots/toolbar_pinned_search_narrow_dark.png`。
+- 設計・仕様: 本書、`docs/search-architecture.md`、`docs/everything-search-plan.md`、
+  `docs/keymap-spec.md`、`docs/spec.md`、`docs/architecture-overview.md`。
+- 公開文書: `htdocs/mimageviewer/index.html`、`htdocs/mimageviewer/manual/settings.html`、
+  `htdocs/mimageviewer/manual/search.html`、`htdocs/mimageviewer/manual/tut-search.html`。
+
+- 新規lib回帰20件: 設定default/JSON roundtrip/未知enum/live carry、本番ツールバー設定UI→
+  Preferences OK helper→DB保存/再読込、幅純関数、1120/720/360ptの共通helper/本番toolbar矩形、
+  owner付きhandler、両方向のG/R解除/保持、未送信/取消後/PhysicalChildのEsc、実Contextの
+  begin_passによるfocus喪失、IME中のEsc/再配置、pin切替、focus集約、古いdebounceの非再開、
+  非active欄の古いfocus要求の破棄。240ptでも全操作と入力が収まることを矩形検証する。
+- 新規PNGは `toolbar_pinned_search_light` と `toolbar_pinned_search_narrow_dark` の2枚、
+  合計46,970 bytes。本番と共通のtoolbar style/描画helperを使い、全欄・未適用表示・適用枠・
+  縮幅・文字と操作の非重複を目視確認した。既存PNGはbyte単位で変更しない。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/section1409/) | test(/global_search_ui::/) | test(/phase_c_key_tests/) | test(/section207/) | test(/toolbar_section/) | test(/index_full_check_tests/) | test(/ime_focus::/)'`
+  → **216件成功**。ログ `target/1409-regression-complete.log`、exit code記録は同名系列。
+- `$env:UPDATE_SNAPSHOTS = '1'; cargo test --test ui_snapshot toolbar_pinned_search`
+  → 新規2件成功（生成専用shell）。
+  `cargo test --test ui_snapshot -- --test-threads=4` → **197件成功**。
+  ログ `target/1409-snapshot-new-final.log` / `target/1409-snapshot-all.log`。
+- `cargo check -p mimageviewer --bin mimageviewer-core` 成功
+  (`target/1409-check-final.log`)。`cargo fmt`（引数なし）で整形し、`cargo fmt --check` 成功。
+- `python scripts/check_ui_glyphs.py` → 危険glyph 0件。
+  `python scripts/check_site_cards.py` → 49カード、超過0件。`git diff --check` 成功。
+- `.\scripts\build-dev.ps1 -PreserveRuntime` 成功（最終差分、core 1分49秒、remote/EPUB workerも成功）。
+  `target/dev-runtime/mimageviewer-core.exe` と両companionを作成し、VCRT/PE検査は runtime=4 / pe=3 成功。
+  成果物は起動していない。通常feature setのため既定は実利用中の `%APPDATA%\mimageviewer` を使う。
+- full lib suite・製品起動・対話操作・コミットは実施していない。実機確認と独立completion reviewは
+  設計leadへ引き継ぐ。設計v1〜v4/d4の範囲で実装し、結果ownerやpending workerを追加していない。
+
+#### 独立レビュー・全lib指摘の修正（32bc933c1後）
+
+- 一時バーのEscは固定欄の(b)と分離し、既存×と同じ終了transactionへ渡す。全OFF/片方だけ固定の
+  G→R/R→G、期限切れの描画前入力ownerを検証する。
+- Smart Folderの`SmartFolderPreparedGrid`は非固定時のtemporary queryだけを退避する。
+  固定Local draftはAppの入力に残し、子から戻っても上書きしない。復元時の固定切替も確認する。
+  非同期再適用は捕捉済み検索条件を実行し、現在の固定draftには代入しない。
+- Metadataの適用条件は一覧採用時の検証事実から公開する。拒否/未検証と正常0件を区別し、
+  初回空Readyを保持してDoneを先に受ける順序も回帰に含める。
+- 並べ替えOFFのラベルもclick senseを持つ。4欄すべての右クリック→「行頭に表示」を合成ポインター入力で検証する。
+- 未確定queryのアドレス「検索中」は製品側を修正し、既存テストの期待は変更しない。
+- Settings転送は4flagの既存除外分類を維持し、総数470/Preferences149/除外321へ件数を更新する。
+  4flag個別の除外分類も明示検証する。公開wire key 147件は変更しない。
+
+検証（2026-10-25、製品実行なし）:
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/section1409/) | test(/global_search_ui::/) | test(/smart_folder/) | test(/settings_transfer::/) | test(/phase_c_drill_address_tests/) | test(/phase_c_key_tests/)'`
+  は408件成功。報告された既存2件の失敗も含む。全libは設計leadが別途実行する。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt`（引数なし）、
+  `cargo fmt --check`、`python scripts/check_ui_glyphs.py`は成功（危険グリフ0件）。
+- `cargo test --test ui_snapshot -- --test-threads=4`は197件成功。
+  `toolbar_pinned_search_light.png` / `toolbar_pinned_search_narrow_dark.png`の2枚だけを更新した。
+  click senseに伴う検索ラベルのテーマ標準の操作可能文字色への変更を目視確認済み。
+  配置は維持し、ほかの既存PNGはbyte単位で不変。
+- `.\scripts\build-dev.ps1 -PreserveRuntime`は成功。本体/Remote/EPUB補助を生成し、
+  VCRT/PE検査はruntime=4/pe=3で成功。通常profileの確認用バイナリは起動していない。
 
 ## 3. 表示形式の一般化
 

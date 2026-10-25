@@ -1833,7 +1833,7 @@ fn toolbar_combo_width(ui: &egui::Ui, inner_width: f32, selected_text: &str) -> 
     actual + 2.0 * padding
 }
 
-fn apply_toolbar_style(ui: &mut egui::Ui) {
+pub(crate) fn apply_toolbar_style(ui: &mut egui::Ui) {
     let toolbar_family = egui::FontFamily::Name(std::sync::Arc::<str>::from(
         crate::ui_fonts::TOOLBAR_TEXT_FAMILY_NAME,
     ));
@@ -4094,6 +4094,10 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
         TS::SmartFolders => "スマートフォルダ",
         TS::Tags => "タグ",
         TS::Folder => "フォルダバー",
+        TS::SearchEverything => "Everything 検索欄",
+        TS::SearchMetadata => "アイテム検索欄",
+        TS::SearchLocal => "現在地の絞り込み欄",
+        TS::SearchContainer => "コンテナ検索欄",
         TS::Unknown => "",
     }
 }
@@ -4234,6 +4238,10 @@ fn set_toolbar_section_visible(
         TS::SmartFolders => settings.show_toolbar_smart_folders = visible,
         TS::Tags => settings.show_toolbar_tags = visible,
         TS::Folder => settings.show_toolbar_folder = visible,
+        TS::SearchEverything => settings.show_toolbar_search_everything = visible,
+        TS::SearchMetadata => settings.show_toolbar_search_metadata = visible,
+        TS::SearchLocal => settings.show_toolbar_search_local = visible,
+        TS::SearchContainer => settings.show_toolbar_search_container = visible,
         TS::Unknown => {}
     }
 }
@@ -10073,6 +10081,7 @@ impl App {
         root_ui: &mut egui::Ui,
     ) -> (Option<PathBuf>, Option<AddressBarNav>) {
         let ctx = &root_ui.ctx().clone();
+        self.prepare_pinned_search_frame(ctx);
         if !self.settings.show_toolbar_folder {
             self.address_has_focus = false;
         }
@@ -10147,6 +10156,10 @@ impl App {
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
                         TS::Folder => show_folder,
+                        TS::SearchContainer => self.settings.show_toolbar_search_container,
+                        TS::SearchLocal => self.settings.show_toolbar_search_local,
+                        TS::SearchMetadata => self.settings.show_toolbar_search_metadata,
+                        TS::SearchEverything => self.settings.show_toolbar_search_everything,
                         TS::Unknown => false,
                     }
                 })
@@ -10166,12 +10179,16 @@ impl App {
             || show_smart_folders
             || show_rating
             || show_tags
-            || self.settings.show_toolbar_folder;
+            || self.settings.show_toolbar_folder
+            || crate::ui_pinned_search::PinnedSearchKind::ALL
+                .into_iter()
+                .any(|kind| kind.pinned(&self.settings));
 
         if !any_toolbar_section {
             return (None, None);
         }
 
+        let mut pinned_actions = Vec::new();
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_address_nav = None;
         let mut toolbar_smart_folder_open: Option<uuid::Uuid> = None;
@@ -10329,6 +10346,10 @@ impl App {
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
                         TS::Folder => self.settings.show_toolbar_folder,
+                        TS::SearchContainer => self.settings.show_toolbar_search_container,
+                        TS::SearchLocal => self.settings.show_toolbar_search_local,
+                        TS::SearchMetadata => self.settings.show_toolbar_search_metadata,
+                        TS::SearchEverything => self.settings.show_toolbar_search_everything,
                         TS::Unknown => false,
                     };
                     if !visible {
@@ -11285,6 +11306,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
                 }
+                TS::SearchContainer | TS::SearchLocal | TS::SearchMetadata | TS::SearchEverything => {
+                    let kind = crate::ui_pinned_search::PinnedSearchKind::from_section(section).unwrap();
+                    let response = self.draw_pinned_search_section(ui, kind);
+                    self.finish_toolbar_section_lead(ui, response.inner.label, section, &mut current_section_anchors, &last_section_anchors);
+                    if let Some(anchor) = current_section_anchors.last_mut() { anchor.1 = response.response.rect; }
+                    pinned_actions.extend(response.inner.actions);
+                }
                 TS::Folder => {
                     // A scope would start a fresh placer at the remaining rect and
                     // lose the full row's left edge. Keep the wrapping placer owner.
@@ -11335,6 +11363,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         // 次フレームのドラッグ並べ替え drop 計算用に、今フレームの可視セクション矩形を格納。
         self.toolbar_section_anchors = current_section_anchors;
+        self.handle_pinned_search_actions(ctx, pinned_actions);
 
         if toolbar_combo_popup_open {
             consume_wheel_input(ctx);
@@ -11536,6 +11565,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .on_hover_text("詳細設定はフォルダバー左端の「フォルダ:」を右クリック")
             .changed();
 
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_container, "コンテナ検索欄")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_local, "現在地の絞り込み欄")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_metadata, "アイテム検索欄")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_everything, "Everything 検索欄")
+            .changed();
+
         ui.separator();
         // ドラッグ並べ替えの許可 (既定 OFF。OFF のときはカーソルも変わらない)。
         if ui
@@ -11632,6 +11674,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_toolbar_facet_filter = true;
         // フォルダバー (アドレス行) もセクション扱いなので一緒に既定へ戻す (Codex P3)。
         s.show_toolbar_folder = true;
+        s.show_toolbar_search_everything = false;
+        s.show_toolbar_search_metadata = false;
+        s.show_toolbar_search_local = false;
+        s.show_toolbar_search_container = false;
         s.show_address_bar_history_nav = true;
         s.show_address_bar_quick_folders = true;
         s.show_toolbar_parent_button = true;
@@ -11710,10 +11756,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let has_section_specific_settings = !matches!(
             section,
-            TS::FolderTree | TS::EffeTune | TS::Rating | TS::Unknown
+            TS::FolderTree
+                | TS::EffeTune
+                | TS::Rating
+                | TS::SearchContainer
+                | TS::SearchLocal
+                | TS::SearchMetadata
+                | TS::SearchEverything
+                | TS::Unknown
         );
         match section {
-            TS::FolderTree | TS::EffeTune | TS::Rating | TS::Folder => {
+            TS::FolderTree
+            | TS::EffeTune
+            | TS::Rating
+            | TS::Folder
+            | TS::SearchContainer
+            | TS::SearchLocal
+            | TS::SearchMetadata
+            | TS::SearchEverything => {
                 // 表示形式・出す項目を持たない。非表示 / 既定化のみ (下の共通部)。
             }
             TS::Bookshelf => {
@@ -15483,7 +15543,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // 開いた場合はここで閉じる (ショートカット側は app.rs で抑止済み)。
         if self.grid_is_pdf_pages() {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -15500,7 +15560,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         // IME 変換確定の Enter は送信に使わず、確定後の通常 Enter だけを検索実行に使う。
         let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
         let local_search_label = self
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
@@ -15508,6 +15567,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
+                if !crate::ui_pinned_search::PinnedSearchKind::Local.pinned(&self.settings) {
                 ui.label("検索:").on_hover_text(format!(
                     "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
@@ -15517,7 +15577,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &mut self.search_query,
                     Some(&mut self.search_focus_request),
                     |edit| {
-                        edit.hint_text(
+                        edit.id(crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id()).hint_text(
                             r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#,
                         )
                         .desired_width(320.0)
@@ -15544,22 +15604,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 // × ボタン
                 if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
-                    self.cancel_pending_folder_nav();
-                    self.show_search_bar = false;
-                    self.search_query.clear();
-                    self.search_filter = None;
-                    self.search_filter_origin_folder = None;
-                    self.search_has_focus = false;
-                    self.search_tag_bridge.clear();
-                    self.move_grid_cursor(
-                        self.selected,
-                        crate::app::GridCursorIntent::ExplicitKeep,
-                    );
-                    self.cancel_search_pending();
-                    self.rebuild_visible_indices();
-                    self.refresh_color_filter_for_scope_change(ctx);
+                    self.close_local_search(ctx);
                 }
 
+                }
                 // ── 検索対象ドロップダウン (§19.7) ──
                 if zip_view {
                     // §4.1.2: ZIP 内はファイル名フィルタ固定。ドロップダウンは無効化
@@ -15601,24 +15649,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     && !self.search_query.trim().is_empty()
                 {
                     self.execute_search(ctx);
-                }
-
-                // Esc で検索解除（ダイアログが開いていない場合のみ。IME 変換中もスキップ）
-                if !self.any_dialog_open() && escape_pressed {
-                    self.cancel_pending_folder_nav();
-                    self.show_search_bar = false;
-                    self.search_query.clear();
-                    self.search_filter = None;
-                    self.search_filter_origin_folder = None;
-                    self.search_has_focus = false;
-                    self.search_tag_bridge.clear();
-                    self.move_grid_cursor(
-                        self.selected,
-                        crate::app::GridCursorIntent::ExplicitKeep,
-                    );
-                    self.cancel_search_pending();
-                    self.rebuild_visible_indices();
-                    self.refresh_color_filter_for_scope_change(ctx);
                 }
 
                 // 検索中インジケータ or マッチ件数 (separator の後に表示)
@@ -15696,7 +15726,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             return;
         }
         let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
         let mut query_changed = false;
@@ -15705,41 +15734,45 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("コンテナ検索:");
-                let mut output = crate::ime_focus::show_singleline(
-                    ui,
-                    &mut self.favsearch.query,
-                    Some(&mut self.favsearch.focus_request),
-                    |edit| {
-                        edit.hint_text(
-                            r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#,
-                        )
-                        .desired_width(320.0)
-                        .min_size(egui::vec2(320.0, 20.0))
-                    },
-                );
-                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
-                    ui,
-                    &mut output,
-                    &mut self.favsearch.query,
-                );
-                let response = output.response;
+                if !crate::ui_pinned_search::PinnedSearchKind::Container.pinned(&self.settings) {
+                    ui.label("コンテナ検索:");
+                    let mut output = crate::ime_focus::show_singleline(
+                        ui,
+                        &mut self.favsearch.query,
+                        Some(&mut self.favsearch.focus_request),
+                        |edit| {
+                            edit.id(
+                                crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id()
+                            )
+                            .hint_text(
+                                r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#,
+                            )
+                            .desired_width(320.0)
+                            .min_size(egui::vec2(320.0, 20.0))
+                        },
+                    );
+                    let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                        ui,
+                        &mut output,
+                        &mut self.favsearch.query,
+                    );
+                    let response = output.response;
 
-                self.favsearch.has_focus = response.has_focus();
+                    self.favsearch.has_focus = response.has_focus();
 
-                // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
-                if response.changed() || menu_changed {
-                    query_changed = true;
+                    // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
+                    if response.changed() || menu_changed {
+                        query_changed = true;
+                    }
+                    // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
+                    if response.lost_focus() && enter_pressed {
+                        query_changed = true;
+                    }
+
+                    if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
+                        close_requested = true;
+                    }
                 }
-                // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
-                if response.lost_focus() && enter_pressed {
-                    query_changed = true;
-                }
-
-                if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
-                    close_requested = true;
-                }
-
                 // ── お気に入り絞り込みドロップダウン (§19.7) ──
                 // `auto_index_structure=true` のお気に入りのみ候補に出す (名前索引の対象と一致)。
                 {
@@ -15836,13 +15869,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             });
             ui.add_space(2.0);
         });
-
-        // Esc で閉じる (IME 変換中はスキップ、他のダイアログが開いていないときのみ)。
-        // テキストボックスが Esc で focus を失ってから本チェックに達するため、
-        // has_focus は要求せず active のみで判定する (Ctrl+F の検索バーと同じ挙動)。
-        if !self.any_dialog_open() && escape_pressed {
-            close_requested = true;
-        }
 
         if close_requested {
             self.close_favsearch();
@@ -31290,5 +31316,76 @@ mod section292_tests {
     #[test]
     fn section292_facet_sort_snapshot_narrow_dark() {
         facet_sort_snapshot("facet_sort_narrow_dark", 320.0);
+    }
+}
+
+#[cfg(test)]
+mod pinned_search_review_tests {
+    use super::*;
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+    use egui_kittest::kittest::Queryable;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    #[test]
+    fn section1409_search_label_secondary_click_opens_settings_with_drag_disabled() {
+        for kind in Kind::ALL {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.toolbar_section_drag_enabled = false;
+            set_toolbar_section_visible(&mut app.settings, kind.section(), true);
+            let app = Rc::new(RefCell::new(app));
+            let render = app.clone();
+            let label_rect = Rc::new(Cell::new(egui::Rect::NOTHING));
+            let rect = label_rect.clone();
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(640.0, 260.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let mut app = render.borrow_mut();
+                            let response = app.draw_pinned_search_section(ui, kind);
+                            rect.set(response.inner.label.rect);
+                            app.finish_toolbar_section_lead(
+                                ui,
+                                response.inner.label,
+                                kind.section(),
+                                &mut Vec::new(),
+                                &[],
+                            );
+                        });
+                    });
+                });
+            harness.run();
+            let pos = label_rect.get().center();
+            harness.hover_at(pos);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.run();
+            harness.get_by_label("行頭に表示").click();
+            harness.run();
+            assert!(
+                app.borrow()
+                    .settings
+                    .toolbar_section_new_row
+                    .contains(&kind.section()),
+                "{kind:?}"
+            );
+            assert!(!app.borrow().settings.toolbar_section_drag_enabled);
+        }
     }
 }

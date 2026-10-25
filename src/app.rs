@@ -627,6 +627,7 @@ mod close_return;
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
+mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
@@ -13519,6 +13520,36 @@ impl SpreadRestoreDefaults {
 
     pub(crate) fn spread_mode(self) -> crate::settings::SpreadMode {
         self.spread_mode
+    }
+
+    /// Resolve initial defaults only; stored folder values win at the restore boundary.
+    pub(crate) fn for_physical_folder(
+        book_locked: bool,
+        is_real_directory: bool,
+        apply_to_plain_folders: bool,
+        default_spread_mode: crate::settings::SpreadMode,
+        default_reading_flow: crate::settings::ReadingFlow,
+        default_reading_direction: crate::settings::ReadingDirection,
+    ) -> Self {
+        if book_locked {
+            Self {
+                spread_mode: default_spread_mode,
+                reading_flow: default_reading_flow,
+                reading_direction: default_reading_direction,
+            }
+        } else if apply_to_plain_folders && is_real_directory {
+            Self {
+                // Legacy Vertical encodes flow, which this preference must not change.
+                spread_mode: if default_spread_mode == crate::settings::SpreadMode::Vertical {
+                    crate::settings::SpreadMode::Single
+                } else {
+                    default_spread_mode
+                },
+                ..Self::NON_BOOK
+            }
+        } else {
+            Self::NON_BOOK
+        }
     }
 
     pub(crate) fn reading_direction(self) -> crate::settings::ReadingDirection {
@@ -28409,7 +28440,7 @@ impl App {
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.search_filter = None;
         self.search_filter_origin_folder = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.show_search_bar = false;
         self.checked.clear();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -32718,7 +32749,10 @@ impl App {
         if full_check_requested {
             self.request_index_full_check_shared();
         }
-        if self.global_search.active && !self.global_search.query.trim().is_empty() {
+        if self.global_search.active
+            && self.global_search.source == crate::global_search_ui::SearchSource::Metadata
+            && !self.global_search.metadata_draft.trim().is_empty()
+        {
             self.global_search.last_executed.clear();
         }
         stage.finish(if self.indexer_init.is_some() {
@@ -33114,7 +33148,7 @@ impl App {
         let mut transferred = self.dismiss_snapshot_with_origin();
         if !matches!(keep, SearchMode::LocalMeta) && self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -33195,7 +33229,7 @@ impl App {
         self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
-        self.favsearch.query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Container);
         self.favsearch.last_executed.clear();
         self.favsearch.nav_stack.clear();
         self.favsearch.results_paths.clear();
@@ -34008,7 +34042,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -37155,7 +37189,7 @@ impl App {
             }
             if app.show_search_bar {
                 app.show_search_bar = false;
-                app.search_query.clear();
+                app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
                 app.search_filter = None;
                 app.search_filter_origin_folder = None;
                 app.search_has_focus = false;
@@ -39051,7 +39085,7 @@ impl App {
         self.clear_tags_cache();
         // Ctrl+F フィルタの残留を解除 (旧レベルの entry 向けなので新レベルでは無効)。
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
@@ -42142,12 +42176,16 @@ impl App {
         // `install_new_items_inner` は view flags と `self.items` を差し替えるため、今回の
         // 読み込みが本かどうかは、確定済みの target source/items から先に決める。
         let page_order_view_kind = PageOrderViewKind::for_loading_source(&source_path);
-        let spread_restore_defaults =
-            if self.page_order_locked_for_items(&source_path, &items, page_order_view_kind) {
-                SpreadRestoreDefaults::for_book(&self.settings)
-            } else {
-                SpreadRestoreDefaults::NON_BOOK
-            };
+        // A signature comes from an accepted directory scan (also retained by Stack).
+        // Physical view kind or the path extension alone does not prove a directory.
+        let spread_restore_defaults = SpreadRestoreDefaults::for_physical_folder(
+            self.page_order_locked_for_items(&source_path, &items, page_order_view_kind),
+            folder_signature.is_some() && page_order_view_kind == PageOrderViewKind::Physical,
+            self.settings.apply_default_spread_to_plain_folders,
+            self.settings.default_spread_mode,
+            self.settings.default_reading_flow,
+            self.settings.default_reading_direction,
+        );
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
@@ -42363,8 +42401,7 @@ impl App {
                 ],
             );
         }
-        // 表示モード: DB から読み込み、なければ読み込み対象が本のときだけ settings の既定値。
-        // 本でないビューは単ページ + ページ単位 + 左→右へ戻す。明示保存値はどちらでも優先する。
+        // 保存値を優先し、未保存なら採用済み分類と通常フォルダ設定から既定を解決する。
         // 旧実装の SpreadMode::Vertical は「単ページ + 縦連結」として解釈する。
         // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
         // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
@@ -42380,7 +42417,7 @@ impl App {
         self.search_filter = None;
         self.search_filter_origin_folder = None;
         if !detached_physical {
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
             // 検索結果インデックスが意味を失う)
             if let Some(pending) = self.search_pending.take() {
@@ -48142,20 +48179,53 @@ impl App {
             self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
-            let preferred_direction = container
-                .spread
-                .direction
-                .unwrap_or(self.settings.default_reading_direction);
-            let stored_spread = container.spread.resolve_mode(
-                self.settings
-                    .default_spread_mode
-                    .with_reading_direction(preferred_direction),
-                preferred_direction,
-            );
-            self.reading_flow = container
-                .spread
-                .flow
-                .unwrap_or(self.settings.default_reading_flow);
+            // Limit the opt-in to plain directories. Keep the pre-1.425 import calculation
+            // for OFF, books and other sources, including its existing differences from open.
+            // Reuse this context's accepted directory scan, without another stat or scan.
+            let physical_folder_defaults = self.folder_observation.as_ref().and_then(|scan| {
+                (self.settings.apply_default_spread_to_plain_folders
+                    && scan.generation == self.items_generation
+                    && self.current_folder.as_ref() == Some(&scan.source)
+                    && self.extracted_result_surface().is_none()
+                    && !self.page_order_locked_for_items(
+                        &scan.source,
+                        &self.items,
+                        PageOrderViewKind::Physical,
+                    ))
+                .then(|| {
+                    SpreadRestoreDefaults::for_physical_folder(
+                        false,
+                        true,
+                        self.settings.apply_default_spread_to_plain_folders,
+                        self.settings.default_spread_mode,
+                        self.settings.default_reading_flow,
+                        self.settings.default_reading_direction,
+                    )
+                })
+            });
+            let (stored_spread, preferred_direction, default_flow) =
+                if let Some(defaults) = physical_folder_defaults {
+                    let resolved = container.spread.resolve_reading(
+                        defaults.spread_mode,
+                        defaults.reading_direction,
+                        false,
+                        None,
+                    );
+                    (resolved.mode, resolved.direction, defaults.reading_flow)
+                } else {
+                    let direction = container
+                        .spread
+                        .direction
+                        .unwrap_or(self.settings.default_reading_direction);
+                    let mode = container.spread.resolve_mode(
+                        self.settings
+                            .default_spread_mode
+                            .with_reading_direction(direction),
+                        direction,
+                    );
+                    (mode, direction, self.settings.default_reading_flow)
+                };
+            self.reading_flow = container.spread.flow.unwrap_or(default_flow);
             self.reading_direction = preferred_direction;
             if stored_spread == crate::settings::SpreadMode::Vertical {
                 self.spread_mode = crate::settings::SpreadMode::Single;
@@ -51540,7 +51610,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -64893,7 +64963,7 @@ impl App {
     }
 
     #[cfg(all(windows, test))]
-    fn start_active_detached_book_context_from_scanned_folder(
+    pub(crate) fn start_active_detached_book_context_from_scanned_folder(
         &mut self,
         path: PathBuf,
         scan: ScannedDir,
@@ -97190,6 +97260,9 @@ impl App {
         // release/中断の各境界で対象キーのみ無効化済み。
         self.update_thumb_adjust_drag_state();
 
+        let escape_input_owner = self.capture_search_escape_input(ctx);
+        let mut search_escape_claim = pinned_search::EscapeClaim::for_frame(self);
+
         // ── メニューバー ─────────────────────────────────────────────
         let (fav_nav, _) = self.render_menubar(ui);
 
@@ -97262,7 +97335,7 @@ impl App {
             if self.show_search_bar {
                 self.cancel_pending_folder_nav();
                 self.show_search_bar = false;
-                self.search_query.clear();
+                self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
                 self.search_filter = None;
                 self.search_filter_origin_folder = None;
                 self.search_has_focus = false;
@@ -97300,6 +97373,8 @@ impl App {
         let mut pre_grid_perf = pre_grid_perf_start_with(perf_on, std::time::Instant::now);
 
         let (folder_pane_nav, folder_pane_rect) = self.render_main_bars(ui, &mut pre_grid_perf);
+        self.route_search_escape(ctx, escape_input_owner, &mut search_escape_claim);
+        self.record_search_input_focus(ctx);
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
         // wheel が背面のサムネイル一覧にも通り抜ける。
@@ -101021,7 +101096,7 @@ mod index_full_check_tests {
         app.window_visible = false;
         app.activity_gate.set_paused(true);
         app.global_search.active = true;
-        app.global_search.query = "latest query".into();
+        app.global_search.metadata_draft = "latest query".into();
         app.global_search.last_executed = "older query".into();
         let manager = crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
             &env.tmp.path().join("late-init"),
@@ -101037,7 +101112,7 @@ mod index_full_check_tests {
         assert!(app.indexer_init.is_terminal());
         let semaphore = app.indexer_init.as_ref().unwrap().io_sem();
         assert!(semaphore.is_throttled());
-        assert_eq!(app.global_search.query, "latest query");
+        assert_eq!(app.global_search.metadata_draft, "latest query");
         assert!(app.global_search.last_executed.is_empty());
         app.global_search.last_executed = "adopted only once".into();
         app.poll_startup_init();
@@ -101059,10 +101134,10 @@ mod index_full_check_tests {
             disposal_witness: None,
         });
         app.global_search.active = true;
-        app.global_search.query = "current text".into();
+        app.global_search.metadata_draft = "current text".into();
         app.global_search.filters.favorite = Some(uuid::Uuid::new_v4());
         app.spawn_global_search(&egui::Context::default());
-        assert_eq!(app.global_search.query, "current text");
+        assert_eq!(app.global_search.metadata_draft, "current text");
         assert!(app.global_search.filters.favorite.is_none());
         assert!(app.global_search.last_executed.is_empty());
         assert!(app.global_search.page_edit_prepare.is_none());

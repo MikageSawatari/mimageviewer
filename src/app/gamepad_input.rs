@@ -7745,7 +7745,7 @@ impl App {
             return None;
         }
         if self.global_search.active {
-            if self.global_search.drill.is_some() {
+            if self.global_search.drill.is_some() || self.everything_has_physical_child() {
                 self.drill_back_one_level();
             }
             return None;

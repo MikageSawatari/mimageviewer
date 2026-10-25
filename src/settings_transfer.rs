@@ -338,6 +338,7 @@ preferences_policy! {
         write_rating_to_xmp: bool => ("評価をXMPに保存", |_, _| true, plain, plain);
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
+        apply_default_spread_to_plain_folders: bool => ("通常フォルダにも既定のページ構成を使う", |_, _| true, plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
         remember_spread_shift_per_book: bool => ("見開きの調整を本ごとに記憶する", |_, _| true, plain, plain);
         page_turn_animation_enabled: bool => ("ページめくりアニメーション", |_, _| true, plain, plain);
@@ -539,6 +540,10 @@ preferences_policy! {
         folder_tree_pane_visible => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_sort_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_pane_width_ratio => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_toolbar_search_container => "環境設定外のツールバー検索欄";
+        show_toolbar_search_local => "環境設定外のツールバー検索欄";
+        show_toolbar_search_metadata => "環境設定外のツールバー検索欄";
+        show_toolbar_search_everything => "環境設定外のツールバー検索欄";
         show_toolbar_folder => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_folder_tree_button => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_effetune => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -933,6 +938,7 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings.apply_default_spread_to_plain_folders = true;
         settings
             .file_type_visibility
             .excluded_categories
@@ -1917,30 +1923,43 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 465);
+        assert_eq!(entries.len(), 470);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            148
+            149
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            317
+            321
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
+        for key in [
+            "show_toolbar_search_container",
+            "show_toolbar_search_local",
+            "show_toolbar_search_metadata",
+            "show_toolbar_search_everything",
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(field, reason)| *field == key && reason.is_some()),
+                "toolbar state must remain classified outside Preferences: {key}"
+            );
+        }
         assert!(
             entries
                 .iter()
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 146);
+        assert_eq!(wire.len(), 147);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
