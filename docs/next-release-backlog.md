@@ -41,6 +41,7 @@
 ### 1.443 ライトテーマで一部のシステムフォントの文字が白くなる — 5ch >>614 (2026-10-25)
 
 - 状態: **未着手・原因確認済み (2026-10-25)**。v4.8.0 / v4.8.1 の報告で、利用者も実アプリで再現を確認。早期の不具合修正候補とする。
+- 対外回答: 作者が [5ch >>616](https://egg.5ch.io/test/read.cgi/software/1782419551/616) (2026-10-25) で、手元の再現確認、v4.8.0 の描画処理更新に伴う不具合であること、修正する方針を返信済み。特定の収録バージョンは約束していない。追加の再現試験は報告者に依頼していない。
 - 症状: MS UI Gothic / MS Gothic / MS Mincho / MS PGothic / MS PMincho では文字が白くなり、NSimSun / SimSun では全角文字だけが白くなる。ライトテーマで読めなくなる。
 - 原因: v4.8.0 の egui / epaint 0.37 更新後、`epaint/src/text/font_face.rs` の `has_color_glyphs` / `has_color_glyph` が単色の EBDT 埋め込みビットマップもカラー字形として扱い、`rasterize_color_glyph` が白で描いて `is_color: true` を返す。`epaint/src/tessellator.rs` はカラー字形をテーマの文字色で着色しないため、通常の文字まで白のまま表示される。
 - 診断結果 (Codex、実アプリの自動操作なし): 実際の Windows フォントを epaint 0.37 に渡し、黒を指定した文字列の字形分類と mesh 頂点色を検査。MS 系は英数字・日本語とも `is_color=true` / 白、SimSun 系は英数字が `false` / 黒で日本語が `true` / 白となり、報告の差を再現した。Meiryo は黒のまま。`color_fonts` を無効にした比較ではすべて黒になったが、これは切り分けであり製品の修正方針ではない。
