@@ -12,7 +12,7 @@ use eframe::egui;
 use super::ViewerPresentation;
 use super::{
     App, ContainerRatingTarget, FolderNavMode, GridContainerOpenMode, GridCursorDirection,
-    GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
+    GridCursorMove, GridScrollIntent, ReadingHistoryEntrance, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -3706,7 +3706,9 @@ impl App {
         };
         let nav = match nav {
             GamepadLocationNav::DriveList => AddressBarNav::DriveList(None),
-            GamepadLocationNav::ReadingHistory => AddressBarNav::ReadingHistory,
+            GamepadLocationNav::ReadingHistory => {
+                AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Menu)
+            }
             GamepadLocationNav::Bookmarks => {
                 self.open_bookmark_browser();
                 return None;
@@ -5906,7 +5908,9 @@ impl App {
         }
         let nav = match action {
             RingActionId::OpenLocationDriveList => AddressBarNav::DriveList(None),
-            RingActionId::OpenLocationReadingHistory => AddressBarNav::ReadingHistory,
+            RingActionId::OpenLocationReadingHistory => {
+                AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Menu)
+            }
             RingActionId::OpenLocationBooksRoot => AddressBarNav::BooksRoot,
             RingActionId::OpenLocationDesktop => {
                 self.quick_location_nav(crate::known_folders::desktop_dir(), "デスクトップ")?

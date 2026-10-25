@@ -1871,7 +1871,7 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
 
 - 状態: 通常フォルダ・レーティング一覧の修正は v4.4.0 で出荷し、報告者が期待どおりの動きを確認済み (2026-10-08、報告者のメール)。
   2026-10-21 に作業記録 (約 300 行) を整理した。経緯・原因の調査・検証記録は `git log -- docs/next-release-backlog.md` の整理前の版 (`4db8a8874` 時点) にある。
-- **残りの対応 (2026-10-25、branch claude/bugs-328-135-123-192-86051c、未 merge)**: 閲覧履歴とサブ展開にも、通常フォルダ・
+- **残りの対応 (2026-10-25、branch claude/bugs-328-135-123-192-86051c、master に merge 済み `af17ce453`、未リリース)**: 閲覧履歴とサブ展開にも、通常フォルダ・
   ★一覧と同じ保存・復元の境界を通す。`RatingGridPosition` を `SessionGridPosition` として共用し、TopLevelGridView が
   閲覧履歴の位置 1 つとサブ展開の位置 1 つ (root キー付き) を持つ (セッション内だけ。永続データは変えない)。離れるときの保存は
   items_generation ごとに 1 回で、戻るときだけキーで行を照合し、見つからなければ先頭 (従来どおり)。戻り先の列数・表示の採用を
@@ -1883,13 +1883,28 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   開いていた行が選ばれた (book_03・book_02 で確認)。サブ展開から本を開き ← で戻っても、開いていた行が選ばれた。
   **ただし閲覧履歴から開いた本で BS を押すと、閲覧履歴の一覧には戻るが先頭 (最新) が選ばれる** (book_02 で 2 回)。
   通常フォルダから開いた本では BS でも元の行に戻る。サブ展開から開いた本で BS を押すと、サブ展開が解除された親フォルダへ戻り、
-  その本が選ばれる (BS = 親フォルダへの既存の意味どおり)。閲覧履歴の BS 経路が、← と同じ保存・復元の境界を通っていないとみられる (コード未確認)。
-- 残り: **閲覧履歴とサブフォルダ展開から開いた後の ←** でも、開いていた項目が選ばれず先頭が選ばれる (コード調査。別原因)。
+  その本が選ばれる (BS = 親フォルダへの既存の意味どおり)。
+  **原因と修正 (同日、branch histbs-1328、commit `f36812d48`)**: 保存位置は残っていたが、main-frame dispatcher
+  (`post_render_main_navigation`) が BS / Esc 直帰の `AddressBarNav::ReadingHistory` をメニュー入場へ送り、
+  `install_reading_history_surface` の Menu 処理が位置を消していた。既存の Folder BS テストは immediate dispatcher を使い、
+  実アプリのこの経路を通っていなかった。ZIP を開き、BS キー処理と main-frame dispatcher まで通す追加テストで、
+  修正前に ← は成功・BS だけ先頭選択で失敗することを確認した。
+  `ReadingHistoryEntrance::Menu / Return` をナビゲーション値の生成元から運び、すべての dispatcher で共通入口へ渡す。
+  本からの BS / 親ボタン / Pad B / Esc 直帰は Return、場所メニュー・明示コマンドは Menu とし、← と同じ位置 owner と
+  Return の保存・復元境界を使用する。選択の後書き戻し・待機・再試行は追加しない。通常フォルダ・サブ展開からの BS、
+  ZIP の深い階層から一段ずつ戻る挙動と `close_return.rs` の深さ判定、detached の述語・viewport は変更しない。
+  独立 Sol / xhigh レビューは重要指摘なし。修正前の比較テストは ← 1成功・BS 1失敗。
+  修正後の `cargo test -p mimageviewer --lib section1328_` は55成功・0失敗、
+  `scripts/test-focused.ps1 -Path src/app/tests/section1328_session.rs` は20成功・0失敗、両方 exit 0。
+  `cargo fmt --check` も exit 0。途中の型import不足と、深いZIP fixtureがidentity準備を待たない不備は修正済み。
+  ログは `target/histbs-1328-section-final.log` / `target/histbs-1328-focused.log`。
+  `scripts/build-dev.ps1 -PreserveRuntime` も exit 0 (通常feature、core / remote / EPUB PDF worker、VCRT PE検査成功)。
+  full lib はClaudeCode担当。修正後の実アプリ確認は未実施 (製品 exe は起動しない)。
+- 過去の記録 (2026-10-07 時点、上の 2026-10-25 の対応で解消): **閲覧履歴とサブフォルダ展開から開いた後の ←** でも、開いていた項目が選ばれず先頭が選ばれていた (コード調査)。
   - 閲覧履歴: replay は `enter_reading_history` へ再入場し、一覧の install が先頭を選ぶ。返り先に opened-row anchor を持たない。
   - サブフォルダ展開: restore state は root / snapshot / tombstone を保持するが selection anchor / scroll を持たず、prepare 完了時に先頭を選ぶ。
   - 報告者へは「同じく先頭が選ばれる作りで、引き続き対応する」と伝えている (2026-10-07)。
-- 対応の方向: それぞれの返り先 owner に opened-row anchor (と比率・位置) を持たせ、通常フォルダ (`save_leaving_folder_grid_position`) と同じ保存・復元の境界に乗せる。
-  検証は section1328 の回帰と RatingFolderBack 型の smoke を流用する。
+- 残り (2026-10-25): 修正後の本体 lib 全件と、修正後の実アプリでの BS の確認 (閲覧履歴から開いた本 → BS → 元の行)。
 - 規模 / 優先度: Small〜Medium / P2。
 
 ### 1.318 起動時の索引走査を HDD ごとに 1 本ずつ順に回す (D2) — 実測から保留 (2026-10-03)
