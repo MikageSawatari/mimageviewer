@@ -38,6 +38,17 @@
 
 ## 1. 優先候補
 
+### 1.443 ライトテーマで一部のシステムフォントの文字が白くなる — 5ch >>614 (2026-10-25)
+
+- 状態: **未着手・原因確認済み (2026-10-25)**。v4.8.0 / v4.8.1 の報告で、利用者も実アプリで再現を確認。早期の不具合修正候補とする。
+- 症状: MS UI Gothic / MS Gothic / MS Mincho / MS PGothic / MS PMincho では文字が白くなり、NSimSun / SimSun では全角文字だけが白くなる。ライトテーマで読めなくなる。
+- 原因: v4.8.0 の egui / epaint 0.37 更新後、`epaint/src/text/font_face.rs` の `has_color_glyphs` / `has_color_glyph` が単色の EBDT 埋め込みビットマップもカラー字形として扱い、`rasterize_color_glyph` が白で描いて `is_color: true` を返す。`epaint/src/tessellator.rs` はカラー字形をテーマの文字色で着色しないため、通常の文字まで白のまま表示される。
+- 診断結果 (Codex、実アプリの自動操作なし): 実際の Windows フォントを epaint 0.37 に渡し、黒を指定した文字列の字形分類と mesh 頂点色を検査。MS 系は英数字・日本語とも `is_color=true` / 白、SimSun 系は英数字が `false` / 黒で日本語が `true` / 白となり、報告の差を再現した。Meiryo は黒のまま。`color_fonts` を無効にした比較ではすべて黒になったが、これは切り分けであり製品の修正方針ではない。
+- 修正の方向: 字形のラスタライズ境界で **単色マスクのビットマップと、本来のカラー字形を区別**し、前者にはテーマ・選択・無効状態などで指定された文字色を適用する。`skrifa::bitmap::BitmapData::Mask` 等の形式情報を使う方針を精査する。カラー絵文字の無効化、フォント候補の削除、白い画素だけでの判定は行わない。Cargo キャッシュを直接改変せず、上流修正の取り込みか既存の vendor / patch 運用に従い、必要なら `PATCHES.md` に記録する。
+- 検証: 該当 7 フォントと正常な対照フォントで英数字・日本語、複数の文字サイズ / DPI、ライト / ダーク、選択・無効状態の文字色を確認する。カラー絵文字が本来の色を保つことも回帰対象にし、実用的なフォント fixture による epaint の字形・mesh テストと UI snapshot を追加する。実アプリ確認は隔離 portable と当該 run の承認を別途得る。
+- 診断用資材 (作業ツリーの無視対象): `target/repro/font-white-614-20261025/` の最小 crate と `color-on.csv` / `color-off.csv`。`cargo run --manifest-path target/repro/font-white-614-20261025/Cargo.toml --target-dir target/repro/font-white-614-20261025/build --offline` と `--no-default-features` を付けた比較が成功。資材がなくても上の入力と判定を再構成できるよう、実装修正側に回帰テストを残す。
+- 関連: [egui 0.37 更新時の上流変更](egui-0.37-upstream-notes.md)、[UI snapshot 方針](ui-snapshot-policy.md)。規模 / 優先度: Small〜Medium / P2。
+
 ### 1.432 フォルダのサムネイル要求を作るとき、代表画像のピン解決が UI スレッドでファイル・DB を読む — §1.410 の独立レビューで判明 (2026-10-25)
 
 - 状態: **未着手・起票 (2026-10-25)**。通常のフォルダ一覧から元々ある共通経路の課題で、§1.410 で Everything のフォルダ行も同じ経路を通るようになった (費用は通常一覧と同じ)。
