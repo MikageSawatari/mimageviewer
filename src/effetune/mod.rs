@@ -1681,8 +1681,20 @@ fn send_latest_now_playing(
     core.start_artwork();
 }
 
+/// Migration and the child bridge must use the same absolute storage root,
+/// including when --data-dir itself is relative. Resolve on their workers;
+/// do not canonicalize, since the selected directory may not exist yet.
+fn sound_data_root(data_dir: &Path) -> Result<PathBuf, String> {
+    std::path::absolute(data_dir)
+        .map(|directory| directory.join("effetune"))
+        .map_err(|error| format!("sound data root: {error}"))
+}
+
+#[cfg(test)]
 pub(crate) fn new_bridge() -> Arc<DspBridge> {
-    DspBridge::new_for_miv_sound(crate::data_dir::get().join("effetune"))
+    DspBridge::new_for_miv_sound(
+        sound_data_root(&crate::data_dir::get()).expect("absolute fixture sound data root"),
+    )
 }
 
 fn load_worker(
@@ -1711,7 +1723,7 @@ fn load_worker(
         ));
     }
     let bridge = DspBridge::new_for_miv_sound_with_startup_gate(
-        crate::data_dir::get().join("effetune"),
+        sound_data_root(&crate::data_dir::get()).map_err(EffetuneFailure::LoadFailed)?,
         startup_gate,
     );
     bridge.set_gui_failure_sink(gui_failure_tx.clone());
@@ -1790,6 +1802,31 @@ fn startup_state_requires_load(saved: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_data_root_resolves_relative_data_dir_without_creating_it() {
+        // Like --data-dir, this path is intentionally relative. No global CWD
+        // or environment changes are needed, so parallel tests remain isolated.
+        let fixture = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let relative = PathBuf::from(fixture.path().file_name().unwrap()).join("new-profile");
+        let expected = fixture.path().join("new-profile").join("effetune");
+        assert!(!relative.is_absolute());
+        assert!(!expected.exists());
+        let actual = sound_data_root(&relative).unwrap();
+        assert!(actual.is_absolute());
+        assert_eq!(actual, expected);
+        assert!(!actual.exists());
+    }
+
+    #[test]
+    fn sound_data_root_preserves_an_absolute_data_dir() {
+        let fixture = tempfile::tempdir().unwrap();
+        let absolute = fixture.path().join("sound profile");
+        assert_eq!(
+            sound_data_root(&absolute).unwrap(),
+            absolute.join("effetune")
+        );
+    }
 
     #[cfg(not(feature = "portable"))]
     fn auto_test_controller() -> EffetuneController {

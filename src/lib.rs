@@ -2223,6 +2223,8 @@ fn cli_flag_takes_value(flag: &str) -> bool {
             | "--settings-override"
             | "--miv-sound-migration-source"
             | "--miv-sound-migration-checkpoints"
+            | "--miv-sound-migration-original-browser"
+            | "--miv-sound-migration-close-file"
             | "--window-size"
             | "--perf-log-path"
             | "--play-test"
@@ -2312,6 +2314,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn source_close_probe_values_never_become_startup_open_paths() {
+        let args = os_args(&[
+            "core.exe",
+            "--miv-sound-migrate-only",
+            "--miv-sound-migration-original-browser",
+            "1234",
+            "--miv-sound-migration-close-file",
+            "source.stop",
+        ]);
+        assert_eq!(parse_startup_open_path_arg_from(&args), None);
     }
 
     #[test]

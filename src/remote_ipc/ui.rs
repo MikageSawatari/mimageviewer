@@ -705,13 +705,11 @@ fn remote_dsp_readiness_budget(start_budget_remaining: std::time::Duration) -> s
 
 #[cfg(windows)]
 fn remote_dsp_admission_waits(
-    user_requested: bool,
-    user_loading: bool,
-    effetune_loading: bool,
+    startup_pending: bool,
     now: std::time::Instant,
     deadline: std::time::Instant,
 ) -> bool {
-    ((user_requested && user_loading) || effetune_loading) && now < deadline
+    startup_pending && now < deadline
 }
 
 struct AppRemoteVideoStarting {
@@ -1843,14 +1841,14 @@ impl crate::app::App {
             Ok(Some(start_inputs)) => {
                 #[cfg(windows)]
                 if remote_dsp_admission_waits(
-                    self.settings.vst3_enabled
-                        && self
-                            .settings
-                            .vst3_plugins
-                            .iter()
-                            .any(|plugin| !plugin.bypass),
-                    self.vst3_startup_load.is_some(),
-                    self.effetune.startup_pending(),
+                    self.audio_plugin_startup_pending(
+                        self.settings.vst3_enabled
+                            && self
+                                .settings
+                                .vst3_plugins
+                                .iter()
+                                .any(|plugin| !plugin.bypass),
+                    ),
                     std::time::Instant::now(),
                     opening.dsp_admission_deadline,
                 ) {
@@ -7437,23 +7435,155 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn remote_dsp_admission_waits_only_for_requested_stages_until_deadline() {
+    fn remote_dsp_admission_waits_for_shared_startup_state_until_deadline() {
         let now = std::time::Instant::now();
         let deadline = now + std::time::Duration::from_secs(1);
-        assert!(!remote_dsp_admission_waits(
-            false, true, false, now, deadline
-        ));
-        assert!(remote_dsp_admission_waits(true, true, false, now, deadline));
-        assert!(remote_dsp_admission_waits(
-            false, false, true, now, deadline
-        ));
-        assert!(remote_dsp_admission_waits(true, true, true, now, deadline));
-        assert!(!remote_dsp_admission_waits(
-            true, false, false, now, deadline
-        ));
-        assert!(!remote_dsp_admission_waits(
-            true, true, true, deadline, deadline
-        ));
+        assert!(!remote_dsp_admission_waits(false, now, deadline));
+        assert!(remote_dsp_admission_waits(true, now, deadline));
+        assert!(!remote_dsp_admission_waits(true, deadline, deadline));
+    }
+
+    #[cfg(windows)]
+    fn remote_opening_with_pending_migration() -> (
+        crate::app::AppTestEnvForTest,
+        std::sync::mpsc::Sender<Result<crate::effetune::migration::MigrationOutcome, String>>,
+    ) {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.remote_video_streaming_enabled = true;
+        app.settings.audio_normalize_enabled = false;
+        app.settings.vst3_enabled = false;
+        let (migration, tx) = crate::effetune::startup::StartupMigration::pending_for_test();
+        app.dsp_bridge = crate::video::dsp::DspBridge::new_waiting_for_migration(migration.gate());
+        app.effetune = crate::effetune::EffetuneController::new_with_startup_gate(migration.gate());
+        // Isolate host creation; later tests deliver the loader boundary through
+        // its existing fake completion, without starting a plugin process.
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Unavailable(
+            crate::effetune::UnavailableReason::CpuUnsupported,
+        );
+        app.audio_plugin_migration = migration;
+        let (handle, owner, _) = active_session();
+        app.set_remote_session_handle(handle.clone());
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks/multi-audio.m4a");
+        let request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let operation = handle
+            .begin_operation(&owner, "migration startup regression".into())
+            .unwrap();
+        let (claimed, _response) = ClaimedVideoStreamUiRequest::for_test(operation, request);
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(0, 1);
+        app.remote_session_ui.video_stream =
+            Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
+                claimed,
+                owner,
+                requested_path: path,
+                quality: crate::video::stream::quality::QualityPreset::Standard,
+                audio_track: Some(0),
+                player: Some(Box::new(player)),
+                budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+                dsp_admission_deadline: std::time::Instant::now()
+                    + std::time::Duration::from_secs(10),
+            }));
+        (app, tx)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_stream_start_waits_for_migration_and_load_before_admitting_dsp() {
+        for migration_succeeds in [true, false] {
+            let (mut app, tx) = remote_opening_with_pending_migration();
+            let ctx = egui::Context::default();
+            let sampled_at = std::time::Instant::now();
+            let (original_budget, original_admission_deadline) =
+                match app.remote_session_ui.video_stream.as_ref().unwrap() {
+                    AppRemoteVideoStreamState::Opening(opening) => {
+                        (opening.budget, opening.dsp_admission_deadline)
+                    }
+                    _ => panic!("fixture must be Opening"),
+                };
+            // Exercise the production Opening -> Starting/session creation path.
+            // Before this fix it already committed a dry DSP snapshot here.
+            app.poll_remote_video_streaming(&ctx);
+            let Some(AppRemoteVideoStreamState::Opening(opening)) =
+                app.remote_session_ui.video_stream.as_ref()
+            else {
+                panic!("Remote must await the same migration as local playback");
+            };
+            assert_eq!(
+                opening.budget.remaining_at(sampled_at),
+                original_budget.remaining_at(sampled_at)
+            );
+            assert_eq!(opening.dsp_admission_deadline, original_admission_deadline);
+            assert!(app.media_startup_load_pending());
+            tx.send(if migration_succeeds {
+                Ok(crate::effetune::migration::MigrationOutcome::NotApplicable)
+            } else {
+                Err("synthetic migration failure".into())
+            })
+            .unwrap();
+            app.poll_audio_plugin_migration(&ctx);
+            if migration_succeeds {
+                app.effetune.runtime = crate::effetune::EffetuneRuntime::Loading {
+                    origin: crate::effetune::LoadOrigin::Startup,
+                    open_gui_when_ready: None,
+                };
+                app.poll_remote_video_streaming(&ctx);
+                assert!(matches!(
+                    app.remote_session_ui.video_stream,
+                    Some(AppRemoteVideoStreamState::Opening(_))
+                ));
+                app.effetune
+                    .set_test_load_bridge_completion(crate::video::dsp::DspBridge::new());
+                assert!(app.effetune.poll());
+            }
+            assert!(!app.media_startup_load_pending());
+            app.poll_remote_video_streaming(&ctx);
+            let Some(AppRemoteVideoStreamState::Starting(starting)) =
+                app.remote_session_ui.video_stream.as_ref()
+            else {
+                panic!("terminal migration/load must create the real Remote streaming session");
+            };
+            assert_eq!(
+                starting.budget.remaining_at(sampled_at),
+                original_budget.remaining_at(sampled_at)
+            );
+            assert!(
+                starting.streaming.session.access().audio_status().requested,
+                "snapshot must include loaded sound or its failure warning, never pre-migration Idle"
+            );
+            app.cancel_remote_video_stream_state(
+                VideoStreamErrorCode::Failed,
+                "regression complete",
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_stream_start_migration_wait_retains_existing_dsp_deadline() {
+        let (mut app, _tx) = remote_opening_with_pending_migration();
+        let Some(AppRemoteVideoStreamState::Opening(opening)) =
+            app.remote_session_ui.video_stream.as_mut()
+        else {
+            panic!()
+        };
+        opening.dsp_admission_deadline = std::time::Instant::now();
+        app.poll_remote_video_streaming(&egui::Context::default());
+        assert!(app.audio_plugin_migration.waiting());
+        assert!(app.media_startup_load_pending());
+        assert!(
+            matches!(
+                app.remote_session_ui.video_stream,
+                Some(AppRemoteVideoStreamState::Starting(_))
+            ),
+            "Remote retains its existing finite DSP admission budget"
+        );
+        app.cancel_remote_video_stream_state(VideoStreamErrorCode::Failed, "regression complete");
     }
 
     #[test]

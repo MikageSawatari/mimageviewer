@@ -54,6 +54,121 @@ impl Drop for OwnedHandle {
     }
 }
 
+/// Only the isolated migrate-only helper uses this handoff. Production lock
+/// acquisition still runs once and never polls or retries. Holding the original
+/// process handle also makes PID reuse irrelevant to the observations.
+#[cfg(feature = "test-script")]
+pub(crate) struct SourceCloseProbe {
+    original: OwnedHandle,
+    pid: u32,
+    close_file: PathBuf,
+    lock_file: PathBuf,
+}
+
+#[cfg(feature = "test-script")]
+impl SourceCloseProbe {
+    pub(crate) fn new(pid: u32, close_file: PathBuf, expected_udf: &Path) -> Result<Self, String> {
+        let original =
+            unsafe { open_process(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, pid) }
+                .ok_or_else(|| {
+                format!(
+                    "cannot open original browser PID {pid}: {}",
+                    io::Error::last_os_error()
+                )
+            })?;
+        let same_user = unsafe {
+            match (user_sid(GetCurrentProcess()), user_sid(original.0)) {
+                (Some(current), Some(original)) => {
+                    EqualSid(
+                        current.as_ptr() as *mut c_void,
+                        original.as_ptr() as *mut c_void,
+                    ) != 0
+                }
+                _ => false,
+            }
+        };
+        if !same_user {
+            return Err(
+                "cannot confirm original source browser belongs to the current user".into(),
+            );
+        }
+        let command = unsafe { command_line(original.0) }?;
+        if !matches_udf(&command, expected_udf)? {
+            return Err("original browser does not use the exact source WebView2 directory".into());
+        }
+        let probe = Self {
+            original,
+            pid,
+            close_file,
+            lock_file: expected_udf.join("lockfile"),
+        };
+        if !probe.alive()? {
+            return Err("original source browser exited before the close handoff was armed".into());
+        }
+        Ok(probe)
+    }
+
+    pub(crate) fn observation(&self) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"original_pid": self.pid, "original_alive": self.alive()?}))
+    }
+
+    fn alive(&self) -> Result<bool, String> {
+        match unsafe { WaitForSingleObject(self.original.0, 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            _ => Err(format!(
+                "observe original browser PID {}: {}",
+                self.pid,
+                io::Error::last_os_error()
+            )),
+        }
+    }
+
+    /// Called by `before_lock`, after migration's normal pre-lock setup. The
+    /// temporary read lease is dropped immediately before the one production
+    /// lock call. There is no stdout, IPC or PowerShell operation in that gap.
+    pub(crate) fn prepare_close(&mut self) -> Result<(), String> {
+        use std::io::Write;
+        let mut signal = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.close_file)
+            .map_err(|error| io_error("request isolated source close", &self.close_file, error))?;
+        signal
+            .write_all(b"close")
+            .map_err(|error| io_error("write isolated source close", &self.close_file, error))?;
+        drop(signal);
+        let started = Instant::now();
+        loop {
+            match OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&self.lock_file)
+            {
+                Ok(lease) => {
+                    drop(lease);
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {}
+                Err(error) => {
+                    return Err(io_error(
+                        "observe source singleton release",
+                        &self.lock_file,
+                        error,
+                    ));
+                }
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                return Err(
+                    "source close did not release its singleton lock within 5 seconds".into(),
+                );
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
 impl MigrationBackend for Backend {
     type Lease = File;
     type Process = OwnedHandle;

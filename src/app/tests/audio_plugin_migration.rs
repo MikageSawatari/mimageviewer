@@ -80,6 +80,40 @@ fn failed_migration_notifies_once_and_allows_only_user_vst_for_this_process() {
 }
 
 #[test]
+fn local_and_remote_share_migration_and_requested_loader_readiness() {
+    let mut env = setup_app_for_test();
+    let app = &mut env.app;
+    let tx = pending(app);
+    app.settings.vst3_enabled = false;
+    app.effetune.runtime = crate::effetune::EffetuneRuntime::Unavailable(
+        crate::effetune::UnavailableReason::CpuUnsupported,
+    );
+    assert!(app.media_startup_load_pending());
+    assert!(app.audio_plugin_startup_pending(false));
+    tx.send(Ok(
+        crate::effetune::migration::MigrationOutcome::NotApplicable,
+    ))
+    .unwrap();
+    app.poll_audio_plugin_migration(&egui::Context::default());
+    assert!(!app.media_startup_load_pending());
+    assert!(!app.audio_plugin_startup_pending(false));
+    let (_tx, rx) = mpsc::channel();
+    app.vst3_startup_load = Some(Vst3StartupLoadPending {
+        rx,
+        progress: Arc::new(Mutex::new(String::new())),
+        started_at: std::time::Instant::now(),
+    });
+    assert!(app.media_startup_load_pending());
+    assert!(app.audio_plugin_startup_pending(true));
+    assert!(!app.audio_plugin_startup_pending(false));
+    app.effetune.runtime = crate::effetune::EffetuneRuntime::Loading {
+        origin: crate::effetune::LoadOrigin::Startup,
+        open_gui_when_ready: None,
+    };
+    assert!(app.audio_plugin_startup_pending(false));
+}
+
+#[test]
 fn terminal_continuation_uses_latest_settings_after_pending_changes() {
     let mut env = setup_app_for_test();
     let app = &mut env.app;

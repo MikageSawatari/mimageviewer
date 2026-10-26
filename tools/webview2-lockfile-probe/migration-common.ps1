@@ -13,7 +13,9 @@ function Get-MigrationRunLayout {
     $data = Join-Path $root 'd'
     return [pscustomobject]@{ root = $root; fake_appdata = $fake; data_dir = $data;
         source = (Join-Path $fake 'mimageviewer-vst3-host.exe');
-        destination = (Join-Path $data 'effetune\webview'); checkpoints = (Join-Path $root 'c') }
+        destination = (Join-Path $data 'effetune\webview'); checkpoints = (Join-Path $root 'c');
+        original_data_dir = (Join-Path $root 'o'); original_checkpoints = (Join-Path $root 'p');
+        original_destination = (Join-Path $root 'o\effetune\webview') }
 }
 function Assert-MigrationPathBudget([string]$Source, [string]$Destination) {
     # The fixture's fixed origin uses this LevelDB directory. Reserve a full
@@ -185,6 +187,33 @@ function Assert-MigrationHelperEvents([object[]]$Events) {
     }
     if ($observed[-1].passed -ne $true) { throw 'Production helper did not report a successful result.' }
 }
+function Get-MigrationOriginalWaitObservation([object[]]$Events, [uint32]$OriginalPid) {
+    # Native handle observations are made before JSON output or checkpoint
+    # pauses. PowerShell/CIM sampling after lock_acquired cannot prove 8ms overlap.
+    $phases = @('lock_acquired', 'process_wait_begin', ('process_wait_pid_begin:' + $OriginalPid),
+        ('process_wait_pid_end:' + $OriginalPid), 'process_wait_end', 'copy_begin')
+    $rows = @($Events | Where-Object { $_.phase -in $phases })
+    $ordered = ($rows.phase -join ',') -ceq ($phases -join ',')
+    $identity = $rows.Count -eq $phases.Count -and
+        @($rows | Where-Object { $_.original_pid -ne $OriginalPid }).Count -eq 0
+    $timed = $true; $previous = -1
+    foreach ($row in $rows) {
+        if ($null -eq $row.elapsed_ms -or [long]$row.elapsed_ms -lt $previous) { $timed = $false; break }
+        $previous = [long]$row.elapsed_ms
+    }
+    $alive = $ordered -and $identity -and $timed -and $rows[0].original_alive -eq $true -and
+        $rows[1].original_alive -eq $true -and
+        $rows[2].original_alive -eq $true -and $rows[3].original_alive -eq $false -and
+        $rows[4].original_alive -eq $false -and $rows[5].original_alive -eq $false
+    return [pscustomobject]@{ original_pid = $OriginalPid; observed = [bool]$alive;
+        native_events = $rows; ordered_wait_evidence = [bool]$ordered;
+        note = 'Requires the same original browser alive at actual lock acquisition and its production PID wait begin, then exited before wait end and copy. Missing evidence is INCONCLUSIVE.' }
+}
+function Get-MigrationAcceptanceStatus($OriginalWait, $WaitCompetitor, $CopyCompetitor) {
+    if ($OriginalWait.observed -eq $true -and $WaitCompetitor.exact_process_overlap_observed -eq $true -and
+        $CopyCompetitor.exact_process_overlap_observed -eq $true) { return 'PASS' }
+    return 'INCONCLUSIVE'
+}
 function Resume-MigrationPhase([string]$Phase) {
     $path = Join-Path $script:MigrationCheckpoints ($Phase + '.continue')
     Assert-ProbePath $path
@@ -251,7 +280,7 @@ function Get-MigrationBlockedResult($Child) {
 function Complete-MigrationCleanup {
     $failures = [Collections.Generic.List[object]]::new()
     # Release helper checkpoints first; all waits remain bounded even on error.
-    foreach ($phase in @('lock_acquired', 'copy_begin', 'copy_end')) { Resume-MigrationPhase $phase }
+    foreach ($phase in @('lock_acquired', 'process_wait_end', 'copy_begin', 'copy_end')) { Resume-MigrationPhase $phase }
     foreach ($child in $script:MigrationChildren) { if (-not $child.helper) { Request-MigrationClose $child } }
     foreach ($child in $script:MigrationChildren) {
         try {

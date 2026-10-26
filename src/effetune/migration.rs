@@ -10,6 +10,8 @@ use std::time::Duration;
 mod tests;
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) use windows::SourceCloseProbe;
 
 const DONE: &str = "migration-v1.done";
 const NOT_APPLICABLE: &str = "migration-v1.not-applicable";
@@ -164,10 +166,11 @@ fn migrate_using<B: MigrationBackend>(
     let _lease = if has_webview {
         let ebwebview = webview_source.join("EBWebView");
         require_directory(&ebwebview)?;
+        observer("before_lock")?;
         let lease = backend.lock(&ebwebview.join("lockfile"))?;
         observer("lock_acquired")?;
         observer("process_wait_begin")?;
-        wait_for_source_processes(backend, &ebwebview)?;
+        wait_for_source_processes(backend, &ebwebview, &mut observer)?;
         observer("process_wait_end")?;
         Some(lease)
     } else {
@@ -250,6 +253,7 @@ fn clear_uncommitted_copies(request: &MigrationRequest) -> Result<(), String> {
 fn wait_for_source_processes<B: MigrationBackend>(
     backend: &mut B,
     udf: &Path,
+    observer: &mut impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
     let started = backend.elapsed();
     loop {
@@ -307,11 +311,13 @@ fn wait_for_source_processes<B: MigrationBackend>(
         for (pid, handle) in waiting {
             let remaining =
                 PROCESS_WAIT_LIMIT.saturating_sub(backend.elapsed().saturating_sub(started));
+            observer(&format!("process_wait_pid_begin:{pid}"))?;
             if remaining.is_zero() || !backend.wait(handle, remaining)? {
                 return Err(format!(
                     "WebView2 PID {pid} did not exit within the shared 5 second deadline"
                 ));
             }
+            observer(&format!("process_wait_pid_end:{pid}"))?;
             crate::logger::log(format!("[EffeTune migration] WebView2 PID {pid} exited"));
         }
         // Re-enumerate after exit: failed startup attempts can still be exiting.

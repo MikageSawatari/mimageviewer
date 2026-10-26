@@ -306,6 +306,10 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
 - `src/effetune/startup.rs` の `StartupMigration` が App ごとに一度だけ worker を開始し、UI は channel の終端結果だけを採用する。
   `HostStartupGate` はその判断を background の bridge にも公開する。未判断中は両方を禁止し、成功後は両方、失敗後はユーザー VST だけを許す。
   `App::start_audio_plugins_after_migration` は結果の採用後だけ呼ぶ。再試行は次の起動。
+  `App::audio_plugin_startup_pending` が移行・ユーザー VST・音響調整の起動待ちを一か所で投影し、ローカルと Remote の開始が共有する。
+  Remote は既存の開始/DSP 予算内で待ち、ユーザー VST が既に不要な場合の扱いと、予算切れの未準備段の除外は維持する。
+- `src/effetune/mod.rs` の `sound_data_root` は選択された data-dir から絶対の `effetune` 根を作り、移行と bridge の環境変数で共有する。
+  相対の `--data-dir` でも同じ場所を渡す。`data_dir::get()` 自体の意味や設定スキーマは変えず、解決は worker で行う。
 - 起動入口の点検: 自動ロードは `kick_off_vst3_startup_load`、設定適用・プリセット変更は
   `kick_off_vst3_chain_rebuild_impl`、音響調整の手動・自動・再読込は `EffetuneController::start_load` に集まる。
   未判断中の VST 設定変更は保存した最新設定だけを終端 continuation が読み込む。専用の操作キューは作らず、組み合わせを減らす。
@@ -318,6 +322,9 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
   `src/effetune/startup/path_identity.rs` が実在祖先を解決し、verbatim・短縮名・junction 等の別名も通常データとして照合する。
   `--miv-sound-migrate-only` は App・設定・WebView2 を作る前に本実装の移行だけを実行し、結果を JSONL で返す。
   `--miv-sound-migration-checkpoints` はこの単独検証専用。lock 保持中の競合試験に使い、待ち切れは移行失敗として扱う。
+  元ブラウザの終了待ちの実測は、PID と close-file を対で渡す専用引数を使う。helper が本実装の lock 取得直前に正常終了を要求し、
+  元 PID のハンドルで取得時・本実装の PID 別 wait 前後を観測する。この区間は出力も checkpoint 停止も挟まず、wait の終端で証拠を出す。
+  競合ホストの起動とは別の隔離先で一回ずつ確認し、元ブラウザの生存と wait の証拠がなければ PASS にしない（未確認は INCONCLUSIVE）。
   GUI の検証入口でも §5.1 の別フォルダの判断は維持するため、取り込みの確認には旧版の検証素材から得た
   `effetune/mixwright-state.json` を隔離 data-dir に用意する（普段の設定・保存データを検査用に流用しない）。
   汎用 WebView2 probe の migrate-only は、プラグインを起動しないので合成した使用済みの印だけを用意する。

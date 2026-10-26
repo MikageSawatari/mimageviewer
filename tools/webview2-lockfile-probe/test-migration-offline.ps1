@@ -59,6 +59,10 @@ $script:ProbeRoot
         @($budget.checks | Where-Object { $_.headroom_utf16_units -lt 32 }).Count -eq 0)
     Check 'preflight uses source engine layout' ($layout.source -ceq (Join-Path $layout.fake_appdata 'mimageviewer-vst3-host.exe'))
     Check 'preflight uses destination engine layout' ($layout.destination -ceq (Join-Path $layout.data_dir 'effetune\webview'))
+    $originalBudget = Assert-MigrationPathBudget $layout.source $layout.original_destination
+    Check 'independent original-wait destination has reserved headroom' ($originalBudget.checks.Count -eq 2 -and
+        @($originalBudget.checks | Where-Object { $_.headroom_utf16_units -lt 32 }).Count -eq 0 -and
+        $layout.original_data_dir -cne $layout.data_dir -and $layout.original_checkpoints -cne $layout.checkpoints)
     # Historical absolute spelling is intentional: this remains an oversized
     # regression input even when this test runs from a shorter checkout.
     $oldRun = 'C:\home\mimageviewer\.claude\worktrees\search-slow-1424-88bb45\target\webview2-lockfile-probe\run-migration-20261026-185550-453-24436'
@@ -193,6 +197,39 @@ foreach ($phase in @('lock_acquired', 'copy_begin', 'copy_end')) {
     Check 'all helper events retained' ($events.Count -eq 6)
     Assert-MigrationHelperEvents $events
     Check 'complete ordered helper result accepted' $true
+    $originalPhases = @('lock_acquired', 'process_wait_begin', 'process_wait_pid_begin:77',
+        'process_wait_pid_end:77', 'process_wait_end', 'copy_begin')
+    $originalEvents = @(foreach ($phase in $originalPhases) {
+        [pscustomobject]@{ phase = $phase; original_pid = 77; elapsed_ms = 0;
+            original_alive = $phase -in @('lock_acquired', 'process_wait_begin', 'process_wait_pid_begin:77') }
+    })
+    $overlap = Get-MigrationOriginalWaitObservation $originalEvents 77
+    $competitor = [pscustomobject]@{ exact_process_overlap_observed = $true }
+    Check 'native original acquisition and actual PID wait qualify' ($overlap.observed -and
+        (Get-MigrationAcceptanceStatus $overlap $competitor $competitor) -ceq 'PASS')
+    foreach ($missing in @('lock_acquired', 'process_wait_pid_begin:77', 'process_wait_pid_end:77', 'process_wait_end')) {
+        $incomplete = Get-MigrationOriginalWaitObservation @($originalEvents | Where-Object phase -ne $missing) 77
+        Check ('missing original wait proof is INCONCLUSIVE: ' + $missing) (
+            (Get-MigrationAcceptanceStatus $incomplete $competitor $competitor) -ceq 'INCONCLUSIVE')
+    }
+    foreach ($mutate in @('lock_acquired', 'process_wait_begin', 'process_wait_pid_begin:77', 'process_wait_pid_end:77', 'copy_begin')) {
+        $changed = $originalEvents | ConvertTo-Json | ConvertFrom-Json
+        ($changed | Where-Object phase -eq $mutate).original_alive = $mutate -in @('process_wait_pid_end:77', 'copy_begin')
+        $incomplete = Get-MigrationOriginalWaitObservation $changed 77
+        Check ('wrong native lifetime cannot PASS: ' + $mutate) (
+            (Get-MigrationAcceptanceStatus $incomplete $competitor $competitor) -ceq 'INCONCLUSIVE')
+    }
+    $wrongPid = Get-MigrationOriginalWaitObservation $originalEvents 78
+    Check 'another browser PID cannot qualify as original wait' (-not $wrongPid.observed)
+    $badTime = $originalEvents | ConvertTo-Json | ConvertFrom-Json
+    $badTime[3].elapsed_ms = -1
+    Check 'out-of-order native observations cannot qualify' (-not (Get-MigrationOriginalWaitObservation $badTime 77).observed)
+    $emptyProof = Get-MigrationOriginalWaitObservation @() 77
+    Check 'empty original proof cannot PASS with both competitors' (
+        (Get-MigrationAcceptanceStatus $emptyProof $competitor $competitor) -ceq 'INCONCLUSIVE')
+    $noWaitCompetitor = [pscustomobject]@{ exact_process_overlap_observed = $false }
+    Check 'original proof does not waive competitor overlap' (
+        (Get-MigrationAcceptanceStatus $overlap $noWaitCompetitor $competitor) -ceq 'INCONCLUSIVE')
     $blocked = $false
     try { Assert-MigrationHelperEvents @($events | Where-Object phase -ne 'process_wait_end') } catch { $blocked = $true }
     Check 'missing process wait completion rejected' $blocked

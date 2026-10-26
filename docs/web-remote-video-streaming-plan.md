@@ -165,6 +165,8 @@ limiter lookahead は AAC へ渡す `audible_pts_secs` から差し引く。
 
 paused headless player は引き続き metadata / thumbnail 専用なので bridge を渡さない。
 配信の受け付けは起動時ロードが終わるのを残り予算内で非同期に待ち、各段を独立して採否決定する。
+音響調整の保存データ移行もこの起動待ちに含める。App の `audio_plugin_startup_pending` をローカル再生と共有し、
+移行中に loader がまだ存在しない状態で配信の DSP snapshot を確定しない。待機によって開始予算や DSP deadline を延ばさない。
 `DspProcessingCoordinator` がローカル pump と `(session, generation)` の worker 間で bridge の
 ブロック単位の操作権を渡し、handoff reset の後に処理する。失敗または未準備の段は warning を示して
 その配信から外し、利用可能な段または normalized dry で継続する (§12 の新しい所有方針)。

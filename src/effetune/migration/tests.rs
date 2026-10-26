@@ -434,7 +434,7 @@ fn migration_webview_exclusions_are_exact_and_original_tree_is_unchanged() {
     let held = backend.held.clone();
     let mut phases = Vec::new();
     let outcome = migrate_using(&f.request, &mut backend, |phase| {
-        assert!(held.get(), "lease must span {phase}");
+        assert_eq!(held.get(), phase != "before_lock", "lease state at {phase}");
         phases.push(phase.to_owned());
         Ok(())
     })
@@ -443,6 +443,7 @@ fn migration_webview_exclusions_are_exact_and_original_tree_is_unchanged() {
     assert_eq!(
         phases,
         [
+            "before_lock",
             "lock_acquired",
             "process_wait_begin",
             "process_wait_end",
@@ -800,6 +801,7 @@ fn migration_rejects_overlapping_source_and_destination_without_copying() {
 #[test]
 fn migration_probe_checkpoint_failure_cleans_copies_without_publishing_a_decision() {
     for fail_at in [
+        "before_lock",
         "lock_acquired",
         "process_wait_begin",
         "process_wait_end",
@@ -820,6 +822,45 @@ fn migration_probe_checkpoint_failure_cleans_copies_without_publishing_a_decisio
         assert!(outcome.unwrap_err().contains("probe checkpoint failed"));
         f.no_partial_copy();
         assert!(!backend.held.get());
+    }
+}
+
+#[test]
+fn migration_observer_identifies_the_actual_process_wait_before_copying() {
+    for wait_error in [false, true] {
+        let f = Fixture::new();
+        f.webview();
+        let mut backend = FakeBackend {
+            inventories: [vec![candidate(77, Some("source"), Owner::SameUser, true)]].into(),
+            wait_error,
+            ..Default::default()
+        };
+        let mut phases = Vec::new();
+        let result = migrate_using(&f.request, &mut backend, |phase| {
+            phases.push(phase.to_owned());
+            Ok(())
+        });
+        assert_eq!(backend.waited, [77]);
+        if wait_error {
+            assert!(result.is_err());
+            assert_eq!(phases.last().unwrap(), "process_wait_pid_begin:77");
+            f.no_partial_copy();
+        } else {
+            assert_eq!(result.unwrap(), MigrationOutcome::Done);
+            assert_eq!(
+                phases,
+                [
+                    "before_lock",
+                    "lock_acquired",
+                    "process_wait_begin",
+                    "process_wait_pid_begin:77",
+                    "process_wait_pid_end:77",
+                    "process_wait_end",
+                    "copy_begin",
+                    "copy_end",
+                ]
+            );
+        }
     }
 }
 

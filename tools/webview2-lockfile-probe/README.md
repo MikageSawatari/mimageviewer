@@ -18,7 +18,8 @@ ClaudeCode がサンドボックスの外で、実行内容の明示承認を得
 通常2〜4分程度、起動や終了が時間切れになった場合は後片付けを含め数分余分にかかる。
 同じ非アクティブの小窓を順に表示するが、前面化・キーボード・マウス入力は行わない。
 使い捨ての保存先は `target\wm\<8桁の16進ID>\` だけ。
-この下の `a\` を仮 APPDATA、`d\` を隔離 data-dir として渡す。checkpoint は `c\`。
+この下の `a\` を仮 APPDATA、`d\` を競合試験の隔離 data-dir として渡す。checkpoint は `c\`。
+元のブラウザの終了待ち試験は別の `o\` を隔離 data-dir、`p\` を checkpoint とする。
 実際の旧 WebView 領域は `a\mimageviewer-vst3-host.exe\`、移行先は `d\effetune\webview\`。
 ビルド済み probe は従来どおり `target\webview2-lockfile-probe\bin\` から読み、過去の実行記録は移動しない。
 環境変数 `APPDATA` の変更や、利用者の通常プロファイルのコピー・変更は行わない。
@@ -37,7 +38,7 @@ ClaudeCode がサンドボックスの外で、実行内容の明示承認を得
 
 ```powershell
 $env:MSBUILDDISABLENODEREUSE = '1'
-$env:MIV_SOUND_CANDIDATE = '9ccc387ad9585db2d7007dba64db3d8c48e486864c76d4679e0143bbf7744d08'
+$env:MIV_SOUND_CANDIDATE = 'dcdfa79447071cc35bfb0dc81928271650fff543e5257275fe0d8c2812fa6d34'
 cargo build -p mimageviewer --bin mimageviewer-core --features test-script --profile dev-runtime
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\webview2-lockfile-probe\run-migration.ps1 -MigrationExe .\target\dev-runtime\mimageviewer-core.exe -InteractiveApproved
 ```
@@ -62,9 +63,21 @@ exe へ再度 `path-policy` を問い合わせ、現在の checkout と runner �
 
 1. 同じ origin の localStorage・IndexedDB (文字列とバイナリ)・OPFS (UTF-8 とバイナリ) に素材を作る。
    いったん正常終了してから元を読み直し、再び `Close()` による正常終了を要求する。
-2. 元の lockfile が自然に解放されるのを最大5秒観測してから、本実装の helper を1回だけ呼ぶ。
-   本実装のロック取得に失敗したら成功にしない。自動的な移行の再試行はしない。
-3. helper の `lock_acquired`・`copy_begin`・`copy_end` で、元の lockfile の共有違反を別経路から確かめる。
+2. **元のブラウザの終了待ちを独立した1回の移行で確かめる**。元が動いているうちにログの browser PID を取り、
+   helper へ `--miv-sound-migration-original-browser <PID>` と
+   `--miv-sound-migration-close-file <正常終了要求ファイル>` を渡す。
+   helper は同じ利用者・同じ保存領域と確認したプロセスのハンドルを先に保持する。
+   本実装のロック直前 (`before_lock`) に native コードで正常終了を要求し、lockfile の自然解放を最大5秒観測する。
+   一時的な観測用ハンドルを閉じ、同じコールバックから戻って直ちに本実装が1回だけロックを取る。
+   PowerShell の待機・CIM 列挙・stdout 出力をこの引き渡しの間に挟まない。
+   実際の `lock_acquired` と `process_wait_pid_begin:<元PID>` で元が生き、
+   `process_wait_pid_end:<元PID>` と `process_wait_end` で終了済みと native ハンドルで観測できることを要求する。
+   各観測は JSON 化より前に行い、`process_wait_end` まで出力を溜める。
+   ここで初めて checkpoint を止め、元ホストの自然終了・原本の基準値を確定する。
+   `copy_begin` / `copy_end` もロック保持を確かめ、コピーの一致、除外、コピー先の読み直しを行う。
+   本実装のロック取得・終了待ち・移行に失敗したら ERROR とし、自動的な移行の再試行はしない。
+3. **別の移行先で競合試験を1回行う**。元は終了済みで、これは最初の移行の再試行ではない。
+   helper の `lock_acquired`・`copy_begin`・`copy_end` で、元の lockfile の共有違反を別経路から確かめる。
    最初の2か所で同じ元を開こうとする別ホストを起動し、該当 Runtime のプロセスを観測してから先へ進む。
    `copy_end` では、両ホストの起動の終端 (失敗またはページ到達など) を記録してからロックを解放する。
    起動が失敗せずページに到達した場合や応答性が失われた場合は、成功にしない。
@@ -72,12 +85,14 @@ exe へ再度 `path-policy` を問い合わせ、現在の checkout と runner �
    全ファイルの相対パス・サイズ・SHA256 を比較する。除外は第8版 §5.3 の完全一致の一覧だけ。
    未知のファイルを除外せず、読み取りエラーも成功にしない。除外された metrics の生の行も残す。
    コピー先は初回起動の前に調べ、lockfile・Crashpad・metrics の除外対象がフォルダごと存在しないことも確かめる。
-5. コピー先で3種類の保存を読み、完全に終了してから再度読み直す。元も最後に読み直す。
+5. 両方のコピー先で3種類の保存を読み、完全に終了してから再度読み直す。元も最後に読み直す。
    すべてのホストの終了で、既存 C++ ホストの共通 `Close()`・callback 完了・自然終了待ちの証拠を確認する。
    前後の WER / Application ログも別に保存する。
 
 checkpoint は test-script の helper だけの制御で、移行エンジンがロックを保持している間に動く。
 JSONL の `phase` / `elapsed_ms` と `<phase>.continue` ファイルを使い、各停止の上限は10秒。
+元の終了待ちモードは `lock_acquired` で止めず、製品の終了待ちを通過した `process_wait_end` で止める。
+競合試験は従来どおり `lock_acquired` で止める。PID 単位の開始・終了には停止を置かない。
 製品経路に待機や再試行を足すものではない。helper のプロセス待ち本体の上限5秒も変えない。
 外側の runner も、例外を含む後片付けで checkpoint を解放し、全ホストへ正常終了を要求する。
 上限35秒の自然終了待ちが失敗しても、**ホストも WebView2 も強制終了しない**。
@@ -87,8 +102,10 @@ JSONL の `phase` / `elapsed_ms` と `<phase>.continue` ファイルを使い、
 `results.json` / `results.md`、元と先の manifest、ホストの JSONL、helper の stdout、各プロセスの記録を
 `target\wm\<ID>\` に残す。競合する起動の Runtime プロセスを checkpoint で観測できなかった場合は
 `INCONCLUSIVE` とし、起動拒否や保存の照合だけで重なりを確認した扱いにはしない。
-元の正常終了直後の隙間は短いため、元プロセスが helper の取得後も残ったかは別項目
-`original_source_close_overlap` に記録する。false のとき、その元プロセスを待つ経路の実測は未確認。
+元の正常終了直後の隙間は短いため、`original_source_close_overlap` に上記 native 観測と PID ごとの
+実際の待ちの証拠を記録する。**元がロック取得時に終了済み、PID ごとの開始時に終了済み、
+待ちの開始・終了のどちらかが無い場合も INCONCLUSIVE であり、PASS にはしない**。
+PowerShell からロック取得後に一覧を読むだけの観測は、この判定に使わない。
 各 checkpoint で観測した競合 Runtime の PID と実際の `process_wait_begin/end`・`copy_begin/end` を
 併せて読み、checkpoint の停止時間を製品の待機やコピー時間と解釈しない。
 PASS も1台・1つの Runtime の有限観測であり、旧版プラグインのデータ互換性や実製品の UI の受け入れを代替しない。

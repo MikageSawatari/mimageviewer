@@ -32582,8 +32582,16 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn media_startup_load_pending(&self) -> bool {
+        self.audio_plugin_startup_pending(true)
+    }
+
+    /// One read-only projection of startup ownership for local and Remote
+    /// consumers. Remote retains its existing policy of ignoring a user chain
+    /// that is no longer requested, but both consumers must await migration.
+    #[cfg(windows)]
+    pub(crate) fn audio_plugin_startup_pending(&self, user_requested: bool) -> bool {
         self.audio_plugin_migration.waiting()
-            || self.vst3_startup_load.is_some()
+            || (user_requested && self.vst3_startup_load.is_some())
             || self.effetune.startup_pending()
     }
 

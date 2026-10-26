@@ -265,6 +265,8 @@ F2a・F2b-1 でも下記の保存済み状態・設定項目の名前と意味�
 App は `src/effetune/startup.rs` の worker の結果を待ち、印の判断が済むまで音響調整・ユーザー VST・
 スキャン用 host を起動しない。失敗した起動では音響調整だけを禁止し、ユーザー VST は結果採用後に使える。
 UI にファイル検査・コピー・プロセス待機を置かず、設定スキーマは変更しない。
+移行先と bridge の `MIV_SOUND_DATA_DIR` は共通の `sound_data_root` で絶対パスにし、相対 `--data-dir` にも対応する。
+`data_dir::get()` は変更しない。ローカルと Remote は App の共通の起動待ちを参照し、Remote は既存の開始予算内で移行とロードを待つ。
 
 - Mixwright の状態: `data_dir/effetune/mixwright-state.json` (base64 を decode した生バイト)。
   settings.db に載せない (状態は IR 等で MB 級になり得るが、`settings_kv` は保存のたびに全行を
