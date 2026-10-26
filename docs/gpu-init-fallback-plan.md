@@ -335,6 +335,12 @@ Vulkanは201件を完走し、189成功 / 以下の12件が画像比較で失敗
 最多15画素の比較画像を目視した範囲では大きな配置差は見えないが、12件全体の許容判断の代わりにはしない。
 `git diff --name-only -- tests/snapshots` は空。Vulkan指定が効くのはharness経由のUIテストだけで、独立GPU fixture47件をVulkan固定で検査したという意味ではない。
 
+- 2026-10-26 独立コードレビュー (Codex gpt-6.1-sol xhigh、対象 `04b416acc`): **ACCEPT** (指摘なし)。
+  Vulkan の 12 件は、比較閾値を超えた画素数が 1〜15 で、8bit 各成分の差の最大は画像ごとに 1〜3 段階。配置の変化・欠落・大きな色の変化は無く、
+  backend 間の描画差として許容する。共通閾値の緩和や期待 PNG の一括更新はしない (Vulkan は開き直しで使う側の API で、既定の検査は DX12)。
+- ClaudeCode の再実行 (同コミット): `test-lib-full.ps1` 14311 件成功。通常の `cargo test -p mimageviewer --test ui_snapshot` を 2 回流し、2 回とも 201 件成功
+  (実装中の D3D12SDKLayers の例外での停止は再発せず)。原因は未確定のまま、以前からの間欠的なテスト実行体の不具合と同種の可能性として記録に残す。
+
 ### 11.5 検証用buildと実アプリで確認する操作
 
 launcherの内包入力も必要なので、dev-runtimeの代わりにrelease構成を用意した。
