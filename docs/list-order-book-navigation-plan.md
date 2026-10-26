@@ -517,3 +517,12 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList
 - 実 native presenter・ゲームパッド機器・変換器・GPUでの確認とlib全件は未実施。
   ClaudeCode側の後続検証へ引き継ぐ。自動試験の動画は表示を行わないfixtureであり、
   変換書庫の回帰も実変換器の起動を要しない。
+
+### 実アプリ確認 (2026-10-27、ClaudeCode、隔離 data-dir)
+
+`target/dev-runtime` の試験版を `--data-dir` で起動し、日付を変えた 6 冊の一覧 (F_book.zip・E_zipsonly (中は ZIP だけ)・D_book・C_empty (空)・
+B_book.zip・A_book) を「日付↓」で並べ、F から Ctrl+Shift+↓ / ↑ を押した。
+- ↓: F → D (E を飛ばす) → B (C を飛ばす) → A → 「一覧の末尾です」で停止。
+- ↑: A → B → D、D から ↑ で F (E を飛ばす) → 「一覧の先頭です」で停止。
+- 既存の Ctrl+↓ は木の順のまま (D → E_zipsonly\inner.zip)。そこから Ctrl+Shift+↓ で D (中の書庫に着いていても一覧の位置は E の行)。
+- 未確認: ゲームパッドでの決定・動画への着地中の押下・detached / F12 linked での通知・EPUB / 変換書庫・評価一覧経由 (自動テストのみ)。
