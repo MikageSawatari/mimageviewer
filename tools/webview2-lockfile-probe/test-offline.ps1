@@ -168,6 +168,34 @@ try {
     $rejected = $false
     try { Assert-ProbePath (Join-Path $script:ProbeRoot '..\outside') } catch { $rejected = $true }
     Check 'PowerShell rejects escaping root' $rejected
+    $nativePolicy = Native @('path-policy')
+    Check 'compiled path policy query succeeds without WebView2' ($nativePolicy.exit_code -eq 0 -and $nativePolicy.lines.Count -eq 1)
+    $pathPolicy = $nativePolicy.lines[0] | ConvertFrom-Json
+    Assert-ProbePathPolicy $pathPolicy $script:ProbeRoot
+    Check 'compiled policy matches both exact checkout roots' $true
+    $shortUdf = Join-Path $pathPolicy.migration_root (([Guid]::NewGuid().ToString('N').Substring(0, 8)) + '\native-lock')
+    foreach ($safePath in @((Join-Path $run 'native-path'), $shortUdf,
+        (Join-Path $pathPolicy.migration_root '12345678\a\mimageviewer-vst3-host.exe'),
+        (Join-Path $pathPolicy.migration_root '12345678\d\effetune\webview'))) {
+        Check ('native permits disposable path: ' + $safePath) ((Native @('path-check', '--path', $safePath)).exit_code -eq 0)
+    }
+    foreach ($unsafePath in @($pathPolicy.migration_root,
+        (Join-Path $pathPolicy.migration_root '12345678'),
+        (Join-Path $pathPolicy.migration_root '1234567\a'),
+        (Join-Path $pathPolicy.migration_root '123456789\a'),
+        (Join-Path $pathPolicy.migration_root '1234567g\a'),
+        (Join-Path $pathPolicy.migration_root '12345678\..\..\outside'),
+        ($pathPolicy.migration_root + '-other\12345678\a'),
+        (Join-Path $script:ProbeRoot 'not-a-run\a'),
+        (Join-Path ([IO.Path]::GetDirectoryName($script:ProbeRoot)) 'not-approved\12345678\a'))) {
+        Check ('native rejects non-disposable path: ' + $unsafePath) ((Native @('path-check', '--path', $unsafePath)).exit_code -eq 10)
+    }
+    # Native path-check validated this target-only path before creating it.
+    [IO.Directory]::CreateDirectory((Join-Path $shortUdf 'EBWebView')) | Out-Null
+    $shortLock = Lock-Try $shortUdf $true
+    Check 'native lock helper works under short root' ($shortLock.exit_code -eq 0 -and
+        @($shortLock.events | Where-Object { $_.kind -eq 'lock_attempt' -and $_.opened }).Count -eq 1)
+    Check 'short root native lock is deleted on close' (-not [IO.File]::Exists((Join-Path $shortUdf 'EBWebView\lockfile')))
     # Deliberately invalid paths are rejected before I/O; no real profile is supplied.
     $outside = Native @('lock', '--udf', (Join-Path $script:ProbeRoot '..\outside'))
     Check 'native rejects escaping root' ($outside.exit_code -eq 10)

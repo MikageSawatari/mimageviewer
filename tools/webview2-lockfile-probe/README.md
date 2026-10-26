@@ -48,6 +48,16 @@ probe の C++ ビルドは runner が行う。probe 自体もビルド済みな�
 exe・Loader・ページ・C++ ソースは従来の `build.json` の SHA256 と照合し、
 移行 helper の SHA256 も新しい実測の `results.json` に保存する。
 
+native の使い捨て領域は、同じ checkout の `target\webview2-lockfile-probe\run-*\` の中と、
+`target\wm\<小文字16進8桁ID>\` の中だけを許す。target 全体や似た名前の隣接フォルダは許さず、
+reparse point の拒否も維持する。probe.exe 自体は従来の `target\webview2-lockfile-probe\bin\` に置く。
+ビルドは、実際にコンパイルした exe の `path-policy` モードから取得した許可ルートと ID 規則を
+`build.json.path_policy` に記録する。runner はこの記録と exe/source の hash を照合し、
+exe へ再度 `path-policy` を問い合わせ、現在の checkout と runner が要求するルートに一致するか確認する。
+この問い合わせはウィンドウ・WebView2・保存領域を作らない。照合は実行用ディレクトリや seed host を作る前に行う。
+古い記録に項目が無い場合や不一致なら、`-SkipBuild` でも再ビルドを案内して停止する。
+その場合は `build.ps1` を実行するか、runner の `-SkipBuild` を外す。本体 core の再ビルドは不要。
+
 検証する流れ:
 
 1. 同じ origin の localStorage・IndexedDB (文字列とバイナリ)・OPFS (UTF-8 とバイナリ) に素材を作る。
@@ -95,6 +105,8 @@ JSONL と3か所の checkpoint、待機・コピーの順序と成功結果、�
 この合成検査を本物の WebView2 や本実装の移行の成功とは扱わない。
 短い実行先と予算検査を追加した版でも、上記の非 WebView2 検査を実行する。
 初回の外部実測は seed の IndexedDB 作成で失敗して移行関数には到達しておらず、短縮後の実物確認は別途必要。
+native の短いルート許可・拒否と、ビルド記録／実行ファイル／runner の一致もオフラインで検査する。
+短縮後の外部実測で分かった古い native ルート制限を修正した版も、実物の再実測は別途必要。
 
 ## ClaudeCode が実行するコマンド
 

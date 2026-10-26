@@ -79,18 +79,33 @@ static Resource resourceForURI(const std::wstring& uri, const std::vector<BYTE>&
     }
     return result;
 }
-static fs::path checkedPath(const fs::path& path) {
+static constexpr wchar_t legacyRunPrefix[] = L"run-";
+static constexpr size_t migrationRunIdLength = 8;
+static std::pair<fs::path, fs::path> disposableRoots() {
     const auto root = exePath().parent_path().parent_path();
-    if (root.filename() != L"webview2-lockfile-probe" || root.parent_path().filename() != L"target")
+    if (exePath().parent_path().filename() != L"bin" || root.filename() != L"webview2-lockfile-probe" || root.parent_path().filename() != L"target")
         throw std::runtime_error("Executable must remain in target/webview2-lockfile-probe/bin");
+    return {root, root.parent_path() / L"wm"};
+}
+static fs::path checkedPath(const fs::path& path) {
+    const auto roots = disposableRoots();
     const auto full = fs::absolute(path).lexically_normal();
-    auto prefix = root.wstring() + L"\\";
     const auto name = full.wstring();
-    if (name.size() <= prefix.size() || CompareStringOrdinal(name.data(), static_cast<int>(prefix.size()), prefix.data(), static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL)
+    bool allowed = false;
+    for (const auto& root : {roots.first, roots.second}) {
+        const auto prefix = root.wstring() + L"\\";
+        if (name.size() <= prefix.size() || CompareStringOrdinal(name.data(), static_cast<int>(prefix.size()), prefix.data(), static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL)
+            continue;
+        const auto relative = name.substr(prefix.size());
+        const auto separator = relative.find(L'\\');
+        if (separator == std::wstring::npos) continue;
+        const auto run = relative.substr(0, separator);
+        if (root == roots.first) allowed = run.rfind(legacyRunPrefix, 0) == 0;
+        else allowed = run.size() == migrationRunIdLength && run.find_first_not_of(L"0123456789abcdef") == std::wstring::npos;
+        if (allowed) break;
+    }
+    if (!allowed)
         throw std::runtime_error("Path outside disposable probe root");
-    const auto relative = name.substr(prefix.size());
-    if (relative.rfind(L"run-", 0) != 0 || relative.find(L'\\') == std::wstring::npos)
-        throw std::runtime_error("Path must be inside a run-* directory");
     fs::path cursor;
     for (const auto& component : full) {
         cursor /= component;
@@ -734,6 +749,20 @@ int wmain(int argc, wchar_t** argv) {
     try {
         if (argc < 2) throw std::runtime_error("Usage: probe.exe host|lock --udf <target/.../run-*/udf> ... | resource-check (no default profile)");
         const Args args(argc, argv);
+        if (std::wstring(argv[1]) == L"path-policy") {
+            // Metadata only: no window, COM environment, file write or Runtime.
+            const auto roots = disposableRoots();
+            std::cout << "{\"version\":1,\"legacy_root\":" << quote(utf8(roots.first.wstring()))
+                << ",\"migration_root\":" << quote(utf8(roots.second.wstring()))
+                << ",\"legacy_run_prefix\":" << quote(utf8(legacyRunPrefix))
+                << ",\"migration_run_id_length\":" << migrationRunIdLength << "}\n";
+            return 0;
+        }
+        if (std::wstring(argv[1]) == L"path-check") {
+            const auto path = args.path(L"--path");
+            std::cout << "{\"checked_path\":" << quote(utf8(path.wstring())) << "}\n";
+            return 0;
+        }
         if (std::wstring(argv[1]) == L"lock") return lockMain(args);
         if (std::wstring(argv[1]) == L"resource-check") return resourceCheckMain();
         if (std::wstring(argv[1]) == L"file-probe") return fileProbeMain(args);

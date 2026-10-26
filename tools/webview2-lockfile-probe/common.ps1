@@ -1,5 +1,33 @@
 # ASCII only. Shared by the runner, offline tests and build script.
 $script:ProbeRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\target\webview2-lockfile-probe'))
+function Read-ProbePathPolicy([string]$Executable) {
+    # A metadata-only native mode. Explicit UTF-8 also supports non-ASCII checkout paths.
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Executable; $start.Arguments = 'path-policy'
+    $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+    $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $start.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw 'Cannot start metadata query.' }
+        $output = $process.StandardOutput.ReadToEndAsync(); $errors = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(5000)) { throw "Path-policy query timed out (PID $($process.Id)); no host was started." }
+        if ($process.ExitCode -ne 0) { throw "Path-policy query failed: $($errors.Result)" }
+        return ($output.Result | ConvertFrom-Json -ErrorAction Stop)
+    } catch { throw "Cannot verify probe path policy. Rebuild probe with build.ps1 (omit -SkipBuild). $($_.Exception.Message)" }
+    finally { $process.Dispose() }
+}
+function Assert-ProbePathPolicy($Policy, [string]$BinaryRoot) {
+    $migrationRoot = Join-Path ([IO.Path]::GetDirectoryName($BinaryRoot)) 'wm'
+    if ($null -eq $Policy -or $Policy.version -ne 1 -or $Policy.legacy_run_prefix -cne 'run-' -or
+        $Policy.migration_run_id_length -ne 8 -or
+        -not [string]::Equals($Policy.legacy_root, $BinaryRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($Policy.migration_root, $migrationRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Probe path policy differs from this checkout/runner. Rebuild probe with build.ps1 (omit -SkipBuild).'
+    }
+}
 function Assert-ProbePath([string]$Path) {
     $full = [IO.Path]::GetFullPath($Path)
     if (-not $full.StartsWith($script:ProbeRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {

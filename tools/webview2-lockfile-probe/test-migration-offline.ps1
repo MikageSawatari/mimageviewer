@@ -20,6 +20,26 @@ try {
         [IO.Path]::GetFileName($layout.root) -cmatch '^[a-f0-9]{8}$')
     Check 'binary root remains separate from migration data' ($script:MigrationBinaryRoot -cne $script:ProbeRoot -and
         $script:MigrationBinaryRoot.EndsWith('\target\webview2-lockfile-probe'))
+    $policy = [pscustomobject]@{version=1; legacy_root=$script:MigrationBinaryRoot;
+        migration_root=$script:ProbeRoot; legacy_run_prefix='run-'; migration_run_id_length=8}
+    Assert-ProbePathPolicy $policy $script:MigrationBinaryRoot
+    Check 'matching build path policy accepted' $true
+    $denied = $false
+    try { Assert-ProbePathPolicy $null $script:MigrationBinaryRoot } catch { $denied = $_.Exception.Message -like '*Rebuild probe*' }
+    Check 'legacy metadata without policy requires rebuild' $denied
+    foreach ($pair in @(@('version', 0), @('legacy_root', 'C:\other\target\webview2-lockfile-probe'),
+        @('migration_root', ($script:ProbeRoot + '-other')), @('legacy_run_prefix', '*'), @('migration_run_id_length', 9))) {
+        $bad = $policy | ConvertTo-Json | ConvertFrom-Json
+        $bad.($pair[0]) = $pair[1]
+        $denied = $false
+        try { Assert-ProbePathPolicy $bad $script:MigrationBinaryRoot } catch { $denied = $_.Exception.Message -like '*Rebuild probe*' }
+        Check ('mismatching compiled policy rejected: ' + $pair[0]) $denied
+    }
+    $denied = $false
+    try { $null = Read-ProbePathPolicy (Join-Path $script:MigrationRun 'missing-probe.exe') } catch {
+        $denied = $_.Exception.Message -like '*Cannot verify probe path policy*Rebuild probe*'
+    }
+    Check 'unavailable metadata query requires rebuild before host startup' $denied
     # The real build script imports common.ps1 in its own script scope. Exercise
     # that boundary without compiling anything or launching a browser/product.
     $scopeScript = Join-Path $script:MigrationRun 'synthetic-build-scope.ps1'
@@ -76,14 +96,18 @@ $script:ProbeRoot
     $runner = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run-migration.ps1'))
     Check 'runner preflight precedes build and host startup' ($runner.IndexOf('Assert-MigrationPathBudget') -lt
         $runner.IndexOf("if (-not `$SkipBuild)") -and $runner.IndexOf('Assert-MigrationPathBudget') -lt $runner.IndexOf('Start-MigrationHost'))
-    foreach ($file in @('migration-common.ps1', 'run-migration.ps1', 'test-migration-offline.ps1')) {
+    Check 'recorded policy checked before creating run' ($runner.IndexOf('Assert-ProbePathPolicy $build.path_policy') -gt 0 -and
+        $runner.IndexOf('Assert-ProbePathPolicy $build.path_policy') -lt $runner.IndexOf('New-Item'))
+    Check 'actual executable policy checked before creating run' ($runner.IndexOf('Read-ProbePathPolicy $script:MigrationProbe') -gt 0 -and
+        $runner.IndexOf('Read-ProbePathPolicy $script:MigrationProbe') -lt $runner.IndexOf('New-Item'))
+    foreach ($file in @('common.ps1', 'build.ps1', 'migration-common.ps1', 'run-migration.ps1', 'test-migration-offline.ps1')) {
         $path = Join-Path $PSScriptRoot $file
         $bytes = [IO.File]::ReadAllBytes($path)
         Check ($file + ' ASCII') (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0)
         $parseTokens = $null; $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$parseTokens, [ref]$parseErrors)
         Check ($file + ' syntax') ($parseErrors.Count -eq 0)
-        if ($file -ne 'test-migration-offline.ps1') {
+        if ($file -in @('migration-common.ps1', 'run-migration.ps1')) {
             Check ($file + ' no forced termination') (-not ([IO.File]::ReadAllText($path) -match '\.Kill\s*\(|Stop-Process|taskkill|TerminateProcess'))
         }
     }

@@ -19,6 +19,7 @@ $script:MigrationProbe = Join-Path $script:MigrationBinaryRoot 'bin\probe.exe'
 $MigrationExe = [IO.Path]::GetFullPath($MigrationExe)
 if (-not [IO.File]::Exists($MigrationExe)) { throw 'Build the test-script core migration helper first.' }
 $build = Get-Content -LiteralPath (Join-Path $script:MigrationBinaryRoot 'bin\build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+Assert-ProbePathPolicy $build.path_policy $script:MigrationBinaryRoot
 foreach ($pair in @(@($script:MigrationProbe, $build.exe_sha256),
     @((Join-Path $script:MigrationBinaryRoot 'bin\page.html'), $build.page_sha256),
     @((Join-Path $script:MigrationBinaryRoot 'bin\WebView2Loader.dll'), $build.loader_sha256),
@@ -27,6 +28,9 @@ foreach ($pair in @(@($script:MigrationProbe, $build.exe_sha256),
     @((Join-Path $PSScriptRoot 'page.html'), $build.page_sha256))) {
     if ((Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne $pair[1]) { throw "Probe build/source mismatch: $($pair[0])" }
 }
+# The hashed executable must also report the same compiled policy now. Querying
+# this mode creates neither a host nor WebView2, including with -SkipBuild.
+Assert-ProbePathPolicy (Read-ProbePathPolicy $script:MigrationProbe) $script:MigrationBinaryRoot
 $script:MigrationRun = $layout.root
 Assert-ProbePath $script:MigrationRun
 New-Item -ItemType Directory -Path $script:MigrationRun -ErrorAction Stop | Out-Null

@@ -48,7 +48,10 @@ $lines += @(('call "{0}"' -f $VcVars),
 & $env:ComSpec /d /c $buildCmd
 if ($LASTEXITCODE -ne 0) { throw "Probe build failed: $LASTEXITCODE" }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'page.html') -Destination (Join-Path $out 'page.html')
+$pathPolicy = Read-ProbePathPolicy $exe
+Assert-ProbePathPolicy $pathPolicy $script:ProbeRoot
 $metadata = [ordered]@{ built_utc = [DateTime]::UtcNow.ToString('o'); choc_header = $ChocHeader;
+    path_policy = $pathPolicy;
     choc_sha256 = (Get-FileHash -LiteralPath $ChocHeader -Algorithm SHA256).Hash;
     source_sha256 = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash;
     snapshot_sha256 = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'snapshot.h') -Algorithm SHA256).Hash;
