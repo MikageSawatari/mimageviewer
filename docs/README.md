@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [section445-stepped-slider-input.md](section445-stepped-slider-input.md) | §1.445、GPUメモリ上限などの手入力。eguiの編集状態とstep丸めの原因、共通修正、兄弟欄とheadless回帰・検証記録 |
 | [section443-font-color-fix.md](section443-font-color-fix.md) | §1.443、単色 EBDT 字形のカラー誤判定。epaint 0.37 の vendor 差分、実フォント・mesh 回帰と検証記録 |
 | [gpu-init-fallback-plan.md](gpu-init-fallback-plan.md) | §1.448 GPU 初期化。`--gpu-backend`、DX12 の FXC 固定、初回 device 作成だけの DX12 → Vulkan 有限選択、試行別診断と起動中だけの Error 保存。報告環境の原因や改善は未確認 |
 | [render-init-failure-report-plan.md](render-init-failure-report-plan.md) | §1.428 run_nativeのErr終了。watchdog休止・原因連鎖の記録・cleanup・終了flush後のnative通知、script自動実行時の表示抑止と検証記録。panic経路の§1.429は対象外 |
