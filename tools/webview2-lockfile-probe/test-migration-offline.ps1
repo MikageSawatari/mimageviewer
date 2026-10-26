@@ -1,7 +1,7 @@
 # ASCII only. Does not build or run Cargo, WebView2, or a product executable.
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'migration-common.ps1')
-$script:MigrationRun = Join-Path $script:ProbeRoot ('run-migration-offline-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff') + '-' + $PID)
+$script:MigrationRun = Join-Path $script:ProbeRoot ('o-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 Assert-ProbePath $script:MigrationRun
 [IO.Directory]::CreateDirectory($script:MigrationRun) | Out-Null
 $script:MigrationCheckpoints = Join-Path $script:MigrationRun 'checkpoints'
@@ -15,6 +15,67 @@ function Check([string]$Name, [bool]$Condition) {
 }
 $errorText = $null
 try {
+    $layout = Get-MigrationRunLayout
+    Check 'short run layout stays in migration root' ([IO.Path]::GetDirectoryName($layout.root) -ceq $script:ProbeRoot -and
+        [IO.Path]::GetFileName($layout.root) -cmatch '^[a-f0-9]{8}$')
+    Check 'binary root remains separate from migration data' ($script:MigrationBinaryRoot -cne $script:ProbeRoot -and
+        $script:MigrationBinaryRoot.EndsWith('\target\webview2-lockfile-probe'))
+    # The real build script imports common.ps1 in its own script scope. Exercise
+    # that boundary without compiling anything or launching a browser/product.
+    $scopeScript = Join-Path $script:MigrationRun 'synthetic-build-scope.ps1'
+    [IO.File]::WriteAllText($scopeScript, @'
+param([string]$CommonPath)
+. $CommonPath
+Assert-ProbePath (Join-Path $script:ProbeRoot 'bin\synthetic')
+$script:ProbeRoot
+'@, [Text.Encoding]::ASCII)
+    $migrationRootBeforeBuild = $script:ProbeRoot
+    $syntheticBuildRoot = & $scopeScript (Join-Path $PSScriptRoot 'common.ps1')
+    Check 'build scope still permits original binary directory' ($syntheticBuildRoot -ceq $script:MigrationBinaryRoot)
+    Check 'build scope cannot reset migration guards' ($script:ProbeRoot -ceq $migrationRootBeforeBuild)
+    Check 'production layout is not created by preflight' (-not [IO.Directory]::Exists($layout.root))
+    $budget = Assert-MigrationPathBudget $layout.source $layout.destination
+    Check 'current source and destination have reserved headroom' ($budget.checks.Count -eq 2 -and
+        @($budget.checks | Where-Object { $_.headroom_utf16_units -lt 32 }).Count -eq 0)
+    Check 'preflight uses source engine layout' ($layout.source -ceq (Join-Path $layout.fake_appdata 'mimageviewer-vst3-host.exe'))
+    Check 'preflight uses destination engine layout' ($layout.destination -ceq (Join-Path $layout.data_dir 'effetune\webview'))
+    # Historical absolute spelling is intentional: this remains an oversized
+    # regression input even when this test runs from a shorter checkout.
+    $oldRun = 'C:\home\mimageviewer\.claude\worktrees\search-slow-1424-88bb45\target\webview2-lockfile-probe\run-migration-20261026-185550-453-24436'
+    $oldSource = Join-Path $oldRun 'fake-appdata\mimageviewer-vst3-host.exe'
+    $oldDestination = Join-Path $oldRun 'isolated-data\effetune\webview'
+    $denied = $false
+    try { $null = Assert-MigrationPathBudget $oldSource $oldDestination } catch {
+        $denied = $_.Exception.Message -like '*path budget exceeded before startup: source*'
+    }
+    Check 'reported long run layout rejected without opening storage' $denied
+    $page = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'page.html'))
+    Check 'path budget origin matches storage fixture' ($page.Contains("location.origin !== 'https://effetune-mixwright.localhost'"))
+    $tail = 'EBWebView\Default\IndexedDB\https_effetune-mixwright.localhost_0.indexeddb.leveldb\MANIFEST-18446744073709551615'
+    $boundary = 'C:\' + ('x' * (227 - 4 - $tail.Length))
+    $atLimit = Assert-MigrationPathBudget $boundary $boundary
+    Check 'exact budget boundary accepted' ($atLimit.checks[0].utf16_units -eq 227 -and
+        $atLimit.checks[0].headroom_utf16_units -eq 32)
+    foreach ($role in @('source', 'destination')) {
+        $denied = $false
+        try {
+            if ($role -eq 'source') { $null = Assert-MigrationPathBudget ($boundary + 'x') 'C:\short' }
+            else { $null = Assert-MigrationPathBudget 'C:\short' ($boundary + 'x') }
+        } catch { $denied = $_.Exception.Message -like ('*before startup: ' + $role + ' = 228 UTF-16 units*') }
+        Check ('one unit over budget rejected for ' + $role) $denied
+    }
+    $unicode = $boundary.Substring(0, $boundary.Length - 2) + [char]::ConvertFromUtf32(0x1F600)
+    $unicodeBudget = Assert-MigrationPathBudget $unicode 'C:\short'
+    Check 'non-BMP path counts surrogate pair as two units' ($unicodeBudget.checks[0].utf16_units -eq 227)
+    $denied = $false
+    try { $null = Get-MigrationRunLayout '..\escape' } catch { $denied = $true }
+    Check 'invalid short run ID rejected' $denied
+    $denied = $false
+    try { Assert-ProbePath ($script:ProbeRoot + '-other\12345678') } catch { $denied = $true }
+    Check 'similar migration root prefix rejected' $denied
+    $runner = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run-migration.ps1'))
+    Check 'runner preflight precedes build and host startup' ($runner.IndexOf('Assert-MigrationPathBudget') -lt
+        $runner.IndexOf("if (-not `$SkipBuild)") -and $runner.IndexOf('Assert-MigrationPathBudget') -lt $runner.IndexOf('Start-MigrationHost'))
     foreach ($file in @('migration-common.ps1', 'run-migration.ps1', 'test-migration-offline.ps1')) {
         $path = Join-Path $PSScriptRoot $file
         $bytes = [IO.File]::ReadAllBytes($path)

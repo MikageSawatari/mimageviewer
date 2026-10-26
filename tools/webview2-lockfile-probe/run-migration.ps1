@@ -8,31 +8,37 @@ $ErrorActionPreference = 'Stop'
 if (-not $InteractiveApproved) { throw 'This WebView2 suite requires prior approval of the scenarios and desktop use, then -InteractiveApproved.' }
 $env:MSBUILDDISABLENODEREUSE = '1'
 . (Join-Path $PSScriptRoot 'migration-common.ps1')
+$layout = Get-MigrationRunLayout
+$pathBudget = Assert-MigrationPathBudget $layout.source $layout.destination
+foreach ($check in $pathBudget.checks) {
+    Write-Host ("WebView2 path preflight: {0} = {1} UTF-16 units, headroom {2} -- {3}" -f
+        $check.role, $check.utf16_units, $check.headroom_utf16_units, $check.indexeddb_file)
+}
 if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') }
-$script:MigrationProbe = Join-Path $script:ProbeRoot 'bin\probe.exe'
+$script:MigrationProbe = Join-Path $script:MigrationBinaryRoot 'bin\probe.exe'
 $MigrationExe = [IO.Path]::GetFullPath($MigrationExe)
 if (-not [IO.File]::Exists($MigrationExe)) { throw 'Build the test-script core migration helper first.' }
-$build = Get-Content -LiteralPath (Join-Path $script:ProbeRoot 'bin\build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$build = Get-Content -LiteralPath (Join-Path $script:MigrationBinaryRoot 'bin\build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 foreach ($pair in @(@($script:MigrationProbe, $build.exe_sha256),
-    @((Join-Path $script:ProbeRoot 'bin\page.html'), $build.page_sha256),
-    @((Join-Path $script:ProbeRoot 'bin\WebView2Loader.dll'), $build.loader_sha256),
+    @((Join-Path $script:MigrationBinaryRoot 'bin\page.html'), $build.page_sha256),
+    @((Join-Path $script:MigrationBinaryRoot 'bin\WebView2Loader.dll'), $build.loader_sha256),
     @((Join-Path $PSScriptRoot 'probe.cpp'), $build.source_sha256),
     @((Join-Path $PSScriptRoot 'snapshot.h'), $build.snapshot_sha256),
     @((Join-Path $PSScriptRoot 'page.html'), $build.page_sha256))) {
     if ((Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne $pair[1]) { throw "Probe build/source mismatch: $($pair[0])" }
 }
-$script:MigrationRun = Join-Path $script:ProbeRoot ('run-migration-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff') + '-' + $PID)
+$script:MigrationRun = $layout.root
 Assert-ProbePath $script:MigrationRun
-[IO.Directory]::CreateDirectory($script:MigrationRun) | Out-Null
-$script:MigrationCheckpoints = Join-Path $script:MigrationRun 'checkpoints'
+New-Item -ItemType Directory -Path $script:MigrationRun -ErrorAction Stop | Out-Null
+$script:MigrationCheckpoints = $layout.checkpoints
 [IO.Directory]::CreateDirectory($script:MigrationCheckpoints) | Out-Null
 $script:MigrationChildren = [Collections.Generic.List[object]]::new()
 $script:MigrationUdfs = [Collections.Generic.List[string]]::new()
 $script:MigrationToken = [Guid]::NewGuid().ToString('D')
-$fake = Join-Path $script:MigrationRun 'fake-appdata'
-$data = Join-Path $script:MigrationRun 'isolated-data'
-$source = Join-Path $fake 'mimageviewer-vst3-host.exe'
-$destination = Join-Path $data 'effetune\webview'
+$fake = $layout.fake_appdata
+$data = $layout.data_dir
+$source = $layout.source
+$destination = $layout.destination
 foreach ($path in @($fake, $data, $source, $destination)) { Assert-ProbePath $path }
 $script:MigrationUdfs.Add($source); $script:MigrationUdfs.Add($destination)
 [IO.Directory]::CreateDirectory((Join-Path $data 'effetune')) | Out-Null
@@ -40,8 +46,10 @@ $script:MigrationUdfs.Add($source); $script:MigrationUdfs.Add($destination)
 $started = [DateTime]::UtcNow
 $beforeCrash = Get-CrashObservation ($started.AddHours(-24))
 Save-Json (Join-Path $script:MigrationRun 'crash-before.json') $beforeCrash
+Save-Json (Join-Path $script:MigrationRun 'path-budget.json') $pathBudget
 $result = [ordered]@{ suite = 'F2b-1 production migration engine with real WebView2'; status = 'ERROR';
     started_utc = $started.ToString('o'); source = $source; destination = $destination;
+    path_budget = $pathBudget;
     helper = $MigrationExe; helper_sha256 = (Get-FileHash -LiteralPath $MigrationExe -Algorithm SHA256).Hash;
     build = $build; phases = [ordered]@{}; competitors = [ordered]@{};
     original_source_close_overlap = $null; error = $null; cleanup_errors = @();

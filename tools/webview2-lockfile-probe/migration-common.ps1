@@ -1,5 +1,42 @@
 # ASCII only. Production migration is executed by the Rust helper, never here.
 . (Join-Path $PSScriptRoot 'common.ps1')
+# Keep the existing probe binaries and historical runs in their original root.
+# Shared path guards now apply only to this migration suite's shorter workspace.
+$script:MigrationBinaryRoot = $script:ProbeRoot
+$script:ProbeRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\target\wm'))
+
+function Get-MigrationRunLayout {
+    param([ValidatePattern('^[a-f0-9]{8}$')][string]$RunId = [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $root = Join-Path $script:ProbeRoot $RunId
+    Assert-ProbePath $root
+    $fake = Join-Path $root 'a'
+    $data = Join-Path $root 'd'
+    return [pscustomobject]@{ root = $root; fake_appdata = $fake; data_dir = $data;
+        source = (Join-Path $fake 'mimageviewer-vst3-host.exe');
+        destination = (Join-Path $data 'effetune\webview'); checkpoints = (Join-Path $root 'c') }
+}
+function Assert-MigrationPathBudget([string]$Source, [string]$Destination) {
+    # The fixture's fixed origin uses this LevelDB directory. Reserve a full
+    # uint64 file number, rather than just the observed six-digit MANIFEST name.
+    # Another 32 UTF-16 units remain available below the 259-unit Win32 limit.
+    # This is a conservative fixture preflight, not a WebView2-wide path promise.
+    $tail = 'EBWebView\Default\IndexedDB\https_effetune-mixwright.localhost_0.indexeddb.leveldb\MANIFEST-18446744073709551615'
+    $maxFileUnits = 259
+    $reserve = 32
+    $checks = @(foreach ($pair in @(@('source', $Source), @('destination', $Destination))) {
+        $udf = [IO.Path]::GetFullPath($pair[1])
+        $file = Join-Path $udf $tail
+        $units = $file.Length # .NET strings count UTF-16 code units, including surrogate pairs.
+        if ($units -gt ($maxFileUnits - $reserve)) {
+            throw ("WebView2 migration probe path budget exceeded before startup: {0} = {1} UTF-16 units, maximum {2} (259 minus {3} reserved). Use a shorter checkout path. File: {4}" -f
+                $pair[0], $units, ($maxFileUnits - $reserve), $reserve, $file)
+        }
+        [pscustomobject]@{ role = $pair[0]; udf = $udf; indexeddb_file = $file;
+            utf16_units = $units; headroom_utf16_units = ($maxFileUnits - $units) }
+    })
+    return [pscustomobject]@{ max_path_utf16_units = 260; maximum_file_utf16_units = $maxFileUnits;
+        reserved_utf16_units = $reserve; allowed_file_utf16_units = ($maxFileUnits - $reserve); checks = $checks }
+}
 
 function Test-MigrationExcluded([string]$RelativePath) {
     $p = $RelativePath.Replace('\', '/').TrimEnd('/')

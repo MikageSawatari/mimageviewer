@@ -120,6 +120,12 @@ mIV は v4.3.0 から EffeTune Mixwright (VST3、MIT、作者 Frieve-A) を**無
 `<data_dir>` は通常版が `%APPDATA%\mimageviewer`、ポータブル版が `<exe_dir>\data` (`src/data_dir.rs:321-323`)。
 `--data-dir` で隔離したときもそこに入る。
 
+F4 の検討材料（製品コードは未変更）: WebView の IndexedDB の `MANIFEST-000001` までで、
+末尾の区切りを除く data_dir の UTF-16 長に116単位が加わり、data_dir が144単位なら全体が260単位になる。
+深い場所のポータブル版などでは移行時・通常使用時とも超え得る。長いファイル番号や他の内部パスの余裕も必要。
+`crates/launcher/src/effetune_bundle.rs` の `check_publish_path_length` は配布 bundle の世代公開時に260以上を拒否するが、
+この利用者ごとの WebView 保存領域は対象外。検証用 probe だけは短い実行先と起動前の予算検査を使う（`tools/webview2-lockfile-probe/README.md`）。
+
 ### 4.2 受け渡し方法
 
 - mIV は音響調整の bridge を起動するとき、**その bridge の環境変数に `MIV_SOUND_DATA_DIR=<data_dir>\effetune`** を設定する

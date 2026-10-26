@@ -17,9 +17,20 @@ PowerShell にコピー処理を再実装せず、旧 `Copy-Udf` も呼ばない
 ClaudeCode がサンドボックスの外で、実行内容の明示承認を得てから実行する。
 通常2〜4分程度、起動や終了が時間切れになった場合は後片付けを含め数分余分にかかる。
 同じ非アクティブの小窓を順に表示するが、前面化・キーボード・マウス入力は行わない。
-使い捨ての保存先は `target\webview2-lockfile-probe\run-migration-*\` だけ。
-この下の `fake-appdata\` を移行元、`isolated-data\` を移行先として渡す。
+使い捨ての保存先は `target\wm\<8桁の16進ID>\` だけ。
+この下の `a\` を仮 APPDATA、`d\` を隔離 data-dir として渡す。checkpoint は `c\`。
+実際の旧 WebView 領域は `a\mimageviewer-vst3-host.exe\`、移行先は `d\effetune\webview\`。
+ビルド済み probe は従来どおり `target\webview2-lockfile-probe\bin\` から読み、過去の実行記録は移動しない。
 環境変数 `APPDATA` の変更や、利用者の通常プロファイルのコピー・変更は行わない。
+
+ビルド・実行用ディレクトリ作成・ホスト起動より前に、元と先の両方について、この origin の
+`EBWebView\Default\IndexedDB\https_effetune-mixwright.localhost_0.indexeddb.leveldb\MANIFEST-18446744073709551615`
+までの絶対パスを UTF-16 単位で計算する。20桁のファイル番号と、さらに32単位の余裕を取り、
+227単位を超えればパスと理由を表示して停止する（MAX_PATH=260、終端を除く上限259）。
+現在の worktree では元223・先213単位で、上限259までそれぞれ36・46単位の余裕がある。
+この予算は合成素材の事前検査で、WebView2 の全内部パスや製品の data-dir の保証ではない。
+通過した計算は `path-budget.json` と `results.json` の `path_budget` に残す。
+深い場所の checkout で停止したときは、短い場所に実ファイルの作業ツリーを用意する。
 
 本体の `test-script` feature を付けた core を用意した後、リポジトリのルートで実行する。
 通常版の core を単独起動するコマンドには置き換えない。
@@ -64,7 +75,7 @@ JSONL の `phase` / `elapsed_ms` と `<phase>.continue` ファイルを使い、
 これは従来 `run.ps1` の最後の手段の Kill とは異なる新経路の仕様。
 
 `results.json` / `results.md`、元と先の manifest、ホストの JSONL、helper の stdout、各プロセスの記録を
-`run-migration-*` に残す。競合する起動の Runtime プロセスを checkpoint で観測できなかった場合は
+`target\wm\<ID>\` に残す。競合する起動の Runtime プロセスを checkpoint で観測できなかった場合は
 `INCONCLUSIVE` とし、起動拒否や保存の照合だけで重なりを確認した扱いにはしない。
 元の正常終了直後の隙間は短いため、元プロセスが helper の取得後も残ったかは別項目
 `original_source_close_overlap` に記録する。false のとき、その元プロセスを待つ経路の実測は未確認。
@@ -81,7 +92,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\webview2-lockfile-pr
 2026-10-27: 新しい PowerShell の構文・ASCII、除外の完全一致と未知パスの維持、共有違反の独立確認、
 JSONL と3か所の checkpoint、待機・コピーの順序と成功結果、自然終了と時間切れ時の非強制終了など53項目が成功。
 証拠: `target\webview2-lockfile-probe\run-migration-offline-20261026-174912-010-21760\offline-results.json`。
-この合成検査を本物の WebView2 や本実装の移行の成功とは扱わない。新経路の外部実測は未実施。
+この合成検査を本物の WebView2 や本実装の移行の成功とは扱わない。
+短い実行先と予算検査を追加した版でも、上記の非 WebView2 検査を実行する。
+初回の外部実測は seed の IndexedDB 作成で失敗して移行関数には到達しておらず、短縮後の実物確認は別途必要。
 
 ## ClaudeCode が実行するコマンド
 
