@@ -235,6 +235,258 @@ fn list_order_gate_rejects_both_directions_and_ctrl_through_sequence_and_display
     assert!(app.folder_nav_pending.is_none());
 }
 
+/// Reach the actual post-worker media downgrade without rendering or desktop input.
+/// The prepared list is adopted by the same navigation/hydration path as a real landing.
+fn video_display_wait(
+    app: &mut tests::phase_c_support::AppTestEnv,
+    ctx: &egui::Context,
+    list_order: bool,
+) {
+    let root = app.tmp.path().join("video-books");
+    let (a, b) = fixture(app, &root);
+    std::fs::remove_file(b.join("page.png")).unwrap();
+    std::fs::write(b.join("video.mp4"), b"video").unwrap();
+    if list_order {
+        app.handle_fullscreen_list_order_nav_context(ctx, 0, true, false);
+    } else {
+        app.begin_fs_folder_navigation_sequence(ctx, 0);
+        app.start_folder_nav(a, false, FolderNavMode::Fullscreen);
+    }
+    let result = receive(app);
+    assert_eq!(result.target.as_ref().unwrap().logical_source(), b);
+    app.apply_folder_nav_result(ctx, result);
+    app.finish_page_identity_preparation_for_test();
+    assert!(app.folder_nav_pending.is_none());
+    assert_eq!(app.current_folder, Some(b));
+    assert!(matches!(app.items[0], GridItem::Video(_)));
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert!(app.fs_nav_is_locked());
+    assert!(!app.bind_fs_navigation_sequence_to_current_target());
+    // Media uses the legacy display-wait owner, rather than a page presentation trace.
+    assert!(!app.fs_navigation_sequence_blocks_new_target());
+}
+
+#[test]
+fn list_order_video_display_wait_rejects_ctrl_without_worker() {
+    for forward in [false, true] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        video_display_wait(&mut app, &ctx, true);
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, forward, false);
+        assert!(app.folder_nav_pending.is_none(), "must not start DFS");
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert!(app.fs_nav_is_locked());
+        app.release_fs_nav_lock();
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, forward, false);
+        assert!(app.folder_nav_pending.is_some(), "release ends rejection");
+    }
+}
+
+#[test]
+fn list_order_video_display_wait_rejects_sibling_without_worker() {
+    for forward in [false, true] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        video_display_wait(&mut app, &ctx, true);
+        app.handle_fullscreen_sibling_nav_context(&ctx, 0, forward, false);
+        assert!(
+            app.folder_nav_pending.is_none(),
+            "must not start sibling DFS"
+        );
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert!(app.fs_nav_is_locked());
+    }
+}
+
+#[test]
+fn list_order_video_display_wait_rejects_list_order_and_common_admission_without_worker() {
+    let mut app = setup_app();
+    let ctx = egui::Context::default();
+    video_display_wait(&mut app, &ctx, true);
+    for forward in [false, true] {
+        app.handle_fullscreen_list_order_nav_context(&ctx, 0, forward, false);
+        assert!(app.folder_nav_pending.is_none());
+        let current = app.effective_folder().unwrap();
+        app.start_folder_nav(current, forward, FolderNavMode::Fullscreen);
+        assert!(
+            app.folder_nav_pending.is_none(),
+            "common gate retains ownership"
+        );
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert!(app.fs_nav_is_locked());
+    }
+}
+
+#[test]
+fn list_order_video_display_wait_preserves_ordinary_fullscreen_continuations() {
+    for sibling in [false, true] {
+        for forward in [false, true] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            video_display_wait(&mut app, &ctx, false);
+            if sibling {
+                app.handle_fullscreen_sibling_nav_context(&ctx, 0, forward, false);
+            } else {
+                app.handle_fullscreen_ctrl_nav_context(&ctx, 0, forward, false);
+            }
+            let pending = app
+                .folder_nav_pending
+                .as_ref()
+                .expect("legacy continuation");
+            assert_eq!(pending.forward, forward);
+            assert_eq!(
+                matches!(pending.mode, FolderNavMode::SiblingFullscreen),
+                sibling
+            );
+            assert!(app.fs_nav_is_locked());
+        }
+    }
+}
+
+#[test]
+fn list_order_owner_survives_recapture_and_drawable_release_until_terminal_finish() {
+    let mut app = setup_app();
+    let ctx = egui::Context::default();
+    video_display_wait(&mut app, &ctx, true);
+    assert!(app.fs_list_order_navigation_blocks_new_target());
+    app.capture_fs_nav_holdover(0);
+    assert!(
+        app.fs_list_order_navigation_blocks_new_target(),
+        "recapture keeps origin"
+    );
+    app.items_generation += 1;
+    let texture = ctx.load_texture(
+        "list-order-ready-video-thumb",
+        egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+        egui::TextureOptions::LINEAR,
+    );
+    app.thumbnails[0] = ThumbnailState::loaded_raster(
+        texture,
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            evaluated_display_px: 64,
+        },
+        false,
+        64,
+        crate::source_coverage::SourceCoverage::FullSource,
+        None,
+        None,
+    );
+    assert!(app.fs_nav_holdover_for_draw().is_none());
+    assert!(matches!(
+        app.fs_holdover_tex,
+        Some(FsHoldover::FolderNavigation(
+            None,
+            FsFolderNavigationOrigin::ListOrder
+        ))
+    ));
+    assert!(
+        app.fs_list_order_navigation_blocks_new_target(),
+        "pixels do not own admission"
+    );
+    app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+    assert!(app.folder_nav_pending.is_none());
+    app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+    assert!(!app.fs_list_order_navigation_blocks_new_target());
+    assert!(!app.fs_nav_is_locked());
+}
+
+#[test]
+fn list_order_owner_follows_still_display_sequence_and_is_cleared_on_release() {
+    let mut app = setup_app();
+    let root = app.tmp.path().to_path_buf();
+    fixture(&mut app, &root);
+    let ctx = egui::Context::default();
+    app.handle_fullscreen_list_order_nav_context(&ctx, 0, true, false);
+    let result = receive(&mut app);
+    assert!(app.fs_list_order_navigation_blocks_new_target());
+    app.apply_folder_nav_result(&ctx, result);
+    app.finish_page_identity_preparation_for_test();
+    assert!(app.bind_fs_navigation_sequence_to_current_target());
+    assert!(app.fs_list_order_navigation_blocks_new_target());
+    assert!(app.fs_navigation_sequence_blocks_new_target());
+    app.release_fs_nav_lock();
+    assert!(!app.fs_list_order_navigation_blocks_new_target());
+}
+
+#[test]
+fn list_order_terminal_rendition_failure_admits_ctrl_sibling_and_common_targets() {
+    for route in 0..5 {
+        for forward in [false, true] {
+            let mut app = setup_app();
+            let root = app.tmp.path().to_path_buf();
+            fixture(&mut app, &root);
+            let ctx = egui::Context::default();
+            app.handle_fullscreen_list_order_nav_context(&ctx, 0, true, false);
+            let _result = receive(&mut app);
+            // State-transition seam: an accepted page target has no usable rendition.
+            // The production resolver must end the lock while retaining its old pixels.
+            let generation = app.items_generation;
+            app.fs_holdover_tex
+                .as_mut()
+                .unwrap()
+                .navigation_sequence_mut()
+                .unwrap()
+                .target = FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: generation,
+                anchor_idx: 0,
+                accept_rendition: true,
+                phase: FsNavigationTargetPhase::Awaiting {
+                    demand: FsNavigationDisplayDemand::navigation_only(0, vec![0]),
+                },
+            });
+            app.thumbnails[0] = ThumbnailState::Failed;
+            app.poll_fs_nav_lock(&ctx);
+            let owner = app
+                .fs_holdover_tex
+                .as_ref()
+                .expect("failure keeps the display owner");
+            assert_eq!(
+                owner.folder_navigation_origin(),
+                FsFolderNavigationOrigin::ListOrder
+            );
+            assert!(matches!(
+                owner.navigation_sequence().unwrap().target,
+                FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                    phase: FsNavigationTargetPhase::RenditionFailed { .. },
+                    ..
+                })
+            ));
+            assert!(!app.fs_nav_is_locked());
+            assert!(!app.fs_list_order_navigation_blocks_new_target());
+            match route {
+                0 => app.handle_fullscreen_ctrl_nav_context(&ctx, 0, forward, false),
+                1 => app.handle_fullscreen_sibling_nav_context(&ctx, 0, forward, false),
+                2 => {
+                    let current = app.effective_folder().unwrap();
+                    app.start_folder_nav(current, forward, FolderNavMode::Fullscreen);
+                }
+                3 => app.handle_fullscreen_list_order_nav_context(&ctx, 0, forward, false),
+                _ => {
+                    // The existing slideshow path recaptures before requesting its next DFS.
+                    app.capture_fs_nav_holdover(0);
+                    assert_eq!(
+                        app.fs_holdover_tex
+                            .as_ref()
+                            .unwrap()
+                            .folder_navigation_origin(),
+                        FsFolderNavigationOrigin::Ordinary
+                    );
+                    let current = app.effective_folder().unwrap();
+                    app.start_folder_nav(current, forward, FolderNavMode::SlideshowNext);
+                    assert!(matches!(
+                        app.folder_nav_pending.as_ref().map(|pending| &pending.mode),
+                        Some(FolderNavMode::SlideshowNext)
+                    ));
+                }
+            }
+            assert!(
+                app.folder_nav_pending.is_some(),
+                "terminal failure admits route {route}"
+            );
+        }
+    }
+}
+
 #[test]
 fn list_order_boundary_keeps_viewer_and_snapshot_and_releases_gate() {
     let mut app = setup_app();

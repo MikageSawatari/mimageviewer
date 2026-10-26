@@ -5429,7 +5429,10 @@ mod tests {
         );
         let sibling = app.push_window_context_for_test(&ctx, 133902, |owner| {
             owner.fs_nav_locked_gen = Some(owner.items_generation);
-            owner.fs_holdover_tex = Some(super::super::FsHoldover::FolderNavigation(None));
+            owner.fs_holdover_tex = Some(super::super::FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary,
+            ));
         });
         let sibling_before = app
             .with_viewer_context(sibling, |owner| {

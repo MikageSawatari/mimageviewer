@@ -1470,6 +1470,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   `ui_fullscreen.rs` の一時的な `FsKeyAction` で、新操作の intent を既存 local / ROOT /
   forwarded ROOT の共通dispatcherへ渡す。ページ端の既存案内・contextの配送先・viewportの選択規則は変えない。
   bundle の swap / fork / park / promote の回帰は独立した列の保持と旧 owner の無効化を検査する。
+- 2026-10-27 独立コードレビュー P2 対応: 既存 bundle 所有の `fs_holdover_tex` の型を拡張し、
+  `NavigationSequence` の purpose から動画・音声の `FolderNavigation` の origin へ一覧順由来を引き継ぐ。
+  worker 完了後も同じ owner が表示待ちの受付方針を保持し、Ctrl / 兄弟移動の継続と共通入口からの
+  乗り換えを拒否する。描画用の旧画像を解放しても origin は owner 終了まで残す。
+  sequence の終端失敗・パスワード待ちは既存の phase / modal の受付規則に従い、
+  旧画像を保持していることだけでは新しい要求を拒否しない。
+  detached の既存 producer は通常由来のまま。既存の初期化・swap・fork・終了を使い、
+  registry の遷移規則・context 配送先・viewport 選択・新たな並列状態 field は変更・追加しない。
+  この所有者拡張は設計担当と独立 reviewer が構造的修正として合意した。
 - 実装で範囲が変わったら、この記録を更新する。
 
 ### 2026-10-23 §1.419 起動系の明示要求を受付順に揃える

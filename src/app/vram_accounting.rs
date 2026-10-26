@@ -194,7 +194,7 @@ impl ViewerTextureCaches<'_> {
                 .fs_holdover_tex
                 .as_ref()
                 .and_then(|holdover| match holdover {
-                    FsHoldover::FolderNavigation(unit) => unit.as_ref(),
+                    FsHoldover::FolderNavigation(unit, _) => unit.as_ref(),
                     FsHoldover::PresentationSwitch(unit) => Some(unit),
                     FsHoldover::NavigationSequence(sequence) => sequence.previous.as_ref(),
                     FsHoldover::FinalEffectSourceReload(holdover) => Some(&holdover.previous),

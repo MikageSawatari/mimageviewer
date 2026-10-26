@@ -7662,6 +7662,7 @@ impl App {
                 if crate::folder_tree::is_virtual_folder(&p) {
                     Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
                 } else {
+                    self.capture_main_folder_list_order(idx);
                     self.note_reading_history_open(idx);
                     if auto_fullscreen {
                         self.pending_auto_fs_open = true;
@@ -7705,6 +7706,7 @@ impl App {
                 ) {
                     // The Smart request owns conversion and adopts its logical source once.
                 } else {
+                    self.capture_main_folder_list_order(idx);
                     let owner = self.main_grid_archive_open_owner(idx, &path);
                     let _outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                         path,
@@ -9158,6 +9160,88 @@ mod tests {
         GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
         draw_gamepad_list_picker_overlay_layout, draw_gamepad_ring_picker_overlay_layout,
     };
+
+    fn list_order_gamepad_fixture() -> crate::app::tests::phase_c_support::AppTestEnv {
+        use crate::app::top_level_grid_view::TopLevelGridSurface;
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let folder = app.tmp.path().join("gamepad-list-order");
+        app.current_folder = Some(folder.clone());
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::Folder);
+        app.items = vec![GridItem::Folder(folder.join("old-book"))];
+        app.visible_indices = vec![0];
+        app.capture_main_folder_list_order(0);
+        app.items = vec![
+            GridItem::Folder(folder.join("folder-book")),
+            GridItem::Image(folder.join("page.png")),
+            GridItem::ZipFile(folder.join("zip-book.zip")),
+            GridItem::ConvertibleArchive {
+                path: folder.join("archive-book.7z"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.visible_indices = vec![3, 1, 0, 2];
+        app
+    }
+
+    fn assert_list_order_gamepad_replaced_stale_snapshot(
+        app: &crate::app::tests::phase_c_support::AppTestEnv,
+        stale: &std::sync::Arc<crate::app::ListOrderSnapshot>,
+    ) {
+        let captured = app.list_order.as_ref().unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(captured, stale),
+            "gamepad activation must replace the old list before starting the open"
+        );
+        let folder = app.tmp.path().join("gamepad-list-order");
+        assert_eq!(captured.owner, app.viewer_context_main());
+        assert_eq!(
+            captured
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                folder.join("archive-book.7z"),
+                folder.join("folder-book"),
+                folder.join("zip-book.zip"),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_order_gamepad_folder_accept_replaces_stale_snapshot_before_navigation() {
+        let mut app = list_order_gamepad_fixture();
+        let stale = app.list_order.as_ref().unwrap().clone();
+        let folder = app.tmp.path().join("gamepad-list-order");
+        app.selected = Some(0);
+        let nav = app.handle_gamepad_grid_accept(&egui::Context::default());
+        assert!(matches!(
+            nav,
+            Some(crate::ui_main::AddressBarNav::Direct(path, _))
+                if path == folder.join("folder-book")
+        ));
+        assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        assert_list_order_gamepad_replaced_stale_snapshot(&app, &stale);
+    }
+
+    #[test]
+    fn list_order_gamepad_convertible_accept_replaces_stale_snapshot_before_loading() {
+        let mut app = list_order_gamepad_fixture();
+        let stale = app.list_order.as_ref().unwrap().clone();
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Convert);
+        app.selected = Some(3);
+        // The missing source keeps this handler test independent of an installed converter.
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert_list_order_gamepad_replaced_stale_snapshot(&app, &stale);
+    }
 
     #[test]
     fn book_composition_gamepad_select_cycles_only_matching_spread_and_single() {

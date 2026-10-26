@@ -138,6 +138,14 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
   `src/app.rs` 約 57696)。拒否は上の handler の return で行う。共通入口に到達した場合も、進行中の `ListOrder` を cancel・再開始しないことを検証する。
 - この操作の準備中に Ctrl+↑↓ を押した場合、Ctrl+↑↓ の準備中にこの操作を押した場合も、既存の gate で拒否される。cancel して乗り換える処理は作らない。
 - 累積 (`MAX_PENDING_NAV`) には乗せない。新しい状態 field は足さない。
+- 表示待ちの受付方針は worker の寿命から独立させる。受理済みの既存 sequence の purpose に
+  `ListOrderNavigation` を保持し、動画・音声への着地で `FolderNavigation` に移るときも
+  typed な origin に引き継ぐ。Ctrl・兄弟移動・共通入口は、準備・表示待ちの間は拒否する。
+  sequence の終端失敗 (RenditionFailed) とパスワード待ちの受付方針は既存の phase / modal に従い、
+  表示用の旧画像が残っていることだけで新しい要求を拒否しない。
+  再 capture も準備・表示待ちが継続中の場合だけ一覧順の受付方針を引き継ぎ、終端失敗から
+  スライドショー等の新しい移動を開始するときに拒否状態を復活させない。
+  通常の Fullscreen 由来の表示待ち中の継続受付は維持する (2026-10-27 独立コードレビュー P2 対応)。
 
 ### 4.3 着地
 
@@ -407,3 +415,105 @@ ClaudeCode側の後続検証へ引き継ぐ。
   `docs/next-release-backlog.md`、`docs/spec.md`、`htdocs/mimageviewer/index.html`、
   `htdocs/mimageviewer/manual/fullscreen.html`、`htdocs/mimageviewer/manual/shortcuts.html`。
   CHANGELOG・版番号・build/test scriptは変更しない。
+
+## 11. 独立コードレビュー P2 対応 (2026-10-27)
+
+対象は `32711c833` からの未コミット差分。レビュー全文の判定は ACCEPT WITH CHANGES、
+必須修正は以下の2件。commit・製品アプリ起動は行わない。
+
+- **ゲームパッドの取得漏れ**: `handle_gamepad_grid_accept` の通常フォルダは履歴・自動表示・
+  評価フィルタの既存処理を行って Direct を直接返し、変換書庫も直接 load していた。
+  その挙動を維持して各分岐の load 前に同じ capture helper を呼ぶ。ZIP/PDF は既存の
+  `grid_physical_navigation` 経由を維持する。初回実装の4か所に2か所を加え、計6呼出しとなる。
+  §3.3 の「ゲームパッドも共通入口を通る」というコードの前提に漏れがあったため補正した。
+- **worker 後の表示待ち**: 受理済み sequence の `FsNavigationPurpose::ListOrderNavigation` を
+  既存共通入口の gate 後に設定する。動画・音声の着地で legacy holdover へ移るとき、
+  `FsFolderNavigationOrigin::Ordinary | ListOrder` に由来を引き継ぐ。
+  Ctrl・兄弟 handler は継続受付より先に同じ owner の受付方針を調べ、共通入口・locked resolver
+  も同じ述語を使う。通常由来の Fullscreen / 兄弟の継続受付は維持する。
+  画像をラッチで解放しても origin は維持し、既存の終了・取消・解放でまとめて退役する。
+  既存 sequence の終端失敗 (RenditionFailed)・パスワード待ちは既存 phase の受付規則を維持する。
+  新しい並列 bool / Option、worker、同期 I/O、registry 遷移規則は追加しない。
+- 独立 reviewer は所有者拡張を構造的修正として受け入れ、終端失敗後に受付を再開する既存規則も
+  確認した。detached 境界の実際の範囲は `detached-rework-plan.md` §11 の同項に追記した。
+
+### 追加した回帰と修正前の失敗
+
+- ゲームパッド2件: 既存決定 handler を通して通常フォルダ / 変換書庫を開き、古い snapshot が
+  新しい表示順 (画像行除外) に置き換わり、Direct の既存挙動を変えないこと。
+  製品修正前は2件とも stale snapshot の検査で失敗 (exit 100、`gamepad-pre-fix.log`)。
+- 動画着地4件: 実 worker → 結果取得 → 採用 → hydration → media 用 owner への bind を通す。
+  worker 不在・lock 継続中の Ctrl / 兄弟 / 一覧順と共通入口を両方向で検査する。
+  製品修正前は Ctrl・兄弟・共通入口の3件が新しい DFS を始めて失敗し、通常 Fullscreen 由来の
+  継続受付1件は成功 (exit 100、`gate-pre-fix-corrected.log`)。
+- 所有者の状態遷移2件: 静止画の Display sequence でも由来を維持し、media の再 capture と
+  描画用画像の解放後も表示待ち中は拒否する。解放 / RequestFailed 終端で受付方針が退役すること。
+- 終端失敗1件: production resolver が RenditionFailed にして lock を解放した後、
+  旧画像と purpose を保持したまま Ctrl・兄弟・共通入口・一覧順の新しい要求を受理すること。
+  再 capture → SlideshowNext の既存呼出し順でも一覧順の拒否を復活させず、新しい worker を受理すること。
+- 最初の gate fixture は AppTestEnv の型 / 借用に誤りがあり compile exit 101。
+  次の試行は media bind 呼出しがなく、通常 DFS の向きも逆で、fixture の検査で exit 100。
+  これらは製品不具合の失敗証明とせず、補正後の上記3件の失敗を証明に使う。
+
+### 検証記録
+
+ログは `target/list-order-p2-verification/`。`MSBUILDDISABLENODEREUSE=1` を使用。
+最終コマンドの結果と確認用 build は以下のとおり。
+
+関連 nextest の式 (`$relatedFilter`):
+
+```powershell
+$relatedFilter = 'test(/list_order/) or test(/gamepad_grid/) or test(/folder_nav/) or test(/fullscreen_ctrl_nav/) or test(/fullscreen_sibling_nav/) or test(/holdover/) or test(/nav_lock/) or test(/navigation_sequence/) or test(/similar_navigation_tests/) or test(/vram_accounting/) or test(/context_async_owner_registry_audits_bundle_pending_fields/)'
+cargo nextest run -p mimageviewer --lib -E $relatedFilter
+```
+
+| コマンド / 条件 | exit code | 結果 / ログ |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/list_order_gamepad_/)'` (修正前) | 100 | 2件とも stale snapshot の検査で失敗。`gamepad-pre-fix.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/list_order_video_display_wait/)'` (fixture補正後・製品修正前) | 100 | 3件が意図した検査で失敗、通常Fullscreen継続1件成功。`gate-pre-fix-corrected.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 / 0 | 初回39.29秒、最終ソース31.35秒。`check.log` / `check-final.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script` | 0 | 1分6秒。`check-test-script.log` |
+| 上記関連 nextest (追加9件・取得/位置・既存Ctrl/兄弟・native・holdover・別窓・類似・VRAM・owner監査) | 0 / 0 | 補正前321/321、再capture補正後も321/321 (26.296秒)。`related.log` / `related-final.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 0 | 203/203 (33.44秒)。snapshot更新なし。`ui-snapshot.log` |
+| `cargo fmt --check` | 0 | 最終ソースで成功。`fmt-check-final.log` |
+| `python scripts/check_ui_glyphs.py` | 0 | 危険文字0件。`glyphs-final.log` |
+| `git diff --check` | 0 | 差分の空白検査成功。CRLF変換の案内のみ |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 0 | 通常featureのcore (3分32秒)・remote・EPUB workerを生成。VCRT/PE監査 runtime=4 / pe=3 成功。`build-dev.log` |
+
+初回の gate fixture compile 失敗は `gate-pre-fix.log` (exit 101)、次のfixture失敗は
+`gate-pre-fix-valid.log` (exit 100) に残す。修正前の製品不具合の証明は表の corrected の結果を使う。
+独立コードレビューと再captureの追補レビューは、ともに ACCEPT、追加の必須指摘なし。
+
+### 今回の変更ファイル (12)
+
+- 実装: `src/app.rs`、`src/ui_fullscreen.rs`、`src/app/gamepad_input.rs`。
+- 既存 holdover の型に合わせる投影 / producer: `src/app/vram_accounting.rs`、
+  `src/app/collection_navigation.rs`。通常由来の挙動は維持する。
+- 新規回帰: `src/app/gamepad_input.rs` 内に2件、`src/app/list_order_worker_tests.rs` に7件。
+  既存fixture / patternの型追従: `src/app/tests.rs`、`src/app/similar_navigation_tests.rs`、
+  `src/app/tests/startup_notices.rs`、および上記既存実装file内のテスト。
+- 文書: 本書、`docs/detached-rework-plan.md`、`docs/fullscreen-navigation-consistency.md`。
+  CHANGELOG・版番号・build/test script・keymap定義・生成default・UI snapshotは変更しない。
+
+### 後続の実アプリ確認 (未実施)
+
+確認用バイナリは `target/dev-runtime/mimageviewer-core.exe`。ビルドのみで起動していない。
+同じ作業ツリーのルートから、隔離確認には次を使う。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir', '.\target\dev-runtime\data'
+```
+
+通常起動は `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定・データ等を更新し得る。
+通常起動はsingle-instance mutexも共有するため、先にインストール版 / tray常駐版を終了する。
+`dev-runtime` は最適化profileであり、portable featureは使っていない。
+
+- 隔離 data-dir の通常フォルダ一覧をスマートフィルタ＋日付降順にし、ゲームパッドの決定で
+  通常フォルダ / 変換書庫を開く。親一覧の順を変えて開き直した場合も、Ctrl+Shift+↑↓ が
+  最後に開いた一覧の順を使うこと。
+- 一覧順移動で動画の本に着地する準備・表示待ち中に、Ctrl+↑↓ / 兄弟移動 / 一覧順移動へ
+  乗り換わらず、表示後は次の操作を受け付けること。通常 Ctrl+↑↓ 由来の移動は従来どおり。
+- 実 native presenter・ゲームパッド機器・変換器・GPUでの確認とlib全件は未実施。
+  ClaudeCode側の後続検証へ引き継ぐ。自動試験の動画は表示を行わないfixtureであり、
+  変換書庫の回帰も実変換器の起動を要しない。

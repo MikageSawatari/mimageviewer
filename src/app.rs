@@ -11873,7 +11873,7 @@ pub(crate) enum FsHoldover {
     /// Legacy owner for detached/slideshow folder transitions. Main-view manual
     /// browsing uses `NavigationSequence`, whose target must be presented before
     /// another target can be accepted.
-    FolderNavigation(Option<FsDisplayUnitHoldover>),
+    FolderNavigation(Option<FsDisplayUnitHoldover>, FsFolderNavigationOrigin),
     /// A display-only bridge while an in-window still viewer moves to the dedicated
     /// fullscreen viewport. It is not a folder-navigation owner and must never keep
     /// the viewer session alive across content teardown.
@@ -11882,10 +11882,29 @@ pub(crate) enum FsHoldover {
     FinalEffectSourceReload(FinalEffectSourceReloadHoldover),
 }
 
+/// Admission policy belongs to the navigation owner, even after its pixels are released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsFolderNavigationOrigin {
+    Ordinary,
+    ListOrder,
+}
+
 impl FsHoldover {
+    pub(crate) fn folder_navigation_origin(&self) -> FsFolderNavigationOrigin {
+        match self {
+            Self::FolderNavigation(_, origin) => *origin,
+            Self::NavigationSequence(sequence)
+                if matches!(sequence.purpose, FsNavigationPurpose::ListOrderNavigation) =>
+            {
+                FsFolderNavigationOrigin::ListOrder
+            }
+            _ => FsFolderNavigationOrigin::Ordinary,
+        }
+    }
+
     pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(unit) => unit.as_ref(),
+            Self::FolderNavigation(unit, _) => unit.as_ref(),
             Self::PresentationSwitch(_)
             | Self::NavigationSequence(_)
             | Self::FinalEffectSourceReload(_) => None,
@@ -11894,7 +11913,7 @@ impl FsHoldover {
 
     pub(crate) fn continues_viewer_during_content_teardown(&self) -> bool {
         match self {
-            Self::FolderNavigation(_) => true,
+            Self::FolderNavigation(_, _) => true,
             Self::NavigationSequence(sequence) => {
                 sequence.continues_viewer_during_content_teardown()
             }
@@ -11905,7 +11924,7 @@ impl FsHoldover {
     pub(crate) fn navigation_sequence(&self) -> Option<&FsNavigationSequence> {
         match self {
             Self::NavigationSequence(sequence) => Some(sequence),
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::FinalEffectSourceReload(_) => None,
         }
@@ -11914,7 +11933,7 @@ impl FsHoldover {
     pub(crate) fn navigation_sequence_mut(&mut self) -> Option<&mut FsNavigationSequence> {
         match self {
             Self::NavigationSequence(sequence) => Some(sequence),
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::FinalEffectSourceReload(_) => None,
         }
@@ -11933,7 +11952,7 @@ impl FsHoldover {
 
     pub(crate) fn final_effect_wait(&self) -> Option<(usize, std::time::Instant)> {
         match self {
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::NavigationSequence(_) => None,
             Self::FinalEffectSourceReload(holdover) => {
@@ -11947,7 +11966,7 @@ impl FsHoldover {
         texture_id: egui::TextureId,
     ) -> Option<&FsDisplayUnitHoldoverPage> {
         let unit = match self {
-            Self::FolderNavigation(unit) => unit.as_ref()?,
+            Self::FolderNavigation(unit, _) => unit.as_ref()?,
             Self::PresentationSwitch(unit) => unit,
             Self::NavigationSequence(sequence) => sequence.previous.as_ref()?,
             Self::FinalEffectSourceReload(holdover) => &holdover.previous,
@@ -11965,7 +11984,7 @@ impl FsHoldover {
         fs_idx: usize,
     ) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(previous) => previous.as_ref(),
+            Self::FolderNavigation(previous, _) => previous.as_ref(),
             Self::PresentationSwitch(unit) => Some(unit),
             Self::NavigationSequence(sequence) => {
                 let previous_is_still_visible = sequence.displays_previous_unit()
@@ -11991,7 +12010,7 @@ impl FsHoldover {
     #[cfg(test)]
     pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
         match self {
-            Self::FolderNavigation(unit) => unit
+            Self::FolderNavigation(unit, _) => unit
                 .as_ref()
                 .expect("folder navigation display unit must be captured for this test")
                 .pages
@@ -12125,6 +12144,8 @@ pub(crate) struct FsNavigationSequence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavigationPurpose {
     Ordinary,
+    /// No traversal continuation may replace this accepted list-order target before display.
+    ListOrderNavigation,
     /// A Smart Ctrl traversal owns the holdover before DFS resolves and while its offscreen
     /// child is preparing. The visible source PDF/ZIP receiver must not finish this sequence.
     SmartFolderNavigation {
@@ -12136,14 +12157,14 @@ pub(crate) enum FsNavigationPurpose {
 impl FsNavigationPurpose {
     pub(crate) fn diagnostic_trace(&self) -> Option<&SimilarMoveTrace> {
         match self {
-            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
+            Self::Ordinary | Self::ListOrderNavigation | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.as_ref(),
         }
     }
 
     pub(crate) fn take_diagnostic_trace(&mut self) -> Option<SimilarMoveTrace> {
         match self {
-            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
+            Self::Ordinary | Self::ListOrderNavigation | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.take(),
         }
     }
@@ -57702,10 +57723,12 @@ impl App {
             return;
         }
         // List order neither joins a burst nor supersedes an in-flight traversal.
-        if self.folder_nav_pending.as_ref().is_some_and(|pending| {
-            matches!(pending.mode, FolderNavMode::ListOrder { .. })
-                || matches!(mode, FolderNavMode::ListOrder { .. })
-        }) {
+        if self.fs_list_order_navigation_blocks_new_target()
+            || self.folder_nav_pending.as_ref().is_some_and(|pending| {
+                matches!(pending.mode, FolderNavMode::ListOrder { .. })
+                    || matches!(mode, FolderNavMode::ListOrder { .. })
+            })
+        {
             return;
         }
         if self.main_folder_history_available() {
@@ -57745,6 +57768,16 @@ impl App {
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = mode.clone();
+        // Stamp only after admission. The handler's fresh FolderItems sequence starts as
+        // Ordinary, so the initial request is admitted while every later request is rejected.
+        if matches!(mode, FolderNavMode::ListOrder { .. })
+            && let Some(sequence) = self
+                .fs_holdover_tex
+                .as_mut()
+                .and_then(FsHoldover::navigation_sequence_mut)
+        {
+            sequence.purpose = FsNavigationPurpose::ListOrderNavigation;
+        }
         self.spawn_folder_nav(current, forward, mode);
     }
 

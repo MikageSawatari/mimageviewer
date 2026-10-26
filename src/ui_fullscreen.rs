@@ -13312,6 +13312,15 @@ impl App {
             .is_some_and(FsNavigationSequence::blocks_new_target)
     }
 
+    pub(crate) fn fs_list_order_navigation_blocks_new_target(&self) -> bool {
+        self.fs_holdover_tex.as_ref().is_some_and(|owner| {
+            owner.folder_navigation_origin() == crate::app::FsFolderNavigationOrigin::ListOrder
+                // Failed renditions retain their pixels; password waits suspend this lock.
+                // Both keep the existing sequence's phase policy rather than its worker alive.
+                && owner.navigation_sequence().is_none_or(FsNavigationSequence::blocks_new_target)
+        })
+    }
+
     /// Record that a navigation request was dropped, and why.
     ///
     /// Dropping repeats while a target is unresolved is the intended behaviour, so this must not
@@ -13605,13 +13614,18 @@ impl App {
                 .get(page.idx)
                 .is_some_and(GridItem::has_page_data)
         }) {
+            let origin = self
+                .fs_holdover_tex
+                .as_ref()
+                .unwrap()
+                .folder_navigation_origin();
             let previous = self
                 .fs_holdover_tex
                 .as_ref()
                 .and_then(FsHoldover::navigation_sequence)
                 .and_then(|sequence| sequence.previous.clone());
             self.finish_similar_move_diagnostic("display_target_not_page_data");
-            self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous));
+            self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous, origin));
             return false;
         }
         if let Some(sequence) = self
@@ -14021,7 +14035,7 @@ impl App {
                     accepted_generation
                 } if self.items_generation > accepted_generation
             ),
-            Some(FsHoldover::FolderNavigation(_)) => self
+            Some(FsHoldover::FolderNavigation(_, _)) => self
                 .fs_nav_locked_gen
                 .is_some_and(|locked_generation| self.items_generation > locked_generation),
             Some(FsHoldover::PresentationSwitch(_) | FsHoldover::FinalEffectSourceReload(_))
@@ -14125,7 +14139,8 @@ impl App {
                     }
                     return None;
                 }
-                if let Some(FsHoldover::FolderNavigation(previous)) = self.fs_holdover_tex.as_mut()
+                if let Some(FsHoldover::FolderNavigation(previous, _)) =
+                    self.fs_holdover_tex.as_mut()
                 {
                     // The legacy navigation owner outlives its drawable resource.  Keep the
                     // owner until poll/release reaches the terminal transition so an internal
@@ -14196,7 +14211,7 @@ impl App {
     ) {
         let had_navigation_owner = matches!(
             self.fs_holdover_tex.as_ref(),
-            Some(FsHoldover::FolderNavigation(_) | FsHoldover::NavigationSequence(_))
+            Some(FsHoldover::FolderNavigation(_, _) | FsHoldover::NavigationSequence(_))
         );
         let diagnostic_reason = match finish {
             crate::app::FsNavigationSequenceFinish::Superseded => "navigation_superseded",
@@ -14301,9 +14316,16 @@ impl App {
     /// なるのを防ぐ。`items_generation` のスナップショットは `poll_fs_nav_lock` の
     /// 「items が入れ替わる前にロックを解除しない」判定に使う。
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
+        // Recapturing an active transition keeps its admission policy. A retained failed or
+        // suspended sequence must not revive that policy for a newly accepted legacy request.
+        let origin = if self.fs_list_order_navigation_blocks_new_target() {
+            crate::app::FsFolderNavigationOrigin::ListOrder
+        } else {
+            crate::app::FsFolderNavigationOrigin::Ordinary
+        };
         let previous = self.capture_fs_display_unit(fs_idx);
         self.finish_superseded_fs_navigation_diagnostic();
-        self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous));
+        self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous, origin));
         self.fs_nav_locked_gen = Some(self.items_generation);
     }
 
@@ -14328,7 +14350,7 @@ impl App {
             .fs_holdover_tex
             .as_ref()
             .and_then(|holdover| match holdover {
-                FsHoldover::FolderNavigation(previous) => previous.clone(),
+                FsHoldover::FolderNavigation(previous, _) => previous.clone(),
                 FsHoldover::PresentationSwitch(unit) => Some(unit.clone()),
                 FsHoldover::NavigationSequence(sequence) => sequence.previous.clone(),
                 FsHoldover::FinalEffectSourceReload(_) => None,
@@ -14341,7 +14363,7 @@ impl App {
             && self.fullscreen_idx.is_none()
             && !matches!(
                 self.fs_holdover_tex.as_ref(),
-                Some(FsHoldover::FolderNavigation(_) | FsHoldover::NavigationSequence(_))
+                Some(FsHoldover::FolderNavigation(_, _) | FsHoldover::NavigationSequence(_))
             )
         {
             if let Some(trace) = purpose.take_diagnostic_trace() {
@@ -30931,7 +30953,9 @@ impl App {
                 self.finish_similar_move_diagnostic("presented");
                 self.similar_panel.complete_similar_book_visit(intent);
             }
-            FsNavigationPurpose::Ordinary | FsNavigationPurpose::SmartFolderNavigation { .. } => {
+            FsNavigationPurpose::Ordinary
+            | FsNavigationPurpose::ListOrderNavigation
+            | FsNavigationPurpose::SmartFolderNavigation { .. } => {
                 if let Some(location) = presented_location() {
                     self.similar_panel.observe_ordinary_book_page(location);
                 }
@@ -42037,6 +42061,9 @@ impl App {
         &self,
         sibling: bool,
     ) -> Option<(PathBuf, crate::app::FolderNavMode)> {
+        if self.fs_list_order_navigation_blocks_new_target() {
+            return None;
+        }
         if let Some(mode) = self.inflight_fullscreen_folder_nav_mode(sibling) {
             let current = match &mode {
                 crate::app::FolderNavMode::Favsearch { .. } => {
@@ -42212,6 +42239,9 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
+        if self.fs_list_order_navigation_blocks_new_target() {
+            return;
+        }
         // A follow-up for the same staged Smart DFS belongs to its typed request. The generic
         // folder-items sequence blocks unrelated targets until adoption, so admit this input
         // before consulting that block; sibling/page navigation remains blocked as before.
@@ -42415,7 +42445,9 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
-        if self.fs_navigation_sequence_blocks_new_target() {
+        if self.fs_list_order_navigation_blocks_new_target()
+            || self.fs_navigation_sequence_blocks_new_target()
+        {
             return;
         }
         if self.fs_nav_is_locked() {
@@ -63760,7 +63792,7 @@ mod tests {
     }
 
     fn captured_folder_navigation_unit(app: &App) -> FsDisplayUnitHoldover {
-        let FsHoldover::FolderNavigation(Some(unit)) = app
+        let FsHoldover::FolderNavigation(Some(unit), _) = app
             .fs_holdover_tex
             .as_ref()
             .expect("folder navigation holdover captured")
@@ -65886,9 +65918,12 @@ mod tests {
             "the password surface replaces the previous page"
         );
         assert!(
-            FsHoldover::FolderNavigation(Some(unit.clone()))
-                .last_painted_display_unit_for_snapshot(7)
-                .is_some()
+            FsHoldover::FolderNavigation(
+                Some(unit.clone()),
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            )
+            .last_painted_display_unit_for_snapshot(7)
+            .is_some()
         );
         assert!(
             FsHoldover::PresentationSwitch(unit.clone())
@@ -67774,7 +67809,10 @@ mod tests {
         app.items_generation = 31;
         app.fullscreen_idx = None;
         app.fs_nav_locked_gen = Some(30);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(
+            None,
+            crate::app::FsFolderNavigationOrigin::Ordinary,
+        ));
         app.activate_sidecar_restore_modal_for_test(folder);
         assert!(app.defer_sidecar_restore_fullscreen(
             0,
@@ -67788,7 +67826,10 @@ mod tests {
         assert_eq!(app.fs_nav_locked_gen, Some(30));
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
         app.items_generation = 32;
@@ -74119,23 +74160,26 @@ mod tests {
             started_at + COLORIZE_WAIT_INDICATOR_DELAY,
         ));
 
-        let folder_navigation = FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
-            singleton_placement: SingletonSpreadPlacement::Center,
-            layout_projection: FsDisplayUnitLayoutProjection::Canonical,
-            pages: vec![FsDisplayUnitHoldoverPage {
-                fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
-                fit_scale_limits: FullscreenFitScaleLimits::default(),
-                occurrence: SpreadPageOccurrence::navigation(0, 0),
-                layout_size: texture.size_vec2(),
-                post_filter: crate::adjustment::PostFilter::None,
-                trace_key: None,
-                trace_load_seq: 0,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
-                rotation: crate::rotation_db::Rotation::None,
-                source_size: None,
-                content_bbox: None,
-            }],
-        }));
+        let folder_navigation = FsHoldover::FolderNavigation(
+            Some(FsDisplayUnitHoldover {
+                singleton_placement: SingletonSpreadPlacement::Center,
+                layout_projection: FsDisplayUnitLayoutProjection::Canonical,
+                pages: vec![FsDisplayUnitHoldoverPage {
+                    fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    occurrence: SpreadPageOccurrence::navigation(0, 0),
+                    layout_size: texture.size_vec2(),
+                    post_filter: crate::adjustment::PostFilter::None,
+                    trace_key: None,
+                    trace_load_seq: 0,
+                    texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                    rotation: crate::rotation_db::Rotation::None,
+                    source_size: None,
+                    content_bbox: None,
+                }],
+            }),
+            crate::app::FsFolderNavigationOrigin::Ordinary,
+        );
         assert!(!colorize_wait_indicator_visible(
             Some(&folder_navigation),
             started_at + COLORIZE_WAIT_INDICATOR_DELAY * 10,
