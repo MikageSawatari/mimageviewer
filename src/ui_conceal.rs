@@ -629,6 +629,7 @@ impl App {
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,

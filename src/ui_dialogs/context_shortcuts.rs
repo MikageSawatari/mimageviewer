@@ -539,6 +539,8 @@ fn video_help_includes_row(row: &CommandDisplayRow) -> bool {
         | KeyAction::FsJumpLast
         | KeyAction::FsCtrlNavPrev
         | KeyAction::FsCtrlNavNext
+        | KeyAction::FsListOrderPrev
+        | KeyAction::FsListOrderNext
         | KeyAction::FsSiblingPrev
         | KeyAction::FsSiblingNext => true,
         action if action.is_location_navigation_action() => !row.shortcut_labels.is_empty(),
@@ -657,6 +659,22 @@ fn draw_supplemental_action_rows(
 mod tests {
     use super::{ShortcutHelpContext, supplemental_action_shortcut_label};
     use crate::keymap::{Chord, KeyAction, Keymap, KeymapSettings, ModKind};
+
+    #[test]
+    fn video_help_includes_list_order_navigation_with_current_assignments() {
+        let keymap =
+            Keymap::from_ini_str("[FsCommon]\nFsListOrderPrev = F16\nFsListOrderNext = F17\n");
+        let rows = keymap
+            .command_display_rows_for_active_scopes(crate::keymap::FS_VIDEO_ACTIVE_SCOPES, false);
+        for (action, label) in [
+            (KeyAction::FsListOrderPrev, "F16"),
+            (KeyAction::FsListOrderNext, "F17"),
+        ] {
+            let row = rows.iter().find(|row| row.spec.action == action).unwrap();
+            assert!(super::video_help_includes_row(row));
+            assert_eq!(row.shortcut_labels, vec![label.to_owned()]);
+        }
+    }
 
     #[test]
     fn original_preview_help_label_follows_assignment_and_disabled_state() {

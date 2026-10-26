@@ -1,5 +1,13 @@
 # アーキテクチャ概観
 
+## 通常フォルダ一覧の表示順ナビゲーション (§1.444)
+
+`app/list_order_navigation` は、main の通常フォルダ一覧から本を開く受付時の本の行だけを
+`ListOrderSnapshot` として凍結する。`ViewerContextBundle` が列と取得元 context id を持ち、
+現在位置は表示中の論理 source から導く。fork の子には渡さず、promote 後の旧 main は id の照合で使えない。
+`FolderNavMode::ListOrder` の行き先選択だけを worker に足し、停止判定・事前走査・採用・本の再表示は
+既存の Fullscreen フォルダナビゲーションと共有する。[仕様と検証](list-order-book-navigation-plan.md)。
+
 ## 本のitems生成境界（§1.242 G1）
 
 `app/book_materialization`に既存ZIP階層、PDF/EPUB page row、folder listingの生成を集約する。

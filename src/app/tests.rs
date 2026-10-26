@@ -7934,25 +7934,31 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
-    FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
-        singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
-        layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
-        pages: vec![FsDisplayUnitHoldoverPage {
-            fit_scale_limits: crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
-            fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
-                crate::settings::FullscreenFitMode::Page,
-            ),
-            occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(page_idx, page_idx),
-            layout_size: texture.size_vec2(),
-            post_filter: crate::adjustment::PostFilter::None,
-            trace_key: None,
-            trace_load_seq: 0,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
-            rotation: crate::rotation_db::Rotation::None,
-            source_size: None,
-            content_bbox: None,
-        }],
-    }))
+    FsHoldover::FolderNavigation(
+        Some(FsDisplayUnitHoldover {
+            singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+            layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
+            pages: vec![FsDisplayUnitHoldoverPage {
+                fit_scale_limits:
+                    crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
+                occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
+                    page_idx, page_idx,
+                ),
+                layout_size: texture.size_vec2(),
+                post_filter: crate::adjustment::PostFilter::None,
+                trace_key: None,
+                trace_load_seq: 0,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                rotation: crate::rotation_db::Rotation::None,
+                source_size: None,
+                content_bbox: None,
+            }],
+        }),
+        crate::app::FsFolderNavigationOrigin::Ordinary,
+    )
 }
 
 #[test]
@@ -48263,7 +48269,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.capture_fs_nav_holdover(idx);
 
-        let FsHoldover::FolderNavigation(Some(unit)) =
+        let FsHoldover::FolderNavigation(Some(unit), _) =
             app.fs_holdover_tex.as_ref().expect("holdover captured")
         else {
             panic!("folder navigation must own a captured display unit");
@@ -48395,7 +48401,7 @@ mod favorite_adjustment_defaults_tests {
         ] {
             app.spread_mode = mode;
             app.capture_fs_nav_holdover(first);
-            let FsHoldover::FolderNavigation(Some(unit)) = app
+            let FsHoldover::FolderNavigation(Some(unit), _) = app
                 .fs_holdover_tex
                 .as_ref()
                 .expect("spread holdover captured")
@@ -49765,7 +49771,10 @@ mod favorite_adjustment_defaults_tests {
         app.capture_fs_nav_holdover(0);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();
@@ -49776,7 +49785,10 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
         app.open_fullscreen(0, HistoryTrigger::UserChosen);
         assert_eq!(app.fullscreen_idx, Some(0));
@@ -50659,7 +50671,10 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
         assert!(
             app.fs_nav_is_locked(),
@@ -50680,7 +50695,10 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
         app.thumbnails = vec![ThumbnailState::loaded_raster(
@@ -88987,7 +89005,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.capture_fs_nav_holdover(idx);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(_))
+            Some(FsHoldover::FolderNavigation(_, _))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();
@@ -89041,7 +89059,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.capture_fs_nav_holdover(idx);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(_))
+            Some(FsHoldover::FolderNavigation(_, _))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();

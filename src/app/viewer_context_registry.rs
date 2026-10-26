@@ -1520,6 +1520,7 @@ pub(in crate::app) struct ViewerContextBundle {
     navigation_scope: ViewerNavigationScope,
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
+    pub(in crate::app) list_order: Option<Arc<super::ListOrderSnapshot>>,
     stack_mode_requested: bool,
     stack_view: Option<std::sync::Arc<crate::filename_stack::StackView>>,
     stack_showing_flat: bool,
@@ -2796,6 +2797,7 @@ impl ViewerContextBundle {
             navigation_scope: ViewerNavigationScope::Main,
             archive_source_override: None,
             zip_nav: None,
+            list_order: None,
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
@@ -3223,6 +3225,7 @@ impl App {
             navigation_scope,
             archive_source_override,
             zip_nav,
+            list_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -3544,6 +3547,7 @@ impl App {
         swap_field!(navigation_scope);
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
+        swap_field!(list_order);
         swap_field!(stack_mode_requested);
         swap_field!(stack_view);
         swap_field!(stack_showing_flat);
@@ -3933,6 +3937,7 @@ impl App {
             navigation_scope,
             archive_source_override,
             zip_nav,
+            list_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -4398,6 +4403,7 @@ impl App {
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
+            list_order,
             current_folder_watch,
             current_folder_watch_failed,
             external_rescan_pending,
@@ -5960,6 +5966,162 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn list_order_snapshot_for_test(
+        owner: ViewerContextId,
+        folder: &Path,
+    ) -> Arc<super::super::ListOrderSnapshot> {
+        Arc::new(super::super::ListOrderSnapshot {
+            owner,
+            entries: Arc::from([super::super::ListOrderEntry {
+                path: folder.to_path_buf(),
+                kind: super::super::ListOrderEntryKind::Folder,
+            }]),
+        })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_registry_bundle_swap_preserves_each_context_snapshot() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let folder = app.tmp.path().join("list-order-main");
+        let main_snapshot = list_order_snapshot_for_test(main, &folder);
+        app.current_folder = Some(folder.clone());
+        app.list_order = Some(Arc::clone(&main_snapshot));
+        assert_eq!(app.list_order_position().unwrap().1, 0);
+
+        let mut bundle = ViewerContextBundle::empty();
+        assert!(bundle.list_order.is_none());
+        let other_folder = app.tmp.path().join("list-order-other");
+        let other_snapshot =
+            list_order_snapshot_for_test(ViewerContextId::for_test(999), &other_folder);
+        bundle.current_folder = Some(other_folder.clone());
+        bundle.list_order = Some(Arc::clone(&other_snapshot));
+
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert!(Arc::ptr_eq(
+            app.list_order.as_ref().unwrap(),
+            &other_snapshot
+        ));
+        assert_eq!(app.current_folder.as_ref(), Some(&other_folder));
+        assert!(Arc::ptr_eq(
+            bundle.list_order.as_ref().unwrap(),
+            &main_snapshot
+        ));
+        assert_eq!(bundle.current_folder.as_ref(), Some(&folder));
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert!(Arc::ptr_eq(
+            app.list_order.as_ref().unwrap(),
+            &main_snapshot
+        ));
+        assert!(Arc::ptr_eq(
+            bundle.list_order.as_ref().unwrap(),
+            &other_snapshot
+        ));
+        assert_eq!(app.list_order_position().unwrap().1, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_registry_forks_start_empty_and_preserve_main_snapshot() {
+        for live in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let main = app.viewer_context_main();
+            let folder = app.tmp.path().join("list-order-fork");
+            let snapshot = list_order_snapshot_for_test(main, &folder);
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(folder.join("page.png"))];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.fullscreen_idx = Some(0);
+            app.list_order = Some(Arc::clone(&snapshot));
+            let child = if live {
+                app.bind_window(main, 91444).unwrap();
+                app.fork_mounted_live_media_context(91444)
+            } else {
+                app.fork_materialized_still_context(&folder, 0)
+            };
+            assert_ne!(child, main);
+            assert_eq!(app.viewer_context_main(), main);
+            assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+            assert_eq!(app.list_order_position().unwrap().1, 0);
+            app.with_viewer_context(child, |owner| {
+                assert!(owner.list_order.is_none());
+                assert!(owner.list_order_position().is_none());
+            })
+            .unwrap();
+            assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+            assert_eq!(app.list_order_position().unwrap().1, 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_registry_mounts_keep_sibling_snapshot_and_promote_invalidates_old_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let old_main = app.viewer_context_main();
+        let folder = app.tmp.path().join("list-order-promote");
+        let main_snapshot = list_order_snapshot_for_test(old_main, &folder);
+        app.current_folder = Some(folder);
+        app.list_order = Some(Arc::clone(&main_snapshot));
+        let sibling_folder = app.tmp.path().join("list-order-sibling");
+        let mut sibling_snapshot = None;
+        let sibling = app.build_window_context_for_test(91445, |owner| {
+            assert!(owner.list_order.is_none());
+            let snapshot =
+                list_order_snapshot_for_test(owner.projected_viewer_context_id(), &sibling_folder);
+            owner.current_folder = Some(sibling_folder.clone());
+            owner.list_order = Some(Arc::clone(&snapshot));
+            sibling_snapshot = Some(snapshot);
+        });
+        let sibling_snapshot = sibling_snapshot.unwrap();
+        for _ in 0..2 {
+            app.with_viewer_context(sibling, |owner| {
+                assert!(Arc::ptr_eq(
+                    owner.list_order.as_ref().unwrap(),
+                    &sibling_snapshot
+                ));
+                assert_eq!(owner.current_folder.as_ref(), Some(&sibling_folder));
+                assert!(owner.list_order_position().is_none());
+            })
+            .unwrap();
+            assert!(Arc::ptr_eq(
+                app.list_order.as_ref().unwrap(),
+                &main_snapshot
+            ));
+            assert_eq!(app.list_order_position().unwrap().1, 0);
+        }
+
+        assert_eq!(
+            app.stash_mounted_and_start_fresh("list_order_promote"),
+            old_main
+        );
+        let new_main = app.viewer_context_main();
+        assert_ne!(old_main, new_main);
+        assert!(app.list_order.is_none());
+        app.with_viewer_context(old_main, |owner| {
+            assert_eq!(owner.list_order.as_ref().unwrap().owner, old_main);
+            assert!(Arc::ptr_eq(
+                owner.list_order.as_ref().unwrap(),
+                &main_snapshot
+            ));
+            assert!(owner.list_order_position().is_none());
+        })
+        .unwrap();
+        app.with_viewer_context(sibling, |owner| {
+            assert!(Arc::ptr_eq(
+                owner.list_order.as_ref().unwrap(),
+                &sibling_snapshot
+            ));
+            assert_eq!(owner.current_folder.as_ref(), Some(&sibling_folder));
+        })
+        .unwrap();
+        assert_eq!(app.viewer_context_main(), new_main);
+        assert!(app.list_order.is_none());
+    }
 
     #[cfg(windows)]
     fn seed_c1_subscription_scan(

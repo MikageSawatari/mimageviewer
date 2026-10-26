@@ -1353,11 +1353,12 @@ impl App {
     }
 
     pub(crate) fn grid_physical_navigation(
-        &self,
+        &mut self,
         index: usize,
         path: std::path::PathBuf,
         auto_fullscreen: bool,
     ) -> crate::ui_main::AddressBarNav {
+        self.capture_main_folder_list_order(index);
         let virtual_container = self.items.get(index).is_some_and(|item| match item {
             GridItem::ZipFile(item_path) | GridItem::PdfFile(item_path) => {
                 crate::folder_tree::path_eq(item_path, &path)

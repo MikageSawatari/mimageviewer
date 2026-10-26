@@ -657,10 +657,20 @@ use book_structural_op::BookStructuralOp;
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
+mod list_order_navigation;
+#[cfg(test)]
+mod list_order_tests;
+#[cfg(test)]
+mod list_order_virtual_tests;
+#[cfg(test)]
+mod list_order_worker_tests;
 mod rating_membership_ops;
 #[cfg(test)]
 pub(crate) mod rating_membership_tests;
 mod viewer_context_registry;
+pub(crate) use list_order_navigation::ListOrderSnapshot;
+#[cfg(test)]
+pub(crate) use list_order_navigation::{ListOrderEntry, ListOrderEntryKind};
 #[cfg(windows)]
 pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
@@ -4498,6 +4508,11 @@ pub(crate) enum FolderNavMode {
     Fullscreen,
     /// フルスクリーン表示中。現在地と同じ親の前後兄弟だけを対象にする。
     SiblingFullscreen,
+    /// 最後に通常フォルダ一覧から開いたときの凍結した表示順。位置は入力時に導く。
+    ListOrder {
+        snapshot: Arc<ListOrderSnapshot>,
+        from_index: usize,
+    },
     /// お気に入り検索コンテキスト。DFS 結果が root 配下なら `nav_stack` に積んで
     /// `load_folder`、root 外なら `favsearch_navigate_sibling` にフォールバックする。
     /// `fullscreen=true` のときは移動後に先頭の画像系アイテムを再度フルスクリーンで開く。
@@ -7949,6 +7964,7 @@ impl FolderNavMode {
             FolderNavMode::Grid => "grid",
             FolderNavMode::SiblingGrid => "grid_sibling",
             FolderNavMode::Fullscreen => "fullscreen",
+            FolderNavMode::ListOrder { .. } => "list_order",
             FolderNavMode::SiblingFullscreen => "fullscreen_sibling",
             FolderNavMode::Favsearch { .. } => "favsearch",
             FolderNavMode::SmartFolder { .. } => "smart_folder",
@@ -11857,7 +11873,7 @@ pub(crate) enum FsHoldover {
     /// Legacy owner for detached/slideshow folder transitions. Main-view manual
     /// browsing uses `NavigationSequence`, whose target must be presented before
     /// another target can be accepted.
-    FolderNavigation(Option<FsDisplayUnitHoldover>),
+    FolderNavigation(Option<FsDisplayUnitHoldover>, FsFolderNavigationOrigin),
     /// A display-only bridge while an in-window still viewer moves to the dedicated
     /// fullscreen viewport. It is not a folder-navigation owner and must never keep
     /// the viewer session alive across content teardown.
@@ -11866,10 +11882,29 @@ pub(crate) enum FsHoldover {
     FinalEffectSourceReload(FinalEffectSourceReloadHoldover),
 }
 
+/// Admission policy belongs to the navigation owner, even after its pixels are released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsFolderNavigationOrigin {
+    Ordinary,
+    ListOrder,
+}
+
 impl FsHoldover {
+    pub(crate) fn folder_navigation_origin(&self) -> FsFolderNavigationOrigin {
+        match self {
+            Self::FolderNavigation(_, origin) => *origin,
+            Self::NavigationSequence(sequence)
+                if matches!(sequence.purpose, FsNavigationPurpose::ListOrderNavigation) =>
+            {
+                FsFolderNavigationOrigin::ListOrder
+            }
+            _ => FsFolderNavigationOrigin::Ordinary,
+        }
+    }
+
     pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(unit) => unit.as_ref(),
+            Self::FolderNavigation(unit, _) => unit.as_ref(),
             Self::PresentationSwitch(_)
             | Self::NavigationSequence(_)
             | Self::FinalEffectSourceReload(_) => None,
@@ -11878,7 +11913,7 @@ impl FsHoldover {
 
     pub(crate) fn continues_viewer_during_content_teardown(&self) -> bool {
         match self {
-            Self::FolderNavigation(_) => true,
+            Self::FolderNavigation(_, _) => true,
             Self::NavigationSequence(sequence) => {
                 sequence.continues_viewer_during_content_teardown()
             }
@@ -11889,7 +11924,7 @@ impl FsHoldover {
     pub(crate) fn navigation_sequence(&self) -> Option<&FsNavigationSequence> {
         match self {
             Self::NavigationSequence(sequence) => Some(sequence),
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::FinalEffectSourceReload(_) => None,
         }
@@ -11898,7 +11933,7 @@ impl FsHoldover {
     pub(crate) fn navigation_sequence_mut(&mut self) -> Option<&mut FsNavigationSequence> {
         match self {
             Self::NavigationSequence(sequence) => Some(sequence),
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::FinalEffectSourceReload(_) => None,
         }
@@ -11917,7 +11952,7 @@ impl FsHoldover {
 
     pub(crate) fn final_effect_wait(&self) -> Option<(usize, std::time::Instant)> {
         match self {
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::NavigationSequence(_) => None,
             Self::FinalEffectSourceReload(holdover) => {
@@ -11931,7 +11966,7 @@ impl FsHoldover {
         texture_id: egui::TextureId,
     ) -> Option<&FsDisplayUnitHoldoverPage> {
         let unit = match self {
-            Self::FolderNavigation(unit) => unit.as_ref()?,
+            Self::FolderNavigation(unit, _) => unit.as_ref()?,
             Self::PresentationSwitch(unit) => unit,
             Self::NavigationSequence(sequence) => sequence.previous.as_ref()?,
             Self::FinalEffectSourceReload(holdover) => &holdover.previous,
@@ -11949,7 +11984,7 @@ impl FsHoldover {
         fs_idx: usize,
     ) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(previous) => previous.as_ref(),
+            Self::FolderNavigation(previous, _) => previous.as_ref(),
             Self::PresentationSwitch(unit) => Some(unit),
             Self::NavigationSequence(sequence) => {
                 let previous_is_still_visible = sequence.displays_previous_unit()
@@ -11975,7 +12010,7 @@ impl FsHoldover {
     #[cfg(test)]
     pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
         match self {
-            Self::FolderNavigation(unit) => unit
+            Self::FolderNavigation(unit, _) => unit
                 .as_ref()
                 .expect("folder navigation display unit must be captured for this test")
                 .pages
@@ -12109,6 +12144,8 @@ pub(crate) struct FsNavigationSequence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavigationPurpose {
     Ordinary,
+    /// No traversal continuation may replace this accepted list-order target before display.
+    ListOrderNavigation,
     /// A Smart Ctrl traversal owns the holdover before DFS resolves and while its offscreen
     /// child is preparing. The visible source PDF/ZIP receiver must not finish this sequence.
     SmartFolderNavigation {
@@ -12120,14 +12157,14 @@ pub(crate) enum FsNavigationPurpose {
 impl FsNavigationPurpose {
     pub(crate) fn diagnostic_trace(&self) -> Option<&SimilarMoveTrace> {
         match self {
-            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
+            Self::Ordinary | Self::ListOrderNavigation | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.as_ref(),
         }
     }
 
     pub(crate) fn take_diagnostic_trace(&mut self) -> Option<SimilarMoveTrace> {
         match self {
-            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
+            Self::Ordinary | Self::ListOrderNavigation | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.take(),
         }
     }
@@ -16065,6 +16102,8 @@ pub struct App {
     /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
     folder_nav_pending: Option<FolderNavPending>,
+    /// Context-owned frozen book rows; no stored current position.
+    pub(crate) list_order: Option<Arc<ListOrderSnapshot>>,
     /// 実フォルダ open の worker scan 待ち ([`FolderPaneOpenPending`])。
     /// folder pane と detached image open のどちらも bundle ownership で保持する。
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
@@ -20450,6 +20489,7 @@ impl App {
             keep_start_shared: Arc::new(AtomicUsize::new(0)),
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             folder_nav_pending: None,
+            list_order: None,
             folder_pane_open_pending: None,
             pending_folder_nav_steps: 0,
             pending_folder_nav_mode: FolderNavMode::Grid,
@@ -57437,6 +57477,7 @@ impl App {
                                 return None;
                             }
                             let owner = self.main_grid_archive_open_owner(idx, &pf);
+                            self.capture_main_folder_list_order(idx);
                             let _open_outcome = self
                                 .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                                     pf,
@@ -57681,6 +57722,15 @@ impl App {
         if self.viewer_mutation_modal_active() {
             return;
         }
+        // List order neither joins a burst nor supersedes an in-flight traversal.
+        if self.fs_list_order_navigation_blocks_new_target()
+            || self.folder_nav_pending.as_ref().is_some_and(|pending| {
+                matches!(pending.mode, FolderNavMode::ListOrder { .. })
+                    || matches!(mode, FolderNavMode::ListOrder { .. })
+            })
+        {
+            return;
+        }
         if self.main_folder_history_available() {
             // Accept traversal now; its worker must not race an older initial open.
             self.cancel_unresolved_open_for_navigation(true);
@@ -57718,6 +57768,16 @@ impl App {
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = mode.clone();
+        // Stamp only after admission. The handler's fresh FolderItems sequence starts as
+        // Ordinary, so the initial request is admitted while every later request is rejected.
+        if matches!(mode, FolderNavMode::ListOrder { .. })
+            && let Some(sequence) = self
+                .fs_holdover_tex
+                .as_mut()
+                .and_then(FsHoldover::navigation_sequence_mut)
+        {
+            sequence.purpose = FsNavigationPurpose::ListOrderNavigation;
+        }
         self.spawn_folder_nav(current, forward, mode);
     }
 
@@ -57785,6 +57845,13 @@ impl App {
             FolderNavMode::SmartFolder { state, .. } => Some(state.clone()),
             _ => None,
         };
+        let list_order = match &mode {
+            FolderNavMode::ListOrder {
+                snapshot,
+                from_index,
+            } => Some((Arc::clone(snapshot), *from_index)),
+            _ => None,
+        };
         let smart_fullscreen = matches!(
             &mode,
             FolderNavMode::SmartFolder {
@@ -57820,7 +57887,17 @@ impl App {
                     ],
                 );
             }
-            let outcome = if let Some(state) = smart_state.as_ref() {
+            let outcome = if let Some((snapshot, from_index)) = list_order.as_ref() {
+                list_order_navigation::navigate_list_order(
+                    snapshot,
+                    *from_index,
+                    forward,
+                    tree_opts.clone(),
+                    &cancel_w,
+                    cache,
+                    memo,
+                )
+            } else if let Some(state) = smart_state.as_ref() {
                 navigate_smart_folder_scope(
                     state,
                     &current,
@@ -59308,6 +59385,7 @@ impl App {
                     return None;
                 }
                 let owner = self.main_grid_archive_open_owner(idx, &path);
+                self.capture_main_folder_list_order(idx);
                 let _open_outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
                     auto_fs,
@@ -59579,6 +59657,20 @@ impl App {
         let Some(target) = result.target else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
+                FolderNavMode::ListOrder { .. } => {
+                    let hint = crate::ui_fullscreen::FsBoundaryHint::Edge {
+                        scope: crate::ui_fullscreen::FsBoundaryEdgeScope::ListOrder,
+                        at_end: result.forward,
+                        at: std::time::Instant::now(),
+                    };
+                    self.fs_boundary_hint = Some(hint);
+                    #[cfg(windows)]
+                    if self.native_video_fullscreen_active_for_main_backdrop() {
+                        self.show_native_video_boundary_hint_overlay(hint);
+                    }
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
                 FolderNavMode::SiblingGrid => {
                     self.show_feedback_warning(if result.forward {
                         "次の兄弟フォルダはありません".to_string()
@@ -59737,9 +59829,11 @@ impl App {
         // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像・動画の無い
         // フォルダへ飛ばしてフルスクリーンが解除されるのを避けるため、現状維持で
         // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
-        if (matches!(result.mode, FolderNavMode::Fullscreen)
-            || (self.navigation_scope.is_detached_physical()
-                && matches!(result.mode, FolderNavMode::SiblingFullscreen))
+        if (matches!(
+            result.mode,
+            FolderNavMode::Fullscreen | FolderNavMode::ListOrder { .. }
+        ) || (self.navigation_scope.is_detached_physical()
+            && matches!(result.mode, FolderNavMode::SiblingFullscreen))
             || matches!(
                 result.mode,
                 FolderNavMode::SmartFolder {
@@ -59791,6 +59885,7 @@ impl App {
                 FolderNavMode::Grid
                     | FolderNavMode::SiblingGrid
                     | FolderNavMode::Fullscreen
+                    | FolderNavMode::ListOrder { .. }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::SlideshowNext
             )
@@ -59801,6 +59896,7 @@ impl App {
             let fullscreen = matches!(
                 result.mode,
                 FolderNavMode::Fullscreen
+                    | FolderNavMode::ListOrder { .. }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::SlideshowNext
             );
@@ -59889,6 +59985,7 @@ impl App {
                 return;
             }
             FolderNavMode::Fullscreen
+            | FolderNavMode::ListOrder { .. }
             | FolderNavMode::SiblingFullscreen
             | FolderNavMode::SlideshowNext => {
                 let resume_slideshow = matches!(result.mode, FolderNavMode::SlideshowNext);
@@ -79357,6 +79454,7 @@ impl App {
             if matches!(
                 pending.mode,
                 FolderNavMode::Fullscreen
+                    | FolderNavMode::ListOrder { .. }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::Favsearch {
                         fullscreen: true,
@@ -95466,6 +95564,7 @@ impl App {
                         return;
                     }
                     self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                        scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                         at_end: delta > 0,
                         at: std::time::Instant::now(),
                     });

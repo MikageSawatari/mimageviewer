@@ -270,7 +270,10 @@ fn startup_notices_settings_and_list_exits_retire_enumeration_before_late_succes
             };
             app.fs_nav_after_pdf_enumerate = Some(deferred_navigation_reopen());
             app.fs_nav_locked_gen = Some(app.items_generation);
-            app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+            app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary,
+            ));
             assert!(app.projected_viewer_session_open());
             assert!(!app.whats_new_visible());
             end_waiting_viewer(&mut app, &ctx, close);
@@ -513,7 +516,10 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
             }));
             app.settings.auto_fullscreen_zip_pdf = true;
             app.fs_nav_locked_gen = Some(app.items_generation);
-            app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+            app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary,
+            ));
             assert!(app.attach_archive_convert_deferred_fullscreen(
                 false,
                 false,
@@ -610,7 +616,10 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
                 let retired = app.stash_mounted_as_active_for_test(1236);
                 // Retirement must not clear the currently mounted sibling's holdover.
                 app.fs_nav_locked_gen = Some(app.items_generation);
-                app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+                app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(
+                    None,
+                    crate::app::FsFolderNavigationOrigin::Ordinary,
+                ));
                 app.retire_context(retired, "notice_test_source_retired", |_| ())
                     .unwrap();
                 assert!(app.fs_nav_is_locked());

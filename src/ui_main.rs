@@ -16792,6 +16792,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         return nav;
                     }
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
+                    self.capture_main_folder_list_order(idx);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let staged = self.will_stage_archive_navigation(&pf, &owner);
                     let open_outcome = self
@@ -26968,6 +26969,89 @@ mod grid_reclick_open_tests {
             );
         }
         harness.run();
+    }
+
+    #[test]
+    fn list_order_double_click_captures_folder_zip_pdf_and_conversion_before_open() {
+        use crate::app::ListOrderEntryKind;
+        use crate::app::top_level_grid_view::TopLevelGridSurface;
+        for activated in 0..4 {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            let app = &mut harness.state_mut().app;
+            let folder = app.tmp.path().join("list-order-pointer-source");
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut rows = vec![
+                GridItem::Folder(folder.join("folder-book")),
+                GridItem::ZipFile(folder.join("zip-book.zip")),
+                GridItem::PdfFile(folder.join("pdf-book.pdf")),
+                GridItem::ConvertibleArchive {
+                    path: folder.join("convert-book.7z"),
+                    format: crate::archive_converter::ArchiveFormat::SevenZ,
+                },
+            ];
+            // Keep the clicked cell at the same on-screen position in every case.
+            rows.swap(0, activated);
+            let expected = rows
+                .iter()
+                .rev()
+                .map(|item| item.container_path().unwrap().to_path_buf())
+                .collect::<Vec<_>>();
+            std::fs::write(folder.join("convert-book.7z"), b"test archive").unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = rows;
+            app.thumbnails = vec![ThumbnailState::Pending; 4];
+            app.image_metas = vec![None; 4];
+            app.visible_indices = vec![3, 2, 1, 0];
+            app.settings.grid_view_mode = GridViewMode::Thumbnail;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            // Conversion stops at its ordinary confirmation; no external tool runs.
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            assert!(app.list_order.is_none());
+            harness.run();
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            assert!(
+                harness.state().app.list_order.is_none(),
+                "selection alone cannot capture"
+            );
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            let app = &harness.state().app;
+            let captured = app
+                .list_order
+                .as_ref()
+                .expect("double-click captures before opening");
+            assert_eq!(captured.owner, app.virtual_list_context_id());
+            assert_eq!(
+                captured
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut expected_kinds = vec![
+                ListOrderEntryKind::Folder,
+                ListOrderEntryKind::Zip,
+                ListOrderEntryKind::Pdf,
+                ListOrderEntryKind::ConvertibleArchive,
+            ];
+            expected_kinds.swap(0, activated);
+            expected_kinds.reverse();
+            assert_eq!(
+                captured
+                    .entries
+                    .iter()
+                    .map(|entry| entry.kind)
+                    .collect::<Vec<_>>(),
+                expected_kinds
+            );
+            // Returned folder/container navigation has not been adopted, and conversion
+            // has only reached confirmation. The captured rows are the outgoing list.
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        }
     }
 
     fn rating_selection_harness(

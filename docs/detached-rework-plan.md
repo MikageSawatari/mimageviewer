@@ -1455,7 +1455,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
-### 2026-10-26 §1.444 一覧の表示順で前後の本へ移る操作 (設計段階の記録)
+### 2026-10-26 §1.444 一覧の表示順で前後の本へ移る操作
 
 - 正本: `list-order-book-navigation-plan.md` 第 3 版。設計担当 ClaudeCode と Codex の独立設計レビュー (第 2 版・第 3 版) は、
   context 所有の凍結データを bundle に載せ、利用資格を owner id・表示先・現在の場所から導く方針が、
@@ -1464,6 +1464,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   fork の `keep_in_main` 分類 (子は空) を明示する。registry の table の遷移規則 (park / mount / fork / promote) は変えない。
 - 表示先の判定: 操作は `ViewerPresentation::MainWindow | Fullscreen` で使え、`DetachedWindow`・独立 owner では通知だけ。
   promote 後の旧 main に残った列は、`owner` が新しい main id と一致しないので使えない (消す処理は足さない)。
+- 実装の端通知は既存 `FsBoundaryHint::Edge` に `FsBoundaryEdgeScope::Page | ListOrder` を明示した。
+  `app/book_composition_permission.rs`・`app/collection_navigation.rs`・`app/native_video.rs` を含む
+  既存 producer は Page のまま、新操作だけ ListOrder にする。egui/native のタイトルを共有する。
+  `ui_fullscreen.rs` の一時的な `FsKeyAction` で、新操作の intent を既存 local / ROOT /
+  forwarded ROOT の共通dispatcherへ渡す。ページ端の既存案内・contextの配送先・viewportの選択規則は変えない。
+  bundle の swap / fork / park / promote の回帰は独立した列の保持と旧 owner の無効化を検査する。
+- 2026-10-27 独立コードレビュー P2 対応: 既存 bundle 所有の `fs_holdover_tex` の型を拡張し、
+  `NavigationSequence` の purpose から動画・音声の `FolderNavigation` の origin へ一覧順由来を引き継ぐ。
+  worker 完了後も同じ owner が表示待ちの受付方針を保持し、Ctrl / 兄弟移動の継続と共通入口からの
+  乗り換えを拒否する。描画用の旧画像を解放しても origin は owner 終了まで残す。
+  sequence の終端失敗・パスワード待ちは既存の phase / modal の受付規則に従い、
+  旧画像を保持していることだけでは新しい要求を拒否しない。
+  detached の既存 producer は通常由来のまま。既存の初期化・swap・fork・終了を使い、
+  registry の遷移規則・context 配送先・viewport 選択・新たな並列状態 field は変更・追加しない。
+  この所有者拡張は設計担当と独立 reviewer が構造的修正として合意した。
 - 実装で範囲が変わったら、この記録を更新する。
 
 ### 2026-10-23 §1.419 起動系の明示要求を受付順に揃える

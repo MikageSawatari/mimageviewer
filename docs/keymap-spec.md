@@ -398,9 +398,12 @@ Windows の `KeySlot` 経路は Win32 key-down edge をフレーム単位で取�
 `Keymap::consume_action_press_count()` が返す回数を既存の typed request / accumulator へ渡す。
 
 `EachPhysicalPress` にできるのは、同じ方向へ 1 step ずつ進むように反復の意味が明確で、
-順番どおりの複数実行が安全であり、下流に明示的な累積上限がある操作だけとする。現在の対象は
+順番どおりの複数実行が安全であり、下流に明示的な累積上限または準備中の受付拒否がある操作だけとする。累積する対象は
 `FsCtrlNavPrev` / `FsCtrlNavNext` / `FsSiblingPrev` / `FsSiblingNext`。これらは既存の
-folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。トグル、削除などの破壊的操作、
+folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。
+`FsListOrderPrev` / `FsListOrderNext` も物理押下を数えるが、準備中は既存の sequence / 表示待ち lock で
+拒否し、累積しない。egui のキーリピートは Ctrl+↑↓ と同じく、物理押下が無いフレームでは最大 1 回にまとめる。
+トグル、削除などの破壊的操作、
 ダイアログ表示、設定変更、単発の保存処理は `SinglePerFrame` のままにし、同一フレームの
 複数 edge を回数分発火させない。ページ送り系は、固定矢印入力、見開き単位、連結読みスクロール、
 割合ジャンプで 1 step の意味が異なるため、共通の回数適用規則を定めるまでは対象外とする。
@@ -705,6 +708,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。修飾なし矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネル・ページジャンプ・Home/End 先頭末尾移動など副作用が明確な操作は KeyAction 化して競合検出対象にする |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。端の no-op は保存しない)。適格な本では既定ONの全体記憶設定に従い、実際の内部アンカーのPageRefを`spread_shift.db`へ保存する。通常一覧と記憶OFFではセッション調整。`spread_db`のmodeは保存し直さない。Single / Split モードでは従来の前 / 次ページ移動。ページ表示が RTL なら左右の意味を反転し、「カーソルキー左右の方向」の影響は受けない。リング / マウス / パッド用の操作候補には、この左右版に加えて PageUp/PageDown と同じく RTL でも前 / 次を反転しない「前 / 次」版を用意する |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。スマートフォルダでは Folder 内 DFS の端と root 直下の本から、一覧表示順の Folder/PDF/ZIP/変換書庫へ移る。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 一覧の表示順で前 / 次の本を開く。Action: `FsListOrderPrev` / `FsListOrderNext` (`FsCommon` / Press / `EachPhysicalPress`)。最後に通常フォルダ一覧から本を開く操作を受け付けた時点の絞り込み・並べ替え順を使い、その一覧の中だけを移動する。Ctrl+↑↓ の DFS と異なりサブフォルダへは降りない。使える範囲・停止条件は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) 参照 |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 同じ親直下の前 / 次の兄弟フォルダへ移動する。Action: `FsSiblingPrev` / `FsSiblingNext`。独立 detached 静止画窓でも窓自身の物理兄弟順を使う |
 | <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸 → 指定サイズで循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
 | 既定キーなし (`FsTogglePageAfterCoverAlone` / `FsToggleLastPageAlone`) | 表紙あり見開きで、表紙の次 / 最終ページを白い相方付きで単独表示する本別設定を切り替える。全体設定に従う状態からは現在の実効値の反対を明示保存する。表紙なし見開き・単ページ・横長分割では値だけ変更し、表示には適用しない |
@@ -946,6 +950,7 @@ SNS 中の通常 `FsExport` は案内だけを表示し、枠の確定・取消�
 | 修飾なしマウスホイール | 前 / 次のファイル（既定）、または音量調整 | `Settings.ring_shortcuts.video_normal_wheel_action`。動画・音声共通で、操作カスタマイズ「マウスボタン」から選択。パネル・モーダル・ストリップ、360度・拡大表示など既存の入力所有を優先し、KeyAction にはしない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量を dB フェーダー目盛りの 1/4 幅で上下 | |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効。切り離した detached 窓 / always-new 窓ではメイン一覧を動かさず、案内だけ出す |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 最後に通常フォルダ一覧から本を開く操作を受け付けた時点の、その一覧の表示順で前 / 次の本を開く | `FsListOrderPrev` / `FsListOrderNext`。native presenter でも同じ handler を使う。別窓・★固定中・保持した一覧に現在の本が無いときは案内だけ出し、準備中の追加入力は受け付けない。native の repeat 受付は既存 Ctrl+↑↓ と同じく無視 |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | 同じ親の直下だけを対象にし、空フォルダも skip しない。検索中は無効。切り離した detached 窓 / always-new 窓では無効 |
 | <kbd>M</kbd> | ミュート トグル | |
 | 既定キーなし | 次の再生可能な音声トラックへ循環 | Action: `VideoNextAudioTrack`。`[FsVideo]` で割り当て可能。動画 HUD と動画→音声モード HUD の「音声 N」からも直接選べる。1 本以下では何もしない |

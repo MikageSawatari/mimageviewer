@@ -1892,6 +1892,7 @@ impl App {
                 == super::file_type_resume::PositionResolution::Restored(intent.idx)
         }) {
             self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end: intent.purpose == BookTargetPurpose::Next,
                 at: std::time::Instant::now(),
             });
