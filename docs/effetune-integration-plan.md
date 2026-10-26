@@ -258,15 +258,19 @@ enum EffetuneFailure {
 
 ### 5.1 保存先
 
-F2a でも下記の保存済み状態・設定項目の名前と意味は変更しない。派生版自身の保存領域と、
-旧共通領域からの一度だけの移行は [派生版計画 §4〜5](effetune-fork-plan.md) が正本（移行本体は F2b）。
+F2a・F2b-1 でも下記の保存済み状態・設定項目の名前と意味は変更しない。派生版自身の保存領域と、
+旧共通領域からの一度だけの移行は [派生版計画 §4〜5](effetune-fork-plan.md) が正本。
+`src/effetune/migration.rs` が `<data_dir>/effetune/plugin` と `webview` を作り、判断の印を置く。
+App は `src/effetune/startup.rs` の worker の結果を待ち、印の判断が済むまで音響調整・ユーザー VST・
+スキャン用 host を起動しない。失敗した起動では音響調整だけを禁止し、ユーザー VST は結果採用後に使える。
+UI にファイル検査・コピー・プロセス待機を置かず、設定スキーマは変更しない。
 
 - Mixwright の状態: `data_dir/effetune/mixwright-state.json` (base64 を decode した生バイト)。
   settings.db に載せない (状態は IR 等で MB 級になり得るが、`settings_kv` は保存のたびに全行を
   書き直すため)。
 - ウィンドウ位置・サイズ: settings に `effetune_gui_pos: Option<(i32,i32)>` /
   `effetune_gui_size: Option<(u32,u32)>`。`overwrite_non_preferences_from` でもコピーする。
-- 未リリース機能なのでマイグレーション不要。
+- この mIV 内部状態の形式変更はない。旧プラグインの共通データの保存先移行は上記の別処理で行う。
 
 ### 5.2 取得 (音声を止めない)
 

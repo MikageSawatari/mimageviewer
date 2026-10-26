@@ -2,6 +2,10 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[cfg(windows)]
+#[path = "tests/audio_plugin_migration.rs"]
+mod audio_plugin_migration;
+
 /// Preserve the headless renderer's logical client dimensions while fixtures
 /// use the same physical outer placement as a decorated native window.
 #[cfg(windows)]

@@ -8783,7 +8783,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "再スキャン".to_string()
         };
         if ui
-            .add_enabled(!state.vst3_scan_in_progress, egui::Button::new(scan_label))
+            .add_enabled(!state.vst3_scan_in_progress && state.audio_plugin_startup.user_vst_allowed(), egui::Button::new(scan_label))
             .on_hover_text(
                 "%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査し、bridge subprocess で audio input/output を確認します",
             )

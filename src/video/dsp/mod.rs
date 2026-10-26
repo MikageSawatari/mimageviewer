@@ -325,6 +325,7 @@ mod bridge_environment_tests {
 /// 時計なしリモート配信で共有する。audio-pump と配信 worker の process/reset/flush は
 /// `DspProcessingCoordinator` の世代付き許可で排他する。
 pub struct DspBridge {
+    startup_gate: Arc<crate::effetune::startup::HostStartupGate>,
     inner: Mutex<DspBridgeInner>,
     environment: BridgeEnvironment,
     gui_owner_policy: GuiOwnerPolicy,
@@ -505,6 +506,31 @@ pub(crate) struct PluginSlot {
 }
 
 impl DspBridge {
+    pub(crate) fn new_waiting_for_migration(
+        gate: Arc<crate::effetune::startup::HostStartupGate>,
+    ) -> Arc<Self> {
+        Self::new_with_environment(
+            GuiOwnerPolicy::Auto,
+            LatencyPolicy::AutoBypass,
+            false,
+            true,
+            BridgeEnvironment::UserVst,
+            gate,
+        )
+    }
+
+    fn require_startup_permission(&self) -> Result<(), String> {
+        let allowed = match self.environment {
+            BridgeEnvironment::UserVst => self.startup_gate.user_vst_allowed(),
+            BridgeEnvironment::MivSound(_) => self.startup_gate.sound_allowed(),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err("音響調整のデータ引き継ぎが完了していません".into())
+        }
+    }
+
     pub fn new() -> Arc<Self> {
         Self::new_with_policies(GuiOwnerPolicy::Auto, LatencyPolicy::AutoBypass, false)
     }
@@ -529,16 +555,28 @@ impl DspBridge {
             strict_state,
             show_editor_bypass_button,
             BridgeEnvironment::UserVst,
+            crate::effetune::startup::HostStartupGate::ready(),
         )
     }
 
     pub(crate) fn new_for_miv_sound(directory: std::path::PathBuf) -> Arc<Self> {
+        Self::new_for_miv_sound_with_startup_gate(
+            directory,
+            crate::effetune::startup::HostStartupGate::ready(),
+        )
+    }
+
+    pub(crate) fn new_for_miv_sound_with_startup_gate(
+        directory: std::path::PathBuf,
+        gate: Arc<crate::effetune::startup::HostStartupGate>,
+    ) -> Arc<Self> {
         Self::new_with_environment(
             GuiOwnerPolicy::Unowned,
             LatencyPolicy::ReportOnly,
             true,
             false,
             BridgeEnvironment::MivSound(directory),
+            gate,
         )
     }
 
@@ -548,8 +586,10 @@ impl DspBridge {
         strict_state: bool,
         show_editor_bypass_button: bool,
         environment: BridgeEnvironment,
+        startup_gate: Arc<crate::effetune::startup::HostStartupGate>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            startup_gate,
             environment,
             inner: Mutex::new(DspBridgeInner {
                 state: DspState::Disabled,
@@ -1139,6 +1179,7 @@ impl DspBridge {
     /// プラグイン追加時に `add_plugin` から個別に spawn される)。
     /// 既に enable 済みなら no-op。
     pub fn enable(&self) -> Result<(), String> {
+        self.require_startup_permission()?;
         let mut inner = self.inner.lock().unwrap();
         if matches!(inner.state, DspState::Enabled) {
             return Ok(());
@@ -1265,6 +1306,7 @@ impl DspBridge {
         initial_window_size: Option<(u32, u32)>,
         load_timeout: std::time::Duration,
     ) -> Result<usize, String> {
+        self.require_startup_permission()?;
         // enable 状態チェック (Mutex を保持しない)
         if !self.is_enabled() {
             return Err("VST3 が無効化されています (enable を先に)".to_string());

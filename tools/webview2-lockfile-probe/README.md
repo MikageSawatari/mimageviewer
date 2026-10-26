@@ -1,7 +1,87 @@
 # WebView2 lockfile probe
 
-`docs/effetune-fork-plan.md` 第6版 §4・§5・§15.5・§15.6 の前提を実測する独立した試作。
-製品・VST3 host・Cargo workspace には接続しない。移行の本実装は含まない。
+`run.ps1` は `docs/effetune-fork-plan.md` 第6版 §4・§5・§15.5・§15.6 の前提を実測する独立した試作。
+その経路は製品・VST3 host・Cargo workspace には接続せず、移行の本実装を含まない。
+第8版 §5.5 に対応する本実装の検証は、次の別経路 `run-migration.ps1` を使う。
+従来の実測・STOP 判定と `run.ps1` の意味は変更しない。
+
+<a id="production-migration"></a>
+
+## F2b-1: 第8版の本実装を使う別の検証
+
+`run-migration.ps1` は、Rust の製品用移行関数を test-script 専用の早期終了 CLI から呼ぶ。
+PowerShell にコピー処理を再実装せず、旧 `Copy-Udf` も呼ばない。
+この CLI は通常のアプリ初期化より前に終了し、製品 UI・設定 DB・VST host を起動しない。
+`--miv-sound-migrate-only` を省いた core の実行は、この手順の対象外。
+
+ClaudeCode がサンドボックスの外で、実行内容の明示承認を得てから実行する。
+通常2〜4分程度、起動や終了が時間切れになった場合は後片付けを含め数分余分にかかる。
+同じ非アクティブの小窓を順に表示するが、前面化・キーボード・マウス入力は行わない。
+使い捨ての保存先は `target\webview2-lockfile-probe\run-migration-*\` だけ。
+この下の `fake-appdata\` を移行元、`isolated-data\` を移行先として渡す。
+環境変数 `APPDATA` の変更や、利用者の通常プロファイルのコピー・変更は行わない。
+
+本体の `test-script` feature を付けた core を用意した後、リポジトリのルートで実行する。
+通常版の core を単独起動するコマンドには置き換えない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+$env:MIV_SOUND_CANDIDATE = '9ccc387ad9585db2d7007dba64db3d8c48e486864c76d4679e0143bbf7744d08'
+cargo build -p mimageviewer --bin mimageviewer-core --features test-script --profile dev-runtime
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\webview2-lockfile-probe\run-migration.ps1 -MigrationExe .\target\dev-runtime\mimageviewer-core.exe -InteractiveApproved
+```
+
+上記の候補はこの検証時点の未承認候補で、check / build / test 用に限る。配布の承認ではない。
+本体のビルドには、その時点の派生版候補など通常のビルド前提が必要。
+probe の C++ ビルドは runner が行う。probe 自体もビルド済みなら `-SkipBuild` を付けられる。
+exe・Loader・ページ・C++ ソースは従来の `build.json` の SHA256 と照合し、
+移行 helper の SHA256 も新しい実測の `results.json` に保存する。
+
+検証する流れ:
+
+1. 同じ origin の localStorage・IndexedDB (文字列とバイナリ)・OPFS (UTF-8 とバイナリ) に素材を作る。
+   いったん正常終了してから元を読み直し、再び `Close()` による正常終了を要求する。
+2. 元の lockfile が自然に解放されるのを最大5秒観測してから、本実装の helper を1回だけ呼ぶ。
+   本実装のロック取得に失敗したら成功にしない。自動的な移行の再試行はしない。
+3. helper の `lock_acquired`・`copy_begin`・`copy_end` で、元の lockfile の共有違反を別経路から確かめる。
+   最初の2か所で同じ元を開こうとする別ホストを起動し、該当 Runtime のプロセスを観測してから先へ進む。
+   `copy_end` では、両ホストの起動の終端 (失敗またはページ到達など) を記録してからロックを解放する。
+   起動が失敗せずページに到達した場合や応答性が失われた場合は、成功にしない。
+4. 元の最初の正常終了完了後を基準に、競合する起動の前後・コピー前後・ロック解放後の
+   全ファイルの相対パス・サイズ・SHA256 を比較する。除外は第8版 §5.3 の完全一致の一覧だけ。
+   未知のファイルを除外せず、読み取りエラーも成功にしない。除外された metrics の生の行も残す。
+   コピー先は初回起動の前に調べ、lockfile・Crashpad・metrics の除外対象がフォルダごと存在しないことも確かめる。
+5. コピー先で3種類の保存を読み、完全に終了してから再度読み直す。元も最後に読み直す。
+   すべてのホストの終了で、既存 C++ ホストの共通 `Close()`・callback 完了・自然終了待ちの証拠を確認する。
+   前後の WER / Application ログも別に保存する。
+
+checkpoint は test-script の helper だけの制御で、移行エンジンがロックを保持している間に動く。
+JSONL の `phase` / `elapsed_ms` と `<phase>.continue` ファイルを使い、各停止の上限は10秒。
+製品経路に待機や再試行を足すものではない。helper のプロセス待ち本体の上限5秒も変えない。
+外側の runner も、例外を含む後片付けで checkpoint を解放し、全ホストへ正常終了を要求する。
+上限35秒の自然終了待ちが失敗しても、**ホストも WebView2 も強制終了しない**。
+残った PID と理由を ERROR として残し、データやログを削除しない。
+これは従来 `run.ps1` の最後の手段の Kill とは異なる新経路の仕様。
+
+`results.json` / `results.md`、元と先の manifest、ホストの JSONL、helper の stdout、各プロセスの記録を
+`run-migration-*` に残す。競合する起動の Runtime プロセスを checkpoint で観測できなかった場合は
+`INCONCLUSIVE` とし、起動拒否や保存の照合だけで重なりを確認した扱いにはしない。
+元の正常終了直後の隙間は短いため、元プロセスが helper の取得後も残ったかは別項目
+`original_source_close_overlap` に記録する。false のとき、その元プロセスを待つ経路の実測は未確認。
+各 checkpoint で観測した競合 Runtime の PID と実際の `process_wait_begin/end`・`copy_begin/end` を
+併せて読み、checkpoint の停止時間を製品の待機やコピー時間と解釈しない。
+PASS も1台・1つの Runtime の有限観測であり、旧版プラグインのデータ互換性や実製品の UI の受け入れを代替しない。
+
+非 WebView2 検証は単独で実行できる。Cargo や製品バイナリは呼ばず、合成ファイルと有限の PowerShell 子プロセスだけを使う。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\webview2-lockfile-probe\test-migration-offline.ps1
+```
+
+2026-10-27: 新しい PowerShell の構文・ASCII、除外の完全一致と未知パスの維持、共有違反の独立確認、
+JSONL と3か所の checkpoint、待機・コピーの順序と成功結果、自然終了と時間切れ時の非強制終了など53項目が成功。
+証拠: `target\webview2-lockfile-probe\run-migration-offline-20261026-174912-010-21760\offline-results.json`。
+この合成検査を本物の WebView2 や本実装の移行の成功とは扱わない。新経路の外部実測は未実施。
 
 ## ClaudeCode が実行するコマンド
 

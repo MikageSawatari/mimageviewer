@@ -1,0 +1,232 @@
+# ASCII only. Production migration is executed by the Rust helper, never here.
+. (Join-Path $PSScriptRoot 'common.ps1')
+
+function Test-MigrationExcluded([string]$RelativePath) {
+    $p = $RelativePath.Replace('\', '/').TrimEnd('/')
+    if ($p -ieq 'EBWebView/lockfile' -or $p -ieq 'EBWebView/CrashpadMetrics.pma' -or
+        $p -ieq 'EBWebView/CrashpadMetrics-active.pma') { return $true }
+    foreach ($directory in @('Crashpad', 'BrowserMetrics', 'DeferredBrowserMetrics', 'EBWebViewMetrics')) {
+        $root = 'EBWebView/' + $directory
+        if ($p -ieq $root -or $p.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+function Get-MigrationManifest([string]$Udf) {
+    # Preserve raw rows, including read errors, for audit. Only the exact accepted
+    # exclusions are removed when constructing the acceptance comparison.
+    $raw = Get-Manifest $Udf
+    return [pscustomobject]@{ raw = $raw; included = @($raw | Where-Object { -not (Test-MigrationExcluded $_.path) });
+        excluded = @($raw | Where-Object { Test-MigrationExcluded $_.path }) }
+}
+function Assert-MigrationExclusions([string]$Udf) {
+    Assert-ProbePath $Udf
+    foreach ($p in @('EBWebView\lockfile', 'EBWebView\Crashpad', 'EBWebView\CrashpadMetrics.pma',
+        'EBWebView\CrashpadMetrics-active.pma', 'EBWebView\BrowserMetrics',
+        'EBWebView\DeferredBrowserMetrics', 'EBWebView\EBWebViewMetrics')) {
+        if (Test-Path -LiteralPath (Join-Path $Udf $p)) { throw "Excluded destination path exists before reopening: $p" }
+    }
+}
+function Join-MigrationArguments([string[]]$Values) {
+    return (@(foreach ($value in $Values) {
+        if ($value.Contains('"') -or $value.EndsWith('\') -or $value -match '[\r\n]') { throw 'Unsupported native argument.' }
+        '"' + $value + '"'
+    }) -join ' ')
+}
+function Start-MigrationChild([string]$Executable, [string[]]$Arguments, [string]$Label,
+    [string]$StopPath = '', [string]$Udf = '', [switch]$Helper) {
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Executable; $start.Arguments = Join-MigrationArguments $Arguments
+    $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+    $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+    $start.EnvironmentVariables['MSBUILDDISABLENODEREUSE'] = '1'
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+    if (-not $process.Start()) { throw "Cannot start child: $Label" }
+    $child = [pscustomobject]@{ process = $process; label = $Label; stop = $StopPath; udf = $Udf;
+        helper = [bool]$Helper; log = (Join-Path $script:MigrationRun ($Label + '.jsonl'));
+        stdout_lines = [Collections.Generic.List[string]]::new();
+        stdout_pending = $process.StandardOutput.ReadLineAsync(); stdout_eof = $false;
+        stderr = $process.StandardError.ReadToEndAsync(); started_utc = [DateTime]::UtcNow.ToString('o') }
+    $script:MigrationChildren.Add($child)
+    return $child
+}
+function Read-MigrationStdout($Child) {
+    # Never synchronously await EOF or an inherited pipe writer.
+    while (-not $Child.stdout_eof -and $Child.stdout_pending.IsCompleted) {
+        if ($Child.stdout_pending.IsFaulted -or $Child.stdout_pending.IsCanceled) { throw "stdout failed: $($Child.label)" }
+        $line = $Child.stdout_pending.Result
+        if ($null -eq $line) { $Child.stdout_eof = $true; break }
+        $Child.stdout_lines.Add($line)
+        [IO.File]::AppendAllText(($Child.log + '.stdout.txt'), $line + "`n", [Text.UTF8Encoding]::new($false))
+        $Child.stdout_pending = $Child.process.StandardOutput.ReadLineAsync()
+    }
+    if ($Child.helper) {
+        foreach ($line in $Child.stdout_lines) {
+            if ($line.Trim()) { $line | ConvertFrom-Json -ErrorAction Stop }
+        }
+    }
+}
+function Save-MigrationChild($Child) {
+    $null = @(Read-MigrationStdout $Child)
+    Save-Json ($Child.log + '.process.json') ([ordered]@{ pid = $Child.process.Id; label = $Child.label;
+        started_utc = $Child.started_utc; observed_utc = [DateTime]::UtcNow.ToString('o');
+        exited = $Child.process.HasExited; exit_code = $(if ($Child.process.HasExited) { $Child.process.ExitCode } else { $null });
+        stdout_eof = $Child.stdout_eof; stderr_status = [string]$Child.stderr.Status;
+        stderr = $(if ([string]$Child.stderr.Status -eq 'RanToCompletion') { $Child.stderr.Result } else { $null });
+        forced_termination = $false })
+}
+function Wait-MigrationExit($Child, [int]$Milliseconds = 35000) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while (-not $Child.process.HasExited -and $clock.ElapsedMilliseconds -lt $Milliseconds) {
+        $null = @(Read-MigrationStdout $Child)
+        Start-Sleep -Milliseconds 20
+    }
+    Save-MigrationChild $Child
+    if (-not $Child.process.HasExited) { throw "Natural-exit deadline exceeded; process left alive, never terminated: $($Child.process.Id)" }
+}
+function Start-MigrationHost([string]$Udf, [string]$Mode, [string]$Label) {
+    Assert-ProbePath $Udf
+    $stop = Join-Path $script:MigrationRun ($Label + '.stop')
+    $log = Join-Path $script:MigrationRun ($Label + '.jsonl')
+    return Start-MigrationChild $script:MigrationProbe @('host', '--udf', $Udf, '--mode', $Mode,
+        '--token', $script:MigrationToken, '--log', $log, '--stop', $stop,
+        '--timeout-ms', '20000', '--shutdown-timeout-ms', '30000') $Label $stop $Udf
+}
+function Request-MigrationClose($Child) {
+    if ($Child.stop) { Assert-ProbePath $Child.stop; [IO.File]::WriteAllText($Child.stop, 'close') }
+}
+function Assert-MigrationHostExit($Child) {
+    $events = @(Read-Events $Child.log)
+    $end = @($events | Where-Object kind -eq 'shutdown_complete')
+    $errors = @($events | Where-Object { $_.kind -eq 'host_error' -or $_.kind -eq 'shutdown_inventory_error' -or
+        ($_.kind -eq 'hresult' -and $_.stage -like '*controller_close' -and $_.failed) })
+    if ($end.Count -ne 1 -or -not $end[0].complete -or $errors.Count -or $Child.process.ExitCode -notin @(0, 2, 3)) {
+        throw "Host did not prove Close and natural-exit completion: $($Child.label)"
+    }
+}
+function Close-MigrationHost($Child) {
+    Request-MigrationClose $Child
+    Wait-MigrationExit $Child
+    Assert-MigrationHostExit $Child
+}
+function Wait-MigrationStorage($Child) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $rows = @(Read-Events $Child.log | Where-Object { $_.kind -eq 'page_message' -and $_.data.kind -eq 'storage_result' })
+        if ($rows.Count) {
+            $data = $rows[-1].data
+            Save-Json ($Child.log + '.storage.json') $data
+            if (-not $data.pass -or -not $data.checks.localStorage -or -not $data.checks.indexedDB -or -not $data.checks.opfs) {
+                throw "Storage verification failed: $($Child.label)"
+            }
+            return $data
+        }
+        if ($Child.process.HasExited) { throw "Host exited before storage result: $($Child.label)" }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt 25000)
+    throw "Storage result deadline: $($Child.label)"
+}
+function Wait-MigrationPhase($Child, [string]$Phase, [int]$Milliseconds = 8000) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $events = @(Read-MigrationStdout $Child)
+        $found = @($events | Where-Object phase -eq $Phase)
+        if ($found.Count) { return $found[-1] }
+        if ($Child.process.HasExited -and $Child.stdout_eof) { Save-MigrationChild $Child; throw "Helper exited before $Phase; inspect stdout and result." }
+        Start-Sleep -Milliseconds 5
+    } while ($clock.ElapsedMilliseconds -lt $Milliseconds)
+    throw "Helper phase deadline: $Phase"
+}
+function Assert-MigrationHelperEvents([object[]]$Events) {
+    $required = @('lock_acquired', 'process_wait_begin', 'process_wait_end', 'copy_begin', 'copy_end', 'result')
+    $observed = @($Events | Where-Object { $_.phase -in $required })
+    if (($observed.phase -join ',') -cne ($required -join ',')) { throw 'Incomplete, duplicate, or out-of-order production migration phases.' }
+    $previous = -1
+    foreach ($event in $observed) {
+        if ($null -eq $event.elapsed_ms -or [long]$event.elapsed_ms -lt $previous) { throw 'Migration event timing is missing or out of order.' }
+        $previous = [long]$event.elapsed_ms
+    }
+    if ($observed[-1].passed -ne $true) { throw 'Production helper did not report a successful result.' }
+}
+function Resume-MigrationPhase([string]$Phase) {
+    $path = Join-Path $script:MigrationCheckpoints ($Phase + '.continue')
+    Assert-ProbePath $path
+    [IO.File]::WriteAllText($path, 'continue')
+}
+function Wait-MigrationLockAvailable([string]$Udf) {
+    $path = Join-Path $Udf 'EBWebView\lockfile'; Assert-ProbePath $path
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        if (-not [IO.File]::Exists($path)) { return }
+        try {
+            $file = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+            $file.Dispose(); return
+        } catch [IO.IOException] { }
+        Start-Sleep -Milliseconds 2
+    } while ($clock.ElapsedMilliseconds -lt 5000)
+    throw 'Source did not naturally release the singleton lock; migration was not started.'
+}
+function Assert-MigrationHeldLock([string]$Udf) {
+    $path = Join-Path $Udf 'EBWebView\lockfile'; Assert-ProbePath $path
+    try {
+        $file = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    } catch [IO.IOException] {
+        $win32 = $_.Exception.HResult -band 65535
+        if ($win32 -in @(32, 33)) { return [pscustomobject]@{ held = $true; win32_error = $win32; observed_utc = [DateTime]::UtcNow.ToString('o') } }
+        throw
+    }
+    $file.Dispose()
+    throw 'Migration checkpoint did not retain an exclusive source lock.'
+}
+function Wait-MigrationCompetitor($Child, [string]$Udf) {
+    # Poll while the helper is at its bounded checkpoint. Resume only after a
+    # real matching Runtime process was observed, or report missing overlap.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $observed = @(); $events = @()
+    do {
+        $events = @(Read-Events $Child.log)
+        $observed = @(Get-UdfProcesses $Udf)
+        if ($observed.Count) { break }
+        if ($Child.process.HasExited -or @($events | Where-Object kind -eq 'host_closing').Count) { break }
+        Start-Sleep -Milliseconds 10
+    } while ($clock.ElapsedMilliseconds -lt 3500)
+    return [pscustomobject]@{ observed_utc = [DateTime]::UtcNow.ToString('o'); matching_processes = $observed;
+        startup_requested = @($events | Where-Object { $_.kind -eq 'stage_begin' -and $_.stage -eq 'create_environment' }).Count -gt 0;
+        exact_process_overlap_observed = $observed.Count -gt 0 }
+}
+function Get-MigrationBlockedResult($Child) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $events = @(Read-Events $Child.log)
+        if ($Child.process.HasExited -or @($events | Where-Object kind -eq 'host_closing').Count) { break }
+        if (@($events | Where-Object kind -eq 'page_message').Count) { break }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt 25000)
+    Request-MigrationClose $Child
+    Wait-MigrationExit $Child
+    Assert-MigrationHostExit $Child
+    $outcome = [pscustomobject]@{ events = @(Read-Events $Child.log); outcome = 'exited' }
+    $result = Get-BlockedObservation $outcome
+    Save-Json ($Child.log + '.blocked.json') $result
+    if (-not $result.blocked -or -not $result.responsive) { throw "Competing startup was not responsively refused: $($Child.label)" }
+    return $result
+}
+function Complete-MigrationCleanup {
+    $failures = [Collections.Generic.List[object]]::new()
+    # Release helper checkpoints first; all waits remain bounded even on error.
+    foreach ($phase in @('lock_acquired', 'copy_begin', 'copy_end')) { Resume-MigrationPhase $phase }
+    foreach ($child in $script:MigrationChildren) { if (-not $child.helper) { Request-MigrationClose $child } }
+    foreach ($child in $script:MigrationChildren) {
+        try {
+            Wait-MigrationExit $child
+            if (-not $child.helper) { Assert-MigrationHostExit $child }
+        } catch { $failures.Add([pscustomobject]@{ pid = $child.process.Id; label = $child.label; reason = $_.Exception.Message }) }
+    }
+    foreach ($udf in $script:MigrationUdfs) {
+        try {
+            $remaining = @(Get-UdfProcesses $udf -IncludeRelated)
+            if ($remaining.Count) { $failures.Add([pscustomobject]@{ udf = $udf; remaining = $remaining; reason = 'Matching Runtime processes remain; no termination performed.' }) }
+        } catch { $failures.Add([pscustomobject]@{ udf = $udf; reason = $_.Exception.Message }) }
+    }
+    return ,@($failures)
+}

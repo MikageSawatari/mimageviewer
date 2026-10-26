@@ -19409,6 +19409,8 @@ pub struct App {
         std::sync::Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
     #[cfg(windows)]
     pub(crate) effetune: crate::effetune::EffetuneController,
+    #[cfg(windows)]
+    pub(crate) audio_plugin_migration: crate::effetune::startup::StartupMigration,
     /// VST3 プラグイン管理ウィンドウ (= プレイバックパネル) の表示状態。
     pub(crate) show_vst3_manager: bool,
     /// VST3 プラグイン候補のスキャン結果 (lazy ロード、初回 enable で実行)。
@@ -20373,6 +20375,8 @@ impl App {
             index.set_raw_executor(Arc::clone(&raw_develop_executor));
         }
 
+        #[cfg(windows)]
+        let audio_plugin_migration = crate::effetune::startup::StartupMigration::default();
         let mut app = Self {
             address: String::new(),
             current_folder: None,
@@ -21674,13 +21678,19 @@ impl App {
             initial_scan_settled_pending: true,
 
             #[cfg(windows)]
-            dsp_bridge: crate::video::dsp::DspBridge::new(),
+            dsp_bridge: crate::video::dsp::DspBridge::new_waiting_for_migration(
+                audio_plugin_migration.gate(),
+            ),
             #[cfg(windows)]
             dsp_processing: std::sync::Arc::new(
                 crate::video::dsp::coordinator::DspProcessingCoordinator::default(),
             ),
             #[cfg(windows)]
-            effetune: crate::effetune::EffetuneController::new(),
+            effetune: crate::effetune::EffetuneController::new_with_startup_gate(
+                audio_plugin_migration.gate(),
+            ),
+            #[cfg(windows)]
+            audio_plugin_migration,
             show_vst3_manager: false,
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
@@ -31636,10 +31646,7 @@ impl App {
         query
     }
 
-    /// Shared startup boundary for both host types (fork plan section 5.2).
-    /// F2b will start the migration worker here and call this continuation only
-    /// after its terminal result. F2a does not implement migration or its marks;
-    /// these development builds must not be run against normal user data.
+    /// Continuation called only after adopting the migration worker's result.
     #[cfg(windows)]
     fn start_audio_plugins_after_migration(&mut self) {
         self.kick_off_vst3_startup_load();
@@ -31649,15 +31656,46 @@ impl App {
         );
     }
 
+    #[cfg(windows)]
+    pub(crate) fn poll_audio_plugin_migration(&mut self, ctx: &egui::Context) {
+        // The terminal continuation can resume a deferred first display. Adopt
+        // it only after the existing sidecar recovery owner has settled.
+        if self.sidecar_restore_active() {
+            return;
+        }
+        if let Some(result) = self.audio_plugin_migration.poll() {
+            match result {
+                Ok(outcome) => crate::logger::log(format!("[mIV Sound migration] {outcome:?}")),
+                Err(reason) => {
+                    crate::logger::log(format!("[mIV Sound migration] FAILED: {reason}"));
+                    self.effetune
+                        .fail(crate::effetune::EffetuneFailure::LoadFailed(reason));
+                    self.show_feedback_toast_with_duration(
+                        crate::effetune::startup::FAILURE_NOTICE.into(),
+                        15.0,
+                    );
+                }
+            }
+            self.start_audio_plugins_after_migration();
+            if !self.media_startup_load_pending() {
+                self.resume_deferred_vst3_media_open(ctx);
+            }
+        }
+        if self.audio_plugin_migration.waiting() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
     /// 1 度しか走らせない。
     pub(crate) fn kick_off_startup_init(&mut self) {
+        #[cfg(windows)]
+        self.audio_plugin_migration.start(
+            crate::data_dir::get(),
+            self.edit_preview_repaint_ctx.clone(),
+        );
         if !matches!(self.indexer_init, IndexerInit::NotStarted) {
             return;
-        }
-        #[cfg(windows)]
-        {
-            self.start_audio_plugins_after_migration();
         }
         let favorites = self.settings.favorites.clone();
         let excluded_roots = vec![self.settings.books_root_path()];
@@ -31754,7 +31792,10 @@ impl App {
     /// 起動直後の VST3 bridge enable + チェーン自動ロードを UI とは独立に開始する。
     #[cfg(windows)]
     pub(crate) fn kick_off_vst3_startup_load(&mut self) {
-        if self.vst3_init_kicked || !self.settings.vst3_enabled {
+        if self.audio_plugin_migration.waiting()
+            || self.vst3_init_kicked
+            || !self.settings.vst3_enabled
+        {
             return;
         }
         self.vst3_init_kicked = true;
@@ -31964,7 +32005,9 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn effetune_toolbar_available(&self) -> bool {
-        !self.remote_session_blocks_local_control() && self.effetune.runtime.toolbar_available()
+        self.audio_plugin_migration.gate().sound_allowed()
+            && !self.remote_session_blocks_local_control()
+            && self.effetune.runtime.toolbar_available()
     }
 
     #[cfg(windows)]
@@ -32011,6 +32054,9 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn effetune_toolbar_tooltip(&self) -> String {
+        if self.audio_plugin_migration.waiting() {
+            return "音響調整のデータを確認中です".into();
+        }
         if self.remote_session_blocks_local_control() {
             return "リモート接続中は音響調整の窓を表示できません。接続が終了すると、表示していた窓が戻ります".into();
         }
@@ -32536,11 +32582,16 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn media_startup_load_pending(&self) -> bool {
-        self.vst3_startup_load.is_some() || self.effetune.startup_pending()
+        self.audio_plugin_migration.waiting()
+            || self.vst3_startup_load.is_some()
+            || self.effetune.startup_pending()
     }
 
     #[cfg(windows)]
     pub(crate) fn vst3_startup_progress_text(&self) -> String {
+        if self.audio_plugin_migration.waiting() {
+            return "音響調整のデータを確認中…".into();
+        }
         self.vst3_startup_load
             .as_ref()
             .map(|p| p.progress_text())

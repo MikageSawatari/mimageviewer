@@ -1046,6 +1046,18 @@ pub(crate) fn exit_with_logs(code: i32) -> ! {
 }
 
 pub fn run() -> eframe::Result {
+    #[cfg(windows)]
+    match effetune::startup::handle_test_arguments() {
+        Ok(Some(code)) => {
+            finish_logs();
+            std::process::exit(code);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            write_to_parent_console(&format!("error: {error}\n"));
+            std::process::exit(1);
+        }
+    }
     miv_startup::init_process(
         miv_startup::Role::Core,
         env!("CARGO_PKG_VERSION"),
@@ -2209,6 +2221,8 @@ fn cli_flag_takes_value(flag: &str) -> bool {
             | "--gpu-test-fail-device"
             | "--test-script"
             | "--settings-override"
+            | "--miv-sound-migration-source"
+            | "--miv-sound-migration-checkpoints"
             | "--window-size"
             | "--perf-log-path"
             | "--play-test"

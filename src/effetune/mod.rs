@@ -16,7 +16,9 @@ use crate::video::dsp::{DspBridge, GuiFailure};
 pub(crate) mod bundle_location;
 pub mod composition;
 pub(crate) mod gui_gate;
+pub(crate) mod migration;
 pub(crate) mod now_playing;
+pub(crate) mod startup;
 mod window;
 pub(crate) use now_playing::{NowPlayingArtworkSource, NowPlayingInput, NowPlayingOwner};
 
@@ -956,6 +958,7 @@ fn complete_load(
 }
 
 pub struct EffetuneController {
+    startup_gate: Arc<startup::HostStartupGate>,
     now_playing: now_playing::NowPlaying,
     auto_open: Arc<AutoOpenSession>,
     main_window: Arc<window::MainWindowObserver>,
@@ -987,6 +990,10 @@ fn wake_ui(context: &Mutex<Option<egui::Context>>) {
 
 impl EffetuneController {
     pub fn new() -> Self {
+        Self::new_with_startup_gate(startup::HostStartupGate::ready())
+    }
+
+    pub(crate) fn new_with_startup_gate(startup_gate: Arc<startup::HostStartupGate>) -> Self {
         let bundle = {
             let _memory = crate::perf::memory::span("effetune_bundle_resolve");
             #[cfg(all(windows, not(feature = "portable"), not(test)))]
@@ -1118,6 +1125,7 @@ impl EffetuneController {
                     .join("effetune")
                     .join("mixwright-state.json"),
             )),
+            startup_gate,
             pending_load: None,
             next_audio_generation: 0,
             pending_capture: None,
@@ -1353,7 +1361,10 @@ impl EffetuneController {
         pos: Option<(i32, i32)>,
         size: Option<(u32, u32)>,
     ) {
-        if !self.runtime.can_start_load() || self.pending_load.is_some() {
+        if !self.startup_gate.sound_allowed()
+            || !self.runtime.can_start_load()
+            || self.pending_load.is_some()
+        {
             return;
         }
         let retry = match &self.runtime {
@@ -1383,6 +1394,7 @@ impl EffetuneController {
             .join("mixwright-state.json");
         let (tx, rx) = mpsc::channel();
         self.pending_load = Some(rx);
+        let startup_gate = Arc::clone(&self.startup_gate);
         let spawn = std::thread::Builder::new()
             .name("effetune-load".into())
             .spawn(move || {
@@ -1430,6 +1442,7 @@ impl EffetuneController {
                         gui_failure_tx,
                         host_tx,
                         repaint_context.clone(),
+                        startup_gate,
                     )
                 });
                 let _ = tx.send(result);
@@ -1682,6 +1695,7 @@ fn load_worker(
     gui_failure_tx: mpsc::Sender<GuiFailure>,
     host_tx: mpsc::Sender<HostCommand>,
     repaint_context: Arc<Mutex<Option<egui::Context>>>,
+    startup_gate: Arc<startup::HostStartupGate>,
 ) -> Result<Option<LoadDone>, EffetuneFailure> {
     let saved = match fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -1696,7 +1710,10 @@ fn load_worker(
             "saved state is empty".into(),
         ));
     }
-    let bridge = new_bridge();
+    let bridge = DspBridge::new_for_miv_sound_with_startup_gate(
+        crate::data_dir::get().join("effetune"),
+        startup_gate,
+    );
     bridge.set_gui_failure_sink(gui_failure_tx.clone());
     let gui_repaint = Arc::clone(&repaint_context);
     bridge.set_gui_result_wake(Arc::new(move || wake_ui(&gui_repaint)));

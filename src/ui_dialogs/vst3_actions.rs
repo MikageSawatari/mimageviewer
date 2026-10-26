@@ -249,7 +249,9 @@ impl App {
     }
 
     fn kick_off_vst3_chain_rebuild_impl(&mut self, snapshot_runtime: bool) {
-        if !self.settings.vst3_enabled {
+        // While migration owns the shared legacy WebView profile, retain only
+        // the latest settings. Its terminal continuation loads that chain once.
+        if self.audio_plugin_migration.waiting() || !self.settings.vst3_enabled {
             return;
         }
         if snapshot_runtime {

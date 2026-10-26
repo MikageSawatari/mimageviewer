@@ -282,6 +282,58 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
 - 2026-10-24 に ClaudeCode が利用者へ「DAW やデスクトップ版とのプリセット共有はなくなる。リリース済みの挙動の変更なので、
   マニュアルと更新履歴に書く」と説明し、利用者は保存先を分ける方針で進めると回答した (§11 に記録)。更新履歴・マニュアル・privacy.html に書く。
 
+### 5.7 F2b-1 の実装と検証の入口
+
+- `src/effetune/migration.rs`: `MigrationRequest` の source_root・destination・mode を受け取る一度だけの移行。
+  印の判定、JSON のファイル単位コピーと検証、プリセットの一方のフォルダ選択、WebView の正確な除外、
+  作成したコピーだけの後始末を所有する。既存の移行先 plugin/webview は上書き・削除しない。
+  原本を保護するため reparse point と移行元・先の重なりを拒否する。
+- `src/effetune/migration/windows.rs`: 既存 lockfile の非破壊・共有なし open、無い lockfile の create_new /
+  delete-on-close、Toolhelp でのプロセス列挙、コマンドラインと利用者 SID の照会、保持ハンドルによる共有5秒の終了待ち。
+  mIV/host の一覧は診断だけに使い、移行可否の根拠にはしない。
+- `src/effetune/startup.rs` の `StartupMigration` が App ごとに一度だけ worker を開始し、UI は channel の終端結果だけを採用する。
+  `HostStartupGate` はその判断を background の bridge にも公開する。未判断中は両方を禁止し、成功後は両方、失敗後はユーザー VST だけを許す。
+  `App::start_audio_plugins_after_migration` は結果の採用後だけ呼ぶ。再試行は次の起動。
+- 起動入口の点検: 自動ロードは `kick_off_vst3_startup_load`、設定適用・プリセット変更は
+  `kick_off_vst3_chain_rebuild_impl`、音響調整の手動・自動・再読込は `EffetuneController::start_load` に集まる。
+  未判断中の VST 設定変更は保存した最新設定だけを終端 continuation が読み込む。専用の操作キューは作らず、組み合わせを減らす。
+  設定画面のスキャンは同じ gate で実行ボタンを無効にする。`DspBridge::enable` と `add_plugin_with_load_timeout` も gate を検査する。
+  ローカル再生と Remote は同じ App の bridge / 音響調整 slot を共有し、独自に host を起こさない。
+  終端の結果から後続 loader が始まらない場合も、保留した動画・音声を既存の context ごとの再開経路へ返す。
+  sidecar 復旧中はこの結果採用・初回表示の再開を保留する。
+- 検証用 build（`test-script` feature）だけに `--miv-sound-migration-source <仮APPDATA>` を設ける。
+  明示した隔離 `--data-dir` が必要で、通常の APPDATA / mIV データと重なる指定を拒否する。
+  `src/effetune/startup/path_identity.rs` が実在祖先を解決し、verbatim・短縮名・junction 等の別名も通常データとして照合する。
+  `--miv-sound-migrate-only` は App・設定・WebView2 を作る前に本実装の移行だけを実行し、結果を JSONL で返す。
+  `--miv-sound-migration-checkpoints` はこの単独検証専用。lock 保持中の競合試験に使い、待ち切れは移行失敗として扱う。
+  GUI の検証入口でも §5.1 の別フォルダの判断は維持するため、取り込みの確認には旧版の検証素材から得た
+  `effetune/mixwright-state.json` を隔離 data-dir に用意する（普段の設定・保存データを検査用に流用しない）。
+  汎用 WebView2 probe の migrate-only は、プラグインを起動しないので合成した使用済みの印だけを用意する。
+- 合成データと差し替え backend の回帰は `src/effetune/migration/tests.rs`、App の入口は
+  `src/app/tests/audio_plugin_migration.rs`。実物の WebView2 は
+  [probe の本実装検証手順](../tools/webview2-lockfile-probe/README.md#production-migration) で、ClaudeCode が外で実行する。
+  合成テストは実物の保存・再読込や旧版プラグインのデータ互換の受け入れを代替しない。
+  まれな失敗は割り切り（ログ＋通知）。原本と既存の保存済み状態は残す。
+
+残る終了時の設計判断: 移行 worker のコピー中に通常の終了を許すと、印の無い部分コピーが残り、
+既存の plugin/webview を保護する検査で次回の移行も止まる。通常の終了操作はまれな障害として扱わない。
+既存の root 終了受付で移行の終端まで終了を保留するか、即時終了を保って部分コピーの所有記録と次回回収を設けるかを、
+設計担当が選ぶ必要がある。未解決のまま F2b-1 を受け入れ完了にしない。
+
+旧版素材の範囲（F2b-1 のソース比較）:
+
+- v0.12.0〜v0.15.0 の `src/bridge/config_store.cpp` と `preset_store.cpp` は同一。
+  SFZ は v0.12 には無く、v0.13 の参照に v0.14 で任意の bankPaths/importedAt が加わり、v0.15 は同じ。
+  派生版の `docs/json-storage-compatibility.md` と JSON 保存互換テストがこの読み込み・再保存を扱う。
+  mIV のコピー処理は形式を書き換えない。
+- WebView の保存器では `visualizer-preset-store.js` と測定の `dataStorage.js` が全版同一。
+  IR は v0.12→v0.13 で保存先の名前空間の指定が加わるが、既定の `ir-library` と形式は同じ。
+  一方 `visualizer-model.js` の正規化は各版で変わっており、Notes の旧パラメーター、アナログメーターの既定値や
+  新しい種類の追加がある。したがって、§5.5 の「変わっていなければ v0.14 の素材で代える」を旧版全体へ適用できない。
+  v0.12/v0.13 の版に対応した素材・正規化の確認と、隔離保存先・Close 修正を持つ検証用ビルドでの確認は別途必要。
+- 本実装を使う汎用 WebView2 コピー試験は、旧プラグインが生成した Visualizer・IR・測定の実素材の受け入れを代替しない。
+  この段の合成検証の成功だけで §5.5 全体を完了としない。
+
 ## 6. ポータブル版での有効化
 
 - 配布物: 署名済みの `mimageviewer-vst3-host.exe` と、**プラグインの DLL に署名した** `<NAME>.vst3` をポータブル版の zip に入れる
