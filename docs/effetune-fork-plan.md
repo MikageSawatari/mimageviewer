@@ -734,7 +734,7 @@ ClaudeCode が根拠を読み、3 件を妥当と判断して第 8 版に反映�
 
 - 道具: `tools/webview2-lockfile-probe/run-migration.ps1`。検証用ビルド (build-dev -TestScript、候補 `dcdfa794…`) の移行専用の入口
   (`--miv-sound-migrate-only`、偽の APPDATA と隔離 data-dir) で製品の移行処理を動かす。実行は ClaudeCode (サンドボックスの外)。
-  記録: `target\wma8de268`、`4f6cc980`、`703e2167` (3 回)。利用者の `%APPDATA%` は変わらず、WerFault は 0。
+  記録: `target\wm\aa8de268`、`4f6cc980`、`703e2167` (3 回)。利用者の `%APPDATA%` は変わらず、WerFault は 0。
 - 3 回とも成り立ったこと:
   - 移行元のブラウザが終了の途中 (lockfile を手放した後も生きている) のときに本実装が lockfile を取り、そのプロセスの終了をハンドルで待ってから写した
     (例: 取得 273 ms、PID の待ち 288→290 ms、全体の待ち終了 312 ms)。
