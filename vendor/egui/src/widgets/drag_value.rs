@@ -516,6 +516,7 @@ impl Widget for DragValue<'_> {
 
         if old_value != value {
             set(&mut get_set_value, value);
+            value = get(&mut get_set_value);
             ui.data_mut(|data| data.remove::<EditState>(id));
         }
 
@@ -529,14 +530,12 @@ impl Widget for DragValue<'_> {
 
         let text_style = ui.style().drag_value_text_style.clone();
 
-        if ui.memory(|mem| mem.lost_focus(id)) {
+        if ui.memory(|mem| mem.lost_focus(id)) && !ui.input(|i| i.key_pressed(Key::Escape)) {
             let edit_state = ui.data_mut(|data| data.remove_temp::<EditState>(id));
             // Ignore the text if the value was changed by something else while we were editing it,
             // or we would revert that change.
             if let Some(value_text) = edit_state
-                .filter(|edit_state| {
-                    edit_state.value == old_value && !ui.input(|i| i.key_pressed(Key::Escape))
-                })
+                .filter(|edit_state| edit_state.value == old_value)
                 .map(|edit_state| edit_state.text)
             {
                 // We were editing the value as text last frame, but lost focus.
@@ -598,12 +597,7 @@ impl Widget for DragValue<'_> {
                 text: value_text,
                 value: get(&mut get_set_value),
             };
-            // A finished edit has already been committed or cancelled above. In
-            // particular, do not leave cancelled text for the next frame's
-            // lost-focus path to commit after the Escape event is gone.
-            if !response.lost_focus() {
-                ui.data_mut(|data| data.insert_temp(id, edit_state));
-            }
+            ui.data_mut(|data| data.insert_temp(id, edit_state));
             response
         } else {
             atoms.map_atoms(|atom| {

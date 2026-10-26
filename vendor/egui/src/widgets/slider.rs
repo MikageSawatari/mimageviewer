@@ -200,8 +200,7 @@ impl<'a> Slider<'a> {
     ///
     /// Default: `0.0` (disabled).
     ///
-    /// With a step, text edits are applied and rounded only on Enter or focus loss.
-    /// Dragging and arrow-key increments still use the step immediately.
+    /// Text edits are applied immediately by default, while preserving the typed text.
     #[inline]
     pub fn step_by(mut self, step: f64) -> Self {
         self.core.step = if step == 0.0 { None } else { Some(step) };
@@ -512,8 +511,6 @@ impl<'a> Slider<'a> {
     ///
     /// Default: `true`.
     /// If `false`, the value will only be updated when user presses enter or deselects the value.
-    /// Sliders with a step (including integer sliders) always wait for text editing to finish,
-    /// so rounding cannot replace an unfinished number.
     #[inline]
     pub fn update_while_editing(mut self, update: bool) -> Self {
         self.core.drag_value.format = self.core.drag_value.format.update_while_editing(update);
@@ -578,23 +575,27 @@ impl Slider<'_> {
     }
 
     fn value_ui(&mut self, ui: &mut Ui, geom: &SliderGeometry) -> Response {
-        let mut value = self.get_value();
+        let value = self.get_value();
         let speed = self.core.drag_value_speed_at(ui, geom, value);
         let bounds = self.core.editable_range();
-        // DragValue's edit state belongs to the unrounded local value. Publishing each
-        // keystroke through set_value would round it, making the next frame look like
-        // an external change and discarding the user's text (e.g. "2" -> "0").
-        // Use its existing commit/cancel handling instead; dragging and arrow keys
-        // are independent of update_while_editing and still apply immediately.
-        if self.core.step.is_some() {
-            self.core.drag_value.format.update_while_editing = false;
-        }
-        let response = self.core.drag_value_ui(ui, &mut value, bounds, speed);
-
-        if value != self.get_value() {
-            self.set_value(value);
-        }
-        response
+        let core = &self.core;
+        let get_set_value = &mut self.get_set_value;
+        // Normalize inside the same get/set boundary DragValue observes. Its edit
+        // state must remember the stored value, not an unrounded local copy, or
+        // our own rounding would look like an external edit on the next frame.
+        core.drag_value_from_get_set_ui(
+            ui,
+            |new_value| {
+                if let Some(new_value) = new_value
+                    && new_value != core.existing(get(get_set_value))
+                {
+                    set(get_set_value, core.rounded(new_value));
+                }
+                core.existing(get(get_set_value))
+            },
+            bounds,
+            speed,
+        )
     }
 
     fn add_contents(&mut self, ui: &mut Ui) -> Response {

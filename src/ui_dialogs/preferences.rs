@@ -4231,6 +4231,157 @@ pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn section1445_cache_text_survives_direct_tree_switch_and_ok() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.cache_policy = crate::settings::CachePolicy::Auto;
+        app.settings.cache_threshold_ms = 60;
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 900.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run_steps(3);
+        let label = "時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):";
+        let slider_rect = harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, label)
+            .rect();
+        let editor = harness
+            .query_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Auto cache time editor missing; slider={slider_rect:?}; numeric nodes={:#?}",
+                    harness
+                        .get_all_by_role(egui::accesskit::Role::SpinButton)
+                        .collect::<Vec<_>>()
+                )
+            });
+        let editor_rect = editor.rect();
+        assert!(
+            editor_rect.left() >= slider_rect.right()
+                && editor_rect.top() <= slider_rect.bottom()
+                && slider_rect.top() <= editor_rect.bottom(),
+            "named editor must be beside its slider: slider={slider_rect:?}, editor={editor_rect:?}"
+        );
+        editor.click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("2".into()));
+        harness.run_steps(2);
+        harness.event(egui::Event::Text("5".into()));
+        harness.run_steps(2);
+
+        // draw_tree switches the page before the old numeric editor is drawn.
+        harness.get_by_label("全体設定").click();
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().pref_state.as_ref().unwrap().selected,
+            PreferencesPage::General
+        );
+        harness.get_by_label("    キャッシュ").click();
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .cache_threshold_ms,
+            25
+        );
+        assert_eq!(harness.state().settings.cache_threshold_ms, 60);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().pref_state.is_none());
+        assert_eq!(harness.state().settings.cache_threshold_ms, 25);
+    }
+
+    #[test]
+    fn section1445_gpu_partial_text_changes_only_draft_until_ok_and_cancel_discards() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gpu_memory_percent = 50;
+        app.open_preferences_page(PreferencesPage::GpuMemory);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 900.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run_steps(3);
+        let live_budget = harness.state().vram_pool_budget();
+        harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("2".into()));
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .gpu_memory_percent,
+            0,
+            "the first digit follows the released live-rounding behavior in the draft"
+        );
+        assert_eq!(harness.state().settings.gpu_memory_percent, 50);
+        assert_eq!(harness.state().vram_pool_budget(), live_budget);
+        harness.event(egui::Event::Text("5".into()));
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .gpu_memory_percent,
+            25
+        );
+        assert_eq!(harness.state().vram_pool_budget(), live_budget);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(2);
+        assert!(harness.state().show_preferences_discard_confirm);
+        // The existing confirmed-discard handler owns dropping the draft.
+        harness.state_mut().discard_preferences_dialog();
+        assert!(harness.state().pref_state.is_none());
+        assert_eq!(harness.state().settings.gpu_memory_percent, 50);
+        assert_eq!(harness.state().vram_pool_budget(), live_budget);
+
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::GpuMemory);
+        harness.run_steps(3);
+        harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("25".into()));
+        harness.run_steps(2);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.gpu_memory_percent, 25);
+        assert_eq!(
+            harness.state().vram_pool_budget(),
+            crate::vram_budget::VramPoolBudget::from_percent(
+                25,
+                harness.state().vram_budget_mode(),
+            )
+        );
+    }
+
     fn preferences_append_receipt(
         app: &crate::app::AppTestEnvForTest,
     ) -> crate::book_append_undo::BookAppendUndoReceipt {

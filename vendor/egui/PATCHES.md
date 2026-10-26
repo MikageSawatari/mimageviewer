@@ -221,33 +221,28 @@ Subsequent no-paint updates/free-only delivery and font reload remain supported.
 The Context regression checks pre-Full whole/partial/free ownership, real font
 definition changes, and no duplicate delivery. See the stage-7 startup ledger.
 
-## §1.445: stepped Slider text commit boundary (2026-10-26)
+## Section 1.445: preserve live Slider edits through normalization (2026-10-26)
 
-- `src/widgets/slider.rs`: stepped sliders use DragValue's existing deferred
-  text-edit mode. Typed text stays private until Enter or focus loss; only then
-  does Slider apply its step rounding. Integer sliders have an implicit step of
-  one and follow the same rule. Dragging, arrow-key increments, and accessibility
-  increments remain immediate. Sliders without a step retain live text updates.
-- The old local-value bridge let DragValue store `EditState.value = 2`, then
-  Slider rounded storage to 0. On the next frame DragValue's external-change
-  check discarded the text. egui 0.33.3 stored only a String and did not discard
-  it this way. That check was introduced by upstream
-  [#8403](https://github.com/emilk/egui/pull/8403), merge commit
-  `d802a982ce959839d92f4f6718fdffa41143110e`, included in 0.36.2.
-  The external-change check itself remains intact.
-- Passive `Always` clamping of stepped sliders clamps the existing value without
-  step snapping, preserving existing off-grid settings. Sliders without a step
-  retain their existing decimal rounding as well as live updates. No settings
-  migration or application-specific workaround is added.
-- `src/widgets/drag_value.rs`: remove finished edit state after commit/cancel,
-  including the lost-focus path. Otherwise Escape could leave text to be
-  committed on the next frame, after the Escape event was gone.
-- `src/widgets/slider_tests.rs`: headless Context input regressions cover
-  digit-by-digit values, partial-value isolation, commit/cancel, deletion/caret,
-  paste/clamping, off-grid storage, rail drag/arrows, numeric arrows, siblings,
-  external changes, implicit integer steps and standalone deferred DragValue.
-  A click-frame check ensures an apply button sees the committed value before
-  closing the UI, without requiring another frame.
+The deferred-edit patch in 4d7b1b0ea was rejected: callers rely on live values
+before changing adjustment scope, replacing a settings page, or painting a mask.
+That change and its additional Escape cleanup have been withdrawn.
 
-Evidence, scope limits and verification commands are recorded in
-[`docs/section445-stepped-slider-input.md`](../../docs/section445-stepped-slider-input.md).
+- Slider passes a get/set closure to DragValue instead of a local f64 bridge.
+  The setter applies existing SliderCore rounding; the getter returns the same
+  effective value as Slider::get_value. EditState remembers what the next frame
+  will read, including rounding, clamping and storage conversion. User text is
+  kept while the rounded value is applied immediately.
+- The #8403 external-change comparison remains intact. Changes made by other
+  code still invalidate the text. Upstream introduced it in
+  d802a982ce959839d92f4f6718fdffa41143110e, included in egui 0.36.2.
+- Equal-value writes are skipped; passive stepped-slider clamping does not snap
+  untouched off-grid settings. Existing non-step decimal rounding remains.
+- DragValue reads storage back after numeric operations before generating their
+  display text (arrows/AccessKit); typed text is not reformatted this way.
+- SliderCore shares number-field configuration through a get/set helper.
+  No new pending state or application-side ordering change is introduced.
+- Widget tests cover live text, external changes, storage conversion, off-grid
+  values, numeric-operation text and changed flags. Application tests use actual
+  panels/handlers for scope, preferences navigation/draft budget and erase input.
+
+Evidence: [docs/section445-stepped-slider-input.md](../../docs/section445-stepped-slider-input.md).

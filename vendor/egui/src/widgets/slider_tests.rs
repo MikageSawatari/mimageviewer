@@ -7,7 +7,9 @@ use core::ops::RangeInclusive;
 
 enum WidgetKind {
     Slider(Option<f64>),
-    DeferredDragValue,
+    LiveDragValue,
+    CustomRoundedSlider,
+    FixedDecimalsSlider,
 }
 
 struct InputTest<Num: Numeric> {
@@ -63,11 +65,21 @@ impl<Num: Numeric> InputTest<Num> {
                         }
                         ui.add(slider)
                     }
-                    WidgetKind::DeferredDragValue => ui.add(
-                        crate::DragValue::new(&mut self.value)
-                            .range(self.range.clone())
-                            .update_while_editing(false),
+                    WidgetKind::LiveDragValue => {
+                        ui.add(crate::DragValue::new(&mut self.value).range(self.range.clone()))
+                    }
+                    WidgetKind::CustomRoundedSlider => ui.add(
+                        Slider::from_get_set(0.0..=100.0, |new_value| {
+                            if let Some(new_value) = new_value {
+                                self.value = Num::from_f64((new_value * 2.0).round() / 2.0);
+                            }
+                            self.value.to_f64()
+                        })
+                        .step_by(0.1),
                     ),
+                    WidgetKind::FixedDecimalsSlider => {
+                        ui.add(Slider::new(&mut self.value, self.range.clone()).fixed_decimals(1))
+                    }
                 };
                 self.rect = response.rect;
                 if self.rail_id == Id::NULL {
@@ -156,10 +168,14 @@ fn stepped_slider_accepts_digits_separately() {
     for (text, expected) in [("25", 25), ("50", 50), ("80", 80), ("100", 100)] {
         let mut test = InputTest::new(60);
         test.edit();
+        let mut prefix = String::new();
         for digit in text.chars() {
+            prefix.push(digit);
             test.type_text(&digit.to_string());
-            assert_eq!(test.value, 60, "unfinished {text}");
-            assert!(!test.changed);
+            let expected_partial = ((prefix.parse::<f64>().unwrap() / 5.0).round() * 5.0) as u32;
+            assert_eq!(test.value, expected_partial, "live {prefix}");
+            test.frame(vec![]);
+            test.assert_text(&prefix);
         }
         test.frame(vec![]);
         test.assert_text(text);
@@ -170,38 +186,41 @@ fn stepped_slider_accepts_digits_separately() {
 }
 
 #[test]
-fn stepped_slider_does_not_publish_partial_text() {
+fn stepped_slider_publishes_rounded_values_without_replacing_text() {
     let mut test = InputTest::new(60);
     test.edit();
     test.type_text("2");
     assert_eq!(
-        test.value, 60,
-        "an unfinished 2 must not publish unlimited (0)"
+        test.value, 0,
+        "live rounding matches egui 0.33; the preferences owner holds the draft"
     );
-    assert!(!test.changed);
+    assert!(test.changed);
+    test.frame(vec![]);
+    test.assert_text("2");
     test.type_text("5");
-    assert_eq!(test.value, 60);
-    test.key(Key::Enter);
     assert_eq!(test.value, 25);
     assert!(test.changed);
+    test.frame(vec![]);
+    test.assert_text("25");
 }
 
 #[test]
-fn stepped_slider_commits_on_focus_loss() {
+fn stepped_slider_focus_loss_preserves_live_value() {
     let mut test = InputTest::new(60);
     test.edit();
     test.type_text("27");
     test.assert_text("27");
-    assert_eq!(test.value, 60);
+    assert_eq!(test.value, 25);
     test.click(test.other_rect.center());
     assert_eq!(test.value, 25);
 }
 
 #[test]
-fn stepped_slider_commits_before_an_apply_button_closes_the_ui() {
+fn stepped_slider_value_is_live_before_an_apply_button_closes_the_ui() {
     let mut test = InputTest::new(60);
     test.edit();
     test.type_text("25");
+    assert_eq!(test.value, 25);
     let pos = test.other_rect.center();
     test.frame(vec![
         Event::PointerMoved(pos),
@@ -237,20 +256,20 @@ fn stepped_slider_deletion_and_caret_edits() {
     test.key(Key::Delete);
     test.type_text("5");
     test.assert_text("50");
-    assert_eq!(test.value, 60);
+    assert_eq!(test.value, 50);
     test.key(Key::Enter);
     assert_eq!(test.value, 50);
 }
 
 #[test]
-fn stepped_slider_escape_discards_text() {
+fn stepped_slider_escape_does_not_undo_live_values() {
     let mut test = InputTest::new(60);
     test.edit();
     test.type_text("2");
     test.key(Key::Escape);
     test.frame(vec![]);
     test.click(test.other_rect.center());
-    assert_eq!(test.value, 60);
+    assert_eq!(test.value, 0);
     test.edit();
     test.type_text("80");
     test.key(Key::Enter);
@@ -268,7 +287,7 @@ fn stepped_slider_explicit_zero_endpoints_paste_and_clamp() {
             } else {
                 test.type_text(text);
             }
-            assert_eq!(test.value, 60);
+            assert_eq!(test.value, expected);
             test.key(Key::Enter);
             test.frame(vec![]);
             assert_eq!(test.value, expected, "{text}, paste={paste}");
@@ -288,9 +307,7 @@ fn stepped_slider_preserves_untouched_off_grid_value() {
     test.frame(vec![]);
     assert_eq!(test.value, 27);
     test.edit();
-    test.type_text("2");
-    test.key(Key::Escape);
-    test.frame(vec![]);
+    test.click(test.other_rect.center());
     assert_eq!(test.value, 27);
 }
 
@@ -350,7 +367,7 @@ fn stepped_slider_sibling_ranges_keep_partial_text() {
         test.edit();
         test.type_text(text);
         test.assert_text(text);
-        assert_eq!(test.value, initial);
+        assert!((test.value - expected).abs() < 1e-10);
         test.key(Key::Enter);
         assert!(
             (test.value - expected).abs() < 1e-10,
@@ -389,6 +406,8 @@ fn stepped_slider_external_change_invalidates_pending_text() {
         test.edit();
         test.type_text("25");
         test.value = 80; // e.g. a reset button or another control of the same value.
+        test.frame(vec![]);
+        test.assert_text("80");
         if blur {
             test.click(test.other_rect.center());
         } else {
@@ -400,43 +419,139 @@ fn stepped_slider_external_change_invalidates_pending_text() {
 }
 
 #[test]
-fn stepped_slider_arrow_replaces_pending_text() {
+fn stepped_slider_arrow_uses_live_value() {
     let mut test = InputTest::new(60);
     test.edit();
     test.type_text("2");
     test.key(Key::ArrowUp);
-    assert_eq!(test.value, 65);
+    assert_eq!(test.value, 5);
     test.frame(vec![]);
-    test.assert_text("65");
+    test.assert_text("5");
     test.key(Key::Enter);
     test.frame(vec![]);
-    assert_eq!(test.value, 65);
+    assert_eq!(test.value, 5);
 }
 
 #[test]
-fn integer_slider_implicit_step_defers_text() {
+fn integer_slider_implicit_step_keeps_live_updates() {
     let mut test = InputTest::new(60);
     test.kind = WidgetKind::Slider(None); // integer() supplies the implicit step of 1.
     test.frame(vec![]);
     test.edit();
     test.type_text("25");
-    assert_eq!(test.value, 60);
+    assert_eq!(test.value, 25);
     test.key(Key::Enter);
     assert_eq!(test.value, 25);
 }
 
 #[test]
-fn deferred_drag_value_cancel_and_commit() {
-    for key in [Key::Escape, Key::Enter] {
-        let mut test = InputTest::new(60);
-        test.kind = WidgetKind::DeferredDragValue;
-        test.frame(vec![]);
-        test.edit();
-        test.type_text("2");
-        assert_eq!(test.value, 60);
-        test.key(key);
-        test.frame(vec![]);
-        test.click(test.other_rect.center());
-        assert_eq!(test.value, if key == Key::Escape { 60 } else { 2 });
-    }
+fn standalone_drag_value_keeps_live_updates_and_external_change_detection() {
+    let mut test = InputTest::new(60);
+    test.kind = WidgetKind::LiveDragValue;
+    test.frame(vec![]);
+    test.edit();
+    test.type_text("25");
+    assert_eq!(test.value, 25);
+    test.frame(vec![]);
+    test.assert_text("25");
+    test.value = 80;
+    test.frame(vec![]);
+    test.assert_text("80");
+    test.key(Key::Enter);
+    assert_eq!(test.value, 80);
+}
+
+#[test]
+fn stepped_slider_off_grid_arrow_text_uses_stored_value() {
+    let mut test = InputTest::new(27);
+    test.edit();
+    test.key(Key::ArrowUp);
+    assert_eq!(test.value, 30);
+    test.assert_text("30");
+    test.frame(vec![]);
+    test.assert_text("30");
+    test.key(Key::ArrowDown);
+    assert_eq!(test.value, 25);
+    test.assert_text("25");
+}
+
+#[test]
+fn stepped_slider_changed_tracks_effective_value() {
+    let mut test = InputTest::new(25);
+    test.edit();
+    test.frame(vec![Event::Text("26".into())]);
+    assert_eq!(test.value, 25);
+    assert!(!test.changed);
+    test.frame(vec![]);
+    test.assert_text("26");
+}
+
+#[test]
+fn slider_f32_and_custom_storage_rounding_preserve_text() {
+    let mut float = InputTest::with_range(1.0_f32, 0.0..=2.0, 0.1);
+    float.edit();
+    float.type_text("1.23");
+    float.frame(vec![]);
+    float.assert_text("1.23");
+    assert!((float.value - 1.2).abs() < 1e-6);
+
+    let mut custom = InputTest::with_range(1.0_f64, 0.0..=100.0, 0.1);
+    custom.kind = WidgetKind::CustomRoundedSlider;
+    custom.frame(vec![]);
+    custom.edit();
+    custom.type_text("0.36");
+    custom.frame(vec![]);
+    custom.assert_text("0.36");
+    assert_eq!(custom.value, 0.5);
+    custom.value = 80.0;
+    custom.frame(vec![]);
+    custom.assert_text("80");
+}
+
+#[test]
+fn slider_own_clamp_at_non_aligned_endpoint_preserves_text() {
+    let mut test = InputTest::with_range(60_u32, 0..=98, 5.0);
+    test.edit();
+    test.type_text("98");
+    test.frame(vec![]); // Existing Always clamping brings the rounded endpoint back into range.
+    assert_eq!(test.value, 98);
+    test.assert_text("98");
+    test.type_text("0");
+    test.frame(vec![]);
+    test.assert_text("980");
+    assert_eq!(test.value, 98);
+}
+
+#[test]
+fn slider_without_step_preserves_text_across_decimal_rounding() {
+    let mut test = InputTest::with_range(1.0_f64, 0.0..=100.0, 0.0);
+    test.kind = WidgetKind::FixedDecimalsSlider;
+    test.frame(vec![]);
+    test.edit();
+    test.type_text("1.234");
+    test.frame(vec![]);
+    test.assert_text("1.234");
+    assert_eq!(test.value, 1.2);
+    test.value = 3.5;
+    test.frame(vec![]);
+    test.assert_text("3.5");
+}
+
+#[test]
+fn stepped_slider_accessibility_set_value_displays_stored_value() {
+    let mut test = InputTest::new(27);
+    test.edit();
+    let target = test.ctx.memory(|mem| mem.focused().unwrap());
+    test.frame(vec![Event::AccessKitActionRequest(
+        crate::accesskit::ActionRequest {
+            action: crate::accesskit::Action::SetValue,
+            target_tree: crate::accesskit::TreeId::ROOT,
+            target_node: target.accesskit_id(),
+            data: Some(crate::accesskit::ActionData::NumericValue(32.0)),
+        },
+    )]);
+    assert_eq!(test.value, 30);
+    test.assert_text("30");
+    test.frame(vec![]);
+    test.assert_text("30");
 }
