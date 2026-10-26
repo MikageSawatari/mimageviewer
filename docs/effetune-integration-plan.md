@@ -1,7 +1,7 @@
 # EffeTune (Mixwright) 組み込み — サンプル版設計
 
 現在の派生版への変更は [派生版計画](effetune-fork-plan.md) 第8版が正本。
-F2a のビルド・候補確認・承認・配布の検査と bridge の保存先は [F2a 引き継ぎ](miv-sound-f2a-handoff.md)。
+F2a のビルド・候補確認・承認・配布の検査と bridge の保存先は [mIV Sound のビルド](miv-sound-build.md)。
 以下のサンプル版・出荷済み Mixwright の経緯は履歴として保持する。
 現在の同梱名・版・manifest root は `config/miv-sound.rs` から読む。
 音響調整の bridge だけが `MIV_SOUND_DATA_DIR=<data_dir>/effetune` を受け、WebView2 の外部 override を除去する。
@@ -389,7 +389,7 @@ enum EffectiveState {
 
 ## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
-派生版の現行手順は [F2a §ビルド・確認・承認](miv-sound-f2a-handoff.md#ビルド確認承認)。
+派生版の現行手順は [mIV Sound のビルド・確認・承認](miv-sound-build.md#build-verify-approve)。
 `vendor/miv-sound` の承認原本と `third_party/miv-sound/<ver>` のmanifestを使い、署名時も原本を変更しない。
 
 - `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.14.0、未署名)。
@@ -517,7 +517,7 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 
 ## 10. 決定済みの配布方針と残る対象外事項
 
-以下の出荷済み版の記録に対し、次版の同梱・承認は [F2a 手順](miv-sound-f2a-handoff.md) を使う。
+以下の出荷済み版の記録に対し、次版の同梱・承認は [mIV Sound のビルド](miv-sound-build.md) を使う。
 上流ZIPを vendor へ置く手順ではなく、派生版の候補IDを確認してから明示承認する。
 portable の解禁は F4 で行う（F2a では既存の制限を維持）。
 

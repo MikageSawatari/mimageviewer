@@ -75,39 +75,48 @@ function Get-SoundBuildBundle {
 }
 
 function Write-SoundCTestRecord {
-    param([object] $Item, [string] $Log)
+    param([object] $Item, [string] $Log, [string] $ContractHash)
     $logPath = Join-Path $Item.Root 'ctest.log'
     [IO.File]::WriteAllText($logPath, $Log, $utf8)
-    $evidence = [ordered]@{ candidate = $Item.Record.id; passed = $true; command = 'ctest --preset windows-release --output-on-failure'; utc = [DateTime]::UtcNow.ToString('o'); log_sha256 = (Get-FileHash -LiteralPath $logPath -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $evidence = [ordered]@{ candidate = $Item.Record.id; build_contract_sha256 = $ContractHash; passed = $true; command = 'ctest --preset windows-release --output-on-failure'; utc = [DateTime]::UtcNow.ToString('o'); log_sha256 = (Get-FileHash -LiteralPath $logPath -Algorithm SHA256).Hash.ToLowerInvariant() }
     [IO.File]::WriteAllText((Join-Path $Item.Root 'ctest.json'), ($evidence | ConvertTo-Json), $utf8)
+}
+
+function Invoke-SoundCandidateCTest {
+    param([object] $Item)
+    $contractHash = Assert-SoundBuildContract $Item
+    $source = $item.Record.source_root
+    $identity = Get-SoundSourceIdentity $source
+    if (($identity | ConvertTo-Json -Compress) -cne ($item.Record.provenance.identity | ConvertTo-Json -Compress)) { throw '[miv-sound] Candidate source identity changed' }
+    # Do not rebuild: test exactly the binaries copied into this candidate.
+    $bundleEntries = Get-MivSoundInventory (Get-SoundBuildBundle $source)
+    foreach ($name in $bundleEntries.Keys) {
+        if ($item.Entries[$MivSound.BUNDLE_NAME + '/' + $name] -cne $bundleEntries[$name]) { throw '[miv-sound] Build output differs from candidate' }
+    }
+    if ($bundleEntries.Count + 1 -ne $item.Entries.Count) { throw '[miv-sound] Build output file set changed' }
+    $cmake = $item.Record.provenance.tools.cmake_path
+    Push-Location $source
+    try {
+        $savedPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $log = & (Join-Path (Split-Path $cmake) 'ctest.exe') --preset windows-release --output-on-failure 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $savedPreference; Pop-Location }
+    Write-Host $log
+    if ($code -ne 0 -or $log -notmatch '100% tests passed, 0 tests failed out of [1-9][0-9]*') { throw '[miv-sound] ctest did not pass' }
+    if ((Get-SoundSourceIdentity $source | ConvertTo-Json -Compress) -cne ($identity | ConvertTo-Json -Compress)) { throw '[miv-sound] Source changed during ctest' }
+    $after = Get-MivSoundInventory (Get-SoundBuildBundle $source)
+    if ((Get-MivSoundManifestText $after) -cne (Get-MivSoundManifestText $bundleEntries)) { throw '[miv-sound] Build output changed during ctest' }
+    if ((Assert-SoundBuildContract $item) -cne $contractHash) { throw '[miv-sound] Build/test contract changed during ctest' }
+    $testCount = @($item.Record.provenance.build_contract.selected_tests).Count
+    if ($log -notmatch ("100% tests passed, 0 tests failed out of " + $testCount + '(?![0-9])')) { throw '[miv-sound] ctest did not run the complete candidate test inventory' }
+    Write-SoundCTestRecord $item $log $contractHash
 }
 
 if ($Approve -or $TestCandidate) {
     $item = Read-MivSoundCandidate -RepoRoot $repo -Candidate $Candidate
     if ($TestCandidate) {
-        $source = $item.Record.source_root
-        $identity = Get-SoundSourceIdentity $source
-        if (($identity | ConvertTo-Json -Compress) -cne ($item.Record.provenance.identity | ConvertTo-Json -Compress)) { throw '[miv-sound] Candidate source identity changed' }
-        # Do not rebuild: test exactly the binaries copied into this candidate.
-        $bundleEntries = Get-MivSoundInventory (Get-SoundBuildBundle $source)
-        foreach ($name in $bundleEntries.Keys) {
-            if ($item.Entries[$MivSound.BUNDLE_NAME + '/' + $name] -cne $bundleEntries[$name]) { throw '[miv-sound] Build output differs from candidate' }
-        }
-        if ($bundleEntries.Count + 1 -ne $item.Entries.Count) { throw '[miv-sound] Build output file set changed' }
-        $cmake = $item.Record.provenance.tools.cmake_path
-        Push-Location $source
-        try {
-            $savedPreference = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            $log = & (Join-Path (Split-Path $cmake) 'ctest.exe') --preset windows-release --output-on-failure 2>&1 | Out-String
-            $code = $LASTEXITCODE
-        } finally { $ErrorActionPreference = $savedPreference; Pop-Location }
-        Write-Host $log
-        if ($code -ne 0 -or $log -notmatch '100% tests passed, 0 tests failed out of [1-9][0-9]*') { throw '[miv-sound] ctest did not pass' }
-        if ((Get-SoundSourceIdentity $source | ConvertTo-Json -Compress) -cne ($identity | ConvertTo-Json -Compress)) { throw '[miv-sound] Source changed during ctest' }
-        $after = Get-MivSoundInventory (Get-SoundBuildBundle $source)
-        if ((Get-MivSoundManifestText $after) -cne (Get-MivSoundManifestText $bundleEntries)) { throw '[miv-sound] Build output changed during ctest' }
-        Write-SoundCTestRecord $item $log
+        Invoke-SoundCandidateCTest $item
         exit 0
     }
     Approve-MivSoundCandidate -RepoRoot $repo -Candidate $Candidate -BackupRoot 'C:\home\mimageviewer_vendor_backup'
@@ -119,9 +128,9 @@ $identity = Get-SoundSourceIdentity $source
 $savedPreference = $ErrorActionPreference
 try {
     $ErrorActionPreference = 'Continue'
-    $buildArgs = @()
-    if ($SkipCTest) { $buildArgs = @('--no-test') }
-    $buildLog = & (Join-Path $source 'build-miv.bat') @buildArgs 2>&1 | Out-String
+    # Capture the configuration/test inventory before running tests. The same
+    # checked ctest path serves normal builds and later -TestCandidate runs.
+    $buildLog = & (Join-Path $source 'build-miv.bat') --no-test 2>&1 | Out-String
     $code = $LASTEXITCODE
 } finally { $ErrorActionPreference = $savedPreference }
 Write-Host $buildLog
@@ -163,6 +172,7 @@ if (-not $sdkPin.Contains('GIT_TAG ' + $sdkCommit)) { throw '[miv-sound] VST3 SD
 $buildScript = [IO.File]::ReadAllText((Join-Path $source 'build-miv.bat'))
 if ($buildScript -notmatch '(?m)^cmake --preset windows-release[^\r\n]*') { throw '[miv-sound] Cannot record configure command from build-miv.bat' }
 $configureCommand = $Matches[0]
+$buildContract = Get-SoundBuildContract $source $cmakePath
 $record = [ordered]@{
     schema = 1; id = $id; version = $MivSound.VERSION; source_root = $source; manifest = $manifest
     provenance = [ordered]@{
@@ -171,6 +181,7 @@ $record = [ordered]@{
         configure_command = $configureCommand
         cmake_presets = [IO.File]::ReadAllText((Join-Path $source 'CMakePresets.json'))
         cmake_cache = $cacheText; compiler_configuration = $compiler
+        build_contract = $buildContract
         build_script_sha256 = (Get-FileHash -LiteralPath (Join-Path $source 'build-miv.bat') -Algorithm SHA256).Hash.ToLowerInvariant()
         tools = [ordered]@{ cmake_path = $cmakePath; cmake = (& $cmakePath --version | Out-String).Trim(); node = (& node --version | Out-String).Trim(); vst3sdk_pin = $sdkCommit; vst3sdk_submodules = @(Get-SoundSubmodules $sdk '' -AllowUnusedSdkModules) }
         upstream_licenses = @('LICENSE', 'external/effetune/LICENSE') | ForEach-Object { [ordered]@{ path = $_; text = [IO.File]::ReadAllText((Join-Path $source $_)); sha256 = (Get-FileHash -LiteralPath (Join-Path $source $_) -Algorithm SHA256).Hash.ToLowerInvariant() } }
@@ -182,11 +193,12 @@ if ($buildEntries.Count + 1 -ne $entries.Count) { throw '[miv-sound] Build outpu
 foreach ($name in $buildEntries.Keys) {
     if ($entries[$MivSound.BUNDLE_NAME + '/' + $name] -cne $buildEntries[$name]) { throw '[miv-sound] Build output changed during candidate capture' }
 }
-[IO.File]::WriteAllText((Join-Path $temporary 'candidate.json'), ($record | ConvertTo-Json -Depth 15), $utf8)
+[IO.File]::WriteAllText((Join-Path $temporary 'candidate.json'), ($record | ConvertTo-Json -Depth 30), $utf8)
 $destination = Join-Path $candidateParent $id
 if (Test-Path -LiteralPath $destination) {
     $old = Read-MivSoundCandidate -RepoRoot $repo -Candidate $id
     if ($old.Record.provenance.identity.commit -cne $identity.commit) { throw '[miv-sound] Identical artifact already recorded from a different commit' }
+    if ((Assert-SoundBuildContract $old) -cne (Get-SoundBuildContractHash $buildContract)) { throw '[miv-sound] Identical artifact already recorded with a different build/test contract' }
     Assert-MivSoundSafeDirectory $temporary
     Remove-Item -LiteralPath $temporary -Recurse -Force
 } else {
@@ -194,8 +206,7 @@ if (Test-Path -LiteralPath $destination) {
 }
 $item = Read-MivSoundCandidate -RepoRoot $repo -Candidate $id
 if (-not $SkipCTest) {
-    if ($buildLog -notmatch '100% tests passed, 0 tests failed out of [1-9][0-9]*') { throw '[miv-sound] ctest success summary missing' }
-    Write-SoundCTestRecord $item $buildLog
+    Invoke-SoundCandidateCTest $item
 }
 Write-Host "[miv-sound] CANDIDATE $id (not approved)"
 if ($SkipCTest) { Write-Host '[miv-sound] ctest pending: -TestCandidate -Candidate <ID> is required before approval' }

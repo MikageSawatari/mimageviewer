@@ -2,6 +2,7 @@
 param([string] $ValidateCandidate, [string] $WorkspaceRoot)
 $candidateValidationRoot = $WorkspaceRoot
 . (Join-Path $PSScriptRoot 'effetune-distribution.ps1')
+. (Join-Path $PSScriptRoot 'miv-sound-build-contract.ps1')
 
 $MivSoundNotices = @(
     'Contents/Resources/THIRD-PARTY-NOTICES.txt',
@@ -110,6 +111,15 @@ function Approve-MivSoundCandidate {
         $testLog -notmatch '100% tests passed, 0 tests failed out of [1-9][0-9]*' -or
         $evidence.log_sha256 -cne (Get-FileHash -LiteralPath (Join-Path $item.Root 'ctest.log') -Algorithm SHA256).Hash.ToLowerInvariant()) {
         throw '[miv-sound] Approval requires successful ctest evidence for this candidate; run -TestCandidate -Candidate <ID>'
+    }
+    $contractHash = Assert-SoundBuildContract $item
+    $evidenceContract = $evidence.PSObject.Properties['build_contract_sha256']
+    if (-not $evidenceContract -or $evidenceContract.Value -cne $contractHash) {
+        throw '[miv-sound] Approval requires ctest evidence bound to the candidate build/test contract'
+    }
+    $testCount = @($item.Record.provenance.build_contract.selected_tests).Count
+    if ($testLog -notmatch ("100% tests passed, 0 tests failed out of " + $testCount + '(?![0-9])')) {
+        throw '[miv-sound] Approval requires ctest success for the complete candidate test inventory'
     }
     $tracked = Join-Path $repo "$($MivSound.NOTICES_ROOT)/$($MivSound.VERSION)"
     $vendor = Join-Path $repo $MivSound.SOURCE_ROOT

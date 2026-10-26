@@ -280,7 +280,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   PEのchecksum／証明書以外の一致を検査する。VERSIONと3通知原文も照合し、更新時は
   `third_party/miv-sound/<version>/` を明示承認で更新する。about の通知rootも同じ定義に従う。
   同梱名・版・root の正本は `config/miv-sound.rs`。候補IDのビルド→確認→承認、ctest記録、
-  外部バックアップは [F2a 手順](miv-sound-f2a-handoff.md) を参照。配布ビルドでmanifestを作り直さない。
+  外部バックアップは [mIV Sound のビルド](miv-sound-build.md) を参照。配布ビルドでmanifestを作り直さない。
 - **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
   `*.onnx` は PE でないので対象外。
 - `build-dist.ps1` は**署名を既定 ON** (`-NoSign` で回避)。実装は `scripts/sign-files.ps1`

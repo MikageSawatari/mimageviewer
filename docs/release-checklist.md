@@ -86,7 +86,7 @@
 
 ### 派生版への切替の前提（F2a）
 
-固定値の正本は `config/miv-sound.rs`。手順は [F2a 引き継ぎ](miv-sound-f2a-handoff.md)。
+固定値の正本は `config/miv-sound.rs`。手順は [mIV Sound のビルド](miv-sound-build.md)。
 候補IDを指定した自動検証・実機確認・独立レビューの後、同じ候補を明示承認する。
 ctest を省いた候補は、その候補の ctest 成功記録を付けるまで承認できない。
 配布ビルドは承認 manifest を照合するだけで生成しない。旧 Mixwright 原本は配布入力にしない。

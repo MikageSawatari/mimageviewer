@@ -330,7 +330,8 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
 第 1 回レビュー P2 を受け、「1 回のビルド成果物を確かめてから、その成果物だけを承認する」順にする。
 
 1. **ビルド**: 派生版のリポジトリの ASCII の `build-miv.bat` (試作の `build-trial.bat` を元に、configure の `/wd4458` を含む) で configure → build → ctest。
-   `scripts/build-miv-sound.ps1` (mIV 側、ASCII) がこれを呼び、候補ごとの置き場を作る (第 2・3 回レビュー P2):
+   `scripts/build-miv-sound.ps1` (mIV 側、ASCII) は `build-miv.bat --no-test` で configure・build を行い、
+   構成と登録テストを記録してから同じ preset の ctest を呼ぶ。候補ごとの置き場を作る (第 2・3 回レビュー P2):
 
    ```text
    target\miv-sound-candidates\<候補 ID>\
@@ -342,12 +343,18 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
    置き場は候補ごとに別なので、後のビルドが前の候補を上書きしない。
    **未コミットの差分や submodule のずれがあれば止める**。出どころとして記録するのは、派生版の commit、上流のタグと commit、
    submodule の commit、CMake の構成 (preset と渡した `-D` の値)、道具の版 (MSVC・CMake・Node・vst3sdk の pin)。
+   構成は preset ファイルと CMakeCache の全型付き値も含めて保存する。`ctest -N --show-only=json-v1` の登録テスト一覧
+   (名前・実行コマンド・属性) と preset が選ぶ一覧も `candidate.json` に保存し、preset が全登録テストを選ぶことを検査する。
+   `-SkipCTest` は候補だけ作る。`-TestCandidate` は構成・登録一覧・ソース・出力を照合し、再ビルドせず ctest を行う。
+   ctest 前後で同一であり、全件成功した場合だけ、候補 ID・構成と一覧の hash・ログ hash に結び付く成功記録を作る。
 2. **確認**: 候補 ID を指定して `build-dev.ps1` の確認用ビルドに `artifact\` を置き (候補 ID を受け取る引数を足す。置くときに一覧と中身が一致することを確かめる)、
    自動テストと実機確認をし、独立レビューを通す。確認の記録には候補 ID を書く。
 3. **承認**: `scripts/build-miv-sound.ps1 -Approve -Candidate <候補 ID>` が、`artifact\` の中身を一覧と照合し (一致しなければ止める)、
    一覧から `third_party/miv-sound/<ver>/manifest.sha256` を作り、`PROVENANCE.md`・`VERSION`・通知 3 本を置き、**`artifact\` の中身だけ**を `vendor/miv-sound/` へ写す
    (今のファイル集合の検査が余分なファイルを拒むため、`candidate.json` は写さない)。承認物そのものを
    `C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\` に保存する。承認はこの明示の操作のときだけ行う。
+   承認時も source/build tree の構成・登録一覧を候補と再照合し、その構成と一覧に結び付いた ctest 成功記録を必須とする。
+   構成・登録一覧の記録がない旧候補は承認せず、現行手順でビルドから作り直す。
 4. **配布ビルド**: `build-release.ps1` / `build-dist.ps1` は、今と同じく承認済みの manifest と照合するだけで、**manifest を作り直さない**
    (今の `scripts/effetune-distribution.ps1:46` が承認 manifest の作り直しを禁じているのと同じ考え)。
 
@@ -455,7 +462,7 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
 
 ## 12. 段階
 
-F2a の mIV 側実装と手順・棚卸し・検証の記録は [F2a 引き継ぎ](miv-sound-f2a-handoff.md)。
+F2a の候補ビルド・確認・承認の手順は [mIV Sound のビルド](miv-sound-build.md)。
 F2a は §7.3〜7.4、bridge 環境と表記までで、§5 の移行本体は F2b。
 固定値は `config/miv-sound.rs` に集約する。`-SkipCTest` の候補は未承認のまま保持し、
 `-TestCandidate -Candidate <ID>` で同じ出力の ctest 成功記録を作ってから承認する。

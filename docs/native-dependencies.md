@@ -36,7 +36,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
   `scripts/build-miv-sound.ps1` による候補のビルド→確認→明示承認、または承認済みの
   `C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\artifact\` から実体を戻す。
   固定値は `config/miv-sound.rs`、検査用manifestと通知は `third_party/miv-sound/<ver>/`。
-  詳細は [F2a 引き継ぎ](miv-sound-f2a-handoff.md)。
+  詳細は [mIV Sound のビルド](miv-sound-build.md)。
 
 - **`vendor/vst3-host/mimageviewer-vst3-host.exe`**: VST3 SDK の DL が ~490 MB と
   大きいので bootstrap には含めていない。以下のいずれかで配置する:
@@ -274,7 +274,7 @@ release link 時に未解決になることがあるため、配布ビルドは�
 無ければ復旧手順付きで止まる。音響調整も `vendor/miv-sound/VERSION` と
 `mIV Sound.vst3/` を必須検証する（固定値は `config/miv-sound.rs`）。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
 承認済み入力は `third_party/miv-sound/<ver>/manifest.sha256` の全エントリと照合する。
-候補のビルド・検証・明示承認は [F2a 引き継ぎ](miv-sound-f2a-handoff.md) を参照。
+候補のビルド・検証・明示承認は [mIV Sound のビルド](miv-sound-build.md) を参照。
 `build-miv-sound.ps1 -Approve -Candidate <ID>` だけが通知・manifest・provenanceと vendor 原本を更新し、
 `C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\` に承認物そのものを保存する。
 未コミット差分・submodule のずれはビルド前に拒否し、承認前に同じ候補の ctest 成功記録を要求する。

@@ -17,6 +17,15 @@ function Assert-Throws([scriptblock] $Action, [string] $Pattern) {
     }
     throw "[candidate-test] Expected rejection: $Pattern"
 }
+function Initialize-CTestFixture([string] $Source) {
+    New-Item -ItemType Directory -Path (Join-Path $Source 'build/windows-release') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $Source 'build-miv.bat'), "@echo off`ngoto done`ncmake --preset windows-release -DFIXTURE=ON`n:done`necho BUILD-OK`nexit /b 0`n", [Text.Encoding]::ASCII)
+    $presets = '{"version":6,"configurePresets":[{"name":"windows-release","generator":"Ninja","binaryDir":"${sourceDir}/build/windows-release"}],"testPresets":[{"name":"windows-release","configurePreset":"windows-release"}]}'
+    [IO.File]::WriteAllText((Join-Path $Source 'CMakePresets.json'), $presets, $utf8)
+    [IO.File]::WriteAllText((Join-Path $Source 'build/windows-release/CMakeCache.txt'), "FIXTURE:BOOL=ON`n", $utf8)
+    $command = 'C:/Program Files/CMake/bin/cmake.exe'
+    [IO.File]::WriteAllText((Join-Path $Source 'build/windows-release/CTestTestfile.cmake'), "add_test(first `"$command`" -E true)`nadd_test(second `"$command`" -E true)`n", $utf8)
+}
 $root = Join-Path ([IO.Path]::GetTempPath()) ('miv-sound-candidate-test-' + [Guid]::NewGuid().ToString('N'))
 $utf8 = New-Object Text.UTF8Encoding($false)
 New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -78,8 +87,13 @@ try {
     New-Item -ItemType Directory -Path (Split-Path $candidateDir) -Force | Out-Null
     Move-Item -LiteralPath $work -Destination $candidateDir
     $artifact = Join-Path $candidateDir 'artifact'
-    $record = @{ schema=1; id=$id; version=$MivSound.VERSION; manifest=$manifest; provenance=@{ inspection_only=$false; identity=@{ commit=('1'*40); upstream_tag=$MivSound.UPSTREAM_TAG; upstream_commit=('2'*40) }; upstream_licenses=$licenses } }
-    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 8), $utf8)
+    $contractSource = Join-Path $root 'contract-source'
+    Initialize-CTestFixture $contractSource
+    $cmakePath = 'C:\Program Files\CMake\bin\cmake.exe'
+    $contract = Get-SoundBuildContract $contractSource $cmakePath
+    Assert-True ($contract.registered_tests.Count -eq 2) 'registered test list missing'
+    $record = @{ schema=1; id=$id; version=$MivSound.VERSION; manifest=$manifest; source_root=$contractSource; provenance=@{ build_contract=$contract; tools=@{cmake_path=$cmakePath}; inspection_only=$false; identity=@{ commit=('1'*40); upstream_tag=$MivSound.UPSTREAM_TAG; upstream_commit=('2'*40) }; upstream_licenses=$licenses } }
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 30), $utf8)
     $null = Read-MivSoundCandidate -RepoRoot $root -Candidate $id
     Assert-Throws { Read-MivSoundCandidate -RepoRoot $root -Candidate '../escape' } 'SHA-256'
     $extra = Join-Path $artifact 'extra'
@@ -100,17 +114,74 @@ try {
     Assert-Throws { Approve-MivSoundCandidate -RepoRoot $root -Candidate $id -BackupRoot $backupRoot } 'ctest.json'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root $MivSound.SOURCE_ROOT))) 'published without ctest'
     $log = Join-Path $candidateDir 'ctest.log'
-    [IO.File]::WriteAllText($log, '100% tests passed, 0 tests failed out of 1 (synthetic fixture only)', $utf8)
-    $evidence = @{ candidate=$id; passed=$true; log_sha256=(Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash.ToLowerInvariant() }
+    [IO.File]::WriteAllText($log, '100% tests passed, 0 tests failed out of 2 (synthetic fixture only)', $utf8)
+    $evidence = @{ candidate=$id; build_contract_sha256=(Get-SoundBuildContractHash $contract); passed=$true; log_sha256=(Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash.ToLowerInvariant() }
     [IO.File]::WriteAllText((Join-Path $candidateDir 'ctest.json'), ($evidence | ConvertTo-Json), $utf8)
     [IO.File]::AppendAllText($log, 'corruption', $utf8)
     Assert-Throws { Approve-MivSoundCandidate -RepoRoot $root -Candidate $id -BackupRoot $backupRoot } 'successful ctest evidence'
+    [IO.File]::WriteAllText($log, '100% tests passed, 0 tests failed out of 2 (synthetic fixture only)', $utf8)
+    # The candidate bundle is unchanged in every case. Neither retesting nor
+    # approval may accept a changed configure command/cache/preset/test set.
+    $contractFiles = @{
+        'build-miv.bat' = @('FIXTURE=ON', 'FIXTURE=OFF')
+        'CMakePresets.json' = @('"generator":"Ninja"', '"generator":"Ninja Multi-Config"')
+        'build/windows-release/CMakeCache.txt' = @('FIXTURE:BOOL=ON', 'FIXTURE:BOOL=OFF')
+        'build/windows-release/CTestTestfile.cmake' = @('add_test(second', '#add_test(second')
+    }
+    foreach ($relative in $contractFiles.Keys) {
+        $path = Join-Path $contractSource $relative
+        $before = [IO.File]::ReadAllText($path)
+        $change = $contractFiles[$relative]
+        [IO.File]::WriteAllText($path, $before.Replace($change[0], $change[1]), $utf8)
+        $fixtureItem = Read-MivSoundCandidate -RepoRoot $root -Candidate $id
+        Assert-Throws { Invoke-SoundCandidateCTest $fixtureItem } 'configuration or registered test inventory changed'
+        Assert-Throws { Approve-MivSoundCandidate -RepoRoot $root -Candidate $id -BackupRoot $backupRoot } 'configuration or registered test inventory changed'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $root $MivSound.SOURCE_ROOT))) 'published changed build/test contract'
+        [IO.File]::WriteAllText($path, $before, $utf8)
+    }
+    $testFile = Join-Path $contractSource 'build/windows-release/CTestTestfile.cmake'
+    $before = [IO.File]::ReadAllText($testFile)
+    [IO.File]::AppendAllText($testFile, 'set_tests_properties(second PROPERTIES DISABLED TRUE)', $utf8)
+    Assert-Throws { Invoke-SoundCandidateCTest (Read-MivSoundCandidate $root $id) } 'configuration or registered test inventory changed'
+    Assert-Throws { Approve-MivSoundCandidate $root $id $backupRoot } 'configuration or registered test inventory changed'
+    [IO.File]::WriteAllText($testFile, $before, $utf8)
+    $presetFile = Join-Path $contractSource 'CMakePresets.json'
+    $before = [IO.File]::ReadAllText($presetFile)
+    [IO.File]::WriteAllText($presetFile, $before.Replace('"configurePreset":"windows-release"}', '"configurePreset":"windows-release","filter":{"include":{"name":"^first$"}}}'), $utf8)
+    Assert-Throws { Invoke-SoundCandidateCTest (Read-MivSoundCandidate $root $id) } 'complete registered test inventory'
+    Assert-Throws { Approve-MivSoundCandidate $root $id $backupRoot } 'complete registered test inventory'
+    [IO.File]::WriteAllText($presetFile, $before, $utf8)
+    $userPreset = Join-Path $contractSource 'CMakeUserPresets.json'
+    [IO.File]::WriteAllText($userPreset, '{"version":6}', $utf8)
+    Assert-Throws { Invoke-SoundCandidateCTest (Read-MivSoundCandidate $root $id) } 'configuration or registered test inventory changed'
+    Assert-Throws { Approve-MivSoundCandidate $root $id $backupRoot } 'configuration or registered test inventory changed'
+    Remove-Item -LiteralPath $userPreset
+    $savedContract = $record.provenance.build_contract
+    $record.provenance.Remove('build_contract')
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 30), $utf8)
+    Assert-Throws { Invoke-SoundCandidateCTest (Read-MivSoundCandidate $root $id) } 'lacks build/test contract'
+    Assert-Throws { Approve-MivSoundCandidate $root $id $backupRoot } 'lacks build/test contract'
+    $record.provenance.build_contract = $savedContract
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 30), $utf8)
+    $evidence.Remove('build_contract_sha256')
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'ctest.json'), ($evidence | ConvertTo-Json), $utf8)
+    Assert-Throws { Approve-MivSoundCandidate $root $id $backupRoot } 'evidence bound to the candidate build/test contract'
+    $evidence.build_contract_sha256 = '0' * 64
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'ctest.json'), ($evidence | ConvertTo-Json), $utf8)
+    Assert-Throws { Approve-MivSoundCandidate $root $id $backupRoot } 'evidence bound to the candidate build/test contract'
+    $evidence.build_contract_sha256 = Get-SoundBuildContractHash $contract
     [IO.File]::WriteAllText($log, '100% tests passed, 0 tests failed out of 1 (synthetic fixture only)', $utf8)
+    $evidence.log_sha256 = (Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'ctest.json'), ($evidence | ConvertTo-Json), $utf8)
+    Assert-Throws { Approve-MivSoundCandidate $root $id $backupRoot } 'complete candidate test inventory'
+    [IO.File]::WriteAllText($log, '100% tests passed, 0 tests failed out of 2 (synthetic fixture only)', $utf8)
+    $evidence.log_sha256 = (Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'ctest.json'), ($evidence | ConvertTo-Json), $utf8)
     $record.provenance.upstream_licenses[1].text += ' omitted upstream text'
-    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 8), $utf8)
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 30), $utf8)
     Assert-Throws { Approve-MivSoundCandidate -RepoRoot $root -Candidate $id -BackupRoot $backupRoot } 'Full upstream license absent'
     $record.provenance.upstream_licenses[1].text = $record.provenance.upstream_licenses[1].text.Replace(' omitted upstream text', '')
-    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 8), $utf8)
+    [IO.File]::WriteAllText((Join-Path $candidateDir 'candidate.json'), ($record | ConvertTo-Json -Depth 30), $utf8)
     Approve-MivSoundCandidate -RepoRoot $root -Candidate $id -BackupRoot $backupRoot
     $vendor = Join-Path $root $MivSound.SOURCE_ROOT
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $vendor 'candidate.json'))) 'management record leaked into artifact'
@@ -133,8 +204,7 @@ try {
         New-Item -ItemType Directory -Path (Join-Path $source $dir) -Force | Out-Null
     }
     [IO.File]::WriteAllText((Join-Path $source '.gitignore'), "build/`n", $utf8)
-    [IO.File]::WriteAllText((Join-Path $source 'build-miv.bat'), "@echo off`ngoto done`ncmake --preset windows-release -DFIXTURE=ON`n:done`necho BUILD-OK`nexit /b 0`n", [Text.Encoding]::ASCII)
-    [IO.File]::WriteAllText((Join-Path $source 'CMakePresets.json'), '{}', $utf8)
+    Initialize-CTestFixture $source
     [IO.File]::WriteAllText((Join-Path $source 'src/plugin/version.h'), "#define EFFETUNE_PLUGIN_VERSION_STR `"$($MivSound.VERSION)`"`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $source 'cmake/Dependencies.cmake'), "GIT_TAG $sdkCommit`n", $utf8)
     foreach ($license in $licenses) { [IO.File]::WriteAllText((Join-Path $source $license.path), $license.text, $utf8) }
@@ -154,6 +224,20 @@ try {
         $built = Read-MivSoundCandidate -RepoRoot $repo -Candidate $id
         Assert-True ($built.Record.provenance.identity.commit.Length -eq 40) 'build provenance missing'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $generated 'ctest.json'))) 'skip-ctest created passing evidence'
+        Assert-True ($built.Record.provenance.build_contract.registered_tests.Count -eq 2) 'public build did not record test inventory'
+        # The public retest path must reject a reduced test set without writing
+        # success evidence, even though the candidate bundle is byte-identical.
+        $testFile = Join-Path $source 'build/windows-release/CTestTestfile.cmake'
+        $before = [IO.File]::ReadAllText($testFile)
+        [IO.File]::WriteAllText($testFile, $before.Replace('add_test(second', '#add_test(second'), $utf8)
+        Assert-Throws { & (Join-Path $PSScriptRoot 'build-miv-sound.ps1') -TestCandidate -Candidate $id } 'configuration or registered test inventory changed'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $generated 'ctest.json'))) 'reduced test set created passing evidence'
+        [IO.File]::WriteAllText($testFile, $before, $utf8)
+        & (Join-Path $PSScriptRoot 'build-miv-sound.ps1') -TestCandidate -Candidate $id
+        $tested = Get-Content -LiteralPath (Join-Path $generated 'ctest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-True ($tested.build_contract_sha256 -ceq (Get-SoundBuildContractHash $built.Record.provenance.build_contract)) 'ctest evidence is not bound to the contract'
+        & (Join-Path $PSScriptRoot 'build-miv-sound.ps1') -SourceRoot $source
+        Assert-True (Test-Path -LiteralPath (Join-Path $generated 'ctest.json')) 'normal build did not record ctest success'
     } finally {
         if (Test-Path -LiteralPath $generated) {
             Assert-MivSoundSafeDirectory $generated

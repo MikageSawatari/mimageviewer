@@ -8728,7 +8728,7 @@ mod tests {
         harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
         harness.run();
         harness
-            .get_by_label("EffeTune に渡す前に 0dB を超える音を抑える")
+            .get_by_label("mIV Sound に渡す前に 0dB を超える音を抑える")
             .click();
         harness.run();
         assert!(
