@@ -1665,6 +1665,8 @@ pub enum KeyAction {
     FsJumpLast,
     FsCtrlNavPrev,
     FsCtrlNavNext,
+    FsListOrderPrev,
+    FsListOrderNext,
     FsSiblingPrev,
     FsSiblingNext,
     FsPagePrev,
@@ -2245,6 +2247,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsJumpLast,
     KeyAction::FsCtrlNavPrev,
     KeyAction::FsCtrlNavNext,
+    KeyAction::FsListOrderPrev,
+    KeyAction::FsListOrderNext,
     KeyAction::FsSiblingPrev,
     KeyAction::FsSiblingNext,
     KeyAction::FsPagePrev,
@@ -4302,6 +4306,8 @@ impl KeyAction {
             FsJumpLast => "FsJumpLast",
             FsCtrlNavPrev => "FsCtrlNavPrev",
             FsCtrlNavNext => "FsCtrlNavNext",
+            FsListOrderPrev => "FsListOrderPrev",
+            FsListOrderNext => "FsListOrderNext",
             FsSiblingPrev => "FsSiblingPrev",
             FsSiblingNext => "FsSiblingNext",
             FsPagePrev => "FsPagePrev",
@@ -5047,6 +5053,8 @@ impl KeyAction {
             FsJumpLast => "末尾の項目へ移動する",
             FsCtrlNavPrev => "前のフォルダまたは検索結果へ移動する",
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
+            FsListOrderPrev => "一覧の表示順で前の本を開く",
+            FsListOrderNext => "一覧の表示順で次の本を開く",
             FsSiblingPrev => "前の兄弟フォルダへ移動する",
             FsSiblingNext => "次の兄弟フォルダへ移動する",
             FsPagePrev => "前のページへ移動する",
@@ -5603,8 +5611,8 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
             FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
-            | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext | FsPanorama
-            | FsPanoramaProjection => KeyContext::FsCommon,
+            | FsCtrlNavPrev | FsCtrlNavNext | FsListOrderPrev | FsListOrderNext | FsSiblingPrev
+            | FsSiblingNext | FsPanorama | FsPanoramaProjection => KeyContext::FsCommon,
             RatingItem1
             | RatingItem2
             | RatingItem3
@@ -6129,6 +6137,8 @@ impl KeyAction {
             | FsJumpLast
             | FsCtrlNavPrev
             | FsCtrlNavNext
+            | FsListOrderPrev
+            | FsListOrderNext
             | FsSiblingPrev
             | FsSiblingNext
             | FsPagePrev
@@ -6411,14 +6421,13 @@ impl KeyAction {
     }
 
     /// Actions whose repeated physical presses are safe and meaningful as
-    /// cumulative steps opt in here. Toggles, dialogs, destructive operations,
+    /// steps opt in here. Toggles, dialogs, destructive operations,
     /// and other one-shot commands remain single-dispatch by default.
     pub fn press_multiplicity(self) -> PressMultiplicity {
         use KeyAction::*;
         match self {
-            FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
-                PressMultiplicity::EachPhysicalPress
-            }
+            FsCtrlNavPrev | FsCtrlNavNext | FsListOrderPrev | FsListOrderNext | FsSiblingPrev
+            | FsSiblingNext => PressMultiplicity::EachPhysicalPress,
             _ => PressMultiplicity::SinglePerFrame,
         }
     }
@@ -6683,6 +6692,8 @@ impl KeyAction {
             FsJumpLast => ChordList::one(Chord::key(End)),
             FsCtrlNavPrev => ChordList::one(Chord::ctrl(Up)),
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
+            FsListOrderPrev => ChordList::one(Chord::ctrl_shift(Up)),
+            FsListOrderNext => ChordList::one(Chord::ctrl_shift(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
             FsSiblingNext => ChordList::one(Chord::ctrl(PageDown)),
             FsPagePrev | FsPageNext => ChordList::EMPTY,
@@ -11700,6 +11711,8 @@ mod tests {
             KeyAction::FsToggleWindowMode,
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -11727,6 +11740,8 @@ mod tests {
             KeyAction::FsToggleWindowMode,
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -12920,10 +12935,12 @@ mod tests {
     }
 
     #[test]
-    fn press_multiplicity_selects_only_cumulative_fullscreen_folder_navigation() {
+    fn press_multiplicity_selects_fullscreen_folder_navigation_physical_presses() {
         for action in [
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -12945,6 +12962,99 @@ mod tests {
                 PressMultiplicity::SinglePerFrame,
                 "{action:?}"
             );
+        }
+    }
+
+    #[test]
+    fn list_order_navigation_defaults_are_distinct_shared_press_actions() {
+        let keymap = Keymap::empty();
+        for (action, key) in [
+            (KeyAction::FsListOrderPrev, KeyName::Up),
+            (KeyAction::FsListOrderNext, KeyName::Down),
+        ] {
+            let chord = Chord::ctrl_shift(key);
+            assert_eq!(action.context(), KeyContext::FsCommon);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                vec![chord]
+            );
+            assert!(ALL_ACTIONS.contains(&action));
+            for scopes in [FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES] {
+                assert_eq!(
+                    keymap.resolve_first_action_for_chord(chord, scopes, ALL_ACTIONS),
+                    Some(action)
+                );
+            }
+            assert_eq!(
+                keymap.resolve_first_action_for_chord(chord, GRID_ACTIVE_SCOPES, ALL_ACTIONS),
+                None
+            );
+            assert!(
+                !KeyAction::FsCtrlNavPrev
+                    .default_chords()
+                    .iter()
+                    .any(|c| c == chord)
+            );
+            assert!(
+                !KeyAction::FsCtrlNavNext
+                    .default_chords()
+                    .iter()
+                    .any(|c| c == chord)
+            );
+        }
+        let keymap =
+            Keymap::from_ini_str("[FsCommon]\nFsListOrderPrev = F16\nFsListOrderNext = F17\n");
+        for (action, key) in [
+            (KeyAction::FsListOrderPrev, KeyName::F16),
+            (KeyAction::FsListOrderNext, KeyName::F17),
+        ] {
+            assert_eq!(
+                keymap.resolve_first_action_for_chord(
+                    Chord::key(key),
+                    FS_VIDEO_ACTIVE_SCOPES,
+                    ALL_ACTIONS
+                ),
+                Some(action)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_navigation_counts_physical_presses_and_coalesces_repeat_like_ctrl_nav() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        for (repeats, expected) in [(vec![false, false, true], 2), (vec![true, true], 1)] {
+            ctx.begin_pass(Default::default());
+            cache_test_keyboard_owner(&ctx);
+            crate::key_input::set_test_frame(
+                repeats
+                    .iter()
+                    .map(|&repeat| {
+                        let mut edge = ctrl_down_edge(repeat);
+                        edge.shift = true;
+                        edge
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsListOrderNext),
+                expected
+            );
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+                0
+            );
+            crate::key_input::set_test_frame(repeats.into_iter().map(ctrl_down_edge).collect());
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+                expected,
+                "ListOrder and Ctrl navigation share the same physical-press/repeat policy"
+            );
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 

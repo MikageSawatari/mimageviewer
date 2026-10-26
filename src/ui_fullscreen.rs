@@ -11286,10 +11286,27 @@ pub(crate) struct NavMarker {
 }
 
 /// フルスクリーン中央のヒントオーバーレイ。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FsBoundaryEdgeScope {
+    Page,
+    ListOrder,
+}
+
+impl FsBoundaryEdgeScope {
+    pub(crate) fn title(self, at_end: bool) -> &'static str {
+        match (self, at_end) {
+            (Self::ListOrder, true) => "一覧の末尾です",
+            (Self::ListOrder, false) => "一覧の先頭です",
+            (Self::Page, _) => fullscreen_boundary_edge_title(at_end),
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub(crate) enum FsBoundaryHint {
     /// 先頭 / 末尾に到達 (at_end: true=末尾, false=先頭)。
     Edge {
+        scope: FsBoundaryEdgeScope,
         at_end: bool,
         at: std::time::Instant,
     },
@@ -19271,6 +19288,7 @@ pub(crate) struct FsKeyAction {
     pub(crate) close_to_page_list: bool,
     pub(crate) page_nav: FsPageNav,
     pub(crate) ctrl_nav: Option<i32>,
+    pub(crate) list_order_nav: Option<bool>,
     pub(crate) sibling_nav: Option<i32>,
     pub(crate) mouse_nav: Option<crate::ui_main::AddressBarNav>,
     /// Home/End などの絶対ジャンプ先 item index
@@ -26934,6 +26952,7 @@ impl App {
         let mut close_to_page_list = false;
         let mut page_nav = FsPageNav::None;
         let mut ctrl_nav: Option<i32> = None;
+        let mut list_order_nav: Option<bool> = None;
         let mut sibling_nav: Option<i32> = None;
         let mut mouse_nav: Option<crate::ui_main::AddressBarNav> = None;
         let mut jump_to: Option<usize> = None;
@@ -27290,7 +27309,7 @@ impl App {
                             return;
                         }
                     };
-                    self.handle_fs_navigation_with_operation(
+                    self.handle_fs_navigation_with_list_order_operation(
                         &root.context,
                         root_action.close,
                         root_action.close_to_page_list,
@@ -27308,6 +27327,7 @@ impl App {
                             root_action.jump_to
                         },
                         input_idx,
+                        root_action.list_order_nav,
                         root_operation,
                     );
                     if self.paged_viewer_drawing_path_changed(embedded) {
@@ -27792,6 +27812,7 @@ impl App {
                         }
                         page_nav = if continuation_committed { FsPageNav::None } else { key_action.page_nav };
                         ctrl_nav = key_action.ctrl_nav;
+                        list_order_nav = key_action.list_order_nav;
                         sibling_nav = key_action.sibling_nav;
                         mouse_nav = key_action.mouse_nav;
                         jump_to = if continuation_committed { None } else { key_action.jump_to };
@@ -27800,6 +27821,8 @@ impl App {
                             self.bump_input_seq("fs_key", Some(&format!("page_nav={page_nav:?}")));
                         } else if ctrl_nav.is_some() {
                             self.bump_input_seq("fs_ctrl_nav", None);
+                        } else if list_order_nav.is_some() {
+                            self.bump_input_seq("fs_list_order_nav", None);
                         } else if sibling_nav.is_some() {
                             self.bump_input_seq("fs_sibling_nav", None);
                         } else if mouse_nav.is_some() {
@@ -27825,7 +27848,7 @@ impl App {
                             music_overflow_input.owns_pointer,
                             &mut navigation_operation,
                             continuation_committed || close_fs || close_to_page_list
-                                || ctrl_nav.is_some() || sibling_nav.is_some()
+                                || ctrl_nav.is_some() || list_order_nav.is_some() || sibling_nav.is_some()
                                 || mouse_nav.is_some() || jump_to.is_some(),
                             true,
                             overflow_pointer_input.clone(),
@@ -27914,6 +27937,7 @@ impl App {
                             || close_to_page_list
                             || !page_nav.is_none()
                             || ctrl_nav.is_some()
+                            || list_order_nav.is_some()
                             || sibling_nav.is_some()
                             || mouse_nav.is_some()
                             || jump_to.is_some()
@@ -29781,6 +29805,7 @@ impl App {
                     || close_fs
                     || close_to_page_list
                     || ctrl_nav.is_some()
+                    || list_order_nav.is_some()
                     || sibling_nav.is_some()
                     || mouse_nav.is_some()
                     || jump_to.is_some(),
@@ -29804,6 +29829,7 @@ impl App {
             page_nav,
             jump_to,
             navigation_idx,
+            list_order_nav,
             navigation_operation,
             &mut fs_render_perf,
         );
@@ -33153,6 +33179,8 @@ impl App {
             );
         } else if key_action.ctrl_nav.is_some() {
             self.bump_input_seq("fs_root_ctrl_nav", None);
+        } else if key_action.list_order_nav.is_some() {
+            self.bump_input_seq("fs_root_list_order_nav", None);
         } else if key_action.sibling_nav.is_some() {
             self.bump_input_seq("fs_root_sibling_nav", None);
         } else if key_action.mouse_nav.is_some() {
@@ -33163,7 +33191,7 @@ impl App {
             self.bump_input_seq("fs_root_close_key", None);
         }
 
-        self.handle_fs_navigation_with_operation(
+        self.handle_fs_navigation_with_list_order_operation(
             ctx,
             key_action.close,
             key_action.close_to_page_list,
@@ -33173,6 +33201,7 @@ impl App {
             key_action.page_nav,
             key_action.jump_to,
             fs_idx,
+            key_action.list_order_nav,
             navigation_operation,
         );
         true
@@ -34151,6 +34180,7 @@ impl App {
             close_to_page_list: false,
             page_nav: FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
@@ -34956,6 +34986,12 @@ impl App {
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
         let esc = self.consume_still_reader_close_key(ctx, fs_idx);
+        let list_next = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsListOrderNext);
+        let list_prev = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsListOrderPrev);
         // 左右キーは上下と分離して処理（RTL 反転のため）
         let ctrl_d_count = self
             .keymap
@@ -35999,6 +36035,24 @@ impl App {
                 action.close = true;
             }
         }
+        if list_next > 0 || list_prev > 0 {
+            if action.close || action.close_to_page_list {
+                return action;
+            }
+            // This operation has no accumulator: only the first press may start a
+            // navigation; subsequent presses during preparation are rejected.
+            let forward = list_prev == 0;
+            action.list_order_nav = Some(forward);
+            *navigation_operation = self.page_turn_navigation_key_operation(
+                ctx,
+                if forward {
+                    KeyAction::FsListOrderNext
+                } else {
+                    KeyAction::FsListOrderPrev
+                },
+            );
+            return action;
+        }
         // I / Tab は左右パネルの呼び出しモードを切り替える。
         if key_i {
             if self.adjustment_mode.is_open() {
@@ -36509,6 +36563,7 @@ impl App {
                 action.jump_to = Some(new_idx);
             } else {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end: forward,
                     at: std::time::Instant::now(),
                 });
@@ -36528,6 +36583,7 @@ impl App {
                 action.jump_to = Some(new_idx);
             } else {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end: forward,
                     at: std::time::Instant::now(),
                 });
@@ -41940,6 +41996,7 @@ impl App {
             Some(target)
         } else {
             self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end,
                 at: std::time::Instant::now(),
             });
@@ -42073,6 +42130,79 @@ impl App {
         }
         self.effective_folder()
             .map(|current| (current, crate::app::FolderNavMode::Fullscreen))
+    }
+
+    pub(crate) fn handle_fullscreen_list_order_nav_context(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+        native_toast: bool,
+    ) {
+        self.handle_fullscreen_list_order_nav_context_with_operation(
+            ctx,
+            fs_idx,
+            forward,
+            native_toast,
+            None,
+        );
+    }
+
+    pub(crate) fn handle_fullscreen_list_order_nav_context_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+        native_toast: bool,
+        operation: Option<ViewerOperationId>,
+    ) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
+        if self.fs_navigation_sequence_blocks_new_target() || self.fs_nav_is_locked() {
+            self.note_fullscreen_nav_request_dropped();
+            return;
+        }
+        let Some((snapshot, from_index)) = self.list_order_position() else {
+            #[cfg(windows)]
+            if native_toast {
+                self.show_native_video_overlay_warning("一覧から開いた本で使えます".into(), true);
+                self.request_native_video_hud_repaint(ctx);
+                return;
+            }
+            #[cfg(not(windows))]
+            let _ = native_toast;
+            self.show_feedback_warning("一覧から開いた本で使えます".into());
+            return;
+        };
+        // EgUI intents and the native presenter share this acceptance boundary.
+        // Rejected preparation/availability checks do not retire another owner.
+        self.cancel_rating_membership_restore();
+        self.supersede_required_fullscreen_folder_open();
+        self.similar_panel
+            .preview
+            .end_gesture_with_reason("navigation_or_close");
+        self.page_turn_excluded_navigation_with_operation(ctx, "list_order_navigation", operation);
+        self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
+        self.continuous_reading_scroll_transition = None;
+        self.slideshow_scroll_range_cache = None;
+        #[cfg(windows)]
+        {
+            self.native_video_deferred_nav_delta = None;
+        }
+        let Some(current) = self.effective_folder() else {
+            return;
+        };
+        self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
+        self.start_folder_nav(
+            current,
+            forward,
+            crate::app::FolderNavMode::ListOrder {
+                snapshot,
+                from_index,
+            },
+        );
     }
 
     pub(crate) fn handle_fullscreen_ctrl_nav_context(
@@ -42525,6 +42655,35 @@ impl App {
         fs_idx: usize,
         operation: Option<ViewerOperationId>,
     ) {
+        self.handle_fs_navigation_with_list_order_operation(
+            ctx,
+            close_fs,
+            close_to_page_list,
+            ctrl_nav,
+            sibling_nav,
+            mouse_nav,
+            page_nav,
+            jump_to,
+            fs_idx,
+            None,
+            operation,
+        );
+    }
+
+    pub(crate) fn handle_fs_navigation_with_list_order_operation(
+        &mut self,
+        ctx: &egui::Context,
+        close_fs: bool,
+        close_to_page_list: bool,
+        ctrl_nav: Option<i32>,
+        sibling_nav: Option<i32>,
+        mouse_nav: Option<crate::ui_main::AddressBarNav>,
+        page_nav: FsPageNav,
+        jump_to: Option<usize>,
+        fs_idx: usize,
+        list_order_nav: Option<bool>,
+        operation: Option<ViewerOperationId>,
+    ) {
         let mut fs_render_perf = None;
         self.handle_fs_navigation_with_render_perf(
             ctx,
@@ -42536,6 +42695,7 @@ impl App {
             page_nav,
             jump_to,
             fs_idx,
+            list_order_nav,
             operation,
             &mut fs_render_perf,
         );
@@ -42552,6 +42712,7 @@ impl App {
         page_nav: FsPageNav,
         jump_to: Option<usize>,
         fs_idx: usize,
+        list_order_nav: Option<bool>,
         operation: Option<ViewerOperationId>,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
@@ -42579,6 +42740,7 @@ impl App {
         if !close_fs
             && !close_to_page_list
             && ctrl_nav.is_none()
+            && list_order_nav.is_none()
             && sibling_nav.is_none()
             && mouse_nav.is_none()
             && (self.settings.page_turn_animation_enabled || self.page_turn_completion_active())
@@ -42754,6 +42916,16 @@ impl App {
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
+        } else if let Some(forward) = list_order_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+            self.handle_fullscreen_list_order_nav_context_with_operation(
+                ctx, fs_idx, forward, false, operation,
+            );
             finish_fs_navigation_perf_span(
                 &mut fs_navigation_perf,
                 FsNavigationPerfSpan::CtrlSiblingMouse,
@@ -43100,6 +43272,7 @@ impl App {
                 }
                 self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end,
                     at: std::time::Instant::now(),
                 });
@@ -43240,6 +43413,7 @@ impl App {
                     self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                        scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                         at_end: nav_delta > 0,
                         at: std::time::Instant::now(),
                     });
@@ -52989,6 +53163,11 @@ impl App {
         };
 
         let (title, body_lines): (&str, Vec<&str>) = match hint {
+            FsBoundaryHint::Edge {
+                scope: FsBoundaryEdgeScope::ListOrder,
+                at_end,
+                ..
+            } => (FsBoundaryEdgeScope::ListOrder.title(at_end), Vec::new()),
             FsBoundaryHint::Edge { at_end: true, .. } => (
                 fullscreen_boundary_edge_title(true),
                 vec!["[Home] 最初に戻る", "[Ctrl]+[↓] ツリー順で次へ"],
@@ -63011,6 +63190,7 @@ mod tests {
         assert!(!fullscreen_boundary_hint_visible(
             false,
             FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end: true,
                 at: now,
             },
@@ -63025,6 +63205,7 @@ mod tests {
         assert!(fullscreen_boundary_hint_visible(
             true,
             FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end: false,
                 at: now,
             },
@@ -63038,6 +63219,7 @@ mod tests {
         for (at_end, expected) in [(false, "先頭です"), (true, "末尾です")] {
             assert_eq!(fullscreen_boundary_edge_title(at_end), expected);
             let text = crate::app::App::native_boundary_hint_text(FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end,
                 at: now,
             });
@@ -70001,6 +70183,118 @@ mod tests {
             },
             session,
         ));
+    }
+
+    fn list_order_acceptance_fixture() -> (crate::app::AppTestEnvForTest, usize) {
+        let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
+        let folder = app.tmp.path().to_path_buf();
+        app.current_folder = Some(folder.clone());
+        app.items[fs_idx] = GridItem::Image(folder.join("page.png"));
+        app.visible_indices = vec![fs_idx];
+        app.selected = Some(fs_idx);
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        app.list_order = Some(Arc::new(crate::app::ListOrderSnapshot {
+            owner: app.virtual_list_context_id(),
+            entries: vec![crate::app::ListOrderEntry {
+                path: folder,
+                kind: crate::app::ListOrderEntryKind::Folder,
+            }]
+            .into(),
+        }));
+        assert!(app.list_order_position().is_some());
+        (app, fs_idx)
+    }
+
+    #[test]
+    fn list_order_handler_retires_rating_restore_only_after_acceptance() {
+        use crate::rating_membership::RatingAdoptionIntent;
+        for (has_snapshot, locked) in [(true, true), (false, false), (true, false)] {
+            let (mut app, fs_idx) = list_order_acceptance_fixture();
+            let ctx = egui::Context::default();
+            let (rating_tx, rx) = std::sync::mpsc::channel();
+            let restore = RatingAdoptionIntent::RestoreOrigin(app.capture_rating_origin().unwrap());
+            app.rating_view_pending = Some(crate::rating_view::RatingViewPending {
+                stars: 3,
+                sequence: 1,
+                source_generation: app.items_generation,
+                context: app.virtual_list_context_id(),
+                rating_write_generation: app.rating_session_write_generation,
+                rating_preview: Default::default(),
+                rating_adoption: restore.clone(),
+                sort: Default::default(),
+                membership_only: true,
+                navigation: None,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+            });
+            if !has_snapshot {
+                app.list_order = None;
+            }
+            if locked {
+                app.fs_nav_locked_gen = Some(app.items_generation);
+            }
+            app.handle_fullscreen_list_order_nav_context(&ctx, fs_idx, true, false);
+            let accepted = has_snapshot && !locked;
+            assert_eq!(
+                app.rating_view_pending.as_ref().unwrap().rating_adoption,
+                if accepted {
+                    RatingAdoptionIntent::Reconcile
+                } else {
+                    restore
+                },
+            );
+            assert_eq!(app.list_order_pending_owners_for_test().0, accepted);
+            drop(rating_tx);
+        }
+    }
+
+    #[test]
+    fn list_order_handler_ends_preview_gesture_only_after_acceptance() {
+        for (has_snapshot, locked) in [(true, true), (false, false), (true, false)] {
+            let (mut app, fs_idx) = list_order_acceptance_fixture();
+            let ctx = egui::Context::default();
+            begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
+            assert!(app.similar_panel.preview.has_active_gesture());
+            if !has_snapshot {
+                app.list_order = None;
+            }
+            if locked {
+                app.fs_nav_locked_gen = Some(app.items_generation);
+            }
+            app.handle_fullscreen_list_order_nav_context(&ctx, fs_idx, true, false);
+            let accepted = has_snapshot && !locked;
+            assert_eq!(app.similar_panel.preview.has_active_gesture(), !accepted);
+            assert_eq!(app.list_order_pending_owners_for_test().0, accepted);
+        }
+    }
+
+    #[test]
+    fn list_order_handler_supersedes_required_open_only_after_acceptance() {
+        for (has_snapshot, locked) in [(true, true), (false, false), (true, false)] {
+            let (mut app, fs_idx) = list_order_acceptance_fixture();
+            let ctx = egui::Context::default();
+            let required_folder = app.tmp.path().to_path_buf();
+            let required_target =
+                crate::snapshot::SnapshotTarget::Fs(required_folder.join("required.png"));
+            app.start_required_fullscreen_folder_open(
+                required_folder,
+                required_target,
+                crate::app::HistoryTrigger::UserChosen,
+                crate::app::FsNavigationPurpose::Ordinary,
+            );
+            assert!(app.list_order_pending_owners_for_test().1);
+            if !has_snapshot {
+                app.list_order = None;
+            }
+            if locked {
+                app.fs_nav_locked_gen = Some(app.items_generation);
+            }
+            app.handle_fullscreen_list_order_nav_context(&ctx, fs_idx, true, false);
+            let accepted = has_snapshot && !locked;
+            assert_eq!(app.list_order_pending_owners_for_test().1, !accepted);
+            assert_eq!(app.list_order_pending_owners_for_test().0, accepted);
+        }
     }
 
     fn complete_navigator_preview_for_test(app: &mut App, color: egui::Color32) {
@@ -92684,6 +92978,44 @@ pub(crate) mod page_turn_submission_tests {
             assert_eq!(app.fullscreen_idx, Some(1));
             assert!(app.should_block_detached_independent_still_navigation_to_video(2));
         });
+    }
+
+    #[test]
+    fn list_order_key_collector_returns_intent_with_original_operation() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsCommon]\nFsListOrderNext = F17\n");
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        frame_with_events(
+            &ctx,
+            vec![pressed(egui::Key::F17), pressed(egui::Key::B)],
+            |ctx| {
+                app.page_turn_pre_draw(ctx);
+                let original = crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
+                    .into_iter()
+                    .find(|edge| {
+                        matches!(
+                            edge,
+                            crate::key_input::KeyOperationEdge::Egui {
+                                key: egui::Key::F17,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap()
+                    .operation_id();
+                let mut operation = None;
+                let action = app.handle_fs_key_input_with_operation(ctx, 1, false, &mut operation);
+                assert_eq!(action.list_order_nav, Some(true));
+                assert!(action.page_nav.is_none());
+                assert!(!app.list_order_pending_owners_for_test().0);
+                assert_eq!(operation, Some(ViewerOperationId::Key(original)));
+            },
+        );
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
     }
 
     #[test]

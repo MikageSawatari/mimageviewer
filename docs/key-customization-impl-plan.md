@@ -1,5 +1,13 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+2026-10-26 §1.444: `FsListOrderPrev` / `FsListOrderNext` は `FsCommon` / Press、
+既定 `Ctrl+Shift+Up` / `Ctrl+Shift+Down`。説明は「一覧の表示順で前 / 次の本を開く」。
+`EachPhysicalPress` で物理押下を数えるが、移動の準備中は既存 gate で拒否し累積しない。
+egui の repeat-only フレームは既存 Ctrl+↑↓ と同じく最大 1 回へまとめ、native は既存 Ctrl+↑↓ と同じく repeat を無視する。
+egui と native 動画の resolver / dispatcher、双方の動画ヘルプへ登録する。
+通常フォルダ一覧から最後に本を開く操作を受け付けた時点の列を使い、DFS / 兄弟移動は維持する。
+詳細は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) を参照。
+
 2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、
 ドラッグが無ければ従来どおりモードを終了する。消しゴム / 補正レイヤーと同じモード内の取消優先であり、
 キー割当や新しい KeyAction は追加しない。通常 release（窓外で離した OS level の確認を含む）の確定と
@@ -578,6 +586,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsClose `Enter` (画像のみ P) / FsBackToList `Backspace` (P) / `Esc` (固定)
 - FsJumpFirst/Last `Home/End` (P)
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
+- FsListOrderPrev/Next `Ctrl+Shift+↑/↓` (P): 最後に通常フォルダ一覧から本を開いたときの一覧順。準備中は受付拒否、累積なし
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` / `RatingBookPreferred*` を共有する。

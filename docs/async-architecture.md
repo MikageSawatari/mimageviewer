@@ -1082,6 +1082,7 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
 | --- | --- | --- |
 | `Grid` | `navigate()` の Ctrl+↑↓ (通常グリッド) | `load_folder_nav_target(p)` のみ。RAR/7z/LZH などは変換ダイアログまたはキャッシュ経由で開く |
 | `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder_nav_target(p)` → `open_fullscreen(先頭 image-like idx)` |
+| `ListOrder { snapshot, from_index }` | Ctrl+Shift+↑↓ | 通常フォルダ一覧の凍結した本の行を同じ停止条件で前後に探す。行き先の事前scan・採用・再openは Fullscreen と共有。sequence / 表示待ち中は拒否し、累積・乗り換えをしない |
 | `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `load_folder_nav_target + nav_stack.push + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
 | `Favsearch { root, fullscreen: true }` | フルスクリーン中の Ctrl+S スコープナビ | 上記に加えて `close_fullscreen` → `open_fullscreen(先頭 image-like idx)` でフルスクリーンを維持 |
 | `SmartFolder { state, fullscreen }` | スマートフォルダ root / scoped drill / root 直下の本のグリッド、リング、ゲームパッド、フルスクリーン | Folder `entry_root` 内だけを DFS。端または root 直下の本からは、最終 root items 表示順の Folder/PDF/ZIP/変換書庫 entry へ移る（単体画像・動画は除外）。worker に渡した単一の型付き root 列と可視列が異なれば旧結果は採用しない。新しい Folder/PDF/ZIP は offscreen `SmartFolderTransition` で準備し、可視採用時に `SmartFolderViewState` と fullscreen 継続を一度だけ更新する |

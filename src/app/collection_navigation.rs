@@ -4583,6 +4583,7 @@ impl App {
                 }
                 let _ = landing;
                 self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end: *delta > 0,
                     at: std::time::Instant::now(),
                 });
