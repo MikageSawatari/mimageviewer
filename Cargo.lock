@@ -2090,8 +2090,6 @@ dependencies = [
 [[package]]
 name = "epaint"
 version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97bac86ae3dde93fc3951e790951caea739ff39a6c89d909cdaf1d9278dbb1bd"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -4149,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "4.8.1"
+version = "4.8.2"
 dependencies = [
  "ab_glyph",
  "base64",
@@ -4231,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-ipc"
-version = "4.8.1"
+version = "4.8.2"
 dependencies = [
  "argon2",
  "getrandom 0.3.4",
@@ -4242,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "4.8.1"
+version = "4.8.2"
 dependencies = [
  "fs4",
  "miv-startup",
@@ -4254,7 +4252,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-remote"
-version = "4.8.1"
+version = "4.8.2"
 dependencies = [
  "argon2",
  "fast_image_resize",
