@@ -8,7 +8,7 @@
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + FFmpeg DLL + VC runtime + EffeTune Mixwright bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
 
@@ -43,11 +43,11 @@
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.14.0 の VERSION と全462ファイルを
-  `third_party/effetune-mixwright/v0.14.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+- **mIV Sound 配布境界**: 単体exe版／インストーラ版は承認済み VERSION とbundle全体を
+  `third_party/miv-sound/<ver>/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
-  launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
+  launcherは `runtime/<version>/effetune/<hash12>-<generation>/mIV Sound.vst3/` に
   検証済み世代を一度だけ公開する。公開処理は既存・使用中treeの移動、置換、削除をしない。**atomicなのは
   完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
   正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
@@ -65,7 +65,7 @@
   音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
   成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
   メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
-  通知原文とmanifestは `third_party/effetune-mixwright/v0.14.0/` に追跡し、`.gitattributes -text`で
+  通知原文とmanifestは `third_party/miv-sound/<ver>/` に追跡し、`.gitattributes -text`で
   checkout時の改行変換を防ぐ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
@@ -83,6 +83,16 @@
   `vendor/vcrt/provenance.json` と実体を一体で見直す。
 - **設定保存先**: インストーラ版・単体exe版は `%APPDATA%\mimageviewer`、
   ポータブル版は `<exe_dir>\data` (書込不可なら APPDATA へフォールバックせずエラー起動拒否)。
+
+### 派生版への切替の前提（F2a）
+
+固定値の正本は `config/miv-sound.rs`。手順は [F2a 引き継ぎ](miv-sound-f2a-handoff.md)。
+候補IDを指定した自動検証・実機確認・独立レビューの後、同じ候補を明示承認する。
+ctest を省いた候補は、その候補の ctest 成功記録を付けるまで承認できない。
+配布ビルドは承認 manifest を照合するだけで生成しない。旧 Mixwright 原本は配布入力にしない。
+F2b の移行、F3 の公開文書、F4 のポータブル有効化が揃うまで、この切替を公開しない。
+F4 の plugin DLL 署名も既存の署名差分検査を通す。公開前には host と plugin DLL を VirusTotal で確認し、
+Google/Microsoft の検出があれば公開を止める（送信の都度、利用者の了承を得る）。
 
 ## リリース手順チェックリスト
 

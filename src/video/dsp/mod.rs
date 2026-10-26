@@ -266,6 +266,59 @@ pub(crate) fn publish_editor_ui_snapshot(shared: &SharedEditorUiSnapshot, next: 
     *shared.write().unwrap_or_else(|err| err.into_inner()) = Arc::new(next);
 }
 
+/// Child-process environment owned by the bridge's purpose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BridgeEnvironment {
+    UserVst,
+    MivSound(std::path::PathBuf),
+}
+
+impl BridgeEnvironment {
+    fn apply(&self, command: &mut std::process::Command) {
+        match self {
+            Self::UserVst => {
+                // Never expose the audio-adjustment profile to user plugins,
+                // including when the parent inherited this variable externally.
+                command.env_remove("MIV_SOUND_DATA_DIR");
+            }
+            Self::MivSound(directory) => {
+                crate::logger::log(format!(
+                    "[miv-sound] bridge environment: MIV_SOUND_DATA_DIR={}, WEBVIEW2_USER_DATA_FOLDER removed",
+                    directory.display()
+                ));
+                command.env("MIV_SOUND_DATA_DIR", directory);
+                command.env_remove("WEBVIEW2_USER_DATA_FOLDER");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bridge_environment_tests {
+    use super::BridgeEnvironment;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn audio_adjustment_overrides_only_its_child_environment() {
+        let directory = std::path::PathBuf::from(r"C:\isolated\音響調整");
+        let mut sound = std::process::Command::new("unused");
+        BridgeEnvironment::MivSound(directory.clone()).apply(&mut sound);
+        let sound_env: std::collections::BTreeMap<_, _> = sound.get_envs().collect();
+        assert_eq!(
+            sound_env[OsStr::new("MIV_SOUND_DATA_DIR")],
+            Some(directory.as_os_str())
+        );
+        assert_eq!(sound_env[OsStr::new("WEBVIEW2_USER_DATA_FOLDER")], None);
+        let mut user = std::process::Command::new("unused");
+        BridgeEnvironment::UserVst.apply(&mut user);
+        let user_env: std::collections::BTreeMap<_, _> = user.get_envs().collect();
+        assert_eq!(user_env[OsStr::new("MIV_SOUND_DATA_DIR")], None);
+        assert!(!user_env.contains_key(OsStr::new("WEBVIEW2_USER_DATA_FOLDER")));
+        // Independent commands retain independent configuration; no global env writes.
+        assert_eq!(sound.get_envs().count(), 2);
+    }
+}
+
 /// DspBridge — 1 本の VST3 チェーンホスト bridge との対話を管理する。
 ///
 /// アプリ起動時に読み込んだユーザー VST と音響調整の各 bridge をローカル再生と
@@ -273,6 +326,7 @@ pub(crate) fn publish_editor_ui_snapshot(shared: &SharedEditorUiSnapshot, next: 
 /// `DspProcessingCoordinator` の世代付き許可で排他する。
 pub struct DspBridge {
     inner: Mutex<DspBridgeInner>,
+    environment: BridgeEnvironment,
     gui_owner_policy: GuiOwnerPolicy,
     gui_gate: std::sync::OnceLock<Arc<crate::effetune::gui_gate::GuiGate>>,
     latency_policy: LatencyPolicy,
@@ -469,7 +523,34 @@ impl DspBridge {
         strict_state: bool,
         show_editor_bypass_button: bool,
     ) -> Arc<Self> {
+        Self::new_with_environment(
+            gui_owner_policy,
+            latency_policy,
+            strict_state,
+            show_editor_bypass_button,
+            BridgeEnvironment::UserVst,
+        )
+    }
+
+    pub(crate) fn new_for_miv_sound(directory: std::path::PathBuf) -> Arc<Self> {
+        Self::new_with_environment(
+            GuiOwnerPolicy::Unowned,
+            LatencyPolicy::ReportOnly,
+            true,
+            false,
+            BridgeEnvironment::MivSound(directory),
+        )
+    }
+
+    fn new_with_environment(
+        gui_owner_policy: GuiOwnerPolicy,
+        latency_policy: LatencyPolicy,
+        strict_state: bool,
+        show_editor_bypass_button: bool,
+        environment: BridgeEnvironment,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            environment,
             inner: Mutex::new(DspBridgeInner {
                 state: DspState::Disabled,
                 slots: Vec::new(),
@@ -1208,6 +1289,7 @@ impl DspBridge {
                     exe,
                     |line| crate::logger::log(format!("[vst3-bridge] {line}")),
                     gui_signal_wake,
+                    &self.environment,
                 )
                 .map_err(|e| format!("bridge spawn 失敗: {e}"))?;
                 if let Err(e) = bridge.send(&Cmd::Hello {

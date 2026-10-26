@@ -22,6 +22,18 @@ const HARMNET_NOTICE: (&str, &str, &str) = (
 const IJG_ATTRIBUTION: &str =
     "This software is based in part on the work of the Independent JPEG Group.";
 
+#[cfg(not(feature = "portable"))]
+fn draw_miv_sound_credits(ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("mIV Sound (MIT)").strong());
+    for text in [
+        "Copyright (c) 2026, Yoshiyuki Kobayashi",
+        "Copyright (c) 2025-2026, Yoshiyuki Kobayashi",
+        "Based on EffeTune / EffeTune Mixwright by Frieve",
+    ] {
+        ui.add(egui::Label::new(text).wrap());
+    }
+}
+
 fn draw_license_text(ui: &mut egui::Ui, title: &str, id: &str, text: &str) {
     egui::CollapsingHeader::new(title)
         .id_salt(id)
@@ -103,25 +115,28 @@ pub fn draw_avif_license_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(not(feature = "portable"))]
 const EFFETUNE_NOTICES: &[(&str, &str, &str)] = &[
     (
-        "EffeTune Mixwright THIRD-PARTY-NOTICES 全文",
+        "mIV Sound THIRD-PARTY-NOTICES 全文",
         "Contents/Resources/THIRD-PARTY-NOTICES.txt",
-        include_str!(
-            "../../third_party/effetune-mixwright/v0.14.0/Contents/Resources/THIRD-PARTY-NOTICES.txt"
-        ),
+        include_str!(concat!(
+            env!("MIV_SOUND_NOTICES_DIR"),
+            "/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+        )),
     ),
     (
-        "EffeTune WebView THIRD-PARTY-NOTICES 全文",
+        "mIV Sound WebView THIRD-PARTY-NOTICES 全文",
         "Contents/Resources/webview/THIRD-PARTY-NOTICES.txt",
-        include_str!(
-            "../../third_party/effetune-mixwright/v0.14.0/Contents/Resources/webview/THIRD-PARTY-NOTICES.txt"
-        ),
+        include_str!(concat!(
+            env!("MIV_SOUND_NOTICES_DIR"),
+            "/Contents/Resources/webview/THIRD-PARTY-NOTICES.txt"
+        )),
     ),
     (
-        "EffeTune DSP NOTICE 全文",
+        "mIV Sound DSP NOTICE 全文",
         "Contents/Resources/webview/plugins/dsp/NOTICE.txt",
-        include_str!(
-            "../../third_party/effetune-mixwright/v0.14.0/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
-        ),
+        include_str!(concat!(
+            env!("MIV_SOUND_NOTICES_DIR"),
+            "/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
+        )),
     ),
 ];
 
@@ -205,8 +220,8 @@ impl App {
 
                         #[cfg(not(feature = "portable"))]
                         {
-                            ui.label("EffeTune Mixwright");
-                            ui.label("MIT — © 2025-2026 Yoshiyuki Kobayashi");
+                            ui.label("mIV Sound");
+                            ui.label("MIT — Yoshiyuki Kobayashi");
                             ui.end_row();
 
                             ui.label("Steinberg VST3 SDK");
@@ -250,6 +265,12 @@ impl App {
                         ui.label("CC-BY 4.0 — Twitter, Inc. and other contributors");
                         ui.end_row();
                     });
+
+                #[cfg(not(feature = "portable"))]
+                {
+                    ui.add_space(8.0);
+                    draw_miv_sound_credits(ui);
+                }
 
                 // FFmpeg は LGPL のライブラリを DLL として同梱・再配布しているので、
                 // ライセンス名だけでなく「どのビルドか」と「対応ソースの入手先」を
@@ -485,6 +506,45 @@ mod tests {
         assert!(EGUI_LICENSE_APACHE.contains("Version 2.0, January 2004"));
     }
 
+    #[cfg(not(feature = "portable"))]
+    #[test]
+    fn miv_sound_credits_snapshot_light_and_narrow_dark() {
+        use egui_kittest::kittest::Queryable;
+        let mut snapshots = egui_kittest::SnapshotResults::default();
+        for (name, theme, width) in [
+            (
+                "miv_sound_credits_light",
+                crate::os_theme::ResolvedTheme::Light,
+                480.0,
+            ),
+            (
+                "miv_sound_credits_narrow_dark",
+                crate::os_theme::ResolvedTheme::Dark,
+                280.0,
+            ),
+        ] {
+            let mut fonts_ready = false;
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(width, 180.0))
+                .build_ui(move |ui| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ui.ctx());
+                        fonts_ready = true;
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    crate::os_theme::apply_resolved(ui.ctx(), theme);
+                    super::draw_miv_sound_credits(ui);
+                });
+            harness.run();
+            harness.get_by_label("Copyright (c) 2026, Yoshiyuki Kobayashi");
+            harness.get_by_label("Copyright (c) 2025-2026, Yoshiyuki Kobayashi");
+            harness.get_by_label("Based on EffeTune / EffeTune Mixwright by Frieve");
+            harness.snapshot(name);
+            snapshots.extend(harness.take_snapshot_results());
+        }
+    }
+
     // cfg を付けず、通常構成と portable 構成の両方で同じ登録・本文を検査する。
     #[test]
     fn harmnet_notice_is_registered_with_embedded_mit_license_in_every_build_flavor() {
@@ -547,6 +607,7 @@ mod tests {
     fn effetune_notice_texts_include_attribution_and_match_vendor_when_present() {
         use super::EFFETUNE_NOTICES;
         let main_notice = EFFETUNE_NOTICES[0].2;
+        assert!(main_notice.contains("Copyright (c) 2026, Yoshiyuki Kobayashi"));
         assert!(main_notice.contains("Copyright (c) 2025-2026, Yoshiyuki Kobayashi"));
         assert!(main_notice.contains("Steinberg Media Technologies GmbH"));
         assert!(main_notice.contains("MIT License"));
@@ -578,9 +639,7 @@ mod tests {
         }
         for &(_, relative_path, embedded) in EFFETUNE_NOTICES {
             let tracked = std::fs::read(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("third_party/effetune-mixwright/v0.14.0")
-                    .join(relative_path),
+                std::path::Path::new(env!("MIV_SOUND_NOTICES_DIR")).join(relative_path),
             )
             .expect("Approved EffeTune notice must be present");
             assert_eq!(
@@ -597,13 +656,14 @@ mod tests {
         }
 
         let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("vendor/effetune-mixwright/EffeTune Mixwright.vst3");
+            .join(crate::miv_sound_config::SOURCE_ROOT)
+            .join(crate::miv_sound_config::BUNDLE_NAME);
         if !vendor.exists() {
             return;
         }
         let vendor_version = std::fs::read_to_string(vendor.parent().unwrap().join("VERSION"))
             .expect("EffeTune vendor VERSION must be present");
-        assert_eq!(vendor_version.trim(), "v0.14.0");
+        assert_eq!(vendor_version.trim(), crate::miv_sound_config::VERSION);
         for &(_, relative_path, embedded) in EFFETUNE_NOTICES {
             let source = std::fs::read(vendor.join(relative_path))
                 .expect("EffeTune vendor notice must be present");

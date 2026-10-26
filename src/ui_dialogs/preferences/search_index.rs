@@ -1332,8 +1332,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "video/effetune-input-limit",
         Video,
-        "EffeTune に渡す前に 0dB を超える音を抑える",
-        ["音響調整", "OVERLOAD", "ピーク", "EffeTune"]
+        "mIV Sound に渡す前に 0dB を超える音を抑える",
+        ["音響調整", "OVERLOAD", "ピーク", "mIV Sound"]
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
@@ -1345,7 +1345,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "ビジュアライザー",
             "自動表示",
             "初回",
-            "EffeTune"
+            "mIV Sound"
         ]
     ),
     #[cfg(not(feature = "portable"))]
@@ -1353,14 +1353,14 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "video/effetune-taskbar",
         Video,
         "音響調整の窓をタスクバーに表示する",
-        ["音響調整", "タスクバー", "taskbar", "復元", "EffeTune"]
+        ["音響調整", "タスクバー", "taskbar", "復元", "mIV Sound"]
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
         "video/effetune-minimized",
         Video,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
-        ["音響調整", "ビジュアライザー", "最小化", "EffeTune"]
+        ["音響調整", "ビジュアライザー", "最小化", "mIV Sound"]
     ),
     entry!(
         "video/normalize-cache",
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     fn effetune_taskbar_search_matches_the_build_flavor() {
-        let result = search_preferences("EffeTune タスクバー", test_tree_position);
+        let result = search_preferences("mIV Sound タスクバー", test_tree_position);
         #[cfg(not(feature = "portable"))]
         assert_eq!(
             result.first().map(|entry| entry.anchor),
@@ -1747,7 +1747,7 @@ mod tests {
 
     #[test]
     fn effetune_minimized_search_matches_the_build_flavor() {
-        let result = search_preferences("EffeTune 最小化", test_tree_position);
+        let result = search_preferences("mIV Sound 最小化", test_tree_position);
         #[cfg(not(feature = "portable"))]
         assert_eq!(
             result.first().map(|entry| entry.anchor),
@@ -1759,7 +1759,7 @@ mod tests {
 
     #[test]
     fn effetune_auto_open_search_matches_the_build_flavor() {
-        let result = search_preferences("EffeTune 自動表示", test_tree_position);
+        let result = search_preferences("mIV Sound 自動表示", test_tree_position);
         #[cfg(not(feature = "portable"))]
         assert_eq!(
             result.first().map(|entry| entry.anchor),

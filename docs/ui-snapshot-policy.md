@@ -4,6 +4,13 @@ v0.7.0 で導入した `egui_kittest` ベースの UI 回帰テストの運用�
 
 ## 目的
 
+mIV Sound F2a の名称変更では `preferences_effetune_input_limit_dark` と
+`preferences_effetune_auto_open_light`、`preferences_effetune_taskbar_narrow_dark` の3枚を更新し、
+文字以外の項目・配置を目視確認する。
+About の上流2本の著作権と credit は、本体と共用する描画helperを使う
+`miv_sound_credits_light`（480×180）と `miv_sound_credits_narrow_dark`（280×180）で確認する。
+追加2枚は計40,255 bytes。狭幅の折り返し後にも全文が収まり、製品の起動や実データ操作は含まない。
+
 Ctrl+G の短い語の拒否 (§1.229) は `global_search_short_term_reject_light` /
 `global_search_short_term_reject_dark` の2枚で、単語1つと複数語の表示を保持する。
 製品と共通の幅制限付きバッジを hover し、省略されたメッセージの全文も確認する。

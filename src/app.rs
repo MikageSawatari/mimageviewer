@@ -31636,6 +31636,19 @@ impl App {
         query
     }
 
+    /// Shared startup boundary for both host types (fork plan section 5.2).
+    /// F2b will start the migration worker here and call this continuation only
+    /// after its terminal result. F2a does not implement migration or its marks;
+    /// these development builds must not be run against normal user data.
+    #[cfg(windows)]
+    fn start_audio_plugins_after_migration(&mut self) {
+        self.kick_off_vst3_startup_load();
+        self.effetune.startup(
+            self.settings.effetune_gui_pos,
+            self.settings.effetune_gui_size,
+        );
+    }
+
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
     /// 1 度しか走らせない。
     pub(crate) fn kick_off_startup_init(&mut self) {
@@ -31644,11 +31657,7 @@ impl App {
         }
         #[cfg(windows)]
         {
-            self.kick_off_vst3_startup_load();
-            self.effetune.startup(
-                self.settings.effetune_gui_pos,
-                self.settings.effetune_gui_size,
-            );
+            self.start_audio_plugins_after_migration();
         }
         let favorites = self.settings.favorites.clone();
         let excluded_roots = vec![self.settings.books_root_path()];

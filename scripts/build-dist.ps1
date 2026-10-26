@@ -52,8 +52,8 @@ $portableTargetDir = Join-Path $repoRoot 'target-portable'
 if ($SkipVst3Bridge) { Assert-MivVst3HostIdentity -RepoRoot $repoRoot }
 # Fail before tests/clean if the complete release bundle or tracked licenses are
 # missing. build-release stages a fresh copy and signs its PE(s) before embedding.
-$null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot 'vendor\effetune-mixwright') `
-    -NoticesRoot (Join-Path $repoRoot 'third_party\effetune-mixwright')
+$null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot $MivSound.SOURCE_ROOT) `
+    -NoticesRoot (Join-Path $repoRoot $MivSound.NOTICES_ROOT)
 
 if ($PreserveRuntime) {
     if (-not $repoRoot.Equals($expectedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -217,7 +217,7 @@ $finalRuntimePe = @(
     (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe'),
     (Join-Path $repoRoot 'target\release\mimageviewer-epub-pdf.exe'),
     $portableDir,
-    (Join-Path $repoRoot 'target\effetune-dist-source\EffeTune Mixwright.vst3')
+    (Join-Path $repoRoot ("target/effetune-dist-source/" + $MivSound.BUNDLE_NAME))
 )
 Write-Host '[build-dist] (7/7) final PE dependency closure'
 Assert-MivVst3HostIdentity -RepoRoot $repoRoot

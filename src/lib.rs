@@ -21,6 +21,9 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[path = "../config/miv-sound.rs"]
+pub(crate) mod miv_sound_config;
+
 #[cfg(test)]
 mod egui037_stage4_gpu_tests;
 mod egui_output;

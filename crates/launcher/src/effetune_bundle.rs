@@ -383,7 +383,10 @@ mod tests {
     fn with_fixture(test: impl FnOnce(&Path, &[BundleFile])) {
         let temp = tempfile::tempdir().unwrap();
         let files = [BundleFile {
-            name: "EffeTune Mixwright.vst3/Contents/test.txt",
+            name: Box::leak(
+                format!("{}/Contents/test.txt", crate::miv_sound_config::BUNDLE_NAME)
+                    .into_boxed_str(),
+            ),
             bytes: b"bundle",
             hash: Box::leak(crate::hex_lower(&Sha256::digest(b"bundle")).into_boxed_str()),
         }];
@@ -478,7 +481,8 @@ mod tests {
     #[test]
     fn rejects_traversal_and_preserves_legacy_tree() {
         with_fixture(|dir, files| {
-            let legacy = dir.join("effetune/EffeTune Mixwright.vst3");
+            let legacy = dir
+                .join(std::path::Path::new("effetune").join(crate::miv_sound_config::BUNDLE_NAME));
             std::fs::create_dir_all(&legacy).unwrap();
             std::fs::write(legacy.join("keep"), b"old").unwrap();
             ensure_bundle(dir, files, "current").unwrap();

@@ -287,7 +287,7 @@ const V4_3_HIGHLIGHTS: &[HighlightItem] = &[
     },
     #[cfg(not(feature = "portable"))]
     HighlightItem {
-        title: "音響調整 (EffeTune) で音を整えられます",
+        title: "音響調整 (mIV Sound) で音を整えられます",
         body: "ツールバーの「音響調整」ボタンから、イコライザーやエフェクトで動画・音声の音を整えられます。一度設定すると、次からは起動時に自動で有効になります。",
     },
     HighlightItem {
@@ -328,7 +328,7 @@ const V4_5_HIGHLIGHTS: &[HighlightItem] = &[
 
 const V4_6_HIGHLIGHTS: &[HighlightItem] = &[
     HighlightItem {
-        title: "同梱の音響調整（EffeTune）を新しい版にしました",
+        title: "同梱の音響調整（mIV Sound）を新しい版にしました",
         body: "ビジュアライザーを起動時の表示に選べるようになり、再生中の曲名やジャケットも表示できます。",
     },
     HighlightItem {
@@ -1049,7 +1049,7 @@ const TABLE: &[VersionHighlights] = &[
             #[cfg(not(feature = "portable"))]
             HighlightItem {
                 title: "ツールバーに「音響調整」ボタンが加わりました",
-                body: "同梱の音響調整 (EffeTune) を開くボタンです。不要な場合は、ツールバーの項目を右クリックして外せます。",
+                body: "同梱の音響調整 (mIV Sound) を開くボタンです。不要な場合は、ツールバーの項目を右クリックして外せます。",
             },
         ],
         highlights: V4_3_HIGHLIGHTS,
@@ -1621,7 +1621,7 @@ mod tests {
         for items in [entry.must_read, entry.highlights] {
             let announces_effetune = items
                 .iter()
-                .any(|item| item.title.contains("音響調整") || item.body.contains("EffeTune"));
+                .any(|item| item.title.contains("音響調整") || item.body.contains("mIV Sound"));
             assert_eq!(announces_effetune, !cfg!(feature = "portable"));
         }
     }

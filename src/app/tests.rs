@@ -9323,7 +9323,7 @@ fn effetune_tooltip_uses_user_reasons_without_diagnostic_details() {
     use crate::effetune::{EffetuneFailure, EffetuneRuntime, UnavailableReason};
 
     let mut app = phase_c_support::setup_app();
-    let diagnostic = r"C:\private\effetune\EffeTune Mixwright.vst3: host error";
+    let diagnostic = r"C:\private\effetune\mIV Sound.vst3: host error";
     let unavailable = [
         (
             UnavailableReason::BundleMissing(diagnostic.into()),

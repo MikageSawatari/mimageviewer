@@ -175,7 +175,7 @@ mImageViewer と関連するアプリを終了してから手動で削除でき�
   - runtime\<version>\mimageviewer-epub-pdf.exe
                      : EPUB 変換用プログラム（初回展開）
   - epub_cache\      : EPUB から変換した PDF（管理画面で削除予約）
-  - runtime\<version>\effetune\<hash12>-<generation>\EffeTune Mixwright.vst3\
+  - runtime\<version>\effetune\<hash12>-<generation>\mIV Sound.vst3\
                      : 音響調整用プラグインと関連ファイル（初回展開）
   - effetune\        : 次回起動時に復元する音響調整の状態
 

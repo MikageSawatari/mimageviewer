@@ -455,6 +455,14 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
 
 ## 12. 段階
 
+F2a の mIV 側実装と手順・棚卸し・検証の記録は [F2a 引き継ぎ](miv-sound-f2a-handoff.md)。
+F2a は §7.3〜7.4、bridge 環境と表記までで、§5 の移行本体は F2b。
+固定値は `config/miv-sound.rs` に集約する。`-SkipCTest` の候補は未承認のまま保持し、
+`-TestCandidate -Candidate <ID>` で同じ出力の ctest 成功記録を作ってから承認する。
+F3 まで公開説明書は同定義の `DOCS_VERSION` で既存 snapshot を維持する。
+F2a は実装・非対話検証・検査用core buildまで実施（未コミット、独立レビュー前）。
+実際の派生版候補のbuild/ctest・承認・release launcherと、F2b以降は未完了。
+
 | 段階 | 内容 | 担当 |
 | --- | --- | --- |
 | F1 | 派生版リポジトリ (v0.15.0 元): 名前・クラス ID・3 種類の版・保存先の環境変数・WebView の user data folder・クレジットと通知・アイコン・Counter を外す (§8)、上流のテストの更新、出荷済みの状態ファイルを読むテスト、`build-miv.bat` | Codex (派生版リポジトリ) |

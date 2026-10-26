@@ -28,22 +28,22 @@ $temp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('
 $testRoot = Join-Path $temp ('miv-effetune-test-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
-    $source = Join-Path $testRoot 'vendor\effetune-mixwright'
-    $bundle = Join-Path $source 'EffeTune Mixwright.vst3'
-    $pePath = Join-Path $bundle 'Contents\x86_64-win\EffeTune Mixwright.vst3'
+    $source = Join-Path $testRoot $MivSound.SOURCE_ROOT
+    $bundle = Join-Path $source $MivSound.BUNDLE_NAME
+    $pePath = Join-Path $bundle ("Contents/x86_64-win/" + $MivSound.BUNDLE_NAME)
     New-Item -ItemType Directory -Path (Split-Path -Parent $pePath) -Force | Out-Null
     $bytes = New-Object byte[] 512
     $bytes[0] = 0x4d; $bytes[1] = 0x5a; $bytes[0x3c] = 0x40
     $bytes[64] = 0x50; $bytes[65] = 0x45
     $bytes[88] = 0x0b; $bytes[89] = 0x02
     [System.IO.File]::WriteAllBytes($pePath, $bytes)
-    $noticesRoot = Join-Path $testRoot 'third_party\effetune-mixwright'
+    $noticesRoot = Join-Path $testRoot $MivSound.NOTICES_ROOT
     foreach ($relative in @(
         'Contents\Resources\THIRD-PARTY-NOTICES.txt',
         'Contents\Resources\webview\THIRD-PARTY-NOTICES.txt',
         'Contents\Resources\webview\plugins\dsp\NOTICE.txt'
     )) {
-        foreach ($path in @((Join-Path $bundle $relative), (Join-Path (Join-Path $noticesRoot 'v0.14.0') $relative))) {
+        foreach ($path in @((Join-Path $bundle $relative), (Join-Path (Join-Path $noticesRoot $MivSound.VERSION) $relative))) {
             New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
             [System.IO.File]::WriteAllText($path, "notice $relative")
         }
@@ -51,7 +51,7 @@ try {
     $hidden = Join-Path $bundle '.gitignore'
     [System.IO.File]::WriteAllText($hidden, 'resource')
     (Get-Item -LiteralPath $hidden).Attributes = [System.IO.FileAttributes]::Hidden
-    [System.IO.File]::WriteAllText((Join-Path $source 'VERSION'), 'v0.14.0')
+    [System.IO.File]::WriteAllText((Join-Path $source 'VERSION'), $MivSound.VERSION)
     $fakeDll = Join-Path $bundle 'not-a-pe.dll'
     [System.IO.File]::WriteAllText($fakeDll, 'MZ')
     Assert-True (Test-MivPeFile $pePath) 'missed .vst3 PE'
@@ -64,14 +64,14 @@ try {
     Remove-Item -LiteralPath $fakeDll, $badOffset
     # Fixture approval is created once, before testing any local modification.
     $sourceFull = [System.IO.Path]::GetFullPath($source)
-    $manifestPath = Join-Path $noticesRoot 'v0.14.0\manifest.sha256'
+    $manifestPath = Join-Path $noticesRoot "$($MivSound.VERSION)/manifest.sha256"
     $manifestLines = @(Get-MivTreeFiles $source | ForEach-Object {
         '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.FullName.Substring($sourceFull.Length + 1).Replace('\', '/')
     })
     [System.IO.File]::WriteAllText($manifestPath, ($manifestLines -join "`n") + "`n")
     $versionPath = Join-Path $source 'VERSION'
     $versionBytes = [System.IO.File]::ReadAllBytes($versionPath)
-    foreach ($unsupported in @('v0.13.0', 'v99.0.0')) {
+    foreach ($unsupported in @('0.13.0', '99.0.0')) {
         [System.IO.File]::WriteAllText($versionPath, $unsupported)
         Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'Unsupported VERSION'
     }
@@ -91,19 +91,19 @@ try {
     Write-FixtureBytes $resource $resourceBytes
     (Get-Item -LiteralPath $resource -Force).Attributes = [System.IO.FileAttributes]::Hidden
     $stage = New-MivEffetuneStage -RepoRoot $testRoot
-    Assert-True (Test-Path -LiteralPath (Join-Path $stage 'EffeTune Mixwright.vst3\.gitignore')) 'lost hidden resource'
+    Assert-True (Test-Path -LiteralPath (Join-Path $stage ($MivSound.BUNDLE_NAME + "/.gitignore"))) 'lost hidden resource'
     Assert-True ((Get-FileHash -LiteralPath $pePath).Hash -eq
-        (Get-FileHash -LiteralPath (Join-Path $stage 'EffeTune Mixwright.vst3\Contents\x86_64-win\EffeTune Mixwright.vst3')).Hash) 'staged PE differs'
+        (Get-FileHash -LiteralPath (Join-Path $stage $MivSound.Plugin)).Hash) 'staged PE differs'
     Assert-MivEffetuneStage -RepoRoot $testRoot -SourceRoot $stage
     $extraStage = Join-Path $stage 'unexpected.js'
     [System.IO.File]::WriteAllText($extraStage, 'extra')
     Assert-Throws { Assert-MivEffetuneStage -RepoRoot $testRoot -SourceRoot $stage } 'Extra unapproved file'
     Remove-Item -LiteralPath $extraStage
-    $stagedResource = Join-Path $stage 'EffeTune Mixwright.vst3\.gitignore'
+    $stagedResource = Join-Path $stage ($MivSound.BUNDLE_NAME + "/.gitignore")
     Write-FixtureBytes $stagedResource ([System.Text.Encoding]::UTF8.GetBytes('modified'))
     Assert-Throws { Assert-MivEffetuneStage -RepoRoot $testRoot -SourceRoot $stage } 'not a PE'
     Write-FixtureBytes $stagedResource $resourceBytes
-    $stagePe = Join-Path $stage 'EffeTune Mixwright.vst3\Contents\x86_64-win\EffeTune Mixwright.vst3'
+    $stagePe = Join-Path $stage $MivSound.Plugin
     $signed = New-Object byte[] 520
     $original = [System.IO.File]::ReadAllBytes($pePath)
     $unsignedChanged = [byte[]]$original.Clone()
@@ -122,7 +122,7 @@ try {
     [System.IO.File]::WriteAllBytes($stagePe, $original)
     $arbitrary = Join-Path $testRoot 'arbitrary-source'
     Copy-Item -LiteralPath $stage -Destination $arbitrary -Recurse -Force
-    [System.IO.File]::WriteAllBytes((Join-Path $arbitrary 'EffeTune Mixwright.vst3\Contents\x86_64-win\EffeTune Mixwright.vst3'), $signed)
+    [System.IO.File]::WriteAllBytes((Join-Path $arbitrary $MivSound.Plugin), $signed)
     Assert-Throws { Assert-MivEffetuneStage -RepoRoot $testRoot -SourceRoot $arbitrary } 'only in the fixed signed distribution stage'
     $stale = Join-Path $stage 'stale.txt'
     [System.IO.File]::WriteAllText($stale, 'old version')
@@ -143,11 +143,11 @@ try {
         # Nonrecursive deletion removes only the junction entry.
         [System.IO.Directory]::Delete($stage)
     }
-    $notice = Join-Path $noticesRoot 'v0.14.0\Contents\Resources\THIRD-PARTY-NOTICES.txt'
+    $notice = Join-Path $noticesRoot "$($MivSound.VERSION)/Contents/Resources/THIRD-PARTY-NOTICES.txt"
     [System.IO.File]::WriteAllText($notice, 'changed')
     Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'differs from vendor'
     Remove-Item -LiteralPath (Join-Path $source 'VERSION')
-    Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'Restore vendor'
+    Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'explicitly approve'
     foreach ($name in @('build-dist.ps1', 'build-release.ps1', 'check-vcrt-pe-dependencies.ps1', 'effetune-distribution.ps1', 'sign-files.ps1')) {
         $errors = $null; $tokens = $null
         $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name), [ref] $tokens, [ref] $errors)

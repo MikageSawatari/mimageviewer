@@ -16,6 +16,9 @@ use std::process::Command;
 use miv_startup::{Lane, Outcome, Role, Stage, WatchSlot};
 use sha2::{Digest, Sha256};
 
+#[path = "../../../config/miv-sound.rs"]
+mod miv_sound_config;
+
 #[path = "../../../src/effetune/bundle_location.rs"]
 mod bundle_location;
 mod bundle_paths;
@@ -980,7 +983,7 @@ mod tests {
             })
             .max()
             .unwrap();
-        assert_eq!(deepest, 252);
+        assert!(deepest > 200, "exercise the deep packaged resources");
         assert!(deepest < 260);
     }
 
@@ -995,10 +998,13 @@ mod tests {
             super::EFFETUNE_MANIFEST,
         )
         .unwrap();
-        let bundle = root.join("EffeTune Mixwright.vst3");
+        let bundle = root.join(crate::miv_sound_config::BUNDLE_NAME);
         assert!(
             bundle
-                .join("Contents/x86_64-win/EffeTune Mixwright.vst3")
+                .join(
+                    std::path::Path::new("Contents/x86_64-win")
+                        .join(crate::miv_sound_config::BUNDLE_NAME)
+                )
                 .is_file()
         );
         assert!(

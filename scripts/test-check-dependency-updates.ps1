@@ -19,6 +19,10 @@ function Assert-Equal {
     if ($Actual -cne $Expected) { throw "$Label expected [$Expected], got [$Actual]" }
 }
 
+Assert-Equal (Get-UpstreamTagComparison 'v0.15.0' '0.15.0') 'up to date' 'upstream tag normalization'
+Assert-Equal (Get-UpstreamTagComparison '0.15.0' 'v0.15.0') 'up to date' 'latest tag normalization'
+Assert-Equal (Get-UpstreamTagComparison 'v0.14.0' 'v0.15.0') 'versions differ; review before updating' 'upstream update'
+
 # Mock only process/network/filesystem inputs. Keep JSON decoding, enumeration,
 # version comparison, bash discovery, setup output parsing and table cells real.
 $useGh = $true

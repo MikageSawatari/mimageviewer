@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde_json::Value;
 
-use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
+use crate::video::dsp::{DspBridge, GuiFailure};
 
 pub(crate) mod bundle_location;
 pub mod composition;
@@ -20,7 +20,7 @@ pub(crate) mod now_playing;
 mod window;
 pub(crate) use now_playing::{NowPlayingArtworkSource, NowPlayingInput, NowPlayingOwner};
 
-const BUNDLE_NAME: &str = "EffeTune Mixwright.vst3";
+const BUNDLE_NAME: &str = crate::miv_sound_config::BUNDLE_NAME;
 const INITIAL_CAPTURE_WAIT: Duration = Duration::from_secs(6);
 const EXIT_FENCE: Duration = Duration::from_secs(2);
 
@@ -100,6 +100,9 @@ pub enum EffetuneFailure {
 impl EffetuneFailure {
     pub(crate) fn user_reason(&self) -> &'static str {
         match self {
+            Self::LoadFailed(reason) if reason.contains("component initialize failed") => {
+                "mIV Sound の初期化に失敗しました (詳しくはログを確認してください)"
+            }
             Self::LoadFailed(_) => "読み込みに失敗しました",
             Self::RestoreFailed(_) => "保存した設定を復元できませんでした",
             Self::ProcessFailed(_) => "音声処理に失敗しました",
@@ -1666,12 +1669,7 @@ fn send_latest_now_playing(
 }
 
 pub(crate) fn new_bridge() -> Arc<DspBridge> {
-    DspBridge::new_with_gui_chrome(
-        GuiOwnerPolicy::Unowned,
-        LatencyPolicy::ReportOnly,
-        true,
-        false,
-    )
+    DspBridge::new_for_miv_sound(crate::data_dir::get().join("effetune"))
 }
 
 fn load_worker(

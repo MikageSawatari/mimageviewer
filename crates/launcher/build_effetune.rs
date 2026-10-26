@@ -1,3 +1,6 @@
+#[path = "../../config/miv-sound.rs"]
+mod identity;
+
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -9,18 +12,22 @@ mod bundle_paths;
 mod source_approval;
 
 pub fn generate(workspace: &Path) {
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace.join("config/miv-sound.rs").display()
+    );
     println!("cargo:rerun-if-env-changed=MIMV_EFFETUNE_DIR");
     println!("cargo:rerun-if-env-changed=MIV_SIGN_SHA1");
     println!("cargo:rerun-if-env-changed=MIV_SIGN_SUBJECT");
     let source = std::env::var_os("MIMV_EFFETUNE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| workspace.join("vendor/effetune-mixwright"));
+        .unwrap_or_else(|| workspace.join(identity::SOURCE_ROOT));
     let source = if source.is_absolute() {
         source
     } else {
         workspace.join(source)
     };
-    let recover = "Restore vendor/effetune-mixwright/VERSION and the complete EffeTune Mixwright.vst3 bundle (v0.14.0); or run scripts/build-release.ps1 to stage it. MIMV_EFFETUNE_DIR must point to a root containing VERSION and the bundle.";
+    let recover = "Build, verify and approve an mIV Sound candidate using scripts/build-miv-sound.ps1, then run scripts/build-release.ps1 to stage it. MIMV_EFFETUNE_DIR must point to a root containing VERSION and the bundle.";
     source_approval::validate(workspace, &source).unwrap_or_else(|e| panic!("{e}. {recover}"));
     bundle_paths::checked_metadata(&source)
         .unwrap_or_else(|e| panic!("EffeTune source {}: {e}. {recover}", source.display()));
@@ -34,13 +41,14 @@ pub fn generate(workspace: &Path) {
         !version.is_empty() && !version.contains(['\n', '\r', '\t']),
         "Invalid EffeTune VERSION. {recover}"
     );
-    let bundle = source.join("EffeTune Mixwright.vst3");
+    let bundle = source.join(identity::BUNDLE_NAME);
     let inventory = bundle_paths::inventory(&bundle)
         .unwrap_or_else(|e| panic!("EffeTune bundle: {e}. {recover}"));
     assert!(!inventory.is_empty(), "Empty EffeTune bundle. {recover}");
     assert!(
         bundle
-            .join("Contents/x86_64-win/EffeTune Mixwright.vst3")
+            .join("Contents/x86_64-win")
+            .join(identity::BUNDLE_NAME)
             .is_file(),
         "Missing EffeTune plugin PE. {recover}"
     );
@@ -58,7 +66,7 @@ pub fn generate(workspace: &Path) {
         if dir {
             continue;
         }
-        let name = format!("EffeTune Mixwright.vst3/{relative}");
+        let name = format!("{}/{relative}", identity::BUNDLE_NAME);
         let hash = crate::sha256_file_hex(&path);
         manifest.update(format!(
             "\n{name}\t{}\t{hash}",

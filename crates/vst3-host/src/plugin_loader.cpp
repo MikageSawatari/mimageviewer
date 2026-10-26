@@ -523,7 +523,7 @@ BridgeEditorWindows create_bridge_view_container(const miv::GuiWindowOptions& op
     }
     const int x = options.has_initial_pos ? options.x : CW_USEDEFAULT;
     const int y = options.has_initial_pos ? options.y : CW_USEDEFAULT;
-    std::wstring title = options.unowned ? L"EffeTune" : utf8_to_wide(options.title);
+    std::wstring title = options.unowned ? L"mIV Sound" : utf8_to_wide(options.title);
     HWND container = CreateWindowExW(ex_style,
                                      kBridgeViewContainerClass,
                                      title.c_str(),
@@ -970,7 +970,11 @@ bool PluginLoader::probe(const std::string& plugin_path,
         if (!component) {
             continue;
         }
-        if (component->initialize(host_app) != kResultOk) {
+        const auto initialized = component->initialize(host_app);
+        if (initialized != kResultOk) {
+            error_out = "component initialize failed: " + info.name() +
+                " (result=" + std::to_string(initialized) + ")";
+            blog("probe: %s", error_out.c_str());
             component = nullptr;
             continue;
         }
@@ -1027,7 +1031,7 @@ bool PluginLoader::probe(const std::string& plugin_path,
         return true;
     }
 
-    error_out = "no AudioEffectClass found in plugin";
+    if (error_out.empty()) error_out = "no AudioEffectClass found in plugin";
     return false;
 }
 
@@ -1082,7 +1086,11 @@ bool PluginLoader::load(const std::string& plugin_path,
                 continue;
             }
             // ホストとして初期化
-            if (component_->initialize(host_app_) != kResultOk) {
+            const auto initialized = component_->initialize(host_app_);
+            if (initialized != kResultOk) {
+                error_out = "component initialize failed: " + info.name() +
+                    " (result=" + std::to_string(initialized) + ")";
+                blog("load: %s", error_out.c_str());
                 component_ = nullptr;
                 continue;
             }
@@ -1137,7 +1145,7 @@ bool PluginLoader::load(const std::string& plugin_path,
     }
 
     if (!component_ || !processor_) {
-        error_out = "no AudioEffectClass found in plugin";
+        if (error_out.empty()) error_out = "no AudioEffectClass found in plugin";
         unload();
         return false;
     }

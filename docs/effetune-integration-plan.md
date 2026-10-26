@@ -1,5 +1,13 @@
 # EffeTune (Mixwright) 組み込み — サンプル版設計
 
+現在の派生版への変更は [派生版計画](effetune-fork-plan.md) 第8版が正本。
+F2a のビルド・候補確認・承認・配布の検査と bridge の保存先は [F2a 引き継ぎ](miv-sound-f2a-handoff.md)。
+以下のサンプル版・出荷済み Mixwright の経緯は履歴として保持する。
+現在の同梱名・版・manifest root は `config/miv-sound.rs` から読む。
+音響調整の bridge だけが `MIV_SOUND_DATA_DIR=<data_dir>/effetune` を受け、WebView2 の外部 override を除去する。
+状態ファイル `mixwright-state.json`、設定名、通知 ID と保存の意味は変えない。
+移行は F2b、公開文書は F3、ポータブル有効化は F4 が担当し、この途中版を通常データで起動しない。
+
 状態: 設計第 5 版 (2026-09-27)。第 1 版 (REVISE、P1×5 / P2×4 / P3×1) と第 2 版 (REVISE、P1×4 / P2×2) への
 Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 / P3×1) を第 4 版で、第 4 版への指摘 (REVISE、P1×2 / P3×1) を第 5 版で反映。第 5 版は ACCEPT WITH CHANGES (P3×1、テストの記述) で、その修正を反映済み。
 サンプル版 (試験用) の設計記録と、v4.3.0 配布版の決定をまとめる。配布の同梱・署名・通知と
@@ -250,6 +258,9 @@ enum EffetuneFailure {
 
 ### 5.1 保存先
 
+F2a でも下記の保存済み状態・設定項目の名前と意味は変更しない。派生版自身の保存領域と、
+旧共通領域からの一度だけの移行は [派生版計画 §4〜5](effetune-fork-plan.md) が正本（移行本体は F2b）。
+
 - Mixwright の状態: `data_dir/effetune/mixwright-state.json` (base64 を decode した生バイト)。
   settings.db に載せない (状態は IR 等で MB 級になり得るが、`settings_kv` は保存のたびに全行を
   書き直すため)。
@@ -378,6 +389,9 @@ enum EffectiveState {
 
 ## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
+派生版の現行手順は [F2a §ビルド・確認・承認](miv-sound-f2a-handoff.md#ビルド確認承認)。
+`vendor/miv-sound` の承認原本と `third_party/miv-sound/<ver>` のmanifestを使い、署名時も原本を変更しない。
+
 - `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.14.0、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
@@ -502,6 +516,10 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   既存の bridge は既定値で従来どおり動く。
 
 ## 10. 決定済みの配布方針と残る対象外事項
+
+以下の出荷済み版の記録に対し、次版の同梱・承認は [F2a 手順](miv-sound-f2a-handoff.md) を使う。
+上流ZIPを vendor へ置く手順ではなく、派生版の候補IDを確認してから明示承認する。
+portable の解禁は F4 で行う（F2a では既存の制限を維持）。
 
 - 最小化中もビジュアライザーを残す設定は当初の配布作業では対象外。公開後の §1.312 で実装、既定は一緒に隠す。§14 を参照。
 - **Windows Sandbox では音響調整 (と EPUB 変換) が動かない — 対処しない (2026-10-04 利用者判断)。** Sandbox では
@@ -717,9 +735,12 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 
 ### 10.5 説明ページの版を上げる手順 (2026-10-12)
 
-説明ページは現在の版だけ公開する。vendor の VERSION と資料 snapshot を更新して
+説明ページは現在の版だけ公開する。F2a では `config/miv-sound.rs` の `DOCS_VERSION` が正本で、
+派生版の製品VERSIONとは分け、F3 まで既存の v0.14.0 snapshot を保持する。
+以下の版更新手順自体の派生版向けの改訂は F3。
+説明ページの版と資料 snapshot を更新して
 `python scripts/gen-effetune-docs.py` を実行し、`manual/effetune/v*/` の他版を削除して `--check` を通す。
-自動削除より単純で誤削除を避けられる残存検査を選択した。現在版の正本は vendor VERSION で、生成時に
+自動削除より単純で誤削除を避けられる残存検査を選択した。生成時に
 `.htaccess` の印付きブロックも更新する。全他版を一つの301規則で同名ファイルへ、廃止ページは現在版の index.html へ送る。
 公開時はサーバ上の旧版も削除し、生成物と `.htaccess` を同時反映する。sitemap はコミット後に再生成する。
 
@@ -1768,16 +1789,20 @@ Shellのheuristicによる。従って通常はhost実行体側の別項目/グ�
 厳密なグループ名や異なるhost世代の統合、pin/relaunchの見え方を保証するとは書かない。
 独立起動可能なEffeTune appやrelaunch登録、mIV全体のpin修正は案Aの対象外。
 
-EffeTune専用frameのwindow titleを`EffeTune`に揃え、preview/window切替時の表示名に使う。
-pluginの識別名・保存state・一般VST editor titleは変えない。
+音響調整専用frameのwindow titleは F2a から `mIV Sound` とし、preview/window切替時の表示名に使う。
+host PE の FileDescription / ProductName はユーザーVSTとも共用するので `mImageViewer audio host` とする。
+保存state・一般VST editor titleは変えない。派生版のplugin識別名は派生版計画 §2〜3 に従う。
 mIVの`assets/icon.ico`をhost PEのicon resourceへ組み込み、frameの大小iconへ設定する。
 §17.2.1のWS_SYSMENU/WS_CAPTIONと組み合わせて初めてtaskbar iconの前提を満たす。
 resourceがあるだけでShellにiconが出たと判定せず、表示確認は§17.7の実機条件に含める。
 core HWNDからWM_GETICONを同期取得する方法は採らず、core UIへの再入待機を作らない。
 hostの内部group/context menuラベルはShellが決めるもので、window titleとの同一性は保証しない。
-AppUserModelID、FileDescriptionのEffeTuneへの全体改名、shortcut編集で表示名を強制しない。
+AppUserModelIDやshortcut編集で表示名を強制しない。
 
 ### 17.5 設定・portable・移行
+
+F2a は既存設定の schema・保存の意味・portable の制限を維持する。
+派生版のデータ移行は F2b、portable の有効化は F4（[派生版計画](effetune-fork-plan.md)）。
 
 - `Settings.effetune_show_in_taskbar: bool`。serde default_trueとSettings::defaultのtrueを揃える。
   既存DB/JSONに項目がなくてもON。新しいDB schema migrationは不要。

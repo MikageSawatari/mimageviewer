@@ -6,6 +6,7 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'miv-sound-config.ps1')
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $rows = New-Object 'System.Collections.Generic.List[object]'
 
@@ -173,6 +174,11 @@ function Get-Comparison {
     return 'versions differ; review before updating'
 }
 
+function Get-UpstreamTagComparison {
+    param([string] $Current, [string] $Latest)
+    return Get-Comparison ($Current -replace '^v', '') ($Latest -replace '^v', '')
+}
+
 function Add-SetupCheck {
     param([string]$Name, [string]$Script, [string]$VersionFile, [string]$BashPath)
     $current = Read-Version $VersionFile
@@ -265,12 +271,13 @@ try {
         Add-Row 'ONNX Runtime DirectML' $current $latest "$(Get-Comparison $current $latest); NuGet stable; check ort C API compatibility"
     } catch { Add-Row 'ONNX Runtime DirectML' $current 'unavailable' 'NuGet query failed; vendor/ort/VERSION' }
 
-    $current = Read-Version 'vendor/effetune-mixwright/VERSION'
+    $provenance = Read-Version "$($MivSound.NOTICES_ROOT)/$($MivSound.VERSION)/PROVENANCE.md"
+    $current = if ($provenance -match '(?m)^Upstream tag: (\S+)') { $Matches[1] } else { 'unknown' }
     try {
         $release = Get-GitHubJson 'repos/Frieve-A/effetune-mixwright/releases/latest'
         if (-not $release.tag_name) { throw 'No release tag' }
-        Add-Row 'EffeTune Mixwright' $current $release.tag_name "$(Get-Comparison $current $release.tag_name); GitHub latest release"
-    } catch { Add-Row 'EffeTune Mixwright' $current 'unavailable' 'GitHub release query failed' }
+        Add-Row 'mIV Sound upstream (EffeTune Mixwright)' $current $release.tag_name "$(Get-UpstreamTagComparison $current $release.tag_name); GitHub latest release"
+    } catch { Add-Row 'mIV Sound upstream (EffeTune Mixwright)' $current 'unavailable' 'GitHub release query failed' }
 
     $current = 'unknown'
     # Do not use setup-vst3-sdk.sh check: it performs git fetch.

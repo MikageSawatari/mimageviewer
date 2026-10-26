@@ -102,8 +102,8 @@ $repoRoot = (Get-Location).Path
 $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'effetune-distribution.ps1')
 . (Join-Path $PSScriptRoot 'vst3-host-identity.ps1')
-$null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot 'vendor\effetune-mixwright') `
-    -NoticesRoot (Join-Path $repoRoot 'third_party\effetune-mixwright')
+$null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot $MivSound.SOURCE_ROOT) `
+    -NoticesRoot (Join-Path $repoRoot $MivSound.NOTICES_ROOT)
 if ($PreserveRuntime) {
     if (-not $repoRoot.Equals($expectedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "[build-release] -PreserveRuntime must be run from the repository root: $expectedRepoRoot"
@@ -313,7 +313,7 @@ Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 # Use a fresh complete copy: signed distribution builds must not mutate the
 # upstream EffeTune bundle. This path is also the final embedded-PE gate input.
 $effetuneStage = New-MivEffetuneStage -RepoRoot $repoRoot
-$effetunePe = @(Get-MivPeFiles -Paths (Join-Path $effetuneStage 'EffeTune Mixwright.vst3'))
+$effetunePe = @(Get-MivPeFiles -Paths (Join-Path $effetuneStage $MivSound.BUNDLE_NAME))
 if ($effetunePe.Count -eq 0) { throw '[build-release] EffeTune bundle contains no PE files' }
 
 if ($Sign) {
@@ -433,7 +433,7 @@ $embeddedPe = @(
     (Join-Path $repoRoot 'vendor\ffmpeg\bin'),
     (Join-Path $repoRoot 'vendor\susie-worker\mimageviewer-susie32.exe'),
     (Join-Path $repoRoot 'vendor\vst3-host\mimageviewer-vst3-host.exe'),
-    (Join-Path $effetuneStage 'EffeTune Mixwright.vst3')
+    (Join-Path $effetuneStage $MivSound.BUNDLE_NAME)
 )
 & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
     -InputPaths $embeddedPe `
