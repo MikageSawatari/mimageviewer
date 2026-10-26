@@ -40,7 +40,7 @@
 
 ### 1.448 v4.8.0 以降、GPU デバイスの作成で起動に失敗する環境がある (「Parent device is lost」) — X の利用者投稿 (2026-10-26)
 
-- 状態: **調査中 (2026-10-26、v4.8.3 候補)**。Codex が Vulkan 側の差・OpenGL の可否・開き直しの設計・ダイアログ詳細を調査中。
+- 状態: **調査済み・範囲は利用者判断待ち (2026-10-26、v4.8.3 候補)**。
 - 出典・症状: X の利用者投稿 (フォロー関係が無いので返信しない。連絡が取れずログは見られない)。v4.7 までは起動し、v4.8.0 から起動しない。
   v4.8.2 ポータブル版で §1.428 の失敗ダイアログに「詳細: Wgpu.RequestDeviceError: WGPU error: Parent device is lost」と表示された
   (投稿のスクショ)。グラフィックドライバは更新したくない意向。
@@ -48,6 +48,7 @@
   hal の想定外エラー (OOM 以外の HRESULT 失敗など) もこの文言になるため、文字どおりのデバイス消失とは限らない。
   mIV の adapter 選択 (DX12 → Vulkan) と要求する制限は v4.7.1 と同じで、違いは wgpu 27 → 30 (egui 0.37 更新に伴う)。
   DX12 のデバイス作成の差は小さく、決め手は未発見。
+- 調査結果 (2026-10-26 Codex gpt-6.1-sol 読み取り調査、ClaudeCode が要点を確認): (a) 製品 logger は target の許可リスト (`src/logger.rs` 約 20) で wgpu の `log::error!` を捨てており、報告者のログにも失敗した操作・HRESULT は残っていない。(b) `request_device` はデバイスを開くほか、wgpu-core の検証用 shader / compute pipeline も作り、その失敗も同じ文言になる。(c) DX12 の shader compiler の既定が wgpu 27 の `Fxc` から 30 の `Auto` (static DXC → `dxcompiler.dll` を LoadLibrary → 無ければ FXC) に変わった。mIV は DXC を同梱せず、開発機にも無いので、開発機とテストは FXC で動いている。PATH 等に `dxcompiler.dll` がある環境だけ DXC になる。(d) Vulkan は最低要件の引き上げは無く、任意拡張・allocator の置き換え等が候補。OpenGL (WGL) は GL 3.3 以上なら root GUI を描ける見込みだが、遅延初期化の別設計が要り v4.8.3 には向かない。(e) 別 API での開き直しは `RenderState::create` 内で adapter 候補を順に試す形で可能 (vendor egui-wgpu の変更)。Codex の推奨は v4.8.3 = 診断強化のみ、開き直しは次。
 - 対策の候補: (1) 失敗ダイアログに GPU 名・API・失敗段階・hal の直近のエラー行を出す。(2) デバイス作成に失敗したら別の API
   (DX12 ↔ Vulkan、OpenGL は可否を確認) で開き直し、選んだ API をログと起動記録に残す。wgpu 27 へ戻すのは egui 0.37 の更新を戻すことになるので採らない。
 - 関連: §1.428 ([render-init-failure-report-plan.md](render-init-failure-report-plan.md))。規模 / 優先度: 調査後に見積り / P1 (起動できない)。
