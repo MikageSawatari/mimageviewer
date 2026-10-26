@@ -213,6 +213,9 @@ fn wire_reply_preserves_unicode_unc_flags_totals_and_actual_sort() {
     assert_eq!(reply.rows[0].full_path, unc);
     assert!(reply.rows[0].is_file());
     assert!(reply.rows[1..].iter().all(|r| !r.is_file()));
+    assert!(!reply.rows[0].is_folder());
+    assert!(reply.rows[1].is_folder());
+    assert!(reply.rows[2..].iter().all(|r| !r.is_folder()));
 }
 
 #[test]

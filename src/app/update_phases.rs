@@ -929,7 +929,7 @@ impl App {
                 .pressed_action(ctx, KeyAction::GlobalLocalSearch);
             if ctrl_f {
                 // 他の検索バーが開いていれば閉じて Ctrl+F に切り替え (相互排他)
-                self.open_local_metadata_search();
+                self.open_search_shortcut(ctx, crate::ui_pinned_search::PinnedSearchKind::Local);
             }
         }
 
@@ -1013,7 +1013,10 @@ impl App {
             let ctrl_s = self.keymap.pressed_action(ctx, KeyAction::GlobalFavSearch);
             if ctrl_s {
                 // 他の検索バーを閉じるのは open_favsearch 内で行う (相互排他)
-                self.open_favsearch();
+                self.open_search_shortcut(
+                    ctx,
+                    crate::ui_pinned_search::PinnedSearchKind::Container,
+                );
             }
         }
 
@@ -1032,7 +1035,7 @@ impl App {
                 .pressed_action(ctx, KeyAction::GlobalMetadataSearch);
             if ctrl_g {
                 // 相互排他は toggle_global_search → open_global_search 内で行う
-                self.toggle_global_search();
+                self.open_search_shortcut(ctx, crate::ui_pinned_search::PinnedSearchKind::Metadata);
             }
         }
 
@@ -1257,8 +1260,8 @@ impl App {
                         self.enter_drive_list_from_navigation(origin);
                         None
                     }
-                    crate::ui_main::AddressBarNav::ReadingHistory => {
-                        self.enter_reading_history_from_menu();
+                    crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
+                        self.enter_reading_history_with_entrance(entrance);
                         None
                     }
                     crate::ui_main::AddressBarNav::Bookmarks => {
@@ -1338,8 +1341,8 @@ impl App {
                                 self.enter_drive_list_from_navigation(origin);
                                 None
                             }
-                            crate::ui_main::AddressBarNav::ReadingHistory => {
-                                self.enter_reading_history();
+                            crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
+                                self.enter_reading_history_with_entrance(entrance);
                                 None
                             }
                             crate::ui_main::AddressBarNav::Bookmarks => {
@@ -1486,8 +1489,8 @@ impl App {
                         self.enter_drive_list_from_navigation(origin);
                         None
                     }
-                    Some(crate::ui_main::AddressBarNav::ReadingHistory) => {
-                        self.enter_reading_history();
+                    Some(crate::ui_main::AddressBarNav::ReadingHistory(entrance)) => {
+                        self.enter_reading_history_with_entrance(entrance);
                         None
                     }
                     Some(crate::ui_main::AddressBarNav::Bookmarks) => {

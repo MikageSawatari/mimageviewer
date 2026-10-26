@@ -17435,3 +17435,78 @@ mod page_edit_switch_audit {
         );
     }
 }
+
+#[cfg(test)]
+mod section1445_slider_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn section1445_page_brightness_text_then_standard_keeps_standard_unchanged() {
+        let mut app = crate::app::setup_app_for_test();
+        let page = app.tmp.path().join("slider-page.png");
+        app.items = vec![crate::grid_item::GridItem::Image(page)];
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_left_panel_tab =
+            crate::settings::FullscreenLeftPanelTab::Adjustment;
+        app.settings.adjustment_settings_tab = crate::settings::AdjustmentSettingsTab::ColorTone;
+        app.settings.global_preset.brightness = 3.0;
+        let standard = app.settings.global_preset.clone();
+        let mut individual = standard.clone();
+        individual.brightness = 10.0;
+        app.set_page_params(0, individual);
+        assert_eq!(app.effective_params(0).brightness, 10.0);
+
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1000.0, 1600.0))
+            .build_ui_state(
+                |root_ui, app| {
+                    crate::test_ui::full_viewport_ui(root_ui, |ui| {
+                        app.draw_adjustment_panel(
+                            ui,
+                            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 1500.0)),
+                            Some((100, 100)),
+                            Default::default(),
+                        );
+                    });
+                },
+                app,
+            );
+        harness.run_steps(3);
+        let slider_rect = harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, "明るさ")
+            .rect();
+        let editor = harness
+            .query_by_role_and_label(egui::accesskit::Role::SpinButton, "明るさ")
+            .unwrap_or_else(|| {
+                panic!(
+                    "brightness editor missing; slider={slider_rect:?}; numeric nodes={:#?}",
+                    harness
+                        .get_all_by_role(egui::accesskit::Role::SpinButton)
+                        .collect::<Vec<_>>()
+                )
+            });
+        let editor_rect = editor.rect();
+        assert!(
+            editor_rect.left() >= slider_rect.right()
+                && editor_rect.top() <= slider_rect.bottom()
+                && slider_rect.top() <= editor_rect.bottom(),
+            "named editor must be beside its slider: slider={slider_rect:?}, editor={editor_rect:?}"
+        );
+        editor.click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("2".into()));
+        harness.run_steps(2);
+        harness.event(egui::Event::Text("0".into()));
+        harness.run_steps(2);
+
+        // No Enter or intermediate blur: this is the real scope-radio action.
+        harness.get_by_label("標準（共通）").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.global_preset, standard);
+        assert!(!harness.state().adjustment_page_params.contains_key(&0));
+        assert_eq!(harness.state().effective_params(0), &standard);
+    }
+}

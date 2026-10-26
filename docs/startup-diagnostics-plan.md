@@ -1197,6 +1197,15 @@ coreの`exit_startup`へ接続し、一般writerとstartup writerで一つの2�
 正常・エラー・skipの実終了は、独立したunit-test executableの子processと一時LOCALAPPDATAで
 回帰確認する。製品binary・モデルruntimeを起動せず、pending記録と末尾terminalを検査する。
 
+### 10.5a §1.428 run_native が Err を返した場合の記録（2026-10-25）
+
+`run_native_failure` の終了境界で heartbeat watchdog を休止し、製品ログには失敗の種類と
+最深部までの原因連鎖を保存する。startup timeline には `run_native.failure.kind` を
+`terminal(Error)` より前に detail として公開する。既存cleanupと合計2秒の終了flush後、
+自動script実行以外では理由とログの場所をnativeダイアログで知らせ、元のErrを返す。
+依存ライブラリのログ保存対象は広げない。panicは別項目§1.429であり、この経路には含めない。
+分類、保存先、検証範囲は [描画失敗の報告設計](render-init-failure-report-plan.md) を正本とする。
+
 ### 10.5 §1.376 配布ビルド経路の照合（2026-10-12）
 
 `ea060b66e`には`642ed1ee5`で`90a8a9353`のsidecar修正と実ファイル回帰が移植済み。

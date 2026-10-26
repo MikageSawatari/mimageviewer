@@ -341,7 +341,8 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
   ├ perf_events.jsonl       # 直近の perf-log (--perf-log の既定出力先)
   ├ perf_*.jsonl            # 任意名で取った過去ログ
   ├ mimageviewer.log        # 通常の logger 出力
-  └ panic.log               # クラッシュログ
+  ├ panic.log               # Rust panic・UI hang
+  └ native-exception.log    # Windows first-chance 例外 (記録は best-effort)
 ```
 
 (Windows の絶対パス: `C:\Users\<user>\AppData\Roaming\mimageviewer\logs\`)。

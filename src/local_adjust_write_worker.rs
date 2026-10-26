@@ -652,10 +652,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("local_adjust.db");
         let handle = LocalAdjustWriteHandle::spawn(path);
+        // worker に取られる前に積み直したことにするため、3 回の積み直しと検査を
+        // 1 つのロックの中で行う。回ごとにロックを手放すと、その間に worker が
+        // 取り出して 0 件になり得る (test-script 付きのビルドで毎回起きた)。
+        let mut queue = handle.shared.lock();
         for name in ["first", "second", "newest"] {
-            // worker に取られる前に積み直したことにする。取られていたら枠は空くので、
-            // この検査は「取られていない分について 1 件しか残らない」を見る。
-            let mut queue = handle.shared.lock();
             queue.documents.insert(
                 "key".to_string(),
                 QueuedWrite {
@@ -669,7 +670,6 @@ mod tests {
             }
         }
 
-        let queue = handle.shared.lock();
         assert_eq!(
             queue.documents.len(),
             1,

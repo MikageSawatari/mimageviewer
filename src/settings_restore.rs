@@ -1839,7 +1839,8 @@ mod tests {
     fn operation_full_reset_closes_real_remote_reader_before_deleting_settings_family() {
         let guard = DataDirOverrideGuard::new();
         let dir = guard.path();
-        let settings = sample_settings();
+        let mut settings = sample_settings();
+        settings.apply_default_spread_to_plain_folders = true;
         let db = std::sync::Arc::new(SettingsDb::create_new(dir).unwrap());
         db.save_full(&settings).unwrap();
         crate::settings_db::set_global_db(dir, Some(std::sync::Arc::clone(&db)));
@@ -1860,6 +1861,7 @@ mod tests {
         for name in family_deletion_order_main_last() {
             assert!(!dir.join(name).exists());
         }
+        assert!(!Settings::load().apply_default_spread_to_plain_folders);
     }
 
     fn sample_settings() -> Settings {

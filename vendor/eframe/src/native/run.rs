@@ -1320,6 +1320,8 @@ mod tests {
 
 impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::callback_entry();
         profiling::scope!("Event::Suspended");
 
         event_loop_context::with_event_loop_context(event_loop, move || {
@@ -1329,6 +1331,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::callback_entry();
         profiling::scope!("Event::Resumed");
 
         // Nb: Make sure this guard is dropped after this function returns.
@@ -1342,6 +1346,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::callback_entry();
         // On Mac, Cmd-Q we get here and then `run_app_on_demand` doesn't return (despite its name),
         // so we need to save state now:
         log::debug!("Received Event::LoopExiting - saving app state…");
@@ -1356,6 +1362,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         device_id: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::callback_entry();
         profiling::function_scope!(egui_winit::short_device_event_description(&event));
 
         // Nb: Make sure this guard is dropped after this function returns.
@@ -1366,6 +1374,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::callback_entry();
         profiling::function_scope!(match &event {
             UserEvent::RequestRepaint { .. } => "UserEvent::RequestRepaint",
             #[cfg(feature = "accesskit")]
@@ -1409,6 +1419,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
     }
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::record(cause);
         if let winit::event::StartCause::ResumeTimeReached { .. } = cause {
             log::trace!("Woke up to check next_repaint_time");
         }
@@ -1418,6 +1430,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::callback_entry();
         event_loop_context::with_event_loop_context(event_loop, move || {
             // This is the first callback whose ownership is outside all message-dispatch
             // callbacks. Scheduling OS redraw is safe in either phase; only this phase may
@@ -1435,6 +1449,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         window_id: WindowId,
         event: winit::event::WindowEvent,
     ) {
+        #[cfg(feature = "miv-test-script-wait-witness")]
+        crate::miv_test_script_wait_witness::callback_entry();
         profiling::function_scope!(egui_winit::short_window_event_description(&event));
 
         // Nb: Make sure this guard is dropped after this function returns.
@@ -1475,6 +1491,10 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
 
             self.handle_event_result(event_loop, event_result, RenderPhase::MessageDispatch, None);
         });
+    }
+    #[cfg(feature = "miv-test-script-wait-witness")]
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        crate::miv_test_script_wait_witness::callback_entry();
     }
 }
 

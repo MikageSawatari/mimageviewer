@@ -272,11 +272,16 @@
     ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
       不足していると `cargo build` が復旧手順付きで止まるようになっている。
 
-9.5. **bench 回帰チェック** (検索周りに変更を入れたリリースで実施):
+9.5. **bench 回帰チェック** (検索周りに変更を入れたリリース、または Rust toolchain (`rust-toolchain.toml`) や tantivy を上げたリリースで実施):
    ```bash
    cargo run --release --features dev-tools --bin bench_search -- --docs 50000 --json /tmp/bench_new.json
    python scripts/check_bench_regression.py vendor/bench_baseline.json /tmp/bench_new.json
    ```
+   - 経緯: backlog §1.424 (v4.8.1 で出荷後に削除。調査の全文は commit `94017f82e` の `docs/next-release-backlog.md`、要約は `vendor/tantivy/MIV-PATCH.md`) で Rust 1.95 以降の 2 語の AND の採点が遅くなったため、toolchain・tantivy 更新時も確認する。
+   - toolchain・tantivy を上げたときは、bench に加えて製品本体の生成コードも確かめる (bench の bin と製品 exe で展開のされ方が違い、bench だけでは見落とすため)。
+     `CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --bin mimageviewer-core --target-dir target/core-sym` の後、
+     `dumpbin /disasm:nobytes target/core-sym/release/mimageviewer-core.exe` で `tantivy::query::intersection::impl$3::score<tantivy::query::term_query::term_scorer::TermScorer,...>` を探し、
+     `unpcklps`/`addps`/`divps` (左右 2 語を SIMD でまとめた形) が無いことを確かめる。
    - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
      `python scripts/check_bench_regression.py --save vendor/bench_baseline.json /tmp/bench_new.json`
    - 既存 baseline と比較して **+30% 超 かつ +1.0ms 超の劣化**で exit 1。原因を切り分けてから先に進む。
@@ -329,6 +334,8 @@
      最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
      - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
      - `request_repaint_after_idle_upgrade` の遅延 wake → 予定遅延との一致を確認した場合は**正常**
+       （通常ビルドの手動 `perf_smoke` ログにはwait witnessがないため、予定より早い起床は `unexplained` のまま。
+       test-script診断版の `normal-proven-wait` は自動化計画§5の待機証跡が揃う場合だけ）
      - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
        (docs/ui-responsiveness.md §4)
    - 遅いupdate自体はtail=`none`でも検査する。既知startup gapを認める場合も、
@@ -445,8 +452,12 @@
       でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
       ([docs/release-operations.md](release-operations.md) §7) が
       再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
-      **前提: 署名前に SimplySign Desktop を起動しログインしておく** (未ログインなら clean 前に `Assert-MivSignReady`
-      で即停止)。署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
+      **前提: 署名前に SimplySign Desktop を起動しログインしておく**。clean／build前の `Assert-MivSignReady` は
+      証明書確認に加え、実行中のPowerShell host exeの一時コピーへ署名・タイムスタンプ取得・検証を行い、
+      鍵が使えない失敗とTSAへ到達できない失敗を区別して停止する。一時コピーは失敗時も削除する。
+      通常は数秒だがsigntoolが数分停止する場合もあり、build中のセッション切れまでは防げない
+      （[署名の注意点](release-operations.md#4-コード署名-v230-以降全配布-pe)）。
+      署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
       `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
     - **通常の開発反復は `.\scripts\build-dev.ps1`**。通常feature set（portableなし）を

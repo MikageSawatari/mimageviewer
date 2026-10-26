@@ -35,6 +35,12 @@ egui の描画結果を PNG スナップショットとして保存し、意図�
 
 ## 実行
 
+通常フォルダの既定ページ構成（§1.425）は、本体と共通のチェック項目・説明文を描く
+`preferences_plain_folder_spread_light_off` と `preferences_plain_folder_spread_dark_on` を追加する。
+400×140 の明暗・OFF/ON を目視確認し、同じ headless fixture でチェック切替も検査する。
+2枚は計42,193 bytes。既存 `preferences_viewer_notice_visibility` も更新指定で実行し、
+表示範囲内の本文・スクロールバーが従来PNGとbyte単位で一致することを確認した。
+
 ```bash
 # 通常実行 (既存スナップショットと比較)
 cargo test --test ui_snapshot

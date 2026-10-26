@@ -11,7 +11,7 @@ pub(crate) struct OffscreenGpu {
 
 impl OffscreenGpu {
     pub(crate) fn new() -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let mut descriptor = wgpu::InstanceDescriptor {
             // Match the existing vendor GPU fixture; avoid Windows WGL initialization.
             backends: if cfg!(target_os = "windows") {
                 wgpu::Backends::DX12
@@ -19,7 +19,9 @@ impl OffscreenGpu {
                 wgpu::Backends::PRIMARY
             },
             ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        };
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        let instance = wgpu::Instance::new(descriptor);
         let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
             .expect("stage4 callback GPU prerequisite: no offscreen adapter (not a pass/skip)");
         let (device, queue) =

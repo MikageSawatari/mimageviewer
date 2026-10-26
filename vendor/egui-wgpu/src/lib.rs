@@ -18,6 +18,7 @@
 
 pub use wgpu;
 
+mod adapter_candidates;
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 pub mod atlas_diag;
 mod mipmap;
@@ -30,8 +31,8 @@ mod setup;
 pub use mipmap::{MipmapGenerator, mip_chain_texel_count, mip_level_count};
 pub use renderer::*;
 pub use setup::{
-    EguiDisplayHandle, NativeAdapterSelectorMethod, WgpuSetup, WgpuSetupCreateNew,
-    WgpuSetupExisting,
+    EguiDisplayHandle, NativeAdapterCandidatesMethod, NativeAdapterSelectorMethod, WgpuSetup,
+    WgpuSetupCreateNew, WgpuSetupExisting,
 };
 pub use startup_diagnostics::{
     RootStartupFrameTag, StartupDiagnosticEvent, StartupDiagnosticsCallback, StartupGpuStage,
@@ -241,44 +242,70 @@ impl RenderState {
                 display_handle: _,
                 power_preference,
                 native_adapter_selector: _native_adapter_selector,
+                native_adapter_candidates: _native_adapter_candidates,
                 device_descriptor,
             }) => {
                 config.startup_begin(StartupGpuStage::AdapterSelection);
                 let adapter_result = {
                     #[cfg(target_arch = "wasm32")]
                     {
-                        request_adapter(instance, power_preference, compatible_surface, &[]).await
+                        request_adapter(instance, power_preference, compatible_surface, &[])
+                            .await
+                            .map(|adapter| vec![adapter])
                     }
                     #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(native_adapter_selector) = _native_adapter_selector {
-                        native_adapter_selector(&available_adapters, compatible_surface)
-                            .map_err(WgpuError::CustomNativeAdapterSelectionError)
-                    } else {
-                        request_adapter(
-                            instance,
-                            power_preference,
-                            compatible_surface,
-                            &available_adapters,
-                        )
-                        .await
+                    {
+                        let available_adapters = &available_adapters;
+                        let custom = adapter_candidates::select_candidates(
+                            _native_adapter_candidates.map(|candidates| {
+                                move || candidates(available_adapters, compatible_surface)
+                            }),
+                            _native_adapter_selector.map(|selector| {
+                                move || selector(available_adapters, compatible_surface)
+                            }),
+                        );
+                        if let Some(result) = custom {
+                            result.map_err(WgpuError::CustomNativeAdapterSelectionError)
+                        } else {
+                            request_adapter(
+                                instance,
+                                power_preference,
+                                compatible_surface,
+                                available_adapters,
+                            )
+                            .await
+                            .map(|adapter| vec![adapter])
+                        }
                     }
-                };
-                config.startup_end(StartupGpuStage::AdapterSelection, adapter_result.is_ok());
-                let adapter = adapter_result?;
-                if config.startup_diagnostics.is_some() {
-                    config
-                        .startup_event(StartupDiagnosticEvent::AdapterSelected(adapter.get_info()));
                 }
-
-                let (device, queue) = {
-                    profiling::scope!("request_device");
-                    config.startup_begin(StartupGpuStage::Device);
-                    let result = adapter
-                        .request_device(&(*device_descriptor)(&adapter))
-                        .await;
-                    config.startup_end(StartupGpuStage::Device, result.is_ok());
-                    result?
-                };
+                .and_then(|adapters| {
+                    if adapters.is_empty() {
+                        Err(WgpuError::CustomNativeAdapterSelectionError(
+                            "No native adapter candidates were selected".to_owned(),
+                        ))
+                    } else {
+                        Ok(adapters)
+                    }
+                });
+                config.startup_end(StartupGpuStage::AdapterSelection, adapter_result.is_ok());
+                let (adapter, (device, queue)) = adapter_candidates::request_device_candidates(
+                    adapter_result?,
+                    config,
+                    wgpu::Adapter::get_info,
+                    |adapter: wgpu::Adapter| {
+                        let descriptor = (*device_descriptor)(&adapter);
+                        async move {
+                            profiling::scope!("request_device");
+                            adapter.request_device(&descriptor).await
+                        }
+                    },
+                )
+                .await?
+                .ok_or_else(|| {
+                    WgpuError::CustomNativeAdapterSelectionError(
+                        "No native adapter candidates were selected".to_owned(),
+                    )
+                })?;
 
                 (instance.clone(), adapter, device, queue)
             }

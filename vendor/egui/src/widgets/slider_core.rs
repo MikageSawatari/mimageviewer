@@ -365,8 +365,29 @@ impl SliderCore<'_> {
         bounds: RangeInclusive<f64>,
         speed: f64,
     ) -> Response {
+        self.drag_value_from_get_set_ui(
+            ui,
+            |new_value| {
+                if let Some(new_value) = new_value {
+                    *value = new_value;
+                }
+                *value
+            },
+            bounds,
+            speed,
+        )
+    }
+
+    /// Configure a number whose storage may normalize values on write.
+    pub fn drag_value_from_get_set_ui(
+        &self,
+        ui: &mut Ui,
+        get_set_value: impl FnMut(Option<f64>) -> f64,
+        bounds: RangeInclusive<f64>,
+        speed: f64,
+    ) -> Response {
         ui.add(
-            DragValue::new(value)
+            DragValue::from_get_set(get_set_value)
                 .speed(speed)
                 .format(self.drag_value.format.clone())
                 .range(bounds)

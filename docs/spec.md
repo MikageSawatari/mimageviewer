@@ -1,5 +1,15 @@
 # mimageviewer 仕様書
 
+### 表示処理の失敗による終了（§1.428）
+
+`run_native` が `Err` を返した場合は、失敗の種類と最深部までの原因連鎖を動作ログへ、
+種類を起動記録へ残す。watchdog休止・既存cleanup・終了記録・ログflushの後に、短い理由と
+ログフォルダーの絶対パスをnativeダイアログで知らせ、元のErrを返す。描画/ウィンドウ準備の
+失敗だけにドライバー更新を案内し、アプリ作成/イベントループ等の失敗ではGPUと断定しない。
+`test-script` featureの有無ではなく、自動script実行時だけ表示を抑止する。
+panic・backend再試行・依存ライブラリの保存ログ対象拡大は含まない。
+詳細は [描画失敗の報告設計](render-init-failure-report-plan.md)。
+
 ### Everything ファイル名検索（§1.374、実装中・検証待ち）
 
 - mainの一覧で `GlobalEverythingSearch`（Grid / Press / 既定Ctrl+R）、または
@@ -732,6 +742,12 @@ App の通常移動入口は `move_grid_cursor`。入力先ごとの起点代入
 - `thumb_vram_cap_percent`（デフォルト 50%）は永続キー名を互換維持したまま、mImageViewer
   全体が使ってよい GPU メモリの割合を表す。一覧ではサムネイルへ 80%、フルスクリーン表示系へ
   20%、フルスクリーン中は逆に配分する。0% は無制限
+- GPUメモリ上限のスライダーは0〜100%、操作刻みは5%。数値欄は入力文字列を保持し、
+  入力中から範囲内へのクランプ・刻みへの丸めをdraftへ即時反映する。
+  入力途中の0もdraftに限り、実際のGPU配分はOKで保存した後に変わる。
+  未操作の既存値は5の倍数でなくても保持する。Slider自身の丸めは外部変更と区別し、
+  本当の外部更新では編集文字列を更新する。調査・回帰は
+  [§1.445の記録](section445-stepped-slider-input.md)を参照。
 - フルスクリーン中もサムネイル保持帯は凍結した一覧スクロール位置ではなく現在ページへ追従し、
   一覧へ戻る位置の周辺を温める。モード切替専用の全破棄は行わず、配分変更の結果として自然に縮退する
 
@@ -1004,6 +1020,17 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   <kbd>6</kbd> は連結方式 (ページ単位 → 縦連結 → 横連結)、<kbd>7</kbd> は横方向
   (左→右 / 右→左)、<kbd>0</kbd> はズーム/フィット
   (ページ全体 / 横幅 / 縦幅 / 100%原寸) を切り替える。
+  「通常フォルダにも既定のページ構成を使う」(`apply_default_spread_to_plain_folders`) は既定 OFF。
+  ON では、走査結果を採用した実フォルダのうち本扱いではないものにも、保存値がないときだけ
+  実効 `default_spread_mode` を使う。お気に入りの既定ページ構成も反映するが、この ON/OFF 自体は
+  お気に入り別の表示状態へ保存しない。連結方式の既定は Paged のまま、方向はページ構成に従い、
+  Single は Ltr とする。旧 Vertical の全体既定はこの分岐だけ Single に正規化する。
+  フォルダ別保存値（連結方式・旧 Vertical を含む）が優先し、既定の適用だけで保存行を作らない。
+  本扱い・ページ順固定・直接ページ表示・自動フルスクリーン・抽出一覧・ZIP/PDF/EPUB は変更しない。
+  メタ情報取り込み後の復元で同じ既定を解決するのは ON・非本の実フォルダだけとし、保存済み連結方式を優先する。
+  OFF・本扱い・その他の対象は導入前の取り込み後の計算を維持し、通常 open との既存不整合は今回直さない。
+  Remote の新しい ON 経路は非本・元の全項目が画像の実フォルダに限定する。混在では既存の Single/LTR を保つ。
+  Remote は最新の共有設定を使い、お気に入り専用の既定は反映しない（従来の制約）。IPC 形式は不変。
   環境設定の見開きページに「PDF / EPUB の右開き指定に従う」を設ける (既定 OFF)。ON のときは、
   本に保存したページ構成・読み方向がどちらも無い場合だけ PDF / EPUB の指定を既定のページ構成と読み方向へ適用する。
   1 ページ表示はそのままで、シークバーの方向は本の指定に従う。ページ構成だけ保存されている場合はその向きを
@@ -2892,6 +2919,10 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
   `show_scroll` / `content_is_too_large` 状態を描画フレーム単位で記録する。環境変数がない
   通常時は入口で無効化し、ログ量と描画負荷を増やさない。詳細一覧本体と下部の選択情報バーは
   `surface` で区別する。
+- **native 例外ログ**: Windows first-chance 例外は専用 `logs/native-exception.log` に記録を試みる。
+  起動時のみ 1 MiB 超で `native-exception.log.bak` に退避し、1 セッション 256 行で停止する。
+  SEH で処理される例外も含み、クラッシュ・記録・WER dump を保証するものではない。
+  初期化・ハンドラ登録失敗は通常ログと既存の診断ログ失敗通知へ渡す。Rust panic・UI hang は `panic.log` のまま。
 - **`panic.log` のローテーション**: panic フックが書く `panic.log` は
   セッションを跨いで append し続けるため、同じ panic の連発で無制限に膨らみ得た。
   4 MiB 超で `panic.log.bak` に 1 世代退避してから作り直す (`main.rs`
@@ -2914,7 +2945,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - **環境設定「開発者」タブ** (`PreferencesPage::Developer`): 上記 `perf_log_enabled`
   のトグルと、「ログを zip にする」ボタンを置く。
 - **診断 zip 書き出し** (`diagnostics.rs` `export_diagnostics_zip`): logs ディレクトリの
-  ログ群 (動作ログ・`panic.log`・`settings.log`・worker ログ・現行 `perf_events.jsonl`)
+  ログ群 (動作ログ・`panic.log`・`native-exception.log` とその `.bak`・`settings.log`・worker ログ・現行 `perf_events.jsonl`)
   と `system_info.txt` (バージョン/OS/GPU) を 1 つの zip にまとめ、デスクトップ
   (`SHGetKnownFolderPath(FOLDERID_Desktop)` で解決) に
   `mImageViewer_diag_<日時>.zip` として保存する。rotate 済みの perf 世代
@@ -3382,3 +3413,10 @@ ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行�
 閲覧の表示方法/連結読みと自動規則変更は使え、方向・表紙・Spreadずらしは構成editorに集約する。
 Remoteは構成適用後にも従来の応答制限を使い、省略ページを追加で読まない。
 保存schema 2の旧units移行は不要。詳細は[本の構成計画](book-composition-plan.md)。
+
+## ツールバーの検索欄固定
+
+コンテナ検索・現在地の絞り込み・アイテム検索・Everything検索の4欄を個別に常設できる。
+既定はすべてOFF。既存の並べ替え・行頭指定・表示設定で管理し、固定時のshortcutは欄へfocusする。
+表示/focusだけでは検索せず、各検索の既存実行タイミングを保つ。検索終了・切替でも固定欄の入力を
+保持する。×でその検索条件を消去し、Escでは入力を残す。適用済み条件と編集済み条件を区別する。

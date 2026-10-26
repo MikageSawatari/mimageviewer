@@ -2333,7 +2333,7 @@ impl crate::app::App {
         self.xmp_cache.clear();
         self.clear_tags_cache();
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.move_grid_cursor(select, crate::app::GridCursorIntent::Automatic);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = select.is_some();

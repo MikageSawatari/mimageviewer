@@ -300,10 +300,30 @@ fullscreen／通過／animation には共通 typed policy で使わない。詳�
 
 ### コア
 
+#### GPU 初期化と診断（§1.448）
+
+`wgpu_backend_policy.rs` が `--gpu-backend auto|dx12|vulkan` の要求を一か所で解析し、
+Instance の backends と順序付き候補を決める。`auto` は surface 対応の最初の DX12、最初の Vulkan の最大2候補。
+vendor `egui-wgpu` の `native_adapter_candidates` は、App 作成前の `request_device` 失敗時だけ次候補へ進む。
+各 API は一回だけで、明示指定・surface/pipeline/描画の失敗・実行中の device lost・panic は再試行しない。
+既存の単一 `native_adapter_selector` は candidates が無い場合の経路として残す。
+成功した API は永続化しない。root GUI と動画 HUD の別 DX12 Instance はともに FXC を明示する。
+
+`gpu_startup_diagnostics.rs` が要求、候補、各試行の確定結果と採用後の root 状態を所有する。
+Instance 初期化前から最初の `RootPresented` までに限り、logger は `wgpu_hal` / `wgpu_core` /
+`gpu_allocator` の crate 直下・子 module の Error を既存の非同期 writer へ渡す。
+別スレッドの Error はログだけに残し、root 初期化スレッドの現在試行にだけ上限付きの行を帰属させる。
+`request_device` の結果ごとに診断を確定し、次候補へ持ち越さない。`End(false)` だけで致命的失敗とは判断しない。
+Err 復帰時は cleanup 前に収集を止め、`run_native_failure.rs` へ snapshot を渡す。
+GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付きの別 API 案内を既存通知へ加え、
+ログと `terminal()` 前の起動記録へ保存する。原因の断定ではなく起動互換性と診断を改善する変更である。
+詳細・案内条件・対象外は [GPU 初期化計画](gpu-init-fallback-plan.md)。
+
 | モジュール | 役割 |
 | --- | --- |
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
+| `run_native_failure.rs` | `run_native` 復帰後の単一終了境界。watchdog休止、失敗分類・原因連鎖の記録、既存cleanup、terminal・flush後のnative通知を順序付ける。自動script実行は通知だけを抑止する。詳細は [描画失敗の報告設計](render-init-failure-report-plan.md) |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。非描画の`logic`と、root Uiを受ける`ui`へ状態遷移を接続する |
 | `app/update_phases.rs` | service・input・render・post-renderの既存順序を所有。表示採用とGPU uploadはUI側へ残す |
 | `app/close_return.rs` / `app/root_lifecycle.rs` | teardown前に捕捉したClose帰還を存続mainの既存navigation ownerへ移し、root Closeをlogic直後のbackend終了判定へ接続する |
@@ -369,6 +389,7 @@ fullscreen／通過／animation には共通 typed policy で使わない。詳�
 | `rename_key_migration.rs` | アプリ内リネーム後の path-keyed 永続データ移行と回復ジャーナル、および content-identity 復元用の非破壊 copy。rename / hard purge / copy は同じ `STORES` descriptor を正本とし、copy は `unique: true` のストアだけを `INSERT OR IGNORE` で複製する。copy の generic SQL は store 非依存のまま、`rating.source_path`、`reading_history.path`、edit-preview の所有 WebP + path 列を per-store fixup する。descriptor transaction の成功境界は path-keyed snapshot の共通 mutation effect も生成し、`edit_origin.file_key` の rewrite / delete 完了時は App が旧 content-identity index を Loading で gate して Low-priority cancellable worker から全件再読込する。未完了 rename 集合の正本は App の in-flight + FIFO queue + boot-retry に置き、ジャーナル書き出しは App-global の単一 latest-value worker が直列化する。起動時の初回 enqueue / poll 前だけ同期 load し、終了時は最新 revision の完了まで flush する |
 | `metadata_cleanup.rs` | 明示操作の孤児メタデータ整理。`rename_key_migration::STORES` を正本に全 path-keyed DB を worker で走査し、親フォルダ到達可能な missing だけを確認後に transaction DELETE する。切断ドライブ、本棚、逆引き不能キーは非破壊側へ倒す。mIV 削除後の purge 最終失敗は `delete_purge_journal.json` に path 単位で残し、同じ孤児安全判定 + 共通 hard-purge を起動時 / idle 時にピンポイント再実行する |
 | `logger.rs` | ファイルロガー (`mimageviewer.log`)。常時記録 + 16 MiB ローテーション |
+| `native_exception_log.rs` | Windows first-chance 例外を専用 sink へ best-effort 記録。起動時に open、handler は CAS・固定バッファ・core 整形・raw WriteFile 1回。ヒープ・Rust TLS・ロック・スタック取得なし |
 | `diagnostics.rs` | 診断 zip 書き出し (`export_diagnostics_zip`)。logs ディレクトリのログ群 + システム情報をまとめてデスクトップに保存。環境設定「開発者」タブから呼ばれる |
 | `stats.rs` | 読み込み統計の集計 |
 
@@ -382,6 +403,7 @@ fullscreen／通過／animation には共通 typed policy で使わない。詳�
 | モジュール | 役割 |
 | --- | --- |
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
+| `ui_pinned_search.rs` / `app/pinned_search.rs` | 4種類の常設検索入力の幅・純粋描画と、既存検索への単一transaction・Esc router。結果/worker ownerは追加しない |
 | `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う。終了・トレイ退避の共通保存境界では有効 draft を Settings へ確定するが worker は開始せず、トレイ復帰時だけ遅延した副作用を1回適用する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
@@ -650,6 +672,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `models/*.onnx` | 初回起動時に exe から展開 | `ai/model_manager.rs` |
 | `mimageviewer.log` | **常時記録** (旧 `--log` ゲートは撤廃、`--log` 引数は no-op)。起動ごとに truncate し、前回分を `mimageviewer.log.prev` に退避。実行中は 16 MiB 超で `mimageviewer.log.bak` にローテーション。非blocking facade、単一writerが各batchを直ちにflush | `logger.rs` / `log_writer.rs` |
 | `logs/panic.log` | Rust panic フックが backtrace 付きで append。セッションを跨いで蓄積するため 4 MiB 超で `panic.log.bak` に 1 世代退避 | `lib.rs` (`append_panic_log_entry`) |
+| `logs/native-exception.log` | Windows native first-chance 例外。起動時のみ1 MiB超で `.bak` へ1世代退避、256行/sessionで停止。sink初期化・VEH登録失敗はlogger初期化後に通常ログ＋既存診断ログ失敗トースト。記録とWER dumpは保証しない | `native_exception_log.rs` |
 | `logs/settings.log` | 設定復旧経路の永続診断ログ。**logger の初期化状態に依存しない独立 sink** なので起動ごく初期の復旧フェーズでも残る。SQLite open 時の primary code + extended code、bak 復旧の経路、quarantine、preupgrade snapshot、save 抑止のイベントが残る。再現が難しい設定リセット系報告の事後解析用 | `settings.rs` (`settings_diag_log`) + `settings_db.rs` (`log_diag`) |
 | `logs/perf_events.jsonl` | 構造化イベントログ (JSON Lines)。`--perf-log` 引数または環境設定「開発者」タブの「性能ログを記録する」が ON のときだけ生成。起動ごとに rotate (`perf_events.1..4.jsonl`)。単一writer、250ms周期flushと完了checkpoint | `perf.rs` / `log_writer.rs` |
 | デスクトップ `mImageViewer_diag_<日時>.zip` | 環境設定「開発者」→「ログを zip にする」で生成する診断 zip。workerの完了barrierで両ログの固定prefixを取得し、補助ログ + `system_info.txt` + `delivery_manifest.json` をまとめる。過去dropは証拠不完全と知らせ保存 | `diagnostics.rs` / `log_writer.rs` |

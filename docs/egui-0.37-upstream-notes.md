@@ -76,7 +76,7 @@ Registry root: `C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b5
   label selection in deferred viewports (#8242); "drunk text" (#8250).
 - eframe/egui-wgpu: VSync and frame latency configurable at runtime (#8114); **wgpu low-latency by default (#8203)**;
   `pre_present_notify` before present (#8089); restored windows choose monitor by overlap (#8191);
-  crash when parent viewport hidden fixed (#8226); glow config grouped (#8108); undecorated window shadows always on Windows (#8169).
+  crash when parent viewport hidden fixed (#8226); glow config grouped (#8108); undecorated window shadows always on Windows (#8169; mIVは§1.426で生成・Decorations更新とも影なしへ戻す。独自borderless全画面は#8449の除外対象にならない)。
 
 ## egui 0.36
 

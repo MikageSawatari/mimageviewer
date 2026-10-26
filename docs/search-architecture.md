@@ -20,7 +20,7 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
 | **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
 | **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画 / 音声を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
-| **Ctrl+R** | Everything ファイル名検索 | Everything の構文で対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
+| **Ctrl+R** | Everything ファイル名検索 | Everything の構文で実フォルダと対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
 - **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名を扱う。
@@ -34,7 +34,7 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
   その場で判定する。構造アイテム (Folder / ZIP / PDF) もファイル名で一貫して
   絞り込む (§5.2)。
 
-4 つは UI 上で排他表示される (同時に 2 本開かない)。Ctrl+G/R は同じ検索ownerのsource切替。
+4 つの有効セッションは排他とする。ツールバーへ固定した入力欄は独立に表示できる。Ctrl+G/R は同じ検索ownerのsource切替。
 従来経路の回帰ガードは
 `src/app.rs::phase_c_key_tests`。
 
@@ -84,18 +84,18 @@ folder/非対応形式を含むraw先頭10,000件の後で、対応形式・表�
 
 `everything_results` は対応候補だけをworkerでstatし、正規化した実path、mtime/size、sort metadataと
 raw/除外/読取不能/重複/上限の件数をimmutable `EverythingDataset` に保持する。
-Folder、unsafe path、未対応形式、非表示種類は除外し、stat失敗をゼロstampに置き換えない。
+Folder は拡張子によらず採用し、通常 scan と同じ mtime／size unknown の sort metadata を持つ。作業用・内部フォルダ、root、unsafe path、未対応形式、非表示種類は除外し、stat失敗をゼロstampに置き換えない。
 同名collapseやsidecar探索で検索hitを別のファイルへ置換しない。通常sort/★/tag/編集準備は
 共通workerで行い、UIは完成したitems/metasと副作用を一つのadoption closureでinstallする。
 Everythingの動画pin WebPもprepare workerのreadonly DBで取得し、完成Arcマップを
-動画thumbnail workerへ渡す。採用時の`lookup_webps_many`やBLOB再取得は行わない。
+動画thumbnail workerへ渡す。Folder の動画 pin（cascade を含む）は既存 helper で同じ prepare worker 上から full-path key の catalog/cache map へ seed する。再投影ごとに現在の thumbnail owner を捕捉・照合する。採用時の`lookup_webps_many`やBLOB再取得は行わない。
 pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存同期bulk lookupは確認済みだが、
 EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。
 
 採用済みEverythingの位置は `EverythingPosition::Root` / `PhysicalChild`。
-ZIP/PDF/EPUB/変換書庫の物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
+実フォルダ・画像フォルダ本・ZIP/PDF/EPUB/変換書庫の main 物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
 取消や失敗で未採用のchildへ進めない。結果へ戻ると保持datasetを共通prepareで再投影し、IPCを再送しない。
-既存thumbnail ownerを利用し、F12 fork/park/promoteではmain検索ownerを複製しない。
+Parent（BS／grid 親／gamepad Back）は ZIP 内部を一段、それ以外は effective_folder が logical_source の厳密な物理子孫なら通常の物理親へ移動し、起点なら Root へ戻す。Results ボタンは階層を飛ばして Root へ戻す。既存thumbnail ownerを利用し、独立 viewer open は main を Root に残す。F12 fork/park/promoteではmain検索ownerを複製しない。
 PDF先行改修は `4510346f5`（master統合 `c1e66f589`）のcontext-owned render epochを前提とする。
 
 Remote query endpoint/result共有、新しい永続設定/索引/検索履歴は追加しない。
@@ -123,6 +123,28 @@ facet のタグ値は表示 `#タグ` ではなく、`tags.db` と同じ `tag_ke
 そのため `INDEX_VERSION` bump は不要で、モデル名の正規化規則は再構築なしに調整できる。
 
 ---
+
+### 1.5 ツールバーの常設検索入力 (§1.409)
+
+4欄はそれぞれ既定OFFの任意セクション。`ui_pinned_search` が単一入力・幅計測・描画操作、
+`app/pinned_search` が受付・開始/切替・明示消去・Escを所有する。
+入力/表示結果/終了先は `edit_owner / applied_owner / closable_owner` として既存stateから導く。
+開始は `ensure_search_session` に集約する。LocalはEnter、Containerは編集で即検索、Metadataは
+既存変更処理とdebounce、EverythingはSubmitのみ。表示/focusだけでは開始しない。
+固定時のshortcutは既存受付後、pending text-input focusでその欄へ移す。
+
+G/Rは `metadata_draft / everything_draft` を個別に持ち、wish比較はMetadata draft、
+Everything採用はimmutable submittedを参照する。`SearchAccepted::Metadata { applied }` は
+採用時のquery/filtersを保持し、source切替後もアドレスと適用表示の正本となる。
+`applied`はOptionであり、正常Batch/正常Doneで成立を確認したrunの一覧採用時だけSomeを公開する。
+未検証/拒否/失敗はNoneとし、成立した0件の結果と区別する。
+終了/切替/install/Snapshotでは固定ONのdraftを保持し、×のみが対象draftを明示消去する。
+Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、固定Local draftをtake/復元しない。
+非同期の再適用も検索条件と現在入力を分け、入力を上書きしない。
+固定OFFの終了時消去は維持する。固定欄の×/Escは適用結果の終了、未送信入力先から保持結果への復帰、
+非active欄の順に所有確認する。一時バーのEscは従来の×と同じ共通検索終了・元一覧復帰とする。全バーのEscは描画前の入力ownerを捕捉し、描画後の単一routerが
+消費する。初回未送信/取消後/PhysicalChildにもclosable ownerで終了先を持つ。
+詳細な幅・フォーカス・簡素化の判断は [ツールバー計画 §2.5](toolbar-customization-plan.md#25-検索欄の個別固定-1409)。
 
 ## 2. モジュールマップ
 

@@ -1899,6 +1899,30 @@ mod tests {
     }
 
     #[test]
+    fn plain_folder_spread_setting_does_not_change_collection_payload() {
+        for enabled in [false, true] {
+            let settings = Settings {
+                apply_default_spread_to_plain_folders: enabled,
+                default_spread_mode: crate::settings::SpreadMode::RtlCover,
+                default_reading_direction: crate::settings::ReadingDirection::Rtl,
+                ..Default::default()
+            };
+            let payload = collection_payload(
+                &settings,
+                "collection",
+                super::super::remote_grid_sort_state(settings.sort_order, None),
+                vec![test_remote_entry("C:/page.jpg", "page.jpg")],
+                1,
+                false,
+                CollectionSpreadRequest::default(),
+            );
+            assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Single);
+            assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+            assert_eq!(payload.page_groups.len(), 1);
+        }
+    }
+
+    #[test]
     fn collection_spread_groups_only_images_and_uses_each_parent_catalog_dimensions() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let first_parent = data_dir.path().join("first");

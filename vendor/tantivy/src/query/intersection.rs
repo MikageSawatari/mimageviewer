@@ -226,6 +226,17 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
     }
 }
 
+// Keep #[inline(never)] on the right-hand score: Rust 1.95+ can fuse both BM25
+// evaluations into SIMD with stale upper lanes, triggering denormal assists.
+// An explicit loop still did this in the product exe. With this helper, the
+// Rust 1.99 product release build has scalar code only (checked by disassembly).
+// `#[inline(never)]` is a hint, so recheck after toolchain/Tantivy updates.
+// See vendor/tantivy/MIV-PATCH.md (2026-10-24) and docs/release-checklist.md §9.5.
+#[inline(never)]
+fn score_out_of_line<TScorer: Scorer>(scorer: &mut TScorer) -> Score {
+    scorer.score()
+}
+
 impl<TScorer, TOtherScorer> Scorer for Intersection<TScorer, TOtherScorer>
 where
     TScorer: Scorer,
@@ -234,22 +245,188 @@ where
     #[inline]
     fn score(&mut self) -> Score {
         self.left.score()
-            + self.right.score()
+            + score_out_of_line(&mut self.right)
             + self.others.iter_mut().map(Scorer::score).sum::<Score>()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use proptest::prelude::*;
 
     use super::Intersection;
     use crate::collector::Count;
     use crate::docset::{DocSet, TERMINATED};
     use crate::postings::tests::test_skip_against_unoptimized;
-    use crate::query::{QueryParser, VecDocSet};
-    use crate::schema::{Schema, TEXT};
-    use crate::Index;
+    use crate::query::term_query::TermScorer;
+    use crate::query::{
+        BooleanQuery, EnableScoring, Occur, Query, QueryParser, Scorer, TermQuery, VecDocSet,
+    };
+    use crate::schema::{IndexRecordOption, Schema, TEXT};
+    use crate::{Index, Score, Term};
+
+    struct RecordingScorer {
+        doc: u32,
+        score: Score,
+        id: usize,
+        calls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl DocSet for RecordingScorer {
+        fn advance(&mut self) -> u32 {
+            self.doc = TERMINATED;
+            self.doc
+        }
+
+        fn doc(&self) -> u32 {
+            self.doc
+        }
+
+        fn size_hint(&self) -> u32 {
+            u32::from(self.doc != TERMINATED)
+        }
+    }
+
+    impl Scorer for RecordingScorer {
+        fn score(&mut self) -> Score {
+            self.calls.lock().unwrap().push(self.id);
+            self.score
+        }
+    }
+
+    fn recording_intersection(
+        scores: &[Score],
+        calls: &Arc<Mutex<Vec<usize>>>,
+    ) -> Intersection<RecordingScorer, RecordingScorer> {
+        let mut scorers = scores
+            .iter()
+            .enumerate()
+            .map(|(id, &score)| RecordingScorer {
+                doc: 0,
+                score,
+                id,
+                calls: Arc::clone(calls),
+            });
+        Intersection {
+            left: scorers.next().unwrap(),
+            right: scorers.next().unwrap(),
+            others: scorers.collect(),
+            num_docs: 1,
+        }
+    }
+
+    #[test]
+    fn test_intersection_score_preserves_negative_zero() {
+        for num_others in [0, 1, 3] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut intersection = recording_intersection(&vec![-0.0; num_others + 2], &calls);
+            assert_eq!(
+                intersection.score().to_bits(),
+                (-0.0f32).to_bits(),
+                "others: {num_others}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_intersection_score_call_order() {
+        for num_others in [0, 1, 3] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut intersection = recording_intersection(&vec![1.0; num_others + 2], &calls);
+            intersection.score();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                (0..num_others + 2).collect::<Vec<_>>(),
+                "others: {num_others}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_intersection_score_bits_one_other_with_rounding() {
+        // (2^24 + 1) rounds to 2^24, so regrouping the additions would change the result.
+        let scores = [16_777_216.0, 1.0, -16_777_216.0];
+        let expected = scores[0] + scores[1] + scores[2..].iter().sum::<Score>();
+        assert_eq!(expected.to_bits(), 0.0f32.to_bits());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut intersection = recording_intersection(&scores, &calls);
+        assert_eq!(intersection.others.len(), 1);
+        assert_eq!(intersection.score().to_bits(), expected.to_bits());
+    }
+
+    fn assert_intersection_score_bits(terms: &[&str], expected_docs: &[u32]) -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+        for content in [
+            "a b c d",
+            "a a b c c d d d",
+            "a b b c d extra extra",
+            "a b",
+            "a",
+            "b c",
+        ] {
+            writer.add_document(doc!(text => content))?;
+        }
+        writer.commit()?;
+
+        let query = BooleanQuery::new(
+            terms
+                .iter()
+                .map(|term| {
+                    let query = TermQuery::new(
+                        Term::from_field_text(text, term),
+                        IndexRecordOption::WithFreqs,
+                    );
+                    (Occur::Must, Box::new(query) as Box<dyn Query>)
+                })
+                .collect(),
+        );
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        let intersection = scorer
+            .downcast_mut::<Intersection<TermScorer>>()
+            .expect("Must terms should use the specialized Intersection<TermScorer>");
+        assert_eq!(intersection.others.len(), terms.len() - 2);
+        assert!(intersection
+            .others
+            .iter()
+            .all(|other| other.is::<TermScorer>()));
+        for &doc in expected_docs {
+            assert_eq!(intersection.doc(), doc);
+            // Use the original expression in the scorer's cost-sorted order.
+            let expected = intersection.left.score()
+                + intersection.right.score()
+                + intersection
+                    .others
+                    .iter_mut()
+                    .map(Scorer::score)
+                    .sum::<Score>();
+            assert_eq!(
+                intersection.score().to_bits(),
+                expected.to_bits(),
+                "doc {doc}"
+            );
+            intersection.advance();
+        }
+        assert_eq!(intersection.doc(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    fn test_intersection_score_bits_two_must_terms() -> crate::Result<()> {
+        assert_intersection_score_bits(&["a", "b"], &[0, 1, 2, 3])
+    }
+
+    #[test]
+    fn test_intersection_score_bits_four_must_terms() -> crate::Result<()> {
+        assert_intersection_score_bits(&["a", "b", "c", "d"], &[0, 1, 2])
+    }
 
     #[test]
     fn test_intersection() {

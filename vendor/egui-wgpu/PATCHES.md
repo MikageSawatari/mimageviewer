@@ -41,7 +41,7 @@ root製品graph・依存切替・eframeの接続は対象外。
 | lib test接続 | (a)+(b) | 新原本のlibはtest有効が既定なので旧test=true指定は不要。pollsterと新版回帰moduleを接続 |
 | license本文 | (b) | 旧vendorのMIT／Apache本文をbyte変更なしで同梱。新原本のMIT OR Apache-2.0宣言を維持 |
 
-`src/setup.rs`、`src/egui.wgsl`、`src/texture_copy.wgsl`、README、Cargo.toml.orig、
+`src/egui.wgsl`、`src/texture_copy.wgsl`、README、Cargo.toml.orig、
 同梱Cargo.lock、.cargo_vcs_info.jsonは原本byteを保持する。
 実行時は同梱lockではなく`vendor-next/Cargo.lock`を使用する。
 
@@ -155,3 +155,26 @@ user texture pixel readback, and later free-only completion. The headless adapte
 is mandatory. Before the egui collector repair it detects the same Managed(0)
 zero-width create_texture validation error as the clean-install startup report.
 The initial reservation is retained by egui, not silently discarded by wgpu.
+
+## Ordered native device candidates (2026-10-26, §1.448)
+
+`WgpuSetupCreateNew::native_adapter_candidates` optionally returns an ordered
+adapter list and takes precedence over the existing native selector. The default
+is `None`, preserving one selector and one device request. Web ignores both
+native callbacks. Clone and Debug preserve/report the new callback like the old
+selector. `src/setup.rs` is therefore no longer byte-identical to upstream.
+
+`RenderState::create` tries only the listed adapters, stopping at the first
+successful `request_device`. Selection errors and empty lists fail selection;
+if all device requests fail, the last original `RequestDeviceError` is returned.
+Surface capabilities, pipeline creation and later rendering remain outside this
+loop, so they never trigger another candidate. Candidate construction and
+surface-compatibility checks belong to the caller's policy.
+
+For each attempted adapter the observer receives `AdapterSelected`, Device
+Begin/End, then `DeviceAttempt { attempt, info, result }` (one-based index,
+`Result<(), String>`). Each result is published before advancing, including
+failures before a later success. AdapterSelection Begin/End still enclose the
+single candidate/selector callback. The generic injected-request helper has
+GPU-free tests for stopping, fallback, last-error preservation, empty candidates,
+event order/history, selector compatibility, and callback Clone/Debug behavior.

@@ -61,7 +61,7 @@ impl App {
         {
             return false;
         }
-        self.open_everything_search();
+        self.open_search_shortcut(ctx, crate::ui_pinned_search::PinnedSearchKind::Everything);
         true
     }
 }
@@ -146,7 +146,7 @@ mod tests {
                 egui::CentralPanel::default().show(root_ui, |ui| {
                     super::super::ui::draw_everything_controls(
                         ui,
-                        &mut app.global_search.query,
+                        &mut app.global_search.everything_draft,
                         &mut app.global_search.focus_request,
                     );
                 })
@@ -157,7 +157,7 @@ mod tests {
         app.open_everything_search();
         for (previous, replacement, ime) in [("mist", "mist", false), ("日本語🍀", "検索", true)]
         {
-            app.global_search.query = previous.into();
+            app.global_search.everything_draft = previous.into();
             ctx.begin_pass(egui::RawInput::default());
             let id = draw(&ctx, &mut app);
             let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
@@ -226,7 +226,7 @@ mod tests {
                 ..Default::default()
             });
             draw(&ctx, &mut app);
-            assert_eq!(app.global_search.query, replacement);
+            assert_eq!(app.global_search.everything_draft, replacement);
             let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
             ctx.begin_pass(egui::RawInput {
                 events: vec![egui::Event::Text("x".into())],
@@ -234,7 +234,7 @@ mod tests {
             });
             draw(&ctx, &mut app);
             assert_eq!(
-                app.global_search.query,
+                app.global_search.everything_draft,
                 format!("{replacement}x"),
                 "ordinary typing must not repeatedly select the query"
             );
@@ -274,7 +274,10 @@ mod tests {
                     ..Default::default()
                 });
                 draw(&ctx, &mut app);
-                assert_eq!(app.global_search.query, format!("{replacement}x確"));
+                assert_eq!(
+                    app.global_search.everything_draft,
+                    format!("{replacement}x確")
+                );
                 let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
             }
         }

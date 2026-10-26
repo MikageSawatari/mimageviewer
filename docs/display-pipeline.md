@@ -1,5 +1,17 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+### GPU の初期化（§1.448）
+
+root GUI の描画 API は `--gpu-backend auto|dx12|vulkan` で選ぶ。既定の `auto` は surface 対応の
+最初の DX12 adapter を試し、`request_device` が失敗した場合だけ最初の Vulkan adapter を一度試す。
+明示指定はその API だけを使う。AppCreator は成功した device で一回だけ呼ばれ、以後の surface / pipeline /
+描画の失敗、実行中の device lost、panic では開き直さない。成功した API の永続化もしない。
+DX12 の shader compiler は root GUI・独立した動画 HUD ともに FXC 固定で、root の Vulkan 指定は HUD の
+DX12 Instance や動画 native presenter（D3D11）を変更しない。
+試行別の結果・GPU / driver・初期化中だけ収集する Error はログと起動記録へ残す。
+この API 選択は報告環境の原因を確定した修正ではない。条件・診断 owner・テスト範囲の正本は
+[GPU 初期化計画](gpu-init-fallback-plan.md)、[アーキテクチャ概観](architecture-overview.md#コア) を参照。
+
 ### 本の構成と提示許可（§1.242 B2、2026-10-13）
 
 accepted構成は方向・表紙・可視実列・ページ指定を渡し、通常の共通builderでSpread/連結/editor/Remoteの組を生成する。
@@ -988,6 +1000,27 @@ Keepは要求を継続し、Moveは置換、Emptyや手動操作はその要求�
 保つ一方、loaded/global editorやidx-only Undoの新しい保持/remap、一般editor ownerの拡張は行わない。
 v4.5.0で既存のSearch streaming idx-only誤配送は別件・本修正の対象外であり、利用者がバックログへ
 記載する。根拠と受入範囲は [編集範囲の利用者決定](rating-filter-fullscreen-plan.md#stage-2-の編集範囲限定--利用者決定-2026-10-11) を参照。
+
+### 2.1.2 通常フォルダの初期ページ構成（§1.425）
+
+初期の物理一覧採用は `SpreadRestoreDefaults::for_physical_folder` に本扱い・実ディレクトリの
+採用済み事実・実効設定の値を渡す。本扱いは従来の `for_book` と同じ mode/flow/direction、
+それ以外は原則 `NON_BOOK`（Single/Paged/Ltr）。`apply_default_spread_to_plain_folders`（既定 OFF）が
+ON の実ディレクトリだけ、mode を実効 `default_spread_mode` へ置き換える。
+この分岐だけ旧 Vertical を Single に正規化し、flow は Paged、方向の fallback は Ltr を保つ。
+`StoredSpreadState::resolve_reading` が保存値を優先し、未保存では mode の埋め込み方向を使う。
+保存済み flow と旧 Vertical の復元は従来どおり。既定の適用から `spread.db` へは書かない。
+
+実ディレクトリの証拠は、directory scan が生成して既存 loader/Stack が運ぶ
+`FolderScanSignature`。Physical 分類や拡張子、UI での stat から推定しない。
+メタ情報取り込み後の既存復元で新 resolver を使うのは、設定 ON・非本の実フォルダだけとする。
+同 context の source/世代が一致する `FolderObservation` を使って対象を確認し、既定を再解決する。
+OFF・本扱い・その他の対象は §1.425 導入前の計算を維持する（通常 open との既存不整合も今回の修正対象外）。
+main/detached は共通 loader を使い、兄弟の読書状態を変更しない。
+抽出結果の early-return と保存 flow の優先順、書庫・文書の専用 `for_book` 経路は保つ。
+
+簡素化として、新しい pending/worker/live rebuild は設けず、既存の一覧採用と取り込み後復元へ
+純粋 resolver を接続する。設定変更を理由に表示中の全窓を組み直す経路は追加しない。
 
 ### 2.2 ロードスレッド
 

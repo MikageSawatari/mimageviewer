@@ -157,6 +157,16 @@ pub type NativeAdapterSelectorMethod = Arc<
         + Sync,
 >;
 
+/// Method for returning native adapters in device-request order.
+///
+/// Only a failed device request advances to the next candidate. The callback
+/// should exclude adapters incompatible with the supplied surface.
+pub type NativeAdapterCandidatesMethod = Arc<
+    dyn Fn(&[wgpu::Adapter], Option<&wgpu::Surface<'_>>) -> Result<Vec<wgpu::Adapter>, String>
+        + Send
+        + Sync,
+>;
+
 /// Configuration for creating a new wgpu setup.
 ///
 /// Used for [`WgpuSetup::CreateNew`].
@@ -189,18 +199,28 @@ pub struct WgpuSetupCreateNew {
     /// `eframe` 's winit & web integrations will attempt to fill the display handle automatically if it is left empty.
     pub display_handle: Option<Box<dyn EguiDisplayHandle>>,
 
-    /// Power preference for the adapter if [`Self::native_adapter_selector`] is not set or targeting web.
+    /// Power preference when neither native callback is set, or when targeting web.
     pub power_preference: wgpu::PowerPreference,
 
     /// Optional selector for native adapters.
     ///
     /// This field has no effect when targeting web!
-    /// Otherwise, if set [`Self::power_preference`] is ignored and the adapter is instead selected by this method.
+    /// Otherwise, if set and [`Self::native_adapter_candidates`] is absent,
+    /// [`Self::power_preference`] is ignored and this method selects the adapter.
     /// Note that [`Self::instance_descriptor`]'s [`wgpu::InstanceDescriptor::backends`]
     /// are still used to filter the adapter enumeration in the first place.
     ///
     /// Defaults to `None`.
     pub native_adapter_selector: Option<NativeAdapterSelectorMethod>,
+
+    /// Optional ordered candidates for native device creation.
+    ///
+    /// Takes precedence over [`Self::native_adapter_selector`] and
+    /// [`Self::power_preference`]. An empty list is an adapter-selection error.
+    /// Each candidate is tried once, stopping at the first successful device
+    /// request. Errors after device creation do not try another candidate.
+    /// Like the selector, this has no effect on web and defaults to `None`.
+    pub native_adapter_candidates: Option<NativeAdapterCandidatesMethod>,
 
     /// Configuration passed on device request, given an adapter
     pub device_descriptor:
@@ -257,6 +277,8 @@ impl WgpuSetupCreateNew {
 
             native_adapter_selector: None,
 
+            native_adapter_candidates: None,
+
             device_descriptor: Arc::new(|adapter| {
                 let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
                     wgpu::Limits::downlevel_webgl2_defaults()
@@ -293,6 +315,7 @@ impl Clone for WgpuSetupCreateNew {
             display_handle: self.display_handle.clone(),
             power_preference: self.power_preference,
             native_adapter_selector: self.native_adapter_selector.clone(),
+            native_adapter_candidates: self.native_adapter_candidates.clone(),
             device_descriptor: Arc::clone(&self.device_descriptor),
         }
     }
@@ -305,6 +328,7 @@ impl core::fmt::Debug for WgpuSetupCreateNew {
             display_handle,
             power_preference,
             native_adapter_selector,
+            native_adapter_candidates,
             device_descriptor: _,
         } = self;
         f.debug_struct("WgpuSetupCreateNew")
@@ -314,6 +338,10 @@ impl core::fmt::Debug for WgpuSetupCreateNew {
             .field(
                 "native_adapter_selector",
                 &native_adapter_selector.is_some(),
+            )
+            .field(
+                "native_adapter_candidates",
+                &native_adapter_candidates.is_some(),
             )
             .finish_non_exhaustive()
     }

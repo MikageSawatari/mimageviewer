@@ -35,6 +35,8 @@ mod disabled_ime_tests;
 mod ime_key_trace;
 #[cfg(test)]
 mod keyboard_input_tests;
+#[cfg(all(test, target_os = "windows"))]
+mod undecorated_window_tests;
 
 pub use window_settings::{WindowGeometry, WindowSettings};
 
@@ -2073,8 +2075,9 @@ fn process_viewport_command(
             {
                 use winit::platform::windows::WindowExtWindows as _;
 
-                // don't request the undecorated-window drop shadow in fullscreen (#8399)
-                window.set_undecorated_shadow(!v && window.fullscreen().is_none());
+                // mIV uses monitor-sized undecorated windows without winit fullscreen.
+                // Keep their client origin unchanged, as before egui 0.37 (§1.426).
+                window.set_undecorated_shadow(false);
             }
         }
         ViewportCommand::WindowLevel(l) => window.set_window_level(match l {
@@ -2442,9 +2445,9 @@ pub fn create_winit_window_attributes(
             window_attributes = window_attributes.with_skip_taskbar(!show);
         }
 
-        // don't request the undecorated-window drop shadow in fullscreen (#8399)
-        let want_undecorated_shadow = !decorations.unwrap_or(true) && !fullscreen.unwrap_or(false);
-        window_attributes = window_attributes.with_undecorated_shadow(want_undecorated_shadow);
+        // mIV needs no undecorated shadows, including its tooltip viewport.
+        // Unlike upstream #8169/#8449, preserve the pre-0.37 client geometry.
+        window_attributes = window_attributes.with_undecorated_shadow(false);
     }
 
     #[cfg(target_os = "macos")]

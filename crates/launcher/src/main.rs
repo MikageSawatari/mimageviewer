@@ -253,7 +253,7 @@ fn run() -> Result<&'static str, String> {
     let core_path = runtime_dir.join("mimageviewer-core.exe");
     let launcher_path = std::env::current_exe().ok();
 
-    let mut cmd = Command::new(&core_path);
+    let mut cmd = core_command(&core_path, &user_args);
     #[cfg(windows)]
     let handoff = trace(
         Stage::RuntimeHandoff,
@@ -263,7 +263,6 @@ fn run() -> Result<&'static str, String> {
     .map_err(|e| format!("runtime handoff: {e}"))?;
     #[cfg(windows)]
     handoff.configure(&mut cmd);
-    cmd.args(&user_args);
     configure_effetune_command(&mut cmd, effetune);
     if let Some(path) = launcher_path {
         cmd.env("MIV_LAUNCHER_EXE_PATH", path);
@@ -318,6 +317,13 @@ fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
         extract_asset(runtime_dir, asset)?;
     }
     Ok(())
+}
+
+/// The new-instance route forwards all options unchanged for the core to validate.
+fn core_command(core_path: &Path, user_args: &[OsString]) -> Command {
+    let mut command = Command::new(core_path);
+    command.args(user_args);
+    command
 }
 
 fn configure_effetune_command(
@@ -418,7 +424,8 @@ fn maybe_handle_version_or_help(args: &[OsString]) -> bool {
              \n\
              Options:\n  \
              -V, --version  Print version and exit\n  \
-             -h, --help     Print this help and exit\n\
+             -h, --help     Print this help and exit\n  \
+             --gpu-backend auto|dx12|vulkan  Select the startup graphics API\n\
              \n\
              PATH  Open the given image file or folder on startup.\n"
         ));
@@ -691,6 +698,8 @@ fn cli_flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "--data-dir"
+            | "--gpu-backend"
+            | "--gpu-test-fail-device"
             | "--window-size"
             | "--perf-log-path"
             | "--play-test"
@@ -844,6 +853,73 @@ mod diagnostics_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use std::ffi::OsString;
+
+    #[test]
+    fn gpu_option_values_are_never_existing_instance_open_paths() {
+        for option in ["--gpu-backend", "--gpu-test-fail-device"] {
+            for value in ["auto", "dx12", "vulkan", "DX12", "opengl"] {
+                let args = [OsString::from(option), OsString::from(value)];
+                assert_eq!(super::parse_startup_open_path_arg_from(&args), None);
+                let with_path = [
+                    args[0].clone(),
+                    args[1].clone(),
+                    OsString::from(r"C:\images"),
+                ];
+                assert_eq!(
+                    super::parse_startup_open_path_arg_from(&with_path),
+                    Some(std::path::PathBuf::from(r"C:\images"))
+                );
+                let with_delimiter = [
+                    args[0].clone(),
+                    args[1].clone(),
+                    OsString::from("--"),
+                    OsString::from("--images"),
+                ];
+                assert_eq!(
+                    super::parse_startup_open_path_arg_from(&with_delimiter),
+                    Some(std::path::PathBuf::from("--images"))
+                );
+                let delimiter_without_path =
+                    [args[0].clone(), args[1].clone(), OsString::from("--")];
+                assert_eq!(
+                    super::parse_startup_open_path_arg_from(&delimiter_without_path),
+                    None
+                );
+            }
+            assert_eq!(
+                super::parse_startup_open_path_arg_from(&[OsString::from(option)]),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_options_combine_and_delimiter_turns_options_into_paths() {
+        let args: Vec<OsString> = [
+            "--gpu-backend",
+            "dx12",
+            "--gpu-test-fail-device",
+            "dx12",
+            r"C:\images",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            super::parse_startup_open_path_arg_from(&args),
+            Some(std::path::PathBuf::from(r"C:\images"))
+        );
+        for option in ["--gpu-backend", "--gpu-test-fail-device"] {
+            assert_eq!(
+                super::parse_startup_open_path_arg_from(&[
+                    OsString::from("--"),
+                    OsString::from(option),
+                    OsString::from("vulkan"),
+                ]),
+                Some(std::path::PathBuf::from(option))
+            );
+        }
+    }
 
     #[test]
     fn preparation_failure_and_success_are_forwarded_without_starting_core() {
@@ -1159,5 +1235,39 @@ mod final_boundary_tests {
         };
         let code = super::complete_launcher(result, |_| {});
         std::process::exit(code);
+    }
+    #[test]
+    fn gpu_options_survive_new_instance_forwarding_with_paths_and_delimiters() {
+        use std::ffi::OsString;
+        for flag in ["--gpu-backend", "--gpu-test-fail-device"] {
+            for value in ["auto", "dx12", "vulkan"] {
+                for suffix in [
+                    vec![],
+                    vec![r"C:\images"],
+                    vec!["--", r"C:\images"],
+                    vec!["--"],
+                ] {
+                    let mut args: Vec<OsString> =
+                        [flag, value].into_iter().map(OsString::from).collect();
+                    args.extend(suffix.into_iter().map(OsString::from));
+                    let command = super::core_command(std::path::Path::new("core.exe"), &args);
+                    assert_eq!(command.get_program(), "core.exe");
+                    assert_eq!(
+                        command.get_args().collect::<Vec<_>>(),
+                        args.iter().map(OsString::as_os_str).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        let args: Vec<OsString> = ["--", "--gpu-backend", "vulkan"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(
+            super::core_command(std::path::Path::new("core.exe"), &args)
+                .get_args()
+                .collect::<Vec<_>>(),
+            args.iter().map(OsString::as_os_str).collect::<Vec<_>>()
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Everything is a producer of the shared Search surface, not a second list owner.
 use super::*;
-mod metadata;
+pub(super) mod metadata;
 mod shortcut;
 pub(super) use metadata::prepare as prepare_everything_metadata;
 pub(super) use metadata::{SearchMetadataInstall, SearchMetadataResources};
@@ -80,6 +80,13 @@ pub(crate) enum EverythingIntent {
     Return,
 }
 
+/// An operation passed to the return router; no additional session state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EverythingReturn {
+    Parent,
+    Results,
+}
+
 impl From<SearchHandle> for SearchProducer {
     fn from(handle: SearchHandle) -> Self {
         Self::Metadata(handle)
@@ -110,13 +117,33 @@ pub(crate) enum EverythingPosition {
     },
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MetadataAppliedSpec {
+    pub(crate) query: String,
+    pub(crate) filters: GlobalSearchFilters,
+}
+
 pub(crate) enum SearchAccepted {
-    Metadata,
+    Metadata {
+        applied: Option<MetadataAppliedSpec>,
+    },
     Everything {
         submitted: SubmittedEverything,
         dataset: Arc<crate::everything_results::EverythingDataset>,
         position: EverythingPosition,
     },
+}
+
+impl SearchAccepted {
+    pub(crate) fn applied_query(&self) -> &str {
+        match self {
+            Self::Metadata {
+                applied: Some(applied),
+            } => &applied.query,
+            Self::Metadata { applied: None } => "",
+            Self::Everything { submitted, .. } => &submitted.query,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -175,8 +202,10 @@ impl App {
     }
 
     pub(crate) fn retire_search_accepted(&mut self) {
-        let accepted =
-            std::mem::replace(&mut self.global_search.accepted, SearchAccepted::Metadata);
+        let accepted = std::mem::replace(
+            &mut self.global_search.accepted,
+            SearchAccepted::Metadata { applied: None },
+        );
         self.retire_smart_folder_payloads([
             Box::new(accepted) as crate::app::smart_folder::RetiredSmartFolderPayload
         ]);
@@ -185,7 +214,7 @@ impl App {
         self.global_search
             .active
             .then(|| match &self.global_search.accepted {
-                SearchAccepted::Metadata => SearchOpenOrigin::Metadata,
+                SearchAccepted::Metadata { .. } => SearchOpenOrigin::Metadata,
                 SearchAccepted::Everything { .. } => SearchOpenOrigin::Everything {
                     run: self.global_search.run_sequence,
                     context: self.virtual_list_context_id(),
@@ -197,7 +226,7 @@ impl App {
         self.global_search.active
             && match origin {
                 SearchOpenOrigin::Metadata => {
-                    matches!(self.global_search.accepted, SearchAccepted::Metadata)
+                    matches!(self.global_search.accepted, SearchAccepted::Metadata { .. })
                 }
                 SearchOpenOrigin::Everything { run, context } => {
                     run == self.global_search.run_sequence
@@ -224,7 +253,7 @@ impl App {
         self.global_search.focus_request = true;
     }
 
-    pub(super) fn switch_search_source(&mut self, source: SearchSource) {
+    pub(crate) fn switch_search_source(&mut self, source: SearchSource) {
         if self.global_search.source == source {
             return;
         }
@@ -233,10 +262,11 @@ impl App {
         self.retire_search_prepare();
         self.global_search.mtime_lookup_pending = None;
         self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
+        self.clear_search_draft_on_end(self.global_search.source.into());
         self.global_search.source = source;
-        self.global_search.query.clear();
         self.global_search.last_executed.clear();
         self.global_search.last_change_at = None;
+        self.global_search.done = true; // Source selection alone has no unfinished query.
         self.global_search.reject_message = None;
         self.global_search.focus_request = true;
         // Accepted data and its source still explain the visible rows after a failed send.
@@ -280,7 +310,9 @@ impl App {
         {
             return;
         }
-        if let Err(error) = crate::everything_ipc::validate_query(&self.global_search.query) {
+        if let Err(error) =
+            crate::everything_ipc::validate_query(&self.global_search.everything_draft)
+        {
             self.global_search.reject_message = Some(error.user_message().into());
             return;
         }
@@ -313,7 +345,7 @@ impl App {
             }
         };
         let submitted = SubmittedEverything {
-            query: self.global_search.query.clone(),
+            query: self.global_search.everything_draft.clone(),
             run: self.global_search.run_sequence,
         };
         let command = SearchPrepareCommand::Everything(submitted.query.clone(), cancel.clone());
@@ -369,6 +401,11 @@ impl App {
             },
         };
         let view = GlobalSearchView::Flat;
+        // Physical child installs replace the thumbnail owner without replacing the
+        // retained search dataset/worker. Each reprojection must target the current owner.
+        let _ = prepare.tx.send(SearchPrepareCommand::MetadataResources(
+            SearchMetadataResources::for_app(self),
+        ));
         let adoption = self.capture_search_view_adoption(&view);
         prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
         prepare.desired = Some(SearchViewWish {
@@ -421,7 +458,7 @@ impl App {
         match &wish.source {
             SearchProjection::Metadata => {
                 self.global_search.source == SearchSource::Metadata
-                    && wish.query == self.global_search.query
+                    && wish.query == self.global_search.metadata_draft
             }
             SearchProjection::Everything { submitted, .. } => match &self.global_search.pending {
                 Some(SearchProducer::Everything {
@@ -434,10 +471,18 @@ impl App {
         }
     }
 
-    pub(super) fn accept_search_projection(&mut self, source: SearchProjection) {
+    pub(super) fn accept_search_projection(
+        &mut self,
+        wish: &SearchViewWish,
+        metadata_applied: Option<MetadataAppliedSpec>,
+    ) {
         self.retire_search_accepted();
-        match source {
-            SearchProjection::Metadata => self.global_search.accepted = SearchAccepted::Metadata,
+        match wish.source.clone() {
+            SearchProjection::Metadata => {
+                self.global_search.accepted = SearchAccepted::Metadata {
+                    applied: metadata_applied,
+                };
+            }
             SearchProjection::Everything { submitted, dataset } => {
                 let old_hits = std::mem::take(&mut self.global_search.all_hits);
                 let old_containers = std::mem::take(&mut self.global_search.containers);
@@ -479,11 +524,11 @@ impl App {
             return false;
         };
         if matches!(position, EverythingPosition::Root) {
-            if !dataset.rows.iter().any(|row| {
-                row.item
-                    .file_operation_path()
-                    .is_some_and(|p| crate::folder_tree::path_eq(p, path))
-            }) {
+            // The accepted dataset owns physical identity for both files and folders.
+            // file_operation_path intentionally excludes Folder (checkable file policy).
+            if !crate::path_key::physical_path_spelling(path)
+                .is_some_and(|key| dataset.rows.iter().any(|row| row.physical_key == key))
+            {
                 return true;
             }
             let route = self
@@ -501,19 +546,38 @@ impl App {
         true
     }
 
-    pub(super) fn return_from_everything_child(&mut self) -> bool {
+    pub(super) fn return_from_everything_child(&mut self, operation: EverythingReturn) -> bool {
         let SearchAccepted::Everything {
             dataset, position, ..
         } = &self.global_search.accepted
         else {
             return false;
         };
-        let EverythingPosition::PhysicalChild { return_anchor, .. } = position else {
+        let EverythingPosition::PhysicalChild {
+            logical_source,
+            return_anchor,
+            ..
+        } = position
+        else {
             return true;
         };
-        if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
-            self.zip_nav_back();
-            return true;
+        if operation == EverythingReturn::Parent {
+            if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
+                self.zip_nav_back();
+                return true;
+            }
+            if self.effective_folder().is_some_and(|current| {
+                crate::path_key::physical_path_is_within(&current, logical_source)
+                    && crate::path_key::physical_path_spelling(&current)
+                        != crate::path_key::physical_path_spelling(logical_source)
+            }) {
+                // Resolve reserves selection of the child. Dispatch directly rather than
+                // re-entering handle_grid_parent_folder_action's active-search gate.
+                if let Some(nav) = self.resolve_grid_parent_nav() {
+                    self.apply_fullscreen_close_nav_immediate(nav);
+                }
+                return true;
+            }
         }
         let anchor = return_anchor.clone();
         let dataset = Arc::clone(dataset);
@@ -582,10 +646,13 @@ impl App {
         true
     }
 
+    pub(crate) fn accepted_everything_query_matches_draft(&self) -> bool {
+        matches!(&self.global_search.accepted, SearchAccepted::Everything { submitted, .. } if submitted.query == self.global_search.everything_draft)
+    }
+
     pub(super) fn render_everything_search_bar(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
         let enter = self.dialog_enter_pressed(ctx);
-        let escape = self.dialog_escape_pressed(ctx);
         let mut send = false;
         let mut close = false;
         let mut back = false;
@@ -593,34 +660,29 @@ impl App {
         egui::Panel::top("global_search_bar").show(root_ui,|ui| {
             self.gate_main_chrome(ui);
             ui.add_enabled_ui(!running,|ui| {
-                let controls = ui::draw_everything_controls(ui,&mut self.global_search.query,&mut self.global_search.focus_request);
-                self.global_search.has_focus = controls.has_focus;
+                if !crate::ui_pinned_search::PinnedSearchKind::Everything.pinned(&self.settings) {
+                let controls = ui::draw_everything_controls(ui,&mut self.global_search.everything_draft,&mut self.global_search.focus_request);
+                self.global_search.has_focus |= controls.has_focus;
                 send = controls.send || controls.lost_focus && enter;
                 close = controls.close;
+                } else { ui::draw_everything_hint(ui); }
                 if self.everything_has_physical_child() { back = ui.button("← 結果へ戻る").clicked(); }
                 match &self.global_search.accepted {
                     SearchAccepted::Everything {submitted,dataset,..} => {
-                        ui::draw_everything_status(ui,ui::EverythingStatus {total:dataset.stats.total_items,raw_returned:dataset.stats.raw_returned,displayed:dataset.rows.len(),unreadable:dataset.stats.unreadable,limit_reached:dataset.stats.limit_reached,query_changed:submitted.query != self.global_search.query,error:self.global_search.reject_message.as_deref()});
+                        ui::draw_everything_status(ui,ui::EverythingStatus {total:dataset.stats.total_items,raw_returned:dataset.stats.raw_returned,displayed:dataset.rows.len(),outside:dataset.stats.unsupported + dataset.stats.excluded,duplicates:dataset.stats.duplicates,unreadable:dataset.stats.unreadable,limit_reached:dataset.stats.limit_reached,query_changed:submitted.query != self.global_search.everything_draft,error:self.global_search.reject_message.as_deref()});
                     }
-                    SearchAccepted::Metadata if self.items_are_global_search_view => { ui.label("表示中: アイテム検索の結果。Everything の条件はまだ適用されていません。"); }
+                    SearchAccepted::Metadata { applied: Some(_) } if self.items_are_global_search_view => { ui.label("表示中: アイテム検索の結果。Everything の条件はまだ適用されていません。"); }
                     _ => {}
                 }
-                if matches!(self.global_search.accepted,SearchAccepted::Metadata) {
+                if matches!(self.global_search.accepted,SearchAccepted::Metadata { .. }) {
                     if let Some(error) = self.global_search.reject_message.as_deref() { ui.colored_label(ui.visuals().error_fg_color,error); }
                 }
             });
         });
-        if escape {
-            if running {
-                self.cancel_everything_search();
-            } else {
-                close = true;
-            }
-        }
         if close {
             self.close_global_search();
         } else if back {
-            self.return_from_everything_child();
+            self.return_from_everything_child(EverythingReturn::Results);
         } else if send {
             self.send_everything_search(ctx);
         }
@@ -630,7 +692,7 @@ impl App {
         if !self.everything_search_progress_visible() {
             return;
         }
-        if ui::draw_everything_progress(ctx) || self.dialog_escape_pressed(ctx) {
+        if ui::draw_everything_progress(ctx) {
             self.cancel_everything_search();
         }
     }

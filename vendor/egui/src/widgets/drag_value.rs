@@ -516,6 +516,7 @@ impl Widget for DragValue<'_> {
 
         if old_value != value {
             set(&mut get_set_value, value);
+            value = get(&mut get_set_value);
             ui.data_mut(|data| data.remove::<EditState>(id));
         }
 

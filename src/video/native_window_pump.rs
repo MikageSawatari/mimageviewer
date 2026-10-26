@@ -554,6 +554,7 @@ pub(crate) struct NativeWindowPumpSpawn {
     pub(crate) hwnd_out: Arc<AtomicU64>,
     pub(crate) hud_hwnd_out: Arc<AtomicU64>,
     pub(crate) closed: Arc<AtomicBool>,
+    pub(crate) faulted: Arc<AtomicBool>,
     pub(crate) presenter_visibility: NativePresenterVisibility,
     pub(crate) source_epoch: Arc<AtomicU64>,
     pub(crate) ui_event_tx: NativeOutputEventSender,
@@ -613,6 +614,7 @@ struct PumpRuntime {
     hwnd_out: Arc<AtomicU64>,
     hud_hwnd_out: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
+    faulted: Arc<AtomicBool>,
     presenter_visibility: NativePresenterVisibility,
     source_epoch: Arc<AtomicU64>,
     ui_event_tx: NativeOutputEventSender,
@@ -668,6 +670,7 @@ impl PumpRuntime {
             hwnd_out: spawn.hwnd_out,
             hud_hwnd_out: spawn.hud_hwnd_out,
             closed: spawn.closed,
+            faulted: spawn.faulted,
             presenter_visibility: spawn.presenter_visibility,
             source_epoch: spawn.source_epoch,
             ui_event_tx: spawn.ui_event_tx,
@@ -1651,7 +1654,12 @@ impl PumpRuntime {
     }
 
     fn record_fault(&self, message: &str) {
-        let rendered = format!("native video session quarantined: {message}");
+        // The render thread has already logged its detail before sending RenderFault.
+        // Publish synchronously even when init_error is locked, and log only the first fault.
+        if !self.faulted.swap(true, Ordering::AcqRel) {
+            crate::logger::log(format!("[native-video] session quarantined: {message}"));
+        }
+        let rendered = super::NATIVE_VIDEO_FAULT_MESSAGE.to_string();
         match self.init_error.try_lock() {
             Ok(mut slot) => {
                 if slot.is_none() {
@@ -2510,7 +2518,7 @@ mod tests {
     const STALL_CHILD_ENV: &str = "MIV_STAGE4_PRODUCTION_STALL_CHILD";
     const HUD_FOCUS_CHILD_ENV: &str = "MIV_HUD_FOCUS_TEST_CHILD";
 
-    fn geometry_runtime() -> (PumpRuntime, Receiver<PumpLifecycleEvent>) {
+    fn fault_test_runtime() -> (PumpRuntime, Receiver<PumpLifecycleEvent>) {
         let fault = Arc::new(AtomicBool::new(false));
         let (pump_route, pump_events) = native_window_event_route(64, Arc::clone(&fault));
         let (render_route, _render_events) = native_window_event_route(64, Arc::clone(&fault));
@@ -2528,6 +2536,7 @@ mod tests {
             hwnd_out: Arc::new(AtomicU64::new(0)),
             hud_hwnd_out: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
             presenter_visibility: NativePresenterVisibility::new(
                 NativeVideoInitialVisibility::Hidden,
             ),
@@ -2541,7 +2550,7 @@ mod tests {
         };
         // Resized lifecycle sends are tested below, so retain this bounded receiver
         // in the fixture rather than changing production send semantics.
-        let mut runtime = PumpRuntime::new(
+        let runtime = PumpRuntime::new(
             spawn,
             command_rx,
             lifecycle_tx,
@@ -2550,11 +2559,64 @@ mod tests {
             render_route,
             pump_events,
         );
+        (runtime, _lifecycle_rx)
+    }
+
+    fn geometry_runtime() -> (PumpRuntime, Receiver<PumpLifecycleEvent>) {
+        let (mut runtime, lifecycle_rx) = fault_test_runtime();
         for epoch in [7, 8] {
             insert_geometry_host(&mut runtime, epoch, true);
         }
         let _ = runtime.pump_events.drain();
-        (runtime, _lifecycle_rx)
+        (runtime, lifecycle_rx)
+    }
+
+    #[test]
+    fn record_fault_latches_before_contended_init_error_can_be_reported() {
+        let (mut runtime, _events) = fault_test_runtime();
+        let output = super::super::NativeVideoOutput::disconnected_for_test();
+        runtime.faulted = Arc::clone(&output.faulted);
+        runtime.init_error = Arc::clone(&output.init_error);
+        let locked = output.init_error.lock().unwrap();
+        assert!(output.reusable_for_swap());
+        runtime.record_fault("contended pump failure");
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.is_closed(), "fault must precede closed publication");
+        assert!(!output.reusable_for_swap());
+        assert!(
+            locked.is_none(),
+            "reporting is still blocked by the held lock"
+        );
+        drop(locked);
+    }
+
+    #[test]
+    fn record_fault_notification_take_never_makes_output_reusable() {
+        let (mut runtime, _events) = fault_test_runtime();
+        let output = super::super::NativeVideoOutput::disconnected_for_test();
+        runtime.faulted = Arc::clone(&output.faulted);
+        runtime.init_error = Arc::clone(&output.init_error);
+        runtime.record_fault("internal pump failure detail");
+        assert_eq!(
+            output.take_init_error().as_deref(),
+            Some(super::super::NATIVE_VIDEO_FAULT_MESSAGE)
+        );
+        assert!(output.take_init_error().is_none());
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.reusable_for_swap());
+        runtime.record_fault("another report cannot clear the fault");
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.reusable_for_swap());
+    }
+
+    #[test]
+    fn normal_typed_shutdown_does_not_mark_fault_or_init_error() {
+        let (mut runtime, _events) = fault_test_runtime();
+        // No HWND or GPU work: exercise the production terminal publication directly.
+        runtime.begin_shutdown(1);
+        assert!(runtime.closed.load(Ordering::Acquire));
+        assert!(!runtime.faulted.load(Ordering::Acquire));
+        assert!(runtime.init_error.lock().unwrap().is_none());
     }
 
     fn insert_geometry_host(runtime: &mut PumpRuntime, epoch: u64, with_hud: bool) {
@@ -2854,6 +2916,7 @@ mod tests {
             hwnd_out: Arc::new(AtomicU64::new(0)),
             hud_hwnd_out: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
             presenter_visibility: NativePresenterVisibility::new(
                 NativeVideoInitialVisibility::Hidden,
             ),
@@ -3094,6 +3157,7 @@ mod tests {
             hwnd_out: Arc::new(AtomicU64::new(0)),
             hud_hwnd_out: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
             presenter_visibility: NativePresenterVisibility::new(
                 NativeVideoInitialVisibility::Visible,
             ),
@@ -3506,6 +3570,7 @@ mod tests {
         let hwnd_out = Arc::new(AtomicU64::new(0));
         let hud_out = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let faulted = Arc::new(AtomicBool::new(false));
         let presenter_visibility =
             NativePresenterVisibility::new(NativeVideoInitialVisibility::Visible);
         let source_epoch = Arc::new(AtomicU64::new(0));
@@ -3557,6 +3622,7 @@ mod tests {
             hwnd_out: Arc::clone(&hwnd_out),
             hud_hwnd_out: hud_out,
             closed: Arc::clone(&closed),
+            faulted: Arc::clone(&faulted),
             presenter_visibility,
             source_epoch,
             ui_event_tx: ui_tx,
@@ -3712,6 +3778,7 @@ mod tests {
             .expect("production pump remained responsive")
             .expect("production pump join");
         assert!(closed.load(Ordering::Acquire));
+        assert!(!faulted.load(Ordering::Acquire));
         assert_eq!(
             init_error.lock().expect("pump init error lock").as_deref(),
             None,

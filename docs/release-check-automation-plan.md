@@ -231,7 +231,23 @@ egui / key_input 注入は通常 handler を検査するが、実 OS キーボ�
 | `known-startup-scan` | 最初の起動 folder-load 区間の同 frame で `lf_scan >100ms` が update の主成分。t が小さいだけでは認定しない。v4.5.0 の tail=`none` / scan 572ms も拾う。件数・gap / update 最大・scan 内訳を別記 |
 | `known-first-ai` | 明示した初回 AI 操作区間で `request_repaint_after_ai_upscale` と同 frame の fullscreen viewport >100ms が主成分で、初回 AI 開始の証拠が揃うもの。後続 AI、証拠不足、同期 I/O の別段は対象外。GPU 競合という原因までは断定しない |
 | `normal-sleep` / `normal-idle-upgrade-wake` | 上記 / 遅い update がなく、直前 frame の tail が `none`、または idle upgrade の予定遅延 wake。gap は sleep 込みなので正常。tail を結合できない場合は正常にしない |
+| `normal-proven-wait` | idle upgrade の予定より20ms超早い起床だけ。test-script版の `eventloop.wait` 証跡で、直前update終了〜次update開始の W に正の待機を確認する。期限以後を差し引き、W内の非待機時間が**合計20ms以下**、begin間gapから採用待機を引いた残りが100ms以下の場合だけ正常。待機そのものを証明するため起床源は制限しない |
 | `unexplained` | それ以外の 100ms 超 gap / update。`request_repaint` 中の停止、未知の遅延 wake、同型でも通常操作中の scan、AI の反復停止を含め FAIL |
+
+`normal-proven-wait` は利用者決定2026-10-24の「証明された待機だけを認める」基準。
+Wの終端は次フレームの更新開始（次々frameの `prev_update_start_t`、最終frameはinner計測）で、
+更新途中の `frame.begin.t` は使わない。`wait_start_t` / `wait_end_t` / `requested_resume_t` は
+`perf::program_start()` 起点の丸めない秒。期限があれば採用区間をそこで切り詰め、
+start >= requested_resume の期限切れWaitUntilは採用しない。callback介入のある記録も採用しない。
+待機記録の欠損フィールド・不正値・null時刻（期限なしのnullは有効）・重複・重なり・順序逆転、
+または採用候補と任意frameのupdate区間との重複があれば証明に使わない。
+wait記録の順序はログ内の順序で検査し、並べ直して修復しない。
+全ApplicationHandler callback入口（new_events以外）をstampし、待機開始以後のcallbackがあれば
+`callback_during_wait=true` とする。resizeのinline描画やupdateを伴わない処理もこれで除外する。
+Windowsの待機開始時刻はwinit 0.30.13がAboutToWait返却直後に取る実装に依存する。
+合計非待機20msは今回の新規則であり、既存の予定時刻±20msとは別の判定。
+`normal-sleep` と予定どおりの `normal-idle-upgrade-wake` は待機証跡を使わず従来どおり。
+遅い起床も従来どおりで、旧バイナリなど待機記録がないrunへのfallbackは設けない。
 
 **利用者決定2026-10-11**: Phase 4 の frame 1→2 に共通する約130–230msの停止は、
 最初の startup-overlay update の後、測定操作の前にある既知の起動停止として許容する。
@@ -306,6 +322,7 @@ run-id と case、対象 SHA / dirty fingerprint、exe hash / feature / profile�
   各 total frames <n>、drawn <16ms <k>/<n> (<%>) / p95 <ms> / max <ms>、
   pre_grid total p50 / p95 / max <ms>。100ms超 gaps <n> / updates <n>、
   normal-sleep <n>、idle-upgrade wake <n>、known-startup-first-frame <frame 1→2 / gap実時間 / 区間 / 上限500ms / 最初の操作t>、
+  normal-proven-wait <n / 各frame・gap ms・wake ms・予定遅延ms・採用待機ms・非待機ms・記録数・終了cause>、
   known-startup-scan <n / 最大 / lf_scan>、
   known-first-ai <n / 最大 / viewport / backend、または未実施>、unexplained <n / 詳細パス>。
   環境注記 <slow update lacks stage breakdown があれば frame / 更新時間 / 区間、環境不成立を維持>。

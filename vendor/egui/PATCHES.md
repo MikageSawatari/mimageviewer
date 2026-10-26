@@ -220,3 +220,29 @@ existence of Fonts during begin_pass) defines this resource publication boundary
 Subsequent no-paint updates/free-only delivery and font reload remain supported.
 The Context regression checks pre-Full whole/partial/free ownership, real font
 definition changes, and no duplicate delivery. See the stage-7 startup ledger.
+
+## Section 1.445: preserve live Slider edits through normalization (2026-10-26)
+
+The deferred-edit patch in 4d7b1b0ea was rejected: callers rely on live values
+before changing adjustment scope, replacing a settings page, or painting a mask.
+That change and its additional Escape cleanup have been withdrawn.
+
+- Slider passes a get/set closure to DragValue instead of a local f64 bridge.
+  The setter applies existing SliderCore rounding; the getter returns the same
+  effective value as Slider::get_value. EditState remembers what the next frame
+  will read, including rounding, clamping and storage conversion. User text is
+  kept while the rounded value is applied immediately.
+- The #8403 external-change comparison remains intact. Changes made by other
+  code still invalidate the text. Upstream introduced it in
+  d802a982ce959839d92f4f6718fdffa41143110e, included in egui 0.36.2.
+- Equal-value writes are skipped; passive stepped-slider clamping does not snap
+  untouched off-grid settings. Existing non-step decimal rounding remains.
+- DragValue reads storage back after numeric operations before generating their
+  display text (arrows/AccessKit); typed text is not reformatted this way.
+- SliderCore shares number-field configuration through a get/set helper.
+  No new pending state or application-side ordering change is introduced.
+- Widget tests cover live text, external changes, storage conversion, off-grid
+  values, numeric-operation text and changed flags. Application tests use actual
+  panels/handlers for scope, preferences navigation/draft budget and erase input.
+
+Evidence: [docs/section445-stepped-slider-input.md](../../docs/section445-stepped-slider-input.md).

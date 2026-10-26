@@ -212,6 +212,11 @@ pub use native::file_storage::storage_dir;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod icon_data;
 
+/// Opt-in event-loop wait diagnostics for mImageViewer test-script builds.
+#[cfg(all(not(target_arch = "wasm32"), feature = "miv-test-script-wait-witness"))]
+#[doc(hidden)]
+pub mod miv_test_script_wait_witness;
+
 /// mImageViewer diagnostics for the actual native window owning a viewport callback.
 #[cfg(all(
     target_os = "windows",

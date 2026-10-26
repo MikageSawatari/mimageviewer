@@ -6,7 +6,9 @@ use crate::ui_fullscreen::page_turn_submission_tests::{
 };
 
 fn render_state() -> egui_wgpu::RenderState {
-    let instance = wgpu::Instance::default();
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+    let instance = wgpu::Instance::new(descriptor);
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     let target_format = wgpu::TextureFormat::Rgba8Unorm;

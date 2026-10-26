@@ -363,13 +363,32 @@ pub(crate) struct RatingPhysicalRestore {
     pub(crate) subfolder_restore: Option<SubfolderExpansionRestoreState>,
 }
 
-/// Session-only Rating position. Pixel offsets and their aspect dependency travel together.
-/// Rating rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
+/// Session-only grid position. Pixel offsets and their aspect dependency travel together.
+/// Synthetic rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
 #[derive(Clone, Debug)]
-pub(crate) struct RatingGridPosition {
+pub(crate) struct SessionGridPosition {
     pub(crate) scroll_offset_y: f32,
     pub(crate) selected_key: Option<String>,
     pub(crate) aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+}
+
+/// Identity of the expansion whose rows own a saved position (no filesystem access).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubfolderExpansionPositionKey {
+    root: String,
+    roots: Vec<String>,
+}
+
+impl SubfolderExpansionPositionKey {
+    pub(crate) fn new(root: &std::path::Path, roots: &[PathBuf]) -> Self {
+        Self {
+            root: crate::path_key::normalize_keep_drive(root),
+            roots: roots
+                .iter()
+                .map(|path| crate::path_key::normalize_keep_drive(path))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1390,7 +1409,11 @@ pub(crate) struct TopLevelGridView {
     return_to: Option<TopLevelGridOrigin>,
     generation: u64,
     /// At most five star lists, owned by this viewer context's navigation session.
-    rating_grid_positions: std::collections::HashMap<u8, RatingGridPosition>,
+    rating_grid_positions: std::collections::HashMap<u8, SessionGridPosition>,
+    reading_history_position: Option<SessionGridPosition>,
+    subfolder_expansion_position: Option<(SubfolderExpansionPositionKey, SessionGridPosition)>,
+    /// A committed departure saves the original rows/presentation only once.
+    pub(crate) departed_items_generation: Option<u64>,
     /// The completed smart-folder result has exactly the same lifetime as this surface plus
     /// descendants opened from it. `begin` is an explicit top-level transition and always drops
     /// the old session; `replace_surface` preserves it only while the same smart-folder surface
@@ -1426,6 +1449,9 @@ impl Clone for TopLevelGridView {
             generation: self.generation,
             // A duplicated viewer does not inherit another context's navigation positions.
             rating_grid_positions: Default::default(),
+            reading_history_position: None,
+            subfolder_expansion_position: None,
+            departed_items_generation: None,
             // Context duplication may copy the visible grid identity for an independent viewer,
             // but the main smart-folder result remains owned by the main top-level surface.
             smart_folder_session: None,
@@ -1472,6 +1498,9 @@ impl Default for TopLevelGridView {
             return_to: None,
             generation: 0,
             rating_grid_positions: Default::default(),
+            reading_history_position: None,
+            subfolder_expansion_position: None,
+            departed_items_generation: None,
             smart_folder_session: None,
             collection_session: None,
             collection_navigation_pending: None,
@@ -1485,17 +1514,50 @@ impl Default for TopLevelGridView {
 }
 
 impl TopLevelGridView {
-    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: RatingGridPosition) {
+    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: SessionGridPosition) {
         self.rating_grid_positions
             .insert(stars.clamp(1, 5), position);
     }
 
-    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&RatingGridPosition> {
+    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&SessionGridPosition> {
         self.rating_grid_positions.get(&stars)
     }
 
-    pub(crate) fn clear_rating_grid_positions(&mut self) {
+    pub(crate) fn reading_history_position(&self) -> Option<&SessionGridPosition> {
+        self.reading_history_position.as_ref()
+    }
+
+    pub(crate) fn save_reading_history_position(&mut self, position: SessionGridPosition) {
+        self.reading_history_position = Some(position);
+    }
+
+    pub(crate) fn clear_reading_history_position(&mut self) {
+        self.reading_history_position = None;
+    }
+
+    pub(crate) fn subfolder_expansion_position(
+        &self,
+        key: &SubfolderExpansionPositionKey,
+    ) -> Option<&SessionGridPosition> {
+        self.subfolder_expansion_position
+            .as_ref()
+            .filter(|(saved_key, _)| saved_key == key)
+            .map(|(_, position)| position)
+    }
+
+    pub(crate) fn save_subfolder_expansion_position(
+        &mut self,
+        key: SubfolderExpansionPositionKey,
+        position: SessionGridPosition,
+    ) {
+        self.subfolder_expansion_position = Some((key, position));
+    }
+
+    pub(crate) fn clear_session_grid_positions(&mut self) {
         self.rating_grid_positions.clear();
+        self.reading_history_position = None;
+        self.subfolder_expansion_position = None;
+        self.departed_items_generation = None;
     }
 
     pub(crate) fn surface(&self) -> &TopLevelGridSurface {

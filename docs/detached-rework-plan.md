@@ -1455,6 +1455,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-26 §1.444 一覧の表示順で前後の本へ移る操作 (設計段階の記録)
+
+- 正本: `list-order-book-navigation-plan.md` 第 3 版。設計担当 ClaudeCode と Codex の独立設計レビュー (第 2 版・第 3 版) は、
+  context 所有の凍結データを bundle に載せ、利用資格を owner id・表示先・現在の場所から導く方針が、
+  症状パッチではなく構造的な設計であることに合意済み。
+- 触れる範囲: `ViewerContextBundle` に `list_order: Option<Arc<ListOrderSnapshot>>` を 1 field 足す。初期化・bundle swap・
+  fork の `keep_in_main` 分類 (子は空) を明示する。registry の table の遷移規則 (park / mount / fork / promote) は変えない。
+- 表示先の判定: 操作は `ViewerPresentation::MainWindow | Fullscreen` で使え、`DetachedWindow`・独立 owner では通知だけ。
+  promote 後の旧 main に残った列は、`owner` が新しい main id と一致しないので使えない (消す処理は足さない)。
+- 実装で範囲が変わったら、この記録を更新する。
+
 ### 2026-10-23 §1.419 起動系の明示要求を受付順に揃える
 
 - 正本: `startup-diagnostics-plan.md` §6.2.2 第3版。設計担当 ClaudeCode と
@@ -6255,3 +6266,19 @@ src/ 外への既存参照（`tests/support/ui_harness.rs`、`tests/support/scro
 root discovery の inventory は examples/・tests/・benches/ と package 直下の Rust ファイルも含み、
 大小文字違いや source link を黙って落とさずエラーにする。監査対象自体は従来の src/**/*.rs を維持する。
 明示 example、自動探索 example、build.rs の path 経路で shared が production と共有される反例を回帰に加えた。
+
+### §11 追補: 2026-10-24 §1.426 Windows枠なしviewportの影なし契約の復元
+
+ClaudeCodeの設計案とCodexのコード確認・独立設計レビューで、症状パッチではなく統合境界の構造修正であることに合意した。
+`vendor/egui-winit/src/lib.rs`の窓生成とDecorations command適用でWindowsのundecorated shadow要求をfalseへ揃える。
+本家#8169/#8449ではwinit fullscreen指定のない枠なし窓へ影を要求するが、mIVはmonitor全域の独自borderlessであり、
+v4.8.0からclient原点が1pxずれる。F12 builderと`app/detached_placement`のborderless切替もこの境界を使うため対象になる。
+通常全画面、geometryなしPDF/ZIP再open、詳細thumbnail tooltipを含め、影を使う窓はなくv4.7.1の契約へ戻す。
+per-viewport opt-out、detached述語・状態・placement保存先・同期経路は増やさない。常時最前面、taskbar操作、待機、raise、repaintの追加もない。
+モーダル化やlive rebuildは不要で、生成・更新双方の同じ属性契約を直すだけで組合せを増やさない。
+非表示実HWNDの生成／Decorations(true→false)でclient原点・寸法とwindow原点・寸法の一致を固定した。
+修正前は両方の原点不一致で回帰が失敗し、修正後はvendor lib 44件が成功した。
+画像のtaskbar前面表示との因果と解消は実機確認待ち。native動画はpresenter自身へforeground/active/focusを渡すため、
+egui viewportの影だけで説明できない。v4.7.1..masterのowner・前面移譲と§1.387 A1〜A3も照合し、動画の原因は未特定として残す。
+presenter/host/HUDと点滅対策は変更しない。調査の詳細は backlog §1.426 に記録した (v4.8.1 で出荷後に削除。全文は commit `94017f82e` の `docs/next-release-backlog.md`)。
+利用者が確認用ビルドで、静止画・動画・F12 の有無・複数ウィンドウとも解消を確認した (2026-10-24)。動画で効いた仕組みは未解明。

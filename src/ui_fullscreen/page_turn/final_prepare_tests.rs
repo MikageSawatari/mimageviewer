@@ -406,7 +406,9 @@ fn assert_held(app: &App, held: &[PreparedPagedPage]) {
 
 #[test]
 fn back_root_native_reaches_real_backward_single_pair_offer_and_d2_handoff() {
-    let instance = wgpu::Instance::default();
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+    let instance = wgpu::Instance::new(descriptor);
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     let target_format = wgpu::TextureFormat::Rgba8Unorm;

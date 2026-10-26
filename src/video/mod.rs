@@ -2657,6 +2657,79 @@ fn unpack_native_video_canvas_color(packed: u32) -> [u8; 3] {
 }
 
 #[cfg(windows)]
+const NATIVE_VIDEO_FAULT_MESSAGE: &str = "動画の表示処理でエラーが起きました。もう一度開くと再生できる場合があります。繰り返すときは mIV を再起動してください。";
+
+#[cfg(windows)]
+fn native_video_panic_detail(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    // App lifecycle tests record the real open arguments without starting decoder/audio/HWNDs.
+    static DISCONNECTED_VIDEO_OPENS: std::cell::RefCell<Option<Vec<bool>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, windows))]
+mod native_video_fault_tests {
+    use super::*;
+
+    #[test]
+    fn native_video_panic_payload_preserves_str_string_and_handles_other_payloads() {
+        assert_eq!(
+            native_video_panic_detail(&"borrowed panic detail"),
+            "borrowed panic detail"
+        );
+        assert_eq!(
+            native_video_panic_detail(&String::from("owned panic detail")),
+            "owned panic detail"
+        );
+        assert_eq!(
+            native_video_panic_detail(&42_u32),
+            "non-string panic payload"
+        );
+    }
+
+    #[test]
+    fn native_video_swap_reuse_requires_live_unfaulted_output_and_survives_error_take() {
+        let output = NativeVideoOutput::disconnected_for_test();
+        assert!(output.reusable_for_swap());
+        output.mark_faulted_for_test();
+        *output.init_error.lock().unwrap() = Some(NATIVE_VIDEO_FAULT_MESSAGE.to_string());
+        assert!(!output.is_closed());
+        assert!(!output.reusable_for_swap());
+        assert_eq!(
+            output.take_init_error().as_deref(),
+            Some(NATIVE_VIDEO_FAULT_MESSAGE)
+        );
+        assert!(output.take_init_error().is_none());
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.reusable_for_swap());
+
+        let closed = NativeVideoOutput::disconnected_for_test();
+        closed.mark_closed_for_test();
+        assert!(!closed.faulted.load(Ordering::Acquire));
+        assert!(!closed.reusable_for_swap());
+        assert!(closed.take_init_error().is_none());
+    }
+
+    #[test]
+    fn native_video_fault_message_contains_no_internal_fault_detail() {
+        for internal in ["native", "render", "panic", "quarantin", "thread"] {
+            assert!(!NATIVE_VIDEO_FAULT_MESSAGE.contains(internal));
+        }
+        assert!(NATIVE_VIDEO_FAULT_MESSAGE.contains("もう一度開く"));
+        assert!(NATIVE_VIDEO_FAULT_MESSAGE.contains("再起動"));
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct NativeVideoOutput {
     #[cfg(feature = "test-script")]
     ui_smoke_output_id: native_ui_smoke::NativeUiSmokeOutputId,
@@ -2669,6 +2742,9 @@ pub(crate) struct NativeVideoOutput {
     hud_hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    /// Output-lifetime latch: faults forbid source reuse before shutdown publishes closed.
+    /// Taking the one-shot init_error never clears this flag.
+    faulted: Arc<AtomicBool>,
     /// Inc 7 hidden presenter: pump の typed `WindowHostState` が所有する実際の可視状態を
     /// output lifetime で公開する projection。render の consume policy と App
     /// (`exit_video_audio_mode` の async 待ち) は同じ値を読み、source switch では交換しない。
@@ -2784,6 +2860,7 @@ impl NativeVideoOutput {
             hud_hwnd: Arc::new(AtomicU64::new(0)),
             first_presented: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
             presenter_visibility: NativePresenterVisibility::new(
                 NativeVideoInitialVisibility::Visible,
             ),
@@ -2813,6 +2890,16 @@ impl NativeVideoOutput {
         self.closed.store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_faulted_for_test(&self) {
+        self.faulted.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_for_test(&self) -> usize {
+        Arc::as_ptr(&self.faulted) as usize
+    }
+
     fn spawn(
         video_rx: crossbeam_channel::Receiver<VideoFrame>,
         clock: Arc<AvClock>,
@@ -2831,6 +2918,7 @@ impl NativeVideoOutput {
         let hud_hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
+        let faulted = Arc::new(AtomicBool::new(false));
         let presenter_visibility = NativePresenterVisibility::new(config.initial_visibility);
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let source_epoch = Arc::new(AtomicU64::new(0));
@@ -2858,6 +2946,7 @@ impl NativeVideoOutput {
         let thread_first_presented = Arc::clone(&first_presented);
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
         let thread_init_error = Arc::clone(&init_error);
+        let thread_faulted = Arc::clone(&faulted);
         let thread_presenter_visibility = presenter_visibility.clone();
         let thread_health = Arc::clone(&health);
         let pump = match native_window_pump::spawn_native_window_pump(
@@ -2867,6 +2956,7 @@ impl NativeVideoOutput {
                 hwnd_out: Arc::clone(&hwnd),
                 hud_hwnd_out: Arc::clone(&hud_hwnd),
                 closed: Arc::clone(&closed),
+                faulted: Arc::clone(&faulted),
                 presenter_visibility: presenter_visibility.clone(),
                 source_epoch: Arc::clone(&source_epoch),
                 ui_event_tx: event_tx.clone(),
@@ -2918,15 +3008,24 @@ impl NativeVideoOutput {
                 }));
                 let error = match result {
                     Ok(Ok(())) => return,
-                    Ok(Err(err)) => err,
-                    Err(_) => "native video render thread panicked".to_string(),
+                    Ok(Err(err)) => {
+                        thread_faulted.store(true, Ordering::Release);
+                        err
+                    }
+                    Err(payload) => {
+                        thread_faulted.store(true, Ordering::Release);
+                        format!(
+                            "native video render thread panicked: {}",
+                            native_video_panic_detail(payload.as_ref())
+                        )
+                    }
                 };
                 {
                     let err = error;
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
                     if let Ok(mut slot) = thread_init_error.lock() {
                         if slot.is_none() {
-                            *slot = Some(format!("native video render fault: {err}"));
+                            *slot = Some(NATIVE_VIDEO_FAULT_MESSAGE.to_string());
                         }
                     }
                     pump_render.render_fault(u64::MAX - 1, err);
@@ -2949,6 +3048,7 @@ impl NativeVideoOutput {
             hud_hwnd,
             first_presented,
             closed,
+            faulted,
             presenter_visibility,
             perf_overlay_visible,
             source_epoch,
@@ -2992,6 +3092,10 @@ impl NativeVideoOutput {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn reusable_for_swap(&self) -> bool {
+        !self.is_closed() && !self.faulted.load(Ordering::Acquire)
     }
 
     /// Hidden presenter lifecycle: presenter ウィンドウ (+ HUD overlay) の表示 / 非表示を
@@ -8795,11 +8899,49 @@ fn eof_freeze_position(known_duration_secs: Option<f64>, current_secs: f64) -> f
 
 impl VideoPlayer {
     #[cfg(all(test, windows))]
+    pub(crate) fn with_disconnected_opens_for_test<T>(f: impl FnOnce() -> T) -> (T, Vec<bool>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                DISCONNECTED_VIDEO_OPENS.with(|opens| *opens.borrow_mut() = None);
+            }
+        }
+        DISCONNECTED_VIDEO_OPENS.with(|opens| {
+            assert!(opens.borrow().is_none(), "nested disconnected open scope");
+            *opens.borrow_mut() = Some(Vec::new());
+        });
+        let _reset = Reset;
+        let result = f();
+        let opens = DISCONNECTED_VIDEO_OPENS.with(|opens| opens.borrow_mut().take().unwrap());
+        (result, opens)
+    }
+
+    #[cfg(all(test, windows))]
     pub(crate) fn mark_native_presenter_closed_for_test(&self) {
         self.native_output
             .as_ref()
             .expect("fixture native output")
             .mark_closed_for_test();
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn mark_native_output_faulted_for_test(&self) {
+        self.native_output
+            .as_ref()
+            .expect("fixture native output")
+            .mark_faulted_for_test();
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn native_output_identity_for_test(&self) -> Option<usize> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::identity_for_test)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn native_output_lifetime_for_test(&self) -> std::sync::Weak<AtomicBool> {
+        Arc::downgrade(&self.native_output.as_ref().expect("fixture output").faulted)
     }
     /// ParkedLive teardown の resume 保存テスト用。worker / native HWND を起動しない。
     #[cfg(test)]
@@ -9278,6 +9420,22 @@ impl VideoPlayer {
             VideoOutputConsumer::Presentation => native_output_config,
             VideoOutputConsumer::RemoteHeadless => None,
         };
+        #[cfg(all(test, windows))]
+        if DISCONNECTED_VIDEO_OPENS.with(|opens| {
+            let mut opens = opens.borrow_mut();
+            if let Some(opens) = opens.as_mut() {
+                opens.push(native_output_config.is_some());
+                true
+            } else {
+                false
+            }
+        }) {
+            let mut player = Self::stream_ready_disconnected_for_test(path);
+            if native_output_config.is_none() {
+                player.native_output = None;
+            }
+            return player;
+        }
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
             // open 失敗時の dummy engine (Idle のまま)。実 decoder は起きないので、
@@ -11533,6 +11691,14 @@ impl VideoPlayer {
         self.native_output
             .as_ref()
             .map(NativeVideoOutput::committed_generation)
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn reusable_for_swap(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .is_some_and(NativeVideoOutput::reusable_for_swap)
     }
 
     /// `PlacementSwitched` 受信時に committed 世代を進める (単調非減少)。

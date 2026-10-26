@@ -5544,7 +5544,9 @@ mod tests {
     fn ordinary_prepare_output_limit_fallback_captures_actual_managed_allocation() {
         // A real headless state gets past the ordinary renderer-availability gate.
         // No surface/window, texture upload, resampler or presentation is created.
-        let instance = wgpu::Instance::default();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        let instance = wgpu::Instance::new(descriptor);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: None,
             ..Default::default()
@@ -6042,7 +6044,9 @@ mod tests {
 
     #[test]
     fn back_native_execution_rechecks_no_removal_before_backing_claim_or_mutation() {
-        let instance = wgpu::Instance::default();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        let instance = wgpu::Instance::new(descriptor);
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).unwrap();

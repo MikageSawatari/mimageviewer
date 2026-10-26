@@ -627,6 +627,7 @@ mod close_return;
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
+mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
@@ -961,11 +962,18 @@ enum BookmarkSurfaceEntrance {
     Restore,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReadingHistoryEntrance {
+    Menu,
+    Return,
+}
+
 enum PreparedSyntheticSurface {
     Drive {
         origin: Option<PathBuf>,
     },
     Reading {
+        entrance: ReadingHistoryEntrance,
         prepared: PreparedReadingHistoryList,
         entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
     },
@@ -13521,6 +13529,36 @@ impl SpreadRestoreDefaults {
         self.spread_mode
     }
 
+    /// Resolve initial defaults only; stored folder values win at the restore boundary.
+    pub(crate) fn for_physical_folder(
+        book_locked: bool,
+        is_real_directory: bool,
+        apply_to_plain_folders: bool,
+        default_spread_mode: crate::settings::SpreadMode,
+        default_reading_flow: crate::settings::ReadingFlow,
+        default_reading_direction: crate::settings::ReadingDirection,
+    ) -> Self {
+        if book_locked {
+            Self {
+                spread_mode: default_spread_mode,
+                reading_flow: default_reading_flow,
+                reading_direction: default_reading_direction,
+            }
+        } else if apply_to_plain_folders && is_real_directory {
+            Self {
+                // Legacy Vertical encodes flow, which this preference must not change.
+                spread_mode: if default_spread_mode == crate::settings::SpreadMode::Vertical {
+                    crate::settings::SpreadMode::Single
+                } else {
+                    default_spread_mode
+                },
+                ..Self::NON_BOOK
+            }
+        } else {
+            Self::NON_BOOK
+        }
+    }
+
     pub(crate) fn reading_direction(self) -> crate::settings::ReadingDirection {
         self.reading_direction
     }
@@ -23756,8 +23794,9 @@ impl App {
         }
         let from = self.reading_history_return_from.as_ref()?;
         let cur = self.effective_folder()?;
-        crate::folder_tree::path_eq(&cur, from)
-            .then_some(crate::ui_main::AddressBarNav::ReadingHistory)
+        crate::folder_tree::path_eq(&cur, from).then_some(
+            crate::ui_main::AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Return),
+        )
     }
 
     /// 横断ブックマーク一覧から直接開いた本・動画・音声を閉じるときだけ、
@@ -24303,8 +24342,8 @@ impl App {
                 self.enter_drive_list_from_navigation(origin);
                 true
             }
-            crate::ui_main::AddressBarNav::ReadingHistory => {
-                self.enter_reading_history();
+            crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
+                self.enter_reading_history_with_entrance(entrance);
                 true
             }
             crate::ui_main::AddressBarNav::Bookmarks => {
@@ -25192,7 +25231,7 @@ impl App {
         }
         self.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         self.folder_history.clear();
-        self.top_level_grid_view.clear_rating_grid_positions();
+        self.top_level_grid_view.clear_session_grid_positions();
 
         // 「場所を忘れる」操作なので、現在表示中の一覧も同じ所有境界で先頭へ戻す。
         // current_grid_order は詳細表示の並べ替えも含む、画面上の実際の表示順。
@@ -26067,6 +26106,7 @@ impl App {
                     &target.location,
                     None,
                     BookmarkSurfaceEntrance::History,
+                    ReadingHistoryEntrance::Return,
                 ) else {
                     return false;
                 };
@@ -26177,6 +26217,14 @@ impl App {
         mut history: MainHistoryOperation,
         drive_origin: Option<Option<PathBuf>>,
     ) {
+        let reading_entrance = if matches!(
+            history,
+            MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
+        ) {
+            ReadingHistoryEntrance::Menu
+        } else {
+            ReadingHistoryEntrance::Return
+        };
         let explicit_request = matches!(
             history,
             MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
@@ -26199,7 +26247,9 @@ impl App {
         self.retire_replaced_main_list_requests_with_startup_intent(None, explicit_request);
         let navigation =
             self.capture_main_list_navigation(history, self.copied_destination_source_proof());
-        let Some(prepared) = self.prepare_synthetic_surface(&target, drive_origin, entrance) else {
+        let Some(prepared) =
+            self.prepare_synthetic_surface(&target, drive_origin, entrance, reading_entrance)
+        else {
             return;
         };
         let destination = self.main_list_requested_destination(&navigation, target, None);
@@ -26221,6 +26271,7 @@ impl App {
         target: &FolderNavHistoryTarget,
         drive_origin: Option<Option<PathBuf>>,
         entrance: BookmarkSurfaceEntrance,
+        reading_entrance: ReadingHistoryEntrance,
     ) -> Option<PreparedSyntheticSurface> {
         let FolderNavHistoryTarget::Path(path) = target else {
             return None;
@@ -26235,7 +26286,11 @@ impl App {
             let entries = self.read_reading_history_entries();
             return self
                 .prepare_reading_history_entries(Vec::new())
-                .map(|prepared| PreparedSyntheticSurface::Reading { prepared, entries });
+                .map(|prepared| PreparedSyntheticSurface::Reading {
+                    entrance: reading_entrance,
+                    prepared,
+                    entries,
+                });
         }
         if crate::folder_tree::path_eq(path, &bookmark_view_synthetic_path()) {
             let token = self.prepare_visible_install(path, &[], None).ok()?;
@@ -26253,9 +26308,11 @@ impl App {
                 self.install_drive_list(origin);
                 None
             }
-            PreparedSyntheticSurface::Reading { prepared, entries } => {
-                self.install_reading_history_surface(prepared, entries)
-            }
+            PreparedSyntheticSurface::Reading {
+                entrance,
+                prepared,
+                entries,
+            } => self.install_reading_history_surface(prepared, entries, entrance),
             PreparedSyntheticSurface::Bookmarks { token, entrance } => {
                 if matches!(entrance, BookmarkSurfaceEntrance::Menu) {
                     self.clear_bookmark_view_return_state();
@@ -28336,7 +28393,7 @@ impl App {
 
     fn install_drive_list(&mut self, origin: Option<PathBuf>) {
         self.capture_main_list_restore_cursor();
-        self.save_leaving_rating_grid_position();
+        self.save_departing_session_grid_positions();
 
         crate::logger::log("=== enter_drive_list ===");
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
@@ -28409,7 +28466,7 @@ impl App {
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.search_filter = None;
         self.search_filter_origin_folder = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.show_search_bar = false;
         self.checked.clear();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -32718,7 +32775,10 @@ impl App {
         if full_check_requested {
             self.request_index_full_check_shared();
         }
-        if self.global_search.active && !self.global_search.query.trim().is_empty() {
+        if self.global_search.active
+            && self.global_search.source == crate::global_search_ui::SearchSource::Metadata
+            && !self.global_search.metadata_draft.trim().is_empty()
+        {
             self.global_search.last_executed.clear();
         }
         stage.finish(if self.indexer_init.is_some() {
@@ -33099,7 +33159,7 @@ impl App {
         &mut self,
         keep: SearchMode,
     ) -> Option<top_level_grid_view::TopLevelGridOrigin> {
-        self.save_leaving_rating_grid_position();
+        self.note_session_grid_positions();
         self.capture_main_list_restore_cursor();
         let source_route = self.folder_nav_current_entry().map_or_else(
             || self.facet_navigation.route().clone(),
@@ -33114,7 +33174,7 @@ impl App {
         let mut transferred = self.dismiss_snapshot_with_origin();
         if !matches!(keep, SearchMode::LocalMeta) && self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -33195,7 +33255,7 @@ impl App {
         self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
-        self.favsearch.query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Container);
         self.favsearch.last_executed.clear();
         self.favsearch.nav_stack.clear();
         self.favsearch.results_paths.clear();
@@ -33936,22 +33996,28 @@ impl App {
 
     /// メニュー操作で閲覧履歴を開く。
     ///
-    /// 履歴 ←/→ からの復元は `dispatch_synthetic_folder_history_target` が
-    /// `enter_reading_history` を直接呼ぶ。ここでだけ遷移を記録することで、メニュー起動時の
-    /// 直前フォルダは back stack に残しつつ、履歴復元時の二重記録を避ける。
+    /// メニュー起動時の直前フォルダを back stack に残し、保存位置を破棄する。
+    /// 親へ戻る操作・履歴復元は Return の入口で保存位置を引き継ぐ。
     pub(crate) fn enter_reading_history_from_menu(&mut self) {
-        self.adopt_synthetic_surface(
-            FolderNavHistoryTarget::Path(reading_history_synthetic_path()),
-            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
-            None,
-        );
+        self.enter_reading_history_with_entrance(ReadingHistoryEntrance::Menu);
     }
 
     /// 閲覧履歴ビューを開く。
     pub(crate) fn enter_reading_history(&mut self) {
+        self.enter_reading_history_with_entrance(ReadingHistoryEntrance::Return);
+    }
+
+    /// The producer owns menu/return intent; dispatchers must not infer it from the input lane.
+    fn enter_reading_history_with_entrance(&mut self, entrance: ReadingHistoryEntrance) {
+        let history = match entrance {
+            ReadingHistoryEntrance::Menu => {
+                MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
+            }
+            ReadingHistoryEntrance::Return => MainHistoryOperation::Restore { route: None },
+        };
         self.adopt_synthetic_surface(
             FolderNavHistoryTarget::Path(reading_history_synthetic_path()),
-            MainHistoryOperation::Restore { route: None },
+            history,
             None,
         );
     }
@@ -33987,6 +34053,7 @@ impl App {
         &mut self,
         prepared: PreparedReadingHistoryList,
         entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
+        entrance: ReadingHistoryEntrance,
     ) -> MainListHydration {
         self.capture_main_list_restore_cursor();
         crate::logger::log("=== enter_reading_history ===");
@@ -34008,7 +34075,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -34017,7 +34084,16 @@ impl App {
         }
 
         self.video_thumb_overrides.clear();
-        let hydration = self.install_prepared_reading_history_entries(prepared);
+        let mut hydration = self.install_prepared_reading_history_entries(prepared);
+        // The shell install has made the last departing save; menu entry discards it.
+        if matches!(entrance, ReadingHistoryEntrance::Menu) {
+            self.top_level_grid_view.clear_reading_history_position();
+        } else if let Some((continuation, _)) = hydration.as_mut() {
+            continuation.auto_aspect_seed = self
+                .top_level_grid_view
+                .reading_history_position()
+                .and_then(|position| position.aspect_seed);
+        }
         let settings = crate::reading_history_thumbnail_sources::DiscoverySettings::from_settings(
             &self.settings,
         );
@@ -34130,12 +34206,24 @@ impl App {
         self.prewarm_rating_cache();
         self.prewarm_grid_tags();
         self.rebuild_visible_indices();
-        if self.selected.is_none()
-            && let Some(&idx) = self.visible_indices.first()
-        {
-            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+        let position = self.top_level_grid_view.reading_history_position();
+        let restored = position
+            .and_then(|position| position.selected_key.as_deref())
+            .and_then(|key| {
+                self.visible_indices.iter().copied().find(|&index| {
+                    self.items
+                        .get(index)
+                        .and_then(reading_history_key_for_item)
+                        .as_deref()
+                        == Some(key)
+                })
+            });
+        if restored.is_some() {
+            self.scroll_offset_y = position.unwrap().scroll_offset_y;
         }
+        let selected = restored.or_else(|| self.visible_indices.first().copied());
+        self.move_grid_cursor(selected, GridCursorIntent::Automatic);
+        self.scroll_to_selected = selected.is_some();
         if !video_items.is_empty() {
             let pin_blobs = self
                 .video_pin_db
@@ -36891,7 +36979,7 @@ impl App {
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
-        self.save_leaving_rating_grid_position();
+        self.note_session_grid_positions();
         self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
         self.rating_view_rows.clear();
         self.rating_view_rows_stars = None;
@@ -37155,7 +37243,7 @@ impl App {
             }
             if app.show_search_bar {
                 app.show_search_bar = false;
-                app.search_query.clear();
+                app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
                 app.search_filter = None;
                 app.search_filter_origin_folder = None;
                 app.search_has_focus = false;
@@ -39051,7 +39139,7 @@ impl App {
         self.clear_tags_cache();
         // Ctrl+F フィルタの残留を解除 (旧レベルの entry 向けなので新レベルでは無効)。
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
@@ -41637,23 +41725,24 @@ impl App {
         )
     }
 
-    pub(crate) fn save_leaving_rating_grid_position(&mut self) {
-        // ZIP pending UI has already saved and cleared the source grid without clearing
-        // its view flags. Its empty interim display must not overwrite that position.
+    /// Record a tentative position while the source rows can still be operated on.
+    /// Surface may already be Search/Folder; row provenance remains authoritative.
+    pub(crate) fn note_session_grid_positions(&mut self) {
+        use top_level_grid_view::{SessionGridPosition, SubfolderExpansionPositionKey};
         if self.navigation_scope.is_detached_physical()
-            || !self.items_are_rating_view
+            || !(self.items_are_rating_view
+                || self.items_are_reading_history_view
+                || self.items_are_subfolder_expansion_view)
             || (self.items.is_empty() && self.selected.is_none() && self.scroll_offset_y == 0.0)
+            || matches!(
+                self.projection_recipe,
+                book_materialization::ProjectionRecipe::ExtractedResult(
+                    book_materialization::ExtractedSurface::Snapshot
+                )
+            )
         {
             return;
         }
-        // The physical adoption owner may have changed the surface to Folder while the
-        // old Rating items remain visible. A Rating-to-Rating install, conversely, has
-        // already replaced rating_view_rows/stars but still owns the old surface/items.
-        let stars = match self.top_level_grid_view.surface() {
-            top_level_grid_view::TopLevelGridSurface::Rating { stars } => Some(*stars),
-            _ => self.rating_view_rows_stars,
-        };
-        let Some(stars) = stars else { return };
         let aspect_seed = self
             .settings
             .thumb_aspect_auto
@@ -41667,35 +41756,73 @@ impl App {
                     .len()
                     .max(self.auto_aspect.cached_sample_gate.unwrap_or(0)),
                 eligible_total: self.auto_aspect_eligible_total(),
-                updated_at: 0, // Runtime-only seed; no Rating entry is persisted to SQLite.
+                updated_at: 0, // Session-only; never persisted to SQLite.
             });
-        let position = top_level_grid_view::RatingGridPosition {
-            scroll_offset_y: self.scroll_offset_y,
-            selected_key: self.selected.and_then(|index| self.rating_path_key(index)),
+        let scroll_offset_y = self.scroll_offset_y;
+        let position = |selected_key| SessionGridPosition {
+            scroll_offset_y,
+            selected_key,
             aspect_seed,
         };
-        self.log_rating_grid_scroll(
-            &format!(
-                "rating-position-save stars={stars} saved={:.1}",
-                position.scroll_offset_y
-            ),
-            self.scroll_offset_y,
-            self.scroll_offset_y,
-            (
-                self.last_grid_cols,
-                self.last_cell_size,
-                self.last_cell_h,
-                self.last_viewport_h,
-            ),
-        );
-        self.top_level_grid_view
-            .save_rating_grid_position(stars, position);
+        if self.items_are_reading_history_view {
+            let saved = position(
+                self.selected
+                    .and_then(|index| self.items.get(index))
+                    .and_then(reading_history_key_for_item),
+            );
+            self.top_level_grid_view
+                .save_reading_history_position(saved);
+        }
+        if self.items_are_subfolder_expansion_view
+            && let Some(root) = self.subfolder_expansion_root.as_deref()
+        {
+            let key = SubfolderExpansionPositionKey::new(root, &self.subfolder_expansion_roots);
+            let saved = position(self.selected.and_then(|index| self.rating_path_key(index)));
+            self.top_level_grid_view
+                .save_subfolder_expansion_position(key, saved);
+        }
+        if self.items_are_rating_view {
+            // Physical adoption can change the surface before replacing old Rating rows.
+            let stars = match self.top_level_grid_view.surface() {
+                top_level_grid_view::TopLevelGridSurface::Rating { stars } => Some(*stars),
+                _ => self.rating_view_rows_stars,
+            };
+            if let Some(stars) = stars {
+                let saved = position(self.selected.and_then(|index| self.rating_path_key(index)));
+                self.log_rating_grid_scroll(
+                    &format!(
+                        "rating-position-save stars={stars} saved={:.1}",
+                        saved.scroll_offset_y
+                    ),
+                    self.scroll_offset_y,
+                    self.scroll_offset_y,
+                    (
+                        self.last_grid_cols,
+                        self.last_cell_size,
+                        self.last_cell_h,
+                        self.last_viewport_h,
+                    ),
+                );
+                self.top_level_grid_view
+                    .save_rating_grid_position(stars, saved);
+            }
+        }
+    }
+
+    /// Rows replacement is committed. Later boundaries must not resave the same rows
+    /// with the destination's presentation, nor overwrite their seed with an empty ZIP shell.
+    pub(crate) fn save_departing_session_grid_positions(&mut self) {
+        if self.top_level_grid_view.departed_items_generation == Some(self.items_generation) {
+            return;
+        }
+        self.note_session_grid_positions();
+        self.top_level_grid_view.departed_items_generation = Some(self.items_generation);
     }
 
     /// Save before the visible source rows or path are replaced (including ZIP pending UI).
     /// This session history is separate from StartupListIntent adoption.
     fn save_leaving_folder_grid_position(&mut self) {
-        self.save_leaving_rating_grid_position();
+        self.save_departing_session_grid_positions();
         if !self.navigation_scope.is_detached_physical()
             && let Some(cur) = self.current_folder.clone()
         {
@@ -41808,6 +41935,8 @@ impl App {
         prepared_visible: PreparedVisibleInstall,
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        // Save source owners before transferring roots or adopting destination presentation.
+        self.save_leaving_folder_grid_position();
         let smart_open_path = match &authority {
             VisibleInstallAuthority::Ordinary
             | VisibleInstallAuthority::Projection { .. }
@@ -42017,9 +42146,13 @@ impl App {
         // folder_history (スクロール位置復元用) へ保存しない。Ctrl+G は current_folder を
         // 検索前フォルダのまま保つため、検索ビューの scroll_offset_y をそのフォルダの
         // スクロール状態として記録すると、後で戻ったとき誤った位置に復元される。
-        self.save_leaving_folder_grid_position();
-        let rating_inherited_view = (!detached_physical
-            && matches!(&authority, VisibleInstallAuthority::Rating { .. }))
+        let synthetic_inherited_view = (!detached_physical
+            && (matches!(&authority, VisibleInstallAuthority::Rating { .. })
+                || crate::folder_tree::path_eq(&source_path, &reading_history_synthetic_path())
+                || crate::folder_tree::path_eq(
+                    &source_path,
+                    &subfolder_expansion_synthetic_path(),
+                )))
         .then(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
         self.change_main_context_for_visible_grid_with_metadata_boundary(
             false,
@@ -42033,10 +42166,10 @@ impl App {
         ]);
         self.page_edit_snapshot = None;
 
-        if let Some(inherited) = rating_inherited_view {
+        if let Some(inherited) = synthetic_inherited_view {
             // Publish the destination presentation in the new visible context, after saving
             // the departing position and before seeding/layout. A late frame-end reconcile
-            // would let ensure-visible use the physical child's columns for the Rating root.
+            // would let ensure-visible use the physical child's columns for the synthetic root.
             self.transition_favorite_view_for_path_with_inherited_at(
                 Some(&source_path),
                 std::time::Instant::now(),
@@ -42142,12 +42275,16 @@ impl App {
         // `install_new_items_inner` は view flags と `self.items` を差し替えるため、今回の
         // 読み込みが本かどうかは、確定済みの target source/items から先に決める。
         let page_order_view_kind = PageOrderViewKind::for_loading_source(&source_path);
-        let spread_restore_defaults =
-            if self.page_order_locked_for_items(&source_path, &items, page_order_view_kind) {
-                SpreadRestoreDefaults::for_book(&self.settings)
-            } else {
-                SpreadRestoreDefaults::NON_BOOK
-            };
+        // A signature comes from an accepted directory scan (also retained by Stack).
+        // Physical view kind or the path extension alone does not prove a directory.
+        let spread_restore_defaults = SpreadRestoreDefaults::for_physical_folder(
+            self.page_order_locked_for_items(&source_path, &items, page_order_view_kind),
+            folder_signature.is_some() && page_order_view_kind == PageOrderViewKind::Physical,
+            self.settings.apply_default_spread_to_plain_folders,
+            self.settings.default_spread_mode,
+            self.settings.default_reading_flow,
+            self.settings.default_reading_direction,
+        );
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
@@ -42363,8 +42500,7 @@ impl App {
                 ],
             );
         }
-        // 表示モード: DB から読み込み、なければ読み込み対象が本のときだけ settings の既定値。
-        // 本でないビューは単ページ + ページ単位 + 左→右へ戻す。明示保存値はどちらでも優先する。
+        // 保存値を優先し、未保存なら採用済み分類と通常フォルダ設定から既定を解決する。
         // 旧実装の SpreadMode::Vertical は「単ページ + 縦連結」として解釈する。
         // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
         // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
@@ -42380,7 +42516,7 @@ impl App {
         self.search_filter = None;
         self.search_filter_origin_folder = None;
         if !detached_physical {
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
             // 検索結果インデックスが意味を失う)
             if let Some(pending) = self.search_pending.take() {
@@ -48142,20 +48278,53 @@ impl App {
             self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
-            let preferred_direction = container
-                .spread
-                .direction
-                .unwrap_or(self.settings.default_reading_direction);
-            let stored_spread = container.spread.resolve_mode(
-                self.settings
-                    .default_spread_mode
-                    .with_reading_direction(preferred_direction),
-                preferred_direction,
-            );
-            self.reading_flow = container
-                .spread
-                .flow
-                .unwrap_or(self.settings.default_reading_flow);
+            // Limit the opt-in to plain directories. Keep the pre-1.425 import calculation
+            // for OFF, books and other sources, including its existing differences from open.
+            // Reuse this context's accepted directory scan, without another stat or scan.
+            let physical_folder_defaults = self.folder_observation.as_ref().and_then(|scan| {
+                (self.settings.apply_default_spread_to_plain_folders
+                    && scan.generation == self.items_generation
+                    && self.current_folder.as_ref() == Some(&scan.source)
+                    && self.extracted_result_surface().is_none()
+                    && !self.page_order_locked_for_items(
+                        &scan.source,
+                        &self.items,
+                        PageOrderViewKind::Physical,
+                    ))
+                .then(|| {
+                    SpreadRestoreDefaults::for_physical_folder(
+                        false,
+                        true,
+                        self.settings.apply_default_spread_to_plain_folders,
+                        self.settings.default_spread_mode,
+                        self.settings.default_reading_flow,
+                        self.settings.default_reading_direction,
+                    )
+                })
+            });
+            let (stored_spread, preferred_direction, default_flow) =
+                if let Some(defaults) = physical_folder_defaults {
+                    let resolved = container.spread.resolve_reading(
+                        defaults.spread_mode,
+                        defaults.reading_direction,
+                        false,
+                        None,
+                    );
+                    (resolved.mode, resolved.direction, defaults.reading_flow)
+                } else {
+                    let direction = container
+                        .spread
+                        .direction
+                        .unwrap_or(self.settings.default_reading_direction);
+                    let mode = container.spread.resolve_mode(
+                        self.settings
+                            .default_spread_mode
+                            .with_reading_direction(direction),
+                        direction,
+                    );
+                    (mode, direction, self.settings.default_reading_flow)
+                };
+            self.reading_flow = container.spread.flow.unwrap_or(default_flow);
             self.reading_direction = preferred_direction;
             if stored_spread == crate::settings::SpreadMode::Vertical {
                 self.spread_mode = crate::settings::SpreadMode::Single;
@@ -51540,7 +51709,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -64893,7 +65062,7 @@ impl App {
     }
 
     #[cfg(all(windows, test))]
-    fn start_active_detached_book_context_from_scanned_folder(
+    pub(crate) fn start_active_detached_book_context_from_scanned_folder(
         &mut self,
         path: PathBuf,
         scan: ScannedDir,
@@ -97190,6 +97359,9 @@ impl App {
         // release/中断の各境界で対象キーのみ無効化済み。
         self.update_thumb_adjust_drag_state();
 
+        let escape_input_owner = self.capture_search_escape_input(ctx);
+        let mut search_escape_claim = pinned_search::EscapeClaim::for_frame(self);
+
         // ── メニューバー ─────────────────────────────────────────────
         let (fav_nav, _) = self.render_menubar(ui);
 
@@ -97262,7 +97434,7 @@ impl App {
             if self.show_search_bar {
                 self.cancel_pending_folder_nav();
                 self.show_search_bar = false;
-                self.search_query.clear();
+                self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
                 self.search_filter = None;
                 self.search_filter_origin_folder = None;
                 self.search_has_focus = false;
@@ -97300,6 +97472,8 @@ impl App {
         let mut pre_grid_perf = pre_grid_perf_start_with(perf_on, std::time::Instant::now);
 
         let (folder_pane_nav, folder_pane_rect) = self.render_main_bars(ui, &mut pre_grid_perf);
+        self.route_search_escape(ctx, escape_input_owner, &mut search_escape_claim);
+        self.record_search_input_focus(ctx);
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
         // wheel が背面のサムネイル一覧にも通り抜ける。
@@ -101021,7 +101195,7 @@ mod index_full_check_tests {
         app.window_visible = false;
         app.activity_gate.set_paused(true);
         app.global_search.active = true;
-        app.global_search.query = "latest query".into();
+        app.global_search.metadata_draft = "latest query".into();
         app.global_search.last_executed = "older query".into();
         let manager = crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
             &env.tmp.path().join("late-init"),
@@ -101037,7 +101211,7 @@ mod index_full_check_tests {
         assert!(app.indexer_init.is_terminal());
         let semaphore = app.indexer_init.as_ref().unwrap().io_sem();
         assert!(semaphore.is_throttled());
-        assert_eq!(app.global_search.query, "latest query");
+        assert_eq!(app.global_search.metadata_draft, "latest query");
         assert!(app.global_search.last_executed.is_empty());
         app.global_search.last_executed = "adopted only once".into();
         app.poll_startup_init();
@@ -101059,10 +101233,10 @@ mod index_full_check_tests {
             disposal_witness: None,
         });
         app.global_search.active = true;
-        app.global_search.query = "current text".into();
+        app.global_search.metadata_draft = "current text".into();
         app.global_search.filters.favorite = Some(uuid::Uuid::new_v4());
         app.spawn_global_search(&egui::Context::default());
-        assert_eq!(app.global_search.query, "current text");
+        assert_eq!(app.global_search.metadata_draft, "current text");
         assert!(app.global_search.filters.favorite.is_none());
         assert!(app.global_search.last_executed.is_empty());
         assert!(app.global_search.page_edit_prepare.is_none());

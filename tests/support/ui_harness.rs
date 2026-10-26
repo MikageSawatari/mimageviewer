@@ -9,16 +9,38 @@ pub(crate) mod scroll_layout;
 
 #[cfg(windows)]
 #[path = "../../src/wgpu_backend_policy.rs"]
+#[allow(dead_code)] // Product argument parsing and candidate ordering are not used by the harness.
 mod backend_policy;
 
 pub(crate) fn wgpu_setup() -> egui_wgpu::WgpuSetup {
+    #[cfg(windows)]
+    {
+        let request = std::env::var("MIV_TEST_GPU_BACKEND")
+            .ok()
+            .map(|value| {
+                backend_policy::GpuBackendRequest::parse_value(&value)
+                    .expect("MIV_TEST_GPU_BACKEND must be auto, dx12 or vulkan")
+            })
+            .unwrap_or_default();
+        wgpu_setup_for_request(request)
+    }
+    #[cfg(not(windows))]
+    egui_kittest::wgpu::default_wgpu_setup()
+}
+
+#[cfg(windows)]
+fn wgpu_setup_for_request(request: backend_policy::GpuBackendRequest) -> egui_wgpu::WgpuSetup {
     #[allow(unused_mut)]
     let mut setup = egui_kittest::wgpu::default_wgpu_setup();
-    #[cfg(windows)]
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut setup {
         // Match the product's explicit override, including when WGPU_BACKEND
         // asks for GL. Enumeration initializes even unselected backends.
-        create_new.instance_descriptor.backends = backend_policy::native_backends();
+        create_new.instance_descriptor.backends = request.backends();
+        create_new
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .shader_compiler = wgpu::Dx12Compiler::Fxc;
     }
     setup
 }
@@ -139,20 +161,40 @@ mod tests {
 
     #[test]
     fn requests_product_backends_without_initializing_gpu() {
-        let egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_setup() else {
-            panic!("UI tests must create independent renderers");
-        };
-        assert_eq!(
-            setup.instance_descriptor.backends,
-            super::backend_policy::native_backends()
-        );
-        assert!(
-            !setup
-                .instance_descriptor
-                .backends
-                .contains(wgpu::Backends::GL)
-        );
-        assert!(setup.native_adapter_selector.is_some());
+        use super::backend_policy::GpuBackendRequest;
+        for request in [
+            GpuBackendRequest::Auto,
+            GpuBackendRequest::Dx12,
+            GpuBackendRequest::Vulkan,
+        ] {
+            let egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_setup_for_request(request)
+            else {
+                panic!("UI tests must create independent renderers");
+            };
+            assert_eq!(setup.instance_descriptor.backends, request.backends());
+            assert!(
+                !setup
+                    .instance_descriptor
+                    .backends
+                    .contains(wgpu::Backends::GL)
+            );
+            assert!(matches!(
+                setup
+                    .instance_descriptor
+                    .backend_options
+                    .dx12
+                    .shader_compiler,
+                wgpu::Dx12Compiler::Fxc
+            ));
+            assert!(
+                setup.native_adapter_selector.is_some(),
+                "retain kittest CPU preference"
+            );
+            assert!(
+                setup.native_adapter_candidates.is_none(),
+                "do not override kittest selector"
+            );
+        }
     }
 
     #[test]

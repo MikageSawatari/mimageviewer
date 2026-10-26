@@ -29,6 +29,7 @@ exclude = [
     "vendor/egui",
     "vendor/egui-wgpu",
     "vendor/egui-winit",
+    "vendor/epaint",
     "vendor/tantivy",
 ]
 
@@ -37,6 +38,7 @@ eframe = { path = "vendor/eframe" }
 egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
+epaint = { path = "vendor/epaint" }
 tantivy = { path = "vendor/tantivy" }
 ort = { path = "crates/ort-patched" }
 
@@ -47,7 +49,7 @@ ort = { path = "crates/ort-patched" }
 # 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "4.8.0"
+version = "4.8.3"
 edition = "2024"
 # egui / eframe 0.37 の MSRV。開発 toolchain は 1.99 固定。
 rust-version = "1.95"
@@ -63,7 +65,7 @@ autobins = false
 manual-e2e = []
 # Opt-in in-process Rhai runner for isolated application tests. Production
 # builds keep this disabled unless the developer explicitly requests it.
-test-script = ["eframe/miv-test-script-window-witness"]
+test-script = ["eframe/miv-test-script-window-witness", "eframe/miv-test-script-wait-witness"]
 # ベンチマーク、配布パック生成、診断用の補助 bin は通常の build/test 対象から外す。
 # 必要なときだけ `--features dev-tools --bin <name>` で明示的に有効化する。
 dev-tools = ["pack-build-tools"]
@@ -286,6 +288,11 @@ libraw-sys = { path = "crates/libraw-sys" }
 libavif-sys = { path = "crates/libavif-sys" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_Graphics_Dwm",
     "Win32_System_Performance",
     "Win32_System_ProcessStatus",

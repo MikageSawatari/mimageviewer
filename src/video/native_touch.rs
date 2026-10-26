@@ -424,14 +424,27 @@ impl Default for NativeTouchAdapter {
     }
 }
 
+/// Terminal fact for one overlay logical pass, recorded where a release is emitted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum NativePointerTermination {
+    Released {
+        button: egui::PointerButton,
+        pos: egui::Pos2,
+    },
+    /// Synthetic release, or Escape delivered to egui (no button).
+    Cancelled { button: Option<egui::PointerButton> },
+}
+
 pub(crate) struct NativeTouchAdapterOutput {
     pub(crate) pos: egui::Pos2,
     pub(crate) egui_events: Vec<egui::Event>,
+    pub(crate) termination: Option<NativePointerTermination>,
 }
 
 pub(crate) struct NativeTouchAdapterReset {
     pub(crate) changed: bool,
     pub(crate) egui_events: Vec<egui::Event>,
+    pub(crate) termination: Option<NativePointerTermination>,
 }
 
 impl NativeTouchAdapter {
@@ -533,8 +546,12 @@ impl NativeTouchAdapter {
 
         let suppress_primary = self.recognizer.should_suppress_primary();
         let mut egui_events = Vec::new();
-        let cancelled_existing_press =
-            suppress_primary && self.cancel_primary_press(pos, &mut egui_events);
+        let mut termination = if suppress_primary {
+            self.cancel_primary_press(pos, &mut egui_events)
+        } else {
+            None
+        };
+        let cancelled_existing_press = termination.is_some();
 
         if is_primary && !cancelled_existing_press {
             match event.phase {
@@ -563,14 +580,15 @@ impl NativeTouchAdapter {
                     egui_events.push(egui::Event::PointerMoved(pos));
                     if event.phase == NativeVideoTouchPhase::End {
                         if self.primary_pressed && !suppress_primary {
-                            self.release_primary_at(pos, &mut egui_events);
+                            termination = Some(self.release_primary_at(pos, &mut egui_events));
                         } else {
                             egui_events.push(egui::Event::PointerGone);
                         }
                     }
                 }
                 NativeVideoTouchPhase::Cancel => {
-                    if !self.cancel_primary_press(pos, &mut egui_events) {
+                    termination = self.cancel_primary_press(pos, &mut egui_events);
+                    if termination.is_none() {
                         egui_events.push(egui::Event::PointerGone);
                     }
                 }
@@ -579,7 +597,7 @@ impl NativeTouchAdapter {
 
         if !self.recognizer.is_active() {
             if self.primary_pressed {
-                self.cancel_primary_press(pos, &mut egui_events);
+                termination = self.cancel_primary_press(pos, &mut egui_events);
             }
             self.primary_id = None;
             self.primary_start_pos = None;
@@ -587,7 +605,11 @@ impl NativeTouchAdapter {
             self.primary_withholds_press = false;
         }
 
-        NativeTouchAdapterOutput { pos, egui_events }
+        NativeTouchAdapterOutput {
+            pos,
+            egui_events,
+            termination,
+        }
     }
 
     fn consume_panorama_touch(
@@ -709,11 +731,19 @@ impl NativeTouchAdapter {
     /// emulated pointer. Leaving the last touch position live would turn the
     /// distance to the next tap into egui's per-pass pointer delta, which a
     /// ScrollArea can consume as a drag on that next press.
-    fn release_primary_at(&mut self, pos: egui::Pos2, events: &mut Vec<egui::Event>) {
+    fn release_primary_at(
+        &mut self,
+        pos: egui::Pos2,
+        events: &mut Vec<egui::Event>,
+    ) -> NativePointerTermination {
         debug_assert!(self.primary_pressed);
         events.push(primary_button_event(pos, false));
         events.push(egui::Event::PointerGone);
         self.primary_pressed = false;
+        NativePointerTermination::Released {
+            button: egui::PointerButton::Primary,
+            pos,
+        }
     }
 
     /// Cancels a synthetic primary press without completing a click.
@@ -726,15 +756,17 @@ impl NativeTouchAdapter {
         &mut self,
         fallback_pos: egui::Pos2,
         events: &mut Vec<egui::Event>,
-    ) -> bool {
+    ) -> Option<NativePointerTermination> {
         if !self.primary_pressed {
-            return false;
+            return None;
         }
         let press_pos = self.primary_start_pos.unwrap_or(fallback_pos);
         let cancel_pos = press_pos + egui::vec2(PRIMARY_CANCEL_DISTANCE_POINTS, 0.0);
         events.push(egui::Event::PointerMoved(cancel_pos));
         self.release_primary_at(cancel_pos, events);
-        true
+        Some(NativePointerTermination::Cancelled {
+            button: Some(egui::PointerButton::Primary),
+        })
     }
 
     /// Commands are destructive-read output. `egui::Context::run` may invoke
@@ -768,7 +800,7 @@ impl NativeTouchAdapter {
             || !self.pending_commands.is_empty()
             || self.first_run_help_phase.is_some();
         let mut egui_events = Vec::new();
-        self.cancel_primary_press(
+        let termination = self.cancel_primary_press(
             self.primary_start_pos.unwrap_or(egui::Pos2::ZERO),
             &mut egui_events,
         );
@@ -776,6 +808,7 @@ impl NativeTouchAdapter {
         NativeTouchAdapterReset {
             changed,
             egui_events,
+            termination,
         }
     }
 }
@@ -792,6 +825,87 @@ fn primary_button_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_termination_tracks_emitted_release_not_raw_touch_phase() {
+        for phase in [NativeVideoTouchPhase::End, NativeVideoTouchPhase::Cancel] {
+            let mut adapter = NativeTouchAdapter::default();
+            let start = adapter.handle_event(
+                hud_event(1, 500, 400, NativeVideoTouchPhase::Start),
+                &geometry(),
+                0,
+                1.0,
+            );
+            assert_eq!(start.termination, None);
+            let output = adapter.handle_event(hud_event(1, 550, 400, phase), &geometry(), 10, 1.0);
+            let expected = match phase {
+                NativeVideoTouchPhase::End => NativePointerTermination::Released {
+                    button: egui::PointerButton::Primary,
+                    pos: egui::pos2(550.0, 400.0),
+                },
+                _ => NativePointerTermination::Cancelled {
+                    button: Some(egui::PointerButton::Primary),
+                },
+            };
+            assert_eq!(output.termination, Some(expected));
+            assert!(has_primary_button(&output.egui_events, false));
+            assert_eq!(adapter.reset_for_source_swap().termination, None);
+        }
+        let mut adapter = NativeTouchAdapter::default();
+        adapter.handle_event(
+            event(1, 100, 400, NativeVideoTouchPhase::Start),
+            &geometry(),
+            0,
+            1.0,
+        );
+        let output = adapter.handle_event(
+            event(1, 100, 400, NativeVideoTouchPhase::End),
+            &geometry(),
+            10,
+            1.0,
+        );
+        assert!(!has_primary_button(&output.egui_events, false));
+        assert_eq!(
+            output.termination, None,
+            "viewer tap End emits no pointer release"
+        );
+    }
+
+    #[test]
+    fn pointer_termination_recognizer_deactivation_and_source_reset_are_cancelled() {
+        for reset in [false, true] {
+            let mut adapter = NativeTouchAdapter::default();
+            adapter.handle_event(
+                hud_event(1, 500, 400, NativeVideoTouchPhase::Start),
+                &geometry(),
+                0,
+                1.0,
+            );
+            let (events, termination) = if reset {
+                let output = adapter.reset_for_source_swap();
+                (output.egui_events, output.termination)
+            } else {
+                // Exercise the adapter's inactive-recognizer cleanup independently
+                // of a primary Cancel, which is handled earlier in handle_event.
+                adapter.recognizer = TouchRecognizer::default();
+                let output = adapter.handle_event(
+                    hud_event(2, 500, 400, NativeVideoTouchPhase::Move),
+                    &geometry(),
+                    10,
+                    1.0,
+                );
+                (output.egui_events, output.termination)
+            };
+            assert!(has_primary_button(&events, false));
+            assert_eq!(
+                termination,
+                Some(NativePointerTermination::Cancelled {
+                    button: Some(egui::PointerButton::Primary)
+                })
+            );
+            assert_eq!(adapter.reset_for_source_swap().termination, None);
+        }
+    }
 
     fn geometry() -> TapZoneGeometry {
         TapZoneGeometry {

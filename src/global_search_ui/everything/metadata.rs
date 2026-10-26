@@ -9,12 +9,34 @@ use crate::tags_db::{TAG_WRITES, TagsDb};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The existing thumbnail owner, captured afresh for each Everything view request.
+#[derive(Clone)]
+pub(crate) struct FolderThumbnailResources {
+    pub(crate) cache: Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
+    pub(crate) catalog: Arc<crate::catalog::CatalogDb>,
+    pub(crate) sort: crate::settings::SortOrder,
+    pub(crate) depth: u32,
+}
+
+impl FolderThumbnailResources {
+    fn identity(&self) -> (usize, usize, crate::settings::SortOrder, u32) {
+        (
+            Arc::as_ptr(&self.cache) as usize,
+            Arc::as_ptr(&self.catalog) as usize,
+            self.sort,
+            self.depth,
+        )
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct SearchMetadataResources {
     pub(crate) pin_db: Option<Arc<FolderThumbPinDb>>,
     pub(crate) tags_db_path: Option<PathBuf>,
     pub(crate) video_pins: Option<crate::video_pins::VideoPinReadSource>,
+    pub(crate) folder_thumbnails: Option<FolderThumbnailResources>,
 }
 
 pub(crate) enum SearchMetadataInstall {
@@ -32,6 +54,7 @@ pub(crate) struct EverythingMetadata {
     pin_stamp: Option<FolderPinMutationStamp>,
     tags_db_path: Option<PathBuf>,
     video_pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+    folder_thumbnail_identity: Option<(usize, usize, crate::settings::SortOrder, u32)>,
 }
 
 impl SearchMetadataInstall {
@@ -48,6 +71,11 @@ impl SearchMetadataInstall {
 impl EverythingMetadata {
     pub(crate) fn is_current(&self, resources: &SearchMetadataResources) -> bool {
         self.tags_db_path == resources.tags_db_path
+            && self.folder_thumbnail_identity
+                == resources
+                    .folder_thumbnails
+                    .as_ref()
+                    .map(FolderThumbnailResources::identity)
             && self.pin_stamp == resources.pin_db.as_ref().map(|db| db.mutation_stamp())
             && TAG_WRITES.accepts(self.tag_stamp)
             && self.video_pin_stamp
@@ -64,6 +92,8 @@ pub(crate) fn prepare(
     items: &[GridItem],
     metas: &[Option<(i64, i64)>],
     resources: &SearchMetadataResources,
+    cancel: &AtomicBool,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
 ) -> Result<SearchMetadataInstall, String> {
     if items.len() != metas.len() {
         return Err("検索結果のメタデータ件数が一致しません。".to_owned());
@@ -81,20 +111,94 @@ pub(crate) fn prepare(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let video_pin_blobs = if !video_paths.is_empty() {
-        if let Some(source) = &resources.video_pins {
-            let db = crate::video_pins::VideoPinDb::open_readonly(&source.path)
-                .map_err(|_| "検索結果の動画ピンを読み取れませんでした。".to_owned())?;
-            db.lookup_webps_many(video_paths)
-        } else {
-            HashMap::new()
-        }
-    } else {
-        HashMap::new()
-    };
     let pins = resources.pin_db.as_ref().map_or_else(HashMap::new, |db| {
         db.lookup_many(items.iter().filter_map(GridItem::container_path))
     });
+    let video_db = if !video_paths.is_empty() || !pins.is_empty() {
+        resources
+            .video_pins
+            .as_ref()
+            .map(|source| {
+                crate::video_pins::VideoPinDb::open_readonly(&source.path)
+                    .map_err(|_| "検索結果の動画ピンを読み取れませんでした。".to_owned())
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let video_pin_blobs = video_db
+        .as_ref()
+        .map_or_else(HashMap::new, |db| db.lookup_webps_many(video_paths));
+    if let Some(owner) = &resources.folder_thumbnails {
+        let seeds = crate::app::smart_folder::prepare_video_folder_pin_seeds(
+            items,
+            &pins,
+            resources.pin_db.as_deref(),
+            owner.sort,
+            owner.depth,
+            video_db.as_ref(),
+            cancel,
+        );
+        let mut deletes = Vec::new();
+        let mut entries = Vec::new();
+        for (seed, webp) in seeds {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let cache_key = crate::thumb_loader::representative_cache_key_for_policy(
+                &seed.cache_key,
+                visibility,
+            );
+            if let Some(webp) =
+                webp.filter(|bytes| crate::catalog::decode_thumb_dims(bytes).is_some())
+            {
+                entries.push((
+                    cache_key,
+                    crate::catalog::CacheEntry {
+                        mtime: seed.mtime,
+                        file_size: seed.file_size,
+                        jpeg_data: webp,
+                        source_dims: None,
+                        layout_dims: None,
+                        folder_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
+                        selection_proof: None,
+                    },
+                ));
+            } else {
+                deletes.push(cache_key);
+            }
+        }
+        // Cache-only publication to the captured thumbnail owner, on this worker.
+        // Never reset a sibling's rows, generation, queues or cancellation token.
+        if (!entries.is_empty() || !deletes.is_empty())
+            && pin_stamp == resources.pin_db.as_ref().map(|db| db.mutation_stamp())
+            && video_pin_stamp
+                == resources
+                    .video_pins
+                    .as_ref()
+                    .map(|source| source.mutation_stamp())
+        {
+            match owner
+                .catalog
+                .commit_pin_materializations(&deletes, &entries, cancel)
+            {
+                Ok(true) => {
+                    if let Ok(mut cache) = owner.cache.write() {
+                        for key in deletes {
+                            cache.remove(&key);
+                        }
+                        cache.extend(entries);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "検索結果の代表サムネイルを準備できませんでした: {error}"
+                    ));
+                }
+            }
+        }
+    }
     let mut converted = HashMap::new();
     for (item, meta) in items.iter().zip(metas) {
         if let GridItem::ConvertibleArchive { path, .. } = item {
@@ -148,6 +252,10 @@ pub(crate) fn prepare(
         pin_stamp,
         tags_db_path: resources.tags_db_path.clone(),
         video_pin_stamp,
+        folder_thumbnail_identity: resources
+            .folder_thumbnails
+            .as_ref()
+            .map(FolderThumbnailResources::identity),
     }))
 }
 
@@ -156,6 +264,20 @@ mod tests {
     use super::*;
     use crate::archive_converter::ArchiveFormat;
     use crate::page_edit_write_epoch::TestEpochScope;
+
+    fn prepare(
+        items: &[GridItem],
+        metas: &[Option<(i64, i64)>],
+        resources: &SearchMetadataResources,
+    ) -> Result<SearchMetadataInstall, String> {
+        super::prepare(
+            items,
+            metas,
+            resources,
+            &AtomicBool::new(false),
+            &Default::default(),
+        )
+    }
 
     fn unpack(install: SearchMetadataInstall) -> EverythingMetadata {
         match install {

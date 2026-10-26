@@ -539,13 +539,44 @@ pub(crate) fn shutdown_until(deadline: Instant) -> bool {
     WRITER.get().is_none_or(|s| s.shutdown(deadline))
 }
 pub(crate) fn take_error() -> Option<String> {
-    let mut notice = WRITER.get()?.error.try_lock().ok()?;
-    if !matches!(*notice, ErrorNotice::Pending(_)) {
-        return None;
+    WRITER.get()?.take_error()
+}
+
+/// Startup-only auxiliary diagnostic failures share the existing one-shot toast.
+/// Never call this (or the normal logger) from an exception handler.
+pub(crate) fn report_diagnostic_error(error: String) {
+    service().fail(error);
+}
+
+impl Service {
+    fn take_error(&self) -> Option<String> {
+        let mut notice = self.error.try_lock().ok()?;
+        if !matches!(*notice, ErrorNotice::Pending(_)) {
+            return None;
+        }
+        match std::mem::replace(&mut *notice, ErrorNotice::Reported) {
+            ErrorNotice::Pending(message) => Some(message),
+            _ => None,
+        }
     }
-    match std::mem::replace(&mut *notice, ErrorNotice::Reported) {
-        ErrorNotice::Pending(message) => Some(message),
-        _ => None,
+}
+
+#[cfg(test)]
+mod diagnostic_notice_tests {
+    use super::*;
+
+    #[test]
+    fn log_writer_auxiliary_diagnostic_notice_is_one_shot() {
+        let service = Service::new(1, 1024);
+        service.fail("native exception sink unavailable".into());
+        service.fail("another diagnostic failure".into());
+        assert_eq!(
+            service.take_error().as_deref(),
+            Some("native exception sink unavailable")
+        );
+        assert!(service.take_error().is_none());
+        service.fail("late diagnostic failure".into());
+        assert!(service.take_error().is_none());
     }
 }
 

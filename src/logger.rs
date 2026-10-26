@@ -16,21 +16,119 @@ struct ProductDiagnostics;
 static PRODUCT_DIAGNOSTICS: ProductDiagnostics = ProductDiagnostics;
 impl log::Log for ProductDiagnostics {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Warn
-            && (metadata.target().starts_with("tantivy::")
-                || metadata.target() == "egui_wgpu::surface_window_limit")
+        dependency_enabled(
+            metadata.level(),
+            metadata.target(),
+            crate::gpu_startup_diagnostics::capturing(),
+        )
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
-            log(format!(
+            let line = format!(
                 "[{}] {}: {}",
                 record.level(),
                 record.target(),
                 record.args()
-            ));
+            );
+            if record.level() == log::Level::Error
+                && crate::gpu_startup_diagnostics::is_gpu_target(record.target())
+            {
+                crate::gpu_startup_diagnostics::error_line(&line);
+            }
+            log(line);
         }
     }
     fn flush(&self) {}
+}
+
+fn dependency_enabled(level: log::Level, target: &str, gpu_startup: bool) -> bool {
+    (level <= log::Level::Warn
+        && (target.starts_with("tantivy::") || target == "egui_wgpu::surface_window_limit"))
+        || (gpu_startup
+            && level == log::Level::Error
+            && crate::gpu_startup_diagnostics::is_gpu_target(target))
+}
+
+#[cfg(test)]
+#[test]
+fn gpu_startup_dependency_filter_is_temporary_and_preserves_existing_targets() {
+    for active in [false, true] {
+        assert!(dependency_enabled(
+            log::Level::Warn,
+            "tantivy::index",
+            active
+        ));
+        assert!(dependency_enabled(
+            log::Level::Error,
+            "egui_wgpu::surface_window_limit",
+            active
+        ));
+        assert!(!dependency_enabled(
+            log::Level::Info,
+            "tantivy::index",
+            active
+        ));
+        assert!(!dependency_enabled(log::Level::Error, "other", active));
+        for target in ["wgpu_hal", "wgpu_hal::dx12", "wgpu_core", "gpu_allocator"] {
+            assert_eq!(
+                dependency_enabled(log::Level::Error, target, active),
+                active
+            );
+            assert!(!dependency_enabled(log::Level::Warn, target, active));
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn gpu_startup_fake_logger_routes_complete_lines_but_attributes_only_root_thread() {
+    use crate::gpu_startup_diagnostics as gpu;
+    use log::Log as _;
+    gpu::begin(crate::wgpu_backend_policy::GpuBackendRequest::Auto);
+    let metadata = log::Metadata::builder()
+        .level(log::Level::Error)
+        .target("wgpu_hal")
+        .build();
+    assert!(PRODUCT_DIAGNOSTICS.enabled(&metadata));
+    PRODUCT_DIAGNOSTICS.log(
+        &log::Record::builder()
+            .level(log::Level::Error)
+            .target("wgpu_hal")
+            .args(format_args!("enumeration failure before device"))
+            .build(),
+    );
+    std::thread::spawn(|| {
+        // This is enabled and reaches the asynchronous sink, but has no root attribution.
+        PRODUCT_DIAGNOSTICS.log(
+            &log::Record::builder()
+                .level(log::Level::Error)
+                .target("wgpu_core::device")
+                .args(format_args!("other thread HUD failure"))
+                .build(),
+        );
+    })
+    .join()
+    .unwrap();
+    let snapshot = gpu::stop_snapshot();
+    assert_eq!(
+        snapshot.lines,
+        ["[ERROR] wgpu_hal: enumeration failure before device"]
+    );
+    assert!(!PRODUCT_DIAGNOSTICS.enabled(&metadata));
+    gpu::begin(crate::wgpu_backend_policy::GpuBackendRequest::Auto);
+    gpu::observe(&egui_wgpu::StartupDiagnosticEvent::RootPresented {
+        frame: 1,
+        normal: false,
+    });
+    assert!(!PRODUCT_DIAGNOSTICS.enabled(&metadata));
+    assert!(
+        PRODUCT_DIAGNOSTICS.enabled(
+            &log::Metadata::builder()
+                .level(log::Level::Warn)
+                .target("tantivy::index")
+                .build()
+        )
+    );
 }
 
 #[cfg(test)]

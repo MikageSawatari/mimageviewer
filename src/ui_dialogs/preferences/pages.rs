@@ -10211,6 +10211,57 @@ pub(super) fn draw_fullscreen_specified_scale_settings(
     *value != before || max_changed
 }
 
+fn draw_plain_folder_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "通常フォルダにも既定のページ構成を使う");
+    ui.small("本として扱わないフォルダで、そのフォルダに保存したページ構成がないときに使います。フォルダの開き方（一覧表示・直接ページ表示）と連結方式は変わりません。");
+}
+
+#[cfg(test)]
+mod plain_folder_spread_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn plain_folder_spread_preference_snapshots_and_toggle() {
+        let mut snapshots = egui_kittest::SnapshotResults::default();
+        for (name, theme, enabled) in [
+            (
+                "preferences_plain_folder_spread_light_off",
+                crate::os_theme::ResolvedTheme::Light,
+                false,
+            ),
+            (
+                "preferences_plain_folder_spread_dark_on",
+                crate::os_theme::ResolvedTheme::Dark,
+                true,
+            ),
+        ] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(400.0, 140.0))
+                .build_ui_state(
+                    move |root_ui, enabled| {
+                        crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                            crate::os_theme::apply_resolved(root_ui.ctx(), theme);
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                draw_plain_folder_spread_setting(ui, enabled);
+                            });
+                        });
+                    },
+                    enabled,
+                );
+            harness.run();
+            harness.snapshot(name);
+            harness
+                .get_by_label("通常フォルダにも既定のページ構成を使う")
+                .click();
+            harness.run();
+            assert_eq!(*harness.state(), !enabled);
+            snapshots.extend(harness.take_snapshot_results());
+        }
+    }
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/chrome-suppression", |ui, state| {
         crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
@@ -10293,6 +10344,17 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 }
             });
     });
+    anchored(
+        ui,
+        state,
+        "spread/page-layout-plain-folders",
+        |ui, state| {
+            draw_plain_folder_spread_setting(
+                ui,
+                &mut state.settings.apply_default_spread_to_plain_folders,
+            );
+        },
+    );
     anchored(ui, state, "spread/document-direction", |ui, state| {
         ui.checkbox(
             &mut state.settings.follow_document_reading_direction,
