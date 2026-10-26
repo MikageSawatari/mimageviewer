@@ -15,7 +15,16 @@ fn absolute_logs_dir(data_dir: &Path) -> std::io::Result<PathBuf> {
 
 /// Classification and wording have no side effects. Both renderers are enabled
 /// in Cargo.toml; native-only variants follow eframe/egui-wgpu's target cfgs.
+#[cfg(test)]
 fn run_native_failure_report(error: &eframe::Error, logs_dir_display: &str) -> FailureReport {
+    report_with_gpu(error, logs_dir_display, &Default::default())
+}
+
+fn report_with_gpu(
+    error: &eframe::Error,
+    logs_dir_display: &str,
+    gpu: &crate::gpu_startup_diagnostics::Snapshot,
+) -> FailureReport {
     let (kind, graphics, inner): (&str, bool, Option<&dyn Error>) = match error {
         eframe::Error::AppCreation(cause) => ("AppCreation", false, Some(cause.as_ref())),
         #[cfg(not(target_arch = "wasm32"))]
@@ -85,13 +94,35 @@ fn run_native_failure_report(error: &eframe::Error, logs_dir_display: &str) -> F
     } else {
         ""
     };
-    FailureReport {
+    let mut report = FailureReport {
         kind,
         log_detail: format!("run_native failed: kind={kind} detail={detail}"),
         dialog_body: format!(
             "{first_line}\n\n{guidance}次のフォルダーのログを添えてお知らせください。\n{logs_dir_display}\n\n詳細: {kind}: {short}"
         ),
+    };
+    if graphics {
+        use egui_wgpu::StartupGpuStage as Stage;
+        let stage = match error {
+            eframe::Error::Wgpu(egui_wgpu::WgpuError::RequestDeviceError(_)) => Some(Stage::Device),
+            eframe::Error::Wgpu(
+                egui_wgpu::WgpuError::RequestAdapterError(_)
+                | egui_wgpu::WgpuError::CustomNativeAdapterSelectionError(_),
+            ) => Some(Stage::AdapterSelection),
+            eframe::Error::Wgpu(egui_wgpu::WgpuError::NoSurfaceFormatsAvailable) => {
+                Some(Stage::PipelineCreate)
+            }
+            eframe::Error::Wgpu(egui_wgpu::WgpuError::CreateSurfaceError(_)) => {
+                Some(Stage::SurfaceCreate)
+            }
+            _ => None,
+        };
+        report.dialog_body.push_str(&gpu.dialog(stage));
+        report
+            .log_detail
+            .push_str(&format!("; gpu diagnostic={gpu:?}"));
     }
+    report
 }
 
 // Effects are injected so tests exercise the same shutdown boundary without
@@ -131,6 +162,8 @@ pub(crate) fn finish_run_native(
     cleanup: impl FnOnce(),
     mut effects: impl ExitEffects,
 ) -> eframe::Result {
+    // Stop before cleanup can initialize/drop unrelated graphics resources.
+    let gpu = crate::gpu_startup_diagnostics::stop_snapshot();
     let report = result.as_ref().err().map(|error| {
         effects.suspend_watchdog();
         // A rare path-resolution failure is recorded and notified, without
@@ -140,7 +173,7 @@ pub(crate) fn finish_run_native(
             Ok(path) => path.display().to_string(),
             Err(_) => "ログフォルダーの場所を取得できませんでした。".into(),
         };
-        let mut report = run_native_failure_report(error, &location);
+        let mut report = report_with_gpu(error, &location, &gpu);
         if let Err(error) = logs_dir {
             report
                 .log_detail
@@ -168,6 +201,30 @@ pub(crate) fn finish_run_native(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn gpu_startup_diagnostics_only_extend_graphics_failure_and_resolve_fatal_stage() {
+        let mut gpu = crate::gpu_startup_diagnostics::Snapshot::default();
+        gpu.request = crate::wgpu_backend_policy::GpuBackendRequest::Vulkan;
+        gpu.stage = Some(egui_wgpu::StartupGpuStage::SurfaceAcquire);
+        gpu.lines = vec!["wgpu detail".into()];
+        let graphics = report_with_gpu(
+            &eframe::Error::Wgpu(egui_wgpu::WgpuError::NoSurfaceFormatsAvailable),
+            "logs",
+            &gpu,
+        );
+        assert!(graphics.dialog_body.contains("段階: PipelineCreate"));
+        assert!(!graphics.dialog_body.contains("段階: SurfaceAcquire"));
+        assert!(graphics.dialog_body.contains("--gpu-backend dx12"));
+        assert!(graphics.dialog_body.contains("wgpu detail"));
+        let app = report_with_gpu(
+            &eframe::Error::AppCreation(Box::new(std::io::Error::other("app"))),
+            "logs",
+            &gpu,
+        );
+        assert!(!app.dialog_body.contains("GPU:"));
+        assert!(!app.dialog_body.contains("--gpu-backend"));
+    }
 
     struct FakeExit<'a>(&'a RefCell<Vec<String>>);
     impl ExitEffects for FakeExit<'_> {

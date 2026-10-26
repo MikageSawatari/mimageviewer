@@ -5497,3 +5497,182 @@ impl App {
             .map(|material| material.source_texture().clone())
     }
 }
+
+#[cfg(test)]
+mod section1445_slider_tests {
+    use super::*;
+    use crate::displayed_image_transform::{
+        DisplayedImageTransformInput, FullscreenFitScaleLimits, RectPixelFit,
+        ResolvedDisplayPlacement,
+    };
+    use egui_kittest::kittest::Queryable;
+
+    fn erase_slider_harness(
+        tool: EraseTool,
+    ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("erase-slider.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        app.erase_mode = true;
+        app.erase_tool = tool;
+        app.erase_paint_mode = true;
+        app.erase_mask_size = [200, 200];
+        app.erase_mask = Some(vec![false; 200 * 200]);
+        app.erase_brush_radius = 1.0;
+        app.erase_bucket_tolerance = 5.0;
+        app.erase_bucket_leak_stop = 0.0;
+        app.erase_bucket_outset = 0.0;
+        app.erase_bucket_region = crate::mask_db::BucketRegion::Connected;
+        let pixels = (0..200 * 200)
+            .map(|i| egui::Color32::from_gray(if i % 200 < 100 { 100 } else { 120 }))
+            .collect();
+        app.erase_base_cache.insert(
+            0,
+            crate::app::EraseBaseSource::raster(Arc::new(egui::ColorImage::new(
+                [200, 200],
+                pixels,
+            ))),
+        );
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1200.0, 1100.0))
+            .build_ui_state(
+                |root_ui, app| {
+                    crate::test_ui::full_viewport_ui(root_ui, |ui| {
+                        let ctx = ui.ctx().clone();
+                        let full_rect = ctx.content_rect();
+                        let transform = DisplayedImageTransform::from_resolved_rect(
+                            DisplayedImageTransformInput {
+                                page_idx: 0,
+                                viewport_rect: full_rect,
+                                source_size: egui::vec2(200.0, 200.0),
+                                texture_size: egui::vec2(200.0, 200.0),
+                                rotation: crate::rotation_db::Rotation::None,
+                                free_rotation_rad: 0.0,
+                                content_bbox: None,
+                                fit_mode:
+                                    crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                                        crate::settings::FullscreenFitMode::Page,
+                                    ),
+                                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                                pixels_per_point: 1.0,
+                                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                                pixel_fit: RectPixelFit::Texels,
+                            },
+                            egui::Rect::from_min_size(
+                                egui::pos2(600.0, 100.0),
+                                egui::vec2(200.0, 200.0),
+                            ),
+                        )
+                        .unwrap();
+                        // Keep fullscreen's production order: canvas input precedes
+                        // the actual panel. No pre-commit or test-only setting copy.
+                        app.handle_erase_paint(&ctx, &transform, Default::default());
+                        app.draw_erase_panel(ui, &ctx, full_rect);
+                    });
+                },
+                app,
+            );
+        harness.run_steps(3);
+        harness
+    }
+
+    fn type_erase_setting(
+        harness: &mut egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
+        label: &str,
+        digits: &[&str],
+    ) {
+        let slider_rect = harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, label)
+            .rect();
+        let editor = harness
+            .query_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "tool setting editor {label:?} missing; slider={slider_rect:?}; numeric nodes={:#?}",
+                    harness.get_all_by_role(egui::accesskit::Role::SpinButton).collect::<Vec<_>>()
+                )
+            });
+        let editor_rect = editor.rect();
+        assert!(
+            editor_rect.left() >= slider_rect.right()
+                && editor_rect.top() <= slider_rect.bottom()
+                && slider_rect.top() <= editor_rect.bottom(),
+            "named editor must be beside its slider: slider={slider_rect:?}, editor={editor_rect:?}"
+        );
+        editor.click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        for digit in digits {
+            harness.event(egui::Event::Text((*digit).into()));
+            harness.run_steps(2);
+        }
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::SpinButton)
+                .any(|node| node.is_focused()),
+            "numeric editing must still own focus before the first canvas press"
+        );
+    }
+
+    #[test]
+    fn section1445_bucket_text_is_used_by_first_canvas_press_before_panel_draw() {
+        let mut harness = erase_slider_harness(EraseTool::Bucket);
+        type_erase_setting(&mut harness, "色差の許容値", &["2", "5"]);
+        assert!(
+            harness
+                .state()
+                .erase_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|p| !*p)
+        );
+        let seed = egui::pos2(650.0, 200.0);
+        harness.hover_at(seed);
+        harness.drag_at(seed);
+        harness.run_steps(1);
+        let mask = harness.state().erase_mask.as_ref().unwrap();
+        assert!(
+            mask[100 * 200 + 50],
+            "the first canvas press reached the bucket handler"
+        );
+        assert!(
+            mask[100 * 200 + 150],
+            "the first fill must cross the 20-level color difference using new tolerance 25"
+        );
+    }
+
+    #[test]
+    fn section1445_brush_size_text_is_used_by_first_canvas_press_before_panel_draw() {
+        let mut harness = erase_slider_harness(EraseTool::Brush);
+        type_erase_setting(&mut harness, "サイズ", &["8"]);
+        assert!(
+            harness
+                .state()
+                .erase_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|p| !*p)
+        );
+        let seed = egui::pos2(700.0, 200.0);
+        harness.hover_at(seed);
+        harness.drag_at(seed);
+        harness.run_steps(1);
+        let mask = harness.state().erase_mask.as_ref().unwrap();
+        assert!(
+            mask[100 * 200 + 100],
+            "the first canvas press reached the brush handler"
+        );
+        assert!(
+            mask[100 * 200 + 106],
+            "the first stroke must already use radius 8 rather than the old radius 1"
+        );
+        assert!(
+            !mask[100 * 200 + 110],
+            "the stroke must remain bounded by the new radius"
+        );
+    }
+}

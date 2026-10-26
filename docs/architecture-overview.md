@@ -300,6 +300,25 @@ fullscreen／通過／animation には共通 typed policy で使わない。詳�
 
 ### コア
 
+#### GPU 初期化と診断（§1.448）
+
+`wgpu_backend_policy.rs` が `--gpu-backend auto|dx12|vulkan` の要求を一か所で解析し、
+Instance の backends と順序付き候補を決める。`auto` は surface 対応の最初の DX12、最初の Vulkan の最大2候補。
+vendor `egui-wgpu` の `native_adapter_candidates` は、App 作成前の `request_device` 失敗時だけ次候補へ進む。
+各 API は一回だけで、明示指定・surface/pipeline/描画の失敗・実行中の device lost・panic は再試行しない。
+既存の単一 `native_adapter_selector` は candidates が無い場合の経路として残す。
+成功した API は永続化しない。root GUI と動画 HUD の別 DX12 Instance はともに FXC を明示する。
+
+`gpu_startup_diagnostics.rs` が要求、候補、各試行の確定結果と採用後の root 状態を所有する。
+Instance 初期化前から最初の `RootPresented` までに限り、logger は `wgpu_hal` / `wgpu_core` /
+`gpu_allocator` の crate 直下・子 module の Error を既存の非同期 writer へ渡す。
+別スレッドの Error はログだけに残し、root 初期化スレッドの現在試行にだけ上限付きの行を帰属させる。
+`request_device` の結果ごとに診断を確定し、次候補へ持ち越さない。`End(false)` だけで致命的失敗とは判断しない。
+Err 復帰時は cleanup 前に収集を止め、`run_native_failure.rs` へ snapshot を渡す。
+GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付きの別 API 案内を既存通知へ加え、
+ログと `terminal()` 前の起動記録へ保存する。原因の断定ではなく起動互換性と診断を改善する変更である。
+詳細・案内条件・対象外は [GPU 初期化計画](gpu-init-fallback-plan.md)。
+
 | モジュール | 役割 |
 | --- | --- |
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |

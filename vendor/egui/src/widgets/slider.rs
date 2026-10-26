@@ -199,6 +199,8 @@ impl<'a> Slider<'a> {
     /// and `clamp_to_range` is enabled, you would not have the ability to change the value.
     ///
     /// Default: `0.0` (disabled).
+    ///
+    /// Text edits are applied immediately by default, while preserving the typed text.
     #[inline]
     pub fn step_by(mut self, step: f64) -> Self {
         self.core.step = if step == 0.0 { None } else { Some(step) };
@@ -573,22 +575,39 @@ impl Slider<'_> {
     }
 
     fn value_ui(&mut self, ui: &mut Ui, geom: &SliderGeometry) -> Response {
-        let mut value = self.get_value();
+        let value = self.get_value();
         let speed = self.core.drag_value_speed_at(ui, geom, value);
         let bounds = self.core.editable_range();
-        let response = self.core.drag_value_ui(ui, &mut value, bounds, speed);
-
-        if value != self.get_value() {
-            self.set_value(value);
-        }
-        response
+        let core = &self.core;
+        let get_set_value = &mut self.get_set_value;
+        // Normalize inside the same get/set boundary DragValue observes. Its edit
+        // state must remember the stored value, not an unrounded local copy, or
+        // our own rounding would look like an external edit on the next frame.
+        core.drag_value_from_get_set_ui(
+            ui,
+            |new_value| {
+                if let Some(new_value) = new_value
+                    && new_value != core.existing(get(get_set_value))
+                {
+                    set(get_set_value, core.rounded(new_value));
+                }
+                core.existing(get(get_set_value))
+            },
+            bounds,
+            speed,
+        )
     }
 
     fn add_contents(&mut self, ui: &mut Ui) -> Response {
         let old_value = self.get_value();
 
         if self.core.clamping == SliderClamping::Always {
-            self.set_value(old_value);
+            if self.core.step.is_some() {
+                // Clamp existing storage without snapping an untouched value to the step grid.
+                set(&mut self.get_set_value, old_value);
+            } else {
+                self.set_value(old_value);
+            }
         }
 
         let mut response = ui.allocate_response(self.core.desired_size(ui), Sense::drag());
@@ -666,3 +685,7 @@ impl Widget for Slider<'_> {
         inner_response.inner | inner_response.response
     }
 }
+
+#[cfg(test)]
+#[path = "slider_tests.rs"]
+mod tests;

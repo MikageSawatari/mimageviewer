@@ -1,5 +1,17 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+### GPU の初期化（§1.448）
+
+root GUI の描画 API は `--gpu-backend auto|dx12|vulkan` で選ぶ。既定の `auto` は surface 対応の
+最初の DX12 adapter を試し、`request_device` が失敗した場合だけ最初の Vulkan adapter を一度試す。
+明示指定はその API だけを使う。AppCreator は成功した device で一回だけ呼ばれ、以後の surface / pipeline /
+描画の失敗、実行中の device lost、panic では開き直さない。成功した API の永続化もしない。
+DX12 の shader compiler は root GUI・独立した動画 HUD ともに FXC 固定で、root の Vulkan 指定は HUD の
+DX12 Instance や動画 native presenter（D3D11）を変更しない。
+試行別の結果・GPU / driver・初期化中だけ収集する Error はログと起動記録へ残す。
+この API 選択は報告環境の原因を確定した修正ではない。条件・診断 owner・テスト範囲の正本は
+[GPU 初期化計画](gpu-init-fallback-plan.md)、[アーキテクチャ概観](architecture-overview.md#コア) を参照。
+
 ### 本の構成と提示許可（§1.242 B2、2026-10-13）
 
 accepted構成は方向・表紙・可視実列・ページ指定を渡し、通常の共通builderでSpread/連結/editor/Remoteの組を生成する。

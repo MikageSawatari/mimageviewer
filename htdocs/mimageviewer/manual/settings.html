@@ -1295,8 +1295,8 @@
             <td>4 ページ</td>
           </tr>
           <tr>
-            <td>GPU メモリ上限</td>
-            <td>mImageViewer 全体が使用できる GPU メモリを VRAM の何 % にするか。一覧とフルスクリーン表示へ、現在の画面に合わせて自動で配分します。0% は無制限です</td>
+            <td id="gpu-memory-limit">GPU メモリ上限</td>
+            <td>mImageViewer 全体が使用できる GPU メモリを VRAM の何 % にするか。一覧とフルスクリーン表示へ、現在の画面に合わせて自動で配分します。0% は無制限です。0〜100% を 5% 刻みで指定します。手入力中も値は刻みに丸められますが、入力中の文字列は保たれるため、続けて桁を入力できます。実際の GPU 配分は OK で保存したときに変わります</td>
             <td>50%</td>
           </tr>
           <tr>
@@ -1517,7 +1517,7 @@
       </div>
     </div>
 
-    <h2>起動オプション（コマンドライン引数）</h2>
+    <h2 id="startup-options">起動オプション（コマンドライン引数）</h2>
     <div class="table-wrap">
       <table>
         <thead>
@@ -1531,6 +1531,10 @@
           <tr>
             <td><code>--window-size &lt;W&gt;x&lt;H&gt;</code></td>
             <td>起動時のウィンドウサイズを指定（例: <code>--window-size 1920x1080</code>）。ウィンドウ位置は画面左上付近に固定されます。</td>
+          </tr>
+          <tr>
+            <td><code>--gpu-backend auto|dx12|vulkan</code></td>
+            <td>画面の描画方式を選びます。省略時は <code>auto</code> で、起動時に DirectX 12 で GPU を使い始める処理が失敗すると Vulkan を一度試します。<code>dx12</code> / <code>vulkan</code> は指定した方式だけを使います。大文字・小文字は区別しません。起動中のアプリには反映されないため、タスクトレイの常駐も終了してから起動してください。</td>
           </tr>
           <tr>
             <td><code>&lt;パス&gt;</code></td>
@@ -1548,6 +1552,18 @@
         仕事用と趣味用など、設定を完全に分離して使いたい場合に活用できます。
       </div>
     </div>
+
+    <h3>ショートカットに描画方式を指定する</h3>
+    <ol>
+      <li>mImageViewer を終了します。タスクトレイに常駐している場合も終了してください。</li>
+      <li>起動用ショートカットを右クリックして「プロパティ」を開きます。</li>
+      <li>「リンク先」の末尾に、半角スペースと <code>--gpu-backend vulkan</code> を追記します。実行ファイルのパスを囲む引用符の外側に付けます。<br>
+        例: <code>"C:\Program Files\mImageViewer\mimageviewer.exe" --gpu-backend vulkan</code></li>
+      <li>「OK」を押し、そのショートカットから起動します。</li>
+    </ol>
+    <p>DirectX 12 を指定する場合は <code>vulkan</code> を <code>dx12</code> に置き換えてください。
+    指定は設定として保存されません。自動選択に戻すには、追加した引数を削除するか <code>auto</code> に変更します。
+    起動できない場合は<a href="troubleshooting.html#display-failure">表示処理の失敗についての案内</a>も確認してください。</p>
 
     <h2>設定の保存場所</h2>
     <div class="table-wrap">
