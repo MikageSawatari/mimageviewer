@@ -103,6 +103,10 @@ fn migrate_using<B: MigrationBackend>(
         }
     }
     backend.diagnostic_hosts();
+    // Until a decision is published neither plugin nor webview can be used by
+    // mIV Sound. They can only be an interrupted import, so discard them before
+    // deciding again. Never touch the opaque mIV state or other siblings.
+    clear_uncommitted_copies(request)?;
     if request.mode == MigrationMode::Portable
         || (request.mode == MigrationMode::Alternate
             && !present(&request.destination.join("mixwright-state.json"))?)
@@ -157,17 +161,6 @@ fn migrate_using<B: MigrationBackend>(
         ensure_separate_trees(source, &request.destination)?;
     }
 
-    // Never replace unknown destination data. This run owns only directories
-    // created below, including when a later copy or mark publication fails.
-    for name in ["plugin", "webview"] {
-        let path = request.destination.join(name);
-        if present(&path)? {
-            return Err(format!(
-                "migration destination already exists: {}",
-                path.display()
-            ));
-        }
-    }
     let _lease = if has_webview {
         let ebwebview = webview_source.join("EBWebView");
         require_directory(&ebwebview)?;
@@ -219,6 +212,39 @@ fn migrate_using<B: MigrationBackend>(
         }
     }
     result
+}
+
+fn clear_uncommitted_copies(request: &MigrationRequest) -> Result<(), String> {
+    let mut leftovers = Vec::new();
+    for name in ["plugin", "webview"] {
+        let path = request.destination.join(name);
+        if present(&path)? {
+            leftovers.push(path);
+        }
+    }
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    // Validate before deleting anything: even a malformed test-source override
+    // must not turn cleanup into deletion of the old data. The destination was
+    // checked above; cleanup only traverses these two literal direct children
+    // and unlinks reparse points without following them.
+    for source in [
+        request.source_root.join("Frieve").join("EffeTunePlugin"),
+        request.source_root.join("effetune"),
+        request.source_root.join("mimageviewer-vst3-host.exe"),
+    ] {
+        ensure_separate_trees(&source, &request.destination)?;
+    }
+    for path in leftovers {
+        crate::logger::log(format!(
+            "[EffeTune migration] removing interrupted copy {}",
+            path.display()
+        ));
+        remove_owned_tree(&path)
+            .map_err(|e| io_error("remove interrupted migration copy", &path, e))?;
+    }
+    Ok(())
 }
 
 fn wait_for_source_processes<B: MigrationBackend>(

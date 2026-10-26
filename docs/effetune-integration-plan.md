@@ -260,6 +260,7 @@ enum EffetuneFailure {
 
 F2a・F2b-1 でも下記の保存済み状態・設定項目の名前と意味は変更しない。派生版自身の保存領域と、
 旧共通領域からの一度だけの移行は [派生版計画 §4〜5](effetune-fork-plan.md) が正本。
+移行の印を唯一の確定点とし、印がない `plugin/`・`webview/` は中断したコピーとして次回起動で破棄・再コピーする。通常終了は待たせず、既存の `mixwright-state.json` には触れない。
 `src/effetune/migration.rs` が `<data_dir>/effetune/plugin` と `webview` を作り、判断の印を置く。
 App は `src/effetune/startup.rs` の worker の結果を待ち、印の判断が済むまで音響調整・ユーザー VST・
 スキャン用 host を起動しない。失敗した起動では音響調整だけを禁止し、ユーザー VST は結果採用後に使える。

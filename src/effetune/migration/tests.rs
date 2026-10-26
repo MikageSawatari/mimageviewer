@@ -271,6 +271,8 @@ fn migration_existing_either_decision_prevents_all_source_work() {
     for mark in [DONE, NOT_APPLICABLE] {
         let f = Fixture::new();
         f.destination(mark, b"decision");
+        f.destination("plugin/keep", b"committed plugin data");
+        f.destination("webview/keep", b"committed webview data");
         f.config();
         f.webview();
         let before = snapshot(&f.request.destination);
@@ -512,20 +514,152 @@ fn migration_copy_read_failure_cleans_new_plugin_directory() {
 }
 
 #[test]
-fn migration_never_overwrites_or_cleans_preexisting_destination_trees() {
-    for name in ["plugin", "webview"] {
-        let f = Fixture::new();
-        f.config();
-        f.destination(&format!("{name}/keep"), b"existing user data");
-        let before = snapshot(&f.request.destination);
-        assert!(
-            f.run(&mut FakeBackend::default())
-                .unwrap_err()
-                .contains("destination already exists")
+fn migration_interrupted_copy_is_discarded_and_reimported_on_next_start() {
+    let f = Fixture::new();
+    f.config();
+    f.webview();
+    f.destination("mixwright-state.json", b"opaque original state");
+    f.destination("other/keep", b"unrelated data");
+    let original = snapshot(&f.request.source_root);
+    // An unwind skips the ordinary Result-error cleanup, like a process exit
+    // between copying and publishing the decision (without killing a process).
+    let interrupted = std::panic::catch_unwind(|| {
+        migrate_using(&f.request, &mut FakeBackend::default(), |phase| {
+            if phase == "copy_end" {
+                assert!(!f.request.destination.join(DONE).exists());
+                panic!("simulate exit before migration commit");
+            }
+            Ok(())
+        })
+    });
+    assert!(interrupted.is_err());
+    f.no_decision();
+    assert!(f.request.destination.join("plugin/config.json").exists());
+    assert!(f.request.destination.join("webview/EBWebView").exists());
+    f.destination("plugin/stale", b"incomplete prior attempt");
+    f.destination("webview/stale/nested", b"incomplete prior attempt");
+    f.source("Frieve/EffeTunePlugin/config.json", br#"{"gain":0.75}"#);
+    assert_eq!(
+        f.run(&mut FakeBackend::default()).unwrap(),
+        MigrationOutcome::Done
+    );
+    assert!(f.request.destination.join(DONE).is_file());
+    assert!(!f.request.destination.join("plugin/stale").exists());
+    assert!(!f.request.destination.join("webview/stale").exists());
+    assert_eq!(
+        fs::read(f.request.destination.join("plugin/config.json")).unwrap(),
+        br#"{"gain":0.75}"#
+    );
+    assert_eq!(
+        fs::read(
+            f.request
+                .destination
+                .join("webview/EBWebView/Default/Local Storage/user")
+        )
+        .unwrap(),
+        b"user data"
+    );
+    assert_eq!(
+        fs::read(f.request.destination.join("mixwright-state.json")).unwrap(),
+        b"opaque original state"
+    );
+    assert_eq!(
+        fs::read(f.request.destination.join("other/keep")).unwrap(),
+        b"unrelated data"
+    );
+    let mut expected = original;
+    expected.insert(
+        PathBuf::from("Frieve/EffeTunePlugin/config.json"),
+        br#"{"gain":0.75}"#.to_vec(),
+    );
+    assert_eq!(snapshot(&f.request.source_root), expected);
+}
+
+#[test]
+fn migration_ineligible_decision_also_discards_only_uncommitted_copy_roots() {
+    for mode in [
+        MigrationMode::Normal,
+        MigrationMode::Alternate,
+        MigrationMode::Portable,
+    ] {
+        let mut f = Fixture::new();
+        f.request.mode = mode;
+        f.destination("plugin/stale", b"partial");
+        f.destination("webview/stale", b"partial");
+        f.destination("other/keep", b"unrelated");
+        if mode == MigrationMode::Portable {
+            f.destination("mixwright-state.json", b"opaque state");
+        }
+        assert_eq!(
+            f.run(&mut FakeBackend::default()).unwrap(),
+            MigrationOutcome::NotApplicable
         );
-        assert_eq!(before, snapshot(&f.request.destination));
-        f.no_decision();
+        assert!(!f.request.destination.join("plugin").exists());
+        assert!(!f.request.destination.join("webview").exists());
+        assert_eq!(
+            fs::read(f.request.destination.join("other/keep")).unwrap(),
+            b"unrelated"
+        );
+        if mode == MigrationMode::Portable {
+            assert_eq!(
+                fs::read(f.request.destination.join("mixwright-state.json")).unwrap(),
+                b"opaque state"
+            );
+        }
     }
+}
+
+#[test]
+fn migration_cleanup_rejects_source_overlap_before_deleting_leftovers() {
+    let mut f = Fixture::new();
+    f.request.destination = f.request.source_root.join("effetune");
+    f.destination("plugin/stale", b"preserve old source");
+    let before = snapshot(&f.request.source_root);
+    assert!(
+        f.run(&mut FakeBackend::default())
+            .unwrap_err()
+            .contains("overlap")
+    );
+    assert_eq!(snapshot(&f.request.source_root), before);
+    f.no_decision();
+}
+
+#[cfg(windows)]
+#[test]
+fn migration_locked_leftover_fails_without_decision_and_retries_next_start() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    f.config();
+    f.destination("plugin/busy", b"interrupted copy");
+    f.destination("mixwright-state.json", b"preserve original state");
+    let original = snapshot(&f.request.source_root);
+    let handle = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(f.request.destination.join("plugin/busy"))
+        .unwrap();
+    assert!(
+        f.run(&mut FakeBackend::default())
+            .unwrap_err()
+            .contains("remove interrupted migration copy")
+    );
+    f.no_decision();
+    assert_eq!(
+        fs::read(f.request.destination.join("mixwright-state.json")).unwrap(),
+        b"preserve original state"
+    );
+    assert_eq!(snapshot(&f.request.source_root), original);
+    drop(handle);
+    assert_eq!(
+        f.run(&mut FakeBackend::default()).unwrap(),
+        MigrationOutcome::Done
+    );
+    assert!(!f.request.destination.join("plugin/busy").exists());
+    assert_eq!(
+        fs::read(f.request.destination.join("mixwright-state.json")).unwrap(),
+        b"preserve original state"
+    );
+    assert_eq!(snapshot(&f.request.source_root), original);
 }
 
 #[test]
