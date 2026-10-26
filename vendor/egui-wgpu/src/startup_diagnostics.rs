@@ -32,6 +32,13 @@ pub enum StartupDiagnosticEvent {
         success: bool,
     },
     AdapterSelected(wgpu::AdapterInfo),
+    /// Definitive result of a device request, emitted before the next candidate.
+    DeviceAttempt {
+        /// One-based index in the ordered adapter candidates.
+        attempt: usize,
+        info: wgpu::AdapterInfo,
+        result: Result<(), String>,
+    },
     /// Emitted only after the real root `Queue::present` returns.
     RootPresented {
         frame: u64,

@@ -24,6 +24,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(test)]
 mod egui037_stage4_gpu_tests;
 mod egui_output;
+mod gpu_startup_diagnostics;
 mod run_native_failure;
 #[cfg(test)]
 mod test_native_focus;
@@ -931,6 +932,7 @@ fn maybe_handle_version_or_help() -> bool {
              Options:\n  \
              -V, --version  Print version and exit\n  \
              -h, --help     Print this help and exit\n  \
+             --gpu-backend auto|dx12|vulkan  Select the startup graphics API\n  \
              --diag-startup-windows  Record startup HWND diagnostics (Windows)\n  \
              \n\
              PATH  Open the given image file or folder on startup.\n",
@@ -1247,6 +1249,27 @@ pub fn run() -> eframe::Result {
         Some(guard)
     };
 
+    let gpu_args: Vec<String> = std::env::args_os()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    let gpu_request = match wgpu_backend_policy::GpuBackendRequest::parse_args(&gpu_args) {
+        Ok(request) => request,
+        Err(error) => {
+            data_dir::show_fatal_messagebox(&error.to_string());
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup(2);
+        }
+    };
+    #[cfg(feature = "test-script")]
+    let gpu_fail_dx12 = match wgpu_backend_policy::parse_fail_device_args(&gpu_args) {
+        Ok(request) => request,
+        Err(error) => {
+            data_dir::show_fatal_messagebox(&error.to_string());
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup(2);
+        }
+    };
+
     install_panic_log_hook();
     install_texture_delta_ledger();
     #[cfg(windows)]
@@ -1516,15 +1539,12 @@ pub fn run() -> eframe::Result {
         }
     }
 
-    // wgpu のバックエンドは **DX12 を優先 + Vulkan フォールバック**。
-    // wgpu 既定のスコアリングでは Vulkan が DX12 より優先選択される環境があるため、
-    // カスタムアダプタセレクタで明示的に DX12 アダプタを最優先する。DX12 が無ければ
-    // Vulkan、それも無ければ任意の adapter を返す (eframe / egui 自体は描画される)。
-    // native video は独立した D3D11 device、HUD は別の DX12 Instance を使い、
-    // root GUI の選択 backend に依存しない。
+    // Finite root API selection completes before AppCreator runs.
+    // Native video and its separate DX12 HUD remain independent.
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
+        gpu_startup_diagnostics::observe(&event);
         use egui_wgpu::{StartupDiagnosticEvent as Event, StartupGpuStage as Gpu};
         let stage = |gpu| match gpu {
             Gpu::TextureDelivery => miv_startup::Stage::TextureDelivery,
@@ -1569,31 +1589,36 @@ pub fn run() -> eframe::Result {
                 ),
             ),
             Event::RootPresented { normal, .. } => miv_startup::mark_present(normal),
+            Event::DeviceAttempt { .. } => {}
         }
     }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends = wgpu_backend_policy::native_backends();
-        create_new.native_adapter_selector = Some(std::sync::Arc::new(
-            |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
-                if let Some(a) = adapters
+        configure_root_gpu_descriptor(&mut create_new.instance_descriptor, gpu_request);
+        create_new.native_adapter_candidates = Some(Arc::new(move |adapters, surface| {
+            let candidates = gpu_request.native_adapter_candidates(adapters, surface);
+            gpu_startup_diagnostics::candidates(
+                &candidates
                     .iter()
-                    .find(|a| a.get_info().backend == wgpu::Backend::Dx12)
-                {
-                    return Ok(a.clone());
-                }
-                if let Some(a) = adapters
-                    .iter()
-                    .find(|a| a.get_info().backend == wgpu::Backend::Vulkan)
-                {
-                    return Ok(a.clone());
-                }
-                adapters
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| "no wgpu adapter available".to_string())
-            },
-        ));
+                    .map(|a| a.get_info().backend)
+                    .collect::<Vec<_>>(),
+            );
+            Ok(candidates)
+        }));
+        #[cfg(feature = "test-script")]
+        {
+            let descriptor = Arc::clone(&create_new.device_descriptor);
+            create_new.device_descriptor = Arc::new(move |adapter| {
+                let mut desc = descriptor(adapter);
+                wgpu_backend_policy::inject_device_failure(
+                    gpu_fail_dx12,
+                    &adapter.get_info(),
+                    &mut desc,
+                );
+                desc
+            });
+        }
     }
+
     let options = eframe::NativeOptions {
         system_font_fallback: false,
         viewport,
@@ -1725,6 +1750,7 @@ pub fn run() -> eframe::Result {
         None::<book_composition::BookCompositionProcessOwner>,
     ));
     let creator_book_composition_owner = Arc::clone(&book_composition_owner);
+    gpu_startup_diagnostics::begin(gpu_request);
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -2175,6 +2201,8 @@ fn cli_flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "--data-dir"
+            | "--gpu-backend"
+            | "--gpu-test-fail-device"
             | "--test-script"
             | "--settings-override"
             | "--window-size"
@@ -2191,6 +2219,14 @@ fn cli_flag_takes_value(flag: &str) -> bool {
             // ここに登録しないと、続く <ver> が startup パスとして開かれてしまう (Codex P3)。
             | "--whatsnew-from"
     )
+}
+
+fn configure_root_gpu_descriptor(
+    descriptor: &mut wgpu::InstanceDescriptor,
+    request: wgpu_backend_policy::GpuBackendRequest,
+) {
+    descriptor.backends = request.backends();
+    descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
 }
 
 /// メインウィンドウの最小 inner サイズ (論理ポイント)。これ以下ではアドレスバーの
@@ -2225,6 +2261,40 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn gpu_startup_root_descriptor_uses_requested_api_and_fxc() {
+        use wgpu_backend_policy::GpuBackendRequest as Request;
+        for request in [Request::Auto, Request::Dx12, Request::Vulkan] {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            configure_root_gpu_descriptor(&mut descriptor, request);
+            assert_eq!(descriptor.backends, request.backends());
+            assert!(matches!(
+                descriptor.backend_options.dx12.shader_compiler,
+                wgpu::Dx12Compiler::Fxc
+            ));
+        }
+    }
+
+    #[test]
+    fn gpu_startup_values_never_become_core_open_paths() {
+        for flag in ["--gpu-backend", "--gpu-test-fail-device"] {
+            for value in ["auto", "dx12", "vulkan"] {
+                let args = os_args(&["core.exe", flag, value]);
+                assert_eq!(parse_startup_open_path_arg_from(&args), None);
+                let args = os_args(&["core.exe", flag, value, "C:\\images"]);
+                assert_eq!(
+                    parse_startup_open_path_arg_from(&args),
+                    Some(PathBuf::from("C:\\images"))
+                );
+                let args = os_args(&["core.exe", flag, value, "--", "--book"]);
+                assert_eq!(
+                    parse_startup_open_path_arg_from(&args),
+                    Some(PathBuf::from("--book"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn panic_and_watchdog_direct_log_remains_independent_of_full_stalled_writer() {

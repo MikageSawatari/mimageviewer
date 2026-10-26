@@ -217,3 +217,191 @@ GPU 診断: <wgpu の直近のエラー 1〜2 行。無ければ「追加情報�
 | P3-6 panic は §1.428 のダイアログに入らない | §5.1: Err を返す失敗だけが対象と訂正 |
 | P3-7 DX12 が失敗したとは確定していない | §5.2: backend 不明と訂正、互換性向上として入れる |
 | P3-8 `ui_harness` の変更は GPU fixture に効かない | §3・§4: 範囲を明記、fixture も FXC に |
+
+## 11. 実装・検証記録 (2026-10-26)
+
+### 11.1 実装範囲
+
+- core / launcher の引数処理と help、`wgpu_backend_policy.rs` の要求・surface 対応候補順、test-script 限定の実 device 要求への失敗注入。
+- vendor `egui-wgpu` の順序付き候補 callback、各試行の結果 event、GPU 不要の generic 試行関数と8件の回帰検査。既存 selector / web 経路を保持。
+- `gpu_startup_diagnostics.rs` に root 診断の単一 owner を追加。起動中の Error filter、試行別確定、別スレッドの除外、Err 復帰時の snapshot と条件付き通知を接続。
+- root / HUD / UI harness / 独立 GPU fixture の FXC 固定。UI harness だけが `MIV_TEST_GPU_BACKEND` を読む。
+- マニュアル2ページ、旧失敗通知計画§6、architecture-overview、display-pipeline、README索引、vendor PATCHESを更新。CHANGELOG・製品ページは変更しない。
+
+設計の変更はない。コードの小さな相違として、比較・パノラマのテストは共通 `OffscreenGpu` を使うので、その生成元だけを変更した。
+追加で見つかった独立 Instance は `gpu_lanczos.rs` の2か所、`app/final_prepare_budget/native_tests.rs`、
+`ui_fullscreen/canonical_demand/draw_key_tests.rs`、`ui_fullscreen/page_turn/final_prepare_tests.rs` で、同じFXC指定だけを加えた。
+起動記録のキーは `record_detail` が static str を要求するため、最大2候補に対応する `gpu.adapter.1/2`・`gpu.attempt.1/2` を固定文字列で渡す。
+値の256 bytes制限とUTF-8境界の短縮は既存起動記録ownerに任せ、通常ログには全文を残す。
+
+独立コードレビュー (GPT-6.1 Sol / xhigh、実装者と別context) と追補レビューを実施。
+追加したlauncher新規起動経路テストの `OsString` import漏れ (P2) を修正し、独立再確認済み。最終的に修正必須の未解決指摘なし。
+静的レビューの合格は、実 surface・実機の成功を示すものではない。
+
+### 11.2 回帰検査と修正前の確認
+
+- backend policy: 値・大小文字・欠値・不正値・`--`・他flagの値の消費・各APIの候補順・欠落/非対応surfaceを検査。feature付きでは注入flagとDX12だけのlimits変更も検査。
+- core / launcher: GPU flag値をパスとして開かないこと、後続パス、`--` の組合せ。既存instanceへの転送では要求を適用せず、起動時だけ解析する。
+- 診断: crate直下/子target、対象外、Instance前/列挙中の行、別thread、0/1/2/長いUTF-8行、試行別確定、Vulkan成功後の段階、回復したEnd(false)、ドライバ不明、案内条件、停止後filterを検査。
+- 実 `ProductDiagnostics.log` を使うfake logger検査で、root診断への接続・別thread除外・収集停止を確認。diskへの全文保存を検証したものではない。
+- 既存の終了境界テストで記録→cleanup→terminal→flush→表示とscripted_runの表示抑止を継続検査。root/HUD/harnessのFXC設定もGPUなしで検査。
+- 修正前RED: `HEAD=50925008d7120cb1b8636899ffa4b6498c4a5331` と現在のcore/launcherから、実際のパス解析2関数を独立Rust testへ抽出して同じassertionを適用。
+  各baselineはcompile exit 0、test exit 101 (6失敗/1成功)。各currentはcompile/test exit 0 (7成功)。
+  失敗は両GPU flagの「パスなし/実パス/`--`後のパス」で値`auto`を開くパスに採用するもの。API不足によるcompile failureではない。
+  コマンド・結果・ログは `target/gpuinit-validation/cli_red_results.json`。実行入口は `python target/gpuinit-validation/build_cli_red_fixtures.py` (exit 0)。
+
+### 11.3 自動検証
+
+対象はこの作業ツリーの未コミット差分。native buildは `MSBUILDDISABLENODEREUSE=1`。
+初回の並列MSBuild停止後、checkと最初のtest用compileは `CARGO_BUILD_JOBS=1`、
+native buildの前提が揃った後のrelease build・追加nextestは24で実行した。設定ファイルは変更していない。
+コマンド全文・終了コード・所要時間・stdout/stderrは `target/gpuinit-validation/` の各JSON / logに保存。
+以下のF0 / F1 / Gは `-E` に渡した文字列の略記で、JSONには展開済みの実引数を保存する。
+
+```text
+F0 = test(/gpu_startup|wgpu_backend_policy|run_native_failure|overlay_instance|requests_product_backends|startup_open_path/)
+F1 = test(/gpu_startup|wgpu_backend_policy|run_native_failure|overlay_instance|requests_product_backends/)
+G  = test(/egui037_stage4_gpu_tests|compare_wgpu|panorama_wgpu|gpu_lanczos::prewarm_tests|canonical_demand::draw_key_tests|final_prepare_budget::native_tests|page_turn::final_prepare_tests|ordinary_prepare_output_limit_fallback_captures_actual_managed_allocation|back_native_execution_rechecks_no_removal/)
+```
+
+| コマンド | exit | 結果 |
+| --- | ---: | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 通常版。`core-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script` | 0 | `script-check.log` |
+| `cargo check -p mimageviewer-launcher` | 0 | 内包する3本のrelease exeを用意した後に成功。`launcher-check.log` |
+| `cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib` | 0 | 45成功。既存のvendor検査方法。run ID `8f0e6866-96ba-4cbf-bce4-29b1b00a0c61` |
+| `cargo nextest run -p mimageviewer --lib -E '<F0>'` | 0 | 89成功。`focused.log` |
+| `cargo nextest run -p mimageviewer --lib --features test-script -E '<F1>'` | 0 | 29成功。失敗注入の解析・limits設定を含む。`focused-script.log` |
+| `cargo nextest run -p mimageviewer --lib -E '<G>'` | 0 | FXC指定を加えた既存GPU fixture関連47成功。`gpu-fixtures.log` |
+| `cargo nextest run -p mimageviewer-launcher` | 0 | 43成功、既存の子プロセス専用helper 1件はskip。`launcher-tests.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 4294967295 | 200成功後、1件がnative例外で停止。非侵入stack採取後、そのtestだけを終了した結果の `0xffffffff`。元の例外コードではない (§11.4) |
+| `cargo nextest run -p mimageviewer --test ui_snapshot -E 'test(=folder_toolbar_flexible_snapshots)'` | 0 | 停止したcaseを単独・別processで検査して成功。`snapshot-folder-isolated.log` |
+| `cargo nextest run -p mimageviewer --test ui_snapshot` | 0 | 既定backend、201成功。`snapshot-nextest.log` |
+| `MIV_TEST_GPU_BACKEND=vulkan cargo test -p mimageviewer --test ui_snapshot` | 101 | 環境変数は子processにだけ設定。189成功 / 12画像差分。期待PNGを更新せず保存 (§11.4) |
+| `cargo fmt --check` | 0 | workspace |
+| `rustfmt --check --edition 2024 vendor/egui-wgpu/src/lib.rs vendor/egui-wgpu/src/setup.rs vendor/egui-wgpu/src/startup_diagnostics.rs vendor/egui-wgpu/src/adapter_candidates.rs` | 0 | workspace除外vendorも確認 |
+| `python scripts/check_ui_glyphs.py` | 0 | 危険グリフ0件 |
+| `git diff --check` | 0 | whitespace問題なし |
+
+UIの追加nextest2回は、それぞれのPython親processにだけ `SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)` を設定し、
+子のcrash dialogを抑止した。テストの期待値・validation設定・renderer機能は変更しない。
+
+初回の非ゼロ結果も成功扱いしない:
+
+- core check初回は `turbojpeg-sys` の並列CMake/MSBuildで停止 (tool exit 1)。
+  同じ生成済みbuild directoryを `cmake --build target/debug/build/turbojpeg-sys-4adae978226e4e06/out/build --target install --config Debug --parallel 1 -- /verbosity:normal /fileLogger /fileLoggerParameters:LogFile=G:/home/mimageviewer-gpuinit/target/turbojpeg-msbuild.log` で検査しexit 0。
+  `CARGO_BUILD_JOBS=4` のcore checkもcargo exit 101で停止したが、1で通過した。ffmpeg-sysのAVは観測していない。
+- launcher check初回は内包用core / remote / EPUB workerのrelease exe未作成でbuild.rsが停止 (tool exit 1)。各実体のbuild後に再検査した。
+- vendor test初回は追加テストの関数型に `&'static str` の明示が足りずcompile失敗 (tool exit 1)、修正済み。
+  その後の `cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib` は43成功 / 2失敗 (tool exit 1):
+  `hwnd_logs_each_oversized_request_but_not_within_limit_or_nosize` のlog assertionと
+  `zero_client_surface_skips_configure_and_acquire_then_resumes_rendering` の `RecreationAttempt`。
+  プロセス共有のある並列cargo testの結果を残し、repo既定のnextestで全45件の成功を確認した。該当コード・期待値は変更しない。
+
+### 11.4 snapshotの結果と残る判断
+
+既定のcargo testでは `folder_toolbar_flexible_snapshots` が停止し、PID 4040 / 実行pathがこのworktreeのtest binaryであることを確認した。
+`cdb.exe -pv -p 4040 -sins -y G:\home\mimageviewer-gpuinit\target\debug\deps -logo G:\home\mimageviewer-gpuinit\target\gpuinit-validation\ui-snapshot-hang-stack.txt -c "~* kb; q"` (exit 0) で非侵入採取。
+test threadは `D3D12SDKLayers` の `RaiseException` → `UnhandledExceptionFilter` → `ZwRaiseHardError` で待機していた。
+到達stackは `CreateSampler` → `wgpu_hal::dx12::SamplerHeap::create_sampler` → `egui_wgpu::Renderer::update_texture` → 当該caseの `Harness::render`。
+device要求中ではない。製品exeを起動したり、dialogへ入力したりせず、採取後にpathを照合して自分のtest PIDだけを終了した。
+
+当該case単独のnextestは成功し、既定UI全201件のnextestも成功した。
+ただし、元の並列cargo testでの停止を解消した証拠ではなく、変更前HEADとの実行比較もしていない。
+今回の回帰・既存不具合・driver/検証環境のどれかは未確定。例外コードとSDK layerのメッセージも未取得。
+独立レビューでもsampler記述子 / heap / texture uploadの直接の変更はなく、harnessのCPU優先selectorと既定backend maskは従来のままと確認した。
+既存のWGL AV (§1.175) と同じ原因とは分類しない。catch追加、validation無効化、描画機能削減は行っていない。
+
+Vulkanは201件を完走し、189成功 / 以下の12件が画像比較で失敗した。
+「Diff」はテストが不一致と判定した画素数で、各1〜15。許容する差か不具合かは未判定で、閾値や期待PNGは変えていない。
+
+| snapshot名 | Diff |
+| --- | ---: |
+| `audio_thumbnail_indicator_modes_light` | 15 |
+| `collection_placeholder_light` | 1 |
+| `cut_item_appearance_dark` | 6 |
+| `cut_item_appearance_light` | 2 |
+| `details_icons_dark` | 4 |
+| `details_name_colors_dark` | 7 |
+| `effetune_show_only_active_tooltip_dark` | 1 |
+| `everything_search_disabled_menu_hover_dark` | 1 |
+| `file_organize_many_dark` | 1 |
+| `file_type_visibility_status_dark` | 1 |
+| `global_search_short_term_reject_dark` | 2 |
+| `metadata_panel_similar_results_dark` | 7 |
+
+元PNG・Vulkanの `.new.png` / `.diff.png` は `target/gpuinit-validation/vulkan-snapshot-diffs/` に保存し、
+画素数は `vulkan-snapshot-differences.json`、判定閾値別の詳細は `snapshot-vulkan.log` に保存した。
+最多15画素の比較画像を目視した範囲では大きな配置差は見えないが、12件全体の許容判断の代わりにはしない。
+`git diff --name-only -- tests/snapshots` は空。Vulkan指定が効くのはharness経由のUIテストだけで、独立GPU fixture47件をVulkan固定で検査したという意味ではない。
+
+### 11.5 検証用buildと実アプリで確認する操作
+
+launcherの内包入力も必要なので、dev-runtimeの代わりにrelease構成を用意した。
+coreは失敗注入を使える **test-script付き・portableなし・未署名の検証用**。配布物ではない。いずれもbuildのみで、製品exeは起動していない。
+
+| コマンド | exit |
+| --- | ---: |
+| `cargo check --release -p mimageviewer --bin mimageviewer-core --features test-script` | 0 |
+| `cargo build --release -p mimageviewer --bin mimageviewer-core --features test-script` | 0 |
+| `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets` | 0 |
+| `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` | 0 |
+| `cargo build --release -p mimageviewer-launcher --bin mimageviewer` | 0 |
+| `scripts/check-vcrt-pe-dependencies.ps1 -InputPaths <releaseのlauncher/core/remote/EPUB worker 4本> -RequireCompanionRuntime -ReportPath target/gpuinit-validation/release-runtime-pe.json` | 0 |
+
+FFmpeg 6 DLLと公式VC runtime 4 DLLを `target/release` に実体copyし、runtime 4 / PE 4 の検査が成功。
+完全な実引数・条件は `release-preflight-result.json`、`release-core-result.json`、`companions-results.json`、`launcher-results.json` に記録。
+通常profileの起動は `Start-Process -FilePath .\target\release\mimageviewer.exe`。
+引数なしでは実利用中の `%APPDATA%\mimageviewer` を開き、設定・データを更新し得る。
+インストール版 / tray常駐版を先に終了する。今回の実アプリ確認は、repo rootから次の隔離 `--data-dir` で行う。
+
+```powershell
+# auto: DX12 request failure -> Vulkan success; verify both attempt records.
+Start-Process -FilePath .\target\release\mimageviewer-core.exe -ArgumentList '--data-dir', '.\target\gpuinit-manual', '--gpu-test-fail-device', 'dx12'
+
+# After closing the first run: one DX12 failure, fatal dialog and Vulkan guidance.
+Start-Process -FilePath .\target\release\mimageviewer-core.exe -ArgumentList '--data-dir', '.\target\gpuinit-manual', '--gpu-backend', 'dx12', '--gpu-test-fail-device', 'dx12'
+
+# After dismissing the failure: explicit Vulkan, without failure injection.
+Start-Process -FilePath .\target\release\mimageviewer-core.exe -ArgumentList '--data-dir', '.\target\gpuinit-manual', '--gpu-backend', 'vulkan'
+```
+
+1. auto注入でGUIが開き、隔離directoryのログ・起動記録にDX12失敗とVulkan成功、`request=auto` の採用が残ること。
+2. 明示DX12+注入では開き直さず、GPU名・ドライバ・DeviceRequest・Vulkanの起動案内を表示して非ゼロ終了すること。
+   limits注入ではHAL Errorが無く「追加情報なし」も正常。HRESULT / Lostの再現ではない。
+3. 明示Vulkanで通常UI・画像・比較・パノラマ・Lanczos・NIS・Pixel AA・Anime4K、および動画のnative presenter (D3D11) とHUD (別DX12 Instance) を確認すること。
+
+これらの実アプリ確認と `test-lib-full.ps1` は未実施で、依頼どおりClaudeCodeの後続検証に残す。
+報告者の環境の「Parent device is lost」の根本原因と、実driverでのDX12失敗→Vulkan成功も未確認。
+commit / push / release公開 / CHANGELOG編集は行っていない。
+
+### 11.6 変更ファイル (26ファイル)
+
+```text
+crates/launcher/src/main.rs
+docs/README.md
+docs/architecture-overview.md
+docs/display-pipeline.md
+docs/gpu-init-fallback-plan.md
+docs/render-init-failure-report-plan.md
+htdocs/mimageviewer/manual/settings.html
+htdocs/mimageviewer/manual/troubleshooting.html
+src/app/final_prepare_budget/native_tests.rs
+src/egui037_stage4_gpu_tests.rs
+src/gpu_lanczos.rs
+src/gpu_lanczos/prewarm_tests.rs
+src/gpu_startup_diagnostics.rs
+src/lib.rs
+src/logger.rs
+src/run_native_failure.rs
+src/ui_fullscreen/canonical_demand/draw_key_tests.rs
+src/ui_fullscreen/page_turn/final_prepare_tests.rs
+src/video/native_presenter/overlay_gpu.rs
+src/wgpu_backend_policy.rs
+tests/support/ui_harness.rs
+vendor/egui-wgpu/PATCHES.md
+vendor/egui-wgpu/src/adapter_candidates.rs
+vendor/egui-wgpu/src/lib.rs
+vendor/egui-wgpu/src/setup.rs
+vendor/egui-wgpu/src/startup_diagnostics.rs
+```

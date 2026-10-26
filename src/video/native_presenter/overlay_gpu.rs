@@ -26,12 +26,18 @@ pub(super) struct OverlayGpuService {
 }
 
 impl OverlayGpuService {
+    fn instance_descriptor() -> wgpu::InstanceDescriptor {
+        let mut descriptor = wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        };
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        descriptor
+    }
+
     fn new() -> Self {
         Self {
-            instance: wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::DX12,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            }),
+            instance: wgpu::Instance::new(Self::instance_descriptor()),
             epochs: Mutex::new(Vec::new()),
             next_generation: AtomicU64::new(1),
         }
@@ -313,6 +319,16 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_instance_stays_dx12_with_fxc_independent_of_root_backend() {
+        let descriptor = OverlayGpuService::instance_descriptor();
+        assert_eq!(descriptor.backends, wgpu::Backends::DX12);
+        assert!(matches!(
+            descriptor.backend_options.dx12.shader_compiler,
+            wgpu::Dx12Compiler::Fxc
+        ));
+    }
 
     #[derive(Clone, Copy)]
     struct EpochCandidate {
