@@ -1455,6 +1455,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-26 §1.444 一覧の表示順で前後の本へ移る操作 (設計段階の記録)
+
+- 正本: `list-order-book-navigation-plan.md` 第 3 版。設計担当 ClaudeCode と Codex の独立設計レビュー (第 2 版・第 3 版) は、
+  context 所有の凍結データを bundle に載せ、利用資格を owner id・表示先・現在の場所から導く方針が、
+  症状パッチではなく構造的な設計であることに合意済み。
+- 触れる範囲: `ViewerContextBundle` に `list_order: Option<Arc<ListOrderSnapshot>>` を 1 field 足す。初期化・bundle swap・
+  fork の `keep_in_main` 分類 (子は空) を明示する。registry の table の遷移規則 (park / mount / fork / promote) は変えない。
+- 表示先の判定: 操作は `ViewerPresentation::MainWindow | Fullscreen` で使え、`DetachedWindow`・独立 owner では通知だけ。
+  promote 後の旧 main に残った列は、`owner` が新しい main id と一致しないので使えない (消す処理は足さない)。
+- 実装で範囲が変わったら、この記録を更新する。
+
 ### 2026-10-23 §1.419 起動系の明示要求を受付順に揃える
 
 - 正本: `startup-diagnostics-plan.md` §6.2.2 第3版。設計担当 ClaudeCode と

@@ -1,6 +1,6 @@
 # 一覧の表示順で前後の本へ移る操作 (§1.444)
 
-2026-10-26 第 3 版 (ClaudeCode)。設計・作業指示・検収 = ClaudeCode、実装 = Codex、独立レビューは通常どおり。
+2026-10-26 第 3 版 (ClaudeCode)。第 3 版の独立レビューは ACCEPT WITH CHANGES で、指摘 4 件を反映済み (§9)。設計・作業指示・検収 = ClaudeCode、実装 = Codex、独立レビューは通常どおり。
 v4.9.0 の候補。コードの事実は 2026-10-26 時点の master を読んだもので、実行時の観測は無い。
 
 - 2026-10-26 利用者決定: **Ctrl+↑↓ (フォルダの木の順) は変えず、別操作にする**。一覧の順は「その一覧の中」しか
@@ -32,7 +32,7 @@ v4.9.0 の候補。コードの事実は 2026-10-26 時点の master を読ん�
 - `press_multiplicity` は Ctrl+↑↓ と同じ `EachPhysicalPress`。新しいゲームパッド割り当ては足さない。
 - 既存の Ctrl+↑↓・Ctrl+PageUp/Down の挙動は変えない。
 
-## 3. 状態: 最後に本を開いた一覧の、凍結した列
+## 3. 状態: 最後に通常フォルダ一覧から本を開く操作を受け付けた時点の、凍結した列
 
 ### 3.1 型と持ち主
 
@@ -71,7 +71,7 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
   要求の source が `Collection` / `Rating` owner でない / スマートフォルダの入口 (`begin_smart_grid_container_navigation`) に入らない。
   評価一覧・スマートフォルダ・検索結果・閲覧履歴・コレクション・ブックマーク・サブフォルダ展開・ドライブ一覧からは取らない。
 - 下位の汎用 load 関数では取らない (DFS・起動時 open・アドレスバー入力が混ざるため)。
-- 開く操作が取消・失敗しても、列は「いま見ている一覧」の写しなので害は無い。次に本を開けば、また置き換わる。
+- 開く操作が取消・失敗しても、列は「いま見ている一覧」の写しなので害は無い。元の列へ戻す処理は作らない。次に本を開けば、また置き換わる。
 
 ### 3.4 使える条件と今の位置 (毎回求める)
 
@@ -83,12 +83,23 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 3. 表示先が `ViewerPresentation::MainWindow` か `Fullscreen` (通常の専用フルスクリーン。App の初期値) で、
    `DetachedWindow` でも独立 owner でもない
 4. 一覧の surface が `TopLevelGridSurface::Folder` で、★固定が無効
-5. 表示中の本 (`effective_folder()`) のパスが `entries` のどれかの `path` と一致する (一致比較は `folder_tree::path_eq`)。その位置を返す
+5. 表示中の本 (`effective_folder()`) のパスから位置を求められる。求め方は 2 段だけ:
+   1. `entries` のどれかの `path` と完全に一致すれば、その位置 (比較は `folder_tree::path_eq`)。
+   2. 一致しなければ、**`Folder` の行だけ**を対象に、表示中のパスをその行の配下に含む行の位置 (パス成分の境界を守る既存の
+      `path_in_subtree_ci` `src/app/metadata_ops.rs` 約 243 と同じ比較)。Folder 行から中の書庫へ着地した場合
+      (行 `P/F` の中身が音声と `book.zip` だけ → 停止条件は音声で真、再オープンは `P/F/book.zip` を開く: `src/folder_tree.rs` 約 587、
+      `src/app.rs` 約 60168・60203) に、行 `P/F` の位置になる。
+   - 比較する値は `effective_folder()` でよい (レビュー確認: EPUB のキャッシュ変換は lease が元の論理パスを持ち、
+     変換書庫は `archive_source_override` が元のパスを返す。`src/pdf_loader.rs` 約 376、`src/app.rs` 約 23733・36874)。
+   - EPUB の「PDF として保存」の後は、保存先の PDF を開く別のパスへの移動として扱う (`src/ui_dialogs/epub_convert.rs` 約 664、
+     `src/app.rs` 約 39585)。保存先が列に無ければ位置は求まらず、通知になる。元の EPUB への別名や位置の保持は足さない。
 
 満たさないときは「一覧から開いた本で使えます」と短く知らせて何もしない。DFS へ黙って切り替えない。
 
-- 5 の帰結: 一覧から開いた本・この操作で移った本はもちろん、DFS や履歴で**同じ列に含まれる本**へ来たときも使える。
-  列は「最後に本を開いた一覧」の写しなので、そこに含まれる本なら前後が決まる。列に無い場所へ移ると自然に使えなくなり、
+- 5 の帰結: 一覧から開いた本・この操作で移った本はもちろん、DFS・履歴・評価一覧から開いた物理の本などで**同じ列に含まれる本**へ
+  来たときも使える (評価一覧から開いた物理の本も surface は `Folder` になる: `src/app.rs` 約 36810)。
+  このとき使うのは、**最後に通常フォルダ一覧から本を開く操作を受け付けた時点の順**で、いま見ている評価一覧などの順ではない。
+  そこに含まれる本なら前後が決まる。列に無い場所へ移ると自然に使えなくなり、
   破棄の処理は要らない。★固定に入ると 4 で使えなくなり、解除すると戻る。
 - 列の位置を index として持たないので、移動の採用・取消・ZIP / PDF の後からの採用・hydration・内側の書庫の open のどれに対しても、
   受け渡しや更新の処理が無い。
@@ -120,17 +131,21 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
   `start_folder_nav` の mode 比較より先に、この sequence / 表示待ち lock で新しい行き先を拒否する
   (`src/ui_fullscreen.rs` 約 13336・42091、`src/app.rs` 約 12375)。新しい操作もこの既存の gate に従う。
   拒否する期間は `folder_nav_pending` だけでなく、後続の準備・hydration・表示確定待ちまでを含む (既存の gate の範囲のまま)。
-- この操作の準備中に Ctrl+↑↓ を押した場合、Ctrl+↑↓ の準備中にこの操作を押した場合も、同じ gate で拒否される。cancel して乗り換える処理は作らない。
-- 累積 (`folder_nav_mode_same_kind` と `MAX_PENDING_NAV`) には乗せない。gate が準備中の押下を拒否するので、累積が起きる経路が無い。
-  `folder_nav_mode_same_kind` は `ListOrder` を他のどの mode とも同じ種類と判定しない。
+- **新しい操作の handler は、sequence / 表示待ち lock 中なら明示的に return する**。既存の Ctrl+↑↓ の lock 分岐は、拒否だけでなく
+  進行中の mode を取って継続を受け付ける処理 (`inflight_fullscreen_folder_nav_mode`、`src/ui_fullscreen.rs` 約 42102) を含むので、
+  新しい操作はこの継続受付に入らない。`inflight_fullscreen_folder_nav_mode` は `ListOrder` を継続対象として返さない。
+- `folder_nav_mode_same_kind` を偽にするだけでは拒否にならない (偽なら `start_folder_nav` は旧 worker を cancel して新しく始める:
+  `src/app.rs` 約 57696)。拒否は上の handler の return で行う。共通入口に到達した場合も、進行中の `ListOrder` を cancel・再開始しないことを検証する。
+- この操作の準備中に Ctrl+↑↓ を押した場合、Ctrl+↑↓ の準備中にこの操作を押した場合も、既存の gate で拒否される。cancel して乗り換える処理は作らない。
+- 累積 (`MAX_PENDING_NAV`) には乗せない。新しい状態 field は足さない。
 
 ### 4.3 着地
 
 - 採用・再オープン・ZIP / PDF の列挙待ち・hydration 後の再オープン・開始ページ (`book_nav_resume`) は、
   **同じ行き先へ Ctrl+↑↓ (`FolderNavMode::Fullscreen`) で着いたときと同じ**にする。`apply_folder_nav_result` の
   `Fullscreen` の後処理と、ZIP / PDF が `PhysicalHistoryTransition` を経て後から採用される経路を共有し、新しい開き方を作らない。
-  `ListOrder` が `Fullscreen` と同じに扱われる必要のある分岐 (`StartupListIntent::folder_navigation`・`history_trigger`・`perf_tag`・
-  `inflight_fullscreen_folder_nav_mode` など) は、実装時に `FolderNavMode` の match を全部たどって揃える。
+  `ListOrder` が `Fullscreen` と同じに扱われる必要のある分岐 (`StartupListIntent::folder_navigation`・`history_trigger`・`perf_tag` など) は、
+  実装時に `FolderNavMode` の match を全部たどって揃える。ただし `inflight_fullscreen_folder_nav_mode` の継続許可は除く (§4.2)。
 - 着いた本の位置は §3.4 で求め直すので、着地後に列へ書き込む処理は無い。
 - 端 (先頭の前・末尾の次、または残りの行がすべて停止条件を満たさない): 既存の `FsBoundaryHint::Edge` の形で
   「一覧の先頭です / 一覧の末尾です」と知らせて止まる。ループしない。
@@ -147,8 +162,9 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 | --- | --- | --- |
 | main の通常フォルダの一覧から本を開く操作を受け付けた | 新しい列に置き換え | 開いた本が表示されれば使える |
 | その open が取消・失敗した | 置き換えたまま (いま見ている一覧の写し) | 一覧に居るので操作の文脈 (FsCommon) に無い |
-| この操作で移動した (ZIP / PDF の後からの採用・内側の書庫・hydration を含む) | 変えない | 着いた本が列にあるので使える |
-| DFS・兄弟移動・履歴・アドレスバー・ブックマークで移った | 変えない | 着いた本が列にあれば使える。無ければ通知 |
+| この操作で移動した (ZIP / PDF の後からの採用・hydration を含む) | 変えない | 着いた本が列にあるので使える。Folder 行から中の書庫に着いたときは §3.4 の 5-2 で行の位置になる |
+| EPUB を「PDF として保存」して保存先を開いた | 変えない | 保存先が列に無ければ通知 |
+| DFS・兄弟移動・履歴・アドレスバー・ブックマーク・評価一覧から開いた物理の本 | 変えない | 着いた本が列にあれば使える (評価一覧の順ではなく保持した列の順)。無ければ通知 |
 | 親一覧へ戻った・他の surface へ移った | 変えない | 一覧に居る間は文脈に無い。次に本を開けば置き換わる |
 | ★固定を有効にした / 解除した | 変えない | 有効の間は 4 で使えない。解除で戻る |
 | F12 で同じ context を別窓へ出す / 戻す (linked) | 変えない | 別窓の間は 3 で使えない |
@@ -172,7 +188,8 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
   採用の時点まで運び、出来事ごとに保持・交換・破棄を決める配管が要った (Direct・warm / cold PDF・変換書庫・ZIP の後からの採用・
   ★固定・内側の書庫ごと)。位置を「データ (列と表示中の本) から導く」形にすると、列を書き換える時点は取得の 1 か所だけになり、
   取消・置換・後からの採用の組み合わせを扱う必要が無くなる。採用。
-  - 引き換え: DFS や履歴で列に含まれる本へ来たときも使える。列は「最後に本を開いた一覧」なので前後は決まり、害は無いと判断した。
+  - 引き換え: DFS・履歴・評価一覧経由で列に含まれる本へ来たときも使える。列は「最後に通常フォルダ一覧から本を開く操作を受け付けた時点の順」
+    なので前後は決まり、害は無いと判断した (レビューも許容)。説明文書でこの定義を統一する。
   - 第 1 版の「パスの変化で保持・破棄を決める」とは違う。第 3 版は保持・破棄をしない。パスは位置を引くためだけに使う。
 - **既存の `FolderNavMode` に 1 variant 足す**: 走査・事前走査・採用・再オープン・ZIP / PDF の待ちを DFS と共有できる。採用。
 - **準備中は受け付けない**: 既存の gate がそうしている。乗り換えや累積を作らない。採用。
@@ -199,20 +216,24 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 `ViewerContextBundle` への field 追加と、表示先の判定は detached の述語 / context 経路に触れる。
 - 第 2 版の独立レビューで、**症状パッチではなく構造的な修正である**ことに合意を得た (2026-10-26)。条件は、
   「registry の遷移を変えない」を table の遷移規則に限ること (field の初期化・swap・fork の分類は行う)、§11 への記録、表示先条件の修正。
-  第 3 版はこの条件に合わせた (§3.1・§3.4 の 3)。第 3 版の再レビューでも合意を確かめる。
-- 合意が保たれたら、触れた範囲と理由を `docs/detached-rework-plan.md` §11 に記録する。
+  第 3 版はこの条件に合わせた (§3.1・§3.4 の 3)。
+- 第 3 版の再レビューでも合意が維持された (2026-10-26)。触れる範囲と理由を `docs/detached-rework-plan.md` §11 に記録した。
+  実装で範囲が変わったら §11 も直す。
 
 ### 8.3 テスト (handler-level と状態遷移)
 
 - 取得: スマートフィルタ・ファセット・Ctrl+F・評価フィルタ・詳細表示の並べ替え (昇降順)・名前 / 日付の昇降順で、列が画面の順・対象と一致する。
   画像・動画の行は入らない。§3.3 の 3 か所 (通常フォルダ・ZIP / PDF・変換対象) で、load の開始前に取れる。
   評価一覧・スマートフォルダ・検索・閲覧履歴・コレクション・サブフォルダ展開・★固定・Collection / Rating owner・main 以外では取らず、既存の列も変えない。
-- 位置 (§3.4): 一覧から開いた本・この操作で移った本 (通常フォルダ・ZIP・cold PDF・warm PDF・変換対象)・DFS で列内の本へ来たときに位置が出る。
+- 位置 (§3.4): 一覧から開いた本・この操作で移った本 (通常フォルダ・ZIP・cold PDF・warm PDF・EPUB のキャッシュ変換・変換対象)・
+  DFS で列内の本へ来たとき・取消後に同じ列の本へ来たとき・評価一覧から開いた物理の本が列内のときに位置が出る。
+  Folder 行 (音声 + 中の ZIP) から中の書庫に着地し、そこから次の行へ進める。境界違い (`book-a` と `book-a-extra`) を取り違えない。
+  EPUB を「PDF として保存」した後、保存先が列に無ければ出ない。
   列外の本・★固定中・`DetachedWindow`・fork の子・promote 後の旧 context では出ない。`MainWindow` と `Fullscreen` の両方で出る。
   別 context の bundle が変わらない。
 - 移動: 前後・端の通知・停止条件で飛ばす行 (ZIP / PDF だけのフォルダ・空のフォルダ・消えた行)・残りが全部飛ばす行のとき端の通知・
   直接ページ表示とページ一覧の両方・`book_nav_resume` の有無。
-- gate: 準備中 (sequence・hydration・表示待ちを含む) の押下を受け付けない。Ctrl+↑↓ の準備中にこの操作、この操作の準備中に Ctrl+↑↓ を押しても乗り換えない。
+- gate: 準備中 (sequence・hydration・表示待ちを含む) の押下を受け付けず、継続受付にも入らない。共通入口に到達しても進行中の `ListOrder` を cancel・再開始しない。Ctrl+↑↓ の準備中にこの操作、この操作の準備中に Ctrl+↑↓ を押しても乗り換えない。
 - 入力: 既定キー・変更した割り当て・repeat・入力欄 / modal 中・使えないときの通知・既存の Ctrl+↑↓ / 兄弟移動が変わらない・
   native 動画再生中に効く。
 - keymap: 生成した `.default` と `docs/keymap.ini.default` の一致テスト。
@@ -221,10 +242,20 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 ### 8.4 文書
 
 - `docs/keymap-spec.md` のフルスクリーンの表、`docs/fullscreen-navigation-consistency.md` §2・§3、
-  マニュアル (`fullscreen.html`・`shortcuts.html`) に新しい操作、「最後に本を開いた一覧の順で移る」こと、
+  マニュアル (`fullscreen.html`・`shortcuts.html`) に新しい操作、「最後に通常フォルダの一覧から本を開いたときの、その一覧の順で移る」こと、
   Ctrl+↑↓ との違い (一覧の中だけ・サブフォルダへは降りない) を書く。
 
 ## 9. レビュー指摘への対応
+
+### 第 3 版 (ACCEPT WITH CHANGES) の指摘
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2-1 Folder 行から中の書庫へ着地すると完全一致で位置が求まらない | §3.4 の 5: 完全一致の次に、Folder 行だけを対象に境界付きの配下判定で求める |
+| P2-2 `folder_nav_mode_same_kind` を偽にするだけでは拒否にならない | §4.2: handler が lock 中に明示的に return し、継続受付に入らない。§4.3 から継続許可を除外 |
+| P2-3 EPUB の「PDF として保存」は別の着地 | §3.4 の 5: 別のパスへの移動として扱い、列に無ければ通知 |
+| P3-4 列の定義と取消時の意味 | §3 見出し・§3.4・§7・§8.4: 「最後に通常フォルダ一覧から本を開く操作を受け付けた時点の順」に統一。評価一覧経由の例をテストに追加 |
+| §8.2 合意 | 第 3 版でも維持 (レビュー明示)。`docs/detached-rework-plan.md` §11 に記録した |
 
 ### 第 2 版 (REJECT) の指摘
 
