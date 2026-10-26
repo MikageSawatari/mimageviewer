@@ -48,21 +48,6 @@
 - 調べること: 失敗時の assert の内容、時刻や待ち時間に依存する箇所。負荷をかけて再現させる手段を先に作る。待ちや再試行を足して隠さない。
 - 規模 / 優先度: 調査後に見積り / P3。
 
-### 1.448 v4.8.0 以降、GPU デバイスの作成で起動に失敗する環境がある (「Parent device is lost」) — X の利用者投稿 (2026-10-26)
-
-- 状態: **調査済み・範囲は利用者判断待ち (2026-10-26、v4.8.3 候補)**。
-- 出典・症状: X の利用者投稿 (フォロー関係が無いので返信しない。連絡が取れずログは見られない)。v4.7 までは起動し、v4.8.0 から起動しない。
-  v4.8.2 ポータブル版で §1.428 の失敗ダイアログに「詳細: Wgpu.RequestDeviceError: WGPU error: Parent device is lost」と表示された
-  (投稿のスクショ)。グラフィックドライバは更新したくない意向。
-- 根拠 (コード確認。実行時の観測は無い): 失敗はデバイス作成 (request_device)。「Parent device is lost」は wgpu-core の `DeviceError::Lost` で、
-  hal の想定外エラー (OOM 以外の HRESULT 失敗など) もこの文言になるため、文字どおりのデバイス消失とは限らない。
-  mIV の adapter 選択 (DX12 → Vulkan) と要求する制限は v4.7.1 と同じで、違いは wgpu 27 → 30 (egui 0.37 更新に伴う)。
-  DX12 のデバイス作成の差は小さく、決め手は未発見。
-- 調査結果 (2026-10-26 Codex gpt-6.1-sol 読み取り調査、ClaudeCode が要点を確認): (a) 製品 logger は target の許可リスト (`src/logger.rs` 約 20) で wgpu の `log::error!` を捨てており、報告者のログにも失敗した操作・HRESULT は残っていない。(b) `request_device` はデバイスを開くほか、wgpu-core の検証用 shader / compute pipeline も作り、その失敗も同じ文言になる。(c) DX12 の shader compiler の既定が wgpu 27 の `Fxc` から 30 の `Auto` (static DXC → `dxcompiler.dll` を LoadLibrary → 無ければ FXC) に変わった。mIV は DXC を同梱せず、開発機にも無いので、開発機とテストは FXC で動いている。PATH 等に `dxcompiler.dll` がある環境だけ DXC になる。(d) Vulkan は最低要件の引き上げは無く、任意拡張・allocator の置き換え等が候補。OpenGL (WGL) は GL 3.3 以上なら root GUI を描ける見込みだが、遅延初期化の別設計が要り v4.8.3 には向かない。(e) 別 API での開き直しは `RenderState::create` 内で adapter 候補を順に試す形で可能 (vendor egui-wgpu の変更)。Codex の推奨は v4.8.3 = 診断強化のみ、開き直しは次。
-- 対策の候補: (1) 失敗ダイアログに GPU 名・API・失敗段階・hal の直近のエラー行を出す。(2) デバイス作成に失敗したら別の API
-  (DX12 ↔ Vulkan、OpenGL は可否を確認) で開き直し、選んだ API をログと起動記録に残す。wgpu 27 へ戻すのは egui 0.37 の更新を戻すことになるので採らない。
-- 関連: §1.428 ([render-init-failure-report-plan.md](render-init-failure-report-plan.md))。規模 / 優先度: 調査後に見積り / P1 (起動できない)。
-
 ### 1.447 ページめくりの描画テストが、全件実行の高負荷時だけ落ちる — master の全件テストで観測 (2026-10-26)
 
 - 状態: **未着手**。テストの問題か製品の問題かは未切り分け。
@@ -87,16 +72,6 @@
 - 調べること: build script 内の bindgen / libclang (`LIBCLANG_PATH`) の読み込みで落ちているか、ダンプを取る (WER の LocalDumps を build script の exe 名に設定)。
   libclang の版、並列度 (`CARGO_BUILD_JOBS`) を下げたときの再現率、メモリの逼迫との関係。リトライや待ちを足して隠さない。
 - 規模 / 優先度: 調査後に見積り / P3 (リリース作業の手戻りになる)。
-
-### 1.445 GPU メモリ上限の手入力が、入力途中から 5% 刻みに丸められる — 5ch >>618 (2026-10-26)
-
-- 状態: **未着手・コード上の原因候補を確認**。報告は v4.8.1 zip 版。実アプリでの再現試験・修正はまだ行っていない。収録バージョンは未定。
-- 出典・症状: [>>618](https://egg.5ch.io/test/read.cgi/software/1782419551/618)。環境設定 → パフォーマンス → GPUメモリの上限欄で、1 文字目に 0〜2 を入力すると 0、3〜7 は 5、8・9 は 10 になり、意図した数値を入力しづらい。
-- 根拠 (コード確認): `src/ui_dialogs/preferences/pages.rs::page_gpu_memory` が `Slider::new(&mut s.gpu_memory_percent, 0..=100u32).step_by(5.0)` を使う。egui 0.37 の `widgets/slider_core.rs::SliderSpec::rounded` は保存する値を `start + round((value - start) / step) * step` へ丸め、数値欄の入力もこの境界を通る。報告の 1 桁目の変化と一致する。egui 更新前との比較や実行時の編集状態までは未検証。
-- 修正の方向: スライダーの操作刻みと、数値欄の入力途中の文字列・確定値を区別し、途中の丸めで後続の桁を入力できなくならないようにする。まず既存 widget の設定で解決できるか確認し、必要なら数値欄とスライダーを分ける。5% 刻みを維持するか手入力を 1% 単位にするかは、既存の操作・保存値との互換性を確認して決める。UI スレッドへ新しい待機・I/O は追加しない。
-- 安全性・互換性: **0% は無制限**なので、1・2 などの入力途中の丸めで意図せず 0 を確定させない。0 / 100 の明示入力、0〜100 の範囲、既存の保存値 (5 の倍数でない値を含む) と設定の適用・取消を維持する。既存設定の一括書き換えはしない。
-- 検証: 数値全選択から 1 桁ずつ 25 / 50 / 80 / 100 を入力、削除・桁の修正、貼り付け、Enter / フォーカス離脱、スライダーとキーボードによる増減、設定の適用・取消・再読込を確認する。egui の fake-input / UI 回帰テストを追加し、同じ `step_by` を使う兄弟入力も調べる (この報告だけを根拠に全設定の刻みを変えない)。実アプリ確認は隔離 portable と当該 run の承認を別途得る。
-- 関連: [UI の実装規約](coding-conventions.md)、[UI snapshot 方針](ui-snapshot-policy.md)。規模 / 優先度: Small (共有 widget 修正が必要なら再評価) / P2。
 
 ### 1.444 一覧の絞り込み・表示順に従う ZIP / フォルダ間移動 — 5ch >>613・617 (2026-10-25 起票、2026-10-26 用途確認)
 
