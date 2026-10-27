@@ -24,6 +24,46 @@ UIスレッドに列挙・metadata照会・待機を追加しない。ソート�
 - 現世代の成功結果でcursorの消失が確定した場合だけactive/rootへ戻す。これに伴うフォルダopenは発生させない。
 - 明示reloadの従来のresetと、option変更時の状態保持refreshは理由を型で区別する。
 
+## 現在地の表示 (§1.451、2026-10-27)
+
+現在地の同期と操作カーソルの分離は維持し、行描画だけを変更する。背景の判定は
+フォーカス中の操作カーソル > 現在地 > 背景なしの順。現在地はテーマの選択背景を
+薄くした色と既存の太字、操作カーソルは従来の選択背景を使う。同じ行なら操作カーソルを優先する。
+行の純粋描画を本体とsnapshotで共有する。状態追加・モーダル化・再読込による簡素化は不要で、
+既存のrow状態の投影だけで解決する。I/O、フォーカス、カーソル、書庫の現在地解決は変更しない。
+
+既存の選択背景使用箇所を検索した範囲では、再利用できる「フォーカスのない選択」専用表現は
+見つからなかった。`ui.visuals().selection.bg_fill.gamma_multiply(0.35)` を行背景へ重ねる。
+固定grayを足さず、通常のフォーカス中のカーソル背景・文字・警告色を維持する。
+
+### §1.450 / §1.451 の非対話検証 (2026-10-27)
+
+対象は `ui-1450-1451` の未コミット差分、default features、dev / test profile。
+コミット・製品起動・本体lib全件・build-devは行わず、後二者と独立レビュー・実機確認はClaudeCodeへ引き継ぐ。
+
+- 旧検索ラベルの実ツールバー回帰は、並べ替え成功のassert後、`LabelSelectionState::has_selection()` がtrueで失敗した。
+  `target/1450-before-valid-env.log`。同runの純描画テストはフォント未登録、通常ラベルのテストは同名ComboBoxとのquery衝突で停止しており、症状確認の根拠には使わない。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/section1450/) | test(/section1451/) | test(/section1409/) | test(/folder_pane/) | test(/toolbar_reorder/) | test(/section207/) | test(/ui_toolbar_layout/)'`
+  は85件中84件成功。新設純描画テストのフォント登録漏れを直し、`-E 'test(/section1450_label_drag/)'` の1件を再実行して成功した。
+  製品コードが同じ残り84件は再実行しない。ログは `target/1450-1451-focused.log` と `target/1450-label-final.log`。
+  検索4種×ドラッグ許可ON/OFFの文字非選択・click/secondary click・TextEditのフォーカスとdrag選択、実ツールバー並べ替え、通常の「列:」と「フォルダ:」のラベルを含む。
+- `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot folder_pane_location -- --test-threads=2` は新規2件成功。
+  初回fixtureの空欄arrowのアクセシビリティエラーを、実ツリー同様の未読込branchで構成して解消し、3状態が収まる420×380にした。
+  `folder_pane_location_light.png` / `folder_pane_location_dark.png` は計64,747 bytesで両方を目視確認した。
+  更新指定を外した `cargo test --test ui_snapshot -- --test-threads=4` は205件成功、既存PNGの変更なし。
+  `target/1451-snapshot-generate-final.log` / `target/1450-1451-snapshot-all.log`。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、引数なしの `cargo fmt`、最終 `cargo fmt --check` は成功。
+  `target/1450-1451-check-final.log` / `target/1450-1451-fmt-check-final.log`。
+  グリフ検査は危険文字0件、製品ページ検査は49カード・超過0件。
+
+このsandboxではTurboJPEGの通常native buildがMSBuild exit 1で止まったため、同じbundled sourceを
+`target/1450-native/` へ実コピーし、MSVC `/MT`・SIMD有効・単並列で静的ライブラリを作った。
+検証processだけ `TURBOJPEG_SOURCE=explicit`、`TURBOJPEG_LIB_DIR=<worktree>/target/1450-native/explicit`、
+`TURBOJPEG_INCLUDE_DIR=<worktree>/target/1450-native/install/include`、`CARGO_BUILD_JOBS=4` を設定した。
+explicit経路が正規化した `\\?\` 付きincludeをMSVCが読めないことは小さなcompileで確認し、
+`CXXFLAGS=-IG:/home/mimageviewer-ui450/target/1450-native/install/include` で通常pathを補った。
+依存関係・Cargo設定・製品のbuild scriptは変更していない。
+
 ## 検収
 
 6候補と同値tie-break、設定欠落の既定/DB往復、Favorite/list sortからの独立、DFS/sibling、paneの途中rows/展開/cursor維持、A→B→Cのstale完了拒否、hidden/drive/reload/arrowの全経路を回帰する。スナップショットで最小pane幅のプルダウンを確認する。

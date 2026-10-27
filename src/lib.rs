@@ -375,6 +375,8 @@ pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_video_thumbnail_indicator_settings_snapshot_fixture;
 mod ui_erase;
 mod ui_folder_pane;
+#[doc(hidden)]
+pub use ui_folder_pane::draw_folder_pane_location_snapshot_fixture;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;

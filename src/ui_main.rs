@@ -14699,7 +14699,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // 左端のラベルを右クリックすると、フォルダバーの設定メニューを開く
                     // (他のツールバーセクションと操作を揃える。実機フィードバック 2026-06-20)。
                     let folder_label_response = ui
-                        .add(egui::Label::new("フォルダ:").sense(
+                        .add(egui::Label::new("フォルダ:").selectable(false).sense(
                             if self.settings.toolbar_section_drag_enabled {
                                 egui::Sense::click_and_drag()
                             } else {
@@ -29900,6 +29900,56 @@ mod section207_tests {
     }
 
     #[test]
+    fn section1450_other_toolbar_labels_do_not_select_text_when_dragged() {
+        for label in ["列:", "フォルダ:"] {
+            let mut app = crate::app::setup_app_for_test();
+            only_folder_and_tree(&mut app);
+            app.settings.show_toolbar_cols = true;
+            app.settings.toolbar_section_drag_enabled = true;
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(800.0, 220.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    app.render_toolbar(root);
+                });
+            harness.run();
+            let rect = harness
+                .get_by_role_and_label(egui::accesskit::Role::Label, label)
+                .rect();
+            let start = rect.left_center() + egui::vec2(2.0, 0.0);
+            let end = rect.right_center() - egui::vec2(2.0, 0.0);
+            harness.event(egui::Event::PointerMoved(start));
+            harness.event(egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.event(egui::Event::PointerMoved(end));
+            harness.event(egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run();
+            assert!(
+                !harness
+                    .ctx
+                    .plugin::<egui::text_selection::LabelSelectionState>()
+                    .lock()
+                    .has_selection(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn file_organize_destinations_location_menu_navigation_and_snapshot() {
         use crate::settings::FileOrganizeDestination;
         let mut env = crate::app::setup_app_for_test();
@@ -31412,6 +31462,67 @@ mod pinned_search_review_tests {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+
+    #[test]
+    fn section1450_pinned_search_drag_reorders_the_production_toolbar_without_selection() {
+        use crate::settings::ToolbarSectionId as TS;
+        let mut app = crate::app::setup_app_for_test();
+        for &section in TS::default_order() {
+            set_toolbar_section_visible(&mut app.settings, section, false);
+        }
+        for kind in Kind::ALL {
+            set_toolbar_section_visible(&mut app.settings, kind.section(), true);
+        }
+        app.settings.toolbar_section_drag_enabled = true;
+        let app = Rc::new(RefCell::new(app));
+        let render = app.clone();
+        let fonts = Cell::new(false);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1200.0, 260.0))
+            .build_ui(move |root| {
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(root.ctx());
+                    root.ctx().request_repaint();
+                    return;
+                }
+                render.borrow_mut().render_toolbar(root);
+            });
+        harness.run();
+        let start = harness
+            .get_by_role_and_label(egui::accesskit::Role::Label, Kind::Metadata.label())
+            .rect()
+            .left_center()
+            + egui::vec2(2.0, 0.0);
+        let end = harness
+            .get_by_role_and_label(egui::accesskit::Role::Label, Kind::Container.label())
+            .rect()
+            .left_center();
+        harness.event(egui::Event::PointerMoved(start));
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerMoved(end));
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        let order = TS::ordered_with_fallback(&app.borrow().settings.toolbar_section_order);
+        let index = |section| order.iter().position(|&s| s == section).unwrap();
+        assert!(index(TS::SearchMetadata) < index(TS::SearchContainer));
+        assert!(
+            !harness
+                .ctx
+                .plugin::<egui::text_selection::LabelSelectionState>()
+                .lock()
+                .has_selection()
+        );
+    }
 
     #[test]
     fn section1409_search_label_secondary_click_opens_settings_with_drag_disabled() {
