@@ -337,6 +337,7 @@
 [FsCommon] ; フルスクリーン共通
 # FsToggleMetadata.1 = I ; 左右パネルの表示モードを切り替える
 # FsToggleMetadata.2 = Tab ; 左右パネルの表示モードを切り替える
+# FsPageOverviewToggle = O ; ページ一覧の表示を切り替える
 # FsBackToList = Backspace ; フルスクリーンを閉じて一覧へ戻る
 # FsToggleWindowMode = F11 ; ウィンドウ表示と全画面表示を切り替える
 # FsJumpFirst = Home ; 先頭の項目へ移動する
@@ -349,6 +350,15 @@
 # FsSiblingNext = Ctrl+PageDown ; 次の兄弟フォルダへ移動する
 # FsPanorama = V ; 360度表示または通常動画の拡大表示を切り替える
 # FsPanoramaProjection = Shift+V ; 360度パノラマの投影方式を切り替える
+
+[FsPageOverview] ; ページ一覧
+# FsPageOverviewConfirm = Enter ; ページ一覧で選択したページへ移動する
+# FsPageOverviewPagePrev = PageUp ; ページ一覧を前の画面へ送る
+# FsPageOverviewPageNext = PageDown ; ページ一覧を次の画面へ送る
+# FsPageOverviewFirst = Home ; ページ一覧の先頭へ移動する
+# FsPageOverviewLast = End ; ページ一覧の末尾へ移動する
+# FsPageOverviewColumnsLess = none ; ページ一覧の列数を減らす
+# FsPageOverviewColumnsMore = none ; ページ一覧の列数を増やす
 
 [Rating] ; レーティング
 # RatingItem1 = F1 ; 星1を付ける（アイテム）

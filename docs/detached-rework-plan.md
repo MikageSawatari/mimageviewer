@@ -1455,6 +1455,90 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-27 §1.340 統合commitの独立レビューP2追補（実装・指定自動検証済み）
+
+統合commit `1c134703b`に対する利用者提示の独立レビューはACCEPT WITH CHANGES、P2-1／P2-2。
+coordinatorは、curl中の入場拒否を受理済み移動が未提示の間すべてへ拡張する方針を採択した。
+既存`fs_navigation_sequence_blocks_new_target()`と`page_turn_barrier_active()`を既存
+`page_overview_available()`へまとめ、OpenとSelectで共用する。Selectの重複checkは除き、
+新しいpredicate・pending・replay・取消は加えず、受理済み移動と既存出力採用を保持する。
+一般のnavigation lock用の新案内は作らず、旧curl限定の理由文は外す。HUDはavailabilityと
+既存optional reasonでenabled／理由を分ける。
+
+P2-2ではOを既存のfocused Slideshow／overflowの次キーdismissより後へ揃える。
+`dismiss_fs_transient_menu_state()`でspread／fit／panoramaのApp boolとoverflowを閉じ、
+通常closeの既存4代入と受理した`open_page_overview_for_viewer`が共用する。
+次キーdismiss／HUD Close／HUD Overviewはoverflowだけの`dismiss_fs_overflow_panel()`を共用し、
+既存意味を維持する。全受理入場を共通化し、physical stream・info lock・拒否ring入場のchromeは残す。
+rotation／seek等のegui Popupは所有viewportの`Memory::end_pass`による自然退役であり、
+`Popup::close_all`やroot ctxの明示popup close、新lookup／guard／stateは追加しない。
+新しいdetached述語・viewport・HWND／placement ownerは追加しない。
+
+追加棚卸しではfront captureは`fs_front_menu_presented`＋overflow rectに限られ、通常adjustment／
+metadata／infoは含まれないことを確認した。tag pickerは既存common modal、overlay編集は既存拒否を使う。
+非focused adjustmentの入場可能性とfocused TextEdit／IME ownerを維持し、durable panelとhover tooltipは一括resetしない。
+新規5回帰のfocusedはr4で5 passed／0 failed、通常／test-script check、audit 69件・違反0、
+UI snapshot 211件（PNG変更なし）、glyph 0も成功。最終関連libは1379件すべて成功、最終fmt checkも成功で、
+新差分の独立再レビュー受入は未取得。詳しい条件・fixture根因は一覧設計書§25.7へ集約する。
+
+追補後の指定自動検証は完了し、独立再レビュー受入は未取得。animation OFFの未提示移動と実O入力を通す回帰、
+前面キーと各入場経路の棚卸しを[一覧設計書§25.7](detached-book-page-overview-plan.md#257-独立レビューp2追補の実装と検証)へ集約する。
+同§25.6と以下の同日統合記録はcommit `1c134703b`までの履歴として保持し、この追補後の成功を主張しない。
+
+### 2026-10-27 §1.340 master取込みの衝突解消・指定自動検証済み、未merge
+
+**現在地**: 作業ファイルの機械的合流は完了し、SelectのClose→既存landing一回は
+coordinator採択後に実装・検証を再開した。§25.1の受理結果返却は現在の停止理由ではない。
+600msのcurl受理後のoverview入場でEnterがviewerを退出するheadless再現と、通常flat待ちbarrierの
+取り残し候補は[一覧設計書§25.4](detached-book-page-overview-plan.md#254-進行中のcurlと一覧入場のcoordinator判断)の修正前履歴へ保持する。
+coordinatorは受理済み移動の保持・追加pendingなしを条件に、同期完了経路が無いことを調査後、
+既存`page_turn_barrier_active()`のTurning／Completing中は新規入場を拒否する新手順2を採択した。
+availability／openの共通受付だけで拒否し、O／HUD／ring／padの保留・replay・新取消は追加しない。
+通常flat採用と既存continuationのcommit後に利用者がもう一度操作する。製品変更は
+`app/page_overview.rs`の既存unavailable-reason gateの6行に限定した。これは新coordinator手順2
+（同期完了なし→入場拒否）で、旧選択肢2の即退役は不採用。
+現行gateの衝突解消・指定自動検証は完了、未merge。新規O回帰2件と関連lib 1374件（特定除外なし）、
+通常／test-script check、audit 69件・違反0、UI snapshot 211件、glyph 0、最終fmt検査が成功した。
+未決の設計選択はない。詳細は一覧設計書§25.6。独立レビュー・full-lib・build-dev・実機確認と
+Gitのstage／mergeはcoordinatorへ引き継ぎ、これらまで完了したとは扱わない。
+
+case 2 gate導入前の部分検証履歴は、関連lib r7が1372件中1371 passed／1 F11 fixture failed、F11だけの最終focusedが
+2 passed／0 failed。D3 source gateはr7で成功。F11 fixtureだけの後続修正なので他1371件を再利用し、
+重複合算や一度の1372件全成功は主張しない。F11はfull rendererのBLACK・overview復帰と、
+既存placement境界でlive fake hostを実`step()`へ渡すheadless検査を分け、実HWND遷移を検証済みとはしない。
+当時の通常／test-script check、UI snapshot 211件、audit違反0、glyph 0、最終fmt／diff checkとマーカー0は
+同§25.5へ履歴として集約する。既知curl入場の失敗は別runの`overview-r3`へ残し、gate導入後の再検証を待つ。
+
+**再開追補（2026-10-27 coordinator判断、検証中）**: 既存のSelect照合（stamp／binding／
+items・projection revision／incarnation／stable identity／active資格）を全通過したら、
+一覧をClosedにして既存landingをちょうど一度呼ぶ。以後の即時着地・Checking後の許可・
+後着拒否・同期拒否は通常navigation ownerに任せ、一覧の再open／待機／追加pending／受付証明は作らない。
+三値返却案は状態の組み合わせを減らして通常移動と揃えるため不採用。構成採用後の可視実items順・
+hiddenを反映し、白紙補助annotationは`None`のまま未接続。新しい所有・detached述語・viewport・
+HWND／placement契約を足さず、既存境界の接続を復元する。統合後の全体検証・独立レビュー受入は未完了。
+以下の停止記録は再開前の履歴として保持し、現行判断は[一覧設計書§25](detached-book-page-overview-plan.md#25-2026-10-27-master統合記録)を優先する。
+
+再開後の機械的合流では、masterの`PhysicalWindowPlacement`から既存
+`detached_snapshot_client_size`でDPI-only client sizeを導いてUI scaleで正規化し、overviewの
+寸法参照3箇所を揃える。CentralPanelの一度のfront pointer captureをprimary終端／一覧／
+通常canvasで共有し、right recognizerはmasterのrecognize／apply分離APIを共用する。
+old-owned releaseの実renderer3surface回帰は追加後に実行し、成功記録は一覧設計書§25.4へ集約した。
+新owner／fallback／時間窓はない。
+SelectのLatestSeekは既存seek／jumpと同じく新curl対象外で、D3は選択先flatの実表示受理後に
+既存`prefetch_next_final_unit`資格へ従う。同期停止経路のソース調査と合流範囲は一覧設計書§25.3へ
+記録し、接続記録だけから実行結果・独立受入を主張しない。
+
+**停止時の履歴（以下は§25.1のcoordinator判断前）**:
+
+coordinator開始済みのmaster mergeについて、両側の記録・context所有を保持して
+作業ファイルを合流した。git indexは操作せず、統合後の自動検証も未実施。
+masterの本の構成の提示許可が既存ownerへ非同期受理される場合、一覧Selectの即時idx比較が
+拒否扱いにしてOpenを残し、後着navigationだけが進む接続不足をソースで確認した。
+受理／拒否を共通landingから返す契約の設計照合が必要なため停止する。
+新しいowner／guard／fallback／pending fieldや背景Selectの再配送は追加していない。
+`ui_fullscreen.rs`の機械的API合流も途中で、stage／commit／コンパイル可能とは扱わない。
+停止点と再開条件は[一覧設計書§25](detached-book-page-overview-plan.md#25-2026-10-27-master統合記録)。
+
 ### 2026-10-26 §1.444 一覧の表示順で前後の本へ移る操作
 
 - 正本: `list-order-book-navigation-plan.md` 第 3 版。設計担当 ClaudeCode と Codex の独立設計レビュー (第 2 版・第 3 版) は、
@@ -1830,51 +1914,6 @@ promote判定だけのguard、false側での再生終了、rect推測・時間�
 案B（再生開始から独立readerへ所有移動）は今回の範囲外。
 **これは不採用案の履歴であり、この案でコードへ進まない。コード変更・検証実行なし。**
 
-### 2026-10-13 §1.341 黒paperと先頭配置の設定採用
-
-利用者採用の[page-turn plan §26](page-turn-animation-plan.md)に従い、local pagedの演出ON時だけ
-先頭配置を実効ONにする。保存値・連結・Remoteは保持する。ON/OFF geometry変更は既存の
-全context設定取消に集約し、各mounted/parked ownerの未配送ready・旧Flat・採用済completion
-receiptを退役する。一件のcontinuationは同ownerに保持し、新canonical flat採用まで解放しない。
-単頁はrect/UVを保った共通黒paperに揃える。品質変更だけのfreezeは保持し、
-Center/Side等のplacement変更をreal geometry変更として通常prepareへ再bindする。
-独立GPT-6.1 Sol / xhighは既存owner境界での構造修正として合意。新pending/state owner、
-viewport/host述語、mount/deposit/worker世代、native focus/placement経路は追加・変更しない。
-通常mountの兄弟取消は行わない。実機採択はcoordinator/利用者へ残す。
-
-### 2026-10-11 §1.341 Pairの移動背とpin枠（構造確認待ち）
-
-利用者option Aによりprojectionのframe-local H/static poseを共通progressで移す。canonical destination clipは既存transform viewportとpainter clipの交差から捕捉する。context resource、normal mount/deposit/fork、native viewport dispatch/placementは変更しない。pin gateを共通helperへまとめ、測定に基づき固定128 MiB capを撤去（有限fullscreen10%、無制限1 GiB）。shared weak inventory/dedup/batch leaseとcontext別退役を維持し、兄弟contextを消さない。これはprojectionと既存pin admissionの構造変更であり、独立確認・実機受入れは未了。
-
-
-### 2026-10-11 §1.341 resident素材でのturn開始（構造確認待ち）
-
-利用者決定のfinal-only撤回に従い、contextのAcceptedOfferがincoming typed resident resourceとlogical content bindingを所有する。共有weak inventoryへaccept source pinを加え、通常prepare後のnative ROIもdedup会計する。turnとcanonical flat採用までは保持素材・最初のplacementを使い、通常producer/upgradeは止めない。source品質publicationのinput epoch更新と実編集を分け、当該contextのitem/edit/params/comic/view/layout bindingを維持する。既存close→continuation commit→captureとflat-firstで保持を解く。fork、park/mount/deposit、兄弟cancel、F12動画拒否、viewport/native生成経路は変更しない。変更範囲はui_fullscreen.rsの通常selector/prepare済素材束縛、page_turn.rs/barrier.rsのowner/lease/採用照合、回帰fixture。新pending・queue・wait・producerを作らない。詳細はpage-turn plan §22。独立構造確認・完了レビューや実窓受入れの合格は主張しない。
-
-### 2026-10-11 §1.341 A0: context単位の紙めくりpresentationと共有会計（確認待ち）
-
-2026-10-11 HUD追補（`bf3b2fae0`）: 既存PC静止画HUDに全体設定のON/OFF行を追加し、Preferencesのadoption処理へ合流する。既存`deactivate_all_page_turn_presentations`を設定変更時に再利用するだけで、detached述語・viewport routing・bundle/workerの所有契約は変更しない。F12からの変更が全体設定と各presentationに反映し、兄弟のitems/idx/input sequenceを変えないことを既存context test内で検査する。設計担当ClaudeCodeの判断で既存overflowの`Settings::save()`へ保存を接続し、DB再読込を同testへ追加する（判断者の訂正は`e3a328ff6`。HUDへON/OFFを追加する利用者要求とは別の保存経路判断）。projection追補は描画先transformのeffective pppをpure geometryへ渡し、独立に丸められたpaint矩形の比較を物理1px以内へ定義する。viewport origin/clipの正本、destination binding、resource/context所有者は変更しない。構造的なgeometryの比較単位修正として記録し、独立構造合意・実機確認を主張しない。詳細と範囲はpage-turn plan §14。
-
-R3は利用者からACCEPTと伝達され`0f6ad9f19`へ統合済み。今回のA0未コミット差分は、
-`src/ui_fullscreen/page_turn.rs`のtyped `PageTurnPresentation`を既存`ViewerContextBundle`へ接続する。
-Inactive/Flat/Offered/Turningは当該contextの提出済みunitとimmutable paint resourceを所有し、
-operation factは配送先context/window/viewportとstable operation IDを保持する。
-通常swap/deposit/mount/pause/parkで兄弟のpresentationを取り消さず、forkはInactive、実際のclose/非表示/取消は
-対象ownerだけを退役させる。共有input_seqを操作identityや配送先の代用にしない。
-
-Appの`PageTurnLeaseInventory`はweak参照の共有VRAM会計一覧で、保持textureのownerではない。
-既存`vram_accounting`/`vram_budget`へsource/outputの保持量を接続し、parked/in-flightも会計する。
-共有予算は新しいeffectのadmissionだけを制約し、兄弟のnavigation・load/cache/workerを止めない。
-触れる範囲は`app.rs`、`app/viewer_context_registry.rs`、`app/vram_accounting.rs`、`vram_budget.rs`、
-`ui_fullscreen.rs`とその`page_turn`moduleのpresentation・入力・提出境界。
-新しいdetached述語、rect捕捉、HWND/viewport生成、placement/focus再生成、grace/debounceは追加しない。
-
-これは既存context所有へpresentationを追加し、会計をweak inventoryへ分離する構造的拡張という
-実装方針の記録であり、症状guardや待機による修正ではない。
-R3採択からA0具体的接続の独立構造合意・完了レビューを推定しない。
-複数窓の取消・park/mount・native batch lifetime/実解放、GPU/実present、性能/実用性の受入れは確認待ち。
-詳細と実績/未完了gateは[page-turn-animation-plan.md §12](page-turn-animation-plan.md#12-a0実装差分検証状況2026-10-11)。
-
 ### 2026-10-14 音楽ビューの音名配色メニュー（鍵盤設計 §15）
 
 [鍵盤設計 §15.5 D7](music-keyboard-harmnet-plan.md) に記録された独立設計レビューと
@@ -1894,6 +1933,70 @@ BookCompositionReadを同じ既存bundleへ保持する。両ownerのcreate／fo
 両側の承認済み構造を接続する統合であり、detached症状へのguard／時間窓／再openを追加しない。
 viewport／geometry／HWND／focus／recreate述語は変更しない。境界のread-only照合でも追加の設計選択はなく、
 統合差分の検証は[§1.375 §8.5](section375-operation-reconcile-plan.md#85-masterとの統合2026-10-14)へ記録する。
+
+### 2026-10-13 §1.340 TILE12: 表示切替前の物理primary終端
+
+`945c21cf3`のTILErev7はREVISE（P2 1件）。TILE11の2指摘は解消確認済みで、独立reviewerは
+共通入力／案内の構造合意を維持している。利用者指定どおり、Esc／Oによる一覧取消とprimary
+releaseの同frame配送を、表示内容より前の共通入力寿命境界で処理する。
+実viewerのCentralPanel入口で既存primary helperをkey handler前に一度呼び、局所decisionを
+通常pointer／一覧へ渡す。終端frameのSuppressを保ったままpersistent PointerStreamを終え、
+次の通常clickへ抑止を残さない。Open／Closedごとのguard、pending field、別ownerは追加しない。
+rootのキー転送やpassive投影は別viewportの物理終端を採用せず、既存context／native ownerを保つ。
+既存focus grace／touch遷移、新規detached述語／viewport／registry／HWND policyは変更しない。
+物理primary PointerStreamの入力寿命を表示状態から分離する構造修正であり、症状パッチではない。
+限定独立設計／完了レビュー（Sol/xhigh）は各ACCEPT、完了レビューP1／P2／P3なし。
+新規実renderer回帰1件（6組）とoverview 102件、touch 126件ほかの関連回帰が成功。
+fmt・監査・通常／portable check・build-devが成功。最終test-full 1回はPASS／exit 0、
+親suite合計13,594 passed、0 failed、64 ignored。製品起動／git add／commitは行っていない。
+詳細・実renderer6組の回帰と最終証拠は[一覧設計書§24](detached-book-page-overview-plan.md#24-キー取消とprimary-releaseの同時配送-tile122026-10-13)へ記録する。
+
+### 2026-10-13 §1.340 TILE11: 共通入力・案内のrenderer接続復元
+
+`13f70e9aa`の独立全体レビューはREVISE（P2 2件）。一覧のCentralPanel early returnが
+右ドラッグ／gestureの認識とgamepad X ring guideの描画を省略し、許可／禁止の実行gateと
+labelがあっても実rendererから到達しなかった。R5双方合意済みの共通入力／presentation契約を
+維持する構造修正として、[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)の限定独立レビューはACCEPT。
+
+`src/ui_fullscreen/viewer_chrome.rs`へ既存primary suppression終端／右ドラッグ取消、
+右ドラッグrecognizer、中ボタン短押し、F11 borderless transition step、共通overlay／dialogを
+抽出し、通常callerのguard・タイミング・描画順を保持してactive一覧も同helperを使う。
+passive guide labelはそのimmutable `overview.executable_actions`から解き、現在の別ownerの
+modeを流用しない。通常ページ送り・pan／zoom・画像menuとstill-only描画を一覧へ開放せず、
+prime black frameではbody／guideを描かない。新owner／scope／state field、HWND捕捉・placement、
+native入力policy、追加の時間窓は導入しない。操作ごとの症状guardを追加する修正ではない。
+
+独立Sol/xhigh完了レビューと追補はACCEPT（P1／P2／P3なし）。right／middle配送後は同じ
+stamp／owner／viewport／pageとpresentationの境界を通し、surface切替後に旧phaseの局所
+navigation結果・同frameの別入力を再利用しない。OS closeを保持し、F11中の一覧を黒で塗る。
+新規10実renderer回帰、passive A／B対称回帰1、pure案内snapshot2を含むoverview 101件が成功。
+通常／portable check・fmt・監査・build-devと最終test-full 1回が成功。全体gateは13,593 passed、
+0 failed、64 ignored。最終gateの実数は[設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)へ記録する。
+ラベルpure test／overview単体snapshotの成功を入力→paint→releaseの到達証明には使わない。
+
+### 2026-10-13 §1.340: 一覧中の回転完了consumer接続漏れ
+
+`503e33d7b`の利用者／ClaudeCode実機報告を、型付き需要計装と修正前headless rendererで調査。
+画像／ZIP／PDFとも、Loadedだが回転未確定のページがworker完了後もplaceholderになる回帰を確認した。
+唯一のproduction pollが一覧中に通らないstrip描画にあり、一覧のstart／投影に完了採用が欠けていた。
+R5の双方合意済みcontext-local worker／consumer契約へ戻す修正として、独立Sol/xhighの
+限定根因／修正設計レビューはACCEPT。同じ需要dispatcherのconsumer適格性確認後に既存pollを接続する。
+第二owner／状態field／force reload／追加repaint loopは作らず、passive／readonlyの投影、
+park／close／fork／swap／世代取消、detached述語・viewport・HWND・placementは変更しない。
+実機の新しい計装ログによる再確認は利用者が行う。証拠・回帰・検証結果は
+[一覧設計書§22](detached-book-page-overview-plan.md#22-一覧の未生成が残る不具合2026-10-13)に記録する。
+
+### 2026-10-13 §1.341 黒paperと先頭配置の設定採用
+
+利用者採用の[page-turn plan §26](page-turn-animation-plan.md)に従い、local pagedの演出ON時だけ
+先頭配置を実効ONにする。保存値・連結・Remoteは保持する。ON/OFF geometry変更は既存の
+全context設定取消に集約し、各mounted/parked ownerの未配送ready・旧Flat・採用済completion
+receiptを退役する。一件のcontinuationは同ownerに保持し、新canonical flat採用まで解放しない。
+単頁はrect/UVを保った共通黒paperに揃える。品質変更だけのfreezeは保持し、
+Center/Side等のplacement変更をreal geometry変更として通常prepareへ再bindする。
+独立GPT-6.1 Sol / xhighは既存owner境界での構造修正として合意。新pending/state owner、
+viewport/host述語、mount/deposit/worker世代、native focus/placement経路は追加・変更しない。
+通常mountの兄弟取消は行わない。実機採択はcoordinator/利用者へ残す。
 
 ### 2026-10-13 §1.375: Folder観測を一覧と同じcontextへ揃える
 
@@ -1967,6 +2070,162 @@ source補充の採用だけを実際のitem keyとcontext世代で行う。close
 維持し、rootの既存終了/トレイ設定へ終端後に渡す。兄弟の退役・items/cacheへの一括変更はしない。
 詳細と実worker順序fixtureは画像folder→ZIP計画§11.3と修正検証記録へ記載する。
 
+### 2026-10-12 §1.340 R5: 双方の構造合意と実装開始
+
+利用者が提示した独立レビュー結果は `a3bb1775b` **ACCEPT（P1/P2/P3なし）**。
+R5の通常fullscreen／メイン内閲覧への拡張も含め、「症状パッチではなく構造的修正である」
+ことに独立Codex reviewerが合意し、ClaudeCode側も同意した。§2の着手条件を満たした記録として残す。
+[設計書](detached-book-page-overview-plan.md) §10のT1→T5に沿って実装する。
+既定O、context-owned state／immutable metadata／bounded exact demand、既存着地とGrid同期、
+非active Select破棄を維持し、placement／HWND捕捉／background landingは追加しない。
+各chunkのtargeted tests／fmt／通常・portable checkと最終gate・確認buildは設計書へ記録する。
+アプリ起動・コミット・CHANGELOG更新は今回の作業に含めない。
+
+T1純粋モデル（`src/page_overview.rs`／`src/lib.rs`）は16 tests／fmt／通常・portable core check成功、
+独立完了レビューACCEPT（P1/P2/P3なし）。App／viewport接続はまだ行っていない。
+T2の前提照合で、PDF queued promotionがperf_keyだけで兄弟／Remote jobにも作用することを確認。
+§8.2／§10の条件に従い、当時の設計書§18に
+mandatory-ownerのcancel Arc identityでqueued jobだけを昇格する限定案と、foreground再評価も
+同じownerへ揃える接続条件を記載して停止した。独立reviewerは限定構造案へ合意済み、
+ClaudeCode側の追加境界合意と実装レビューは未実施。PDF製品コード変更・新たなepoch／取消変更はない。
+T1 ACCEPTを機能全体の完成・native入力／focus確認済みとは扱わない。
+
+coordinator追補（2026-10-12）: T1を `588fe1d76` としてコミット。PDF所有は§1.377
+`next-effetune` `4510346f5` の独立ACCEPT済みowner ticket／世代付き昇格を再利用する。
+旧§18のcancel Arc identity API案は撤回し、別の所有判定を実装しない。
+master統合後にnext-tileへmasterを取り込み、既存promotion tracking／bundle移譲上へ接続する。
+その間は非PDF UI・キーO・入力・snapshot・マニュアルを先行する指示を受けた。
+現行契約は[設計書§18](detached-book-page-overview-plan.md#18-t2-pdf昇格は1377の既存owner-scoped-apiへ接続する2026-10-12決定)。
+
+非PDF先行実装（2026-10-12）: ViewerContextBundleにClosed／Open一覧ownerを分類し、
+canonical immutable metadata／読み順と有界thumbnail投影を通常fullscreen／main内閲覧／
+detachedの既存surfaceへ接続した。stripと単一foreground exact demandを共有し、局所queued prune／
+Pixels・Finalized／RAW取消とroot Gridの保持範囲を既存ownerで扱う。parkはOpenを保持して新規需要を撤回、
+forkはClosed。無入力のpassive描画は生成・activationを行わず、commandは実際のactive資格を再検証する。
+F11／連動F12の同context移動はowner stamp単位のgeometry cacheを引き継ぎ、実surfaceの変更でreflowする。
+一覧終了後の描画は既存Closed／Rebased transitionで再準備し、通常入力を同passで再実行しない。
+既定O／有限KeyAction集合をdispatch・help・ring・padへ揃えた。配置／foreground／HWNDの新ownerは作らない。
+
+独立gpt-6.1-sol／xhigh完了レビューは非PDF coherent chunkにACCEPT、P1/P2/P3なし。
+readonly `ContextRef::page_overview_view` はimmutable投影だけを返すAPIとして、監査の完全一致指紋を1件追加。
+規則・閾値・ファイル除外・known findingsは緩和しない。R5双方の構造合意の境界内であり、
+PDF／EPUB要求接続・実機focus／HWND検証・機能全体の最終gateを完了扱いにはしない。
+§1.377はmasterへ統合済みだが、この実行環境ではworktree外のGit管理領域のindex.lock書込みが拒否され、
+next-tileへのmaster取込みは未実施だった。統合前の検証実数と残工程は設計書§19の履歴へ記録する。
+
+master統合／T2 PDF接続（2026-10-12）: coordinatorが非PDF `f3d5cbe22` をコミットし、
+Everythingと§1.377 `4510346f5`を含むmasterをmergeした。3競合の作業ファイルを解消し、
+一覧ownerとPDF render owner／promotion trackingのfresh/build/swap/fork/retireを両方保持した。
+readonly `ContextRef::page_overview_view` のA4完全一致指紋を維持し、PDF owner／trackingは
+既存private分類のままで新規公開API・監査例外を追加しない。Gitのstage／merge commitはcoordinator担当。
+
+一覧のPDF／EPUB要求はstrip共用dispatcherの`PdfPage` admissionと
+`promote_viewer_pdf_keys`へ接続した。§1.377のowner/current ticket/key照合とcontext-local Trackingを
+再利用し、第二のArc identity、別retry owner、背景着地、presentation／HWNDの新契約は作らない。
+R5双方の構造合意と§1.377の独立ACCEPT境界内の接続で、独立Sol/xhigh完了レビューは
+**ACCEPT、P1/P2/P3なし**。新規PDF／EPUBの3回帰を含むoverview 85件成功。
+最終検証・build実数は[設計書§20](detached-book-page-overview-plan.md#20-master統合とt2-pdfepub接続2026-10-12)へ集約する。
+実機PDFium／HWND／foreground／性能の受入はheadless検証から主張せず、製品起動・コミットは行わない。
+
+統合後の監査でEverythingの子testファイルだけにA6が46件出たため、親の既存test条件と同等の
+`#![cfg(test)]`を明示した。追加の独立静的レビューACCEPT（P1/P2/P3なし）、再監査exit 0。
+既存の末尾A6修正方針と同じで、製品経路・テスト内容・監査規則／allowlistの変更はない。
+
+最終fullで旧stripのcold rotation SQLzero回帰が単独でも失敗した。共用exact需要reconcileが
+非表示Bookmark consumerのgetterを呼び、既存eligibilityより先にspread SQLを実行するのが原因。
+panel open／Bookmarks tabの既存必須条件をresolver前へ移し、空需要の副作用だけを除く。
+独立Sol/xhigh reviewはR5 §8.1の同じ需要所有境界の実装是正としてACCEPT、追加設計／API／owner不要。
+有資格時の実spread／draw reachabilityと需要集合は保持する。閉panel／開panel別tabのLTR／RTL・F5を
+旧SQLzero回帰へ加え、active保持回帰も確認する。fullは1回に留め、素材／fixture／UI期待値の
+補完と確認buildの実数を設計書§20.1へ記録する。HWND／presentation／foreground契約は変更しない。
+
+### 2026-10-12 §1.340: 画像窓内ページ一覧の設計提出（構造合意待ち、コード変更なし）
+
+`next-tile` / `ea060b66e` 基準の
+[detached-book-page-overview-plan.md](detached-book-page-overview-plan.md) を作成した。
+公開は v4.6.0 の次の版の後。独立レビュー・利用者確認の前に実装しない。
+本記録は設計提出であり、ClaudeCode／Codex の構造合意や検収完了を表さない。
+
+- §2 を読んだ上で、一覧状態は `ViewerContextBundle` の単一 typed owner、
+  表示先は既存 window_id／context binding、前面サムネイル需要は既存 request owner を
+  維持して exact set を一般化する案とした。App-global detached flag、placement の
+  第二の正本、rect 捕捉条件、host_lost による recreate、競合回避の時間窓は追加しない。
+- R4 未完を前提に active／passive deferred／legacy passive／backstop を棚卸しし、
+  同じ bounded read-only overview projection を使う案を記した。passive の入力は
+  描画時 identity 付き command と activation を既存 manager／registry 境界へ渡す。
+  最初のクリックを単なる ActivateOnly に落とさず、一度だけ元窓へ実行する。
+- 一覧の開閉だけで items 世代／兄弟 context／Remote mutation を失効させず、
+  需要解除では保存終端を偽装しない。全ページ queue／画像生成、全窓 modal、
+  park 時の一覧自動取消を避け、items／構成変更時は既存境界で一覧を閉じる。
+- 今後触る予定範囲は App の mounted projection、bundle の交換・teardown、
+  detached snapshot／deferred event／activation intent、既存 foreground demand、
+  viewport 描画・入力分岐。HWND 捕捉／placement／presentation transition の所有は変えない。
+  §1.242 の canonical projection と白紙 landing は統合後の設計再照合が必要。
+- 症状パッチではなく所有境界の構造追加にできるかを、実装前の設計 lead／独立 reviewer
+  の明示合意に委ねる。製品コード変更・アプリ起動・コミットは行っていない。
+
+**独立設計レビューへの改訂（2026-10-12、対象 `6432e8e04`）**:
+利用者が提示したレビューは REVISE（P1 0件、P2 3件、P3 1件）。単一 context owner、
+既存 navigation、exact demand 一般化は症状パッチではなく構造追加と評価されたが、
+実装着手への全面的な構造合意は保留。以下を設計書へ反映し、再レビュー待ちとした。
+
+- `next-book` `5fb135810` の構成正本に合わせ、一覧は可視実ページのみ。
+  白紙は対応実ページセル内の補助表示に限り、独立セル／identity／選択／総数／landing を作らない。
+  上記初回記録の「白紙 landing」の検討は撤回し、構成との統合確認は実ページ projection を対象にする。
+- toggle は FsCommon、一覧 scope は Global／FsCommon／FsPageOverview。
+  一覧の許可 Action 集合と優先順位を dispatch・競合表示・ヘルプ・リングで共有する。
+  toggle=Enter と Confirm の競合を同時実行可能集合により表示する。
+- passive に可視実ページ全列の immutable metadata を共有し、画像保持だけを有界にする。
+  park後のresize／DPI変更で露出した未生成セルも、描画した identity へ最初の一クリックで着地する。
+- 入力なしの repaint／resize／サムネ終端では前面化せず、通常resumeはwindow bindingと
+  生存HWND／incarnationを維持する。focus移動後の配送済み stamped edge は元contextへ適用し、
+  current-levelで破棄／再活性化しない。独立静止画窓のF12無効と連動窓migrationの受入を分ける。
+
+設計書 §13 に指摘別の対応と受入ケースを記録。今回も製品コード・実装・起動・コミットなし。
+
+**R2再レビュー P1へのR3改訂（2026-10-12、対象 `daa32a068`）**:
+利用者が提示した再レビューは REVISE（P1 1件、P2/P3 0件）。前回4件の文書対応は確認されたが、
+scoped mount内のSelect着地がApp-global active session／presentationを変更する問題で構造合意は保留。
+coordinatorの状態組合せ削減の判断を採用し、上記R2記録のfocus移動後のSelect着地案を撤回した。
+
+- Select処理時に元contextが実際のactive ownerでなければ着地させずSelectを破棄し、元窓の一覧を残す。
+  遅延Selectを成立させる再activation／scoped mount／fullscreen openを行わず、保留・再配送しない。
+- AへEnter配送→B復帰→AのSelect処理で、Bのactive session・runtime・描画先・foregroundが不変、
+  Aの一覧Openが維持される受入を設計書§6.3／ケース13・18へ記載。Aへ戻って新しいSelectで選び直す。
+- 共通navigationの内容更新／presentation分離、非active窓のClosed投影／backgroundロード回収は
+  この機能の契約に追加しない。既存着地はactive contextで使用する。
+
+設計書 §14 にR3の判断と検証範囲を記録。今回も実装・製品起動・コミットなし、再レビュー待ち。
+
+**R3 ACCEPT／利用者決定によるR4対象拡張（2026-10-12）**:
+利用者が提示した独立レビュー結果はR3 `015b44c03` ACCEPT、構造的修正であることへ合意済み。
+R3の非active Select破棄・元一覧維持の契約は継続する。
+利用者確認で通常fullscreen／メイン内閲覧も対象、既定キーを付けることと操作案を確定した。
+
+- 通常viewerのmounted ownerとbundle交換を同じ所有にし、別context／detached窓への迂回を作らない。
+  root embeddedのinputをGridへ漏らさず、overviewのcursor／scrollをmain Gridのselected／checked／
+  scroll／場所履歴と分離する。既存「一覧を開く」はメインページ一覧への切替として共存する。
+- Sを維持した既定キー候補3件（Ctrl+D／Ctrl+W／Ctrl+Q）を設計書§4.2に根拠付きで記載。
+  Grid専用Ctrl+Dの既存意味は維持する。最終chordは利用者が選び、今回は設定・コードを変更しない。
+- 拡張したsurface所有・active資格・共通入力集合・メインGrid保持は設計書§5.1／§15と
+  ケース19／20に記録し、再レビューへ渡す。R3の合意を対象拡張の承認として流用しない。
+
+今回も設計のみ、実装・製品起動・コミットなし。R4拡張再レビューと既定キー選択待ちで停止する。
+
+**R4再レビューP1／既定OのR5改訂（2026-10-12、対象 `7d0d0cf0a`）**:
+利用者が提示した再レビューはREVISE（P1 1件、P2/P3 0件）。R3の構造合意は維持、拡張全体は保留。
+利用者はO（Overview）を既定キーに決定。閲覧scope、固定キー／マウス／gamepad、編集scopeのOを
+静的に照合し、設計書§4.2で確定仕様とKeyAction／同梱defaultの実装前提を記載した。
+
+- coordinatorの簡素化判断により一覧Selectを通常ページ移動と同じ経路・Grid同期に揃える。
+  一覧閲覧中／取消はGridを変更せず、受理Select後は通常fullscreen／メイン内／連動F12で
+  既存Grid追従、独立窓では既存main非干渉に従う。R4の「選択後もGrid保持」を撤回する。
+- `sync_main_selection_from_viewer_idx`／連結seekのcursor・scroll更新／後続連動同期を抑止せず、
+  一覧専用navigation origin、着地／Grid同期分離、snapshot／rollback、App-global抑止flagを作らない。
+- 受入ケース19は通常移動との対照と、10→40選択後の描画・連結再アンカー・連動同期、
+  続く明示Grid操作を含む。R3の非active Select破棄／元一覧維持の契約は変更しない。
+
+設計書§16に判断と検証範囲を記録し、R5再レビュー待ちで停止。今回も実装・製品起動・コミットなし。
 ### 2026-10-12 音楽ベース表示の共通基音推定への移行 (§13、第2段階)
 
 [鍵盤設計 §13.7 P4](music-keyboard-harmnet-plan.md) と利用者の実装指示による。
@@ -1978,6 +2237,39 @@ detached述語、viewport経路、park／復帰の所有・遷移、Norm引数�
 既存のpark／復帰回帰にはBass結果の保持・採用の検査を加えた。
 設計側の判断は§13.7末尾に記録済み。実装側も上記主張に合意する。
 独立実装レビューの合意・自動検証は鍵盤設計の今回の検証記録へ追記する。
+
+### 2026-10-11 §1.341 Pairの移動背とpin枠（構造確認待ち）
+
+利用者option Aによりprojectionのframe-local H/static poseを共通progressで移す。canonical destination clipは既存transform viewportとpainter clipの交差から捕捉する。context resource、normal mount/deposit/fork、native viewport dispatch/placementは変更しない。pin gateを共通helperへまとめ、測定に基づき固定128 MiB capを撤去（有限fullscreen10%、無制限1 GiB）。shared weak inventory/dedup/batch leaseとcontext別退役を維持し、兄弟contextを消さない。これはprojectionと既存pin admissionの構造変更であり、独立確認・実機受入れは未了。
+
+
+### 2026-10-11 §1.341 resident素材でのturn開始（構造確認待ち）
+
+利用者決定のfinal-only撤回に従い、contextのAcceptedOfferがincoming typed resident resourceとlogical content bindingを所有する。共有weak inventoryへaccept source pinを加え、通常prepare後のnative ROIもdedup会計する。turnとcanonical flat採用までは保持素材・最初のplacementを使い、通常producer/upgradeは止めない。source品質publicationのinput epoch更新と実編集を分け、当該contextのitem/edit/params/comic/view/layout bindingを維持する。既存close→continuation commit→captureとflat-firstで保持を解く。fork、park/mount/deposit、兄弟cancel、F12動画拒否、viewport/native生成経路は変更しない。変更範囲はui_fullscreen.rsの通常selector/prepare済素材束縛、page_turn.rs/barrier.rsのowner/lease/採用照合、回帰fixture。新pending・queue・wait・producerを作らない。詳細はpage-turn plan §22。独立構造確認・完了レビューや実窓受入れの合格は主張しない。
+
+### 2026-10-11 §1.341 A0: context単位の紙めくりpresentationと共有会計（確認待ち）
+
+2026-10-11 HUD追補（`bf3b2fae0`）: 既存PC静止画HUDに全体設定のON/OFF行を追加し、Preferencesのadoption処理へ合流する。既存`deactivate_all_page_turn_presentations`を設定変更時に再利用するだけで、detached述語・viewport routing・bundle/workerの所有契約は変更しない。F12からの変更が全体設定と各presentationに反映し、兄弟のitems/idx/input sequenceを変えないことを既存context test内で検査する。設計担当ClaudeCodeの判断で既存overflowの`Settings::save()`へ保存を接続し、DB再読込を同testへ追加する（判断者の訂正は`e3a328ff6`。HUDへON/OFFを追加する利用者要求とは別の保存経路判断）。projection追補は描画先transformのeffective pppをpure geometryへ渡し、独立に丸められたpaint矩形の比較を物理1px以内へ定義する。viewport origin/clipの正本、destination binding、resource/context所有者は変更しない。構造的なgeometryの比較単位修正として記録し、独立構造合意・実機確認を主張しない。詳細と範囲はpage-turn plan §14。
+
+R3は利用者からACCEPTと伝達され`0f6ad9f19`へ統合済み。今回のA0未コミット差分は、
+`src/ui_fullscreen/page_turn.rs`のtyped `PageTurnPresentation`を既存`ViewerContextBundle`へ接続する。
+Inactive/Flat/Offered/Turningは当該contextの提出済みunitとimmutable paint resourceを所有し、
+operation factは配送先context/window/viewportとstable operation IDを保持する。
+通常swap/deposit/mount/pause/parkで兄弟のpresentationを取り消さず、forkはInactive、実際のclose/非表示/取消は
+対象ownerだけを退役させる。共有input_seqを操作identityや配送先の代用にしない。
+
+Appの`PageTurnLeaseInventory`はweak参照の共有VRAM会計一覧で、保持textureのownerではない。
+既存`vram_accounting`/`vram_budget`へsource/outputの保持量を接続し、parked/in-flightも会計する。
+共有予算は新しいeffectのadmissionだけを制約し、兄弟のnavigation・load/cache/workerを止めない。
+触れる範囲は`app.rs`、`app/viewer_context_registry.rs`、`app/vram_accounting.rs`、`vram_budget.rs`、
+`ui_fullscreen.rs`とその`page_turn`moduleのpresentation・入力・提出境界。
+新しいdetached述語、rect捕捉、HWND/viewport生成、placement/focus再生成、grace/debounceは追加しない。
+
+これは既存context所有へpresentationを追加し、会計をweak inventoryへ分離する構造的拡張という
+実装方針の記録であり、症状guardや待機による修正ではない。
+R3採択からA0具体的接続の独立構造合意・完了レビューを推定しない。
+複数窓の取消・park/mount・native batch lifetime/実解放、GPU/実present、性能/実用性の受入れは確認待ち。
+詳細と実績/未完了gateは[page-turn-animation-plan.md §12](page-turn-animation-plan.md#12-a0実装差分検証状況2026-10-11)。
 
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 

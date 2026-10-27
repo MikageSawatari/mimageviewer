@@ -34,6 +34,1575 @@ use crate::ring_shortcut::{
     RingPickerState, RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
     mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
 };
+
+#[cfg(test)]
+mod overview_guide_snapshots;
+
+#[cfg(all(test, windows))]
+mod overview_viewer_chrome_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Mode {
+        Fullscreen,
+        MainWindow,
+        Detached,
+    }
+
+    fn configure(app: &mut App, ctx: &egui::Context, root: &std::path::Path, mode: Mode) {
+        configure_page_count(app, ctx, root, mode, 4);
+    }
+
+    fn configure_page_count(
+        app: &mut App,
+        ctx: &egui::Context,
+        root: &std::path::Path,
+        mode: Mode,
+        page_count: usize,
+    ) {
+        use crate::fs_animation::{FsCacheEntry, StaticAnimationState};
+        app.items = (0..page_count)
+            .map(|idx| GridItem::Image(root.join(format!("page-{idx}.png"))))
+            .collect();
+        app.image_metas = vec![Some((1, 1)); page_count];
+        app.visible_indices = (0..page_count).collect();
+        app.current_folder = Some(root.to_path_buf());
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+        app.viewer_presentation = match mode {
+            Mode::Fullscreen => ViewerPresentation::Fullscreen,
+            Mode::MainWindow => ViewerPresentation::MainWindow,
+            Mode::Detached => ViewerPresentation::DetachedWindow,
+        };
+        app.native_video_in_window_active = matches!(mode, Mode::MainWindow);
+        let pixels = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            "overview-real-viewer",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails = (0..page_count)
+            .map(|idx| {
+                crate::grid_item::ThumbnailState::loaded_raster(
+                    if idx == 0 {
+                        tex.clone()
+                    } else {
+                        ctx.load_texture(
+                            format!("overview-real-page-{idx}"),
+                            (*pixels).clone(),
+                            egui::TextureOptions::LINEAR,
+                        )
+                    },
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 2,
+                    },
+                    false,
+                    2,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((2, 2)),
+                    None,
+                )
+            })
+            .collect();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                pdf_metadata: None,
+                pdf_rerender_failures: Vec::new(),
+                tex,
+                pixels,
+                source_dims: Some([2, 2]),
+                load_seq: app.input_seq,
+                animation: StaticAnimationState::Still,
+            },
+        );
+        for idx in 0..page_count {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+        }
+        app.page_identity_index = Arc::new(
+            crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &app.items,
+                None,
+                app.settings.file_type_visibility.clone(),
+            ),
+        );
+    }
+
+    fn fixture(mode: Mode, test: impl FnOnce(&mut App, &egui::Context)) {
+        let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
+        // Headless child viewports are embedded egui Windows. Their Area fade-in
+        // multiplies every paint alpha; this fixture checks the viewer's actual
+        // canvas and input transitions, independently of that backend animation.
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let mut env = crate::app::setup_app_for_test();
+        let root = env.tmp.path().to_path_buf();
+        if matches!(mode, Mode::Detached) {
+            let id = env.build_active_context_for_test(
+                Some(134011),
+                crate::app::DetachedSource::Image,
+                |app| configure(app, &ctx, &root, mode),
+            );
+            env.with_window_context_for_test(id, |app| {
+                assert!(app.open_page_overview(surface(), Default::default()));
+                test(app, &ctx);
+            });
+        } else {
+            configure(&mut env, &ctx, &root, mode);
+            assert!(env.open_page_overview(surface(), Default::default()));
+            test(&mut env, &ctx);
+        }
+    }
+
+    fn surface() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960., 720.))
+    }
+
+    fn viewer_input(app: &App, events: Vec<egui::Event>) -> egui::RawInput {
+        let id = if matches!(app.viewer_presentation, ViewerPresentation::MainWindow) {
+            egui::ViewportId::ROOT
+        } else {
+            app.fullscreen_viewport_id()
+        };
+        let mut input = egui::RawInput {
+            viewport_id: id,
+            screen_rect: Some(surface()),
+            events,
+            ..Default::default()
+        };
+        input.viewports.insert(
+            id,
+            egui::ViewportInfo {
+                parent: (id != egui::ViewportId::ROOT).then_some(egui::ViewportId::ROOT),
+                focused: Some(true),
+                ..Default::default()
+            },
+        );
+        input
+    }
+
+    fn frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        frame_with_viewer_area(app, ctx, events).0
+    }
+
+    fn frame_with_viewer_area(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<egui::Rect>) {
+        let viewer_id = app.fullscreen_viewport_id();
+        let mut area = None;
+        // egui's embedded headless callback still runs the production fullscreen renderer.
+        let output = crate::test_ui::headless_paint_output(ctx.run_ui(
+            viewer_input(app, events),
+            |root_ui| {
+                app.render_fullscreen_viewport(root_ui);
+                // Area memory is viewport-scoped. Read before end_pass restores ROOT,
+                // using the actual child Window id rather than the ambient viewport id.
+                area = root_ui.memory(|memory| memory.area_rect(egui::Id::unique(viewer_id)));
+            },
+        ));
+        (output, area)
+    }
+
+    fn gamepad_frame(app: &mut App, ctx: &egui::Context, events: &[PadEvent]) -> egui::FullOutput {
+        for event in events {
+            app.gamepad.push_for_test(*event);
+        }
+        crate::test_ui::headless_paint_output(ctx.run_ui(viewer_input(app, vec![]), |root_ui| {
+            let ctx = root_ui.ctx();
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            let outcome = app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true);
+            assert!(outcome.dispatch_allowed);
+            app.render_fullscreen_viewport(root_ui);
+        }))
+    }
+
+    fn pointer(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn key_press(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn white_canvas_rect(output: &egui::FullOutput) -> egui::Rect {
+        fn collect(shape: &egui::epaint::Shape, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == egui::Color32::WHITE => {
+                    rects.push(rect.rect);
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut rects);
+        }
+        rects
+            .into_iter()
+            .max_by(|left, right| left.area().total_cmp(&right.area()))
+            .expect("the configured WHITE CentralPanel must identify the actual viewer canvas")
+    }
+
+    fn has_text(output: &egui::FullOutput, expected: &str) -> bool {
+        fn contains(shape: &egui::epaint::Shape, expected: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(text) => text.galley.job.text.contains(expected),
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().any(|shape| contains(shape, expected))
+                }
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains(&shape.shape, expected))
+    }
+
+    fn assert_black_canvas(output: &egui::FullOutput, viewer_area: Option<egui::Rect>) {
+        fn collect_rects(
+            shape: &egui::Shape,
+            clip: egui::Rect,
+            rects: &mut Vec<(egui::Rect, egui::Rect, egui::Color32)>,
+        ) {
+            match shape {
+                egui::Shape::Rect(rect) => rects.push((rect.rect, clip, rect.fill)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_rects(shape, clip, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let viewer_area =
+            viewer_area.expect("the fixture must observe its actual embedded viewer Area");
+        let mut rects = Vec::new();
+        for shape in &output.shapes {
+            collect_rects(&shape.shape, shape.clip_rect, &mut rects);
+        }
+        // The deliberately WHITE CentralPanel independently identifies the real
+        // child canvas. Embedded Windows can resize after native placement;
+        // an arbitrary small black tile must never satisfy this assertion.
+        let (background, &(canvas, _, _)) = rects
+            .iter()
+            .enumerate()
+            .filter(|(_, (rect, clip, fill))| {
+                *fill == egui::Color32::WHITE
+                    && viewer_area.contains_rect(*rect)
+                    && rect.contains(viewer_area.center())
+                    && rect.area() > viewer_area.area() * 0.5
+                    && clip.contains_rect(*rect)
+            })
+            .max_by(|(_, (left, _, _)), (_, (right, _, _))| left.area().total_cmp(&right.area()))
+            .unwrap_or_else(|| {
+                panic!("missing full WHITE canvas in viewer Area {viewer_area:?}: {rects:?}")
+            });
+        let fills = rects[background + 1..]
+            .iter()
+            .filter_map(|(rect, clip, fill)| {
+                (rect.contains_rect(canvas) && clip.contains_rect(canvas)).then_some(*fill)
+            })
+            .collect::<Vec<_>>();
+        let opaque = fills
+            .iter()
+            .rposition(|fill| fill.a() == 255)
+            .unwrap_or_else(|| {
+                panic!("canvas {canvas:?} must have a later opaque fill: {fills:?}")
+            });
+        assert_eq!(
+            fills[opaque],
+            egui::Color32::BLACK,
+            "overview must cover the whole WHITE canvas {canvas:?} with opaque black"
+        );
+        assert!(
+            fills[opaque + 1..]
+                .iter()
+                .all(|fill| fill.r() == 0 && fill.g() == 0 && fill.b() == 0),
+            "later full-canvas shades must composite to black: canvas={canvas:?} fills={fills:?}"
+        );
+    }
+
+    #[test]
+    fn overview_real_viewer_o_dismisses_overflow_before_tile_input_or_cancel() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for cancel in [false, true] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    // Fill the default columns so a real tile reaches the right-side
+                    // menu even in the widest fixture. Other tests keep four pages.
+                    let root = app.current_folder.clone().unwrap();
+                    configure_page_count(app, ctx, &root, mode, 8);
+                    app.viewer_navigation_caches.invalidate();
+                    app.settings.fullscreen_image_margin_color = [255; 3];
+                    frame(app, ctx, vec![]);
+                    app.apply_fs_overflow_open_request_for_test();
+                    let output = frame(app, ctx, vec![]);
+                    let old_menu = app
+                        .fullscreen_overflow_panel_rect_for_test(white_canvas_rect(&output))
+                        .unwrap();
+                    frame(app, ctx, vec![key_press(egui::Key::O)]);
+                    assert!(app.page_overview.session().is_some(), "{mode:?}");
+                    assert_eq!(
+                        app.fs_overflow_panel_state,
+                        crate::app::FsOverflowPanelState::Closed,
+                        "{mode:?}: O must finish the previous chrome before returning"
+                    );
+                    // Service the accepted action's existing repaint before measuring
+                    // the click target in the displayed overview.
+                    frame(app, ctx, vec![]);
+                    if cancel {
+                        frame(app, ctx, vec![key_press(egui::Key::Escape)]);
+                        assert!(app.page_overview.session().is_none());
+                        frame(app, ctx, vec![]);
+                        assert_eq!(
+                            app.fs_overflow_panel_state,
+                            crate::app::FsOverflowPanelState::Closed,
+                            "{mode:?}: cancelling overview must not resurrect the old menu"
+                        );
+                        assert_eq!(app.fullscreen_idx, Some(0));
+                    } else {
+                        let view = app.page_overview_view().unwrap();
+                        let layout = App::page_overview_cached_layout(ctx, &view).unwrap();
+                        let (ordinal, pos) = (1..view.projection.len())
+                            .find_map(|ordinal| {
+                                let overlap = layout
+                                    .cell_rect(ordinal, view.scroll_anchor)?
+                                    .intersect(old_menu)
+                                    .shrink(2.0);
+                                overlap.is_positive().then_some((ordinal, overlap.center()))
+                            })
+                            .expect("a non-current tile must overlap the old menu rectangle");
+                        assert!(old_menu.contains(pos));
+                        assert!(app.fs_prev_focused);
+                        // This is an already-focused viewer, not the first click used
+                        // to restore focus. Let the existing 300ms guard expire itself.
+                        app.fs_focus_regained_at = Some(Instant::now() - Duration::from_secs(1));
+                        frame(
+                            app,
+                            ctx,
+                            vec![
+                                egui::Event::PointerMoved(pos),
+                                pointer(pos, egui::PointerButton::Primary, true),
+                            ],
+                        );
+                        assert!(app.fs_focus_regained_at.is_none());
+                        assert!(!app.fs_primary_suppression.is_active());
+                        frame(
+                            app,
+                            ctx,
+                            vec![pointer(pos, egui::PointerButton::Primary, false)],
+                        );
+                        assert!(
+                            app.page_overview.session().is_none(),
+                            "{mode:?} ordinal={ordinal} pos={pos:?} old_menu={old_menu:?} layout={:?}",
+                            layout.viewport()
+                        );
+                        assert_eq!(app.fullscreen_idx, Some(ordinal), "{mode:?}");
+                        assert_eq!(
+                            app.fs_overflow_panel_state,
+                            crate::app::FsOverflowPanelState::Closed
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_o_finishes_nonfocused_top_menu_and_retains_info_lock() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for spread in [false, true] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    app.fs_info_panel.locked = true;
+                    frame(app, ctx, vec![]);
+                    app.spread_popup_open = spread;
+                    app.fit_popup_open = !spread;
+                    frame(app, ctx, vec![]);
+                    frame(app, ctx, vec![key_press(egui::Key::O)]);
+                    assert!(
+                        app.page_overview.session().is_some(),
+                        "{mode:?} spread={spread}"
+                    );
+                    assert!(!app.spread_popup_open && !app.fit_popup_open);
+                    assert!(app.fs_info_panel.locked);
+                    frame(app, ctx, vec![key_press(egui::Key::Escape)]);
+                    frame(app, ctx, vec![]);
+                    assert!(app.page_overview.session().is_none());
+                    assert!(!app.spread_popup_open && !app.fit_popup_open);
+                    assert!(
+                        app.fs_info_panel.locked,
+                        "{mode:?}: saved info lock must survive"
+                    );
+                    assert_eq!(app.fullscreen_idx, Some(0));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_popup_lifecycle_keeps_seek_keys_then_retires_in_own_pass() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for seek in [false, true] {
+                for cancel in [false, true] {
+                    fixture(mode, |app, ctx| {
+                        app.close_page_overview_with_ctx(ctx);
+                        app.settings.fullscreen_top_bar_locked = true;
+                        app.settings.fullscreen_seek_bar_locked = true;
+                        frame(app, ctx, vec![]);
+                        let popup = egui::Id::unique(if seek {
+                            "fullscreen_still_seek_strip"
+                        } else {
+                            "fs_rotation_btn"
+                        })
+                        .with("popup");
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            egui::Popup::open_id(ui.ctx(), popup);
+                            app.render_fullscreen_viewport(ui);
+                        }));
+                        // A second ordinary frame must keep the real popup alive;
+                        // merely seeding popup memory is not presentation evidence.
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            app.render_fullscreen_viewport(ui);
+                            assert!(
+                                egui::Popup::is_id_open(ui.ctx(), popup),
+                                "{mode:?} seek={seek}"
+                            );
+                        }));
+                        let input = viewer_input(app, vec![key_press(egui::Key::O)]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            assert!(egui::Popup::is_id_open(ui.ctx(), popup));
+                            app.render_fullscreen_viewport(ui);
+                        }));
+                        if seek {
+                            assert!(app.page_overview.session().is_none(), "seek popup owns O");
+                            // Non-key saved commands still use the common accepted
+                            // transition; popup retirement belongs to its renderer pass.
+                            let input = viewer_input(app, vec![]);
+                            let _ =
+                                crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                                    let _ = app.apply_ring_action(
+                                        ui.ctx(),
+                                        RingShortcutContext::ImageFullscreen,
+                                        RingActionId::ImagePageOverview,
+                                        "overview-popup-fixture",
+                                    );
+                                    app.render_fullscreen_viewport(ui);
+                                }));
+                        }
+                        assert!(
+                            app.page_overview.session().is_some(),
+                            "{mode:?} seek={seek}"
+                        );
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            // Service the action's requested repaint while inspecting:
+                            // a no-render pass would abandon the embedded viewer Area.
+                            app.render_fullscreen_viewport(ui);
+                            assert!(
+                                !egui::Popup::is_id_open(ui.ctx(), popup),
+                                "{mode:?} seek={seek}: the abandoned owner popup must retire at end_pass"
+                            );
+                        }));
+                        if cancel {
+                            frame(app, ctx, vec![key_press(egui::Key::Escape)]);
+                            frame(app, ctx, vec![]);
+                            let input = viewer_input(app, vec![]);
+                            let _ =
+                                crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                                    app.render_fullscreen_viewport(ui);
+                                    assert!(!egui::Popup::is_id_open(ui.ctx(), popup));
+                                }));
+                            assert!(app.page_overview.session().is_none());
+                            assert_eq!(app.fullscreen_idx, Some(0));
+                        } else {
+                            let view = app.page_overview_view().unwrap();
+                            let pos = App::page_overview_cached_layout(ctx, &view)
+                                .unwrap()
+                                .cell_rect(1, view.scroll_anchor)
+                                .unwrap()
+                                .center();
+                            assert!(app.fs_prev_focused);
+                            // Age the existing focus-restoration observation rather
+                            // than disabling its physical pointer-stream guard.
+                            app.fs_focus_regained_at =
+                                Some(Instant::now() - Duration::from_secs(1));
+                            frame(
+                                app,
+                                ctx,
+                                vec![
+                                    egui::Event::PointerMoved(pos),
+                                    pointer(pos, egui::PointerButton::Primary, true),
+                                ],
+                            );
+                            assert!(app.fs_focus_regained_at.is_none());
+                            assert!(!app.fs_primary_suppression.is_active());
+                            frame(
+                                app,
+                                ctx,
+                                vec![pointer(pos, egui::PointerButton::Primary, false)],
+                            );
+                            assert!(
+                                app.page_overview.session().is_none(),
+                                "{mode:?} seek={seek} pos={pos:?}"
+                            );
+                            assert_eq!(app.fullscreen_idx, Some(1));
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_gamepad_ring_entry_finishes_only_accepted_chrome_transition() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for accepted in [false, true] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    app.settings.gamepad_enabled = true;
+                    app.note_input_surface(crate::app::ActionSurface::Viewer);
+                    app.settings.ring_shortcuts.image.slots[RingDirection::Up.slot_index()] =
+                        RingActionId::ImagePageOverview;
+                    frame(app, ctx, vec![]);
+                    app.apply_fs_overflow_open_request_for_test();
+                    frame(app, ctx, vec![]);
+                    // An actual saved command is refused by the common availability
+                    // gate without dismissing the previous menu on that path.
+                    app.show_preferences = !accepted;
+                    if !accepted {
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
+                            assert!(
+                                app.apply_ring_action(
+                                    ctx,
+                                    RingShortcutContext::ImageFullscreen,
+                                    RingActionId::ImagePageOverview,
+                                    "overview-overflow-fixture",
+                                )
+                                .is_none()
+                            );
+                        }));
+                        assert!(app.page_overview.session().is_none());
+                        assert_eq!(
+                            app.fs_overflow_panel_state,
+                            crate::app::FsOverflowPanelState::Root
+                        );
+                    }
+                    gamepad_frame(
+                        app,
+                        ctx,
+                        &[
+                            PadEvent::ButtonPressed(PadButton::West),
+                            PadEvent::ButtonPressed(PadButton::DPadUp),
+                        ],
+                    );
+                    gamepad_frame(app, ctx, &[PadEvent::ButtonReleased(PadButton::West)]);
+                    assert_eq!(app.page_overview.session().is_some(), accepted, "{mode:?}");
+                    assert_eq!(
+                        app.fs_overflow_panel_state,
+                        if accepted {
+                            crate::app::FsOverflowPanelState::Closed
+                        } else {
+                            crate::app::FsOverflowPanelState::Root
+                        },
+                        "{mode:?} accepted={accepted}"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_right_ring_and_gesture_release_use_allowed_actions() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for drag in [RightDragMode::RingShortcut, RightDragMode::MouseGesture] {
+                for (action, cancels) in [
+                    (RingActionId::ImagePageOverview, true),
+                    (RingActionId::ImageSlideshow, false),
+                ] {
+                    fixture(mode, |app, ctx| {
+                        app.settings
+                            .ring_shortcuts
+                            .set_right_drag_mode(RightDragContext::ImageFullscreen, drag.clone());
+                        app.settings.ring_shortcuts.image.slots
+                            [RingDirection::Right.slot_index()] = action.clone();
+                        app.settings.ring_shortcuts.mouse_gestures_image.bindings =
+                            vec![crate::ring_shortcut::MouseGestureBinding::new(
+                                vec![MouseGestureDirection::Right],
+                                action.clone(),
+                            )];
+                        frame(app, ctx, vec![]);
+                        let start = egui::pos2(300., 250.);
+                        let end = start + egui::vec2(100., 0.);
+                        frame(
+                            app,
+                            ctx,
+                            vec![
+                                egui::Event::PointerMoved(start),
+                                pointer(start, egui::PointerButton::Secondary, true),
+                            ],
+                        );
+                        assert!(
+                            app.mouse_ring_flick.is_some() || app.mouse_gesture.is_some(),
+                            "{mode:?} {drag:?}: recognition must run"
+                        );
+                        // Advance the existing guide clock without sleeping or modifying production delays.
+                        if let Some(flick) = &mut app.mouse_ring_flick {
+                            flick.start_time = Instant::now() - Duration::from_secs(1);
+                        }
+                        if let Some(gesture) = &mut app.mouse_gesture {
+                            gesture.start_time = Instant::now() - Duration::from_secs(1);
+                        }
+                        let output = frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+                        let label = if cancels {
+                            "本のページ一覧"
+                        } else {
+                            "無効: スライドショー"
+                        };
+                        assert!(
+                            has_text(&output, label),
+                            "{mode:?} {drag:?}: guide must paint {label}"
+                        );
+                        frame(
+                            app,
+                            ctx,
+                            vec![pointer(end, egui::PointerButton::Secondary, false)],
+                        );
+                        assert_eq!(
+                            app.page_overview.session().is_none(),
+                            cancels,
+                            "{mode:?} {drag:?}: release uses overview gate"
+                        );
+                        assert!(!app.slideshow_playing);
+                        assert_eq!(app.fullscreen_idx, Some(0));
+                        assert_eq!(app.selected, Some(0));
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_middle_short_click_uses_allowed_actions() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for (action, cancels) in [
+                (RingActionId::ImagePageOverview, true),
+                (RingActionId::ImageSlideshow, false),
+            ] {
+                fixture(mode, |app, ctx| {
+                    app.settings.ring_shortcuts.mouse_buttons_image.middle = action;
+                    frame(app, ctx, vec![]);
+                    let pos = egui::pos2(300., 250.);
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            pointer(pos, egui::PointerButton::Middle, true),
+                        ],
+                    );
+                    frame(
+                        app,
+                        ctx,
+                        vec![pointer(pos, egui::PointerButton::Middle, false)],
+                    );
+                    assert_eq!(
+                        app.page_overview.session().is_none(),
+                        cancels,
+                        "{mode:?}: middle release uses overview gate"
+                    );
+                    assert!(!app.slideshow_playing);
+                    assert_eq!(app.fullscreen_idx, Some(0));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_detached_f11_consumes_existing_transition() {
+        fixture(Mode::Detached, |app, ctx| {
+            use crate::app::DetachedViewerBorderlessTransitionPhase as Phase;
+            let window_id = app.active_detached_window_id().unwrap();
+            let placement = app.default_detached_viewer_window_placement();
+            app.window_visible = true;
+            app.set_detached_window_runtime_placement(window_id, placement, "overview-f11-fixture");
+            crate::app::detached_placement::with_host_geometry_for_test(
+                window_id,
+                placement.outer,
+                false,
+                || {
+                    app.settings.fullscreen_image_margin_color = [255; 3];
+                    frame(app, ctx, vec![]);
+                    app.toggle_detached_viewer_borderless_fullscreen(ctx);
+                    assert!(matches!(
+                        app.detached_viewer_borderless_transition
+                            .as_ref()
+                            .unwrap()
+                            .phase,
+                        Phase::PrimeBlackFrame
+                    ));
+                    let (output, area) = frame_with_viewer_area(app, ctx, vec![]);
+                    assert!(matches!(
+                        app.detached_viewer_borderless_transition
+                            .as_ref()
+                            .unwrap()
+                            .phase,
+                        Phase::ApplyWindowMode
+                    ));
+                    assert!(
+                        !has_text(&output, "現在"),
+                        "prime frame must not paint overview body"
+                    );
+                    assert_black_canvas(&output, area);
+                    let target_outer = app
+                        .detached_viewer_borderless_transition
+                        .as_ref()
+                        .unwrap()
+                        .target_outer;
+                    // The headless viewport has no native HWND. The full renderer's
+                    // real IsWindow check must reject a fake one, so exercise Apply
+                    // at the existing native placement observation boundary instead.
+                    // Prime and Settle still paint through the complete renderer.
+                    let input = viewer_input(app, vec![]);
+                    let _ = crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
+                        assert_eq!(app.active_detached_hwnd_window_id(), Some(window_id));
+                        app.set_detached_window_host_for_test(window_id, 0x134011);
+                        assert!(
+                            app.detached_window_manager
+                                .host_claim_alive(window_id)
+                                .is_some()
+                        );
+                        assert!(app.step_detached_viewer_borderless_transition(ctx));
+                    }));
+                    assert_eq!(
+                        crate::app::detached_placement::host_geometry_for_test(window_id),
+                        Some((target_outer, false))
+                    );
+                    assert!(app.detached_window_host_is_placed(window_id));
+                    assert!(app.detached_viewer_borderless_fullscreen);
+                    let transition = app.detached_viewer_borderless_transition.as_mut().unwrap();
+                    assert!(
+                        matches!(transition.phase, Phase::Settle { .. }),
+                        "{:?}",
+                        transition.phase
+                    );
+                    // Keep the genuine Settle phase active independently of CPU
+                    // scheduling, then expire its existing deadline below.
+                    if let Phase::Settle { until } = &mut transition.phase {
+                        *until = Instant::now() + Duration::from_secs(60);
+                    }
+                    let (output, area) = frame_with_viewer_area(app, ctx, vec![]);
+                    assert_black_canvas(&output, area);
+                    assert!(!has_text(&output, "現在"));
+                    let transition = app.detached_viewer_borderless_transition.as_mut().unwrap();
+                    assert!(matches!(transition.phase, Phase::Settle { .. }));
+                    if let Phase::Settle { until } = &mut transition.phase {
+                        *until = Instant::now() - Duration::from_secs(1);
+                    }
+                    let output = frame(app, ctx, vec![]);
+                    assert!(app.detached_viewer_borderless_transition.is_none());
+                    assert!(app.page_overview.session().is_some());
+                    assert!(has_text(&output, "現在"));
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn overview_real_viewer_middle_f11_consumes_prime_before_same_frame_tile_selection() {
+        fixture(Mode::Detached, |app, ctx| {
+            use crate::app::DetachedViewerBorderlessTransitionPhase as Phase;
+            app.settings.fullscreen_image_margin_color = [255; 3];
+            app.settings.ring_shortcuts.mouse_buttons_image.middle = RingActionId::ToggleWindowMode;
+            frame(app, ctx, vec![]);
+            let view = app.page_overview_view().unwrap();
+            let pos = App::page_overview_cached_layout(ctx, &view)
+                .unwrap()
+                .cell_rect(1, view.scroll_anchor)
+                .unwrap()
+                .center();
+            frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    pointer(pos, egui::PointerButton::Middle, true),
+                    pointer(pos, egui::PointerButton::Primary, true),
+                ],
+            );
+            let (output, area) = frame_with_viewer_area(
+                app,
+                ctx,
+                vec![
+                    pointer(pos, egui::PointerButton::Middle, false),
+                    pointer(pos, egui::PointerButton::Primary, false),
+                ],
+            );
+            assert!(app.page_overview.session().is_some());
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.selected, Some(0));
+            assert!(matches!(
+                app.detached_viewer_borderless_transition
+                    .as_ref()
+                    .unwrap()
+                    .phase,
+                Phase::ApplyWindowMode
+            ));
+            assert_black_canvas(&output, area);
+            assert!(!has_text(&output, "現在"));
+        });
+    }
+
+    #[test]
+    fn overview_real_viewer_x_guide_and_release_agree_for_allowed_and_disabled_slots() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for (action, label, cancels) in [
+                (RingActionId::ImageSlideshow, "無効: スライドショー", false),
+                (RingActionId::ImagePageOverview, "本のページ一覧", true),
+            ] {
+                fixture(mode, |app, ctx| {
+                    app.settings.gamepad_enabled = true;
+                    app.note_input_surface(crate::app::ActionSurface::Viewer);
+                    app.settings.ring_shortcuts.image.slots[RingDirection::Up.slot_index()] =
+                        action.clone();
+                    frame(app, ctx, vec![]).drop_without_applying_deltas();
+                    let output = gamepad_frame(
+                        app,
+                        ctx,
+                        &[
+                            PadEvent::ButtonPressed(PadButton::West),
+                            PadEvent::ButtonPressed(PadButton::DPadUp),
+                        ],
+                    );
+                    assert!(app.gamepad.state.west_ring_active());
+                    assert!(app.gamepad.state.button_down(PadButton::West));
+                    assert!(app.gamepad.state.delivered_button_down(PadButton::West));
+                    assert_eq!(
+                        app.dispatched_input_surface(),
+                        crate::app::ActionSurface::Viewer
+                    );
+                    assert_eq!(
+                        app.gamepad.state.west_ring_direction(),
+                        Some(RingDirection::Up)
+                    );
+                    assert!(
+                        has_text(&output, label),
+                        "{mode:?}: X guide must paint {label}"
+                    );
+                    assert!(app.page_overview.session().is_some());
+                    gamepad_frame(app, ctx, &[PadEvent::ButtonReleased(PadButton::West)])
+                        .drop_without_applying_deltas();
+                    assert_eq!(app.page_overview.session().is_none(), cancels);
+                    assert!(!app.slideshow_playing);
+                    assert!(!app.gamepad.state.west_ring_active());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_gamepad_batch_retains_routing_after_confirm_or_cancel_and_delivers_terminals() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for tracking in [false, true] {
+                for confirm in [false, true] {
+                    fixture(mode, |app, ctx| {
+                        app.settings.page_turn_animation_enabled = tracking;
+                        app.note_input_surface(crate::app::ActionSurface::Viewer);
+                        frame(app, ctx, vec![]).drop_without_applying_deltas();
+                        assert!(app.move_page_overview_cursor(
+                            crate::page_overview::PageOverviewCursorMove::Last,
+                            surface(),
+                            app.page_overview_direction(),
+                        ));
+                        let expected_idx = if confirm { 3 } else { 0 };
+                        let zoom = app.fs_zoom;
+                        app.gamepad.state.set_axis(PadAxis::RightY, 0.9);
+                        let axes = app.gamepad.state.physical_axes();
+                        app.gamepad.state.deliver_axes([0.0; 6]);
+                        let mut batch = GamepadFrameBatch::empty_for_test();
+                        batch.analog_operation = true;
+                        batch.saw_input_event = true;
+                        let accept = if confirm {
+                            PadButton::South
+                        } else {
+                            PadButton::East
+                        };
+                        batch.events = [
+                            (accept, PadActionKind::Press),
+                            (accept, PadActionKind::Release),
+                            (PadButton::DPadLeft, PadActionKind::Press),
+                            (PadButton::DPadLeft, PadActionKind::SuppressedRelease),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ordinal, (button, kind))| {
+                            PadBatchEvent::Action(PadAction {
+                                operation_id: PadOperationId {
+                                    batch: batch.operation_batch,
+                                    ordinal: ordinal as u32,
+                                },
+                                button,
+                                kind,
+                            })
+                        })
+                        .collect();
+                        batch.events.push(PadBatchEvent::AxesChanged(axes));
+                        let mut replay = batch.clone();
+                        replay.delivery = PadBatchDelivery::Replay;
+                        ctx.begin_pass(viewer_input(app, vec![]));
+                        let outcome =
+                            app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true);
+                        assert!(outcome.dispatch_allowed && outcome.dispatched);
+                        assert!(outcome.nav.is_none());
+                        assert!(
+                            app.page_overview.session().is_none(),
+                            "{mode:?} confirm={confirm}"
+                        );
+                        assert_eq!(app.fullscreen_idx, Some(expected_idx));
+                        assert_eq!(app.fs_zoom, zoom, "the same batch must not zoom the reader");
+                        assert!(!app.gamepad.state.delivered_button_down(accept));
+                        assert!(!app.gamepad.state.delivered_button_down(PadButton::DPadLeft));
+                        assert_eq!(app.gamepad.state.delivered_axis(PadAxis::RightY), 0.9);
+                        assert_eq!(app.gamepad_operation_for_navigation(ctx), None);
+                        app.dispatch_gamepad_batch_with_admission(ctx, replay, |_, _| true);
+                        assert_eq!(app.fullscreen_idx, Some(expected_idx));
+                        assert_eq!(app.fs_zoom, zoom);
+                        let mut terminal = GamepadFrameBatch::empty_for_test();
+                        terminal.events.push(PadBatchEvent::SessionEnded);
+                        app.dispatch_gamepad_batch_with_admission(ctx, terminal, |_, _| true);
+                        assert_eq!(app.gamepad.state.delivered_axis(PadAxis::RightY), 0.0);
+                        ctx.end_pass().drop_without_applying_deltas();
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_cancel_does_not_redispatch_same_frame_middle_release() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            fixture(mode, |app, ctx| {
+                app.settings.ring_shortcuts.set_right_drag_mode(
+                    RightDragContext::ImageFullscreen,
+                    RightDragMode::RingShortcut,
+                );
+                app.settings.ring_shortcuts.image.slots[RingDirection::Right.slot_index()] =
+                    RingActionId::ImagePageOverview;
+                app.settings.ring_shortcuts.mouse_buttons_image.middle =
+                    RingActionId::ImageSlideshow;
+                frame(app, ctx, vec![]);
+                let start = egui::pos2(300., 250.);
+                let end = start + egui::vec2(100., 0.);
+                frame(
+                    app,
+                    ctx,
+                    vec![
+                        egui::Event::PointerMoved(start),
+                        pointer(start, egui::PointerButton::Secondary, true),
+                    ],
+                );
+                frame(
+                    app,
+                    ctx,
+                    vec![
+                        egui::Event::PointerMoved(end),
+                        pointer(end, egui::PointerButton::Middle, true),
+                    ],
+                );
+                frame(
+                    app,
+                    ctx,
+                    vec![
+                        pointer(end, egui::PointerButton::Secondary, false),
+                        pointer(end, egui::PointerButton::Middle, false),
+                    ],
+                );
+                assert!(app.page_overview.session().is_none());
+                assert!(
+                    !app.slideshow_playing,
+                    "{mode:?}: middle must not acquire ordinary image permissions after cancel"
+                );
+                assert!(
+                    app.mouse_middle_click_start.is_none(),
+                    "terminal edge must be consumed"
+                );
+                frame(app, ctx, vec![]);
+                assert!(!app.slideshow_playing);
+            });
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_middle_entry_does_not_reuse_normal_wheel_or_tile_release() {
+        fixture(Mode::MainWindow, |app, ctx| {
+            frame(app, ctx, vec![]);
+            let view = app.page_overview_view().unwrap();
+            let pos = App::page_overview_cached_layout(ctx, &view)
+                .unwrap()
+                .cell_rect(1, view.scroll_anchor)
+                .unwrap()
+                .center();
+            app.close_page_overview_with_ctx(ctx);
+            app.settings.ring_shortcuts.mouse_buttons_image.middle =
+                RingActionId::ImagePageOverview;
+            frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    pointer(pos, egui::PointerButton::Middle, true),
+                ],
+            );
+            let output = frame(
+                app,
+                ctx,
+                vec![
+                    pointer(pos, egui::PointerButton::Middle, false),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0., -3.),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                    },
+                ],
+            );
+            assert!(app.page_overview.session().is_some());
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(
+                has_text(&output, "現在"),
+                "new mode must paint in the entry pass"
+            );
+        });
+    }
+
+    #[test]
+    fn overview_real_viewer_right_entry_discards_old_wheel_and_key_navigation() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for key_navigation in [false, true] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    app.settings.ring_shortcuts.set_right_drag_mode(
+                        RightDragContext::ImageFullscreen,
+                        RightDragMode::RingShortcut,
+                    );
+                    app.settings.ring_shortcuts.image.slots[RingDirection::Right.slot_index()] =
+                        RingActionId::ImagePageOverview;
+                    frame(app, ctx, vec![]);
+                    let start = egui::pos2(300., 250.);
+                    let end = start + egui::vec2(100., 0.);
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            pointer(start, egui::PointerButton::Secondary, true),
+                        ],
+                    );
+                    frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+                    let mut events = vec![pointer(end, egui::PointerButton::Secondary, false)];
+                    if key_navigation {
+                        events.push(egui::Event::Key {
+                            key: egui::Key::ArrowRight,
+                            physical_key: Some(egui::Key::ArrowRight),
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    } else {
+                        events.push(egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: egui::vec2(0., -3.),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        });
+                    }
+                    let output = frame(app, ctx, events);
+                    assert!(
+                        app.page_overview.session().is_some(),
+                        "{mode:?}: right action must open overview"
+                    );
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(0),
+                        "{mode:?}: old navigation phase must not land"
+                    );
+                    assert_eq!(app.selected, Some(0));
+                    assert!(has_text(&output, "現在"));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_deferred_right_entry_discards_mixed_wheel_and_key_navigation() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for drag in [RightDragMode::RingShortcut, RightDragMode::MouseGesture] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    app.settings
+                        .ring_shortcuts
+                        .set_right_drag_mode(RightDragContext::ImageFullscreen, drag.clone());
+                    app.settings.ring_shortcuts.image.slots[RingDirection::Right.slot_index()] =
+                        RingActionId::ImagePageOverview;
+                    app.settings.ring_shortcuts.mouse_gestures_image.bindings =
+                        vec![crate::ring_shortcut::MouseGestureBinding::new(
+                            vec![MouseGestureDirection::Right],
+                            RingActionId::ImagePageOverview,
+                        )];
+                    frame(app, ctx, vec![]).drop_without_applying_deltas();
+                    let start = egui::pos2(300., 250.);
+                    let end = start + egui::vec2(100., 0.);
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            pointer(start, egui::PointerButton::Secondary, true),
+                        ],
+                    )
+                    .drop_without_applying_deltas();
+                    frame(app, ctx, vec![egui::Event::PointerMoved(end)])
+                        .drop_without_applying_deltas();
+                    assert!(app.mouse_ring_flick.is_some() || app.mouse_gesture.is_some());
+                    let input = viewer_input(
+                        app,
+                        vec![
+                            pointer(end, egui::PointerButton::Secondary, false),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Line,
+                                delta: egui::vec2(0., -3.),
+                                modifiers: egui::Modifiers::NONE,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                            },
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Line,
+                                delta: egui::vec2(0., 3.),
+                                modifiers: egui::Modifiers::CTRL,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                            },
+                            egui::Event::Key {
+                                key: egui::Key::ArrowRight,
+                                physical_key: Some(egui::Key::ArrowRight),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                    ctx.run_ui(input, |root_ui| {
+                        let options = root_ui.options(|options| options.input_options);
+                        let segments = root_ui.input(|input| {
+                            crate::wheel_input::remaining_wheel_segments(input, options)
+                        });
+                        assert_eq!(
+                            segments.len(),
+                            2,
+                            "the mixed tail route requires two segments"
+                        );
+                        assert!(!segments[0].input.modifiers.ctrl);
+                        assert!(segments[1].input.modifiers.ctrl);
+                        app.render_fullscreen_viewport(root_ui);
+                    })
+                    .drop_without_applying_deltas();
+                    assert!(app.page_overview.session().is_some(), "{mode:?} {drag:?}");
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(0),
+                        "{mode:?} {drag:?}: deferred overview entry must retire the old key candidate"
+                    );
+                    assert_eq!(app.selected, Some(0));
+                    frame(
+                        app,
+                        ctx,
+                        vec![egui::Event::Key {
+                            key: egui::Key::ArrowRight,
+                            physical_key: Some(egui::Key::ArrowRight),
+                            pressed: false,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    )
+                    .drop_without_applying_deltas();
+                    assert!(app.page_overview.session().is_some());
+                    assert_eq!(app.fullscreen_idx, Some(0));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_o_entry_pointer_landing_rebases_frame_consumers() {
+        fixture(Mode::MainWindow, |app, ctx| {
+            frame(app, ctx, vec![]);
+            let view = app.page_overview_view().unwrap();
+            let pos = App::page_overview_cached_layout(ctx, &view)
+                .unwrap()
+                .cell_rect(1, view.scroll_anchor)
+                .unwrap()
+                .center();
+            // Release lands page 2 during the first renderer pass in which O opens overview.
+            app.close_page_overview_with_ctx(ctx);
+            frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::Key {
+                        key: egui::Key::O,
+                        physical_key: Some(egui::Key::O),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerMoved(pos),
+                    pointer(pos, egui::PointerButton::Primary, true),
+                    pointer(pos, egui::PointerButton::Primary, false),
+                ],
+            );
+            assert!(app.page_overview.session().is_none());
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert_eq!(app.selected, Some(1));
+            // Read the pre-existing frame memo; no test state or production observer is added.
+            crate::ui_fullscreen::assert_prepared_viewer_frame_idx(ctx, 1);
+        });
+    }
+
+    #[test]
+    fn overview_real_viewer_o_entry_preserves_front_owned_release_until_fresh_tile_click() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            fixture(mode, |app, ctx| {
+                app.spread_mode = SpreadMode::Single;
+                app.fs_prev_focused = true;
+                frame(app, ctx, vec![]);
+                let view = app.page_overview_view().unwrap();
+                let pos = App::page_overview_cached_layout(ctx, &view)
+                    .unwrap()
+                    .cell_rect(1, view.scroll_anchor)
+                    .unwrap()
+                    .center();
+                app.close_page_overview_with_ctx(ctx);
+                frame(
+                    app,
+                    ctx,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        pointer(pos, egui::PointerButton::Primary, true),
+                    ],
+                );
+                // Model a front panel's already-admitted physical press. The real
+                // renderer must bind and retire this App-owned stream across O;
+                // no new press arrives in the release frame to reclassify it.
+                app.fs_front_pointer =
+                    crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+                assert!(app.fs_front_pointer.is_active());
+                frame(
+                    app,
+                    ctx,
+                    vec![
+                        egui::Event::Key {
+                            key: egui::Key::O,
+                            physical_key: Some(egui::Key::O),
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        pointer(pos, egui::PointerButton::Primary, false),
+                    ],
+                );
+                assert!(
+                    app.page_overview.session().is_some(),
+                    "{mode:?}: the old front-owned release must not select the tile"
+                );
+                assert_eq!(app.fullscreen_idx, Some(0), "{mode:?}");
+                assert_eq!(app.selected, Some(0), "{mode:?}");
+                assert!(
+                    !app.fs_front_pointer.is_active(),
+                    "{mode:?}: stream terminal"
+                );
+                assert!(app.mouse_ring_flick.is_none());
+                assert!(!app.slideshow_playing);
+
+                frame(
+                    app,
+                    ctx,
+                    vec![egui::Event::Key {
+                        key: egui::Key::O,
+                        physical_key: Some(egui::Key::O),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                frame(
+                    app,
+                    ctx,
+                    vec![pointer(pos, egui::PointerButton::Primary, true)],
+                );
+                frame(
+                    app,
+                    ctx,
+                    vec![pointer(pos, egui::PointerButton::Primary, false)],
+                );
+                assert!(app.page_overview.session().is_none(), "{mode:?}");
+                assert_eq!(
+                    app.fullscreen_idx,
+                    Some(1),
+                    "{mode:?}: a fresh click must select the same noncurrent tile"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn overview_passive_guide_uses_its_snapshot_actions_independent_of_active_mode() {
+        for overview_a in [true, false] {
+            for drag in [RightDragMode::RingShortcut, RightDragMode::MouseGesture] {
+                let ctx = egui::Context::default();
+                let mut env = crate::app::setup_app_for_test();
+                let root = env.tmp.path().to_path_buf();
+                let a = env.build_active_context_for_test(
+                    Some(134012),
+                    crate::app::DetachedSource::Image,
+                    |app| {
+                        configure(app, &ctx, &root, Mode::Detached);
+                    },
+                );
+                let snapshot = env.with_window_context_for_test(a, |app| {
+                    if overview_a {
+                        assert!(app.open_page_overview(surface(), Default::default()));
+                    }
+                    app.build_active_detached_image_window_snapshot(Some(&ctx))
+                        .unwrap()
+                });
+                let b = env.build_active_context_for_test(
+                    Some(134013),
+                    crate::app::DetachedSource::Image,
+                    |app| {
+                        configure(app, &ctx, &root, Mode::Detached);
+                    },
+                );
+                env.with_window_context_for_test(b, |app| {
+                    app.settings
+                        .ring_shortcuts
+                        .set_right_drag_mode(RightDragContext::ImageFullscreen, drag.clone());
+                    app.settings.ring_shortcuts.image.slots[RingDirection::Up.slot_index()] =
+                        RingActionId::ImageSlideshow;
+                    app.settings.ring_shortcuts.mouse_gestures_image.bindings =
+                        vec![crate::ring_shortcut::MouseGestureBinding::new(
+                            vec![MouseGestureDirection::Up],
+                            RingActionId::ImageSlideshow,
+                        )];
+                    let owner = RightDragOwner::DetachedWindow(snapshot.id);
+                    let now = Instant::now() - Duration::from_secs(1);
+                    match drag {
+                        RightDragMode::RingShortcut => {
+                            app.mouse_ring_flick = Some(MouseFlickState::new(
+                                owner,
+                                RingShortcutContext::ImageFullscreen,
+                                now,
+                                egui::pos2(200., 200.),
+                            ))
+                        }
+                        RightDragMode::MouseGesture => {
+                            app.mouse_gesture = Some(MouseGestureState::new(
+                                owner,
+                                RightDragContext::ImageFullscreen,
+                                now,
+                                egui::pos2(200., 200.),
+                            ))
+                        }
+                        _ => unreachable!(),
+                    }
+                    let placement = app.active_detached_viewer_current_placement();
+                    let projected =
+                        app.deferred_detached_image_window_view(&snapshot, placement, false);
+                    let expected = if overview_a {
+                        "無効: スライドショー"
+                    } else {
+                        "スライドショー"
+                    };
+                    match projected.right_drag_guide.unwrap() {
+                        RightDragGuide::Ring { slot_labels, .. } => {
+                            assert_eq!(slot_labels[RingDirection::Up.slot_index()], expected)
+                        }
+                        RightDragGuide::Gesture {
+                            rows,
+                            short_click_hint,
+                            ..
+                        } => {
+                            assert_eq!(rows[0].value, expected);
+                            assert_eq!(short_click_hint == "短押し操作なし", overview_a);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_key_cancel_and_primary_release_end_suppression_before_next_click() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for key in [egui::Key::Escape, egui::Key::O] {
+                fixture(mode, |app, ctx| {
+                    app.spread_mode = SpreadMode::Single;
+                    // Start from an already focused reader, matching the reported use.
+                    // A headless fixture's first focus observation otherwise starts the
+                    // separate 300ms focus-restoration click suppression contract.
+                    app.fs_prev_focused = true;
+                    app.settings.ring_shortcuts.set_right_drag_mode(
+                        RightDragContext::ImageFullscreen,
+                        RightDragMode::RingShortcut,
+                    );
+                    frame(app, ctx, vec![]);
+                    let view = app.page_overview_view().unwrap();
+                    let layout = App::page_overview_cached_layout(ctx, &view).unwrap();
+                    let pos = layout.cell_rect(1, view.scroll_anchor).unwrap().center();
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            pointer(pos, egui::PointerButton::Secondary, true),
+                        ],
+                    );
+                    assert!(app.mouse_ring_flick.is_some());
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            pointer(pos, egui::PointerButton::Primary, true),
+                            pointer(pos, egui::PointerButton::Secondary, false),
+                        ],
+                    );
+                    assert!(app.mouse_ring_flick.is_none());
+                    assert!(app.fs_primary_suppression.is_active());
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::Key {
+                                key,
+                                physical_key: Some(key),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                            pointer(pos, egui::PointerButton::Primary, false),
+                        ],
+                    );
+                    assert!(app.page_overview.session().is_none(), "{mode:?} {key:?}");
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(0),
+                        "cancel must not dispatch behind overview"
+                    );
+                    assert!(
+                        !app.fs_primary_suppression.is_active(),
+                        "{mode:?} {key:?}: release must end the owner in the cancel frame"
+                    );
+                    let next = egui::pos2(600., 360.);
+                    // Give the ordinary surface a pass to install its backing click response.
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::Key {
+                                key,
+                                physical_key: Some(key),
+                                pressed: false,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                            egui::Event::PointerMoved(next),
+                        ],
+                    );
+                    frame(
+                        app,
+                        ctx,
+                        vec![pointer(next, egui::PointerButton::Primary, true)],
+                    );
+                    frame(
+                        app,
+                        ctx,
+                        vec![pointer(next, egui::PointerButton::Primary, false)],
+                    );
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(1),
+                        "{mode:?} {key:?}: the next ordinary click must turn the page"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_primary_cancels_drag_without_selecting_tile() {
+        fixture(Mode::MainWindow, |app, ctx| {
+            app.settings.ring_shortcuts.set_right_drag_mode(
+                RightDragContext::ImageFullscreen,
+                RightDragMode::RingShortcut,
+            );
+            frame(app, ctx, vec![]);
+            let view = app.page_overview_view().unwrap();
+            let layout = App::page_overview_cached_layout(ctx, &view).unwrap();
+            let pos = layout.cell_rect(1, view.scroll_anchor).unwrap().center();
+            frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    pointer(pos, egui::PointerButton::Secondary, true),
+                ],
+            );
+            assert!(app.mouse_ring_flick.is_some());
+            frame(
+                app,
+                ctx,
+                vec![pointer(pos, egui::PointerButton::Primary, true)],
+            );
+            assert!(app.mouse_ring_flick.is_none());
+            frame(
+                app,
+                ctx,
+                vec![pointer(pos, egui::PointerButton::Primary, false)],
+            );
+            assert!(app.page_overview.session().is_some());
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(!app.fs_primary_suppression.is_active());
+        });
+    }
+}
 use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
     ThumbAspect, format_video_volume_db, step_video_volume_by_fader_key_step,
@@ -454,6 +2023,160 @@ enum PadDir {
     Right,
 }
 
+fn overview_cursor_direction(direction: PadDir) -> crate::page_overview::PageOverviewCursorMove {
+    use crate::page_overview::PageOverviewCursorMove;
+    match direction {
+        PadDir::Up => PageOverviewCursorMove::Up,
+        PadDir::Down => PageOverviewCursorMove::Down,
+        PadDir::Left => PageOverviewCursorMove::Left,
+        PadDir::Right => PageOverviewCursorMove::Right,
+    }
+}
+
+fn overview_pad_key_action(action: PadAction) -> Option<KeyAction> {
+    if action.kind != PadActionKind::Press {
+        return None;
+    }
+    match action.button {
+        PadButton::South => Some(KeyAction::FsPageOverviewConfirm),
+        PadButton::East => Some(KeyAction::FsPageOverviewToggle),
+        PadButton::LeftShoulder => Some(KeyAction::FsCtrlNavPrev),
+        PadButton::RightShoulder => Some(KeyAction::FsCtrlNavNext),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod page_overview_pad_tests {
+    use super::*;
+
+    #[test]
+    fn overview_gamepad_confirm_cancel_are_direct_actions_and_never_repeat() {
+        for (button, expected) in [
+            (PadButton::South, KeyAction::FsPageOverviewConfirm),
+            (PadButton::East, KeyAction::FsPageOverviewToggle),
+        ] {
+            assert_eq!(
+                overview_pad_key_action(PadAction {
+                    operation_id: PadOperationId::unassigned(),
+                    button,
+                    kind: PadActionKind::Press
+                }),
+                Some(expected)
+            );
+            for kind in [PadActionKind::Repeat, PadActionKind::Release] {
+                assert_eq!(
+                    overview_pad_key_action(PadAction {
+                        operation_id: PadOperationId::unassigned(),
+                        button,
+                        kind
+                    }),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            overview_pad_key_action(PadAction {
+                operation_id: PadOperationId::unassigned(),
+                button: PadButton::Select,
+                kind: PadActionKind::Press
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn overview_gamepad_arrows_preserve_screen_geometry_instead_of_reader_next() {
+        use crate::page_overview::PageOverviewCursorMove;
+        assert_eq!(
+            overview_cursor_direction(PadDir::Left),
+            PageOverviewCursorMove::Left
+        );
+        assert_eq!(
+            overview_cursor_direction(PadDir::Right),
+            PageOverviewCursorMove::Right
+        );
+        assert_eq!(
+            overview_cursor_direction(PadDir::Up),
+            PageOverviewCursorMove::Up
+        );
+        assert_eq!(
+            overview_cursor_direction(PadDir::Down),
+            PageOverviewCursorMove::Down
+        );
+    }
+
+    #[test]
+    fn overview_saved_ring_action_is_blocked_then_restored_after_cancel() {
+        use crate::book_resume_db::PageIdentity;
+        use crate::page_overview::{
+            PageOverviewEntry, PageOverviewMetadata, PageOverviewPage, PageOverviewProjection,
+            PageOverviewStamp, PageOverviewState,
+        };
+        use std::sync::Arc;
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(app.tmp.path().join("overview.png"))];
+        app.fullscreen_idx = Some(0);
+        let metadata = PageOverviewMetadata::new([PageOverviewEntry {
+            items_idx: 0,
+            page: Arc::new(PageOverviewPage {
+                identity: PageIdentity::Image {
+                    path: "g:/test/overview.png".to_owned(),
+                },
+                label: Arc::from("overview.png"),
+                white_companion: None,
+            }),
+        }])
+        .unwrap();
+        app.page_overview = PageOverviewState::open(
+            Arc::new(PageOverviewProjection::new(Arc::new(metadata), Arc::new(vec![0])).unwrap()),
+            PageOverviewStamp {
+                context_serial: 1,
+                items_generation: 2,
+                reader_order_revision: 3,
+                incarnation: 4,
+            },
+            0,
+            4,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0)),
+            Default::default(),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        assert!(!app.slideshow_playing);
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::ImageFullscreen,
+            RingActionId::ImageSlideshow,
+            "overview-test",
+        );
+        assert!(!app.slideshow_playing);
+        assert!(app.page_overview.session().is_some());
+        assert_eq!(
+            app.ring_runtime_label(
+                RingShortcutContext::ImageFullscreen,
+                &RingActionId::ImageSlideshow
+            ),
+            "無効: スライドショー"
+        );
+        app.page_overview.close();
+        assert_eq!(
+            app.ring_runtime_label(
+                RingShortcutContext::ImageFullscreen,
+                &RingActionId::ImageSlideshow
+            ),
+            "スライドショー"
+        );
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::ImageFullscreen,
+            RingActionId::ImageSlideshow,
+            "overview-test",
+        );
+        assert!(app.slideshow_playing);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MouseMiddleClickState {
     start: egui::Pos2,
@@ -757,6 +2480,41 @@ pub(crate) struct MouseButtonDispatchResult {
 }
 
 impl App {
+    /// Shared gate for saved ring, gesture, mouse-button execution and runtime guide labels.
+    pub(crate) fn page_overview_ring_action_executable(
+        &self,
+        context: RingShortcutContext,
+        action: &RingActionId,
+    ) -> bool {
+        if context != RingShortcutContext::ImageFullscreen || self.page_overview.session().is_none()
+        {
+            return true;
+        }
+        action.is_executable_in_page_overview(&self.page_overview_executable_actions())
+    }
+
+    fn ring_runtime_label(&self, context: RingShortcutContext, action: &RingActionId) -> String {
+        let overview_actions = (context == RingShortcutContext::ImageFullscreen
+            && self.page_overview.session().is_some())
+        .then(|| self.page_overview_executable_actions());
+        Self::ring_runtime_label_for_actions(context, action, overview_actions.as_deref())
+    }
+
+    fn ring_runtime_label_for_actions(
+        context: RingShortcutContext,
+        action: &RingActionId,
+        overview_actions: Option<&[KeyAction]>,
+    ) -> String {
+        let label = action.label_for_context(context);
+        if context != RingShortcutContext::ImageFullscreen
+            || overview_actions.is_none_or(|actions| action.is_executable_in_page_overview(actions))
+        {
+            label.to_owned()
+        } else {
+            format!("無効: {label}")
+        }
+    }
+
     pub(crate) fn draw_gamepad_ring_overlay(
         &self,
         ui: &mut egui::Ui,
@@ -775,12 +2533,15 @@ impl App {
         let center = full_rect.center();
         let radius = ring_guide_radius_for_rect(full_rect);
         let slots = &self.settings.ring_shortcuts.profile(context).slots;
+        let labels = slots
+            .iter()
+            .map(|action| self.ring_runtime_label(context, action))
+            .collect::<Vec<_>>();
         draw_ring_guide_donut(painter, center, radius, selected, |direction| {
-            slots
+            labels
                 .get(direction.slot_index())
-                .cloned()
-                .unwrap_or_default()
-                .label_for_context(context)
+                .map(String::as_str)
+                .unwrap_or("なし")
         });
     }
 
@@ -1021,6 +2782,22 @@ impl App {
         owner: RightDragOwner,
         surface_context: RightDragContext,
     ) -> Option<RightDragGuide> {
+        let overview_actions = (surface_context == RightDragContext::ImageFullscreen
+            && self.page_overview.session().is_some())
+        .then(|| self.page_overview_executable_actions());
+        self.right_drag_guide_for_owner_with_actions(
+            owner,
+            surface_context,
+            overview_actions.as_deref(),
+        )
+    }
+
+    pub(crate) fn right_drag_guide_for_owner_with_actions(
+        &self,
+        owner: RightDragOwner,
+        surface_context: RightDragContext,
+        overview_actions: Option<&[KeyAction]>,
+    ) -> Option<RightDragGuide> {
         if self.ring_picker.is_some() {
             return None;
         }
@@ -1056,17 +2833,24 @@ impl App {
                         .iter()
                         .map(|binding| RightDragGuideRow {
                             label: format_mouse_gesture_pattern(&binding.pattern),
-                            value: binding.action.label_for_context(action_context).to_string(),
+                            value: Self::ring_runtime_label_for_actions(
+                                action_context,
+                                &binding.action,
+                                overview_actions,
+                            ),
                         })
                         .collect(),
                     selected_row: profile.binding_index_for_pattern(&gesture.pattern),
-                    short_click_hint: self
-                        .settings
-                        .ring_shortcuts
-                        .viewer_short_right_click_action(surface_context)
-                        .map(|action| action.guide_hint())
-                        .unwrap_or("短押しは従来操作")
-                        .to_string(),
+                    short_click_hint: if overview_actions.is_some() {
+                        "短押し操作なし".to_string()
+                    } else {
+                        self.settings
+                            .ring_shortcuts
+                            .viewer_short_right_click_action(surface_context)
+                            .map(|action| action.guide_hint())
+                            .unwrap_or("短押しは従来操作")
+                            .to_string()
+                    },
                 })
             }
             RightDragMode::RingShortcut => {
@@ -1089,12 +2873,12 @@ impl App {
                     selected: mouse_flick_direction(flick),
                     slot_labels: (0..crate::ring_shortcut::RING_SHORTCUT_SLOT_COUNT)
                         .map(|slot_index| {
-                            slots
-                                .get(slot_index)
-                                .cloned()
-                                .unwrap_or_default()
-                                .label_for_context(ring_context)
-                                .to_string()
+                            let action = slots.get(slot_index).cloned().unwrap_or_default();
+                            Self::ring_runtime_label_for_actions(
+                                ring_context,
+                                &action,
+                                overview_actions,
+                            )
                         })
                         .collect(),
                 })
@@ -1753,12 +3537,15 @@ impl App {
                 if show_result_toast {
                     self.show_feedback_toast(format!(
                         "[Gesture: {pattern_label} {}]",
-                        action.label_for_context(action_context)
+                        self.ring_runtime_label(action_context, &action)
                     ));
                 }
                 self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
             }
             RightDragCommand::ViewerShortRightClick { context, pos } => {
+                if self.page_overview.session().is_some() {
+                    return None;
+                }
                 let Some(fs_idx) = self.fullscreen_idx else {
                     crate::logger::log(
                         "passive right-drag short click dropped: fullscreen_idx_missing",
@@ -2377,6 +4164,10 @@ impl App {
                 };
             }
             self.consume_gamepad_directional_neutral_gate(now);
+            // Capture the mode for this batch. Cancel/Confirm cannot release later edges in
+            // the same physical batch into ordinary viewer navigation or analog zoom/pan.
+            let overview_batch =
+                self.page_overview.session().is_some() && self.gamepad_targets_viewer();
             let analog_ordinal = events.len() as u32;
             for event in events {
                 if self.gamepad_targets_viewer() {
@@ -2394,8 +4185,12 @@ impl App {
                             self.gamepad.state.deliver_button_edge(action.button, true);
                         }
                         if nav.is_none() {
-                            if let Some(next_nav) =
-                                self.dispatch_gamepad_button_with_operation(ctx, action)
+                            if let Some(next_nav) = self
+                                .dispatch_gamepad_batch_button_with_operation(
+                                    ctx,
+                                    action,
+                                    overview_batch,
+                                )
                             {
                                 nav = Some(next_nav);
                             }
@@ -2424,7 +4219,11 @@ impl App {
                     )
                 })
                 .flatten();
-            if self.dispatch_gamepad_analog(ctx, now) {
+            if if overview_batch {
+                self.dispatch_page_overview_gamepad_analog(ctx, now)
+            } else {
+                self.dispatch_gamepad_analog(ctx, now)
+            } {
                 dispatched = true;
             }
         } else {
@@ -2469,6 +4268,15 @@ impl App {
         ctx: &egui::Context,
         action: PadAction,
     ) -> Option<AddressBarNav> {
+        self.dispatch_gamepad_batch_button_with_operation(ctx, action, false)
+    }
+
+    fn dispatch_gamepad_batch_button_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        action: PadAction,
+        overview_batch: bool,
+    ) -> Option<AddressBarNav> {
         let _operation_scope = (!matches!(
             action.kind,
             PadActionKind::Release | PadActionKind::SuppressedRelease
@@ -2489,7 +4297,12 @@ impl App {
             )
         })
         .flatten();
-        self.dispatch_gamepad_button(ctx, action)
+        if overview_batch && action.kind != PadActionKind::SuppressedRelease {
+            self.dispatch_page_overview_gamepad_button(ctx, action);
+            None
+        } else {
+            self.dispatch_gamepad_button(ctx, action)
+        }
     }
 
     fn gamepad_navigation_dispatch_scope(
@@ -2655,6 +4468,10 @@ impl App {
             }
             return None;
         }
+        if self.page_overview.session().is_some() && self.gamepad_targets_viewer() {
+            self.dispatch_page_overview_gamepad_button(ctx, action);
+            return None;
+        }
         if self.gamepad_video_marker_picker.is_some() {
             self.dispatch_gamepad_video_marker_picker_button(ctx, action);
             return None;
@@ -2757,7 +4574,82 @@ impl App {
         }
     }
 
+    fn dispatch_page_overview_gamepad_button(&mut self, ctx: &egui::Context, action: PadAction) {
+        if self.page_overview.session().is_none() {
+            if action.kind == PadActionKind::Release && action.button == PadButton::West {
+                let _ = self.gamepad.state.finish_west_release();
+            }
+            return;
+        }
+        if self.gamepad.state.directional_neutral_required()
+            && (button_dir(action.button).is_some() || action.button == PadButton::West)
+        {
+            return;
+        }
+        if action.kind == PadActionKind::Release {
+            if action.button == PadButton::West {
+                self.finish_gamepad_west_release(ctx);
+            }
+            return;
+        }
+        if let Some(dir) = button_dir(action.button) {
+            if self.gamepad.state.west_ring_active() {
+                if let Some(direction) = self.current_ring_gamepad_direction() {
+                    self.gamepad.state.mark_west_ring_direction(direction);
+                    ctx.request_repaint();
+                }
+            } else {
+                self.page_overview_cursor_input(ctx, overview_cursor_direction(dir));
+            }
+            return;
+        }
+        if action.kind != PadActionKind::Press {
+            return;
+        }
+        if let Some(key_action) = overview_pad_key_action(action) {
+            self.execute_page_overview_key_action(ctx, &key_action);
+        } else if action.button == PadButton::West {
+            ctx.request_repaint();
+        }
+        if self.page_overview.session().is_none() {
+            self.gamepad.state.require_directional_neutral();
+        }
+    }
+
+    fn dispatch_page_overview_gamepad_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
+        if self.page_overview.session().is_none() {
+            self.reset_gamepad_continuous_steps(now);
+            return false;
+        }
+        if self.consume_gamepad_directional_neutral_gate(now) {
+            return false;
+        }
+        if self.gamepad.state.west_ring_active() {
+            if let Some(direction) = self.current_ring_gamepad_direction() {
+                self.gamepad.state.mark_west_ring_direction(direction);
+            }
+            return true;
+        }
+        let direction = dominant_stick_dir(stick_pair(
+            &self.gamepad.state,
+            PadAxis::LeftX,
+            PadAxis::LeftY,
+        ));
+        if self
+            .gamepad
+            .state
+            .left_stick_step_due(direction.is_some(), now, STICK_STEP_INTERVAL)
+            && let Some(direction) = direction
+        {
+            return self.page_overview_cursor_input(ctx, overview_cursor_direction(direction));
+        }
+        false
+    }
+
     fn dispatch_gamepad_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
+        if self.page_overview.session().is_some() && self.gamepad_targets_viewer() {
+            return self.dispatch_page_overview_gamepad_analog(ctx, now);
+        }
         if self.gamepad_video_marker_picker.is_some() {
             return self.dispatch_gamepad_video_marker_picker_analog(ctx, now);
         }
@@ -3030,6 +4922,12 @@ impl App {
         self.clear_native_video_ring_guide_overlay(ctx);
         match self.gamepad.state.finish_west_release() {
             WestReleaseOutcome::Picker => {
+                if self.page_overview.session().is_some() {
+                    self.show_feedback_toast(
+                        "ページ一覧中は画像の設定ピッカーを使用できません".to_owned(),
+                    );
+                    return None;
+                }
                 self.open_gamepad_ring_picker(ctx);
                 None
             }
@@ -5694,6 +7592,9 @@ impl App {
             ));
             return MouseButtonDispatchResult::default();
         }
+        if !self.page_overview_ring_action_executable(context, &action) {
+            return MouseButtonDispatchResult::default();
+        }
         if mouse_button_action_blocked_by_edit_mode(self.is_overlay_edit_mode_active(), &action) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored mouse button action={} during edit mode",
@@ -6177,6 +8078,15 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        if self.page_overview.session().is_some() && context == RingShortcutContext::ImageFullscreen
+        {
+            if self.page_overview_ring_action_executable(context, &action)
+                && let Some(key_action) = action.page_overview_key_action()
+            {
+                self.execute_page_overview_key_action(ctx, &key_action);
+            }
+            return None;
+        }
         if context == RingShortcutContext::Grid
             && !self.grid_item_input_allowed()
             && !grid_ring_action_allowed_during_refresh(&action)
@@ -6205,6 +8115,12 @@ impl App {
 
         match action {
             RingActionId::None | RingActionId::Unknown(_) => None,
+            RingActionId::ImagePageOverview => {
+                if context == RingShortcutContext::ImageFullscreen {
+                    self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
+                }
+                None
+            }
             RingActionId::ToggleDetachedViewer => {
                 self.toggle_detached_viewer_mode();
                 None

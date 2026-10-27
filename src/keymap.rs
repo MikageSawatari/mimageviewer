@@ -9,6 +9,7 @@ pub enum KeyContext {
     Global,
     Grid,
     FsCommon,
+    FsPageOverview,
     Rating,
     FsImage,
     FsVideo,
@@ -26,6 +27,7 @@ impl KeyContext {
             KeyContext::Global => "Global",
             KeyContext::Grid => "Grid",
             KeyContext::FsCommon => "FsCommon",
+            KeyContext::FsPageOverview => "FsPageOverview",
             KeyContext::Rating => "Rating",
             KeyContext::FsImage => "FsImage",
             KeyContext::FsVideo => "FsVideo",
@@ -43,6 +45,7 @@ impl KeyContext {
             KeyContext::Global => "全体共通",
             KeyContext::Grid => "サムネイル一覧",
             KeyContext::FsCommon => "フルスクリーン共通",
+            KeyContext::FsPageOverview => "ページ一覧",
             KeyContext::Rating => "レーティング",
             KeyContext::FsImage => "画像フルスクリーン",
             KeyContext::FsVideo => "動画フルスクリーン",
@@ -61,6 +64,7 @@ impl KeyContext {
             KeyContext::Global,
             KeyContext::Grid,
             KeyContext::FsCommon,
+            KeyContext::FsPageOverview,
             KeyContext::Rating,
             KeyContext::FsImage,
             KeyContext::FsVideo,
@@ -1658,6 +1662,14 @@ pub enum KeyAction {
     GridDeleteEraseMask,
     GridDeleteConcealMask,
     FsToggleMetadata,
+    FsPageOverviewToggle,
+    FsPageOverviewConfirm,
+    FsPageOverviewPagePrev,
+    FsPageOverviewPageNext,
+    FsPageOverviewFirst,
+    FsPageOverviewLast,
+    FsPageOverviewColumnsLess,
+    FsPageOverviewColumnsMore,
     FsClose,
     FsBackToList,
     FsToggleWindowMode,
@@ -2240,6 +2252,14 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeleteEraseMask,
     KeyAction::GridDeleteConcealMask,
     KeyAction::FsToggleMetadata,
+    KeyAction::FsPageOverviewToggle,
+    KeyAction::FsPageOverviewConfirm,
+    KeyAction::FsPageOverviewPagePrev,
+    KeyAction::FsPageOverviewPageNext,
+    KeyAction::FsPageOverviewFirst,
+    KeyAction::FsPageOverviewLast,
+    KeyAction::FsPageOverviewColumnsLess,
+    KeyAction::FsPageOverviewColumnsMore,
     KeyAction::FsClose,
     KeyAction::FsBackToList,
     KeyAction::FsToggleWindowMode,
@@ -4299,6 +4319,14 @@ impl KeyAction {
             GridDeleteEraseMask => "GridDeleteEraseMask",
             GridDeleteConcealMask => "GridDeleteConcealMask",
             FsToggleMetadata => "FsToggleMetadata",
+            FsPageOverviewToggle => "FsPageOverviewToggle",
+            FsPageOverviewConfirm => "FsPageOverviewConfirm",
+            FsPageOverviewPagePrev => "FsPageOverviewPagePrev",
+            FsPageOverviewPageNext => "FsPageOverviewPageNext",
+            FsPageOverviewFirst => "FsPageOverviewFirst",
+            FsPageOverviewLast => "FsPageOverviewLast",
+            FsPageOverviewColumnsLess => "FsPageOverviewColumnsLess",
+            FsPageOverviewColumnsMore => "FsPageOverviewColumnsMore",
             FsClose => "FsClose",
             FsBackToList => "FsBackToList",
             FsToggleWindowMode => "FsToggleWindowMode",
@@ -5046,6 +5074,14 @@ impl KeyAction {
             GridDeleteEraseMask => "選択中またはチェック済み画像の消しゴムマスクを削除する",
             GridDeleteConcealMask => "選択中またはチェック済み画像の隠蔽マスクを削除する",
             FsToggleMetadata => "左右パネルの表示モードを切り替える",
+            FsPageOverviewToggle => "ページ一覧の表示を切り替える",
+            FsPageOverviewConfirm => "ページ一覧で選択したページへ移動する",
+            FsPageOverviewPagePrev => "ページ一覧を前の画面へ送る",
+            FsPageOverviewPageNext => "ページ一覧を次の画面へ送る",
+            FsPageOverviewFirst => "ページ一覧の先頭へ移動する",
+            FsPageOverviewLast => "ページ一覧の末尾へ移動する",
+            FsPageOverviewColumnsLess => "ページ一覧の列数を減らす",
+            FsPageOverviewColumnsMore => "ページ一覧の列数を増やす",
             FsClose => "画像フルスクリーンを閉じる",
             FsBackToList => "フルスクリーンを閉じて一覧へ戻る",
             FsToggleWindowMode => "ウィンドウ表示と全画面表示を切り替える",
@@ -5612,7 +5648,16 @@ impl KeyAction {
             | GridDeleteConcealMask => KeyContext::Grid,
             FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
             | FsCtrlNavPrev | FsCtrlNavNext | FsListOrderPrev | FsListOrderNext | FsSiblingPrev
-            | FsSiblingNext | FsPanorama | FsPanoramaProjection => KeyContext::FsCommon,
+            | FsSiblingNext | FsPanorama | FsPanoramaProjection | FsPageOverviewToggle => {
+                KeyContext::FsCommon
+            }
+            FsPageOverviewConfirm
+            | FsPageOverviewPagePrev
+            | FsPageOverviewPageNext
+            | FsPageOverviewFirst
+            | FsPageOverviewLast
+            | FsPageOverviewColumnsLess
+            | FsPageOverviewColumnsMore => KeyContext::FsPageOverview,
             RatingItem1
             | RatingItem2
             | RatingItem3
@@ -6130,6 +6175,14 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask
             | FsToggleMetadata
+            | FsPageOverviewToggle
+            | FsPageOverviewConfirm
+            | FsPageOverviewPagePrev
+            | FsPageOverviewPageNext
+            | FsPageOverviewFirst
+            | FsPageOverviewLast
+            | FsPageOverviewColumnsLess
+            | FsPageOverviewColumnsMore
             | FsClose
             | FsBackToList
             | FsToggleWindowMode
@@ -6685,6 +6738,14 @@ impl KeyAction {
             GridDeleteEraseMask => ChordList::two(Chord::shift(F7), Chord::shift(F8)),
             GridDeleteConcealMask => ChordList::two(Chord::shift(F9), Chord::shift(F10)),
             FsToggleMetadata => ChordList::two(Chord::key(I), Chord::key(Tab)),
+            FsPageOverviewToggle => ChordList::one(Chord::key(O)),
+            FsPageOverviewConfirm => ChordList::one(Chord::key(Enter)),
+            FsPageOverviewPagePrev => ChordList::one(Chord::key(PageUp)),
+            FsPageOverviewPageNext => ChordList::one(Chord::key(PageDown)),
+            FsPageOverviewFirst => ChordList::one(Chord::key(Home)),
+            FsPageOverviewLast => ChordList::one(Chord::key(End)),
+            FsPageOverviewColumnsLess => ChordList::EMPTY,
+            FsPageOverviewColumnsMore => ChordList::EMPTY,
             FsClose => ChordList::one(Chord::key(Enter)),
             FsBackToList => ChordList::one(Chord::key(Backspace)),
             FsToggleWindowMode => ChordList::one(Chord::key(F11)),
@@ -7161,10 +7222,44 @@ pub const FS_VIDEO_ACTIVE_SCOPES: &[CommandScope] = &[
     KeyContext::FsVideo,
 ];
 
+/// Scope selection alone does not authorize every Global/FsCommon command in the overview.
+pub const FS_PAGE_OVERVIEW_ACTIVE_SCOPES: &[CommandScope] = &[
+    KeyContext::Global,
+    KeyContext::FsCommon,
+    KeyContext::FsPageOverview,
+];
+
+/// Potential executable actions, in dispatch priority order. Runtime presentation and
+/// navigation gates may remove actions, but must not add actions outside this set.
+/// Fixed Escape cancellation precedes this list; fixed cursor navigation follows it.
+pub const FS_PAGE_OVERVIEW_ACTION_PRIORITY: &[KeyAction] = &[
+    KeyAction::HelpShowContextShortcuts,
+    KeyAction::FsPageOverviewToggle,
+    KeyAction::FsToggleWindowMode,
+    KeyAction::ToggleDetachedViewerMode,
+    KeyAction::ToggleAlwaysOnTop,
+    KeyAction::FsCtrlNavPrev,
+    KeyAction::FsCtrlNavNext,
+    KeyAction::FsSiblingPrev,
+    KeyAction::FsSiblingNext,
+    KeyAction::FsPageOverviewConfirm,
+    KeyAction::FsPageOverviewPagePrev,
+    KeyAction::FsPageOverviewPageNext,
+    KeyAction::FsPageOverviewFirst,
+    KeyAction::FsPageOverviewLast,
+    KeyAction::FsPageOverviewColumnsLess,
+    KeyAction::FsPageOverviewColumnsMore,
+];
+
+pub fn page_overview_action_allowed(action: KeyAction) -> bool {
+    FS_PAGE_OVERVIEW_ACTION_PRIORITY.contains(&action)
+}
+
 const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
     GRID_ACTIVE_SCOPES,
     FS_IMAGE_ACTIVE_SCOPES,
     FS_VIDEO_ACTIVE_SCOPES,
+    FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
     &[KeyContext::Erase],
     &[KeyContext::Conceal],
     &[KeyContext::Crop],
@@ -7178,6 +7273,20 @@ pub fn command_scopes_overlap(a: CommandScope, b: CommandScope) -> bool {
         || ACTIVE_SCOPE_SETS
             .iter()
             .any(|set| set.contains(&a) && set.contains(&b))
+}
+
+fn native_video_shortcut_action(action: KeyAction) -> bool {
+    action != KeyAction::FsPageOverviewToggle
+        && (matches!(
+            action.context(),
+            KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
+        ) || matches!(
+            action,
+            KeyAction::ToggleDetachedViewerMode
+                | KeyAction::ToggleAlwaysOnTop
+                | KeyAction::ClearVideoMediaMemory
+                | KeyAction::ClearBookResumePositions
+        ))
 }
 
 fn is_overlay_edit_scope(scope: CommandScope) -> bool {
@@ -7197,6 +7306,18 @@ fn help_context_shortcuts_overlaps_scope(action: KeyAction, scope: CommandScope)
 }
 
 fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
+    // Local overview actions coexist only with the finite executable set. The toggle
+    // also exists in ordinary still-image viewing, but never in video or edit modes.
+    if first.context() == KeyContext::FsPageOverview
+        || second.context() == KeyContext::FsPageOverview
+    {
+        return page_overview_action_allowed(first) && page_overview_action_allowed(second);
+    }
+    if first == KeyAction::FsPageOverviewToggle || second == KeyAction::FsPageOverviewToggle {
+        return (page_overview_action_allowed(first) && page_overview_action_allowed(second))
+            || (FS_IMAGE_ACTIVE_SCOPES.contains(&first.context())
+                && FS_IMAGE_ACTIVE_SCOPES.contains(&second.context()));
+    }
     command_scopes_overlap(first.context(), second.context())
         || help_context_shortcuts_overlaps_scope(first, second.context())
         || help_context_shortcuts_overlaps_scope(second, first.context())
@@ -7648,6 +7769,37 @@ impl Keymap {
     ) -> Vec<CommandDisplayRow> {
         command_catalog()
             .filter(|spec| active_scopes.contains(&spec.scope))
+            .filter(|spec| {
+                !active_scopes.contains(&KeyContext::FsVideo)
+                    || spec.action != KeyAction::FsPageOverviewToggle
+            })
+            .filter(|spec| {
+                !active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(spec.action)
+            })
+            .filter(|spec| spec.action != KeyAction::HelpShowContextShortcuts)
+            .filter(|spec| spec.action.is_user_facing())
+            .filter_map(|spec| {
+                let shortcut_labels = self.chord_labels(spec.action);
+                if shortcut_labels.is_empty() && !include_unassigned {
+                    return None;
+                }
+                Some(CommandDisplayRow {
+                    spec,
+                    shortcut_labels,
+                })
+            })
+            .collect()
+    }
+
+    /// Build help from the exact runtime executable action set, after availability gates.
+    pub fn command_display_rows_for_actions(
+        &self,
+        executable_actions: &[KeyAction],
+        include_unassigned: bool,
+    ) -> Vec<CommandDisplayRow> {
+        command_catalog()
+            .filter(|spec| executable_actions.contains(&spec.action))
             .filter(|spec| spec.action != KeyAction::HelpShowContextShortcuts)
             .filter(|spec| spec.action.is_user_facing())
             .filter_map(|spec| {
@@ -7708,6 +7860,8 @@ impl Keymap {
         priority.iter().copied().find(|action| {
             action.trigger() == KeyTrigger::Press
                 && active_scopes.contains(&action.context())
+                && (!active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(*action))
                 && self.action_has_chord(*action, chord)
         })
     }
@@ -7721,7 +7875,26 @@ impl Keymap {
         priority.iter().copied().find(|action| {
             action.trigger() == KeyTrigger::Press
                 && active_scopes.contains(&action.context())
+                && (!active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(*action))
                 && self.consume_action(ctx, *action)
+        })
+    }
+
+    /// Dispatch a runtime-filtered priority list without retriggering held Press actions.
+    /// Keyboard ownership and physical-edge consumption remain in the existing helpers.
+    pub fn consume_first_action_no_repeat(
+        &self,
+        ctx: &egui::Context,
+        active_scopes: &[CommandScope],
+        priority: &[KeyAction],
+    ) -> Option<KeyAction> {
+        priority.iter().copied().find(|action| {
+            action.trigger() == KeyTrigger::Press
+                && active_scopes.contains(&action.context())
+                && (!active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(*action))
+                && self.consume_action_no_repeat(ctx, *action)
         })
     }
 
@@ -8527,18 +8700,11 @@ impl Keymap {
 
     pub fn install_global_native_video_shortcuts(&self) {
         let mut chords = Vec::new();
-        for action in KeyAction::all().iter().copied().filter(|action| {
-            matches!(
-                action.context(),
-                KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || matches!(
-                action,
-                KeyAction::ToggleDetachedViewerMode
-                    | KeyAction::ToggleAlwaysOnTop
-                    | KeyAction::ClearVideoMediaMemory
-                    | KeyAction::ClearBookResumePositions
-            )
-        }) {
+        for action in KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| native_video_shortcut_action(*action))
+        {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
             } else {
@@ -8675,6 +8841,7 @@ impl Keymap {
             KeyContext::Global,
             KeyContext::Grid,
             KeyContext::FsCommon,
+            KeyContext::FsPageOverview,
             KeyContext::Rating,
             KeyContext::FsImage,
             KeyContext::FsVideo,
@@ -9623,18 +9790,7 @@ pub fn native_video_fullscreen_shortcut_key(
     KeyAction::all()
         .iter()
         .copied()
-        .filter(|action| {
-            matches!(
-                action.context(),
-                KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || matches!(
-                action,
-                KeyAction::ToggleDetachedViewerMode
-                    | KeyAction::ToggleAlwaysOnTop
-                    | KeyAction::ClearVideoMediaMemory
-                    | KeyAction::ClearBookResumePositions
-            )
-        })
+        .filter(|action| native_video_shortcut_action(*action))
         .any(|action| fallback.matches_vk_action(action, key))
 }
 
@@ -9886,6 +10042,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_overview_actions_register_defaults_and_keep_existing_bindings() {
+        let defaults = [
+            (KeyAction::FsPageOverviewToggle, Some(KeyName::O)),
+            (KeyAction::FsPageOverviewConfirm, Some(KeyName::Enter)),
+            (KeyAction::FsPageOverviewPagePrev, Some(KeyName::PageUp)),
+            (KeyAction::FsPageOverviewPageNext, Some(KeyName::PageDown)),
+            (KeyAction::FsPageOverviewFirst, Some(KeyName::Home)),
+            (KeyAction::FsPageOverviewLast, Some(KeyName::End)),
+            (KeyAction::FsPageOverviewColumnsLess, None),
+            (KeyAction::FsPageOverviewColumnsMore, None),
+        ];
+        for (action, key) in defaults {
+            assert!(ALL_ACTIONS.contains(&action));
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.context(),
+                if action == KeyAction::FsPageOverviewToggle {
+                    KeyContext::FsCommon
+                } else {
+                    KeyContext::FsPageOverview
+                }
+            );
+            assert_eq!(action.default_chords().iter().next(), key.map(Chord::key));
+            assert_eq!(
+                action.default_chords().iter().count(),
+                usize::from(key.is_some())
+            );
+            assert!(action.is_user_facing());
+        }
+        assert_eq!(
+            KeyContext::parse("FsPageOverview"),
+            Some(KeyContext::FsPageOverview)
+        );
+        for (action, chord) in [
+            (KeyAction::FsSlideshow, Chord::key(KeyName::S)),
+            (KeyAction::FsSeekStripToggle, Chord::shift(KeyName::S)),
+            (KeyAction::FsCapture, Chord::ctrl(KeyName::S)),
+            (KeyAction::GlobalOpenFolder, Chord::ctrl(KeyName::O)),
+            (KeyAction::EraseToolEllipse, Chord::key(KeyName::O)),
+            (KeyAction::ConcealToolEllipse, Chord::key(KeyName::O)),
+            (KeyAction::LaToolEllipse, Chord::key(KeyName::O)),
+        ] {
+            assert_eq!(
+                action.default_chords().iter().next(),
+                Some(chord),
+                "{action:?}"
+            );
+        }
+        for other in KeyAction::all().iter().copied().filter(|other| {
+            *other != KeyAction::FsPageOverviewToggle
+                && actions_can_overlap(KeyAction::FsPageOverviewToggle, *other)
+        }) {
+            assert!(
+                !other
+                    .default_chords()
+                    .iter()
+                    .any(|chord| chord == Chord::key(KeyName::O)),
+                "the overview O default conflicts with {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_overview_help_and_resolver_use_the_finite_action_set() {
+        let keymap = Keymap::empty();
+        let rows =
+            keymap.command_display_rows_for_active_scopes(FS_PAGE_OVERVIEW_ACTIVE_SCOPES, true);
+        assert!(
+            rows.iter()
+                .all(|row| page_overview_action_allowed(row.spec.action))
+        );
+        assert_eq!(rows.len(), FS_PAGE_OVERVIEW_ACTION_PRIORITY.len() - 1);
+        for action in [
+            KeyAction::FsClose,
+            KeyAction::FsBackToList,
+            KeyAction::FsToggleMetadata,
+            KeyAction::FsPageNext,
+            KeyAction::FsSlideshow,
+            KeyAction::RatingItem1,
+            KeyAction::GlobalOpenFolder,
+        ] {
+            assert!(!page_overview_action_allowed(action), "{action:?}");
+            assert!(!rows.iter().any(|row| row.spec.action == action));
+        }
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::Backspace),
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                &[KeyAction::FsBackToList]
+            ),
+            None
+        );
+        let executable = FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            .iter()
+            .copied()
+            .filter(|action| {
+                *action != KeyAction::ToggleDetachedViewerMode
+                    && *action != KeyAction::FsCtrlNavPrev
+            })
+            .collect::<Vec<_>>();
+        let rows = keymap.command_display_rows_for_actions(&executable, true);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::ToggleDetachedViewerMode
+                    || row.spec.action == KeyAction::FsCtrlNavPrev)
+        );
+    }
+
+    #[test]
     fn generic_book_view_actions_are_assignable_without_default_bindings() {
         let mut settings = KeymapSettings::default();
         for (action, key) in [
@@ -9910,6 +10177,153 @@ mod tests {
             Keymap::default().effective_chords(KeyAction::FsSpreadLtr),
             &[Chord::key(KeyName::Num2), Chord::key(KeyName::Numpad2)]
         );
+    }
+
+    #[test]
+    fn page_overview_coexistence_checks_all_potential_actions_without_edit_or_video() {
+        for first in FS_PAGE_OVERVIEW_ACTION_PRIORITY.iter().copied() {
+            for second in FS_PAGE_OVERVIEW_ACTION_PRIORITY.iter().copied() {
+                assert!(actions_can_overlap(first, second), "{first:?} / {second:?}");
+            }
+        }
+        for local in KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| action.context() == KeyContext::FsPageOverview)
+        {
+            for excluded in [
+                KeyAction::FsClose,
+                KeyAction::FsBackToList,
+                KeyAction::GlobalOpenFolder,
+                KeyAction::FsSlideshow,
+                KeyAction::RatingItem1,
+                KeyAction::VideoTileMode,
+                KeyAction::EraseToolEllipse,
+                KeyAction::ConcealToolEllipse,
+                KeyAction::LaToolEllipse,
+            ] {
+                assert!(
+                    !actions_can_overlap(local, excluded),
+                    "{local:?} / {excluded:?}"
+                );
+                assert!(!actions_can_overlap(excluded, local));
+            }
+        }
+        for excluded in [
+            KeyAction::VideoTileMode,
+            KeyAction::EraseToolEllipse,
+            KeyAction::ConcealToolEllipse,
+            KeyAction::LaToolEllipse,
+        ] {
+            assert!(!actions_can_overlap(
+                KeyAction::FsPageOverviewToggle,
+                excluded
+            ));
+        }
+        assert!(actions_can_overlap(
+            KeyAction::FsPageOverviewToggle,
+            KeyAction::FsClose
+        ));
+        assert!(!native_video_shortcut_action(
+            KeyAction::FsPageOverviewToggle
+        ));
+        assert!(native_video_shortcut_action(KeyAction::FsToggleWindowMode));
+        assert!(native_video_shortcut_action(KeyAction::VideoTileMode));
+        for action in [
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
+        ] {
+            assert!(native_video_shortcut_action(action), "{action:?}");
+            assert!(!page_overview_action_allowed(action), "{action:?}");
+        }
+        let keymap = Keymap::empty();
+        assert!(
+            !keymap
+                .command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, true)
+                .iter()
+                .any(|row| row.spec.action == KeyAction::FsPageOverviewToggle)
+        );
+        assert!(
+            keymap
+                .command_display_rows_for_active_scopes(FS_IMAGE_ACTIVE_SCOPES, true)
+                .iter()
+                .any(|row| row.spec.action == KeyAction::FsPageOverviewToggle)
+        );
+    }
+
+    #[test]
+    fn page_overview_toggle_enter_reports_confirm_conflict_and_resolves_toggle_first() {
+        let keymap = Keymap::from_ini_str("[FsCommon]\nFsPageOverviewToggle = Enter\n");
+        assert!(
+            keymap
+                .binding_conflicts()
+                .iter()
+                .any(
+                    |conflict| conflict.action == KeyAction::FsPageOverviewToggle
+                        && conflict.other_action == Some(KeyAction::FsPageOverviewConfirm)
+                )
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::Enter),
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            Some(KeyAction::FsPageOverviewToggle)
+        );
+    }
+
+    #[test]
+    fn page_overview_no_repeat_dispatch_consumes_enter_once_without_confirm_fallthrough() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        let ctx = egui::Context::default();
+        let keymap = Keymap::from_ini_str("[FsCommon]\nFsPageOverviewToggle = Enter\n");
+        begin_key_pass(&ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(
+            keymap.consume_first_action_no_repeat(
+                &ctx,
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            Some(KeyAction::FsPageOverviewToggle)
+        );
+        assert_eq!(
+            keymap.consume_first_action_no_repeat(
+                &ctx,
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            None
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        assert_eq!(
+            keymap.consume_first_action_no_repeat(
+                &ctx,
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            None
+        );
+        assert!(ctx.input(|input| input.events.is_empty()));
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -10649,6 +11063,7 @@ mod tests {
             "ImageCapture".to_string(),
             "ImageToggleMetadata".to_string(),
             "ImageSlideshow".to_string(),
+            "ImagePageOverview".to_string(),
             "ImageZoomMode".to_string(),
             "ImagePixelGrid".to_string(),
             "ImageBackgroundCycle".to_string(),

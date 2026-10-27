@@ -44,6 +44,8 @@ fn collect_actual_merge(
     let mut operation = None;
     let (overflow_pointer_input, overflow_touch_excluded) =
         app.capture_fs_front_pointer_input(&ctx, ui.max_rect());
+    let primary_suppression =
+        app.advance_viewer_primary_pointer_frame(&ctx, overflow_pointer_input.primary_owned);
     let result = app.handle_fs_wheel_and_click_frame(
         ui,
         &ctx,
@@ -54,6 +56,7 @@ fn collect_actual_merge(
         0,
         &mut None,
         None,
+        primary_suppression,
         false,
         &mut operation,
         suppress_navigation,

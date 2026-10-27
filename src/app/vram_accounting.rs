@@ -274,12 +274,15 @@ impl App {
             });
         }
         for window in &self.detached_image_windows {
-            accountant.add_texture(
-                VramSubsystem::FsCache,
-                window.texture.source_texture(),
-                true,
-            );
-            add_lanczos_resource(accountant, &window.texture);
+            if let Some(resource) = window.display.still() {
+                accountant.add_texture(VramSubsystem::FsCache, resource.source_texture(), true);
+                add_lanczos_resource(accountant, resource);
+            }
+            if let Some(overview) = window.display.overview() {
+                for texture in &overview.retained_textures {
+                    accountant.add_texture(VramSubsystem::Thumbnails, texture, false);
+                }
+            }
             for page in &window.frozen_continuous_pages {
                 accountant.add_texture(VramSubsystem::FsCache, page.texture.source_texture(), true);
                 add_lanczos_resource(accountant, &page.texture);
@@ -287,8 +290,15 @@ impl App {
         }
         for shared in self.deferred_detached_image_window_views.values() {
             if let Some(view) = shared.view() {
-                accountant.add_texture(VramSubsystem::FsCache, view.texture.source_texture(), true);
-                add_lanczos_resource(accountant, &view.texture);
+                if let Some(resource) = view.display.still() {
+                    accountant.add_texture(VramSubsystem::FsCache, resource.source_texture(), true);
+                    add_lanczos_resource(accountant, resource);
+                }
+                if let Some(overview) = view.display.overview() {
+                    for texture in &overview.retained_textures {
+                        accountant.add_texture(VramSubsystem::Thumbnails, texture, false);
+                    }
+                }
                 for page in &view.frozen_continuous_pages {
                     accountant.add_texture(
                         VramSubsystem::FsCache,

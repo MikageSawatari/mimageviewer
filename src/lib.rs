@@ -251,6 +251,7 @@ mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
 mod page_dims;
+pub mod page_overview;
 pub mod page_split;
 pub mod panorama;
 pub mod panorama_wgpu;
@@ -393,6 +394,7 @@ pub use ui_fullscreen::{
 mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
+pub mod ui_page_overview;
 pub mod ui_pinned_search;
 pub mod ui_toolbar_layout;
 #[doc(hidden)]

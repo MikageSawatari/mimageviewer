@@ -1,5 +1,60 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
+動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
+受理済み移動が未提示の間はanimationのON／OFFにかかわらずOによる新規入場を受け付けない。
+既存`fs_navigation_sequence_blocks_new_target()`と`page_turn_barrier_active()`を
+既存`page_overview_available()`へ集約し、OpenとSelectで共用する。受理済み移動を保持し、
+完了後にもう一度Oを押す。新しいpredicate・pending・replay・取消や一般lockの新案内は加えない。
+HUD／リング／パッドも`open_page_overview_for_viewer`→`open_page_overview`の同じ受付へ通す。
+入場要求の保留・自動再実行・新しい取消処理は作らない。Oの既存operation観測が通常flat完了へ
+進める場合と、一覧入場の受付がownerを変更することは区別する（2026-10-27の新coordinator手順2、
+一覧設計書§25.4）。旧選択肢2の即退役を採択した意味ではない。独立レビューP2追補の指定自動検証は同§25.7で成功し、
+同§25.6の統合時の成功と区別する。
+
+Oは既存のfocused Slideshow／overflowの「次のキーで閉じる」処理より後に判定する。
+受理した共通一覧入場ではkeyboard／HUD／ring／gesture／padとも`dismiss_fs_transient_menu_state()`で
+spread／fit／panoramaのboolとoverflowを終了し、physical streamを維持する。
+keyboard次キーdismiss／HUD Close／HUD Overviewが共用するのはoverflowだけの`dismiss_fs_overflow_panel()`。
+拒否されたring入場はchromeを残し、ring全体の一括resetと通常キーのdismiss規則の変更は行わない。
+rotation／seek等のegui Popupは表示／keepされなければ所有viewportの`Memory::end_pass`で自然に退役する。
+keyboardのseek ownerは従来どおりOを拒否し、非keyのring入場後はowner pass終端で自然に閉じる。
+兄弟viewportへ影響する`Popup::close_all`やroot ctxへの明示popup closeは加えない。
+context menu／modal／overlay編集／pickerの既存入場拒否と、info panelの永続lockは維持する。
+fullscreen tag pickerも既存common modalに含む。通常adjustment panelは非focusedなら入場できる場合があるが、
+front-menu captureには含まれず、focused TextEdit／IMEは既存keyboard ownerがOを止める。
+metadata／infoのlock・明示表示・hoverと、非永続のhover tooltipは旧menu captureとして一括resetしない。
+一覧中の scope は Global + FsCommon + FsPageOverview とし、FsImage／Rating は同時 active にしない。
+一覧確定は `FsPageOverviewConfirm`（Enter）、画面送りは `FsPageOverviewPagePrev`／
+`FsPageOverviewPageNext`（PageUp／PageDown）、先頭末尾は `FsPageOverviewFirst`／
+`FsPageOverviewLast`（Home／End）、列数は `FsPageOverviewColumnsLess`／
+`FsPageOverviewColumnsMore`（既定なし）。新規操作はすべて Press／no-repeat。
+
+一覧の実行可能集合は `FS_PAGE_OVERVIEW_ACTION_PRIORITY` を正本とし、新規一覧操作、
+`HelpShowContextShortcuts`、`FsToggleWindowMode`、`ToggleDetachedViewerMode`、
+`ToggleAlwaysOnTop`、`FsCtrlNavPrev`／`FsCtrlNavNext`／`FsSiblingPrev`／`FsSiblingNext`
+に限る。表示先と navigation の既存 gate でさらに絞り、独立静止画窓の F12 は含めない。
+ヘルプ・ボタン・リング／ジェスチャ・パッドも同じ集合を使い、許可外の保存済み割当は実行しない。
+`FsClose`／`FsBackToList`、背面の画像操作／評価／slideshow へ fallthrough しない。
+一覧を取消した後は通常の割当へ戻る。
+
+一覧のactive rendererも通常viewerと共通のpointer recognition／guide描画を通る。
+右ドラッグring／gestureと中ボタン短押しは既存の認識・取消・primary suppressionを使い、
+保存済み割当を上の有限集合へdispatchする。X長押しringは一覧中も案内を描き、
+許可slot／「無効」slotのlabelとrelease時の実行gateを一致させる。
+activeのlabelは現在ownerの集合、passiveのlabelはそのimmutable `overview.executable_actions`を使う。
+集合・scope・新規Actionは増やさず、短右click／画像long-press menu、中ドラッグzoom、
+通常ページ送り・wheel pan／zoomを一覧へ流さない。
+TILE11の接続修正・検証記録は[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)を参照する。
+
+修飾なし矢印は一覧 cursor の固定ナビ、Esc は一覧取消の固定操作で keymap 対象外。
+どちらも通常 viewer と共通の固定入力／IME-safe 契約を保ち、TextInput／IME／modal を優先する。
+背景クリックでは取消しない。OS／タイトルバーの窓 close は従来の terminal close。
+入力優先は modal・text・popup → 固定 Esc → ヘルプ → toggle → F11／F12／最前面 →
+Ctrl／sibling navigation → Confirm → その他の一覧操作／固定 cursor とし、一つの edge を一度消費する。
+toggle を Enter に割り当てると Confirm との競合を表示し、実行時は toggle だけで一回取消す。
+潜在的な競合は一時的な modal／nav lock によって消さず、一覧の全許可集合で検査する。
+
 ## 手動の前後移動ループ（§1.400）
 
 `fullscreen_manual_nav_wrap`（既定OFF）がONなら、既存の手動前後移動Actionは現在の閲覧順・

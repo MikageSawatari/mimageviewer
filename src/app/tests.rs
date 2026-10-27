@@ -8039,7 +8039,7 @@ fn contextless_test_window(ctx: &egui::Context, id: u64) -> DetachedImageWindowS
     );
     DetachedImageWindowSnapshot {
         id,
-        texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+        display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
         title: format!("paused-{id}"),
         location_display: format!("paused-{id}"),
         image_dims: None,
@@ -77410,7 +77410,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 7,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -77499,7 +77499,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex)).into(),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -77727,7 +77727,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex)).into(),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -77801,7 +77801,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let make_snapshot =
             |id: u64, tex: egui::TextureHandle, path: &str| DetachedImageWindowSnapshot {
                 id,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: format!("still {id}"),
                 location_display: format!("still {id}"),
                 image_dims: None,
@@ -78364,7 +78364,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 91,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex)).into(),
                 title: "parked".to_owned(),
                 location_display: "parked".to_owned(),
                 image_dims: None,
@@ -78674,7 +78674,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 95,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked music".to_owned(),
                 location_display: "parked music".to_owned(),
                 image_dims: None,
@@ -79319,7 +79319,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 93,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked".to_owned(),
                 location_display: "parked".to_owned(),
                 image_dims: None,
@@ -79371,7 +79371,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 94,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked still".to_owned(),
                 location_display: "parked still".to_owned(),
                 image_dims: None,
@@ -80634,7 +80634,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: WINDOW_ID,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -80781,7 +80781,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 42,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(first_texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(first_texture))
+                    .into(),
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -80995,7 +80996,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "pinned.pdf - mimageviewer".to_string(),
                 location_display: "pinned.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -82283,7 +82284,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .iter()
             .find(|snapshot| snapshot.id == window_id)
             .expect("old held frame was parked");
-        assert_eq!(passive.texture.source_texture_id(), old_texture_id);
+        assert_eq!(
+            passive
+                .display
+                .still()
+                .expect("still snapshot")
+                .source_texture_id(),
+            old_texture_id
+        );
         assert_eq!(passive.frozen_continuous_pages.len(), 1);
         assert_eq!(
             passive.frozen_continuous_pages[0]
@@ -84538,7 +84546,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 43,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "a.jpg - mimageviewer".to_string(),
                 location_display: "a.jpg".to_string(),
                 image_dims: Some((1, 1)),
@@ -84662,7 +84670,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 62,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "parked.flac - mimageviewer".to_owned(),
                 location_display: "parked.flac".to_owned(),
                 image_dims: None,
@@ -84801,7 +84809,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 102,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()))
+                    .into(),
                 title: "passive.jpg - mimageviewer".to_owned(),
                 location_display: "passive.jpg".to_owned(),
                 image_dims: Some((1, 1)),
@@ -84831,7 +84840,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 103,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "live.mp4 - mimageviewer".to_owned(),
                 location_display: "live.mp4".to_owned(),
                 image_dims: None,
@@ -85089,7 +85098,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -85426,7 +85435,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 72,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "live.mp4 - mimageviewer".to_owned(),
                 location_display: "live.mp4".to_owned(),
                 image_dims: None,
@@ -86707,7 +86716,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 71,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "old".to_owned(),
                 location_display: "old".to_owned(),
                 image_dims: None,
@@ -86768,7 +86777,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 81,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -88544,7 +88553,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 82,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -89784,6 +89793,465 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(!app.current_context_owns_source_swap_pending());
     }
 
+    fn install_open_overview_snapshot_fixture(
+        app: &mut App,
+        count: usize,
+    ) -> Arc<crate::page_overview::PageOverviewProjection> {
+        use crate::page_overview::{
+            PageOverviewDirection, PageOverviewProjection, PageOverviewStamp, PageOverviewState,
+        };
+        app.items = (0..count)
+            .map(|idx| GridItem::Image(format!("C:/pics/{idx}.jpg").into()))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; count];
+        app.image_metas = vec![None; count];
+        app.visible_indices = (0..count).collect();
+        app.details_order.clear();
+        app.fullscreen_idx = Some(0);
+        app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+            &app.items,
+            None,
+            app.settings.file_type_visibility.clone(),
+        ));
+        let metadata = Arc::clone(app.page_identity_index.overview_metadata());
+        let projection = Arc::new(
+            PageOverviewProjection::new(metadata, Arc::new((0..count).collect())).unwrap(),
+        );
+        let stamp = PageOverviewStamp {
+            context_serial: app.projected_viewer_context_id().serial(),
+            items_generation: app.items_generation,
+            reader_order_revision: Arc::as_ptr(&projection) as usize as u64,
+            incarnation: 1,
+        };
+        app.page_overview_incarnation = 1;
+        app.page_overview = PageOverviewState::open(
+            Arc::clone(&projection),
+            stamp,
+            0,
+            5,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 660.0)),
+            PageOverviewDirection::LeftToRight,
+        )
+        .unwrap();
+        projection
+    }
+
+    #[test]
+    fn overview_select_uses_ordinary_root_navigation_grid_sync() {
+        use crate::app::page_overview::PageOverviewCommand;
+        use crate::page_overview::PageOverviewDirection;
+        for presentation in [
+            ViewerPresentation::MainWindow,
+            ViewerPresentation::Fullscreen,
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            install_open_overview_snapshot_fixture(&mut app, 4);
+            app.viewer_presentation = presentation;
+            app.selected = Some(0);
+            app.scroll_to_selected = false;
+            let selection = app.page_overview_view().unwrap().capture_select(2).unwrap();
+            let active_context = app.page_overview_active_context_serial();
+            assert!(app.handle_page_overview_command(
+                &ctx,
+                &PageOverviewCommand::Select(selection),
+                ctx.content_rect(),
+                PageOverviewDirection::LeftToRight,
+                active_context,
+            ));
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert_eq!(app.selected, Some(2));
+            assert!(app.scroll_to_selected);
+            assert!(app.page_overview.session().is_none());
+            app.sync_detached_viewer_to_selected(&ctx);
+            assert_eq!(app.fullscreen_idx, Some(2));
+        }
+    }
+
+    #[test]
+    fn overview_reader_rebuild_compares_only_canonical_real_pages() {
+        let mut app = setup_app();
+        install_open_overview_snapshot_fixture(&mut app, 3);
+        app.items.push(GridItem::Folder("C:/pics/subfolder".into()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.visible_indices = vec![3, 0, 1, 2];
+        let view = app.page_overview_view().unwrap();
+        app.close_page_overview_if_reader_order_changed();
+        assert_eq!(app.page_overview_view().unwrap().stamp, view.stamp);
+        app.visible_indices = vec![3, 0, 2, 1];
+        app.close_page_overview_if_reader_order_changed();
+        assert!(app.page_overview.session().is_none());
+    }
+
+    #[test]
+    fn overview_root_forwarding_accepts_remapped_confirm_and_blocks_grid_fallthrough() {
+        let _input_guard = crate::key_input::lock_test_input();
+        struct ClearInput;
+        impl Drop for ClearInput {
+            fn drop(&mut self) {
+                crate::key_input::clear_test_frame();
+            }
+        }
+        let _clear = ClearInput;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 4);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.keymap =
+            crate::keymap::Keymap::from_ini_str("[FsPageOverview]\nFsPageOverviewConfirm = Q\n");
+        let view = app.page_overview_view().unwrap();
+        let target = view.capture_select(2).unwrap().target;
+        let layout = view.layout(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960., 660.)),
+            crate::page_overview::PageOverviewDirection::LeftToRight,
+        );
+        app.page_overview
+            .session_mut()
+            .unwrap()
+            .set_cursor_target(&target, &layout);
+        ctx.begin_pass(egui::RawInput {
+            focused: true,
+            ..Default::default()
+        });
+        crate::key_input::set_test_frame_for_viewport(
+            ctx.viewport_id(),
+            vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
+                source_hwnd: 1,
+                source_viewport: ctx.viewport_id(),
+                virtual_key: 0x51,
+                scan_code: 0x10,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }],
+        );
+        assert!(app.handle_fullscreen_root_key_input(&ctx));
+        ctx.end_pass().drop_without_applying_deltas();
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert!(app.page_overview.session().is_none());
+    }
+
+    #[test]
+    fn overview_key_exit_reports_typed_page_rebase_for_selection_and_same_page_cancel() {
+        let _input_guard = crate::key_input::lock_test_input();
+        struct ClearInput;
+        impl Drop for ClearInput {
+            fn drop(&mut self) {
+                crate::key_input::clear_test_frame();
+            }
+        }
+        let _clear = ClearInput;
+        for (virtual_key, expected_idx) in [(0x0d, 2), (0x1b, 0)] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            install_open_overview_snapshot_fixture(&mut app, 4);
+            app.viewer_presentation = ViewerPresentation::MainWindow;
+            let view = app.page_overview_view().unwrap();
+            let target = view.capture_select(2).unwrap().target;
+            let layout = view.layout(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.)),
+                crate::page_overview::PageOverviewDirection::LeftToRight,
+            );
+            app.page_overview
+                .session_mut()
+                .unwrap()
+                .set_cursor_target(&target, &layout);
+            ctx.begin_pass(egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key: if virtual_key == 0x1b {
+                        egui::Key::Escape
+                    } else {
+                        egui::Key::Enter
+                    },
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800., 600.),
+                )),
+                ..Default::default()
+            });
+            crate::key_input::set_test_frame_for_viewport(
+                ctx.viewport_id(),
+                vec![crate::key_input::KeyEdge {
+                    operation_id: crate::key_input::KeyOperationId::unassigned(),
+                    source_hwnd: 1,
+                    source_viewport: ctx.viewport_id(),
+                    virtual_key,
+                    scan_code: 0,
+                    extended: false,
+                    pressed: true,
+                    repeat: false,
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                }],
+            );
+            let action = app.handle_fs_key_input(&ctx, 0, false);
+            ctx.end_pass().drop_without_applying_deltas();
+            assert_eq!(
+                action.page_transition,
+                crate::ui_fullscreen::FsKeyPageTransition::Rebased { idx: expected_idx }
+            );
+            assert_eq!(app.fullscreen_idx, Some(expected_idx));
+            assert!(app.page_overview.session().is_none());
+        }
+    }
+
+    #[test]
+    fn overview_direction_uses_reader_direction_even_for_single_page_mode() {
+        let mut app = setup_app();
+        for spread in [
+            crate::settings::SpreadMode::Single,
+            crate::settings::SpreadMode::Vertical,
+            crate::settings::SpreadMode::Rtl,
+        ] {
+            app.spread_mode = spread;
+            app.reading_direction = crate::settings::ReadingDirection::Rtl;
+            assert_eq!(
+                app.page_overview_direction(),
+                crate::page_overview::PageOverviewDirection::RightToLeft
+            );
+            app.reading_direction = crate::settings::ReadingDirection::Ltr;
+            assert_eq!(
+                app.page_overview_direction(),
+                crate::page_overview::PageOverviewDirection::LeftToRight
+            );
+        }
+    }
+
+    #[test]
+    fn overview_remote_acquire_blocks_delivered_local_commands_before_any_change() {
+        use crate::app::page_overview::PageOverviewCommand;
+        use crate::page_overview::PageOverviewDirection;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 4);
+        let view = app.page_overview_view().unwrap();
+        let active = app.page_overview_active_context_serial();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "overview-regression".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert!(app.page_overview_executable_actions().is_empty());
+        for command in [
+            PageOverviewCommand::Select(view.capture_select(2).unwrap()),
+            PageOverviewCommand::Cancel { stamp: view.stamp },
+            PageOverviewCommand::ScrollRows {
+                stamp: view.stamp,
+                delta: 2,
+            },
+        ] {
+            assert!(!app.handle_page_overview_command(
+                &ctx,
+                &command,
+                ctx.content_rect(),
+                PageOverviewDirection::LeftToRight,
+                active,
+            ));
+        }
+        assert_eq!(app.fullscreen_idx, Some(0));
+        let after = app.page_overview_view().unwrap();
+        assert_eq!(after.stamp, view.stamp);
+        assert_eq!(after.scroll_anchor, view.scroll_anchor);
+        assert_eq!(after.cursor, view.cursor);
+    }
+
+    #[test]
+    fn overview_inactive_select_preserves_open_view_and_active_presentation() {
+        use crate::app::page_overview::PageOverviewCommand;
+        use crate::page_overview::PageOverviewDirection;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 4);
+        app.selected = Some(0);
+        app.scroll_to_selected = false;
+        let view = app.page_overview_view().unwrap();
+        let selection = view.capture_select(2).unwrap();
+        let session = app.active_detached_session.map(|session| session.window_id);
+        let presentation = app.viewer_presentation;
+        let binding = app.detached_viewer_window_id();
+        assert!(!app.handle_page_overview_command(
+            &ctx,
+            &PageOverviewCommand::Select(selection),
+            ctx.content_rect(),
+            PageOverviewDirection::LeftToRight,
+            Some(view.stamp.context_serial + 1),
+        ));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.selected, Some(0));
+        assert!(!app.scroll_to_selected);
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            session
+        );
+        assert_eq!(app.viewer_presentation, presentation);
+        assert_eq!(app.detached_viewer_window_id(), binding);
+        assert_eq!(app.page_overview_view().unwrap().stamp, view.stamp);
+    }
+
+    #[test]
+    fn detached_overview_snapshot_parks_metadata_without_any_full_image_or_thumbnail() {
+        let mut app = setup_app();
+        let projection = install_open_overview_snapshot_fixture(&mut app, 2048);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.set_detached_window_binding_for_test(Some(99));
+        app.begin_active_detached_session(99, DetachedSource::Image);
+        assert!(app.fs_cache.is_empty());
+        assert!(app.park_active_detached_image_window());
+        let snapshot = app.detached_image_windows.last().unwrap();
+        assert!(snapshot.display.still().is_none());
+        let overview = snapshot
+            .display
+            .overview()
+            .expect("overview requires no image resource");
+        assert!(Arc::ptr_eq(&overview.view.projection, &projection));
+        assert_eq!(overview.view.projection.len(), 2048);
+        assert!(overview.thumbnails.is_empty());
+        assert!(overview.retained_textures.is_empty());
+        assert!(overview.view.capture_select(2047).is_some());
+        assert!(snapshot.frozen_continuous_pages.is_empty());
+        let placement = app.detached_window_runtime_placement(snapshot.id).unwrap();
+        let deferred = DeferredDetachedImageWindowView::from_snapshot(
+            snapshot,
+            placement,
+            false,
+            None,
+            egui::Color32::BLACK,
+        );
+        assert!(Arc::ptr_eq(
+            &deferred.display.overview().unwrap().view.projection,
+            &projection
+        ));
+        assert!(deferred.display.still().is_none());
+        assert!(app.page_overview.session().is_some());
+    }
+
+    #[test]
+    fn detached_overview_snapshot_retains_only_capture_time_overscan_textures() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let projection = install_open_overview_snapshot_fixture(&mut app, 2048);
+        let loaded = mutation_refresh_loaded_thumb(&ctx);
+        app.thumbnails.fill(loaded);
+        for idx in 0..app.items.len() {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+        }
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.set_detached_window_binding_for_test(Some(100));
+        app.begin_active_detached_session(100, DetachedSource::Image);
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .unwrap();
+        let overview = snapshot.display.overview().unwrap();
+        assert!(Arc::ptr_eq(&overview.view.projection, &projection));
+        assert!(!overview.retained_textures.is_empty());
+        assert_eq!(overview.thumbnails.len(), overview.retained_textures.len());
+        assert!(overview.retained_textures.len() <= 100);
+        assert!(!overview.thumbnails.contains_key(&2047));
+        assert!(
+            overview.view.capture_select(2047).is_some(),
+            "metadata identifies newly exposed placeholders"
+        );
+    }
+
+    #[test]
+    fn overview_items_generation_change_closes_only_the_changed_owner() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 3);
+        let sibling = app.push_window_context_for_test(&ctx, 101, |owner| {
+            install_open_overview_snapshot_fixture(owner, 4);
+            owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            owner.current_folder = Some("C:/pics".into());
+        });
+        let unchanged = app.items_generation;
+        app.set_items_generation(unchanged);
+        assert!(app.page_overview.session().is_some());
+        app.set_items_generation(unchanged.wrapping_add(1));
+        assert!(app.page_overview.session().is_none());
+        assert!(
+            app.with_viewer_context_ref(sibling, |owner| owner.page_overview_view().is_some())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn overview_global_filter_rebuild_preserves_unchanged_detached_reader() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 3);
+        let sibling = app.push_window_context_for_test(&ctx, 102, |owner| {
+            install_open_overview_snapshot_fixture(owner, 4);
+            owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            owner.current_folder = Some("C:/pics".into());
+        });
+        let before = app
+            .with_viewer_context_ref(sibling, |owner| owner.page_overview_view().unwrap())
+            .unwrap();
+        app.search_filter = Some(std::collections::HashSet::new().into());
+        app.rebuild_all_viewer_context_visible_indices();
+        assert!(app.page_overview.session().is_none());
+        let after = app
+            .with_viewer_context_ref(sibling, |owner| owner.page_overview_view().unwrap())
+            .unwrap();
+        assert_eq!(after.stamp, before.stamp);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.scroll_anchor, before.scroll_anchor);
+        assert!(Arc::ptr_eq(&before.projection, &after.projection));
+    }
+
+    #[test]
+    fn overview_entry_refuses_existing_image_picker_without_committing_or_dropping_it() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, "C:/pics/picker.jpg");
+        app.fullscreen_idx = Some(idx);
+        let picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::ImageFullscreen);
+        let before = (
+            picker.owner,
+            picker.row,
+            picker.item_rating,
+            picker.dirty_rows.clone(),
+        );
+        app.ring_picker = Some(picker);
+        assert_eq!(
+            app.page_overview_unavailable_reason(),
+            Some("選択画面を閉じてからページ一覧を開いてください")
+        );
+        assert!(!app.open_page_overview(
+            ctx.content_rect(),
+            crate::page_overview::PageOverviewDirection::LeftToRight
+        ));
+        let after = app.ring_picker.as_ref().unwrap();
+        assert_eq!(
+            (
+                after.owner,
+                after.row,
+                after.item_rating,
+                after.dirty_rows.clone()
+            ),
+            before
+        );
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(app.page_overview.session().is_none());
+    }
+
     #[test]
     fn pending_mode_owns_same_output_f11_close_and_park_until_delivered() {
         for maximized in [false, true] {
@@ -90707,7 +91175,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 7,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "a.jpg - mimageviewer".to_string(),
                 location_display: "a.jpg".to_string(),
                 image_dims: Some((1, 1)),
@@ -90795,7 +91263,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let placement = app.detached_viewer_window_placement();
         let snapshot = DetachedImageWindowSnapshot {
             id: 7,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
             title: "a.jpg - mimageviewer".to_string(),
             location_display: "a.jpg".to_string(),
             image_dims: Some((1, 1)),
@@ -90897,7 +91365,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         };
         let snapshot = DetachedImageWindowSnapshot {
             id: 7,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
             title: "deferred.jpg - mimageviewer".to_string(),
             location_display: "deferred.jpg".to_string(),
             image_dims: Some((1, 1)),

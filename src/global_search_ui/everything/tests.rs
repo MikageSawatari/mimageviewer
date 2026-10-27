@@ -2,7 +2,6 @@
 
 //! Headless lifecycle checks. The name-search transport is never called: completed datasets
 //! enter the same Search prepare/adoption owner used by production.
-#![cfg(test)]
 use super::*;
 use crate::everything_results::{EverythingDataset, EverythingPreparedRow, EverythingStats};
 use crate::settings::{ListingSortMetadata, SortOrder};

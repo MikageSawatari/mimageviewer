@@ -6,8 +6,8 @@
 use crate::app::App;
 use crate::grid_item::GridItem;
 use crate::keymap::{
-    CommandDisplayRow, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES,
-    GRID_ACTIVE_SCOPES, KeyAction,
+    CommandDisplayRow, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+    FS_VIDEO_ACTIVE_SCOPES, GRID_ACTIVE_SCOPES, KeyAction,
 };
 use eframe::egui;
 
@@ -51,6 +51,37 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "Ctrl+ホイール",
         description: "ズーム倍率を変更する",
+    },
+];
+
+const FS_PAGE_OVERVIEW_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc",
+        description: "ページ一覧を取消して元のページ表示に戻る",
+    },
+    FixedShortcutRow {
+        keys: "← / → / ↑ / ↓",
+        description: "描画されたセルの方向にカーソルを移動する",
+    },
+    FixedShortcutRow {
+        keys: "マウスホイール",
+        description: "ページ一覧を行単位でスクロールする",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl+ホイール",
+        description: "この一覧の列数を変更する",
+    },
+    FixedShortcutRow {
+        keys: "セルをクリック / タップ",
+        description: "同じ画像ウィンドウで選んだページへ移動する",
+    },
+    FixedShortcutRow {
+        keys: "パッド矢印 / A / B",
+        description: "カーソル移動 / 選択確定 / 一覧取消",
     },
 ];
 
@@ -296,6 +327,7 @@ const TEXT_SUPPLEMENTAL_ACTION_ROWS: &[(KeyAction, &str)] = &[(
 enum ShortcutHelpContext {
     Grid,
     FsImage,
+    FsPageOverview,
     FsVideo,
     Erase,
     Conceal,
@@ -310,6 +342,7 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => "サムネイル一覧",
             Self::FsImage => "画像フルスクリーン",
+            Self::FsPageOverview => "本のページ一覧",
             Self::FsVideo => "動画フルスクリーン",
             Self::Erase => "消しゴムモード",
             Self::Conceal => "隠蔽加工モード",
@@ -324,6 +357,7 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => GRID_ACTIVE_SCOPES,
             Self::FsImage => FS_IMAGE_ACTIVE_SCOPES,
+            Self::FsPageOverview => FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
             Self::FsVideo => FS_VIDEO_ACTIVE_SCOPES,
             Self::Erase => ERASE_HELP_SCOPES,
             Self::Conceal => CONCEAL_HELP_SCOPES,
@@ -338,6 +372,7 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => GRID_FIXED_SHORTCUT_ROWS,
             Self::FsImage => FS_IMAGE_FIXED_SHORTCUT_ROWS,
+            Self::FsPageOverview => FS_PAGE_OVERVIEW_FIXED_SHORTCUT_ROWS,
             Self::FsVideo => FS_VIDEO_FIXED_SHORTCUT_ROWS,
             Self::Erase => ERASE_FIXED_SHORTCUT_ROWS,
             Self::Conceal => CONCEAL_FIXED_SHORTCUT_ROWS,
@@ -353,6 +388,7 @@ impl ShortcutHelpContext {
             Self::Text => TEXT_SUPPLEMENTAL_ACTION_ROWS,
             Self::Grid
             | Self::FsImage
+            | Self::FsPageOverview
             | Self::FsVideo
             | Self::Erase
             | Self::Conceal
@@ -372,6 +408,7 @@ impl ShortcutHelpContext {
             Self::FsImage => FS_IMAGE_TOUCH_SHORTCUT_ROWS_LTR,
             Self::FsVideo if video_touch_available => FS_VIDEO_TOUCH_SHORTCUT_ROWS,
             Self::Grid
+            | Self::FsPageOverview
             | Self::FsVideo
             | Self::Erase
             | Self::Conceal
@@ -388,6 +425,7 @@ impl ShortcutHelpContext {
         }
         match self {
             Self::Grid => true,
+            Self::FsPageOverview => true,
             Self::FsImage => {
                 row.spec.scope != CommandScope::Global
                     || row.spec.action == KeyAction::ToggleDetachedViewerMode
@@ -423,20 +461,27 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(72.0, 52.0);
         let scroll_max_h = (ctx.content_rect().height() - 180.0).min(620.0).max(160.0);
-        let rows = self
-            .keymap
-            .command_display_rows_for_active_scopes(help_context.active_scopes(), false)
-            .into_iter()
-            .filter(|row| help_context.includes_row(row))
-            .filter(|row| {
-                self.explicit_grid_container_open_disabled_reason()
-                    .is_none()
-                    || !matches!(
-                        row.spec.action,
-                        KeyAction::GridOpenSelectedAsPage | KeyAction::GridOpenSelectedAsList
-                    )
-            })
-            .collect::<Vec<_>>();
+        let rows = if matches!(help_context, ShortcutHelpContext::FsPageOverview) {
+            self.keymap
+                .command_display_rows_for_actions(&self.page_overview_executable_actions(), true)
+        } else {
+            self.keymap
+                .command_display_rows_for_active_scopes(help_context.active_scopes(), false)
+        }
+        .into_iter()
+        .filter(|row| {
+            matches!(help_context, ShortcutHelpContext::FsPageOverview)
+                || help_context.includes_row(row)
+        })
+        .filter(|row| {
+            self.explicit_grid_container_open_disabled_reason()
+                .is_none()
+                || !matches!(
+                    row.spec.action,
+                    KeyAction::GridOpenSelectedAsPage | KeyAction::GridOpenSelectedAsList
+                )
+        })
+        .collect::<Vec<_>>();
         let mut close_clicked = false;
 
         egui::Window::new("ショートカット")
@@ -491,6 +536,9 @@ impl App {
     }
 
     fn current_shortcut_help_context(&self) -> ShortcutHelpContext {
+        if self.page_overview.session().is_some() {
+            return ShortcutHelpContext::FsPageOverview;
+        }
         if self.erase_mode {
             return ShortcutHelpContext::Erase;
         }
@@ -659,6 +707,31 @@ fn draw_supplemental_action_rows(
 mod tests {
     use super::{ShortcutHelpContext, supplemental_action_shortcut_label};
     use crate::keymap::{Chord, KeyAction, Keymap, KeymapSettings, ModKind};
+
+    #[test]
+    fn overview_help_uses_its_own_fixed_navigation_and_exact_executable_rows() {
+        let context = ShortcutHelpContext::FsPageOverview;
+        assert_eq!(context.title(), "本のページ一覧");
+        assert!(
+            context
+                .fixed_rows()
+                .iter()
+                .any(|row| row.keys == "Esc" && row.description.contains("取消"))
+        );
+        assert!(context.touch_rows(false, false).is_empty());
+        let actions = [
+            KeyAction::FsPageOverviewToggle,
+            KeyAction::FsPageOverviewConfirm,
+            KeyAction::FsToggleWindowMode,
+        ];
+        let rows = Keymap::empty().command_display_rows_for_actions(&actions, true);
+        assert_eq!(rows.len(), actions.len());
+        assert!(rows.iter().all(|row| actions.contains(&row.spec.action)));
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row.spec.action, KeyAction::FsClose | KeyAction::FsSlideshow))
+        );
+    }
 
     #[test]
     fn video_help_includes_list_order_navigation_with_current_assignments() {

@@ -219,6 +219,9 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    // 1.340 R5: immutable overview metadata/cursor projection only; no mount or mutation.
+    // Accepted owner-scoped design and independent non-PDF implementation review (2026-10-12).
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn page_overview_view (self ,) -> Option < crate :: page_overview :: PageOverviewView >",
     // egui 0.37 stage 1b (9481bc344): state-only mounts use the existing table,
     // restore the original owner even on unwind, and leave publication in the UI
     // wrapper. Window access resolves an existing binding without changing it.
@@ -293,7 +296,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "item enum # [cfg (windows)] pub (in crate :: app) enum RetireContextError { Mount (MountError) , Retire (RetireError) , }",
     // 1.364 D2 keeps the accepted spread-shift owner in the bundle across mount/swap/fork.
     // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
-    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
+    // 1.444 freezes the main listing order in this bundle; forks leave it with the parent.
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (in crate :: app) list_order : Option < Arc < super :: ListOrderSnapshot > > , pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
     "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",

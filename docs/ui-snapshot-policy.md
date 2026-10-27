@@ -52,6 +52,27 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
+閲覧中のページ一覧（§1.340）は専用8枚に加え、unit snapshotの
+`fullscreen_overflow_panel_root`で「ページ一覧 [O]」を含む7行の入口を検査する。
+行のtouch targetは48pxを維持し、狭い面では共通のscroll／clampを使う。
+rootの入口追加で変わったPNGは1枚だけを更新して目視確認し、navigator submenuの基準は維持する。
+これはnext-tile側の統合前の検証履歴。2026-10-27のmaster取り込み後は、共通overflowの
+行高・行間修正と一覧入口を併せて比較する。再生成したRoot／RootTall／PageTurnOnは親担当が
+実PNGを目視し、先頭の構成編集、次のページ一覧[O]、既存のページめくり／スライドショーを確認した。
+Tall fixtureは10行×48ptにviewport高608ptが必要なため600→614へ調整した。
+600ptで8ptスクロールする製品layoutは正しく、製品layoutは変更していない。
+overflow panel8件は成功したが、同時実行のF11 fixture1件は失敗。guide2枚も再生成・目視確認済み。
+後続のF11診断では実child 340×420／inner 326×372の全域に不透明BLACKを確認した。
+固定canvasを前提にしたfixtureを、同passの実Area採取と独立した大きなWHITE背景に対する
+全域BLACKの検査へ修正した。r7の1372件中1371 passed／1 F11 fixture failedを経て、
+F11だけの最終focused検証は2 passed／0 failed、コンパイル込み95.47秒。
+full rendererのPrime→Apply／SettleのBLACK・期限終了後のoverview復帰と、既存placement境界の
+`ctx.run_pass`内でlive fake hostを渡して実`step()`がSettleへ進む検査を分ける。
+実`IsWindow`がfake hostを無効化するheadlessの制約を明示し、実HWND遷移の検証と混同しない。
+製品変更・新しいtest seam・Settle強制代入は行わず、既存deadlineだけをfixtureで設定する。
+r7の他1371件は再利用し、focused 2件との重複合算や一度の1372件全成功は主張しない。
+統合後の部分結果と未完了事項は[一覧設計書§25.5](detached-book-page-overview-plan.md#255-追加の部分検証と画像確認2026-10-27検証中)へ記録する。
+
 音楽タイムラインの調・低域音量（鍵盤設計§14、2026-10-14）は、libの純ラスタ描画で
 `timeline_bass_partial_raster`（240×80）と`timeline_key_states_raster`（660×80）を検査する。
 前者はベース高さの低域音量化とKey既定色の灰色化で更新（変更2798px、範囲x=8..207/y=23..39）。
@@ -112,6 +133,50 @@ Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・
 環境設定の位置復元 (§1.365) は `preferences_restore_position_light_on` と
 `preferences_restore_position_dark_off_narrow` の2枚で、本体と共通のチェック項目を描く。
 既定 ON のライト表示と、OFF のダーク表示・狭い幅での折り返しを確認する。
+
+本のページ一覧 (§1.340) は `page_overview_light/dark`、
+`page_overview_narrow_light/dark`、`page_overview_rtl_dark`、
+`page_overview_white_companion_dark`、`page_overview_eight_columns_dark`、
+`page_overview_twenty_columns_dark` の8ケースを定義する。通常は600×420、狭幅は200×440、
+8列は960×480、20列は2200×440。初期8列と上限20列を実際に描画し、通常／狭幅は
+最小セル幅で実効列数が減ることも確認する。Light／Darkは親のテーマを表し、一覧自体は
+共通rendererのchild Uiに`os_theme::apply_dark_ui`を適用して常に黒ベースにする。
+親visuals／Contextの両theme style／theme preferenceの不変と強い文字コントラストの維持はunitテストで検査する。
+本体と共通のrendererで固定ヘッダ・戻る・列数・番号／短名・現在ページとcursor・
+placeholder／失敗セル・RTL順・白紙／表示余白の補助表示を描く。
+fixtureはApp・実ファイル・workerを使わず、全ページ生成や製品起動を行わない。
+取消／選択／wheel消費と小面の戻る到達性はheadless handlerテストで別に検査する。
+PNG生成・目視確認・実行結果の記録は検証ownerが担当し、定義追加だけを実行済みと扱わない。
+2026-10-27のmaster統合では、構成採用後の可視実items順とhiddenを一覧へ反映する。
+白紙補助annotationは`None`のまま未接続で、白紙fixtureの描画はadapter契約の検査に限る。
+Selectは既存照合の全通過でClosed→既存landing一回とし、Checking後許可・拒否や同期拒否でも
+一覧を再openしない（一覧設計書§25.1追補）。この遷移はPNGと別のhandler回帰で確認し、
+以下はgate導入前の画像更新・部分検証の履歴。現行gate導入後の指定自動検証成功は一覧設計書§25.6へ記録する。
+初回`ui_snapshot`全件は203 passed／overview8件の画像差分。8枚の候補は親担当がすべて目視し、
+geometry・背景・列数・RTLの保持を確認した。`ui-overview-update`は8 passed／8枚再生成、
+コンパイル込み143.17秒。dark／eight columns／narrow lightの実PNGも親担当が追加で開き、
+確認済み候補との見え方の一致を確認した。更新指定なしの`ui-snapshot-final`全件比較はexit 0、
+211 passed／0 failed／0 ignored、コンパイル込み87.60秒。ここまでは通常／test-script check後の変更は
+test-fixtureの診断だけだった。その後coordinatorは、受理済み移動を保持し、既存barrierの
+Turning／Completing中だけ新規overview入場を拒否する新手順2を採択した。旧選択肢2の即退役ではない。O／HUD／ring／padは
+同じavailability／open受付を使い、完了後にもう一度操作する。入場要求の保留・replay・新取消は作らない。
+`app/page_overview.rs`の既存gate変更後にも全UI snapshotを通常比較し、211 passed／0 failed／0 ignored、
+コンパイル込み135.37秒・テスト実行30.65秒で成功した。前回再生成した13枚はそのままで追加再生成はない。
+新規O回帰2件、関連lib 1374件も特定除外なしで成功し、指定自動検証は完了、未merge。
+最新の条件・件数と独立レビュー／full-lib／build-dev／実機確認の引継ぎは一覧設計書§25.6に記録し、
+自動検証成功をこれらの受入まで完了したとは扱わない。
+同frameのfront pointer captureをprimary終端／一覧／通常canvasで共有するmaster合流には、
+old-owned releaseを取り逃さない3surfaceの実renderer回帰を追加した。追加時点の記録は§25.3、
+その後の実行結果は§25.4へ記録する。PNGやテスト追加だけを入力終端の成功証拠にはしない。
+
+TILE11の右ドラッグ／gesture認識とX長押しguideの接続漏れは、一覧rendererのearly returnが
+共通入力・overlayを飛ばしたため、labelのpure testや`draw_page_overview`単体snapshotでは
+検出できなかった。これらの検証とは別に、通常fullscreen／メイン内閲覧／active detachedの
+実rendererへ入力を注入し、認識→paintされたguide→許可／禁止slotのreleaseまで検査する。
+中ボタン短押し、primary取消／suppression終端、F11 stepとprime black frameの描画抑止も
+共有境界の回帰に含める。passive Aとactive Bでmode／集合が異なる場合は、Aのimmutable
+実行可能集合に基づくlabelを確認する。製品起動を伴わないheadless renderer回帰で補い、
+App全体のsnapshotへ置き換えない。実数・結果は[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)に記録する。
 
 音響調整のタスクバー表示 (§1.378) は既存の`preferences_effetune_input_limit_dark` /
 `preferences_effetune_auto_open_light`と、追加した320px幅の`preferences_effetune_taskbar_narrow_dark`で確認する。

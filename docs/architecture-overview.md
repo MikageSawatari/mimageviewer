@@ -163,6 +163,50 @@ volatileを反映する。非resident ownerも対象とし、同keyの未確定d
 
 ---
 
+### 閲覧中のページ一覧 (§1.340、2026-10-27 独立レビューP2追補・指定自動検証済み)
+
+`PageOverviewState::Closed | Open(PageOverviewSession)` は `ViewerContextBundle` が所有し、
+mount / deposit で状態と incarnation を移譲する。独立 fork は Closed で開始し、
+items／読み順の置換と terminal teardown は当該 owner の一覧を閉じる。
+`PreparedPageIdentityIndex` が既存一覧の準備境界で実ページの identity／表示名を持つ
+immutable metadata を作り、`ViewerNavigationCaches` が現在の実ページ列との projection を共有する。
+通常 fullscreen、メイン内閲覧、F12連動窓、独立窓は同じ描画・入力・ページ着地の境界を使う。
+passive は `StillImage | PageOverview` の投影を持ち、全実ページ metadata の Arc と
+可視近傍の bounded texture だけを保持する。全ページ画像の生成や別の navigation owner は作らない。
+新規入場とSelectは既存`page_overview_available()`にまとめた
+`fs_navigation_sequence_blocks_new_target()`／`page_turn_barrier_active()`を共用する。
+animationのON／OFFに依存せず、受理済み移動が未提示の間は入場を拒否する。
+受理済み移動と既存continuationの完了を維持し、利用者が完了後に
+O／HUD／ring／padをもう一度操作する。全入口は`open_page_overview_for_viewer`→`open_page_overview`へ
+通し、保留・replay・新しい取消ownerを追加しない。2026-10-27の新coordinator手順2
+（同期完了なし→入場拒否）を独立レビューP2-1で通常の表示待ちにも拡張し、旧選択肢2の即退役は不採用。
+新しいpredicate・pending・replay・取消は作らない。既存前面操作のキー優先順と、共通入場受理時の
+chrome終了はP2-2で揃える。`dismiss_fs_transient_menu_state()`はApp boolのspread／fit／panoramaと
+overflowを終了し、通常closeと受理入場が共用する。次キー／HUDのoverflow-only終了は
+`dismiss_fs_overflow_panel()`で維持する。egui Popupは所有viewportの`Memory::end_pass`で自然に退役し、
+明示的な全viewport closeを足さない。physical streamとinfo lock、拒否入場のchromeを保持する。
+front captureは`fs_front_menu_presented`とoverflow rectに限り、通常adjustment／metadata／infoは含めない。
+tag pickerとoverlay編集の既存入場拒否、TextEdit／IMEのkeyboard ownerは維持し、durable panelや
+hover tooltipの寿命を一括resetで置き換えない。
+追補後の指定自動検証は同§25.7で成功。新差分の独立再レビューはcoordinatorへ引き継ぐ。
+
+PDF／EPUBの要求・昇格も、master取込み後に§1.377の既存 `PdfRenderEpochOwner`／ticket、
+`promote_viewer_pdf_keys`／`PdfVisiblePromotionState` へ接続済み。別の要求ownerは作らない。
+接続・最終修正の独立レビューはACCEPT。full 1回で見つかった環境／fixture／回帰を補完済みで、実機受入は未完了。
+これは2026-10-12〜13の検証履歴。§25.6の指定自動検証は統合commit `1c134703b`までの履歴で、
+独立レビューP2追補後の成功証拠とはしない。
+独立レビュー・full-lib・build-dev・実機確認はcoordinatorへ引き継ぐ。
+2026-10-27のmaster統合では構成採用後の可視実items順とhiddenを反映し、
+白紙補助annotationは`None`のまま未接続とする。
+Selectは既存のstamp／binding／items・projection revision／incarnation／stable identity／active資格を
+すべて照合した時点で受理し、Closed→既存landing一回へ進む。即時・Checking後許可・後着拒否・
+同期拒否は通常navigation ownerへ任せ、一覧の再open／待機／追加pending／受付証明は作らない。
+LatestSeekは既存seek／jumpと同じく新curl対象外。選択先flatの実表示受理後のD3先読みも
+既存`prefetch_next_final_unit`資格を使い、一覧専用policyを設けない。
+masterのphysical placementは既存client-size変換とUI scale正規化を使い、front pointerは
+CentralPanelで一度captureしてprimary終端／一覧／通常canvasが同frameの値を共有する。
+[R5・統合契約と今回の記録§25](detached-book-page-overview-plan.md#25-2026-10-27-master統合記録)。
+
 ### 音声サムネイル (§1.347、2026-10-08)
 
 `audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は統合版 v70（§1.345 v68＋master v67）、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
@@ -414,6 +458,8 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `ui_pinned_search.rs` / `app/pinned_search.rs` | 4種類の常設検索入力の幅・純粋描画と、既存検索への単一transaction・Esc router。結果/worker ownerは追加しない |
 | `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う。終了・トレイ退避の共通保存境界では有効 draft を Settings へ確定するが worker は開始せず、トレイ復帰時だけ遅延した副作用を1回適用する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |
+| `page_overview.rs` / `ui_page_overview.rs` | viewer所有のClosed／Open、実ページprojection、stamp、cursor／仮想行／RTLの純粋モデルと共通描画。描画はstamped commandを返し、I/Oやページ移動を実行しない |
+| `app/page_overview.rs` / `app/detached_page_overview.rs` / `ui_fullscreen/page_overview.rs` | 一覧の適格性、root／detached入力所有、passive投影、bounded前面需要、既存LatestSeek着地を接続する。入力stampと実際のactive ownerを別々に検証する |
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
 | `source_coverage.rs` | §1.165 B1 の素材の収録範囲。`SourceCoverage::{FullSource, Known(EditPreviewGeometry), Unknown}` が通常素材・生成由来が既知の編集 preview・旧行を区別する。正規座標の元寸法、切り出し前 raster 寸法、実整数 pixel bounds を別に持ち、現在 crop と独立した UV を供給する。Unknown の代役可否は共通 typed policy 一か所で解決する |

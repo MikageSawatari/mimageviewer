@@ -2682,6 +2682,14 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
 
 fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, RingActionId)> {
     let mut out = Vec::new();
+    if action == KeyAction::FsPageOverviewToggle {
+        push_ring_binding_if_available(
+            &mut out,
+            RingShortcutContext::ImageFullscreen,
+            RingActionId::ImagePageOverview,
+        );
+        return out;
+    }
     if let Some(slot) = action.favorite_slot_number()
         && let Some(ring_action) = RingActionId::favorite_slot_action(slot)
     {
@@ -3614,12 +3622,13 @@ fn command_editor_source_chord_section(
     });
 }
 
-fn key_assignment_context_filters() -> [Option<KeyContext>; 8] {
+fn key_assignment_context_filters() -> [Option<KeyContext>; 9] {
     [
         None,
         Some(KeyContext::Global),
         Some(KeyContext::Grid),
         Some(KeyContext::FsCommon),
+        Some(KeyContext::FsPageOverview),
         Some(KeyContext::Rating),
         Some(KeyContext::FsImage),
         Some(KeyContext::FsVideo),
@@ -12276,6 +12285,13 @@ mod tests {
 
     #[test]
     fn settings_dialog_key_actions_map_to_grid_ring_actions() {
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::FsPageOverviewToggle),
+            vec![(
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ImagePageOverview
+            )]
+        );
         assert_eq!(
             ring_bindings_for_key_action(KeyAction::GridOrganizeFiles),
             vec![(RingShortcutContext::Grid, RingActionId::GridOrganizeFiles)]

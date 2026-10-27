@@ -1532,6 +1532,8 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
     page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    page_overview: crate::page_overview::PageOverviewState,
+    page_overview_incarnation: u64,
     projection_recipe: super::book_materialization::ProjectionRecipe,
     current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
     current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
@@ -2354,6 +2356,16 @@ impl ContextAsyncOwner {
 
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
+    /// Passive surfaces share the immutable projection and never create an overview owner.
+    pub(in crate::app) fn page_overview_view(
+        self,
+    ) -> Option<crate::page_overview::PageOverviewView> {
+        let state = match self.source {
+            ContextRefSource::Mounted(app) => &app.page_overview,
+            ContextRefSource::AtRest(bundle) => &bundle.page_overview,
+        };
+        state.session().map(|session| session.view().clone())
+    }
     pub(in crate::app) fn mounted(app: &'a App) -> Self {
         Self {
             source: ContextRefSource::Mounted(app),
@@ -2674,6 +2686,7 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        self.page_overview.close();
         if let Some(pending) = self.external_rescan_pending.take() {
             pending.cancel_and_retire();
         }
@@ -2755,6 +2768,7 @@ const _: () = {
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.page_overview.close();
             self.requested.clear();
             crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
             self.raw_thumb_develop
@@ -2809,6 +2823,8 @@ impl ViewerContextBundle {
             stack_selection_target: None,
             items: Vec::new(),
             page_identity_index: Default::default(),
+            page_overview: crate::page_overview::PageOverviewState::Closed,
+            page_overview_incarnation: 0,
             projection_recipe: Default::default(),
             current_book_bookmarks: Vec::new(),
             current_book_bookmarks_key: None,
@@ -3140,6 +3156,9 @@ impl App {
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
+        if self.page_overview.session().is_some() {
+            self.withdraw_foreground_thumbnail_requests();
+        }
         self.fs_nav_dropped_block_signature = None;
         self.fs_nav_dropped_block_count = 0;
         self.continuous_page_transitions.clear();
@@ -3237,6 +3256,8 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            page_overview,
+            page_overview_incarnation,
             projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
@@ -3559,6 +3580,8 @@ impl App {
         swap_field!(stack_selection_target);
         swap_field!(items);
         swap_field!(page_identity_index);
+        swap_field!(page_overview);
+        swap_field!(page_overview_incarnation);
         swap_field!(projection_recipe);
         swap_field!(current_book_bookmarks);
         swap_field!(current_book_bookmarks_key);
@@ -3911,6 +3934,7 @@ impl App {
         // Forking changes the exact viewer owner even when the new payload retains the same
         // fullscreen index. Never carry a physical right-button sequence across that boundary.
         self.fs_secondary_press.cancel();
+        self.close_page_overview();
         macro_rules! duplicate_for_parked {
             ($($field:ident),+ $(,)?) => {
                 $(*$field = self.$field.clone();)+
@@ -3949,6 +3973,8 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            page_overview,
+            page_overview_incarnation,
             projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
@@ -4221,6 +4247,9 @@ impl App {
         // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
         // A fork copies the requirement values, never the mutable worker projection.
         // Otherwise the new overlay (or its generation invalidation) cancels main's work.
+        // A new identity never inherits the source viewer's overview incarnation/session.
+        *page_overview = self.page_overview.fork_closed();
+        *page_overview_incarnation = 0;
         *still_seek_thumbnail_pages_shared = Arc::new(std::sync::RwLock::new(
             self.still_seek_thumbnail_pages.clone(),
         ));
@@ -5885,7 +5914,7 @@ impl App {
         );
         let snapshot = DetachedImageWindowSnapshot {
             id: window_id,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
             title: format!("paused-{window_id}"),
             location_display: format!("paused-{window_id}"),
             image_dims: None,
@@ -6284,6 +6313,44 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn overview_bundle_fixture(serial: u64) -> ViewerContextBundle {
+        use crate::page_overview::{PageOverviewProjection, PageOverviewStamp, PageOverviewState};
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image("book/page.jpg".into())];
+        bundle.items_generation = 7;
+        bundle.page_identity_index = Arc::new(
+            super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &bundle.items,
+                None,
+                Default::default(),
+            ),
+        );
+        let projection = Arc::new(
+            PageOverviewProjection::new(
+                Arc::clone(bundle.page_identity_index.overview_metadata()),
+                Arc::new(vec![0]),
+            )
+            .unwrap(),
+        );
+        bundle.page_overview_incarnation = 19;
+        bundle.page_overview = PageOverviewState::open(
+            projection,
+            PageOverviewStamp {
+                context_serial: serial,
+                items_generation: 7,
+                reader_order_revision: 8,
+                incarnation: 19,
+            },
+            0,
+            5,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            Default::default(),
+        )
+        .unwrap();
+        bundle
+    }
+
+    #[cfg(windows)]
     fn pdf_promotion_for_test(
         ticket: &crate::pdf_loader::PdfRenderEpochTicket,
         retry_needed: bool,
@@ -6315,6 +6382,51 @@ mod tests {
             &std::collections::HashSet::from(["same.pdf:p:0@256".to_owned()])
         );
         assert_eq!(*retry_needed, expected_retry);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overview_bundle_empty_fork_generation_and_retire_keep_sibling_owner() {
+        let empty = ViewerContextBundle::empty();
+        assert!(empty.page_overview.session().is_none());
+        assert_eq!(empty.page_overview_incarnation, 0);
+        let mut owner = overview_bundle_fixture(1);
+        let sibling = overview_bundle_fixture(2);
+        let sibling_projection =
+            Arc::clone(&sibling.page_overview.session().unwrap().view().projection);
+        let sibling_token = Arc::clone(&sibling.cancel_token);
+        assert!(owner.page_overview.fork_closed().session().is_none());
+        owner.set_items_generation(7);
+        assert!(
+            owner.page_overview.session().is_some(),
+            "same owner/generation retains the session"
+        );
+        owner.set_items_generation(8);
+        assert!(owner.page_overview.session().is_none());
+        assert_eq!(
+            owner.page_overview_incarnation, 19,
+            "reopen cannot reuse an incarnation"
+        );
+        let mut retiring = overview_bundle_fixture(3);
+        retiring.cancel_all_context_work();
+        assert!(retiring.page_overview.session().is_none());
+        drop(owner);
+        drop(retiring);
+        assert!(!sibling_token.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(
+            &sibling_projection,
+            &sibling.page_overview.session().unwrap().view().projection
+        ));
+        assert_eq!(
+            sibling
+                .page_overview
+                .session()
+                .unwrap()
+                .view()
+                .stamp
+                .context_serial,
+            2
+        );
     }
 
     #[cfg(windows)]
@@ -6353,6 +6465,60 @@ mod tests {
         assert!(!main.is_stale());
         drop(app);
         assert!(main.is_stale());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overview_bundle_registry_deposit_withdraw_preserves_same_session() {
+        // No App/DB fixture or I/O worker is needed: exercise the production table's
+        // actual ownership slots with the production payload, not a cloned session.
+        let mut table = ContextTable::<Box<ViewerContextBundle>>::new();
+        let owner = table.main();
+        let projection = overview_bundle_fixture(owner.serial());
+        let stamp = projection.page_overview.session().unwrap().view().stamp;
+        let metadata = Arc::clone(projection.page_identity_index.overview_metadata());
+        let (reserved, operations) = table.plan_begin_build();
+        assert_eq!(
+            operations,
+            vec![
+                TableOp::ReplaceProjectionWithFreshEmpty,
+                TableOp::DepositInto(owner)
+            ]
+        );
+        table.deposit(owner, Box::new(projection));
+        table.finish_begin_build();
+        let retained = table.at_rest(owner).unwrap();
+        assert_eq!(
+            retained.page_overview.session().unwrap().view().stamp,
+            stamp
+        );
+        assert_eq!(retained.page_overview_incarnation, 19);
+        assert!(Arc::ptr_eq(
+            retained.page_identity_index.overview_metadata(),
+            &metadata
+        ));
+        let operations = table.plan_abort_build();
+        assert_eq!(
+            operations,
+            vec![
+                TableOp::ReplaceProjectionWithFreshEmpty,
+                TableOp::DepositInto(reserved),
+                TableOp::WithdrawFrom(owner),
+                TableOp::RestoreProjectionAndDropDisplacedEmpty,
+                TableOp::WithdrawFrom(reserved),
+                TableOp::DropTransientAsRetired(reserved),
+            ]
+        );
+        table.deposit(reserved, Box::new(ViewerContextBundle::empty()));
+        let restored = table.withdraw(owner);
+        drop(table.withdraw(reserved));
+        table.finish_abort_build();
+        assert_eq!(table.mounted_id(), Some(owner));
+        assert_eq!(
+            restored.page_overview.session().unwrap().view().stamp,
+            stamp
+        );
+        assert!(!restored.cancel_token.load(Ordering::Relaxed));
     }
 
     #[cfg(windows)]

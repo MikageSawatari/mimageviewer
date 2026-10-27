@@ -1990,6 +1990,9 @@ impl App {
     }
 
     pub(crate) fn accumulate_staged_smart_fullscreen_ctrl_step(&mut self, forward: bool) -> bool {
+        if !self.staged_smart_fullscreen_ctrl_step_available() {
+            return false;
+        }
         let mode = self
             .smart_folder_transition
             .as_ref()
@@ -2012,6 +2015,14 @@ impl App {
             return false;
         };
         self.accumulate_staged_smart_folder_dfs_step(forward, &mode)
+    }
+
+    pub(crate) fn staged_smart_fullscreen_ctrl_step_available(&self) -> bool {
+        self.smart_folder_transition.as_ref().is_some_and(|transition| {
+            self.main_list_navigation_is_current(&transition.navigation)
+                && matches!(&transition.intent, SmartTransitionIntent::FolderNav(nav)
+                    if matches!(&nav.mode, super::FolderNavMode::SmartFolder { fullscreen: true, .. }))
+        })
     }
 
     pub(crate) fn retire_staged_smart_fullscreen_nav_for_close(&mut self) {

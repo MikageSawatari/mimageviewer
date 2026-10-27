@@ -27,6 +27,8 @@ mod front_popup_input_tests;
 mod native_focus_tests;
 #[cfg(test)]
 mod overflow_input_tests;
+#[cfg(test)]
+mod overview_page_turn_tests;
 mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
@@ -109,6 +111,11 @@ use crate::settings::{
     SlideshowEndAction, SpreadMode,
 };
 use crate::ui_helpers::{HoverTipExt, open_external_player};
+
+mod page_overview;
+mod viewer_chrome;
+#[cfg(test)]
+pub(crate) use viewer_chrome::assert_prepared_viewer_frame_idx;
 
 const FULLSCREEN_SECONDARY_PRESS_MOVE_THRESHOLD_PX: f32 =
     crate::ring_shortcut::MOUSE_FLICK_MOVE_THRESHOLD_PX;
@@ -1057,7 +1064,7 @@ impl FsPageTurnDecisionPerfRecorder {
 }
 
 #[derive(Debug, Default)]
-struct FsNavigationPerfRecorder {
+pub(crate) struct FsNavigationPerfRecorder {
     close: std::time::Duration,
     ctrl_sibling_mouse: std::time::Duration,
     page: std::time::Duration,
@@ -18453,6 +18460,28 @@ struct FsFrameState {
     pdf_content_type: Option<PdfPageContentType>,
 }
 
+impl FsFrameState {
+    /// The existing viewport builder needs a still surface, not an image pipeline result.
+    /// Overview content comes from its metadata projection; never fabricate a backdrop texture.
+    fn overview_shell() -> Self {
+        Self {
+            is_video: false,
+            original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        }
+    }
+}
+
 /// Per-frame page-turn choices. Paint selection owns full-resolution work admission: a target
 /// painted from its materialized source must be allowed to produce and consume the work that can
 /// retire its navigation sequence, while a ready pass-through rendition keeps that work deferred.
@@ -19331,7 +19360,7 @@ pub(crate) struct FsSeekInfo {
 impl FsSeekInfo {
     /// The page track/thumbnail content is available only for an all-image navigation list.
     /// Geometry and painting must use this same decision, including on the first frame.
-    fn has_page_strip_content(&self) -> bool {
+    pub(crate) fn has_page_strip_content(&self) -> bool {
         self.media_count == self.image_indices.len() && !self.image_indices.is_empty()
     }
 }
@@ -19346,6 +19375,13 @@ pub(crate) struct ViewerNavigationCaches {
     source: Option<(u64, ReadingFlow)>,
     nav_indices: Option<Arc<Vec<usize>>>,
     still_image_indices: Option<Arc<Vec<usize>>>,
+    overview_projection: Option<(
+        Arc<crate::page_overview::PageOverviewMetadata>,
+        Result<
+            Arc<crate::page_overview::PageOverviewProjection>,
+            crate::page_overview::PageOverviewProjectionError,
+        >,
+    )>,
     fs_seek_info: Option<(usize, FsSeekInfo)>,
     /// Exact `items` classification memo for the current source generation.
     ///
@@ -19359,6 +19395,7 @@ impl ViewerNavigationCaches {
         self.source = None;
         self.nav_indices = None;
         self.still_image_indices = None;
+        self.overview_projection = None;
         self.fs_seek_info = None;
         self.all_items_are_images = None;
     }
@@ -22813,6 +22850,9 @@ impl App {
         image_rect: egui::Rect,
         window: &crate::app::DeferredDetachedImageWindowView,
     ) {
+        let Some(texture) = window.display.still() else {
+            return;
+        };
         let painter = ui.painter().with_clip_rect(full_rect);
         let bg_style = Self::detached_image_underlay_style(&window.image_underlay);
         let (paint_rect, uv_rect) = fs_image_paint_rect_and_uv(
@@ -22827,11 +22867,8 @@ impl App {
             &bg_style,
         );
         #[cfg(test)]
-        crate::app::paint_record_test_support::record_selected_paint_resource(
-            &painter,
-            &window.texture,
-        );
-        window.texture.paint_source_region(
+        crate::app::paint_record_test_support::record_selected_paint_resource(&painter, texture);
+        texture.paint_source_region(
             &painter,
             image_rect,
             window.rotation,
@@ -22840,8 +22877,8 @@ impl App {
             egui::Color32::WHITE,
         );
         #[cfg(all(windows, feature = "test-script"))]
-        crate::test_script::record_drawn_paint(&painter, &window.texture, "snapshot_direct".into());
-        window.texture.retain_native_output_for_paint(&painter);
+        crate::test_script::record_drawn_paint(&painter, texture, "snapshot_direct".into());
+        texture.retain_native_output_for_paint(&painter);
     }
 
     #[cfg(all(test, windows))]
@@ -22855,6 +22892,22 @@ impl App {
 
     #[cfg(windows)]
     fn draw_detached_image_window_snapshot(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        window: &crate::app::DeferredDetachedImageWindowView,
+    ) -> Vec<(
+        crate::app::page_overview::PageOverviewCommand,
+        crate::app::DetachedPageOverviewInputProvenance,
+    )> {
+        if let Some(overview) = window.display.overview() {
+            return Self::draw_passive_page_overview(ui, full_rect, window, overview);
+        }
+        Self::draw_detached_still_image_snapshot(ui, full_rect, window);
+        Vec::new()
+    }
+
+    #[cfg(windows)]
+    fn draw_detached_still_image_snapshot(
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
         window: &crate::app::DeferredDetachedImageWindowView,
@@ -23346,6 +23399,13 @@ impl App {
         batch: &mut DetachedImageWindowEventBatch,
     ) {
         match event {
+            crate::app::DeferredDetachedImageWindowEvent::PageOverview {
+                id,
+                command,
+                provenance,
+            } => {
+                self.queue_detached_page_overview_command(id, command, provenance);
+            }
             crate::app::DeferredDetachedImageWindowEvent::FirstCallback { id } => {
                 if self
                     .detached_image_windows
@@ -23872,8 +23932,14 @@ impl App {
                     self.detached_window_context_is_at_rest(window.id),
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some(),
-                    window.texture.size_vec2().x,
-                    window.texture.size_vec2().y,
+                    window
+                        .display
+                        .still()
+                        .map_or(0.0, |texture| texture.size_vec2().x),
+                    window
+                        .display
+                        .still()
+                        .map_or(0.0, |texture| texture.size_vec2().y),
                     window.frozen_continuous_pages.len(),
                     window.activation_armed,
                     window.focused_last_frame,
@@ -24023,16 +24089,32 @@ impl App {
                                 "deferred_first_draw",
                             );
                         }
-                        Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
+                        for (command, provenance) in
+                            Self::draw_detached_image_window_snapshot(ui, full_rect, &view)
+                        {
+                            shared.push_event(
+                                crate::app::DeferredDetachedImageWindowEvent::PageOverview {
+                                    id: view.id,
+                                    command,
+                                    provenance,
+                                },
+                            );
+                        }
                         #[cfg(feature = "test-script")]
                         if let Some(owner) = view.test_script_window_identity.clone() {
                             let content = view
                                 .frozen_continuous_pages
                                 .is_empty()
-                                .then(|| view.texture.test_script_content_proof())
+                                .then(|| {
+                                    view.display
+                                        .still()
+                                        .and_then(|texture| texture.test_script_content_proof())
+                                })
                                 .flatten()
                                 .filter(|proof| {
-                                    proof.source_texture_id == view.texture.source_texture_id()
+                                    view.display.still().is_some_and(|texture| {
+                                        proof.source_texture_id == texture.source_texture_id()
+                                    })
                                 })
                                 .cloned();
                             if eframe::miv_test_script_window_witness::active()
@@ -24045,13 +24127,18 @@ impl App {
                         } else {
                             crate::test_script::discard_drawn_paint(vp_ctx.viewport_id());
                         }
-                        Self::draw_detached_image_window_bar(
-                            ui,
-                            vp_ctx,
-                            full_rect,
-                            &view,
-                            &mut bar_close_requested,
-                        );
+                        if view.display.overview().is_some() {
+                            bar_close_requested |=
+                                Self::draw_page_overview_window_close(ui, full_rect);
+                        } else {
+                            Self::draw_detached_image_window_bar(
+                                ui,
+                                vp_ctx,
+                                full_rect,
+                                &view,
+                                &mut bar_close_requested,
+                            );
+                        }
                         if let Some(guide) = view.right_drag_guide.as_ref() {
                             crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
                         }
@@ -24264,10 +24351,16 @@ impl App {
                                 let content = view
                                     .frozen_continuous_pages
                                     .is_empty()
-                                    .then(|| view.texture.test_script_content_proof())
+                                    .then(|| {
+                                        view.display
+                                            .still()
+                                            .and_then(|texture| texture.test_script_content_proof())
+                                    })
                                     .flatten()
                                     .filter(|proof| {
-                                        proof.source_texture_id == view.texture.source_texture_id()
+                                        view.display.still().is_some_and(|texture| {
+                                            proof.source_texture_id == texture.source_texture_id()
+                                        })
                                     })
                                     .cloned();
                                 test_script_passive_frame =
@@ -24489,7 +24582,7 @@ impl App {
         }
     }
 
-    fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
+    pub(crate) fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
         !is_video
             && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
             && !self.any_dialog_open()
@@ -24891,7 +24984,7 @@ impl App {
     /// 描画されるが、中身は全 items の filter+collect ×2。10k ページ級のアーカイブで
     /// フレームごとに作り直すのは純粋な無駄なので、一覧キャッシュと同じ owner に
     /// 乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
-    fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
+    pub(crate) fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
         self.viewer_navigation_caches
             .ensure_source(self.items_generation, self.reading_flow);
         if let Some(info) = self.viewer_navigation_caches.fs_seek_info(fs_idx) {
@@ -25132,7 +25225,7 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn land_still_page_navigation_target(
+    pub(crate) fn land_still_page_navigation_target(
         &mut self,
         ctx: &egui::Context,
         current_idx: usize,
@@ -26527,14 +26620,18 @@ impl App {
         // holdover へ縮退させず、通常レンダラと同じ visible-pages 経路で描く。
         let holdover = self.fs_nav_holdover_for_draw();
         let navigation_chrome = self.fs_navigation_chrome_for_draw();
-        let current_still = self.fullscreen_idx.and_then(|idx| {
-            detached_backstop_current_kind(
-                self.items.get(idx),
-                self.fs_music_view_active(idx),
-                self.continuous_reading_active_for_idx(idx),
-            )
-            .map(|kind| (idx, kind))
-        });
+        let overview_view = self.page_overview_view();
+        let current_still = self
+            .fullscreen_idx
+            .filter(|_| overview_view.is_none())
+            .and_then(|idx| {
+                detached_backstop_current_kind(
+                    self.items.get(idx),
+                    self.fs_music_view_active(idx),
+                    self.continuous_reading_active_for_idx(idx),
+                )
+                .map(|kind| (idx, kind))
+            });
         let backstop_draw = if let Some((idx, kind)) = current_still {
             if kind == DetachedBackstopCurrentKind::Continuous {
                 DetachedBackstopStillDraw::CurrentContinuous { idx }
@@ -26626,6 +26723,10 @@ impl App {
                 .show(vp_ctx_ui, |ui| {
                     let full_rect = ui.max_rect();
                     let layout = self.fs_navigation_gap_layout(full_rect, navigation_chrome);
+                    if let Some(view) = overview_view.as_ref() {
+                        self.draw_page_overview_readonly(ui, view);
+                        return;
+                    }
                     match &backstop_draw {
                         DetachedBackstopStillDraw::CurrentContinuous { idx } => {
                             self.draw_fs_continuous_reading(
@@ -26971,6 +27072,7 @@ impl App {
             && !self.fs_music_view_active(fs_idx);
 
         let mut close_fs = false;
+        let mut presentation_close_requested = false;
         let mut close_to_page_list = false;
         let mut page_nav = FsPageNav::None;
         let mut ctrl_nav: Option<i32> = None;
@@ -27089,11 +27191,12 @@ impl App {
             detached_open_pending,
             detached_open_holdover_ready,
         ) = if detached && !embedded {
-            // Visibility/readiness probe only: this &self lookup neither captures
-            // a paint source nor accepts an offer/receipt. Actual viewport selection
-            // passes begin_page_turn_viewer_frame's service prefix. Existing close
-            // ordering is retained separately for barrier/no-barrier paths.
-            let display_ready = self.resolve_fs_display_tex(fs_idx, true).is_some();
+            let display_ready = match &self.page_overview {
+                crate::page_overview::PageOverviewState::Open(_) => true,
+                crate::page_overview::PageOverviewState::Closed => {
+                    self.resolve_fs_display_tex(fs_idx, true).is_some()
+                }
+            };
             let cache_state = match self.fs_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Static { .. }) => "static",
                 Some(FsCacheEntry::Animated { .. }) => "animated",
@@ -27562,6 +27665,8 @@ impl App {
                     close_fs = true;
                 }
                 fs_setup_ms = setup_t0.elapsed().as_secs_f64() * 1000.0;
+                // Preserve viewport/system close when a later input action replaces the canvas.
+                presentation_close_requested = close_fs;
 
                 let central_t0 = std::time::Instant::now();
                 let mut music_view_frame_ui = MusicViewFrameUiState::default();
@@ -27578,9 +27683,46 @@ impl App {
                     .show(root_ui, |ui| {
                         if self.viewer_mutation_modal_active() { ui.disable(); }
                         let full_rect = ui.max_rect();
+                        // Physical stream lifetime belongs to this viewer pass, before keys
+                        // can replace its surface. Keep the terminal frame's suppression
+                        // decision even after the persistent owner has returned to Idle.
+                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_front_pointer_input(ctx, full_rect);
+                        let primary_suppression = self.advance_viewer_primary_pointer_frame(ctx, overflow_pointer_input.primary_owned);
+                        if self.page_overview.session().is_some() {
+                            let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+                            let mut key_page_transition = key_action.page_transition;
+                            if key_page_transition != FsKeyPageTransition::Closed {
+                                close_fs |= self.render_page_overview_surface_with_primary_frame(
+                                    ui, full_rect, primary_suppression, overflow_pointer_input.clone(),
+                                );
+                                // Pointer selection can also land after the key handler returned.
+                                key_page_transition = self.fs_page_transition_after_overview_input(fs_idx);
+                            }
+                            match key_page_transition {
+                                FsKeyPageTransition::Unchanged => {}
+                                FsKeyPageTransition::Closed => { frame_exited = true; return; },
+                                FsKeyPageTransition::Rebased { idx } => {
+                                    fs_idx = idx;
+                                    if self.paged_viewer_drawing_path_changed(embedded) {
+                                        frame_path_changed = true;
+                                        return;
+                                    }
+                                    let presentation;
+                                    (state, _, presentation, spread_pair, is_spread_double) =
+                                        self.prepare_paged_viewer_frame(ctx, idx, embedded, &mut fs_render_perf);
+                                    display_composition = presentation.composition;
+                                    continuous = presentation.continuous;
+                                    checking_mode_surface = presentation.checking_mode_surface;
+                                    display_permission_allowed = presentation.allowed;
+                                    paint_idx = presentation.paint_idx;
+                                    presentation_trace_allowed = display_permission_allowed && !continuous;
+                                    frame_snapshot = Some((idx, state.is_video));
+                                }
+                            }
+                            return;
+                        }
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
-                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_front_pointer_input(ctx, full_rect);
                         let music_overflow_input = self.begin_music_overflow_frame_input(ctx, full_rect, fs_idx);
                         let mut hud_popup_wheel = self
                             .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx, music_overflow_input)
@@ -27792,11 +27934,16 @@ impl App {
                         } else {
                             self.handle_fs_key_input_with_operation(ctx, fs_idx, is_spread_double, &mut navigation_operation)
                         };
-                        #[cfg(all(windows, feature = "test-script"))]
-                        if !embedded {
-                            crate::test_script::finish_action_pass(ctx);
-                        }
-                        match key_action.page_transition {
+                        let overview_rendered = self.page_overview.session().is_some();
+                        let key_page_transition = if overview_rendered {
+                            close_fs |= self.render_page_overview_surface_with_primary_frame(
+                                ui, full_rect, primary_suppression, overflow_pointer_input.clone(),
+                            );
+                            self.fs_page_transition_after_overview_input(fs_idx)
+                        } else {
+                            key_action.page_transition
+                        };
+                        match key_page_transition {
                             FsKeyPageTransition::Unchanged => {}
                             FsKeyPageTransition::Closed => {
                                 frame_exited = true;
@@ -27820,6 +27967,7 @@ impl App {
                                 frame_snapshot = Some((idx, state.is_video));
                             }
                         }
+                        if overview_rendered { return; }
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
@@ -27867,6 +28015,7 @@ impl App {
                             prev_foreground_hwnd,
                             &mut similar_preview_navigator_input,
                             hud_popup_wheel.as_ref(),
+                            primary_suppression,
                             music_overflow_input.owns_pointer,
                             &mut navigation_operation,
                             continuation_committed || close_fs || close_to_page_list
@@ -27899,14 +28048,54 @@ impl App {
                         } else if click_close {
                             self.bump_input_seq("fs_close_click", None);
                         }
+                        // Saved pointer actions can enter overview. Finish the current input
+                        // phase, then paint the new surface without reusing its physical edges.
+                        if self.page_overview.session().is_some() {
+                            // Navigation candidates belong to the replaced ordinary input phase.
+                            // Keep no old key/wheel/click result alive across the surface change.
+                            wheel_frame_proposal = None;
+                            navigation_operation = None;
+                            page_nav = FsPageNav::None;
+                            ctrl_nav = None;
+                            list_order_nav = None;
+                            sibling_nav = None;
+                            mouse_nav = None;
+                            jump_to = None;
+                            close_fs = presentation_close_requested;
+                            close_to_page_list = false;
+                            close_fs |= self.render_page_overview_after_pointer_dispatch(ui, full_rect);
+                            let key_page_transition = self.fs_page_transition_after_overview_input(fs_idx);
+                            match key_page_transition {
+                                FsKeyPageTransition::Unchanged => {}
+                                FsKeyPageTransition::Closed => { frame_exited = true; return; },
+                                FsKeyPageTransition::Rebased { idx } => {
+                                    fs_idx = idx;
+                                    if self.paged_viewer_drawing_path_changed(embedded) {
+                                        frame_path_changed = true;
+                                        return;
+                                    }
+                                    let presentation;
+                                    (state, _, presentation, spread_pair, is_spread_double) =
+                                        self.prepare_paged_viewer_frame(ctx, idx, embedded, &mut fs_render_perf);
+                                    display_composition = presentation.composition;
+                                    continuous = presentation.continuous;
+                                    checking_mode_surface = presentation.checking_mode_surface;
+                                    display_permission_allowed = presentation.allowed;
+                                    paint_idx = presentation.paint_idx;
+                                    presentation_trace_allowed = display_permission_allowed && !continuous;
+                                    frame_snapshot = Some((idx, state.is_video));
+                                }
+                            }
+                            fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
+                            return;
+                        }
                         // ホイール/キーでページ移動が確定済みなら、
                         // ホバーバーのボタンホバーで上書きされないよう保護
                         let nav_locked = wheel_result.wheel_navigation_produced || !page_nav.is_none();
 
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
-                        #[cfg(windows)]
-                        if detached && self.step_detached_viewer_borderless_transition(ctx) {
+                        if self.paint_viewer_presentation_interlude(ui, full_rect, ctx, detached, canvas_color) {
                             return;
                         }
 
@@ -29235,75 +29424,13 @@ impl App {
                             self.draw_fs_ai_status(ui, fs_idx);
                         }
 
-                        // ── 右上フィードバックトースト ──
-                        let ring_surface_context = self
-                            .ring_shortcut_context_for_surface(crate::app::ActionSurface::Viewer);
-                        if self.mouse_ring_flick.is_some()
-                            && ring_surface_context
-                                == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
-                        {
-                            self.sync_native_video_ring_guide_overlay_for_context(
-                                ctx,
-                                ring_surface_context,
-                            );
-                        }
-                        self.draw_mouse_ring_flick_overlay(ui, full_rect, ring_surface_context);
-                        self.draw_mouse_gesture_overlay(
-                            ui,
-                            full_rect,
-                            self.current_right_drag_context(),
-                        );
-                        self.draw_gamepad_ring_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_gamepad_picker_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_gamepad_favorite_picker_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_gamepad_video_marker_picker_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_feedback_toast(
-                            ui,
-                            full_rect,
-                            ctx,
-                            crate::app::ActionSurface::Viewer,
-                        );
-
-                        self.draw_colorize_wait_overlay(ui, full_rect, ctx);
-
-                        // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
-                        self.draw_stamp_embed_overlay(ui, full_rect, ctx);
-
-                        // ── 注釈ベイク worker の進行表示 (中央「テキスト処理中…」) ──
-                        self.draw_comic_bake_overlay(ui, full_rect, ctx);
-
-                        // 動画ブックマーク名編集ダイアログは native presenter overlay の
-                        // 中で描画される (= `native_presenter/overlay_draw.rs::draw_native_*`)。
-                        // eframe ビューポートからは描画しない。
-
-                        // ── 中央の先頭 / 末尾ヒント ──
-                        self.draw_boundary_hint(ui, full_rect, ctx);
+                        self.draw_viewer_shared_overlays(ui, full_rect, ctx);
 
                         // The touch help is the final canvas overlay: once it is visible,
                         // no panel, page, or gesture target should appear above its guide.
                         self.draw_still_touch_first_run_help_overlay(ui, ctx, full_rect, fs_idx);
 
-                        // ── スロット保存ダイアログ ──
-                        self.draw_slot_save_dialog(ctx);
-                        self.draw_favorite_default_clear_confirm_dialog(ctx);
-                        self.draw_export_dialog(ctx);
-                        self.draw_export_progress_dialog(ctx);
+                        self.draw_viewer_shared_dialogs(ctx);
 
                         // The popup edits temporary fields during drawing. Restore the
                         // previous state and persist the complete proposed presentation
@@ -29421,6 +29548,12 @@ impl App {
                         fs_tail_ms = tail_t0.elapsed().as_secs_f64() * 1000.0;
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
+                // Finish the same delivered action pass after either canvas mode, including
+                // overview's content return and presentation's black-frame suppression.
+                #[cfg(all(windows, feature = "test-script"))]
+                if !embedded {
+                    crate::test_script::finish_action_pass(ctx);
+                }
                 if frame_exited || frame_path_changed {
                     return;
                 }
@@ -29839,6 +29972,20 @@ impl App {
                 page_nav = result.page_nav;
             }
             close_fs |= result.close;
+            if self.page_overview.session().is_some() {
+                // This proposal was captured by the ordinary canvas. Its delayed
+                // secondary command can replace that canvas just like the immediate
+                // pointer path above. Spend the old phase once; retain only OS close.
+                navigation_operation = None;
+                page_nav = FsPageNav::None;
+                ctrl_nav = None;
+                list_order_nav = None;
+                sibling_nav = None;
+                mouse_nav = None;
+                jump_to = None;
+                close_to_page_list = false;
+                close_fs = presentation_close_requested;
+            }
         }
         let navigation_idx = self.fullscreen_idx.unwrap_or(fs_idx);
         self.handle_fs_navigation_with_render_perf(
@@ -29887,6 +30034,9 @@ impl App {
 
     /// アニメーションフレームを進める（メインコンテキストの時刻を使う）。
     fn advance_animation(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.page_overview.session().is_some() {
+            return;
+        }
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         if is_video {
             return;
@@ -30103,7 +30253,9 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> Option<&'static str> {
-        if !self.reading_flow.is_paged() {
+        if self.page_overview.session().is_some() {
+            Some("page_overview")
+        } else if !self.reading_flow.is_paged() {
             Some("reading_flow_not_paged")
         } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             Some("item_not_page_data")
@@ -32501,7 +32653,46 @@ impl App {
         {
             self.invalidate_fullscreen_display_unit_owners();
         }
+        let metadata = Arc::clone(self.page_identity_index.overview_metadata());
+        if self
+            .viewer_navigation_caches
+            .overview_projection
+            .as_ref()
+            .is_none_or(|(cached, _)| !Arc::ptr_eq(cached, &metadata))
+        {
+            let retained = self
+                .page_overview
+                .session()
+                .map(|session| Arc::clone(&session.view().projection));
+            let projection = if let Some(retained) = retained.filter(|projection| {
+                Arc::ptr_eq(projection.metadata(), &metadata)
+                    && projection.reader_order().as_slice() == indices.as_slice()
+            }) {
+                Ok(retained)
+            } else {
+                self.close_page_overview();
+                crate::page_overview::PageOverviewProjection::new(
+                    Arc::clone(&metadata),
+                    Arc::clone(&indices),
+                )
+                .map(Arc::new)
+            };
+            self.viewer_navigation_caches.overview_projection = Some((metadata, projection));
+        }
         indices
+    }
+
+    pub(crate) fn prepared_page_overview_projection(
+        &mut self,
+    ) -> Option<Arc<crate::page_overview::PageOverviewProjection>> {
+        self.get_still_image_indices();
+        self.viewer_navigation_caches
+            .overview_projection
+            .as_ref()?
+            .1
+            .as_ref()
+            .ok()
+            .map(Arc::clone)
     }
 
     pub(crate) fn fullscreen_large_jump_target(
@@ -33135,6 +33326,12 @@ impl App {
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return true;
         }
+        if self.page_overview.session().is_some() {
+            // The overview owns root forwarding too, including user-remapped chords.
+            // Its shared handler applies the runtime finite set and keyboard-owner gates.
+            self.handle_page_overview_keys(ctx);
+            return true;
+        }
         if !_owner.blocks_legacy_keymap_shortcuts() {
             self.page_turn_pre_draw(ctx);
         }
@@ -33661,7 +33858,8 @@ impl App {
         let initial_demand = self
             .spread_display_composition_for_anchor(fs_idx)
             .presentation_demand(self.spread_mode, self.fullscreen_page_slice);
-        let target_load_allowed = !self.continuous_reading_active_for_idx(fs_idx)
+        let target_load_allowed = self.page_overview.session().is_none()
+            && !self.continuous_reading_active_for_idx(fs_idx)
             && matches!(self.book_presentation_allowed(&initial_demand),
                 crate::book_composition::PresentationDecision::Allowed(ref allowed)
                     if initial_demand.iter().zip(allowed).any(|(occurrence, allowed)|
@@ -33718,7 +33916,9 @@ impl App {
         // Resolve permission in the actual drawing context after its pre-draw input commit.
         let presentation = self.resolve_book_fullscreen_presentation(fs_idx);
         let paint_idx = presentation.paint_idx;
-        let target_allowed = presentation.allowed && !presentation.continuous;
+        let target_allowed = self.page_overview.session().is_none()
+            && presentation.allowed
+            && !presentation.continuous;
         if target_allowed {
             if paint_idx != fs_idx {
                 self.ensure_fs_page_turn_target_load(page_turn_decision, paint_idx);
@@ -33766,12 +33966,16 @@ impl App {
             self.fullscreen_viewport_id()
         };
         self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
-        let state = self.prepare_fullscreen_state_with_permission(
-            ctx,
-            paint_idx,
-            page_turn_decision,
-            target_allowed,
-        );
+        let state = if self.page_overview.session().is_some() {
+            FsFrameState::overview_shell()
+        } else {
+            self.prepare_fullscreen_state_with_permission(
+                ctx,
+                paint_idx,
+                page_turn_decision,
+                target_allowed,
+            )
+        };
 
         (
             state,
@@ -34234,6 +34438,11 @@ impl App {
             return action;
         }
 
+        if self.page_overview.session().is_some() {
+            self.handle_page_overview_keys(ctx);
+            action.page_transition = self.fs_page_transition_after_overview_input(fs_idx);
+            return action;
+        }
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::mark_action_pass_eligible(ctx);
 
@@ -34256,7 +34465,18 @@ impl App {
                     .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
             })
         {
-            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            self.dismiss_fs_overflow_panel();
+        }
+
+        if !self.ime_input_active(ctx)
+            && !owner.blocks_legacy_keymap_shortcuts()
+            && self.page_overview_available()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::FsPageOverviewToggle)
+        {
+            self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
+            return action;
         }
 
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
@@ -36881,10 +37101,23 @@ impl App {
         });
     }
 
-    fn fullscreen_overflow_panel_view(&self, is_spread_double: bool) -> FsOverflowPanelView {
+    fn fullscreen_overflow_panel_view(&mut self, is_spread_double: bool) -> FsOverflowPanelView {
         let mut root_rows = Vec::new();
         for &item in FullscreenOverflowItemId::fixed_order() {
             let (label, status, enabled, disabled_reason) = match item {
+                FullscreenOverflowItemId::PageOverview => {
+                    let reason = self.page_overview_unavailable_reason();
+                    let enabled = self.page_overview_available();
+                    (
+                        self.keymap.first_chord_bracket_label(
+                            item.label(),
+                            KeyAction::FsPageOverviewToggle,
+                        ),
+                        String::new(),
+                        enabled,
+                        reason,
+                    )
+                }
                 FullscreenOverflowItemId::SpreadAdjustment => (
                     item.label().into(),
                     if self.spread_shift_anchor_idx().is_some() {
@@ -37254,6 +37487,17 @@ impl App {
         self.apply_fs_overflow_panel_action(ctx, &view, is_spread_double, action);
     }
 
+    pub(crate) fn dismiss_fs_overflow_panel(&mut self) {
+        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+    }
+
+    pub(crate) fn dismiss_fs_transient_menu_state(&mut self) {
+        self.spread_popup_open = false;
+        self.fit_popup_open = false;
+        self.panorama_projection_popup_open = false;
+        self.dismiss_fs_overflow_panel();
+    }
+
     fn apply_fs_overflow_panel_action(
         &mut self,
         ctx: &egui::Context,
@@ -37268,7 +37512,7 @@ impl App {
                 self.start_local_composition_editor(ctx);
             }
             FsOverflowPanelAction::Close => {
-                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                self.dismiss_fs_overflow_panel();
             }
             FsOverflowPanelAction::Back => {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
@@ -37276,6 +37520,10 @@ impl App {
             FsOverflowPanelAction::Activate(item) => match item {
                 FullscreenOverflowItemId::SpreadAdjustment => {
                     self.fs_overflow_panel_state = FsOverflowPanelState::SpreadAdjustment;
+                }
+                FullscreenOverflowItemId::PageOverview => {
+                    self.dismiss_fs_overflow_panel();
+                    self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
                 }
                 FullscreenOverflowItemId::NavigatorToggle => {
                     self.set_fullscreen_navigator_visible(
@@ -37403,6 +37651,14 @@ impl App {
         } else {
             FsOverflowPanelState::Root
         };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fullscreen_overflow_panel_rect_for_test(
+        &self,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
     }
 
     pub(crate) fn fs_touch_tap_zones_enabled(&self) -> bool {
@@ -38822,6 +39078,8 @@ impl App {
     ) -> (FsPageNav, bool) {
         let (overflow_pointer_input, overflow_touch_excluded) =
             self.capture_fs_front_pointer_input(ctx, full_rect);
+        let primary_suppression =
+            self.advance_viewer_primary_pointer_frame(ctx, overflow_pointer_input.primary_owned);
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
@@ -38832,6 +39090,7 @@ impl App {
             prev_foreground_hwnd,
             navigator_reservation,
             front_wheel_owner,
+            primary_suppression,
             music_front_pointer_owned,
             navigation_operation,
             false,
@@ -38853,6 +39112,7 @@ impl App {
         prev_foreground_hwnd: usize,
         navigator_reservation: &mut Option<FsNavigatorInputReservation>,
         front_wheel_owner: Option<&FsHudPopupWheelInput>,
+        mut primary_suppression: FullscreenPrimarySuppressionDecision,
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
         suppress_wheel_navigation: bool,
@@ -38875,36 +39135,7 @@ impl App {
         // 同じ面の認識器を回す呼び出しが下に複数ある。接触の開始フレームを処理した
         // 呼び出しが所有者を決めるので、**全部で同じ値を使う**。
         let touch_tap_zones = self.fs_touch_tap_zones_enabled();
-        const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
-        let (primary_pressed, pointer_primary_down, primary_released) = ctx.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-            )
-        });
-        if self.cancel_mouse_right_drag_on_primary_press(
-            crate::ring_shortcut::RightDragOwner::Root,
-            primary_pressed && !overflow_pointer_input.primary_owned,
-        ) {
-            self.fs_primary_suppression.arm_pointer_stream();
-        }
-        if let Some(t) = self.fs_focus_regained_at {
-            if t.elapsed() >= FOCUS_RESTORE_GRACE {
-                self.fs_focus_regained_at = None;
-            } else if !self.fs_primary_suppression.is_active() && pointer_primary_down {
-                self.fs_primary_suppression.arm_pointer_stream();
-                self.fs_focus_regained_at = None;
-            }
-        }
-        // Snapshot before releasing persistent ownership. The terminal frame
-        // itself remains suppressed, while later early returns cannot strand
-        // the owner because this transition runs at the function boundary.
-        let mut primary_suppression =
-            self.fs_primary_suppression
-                .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
-                    released: primary_released,
-                });
+        let pointer_primary_down = ctx.input(|input| input.pointer.primary_down());
 
         // Music menu input was claimed at frame start, before a key or outside click
         // could close it. Complete primary release bookkeeping above, then leave the
@@ -39811,14 +40042,10 @@ impl App {
             self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input.clone());
         }
         if middle_short_click {
-            if let Some(nav) = self.apply_mouse_button(
-                ctx,
-                crate::ring_shortcut::MouseButtonSlot::Middle,
-                crate::app::ActionSurface::Viewer,
-                "fullscreen-middle-mouse",
-            ) {
-                self.mouse_ring_nav = Some(nav);
-            }
+            self.dispatch_viewer_middle_short_click(ctx);
+        }
+        if self.page_overview.session().is_some() {
+            return FsWheelFrameResult::default();
         }
 
         // 動画タイルモード中でも Ctrl なし Wheel は前後アイテム移動に使う。
@@ -40560,6 +40787,9 @@ impl App {
             }
         }
 
+        if self.page_overview.session().is_some() {
+            return FsWheelFrameResult::default();
+        }
         FsWheelFrameResult {
             page_nav,
             close,
@@ -40774,40 +41004,7 @@ impl App {
         prev_foreground_hwnd: usize,
         overflow_pointer_input: FsFrontPointerFrameInput,
     ) -> FsSecondaryAction {
-        let dialog_open_for_right_drag = self.any_dialog_open();
-        if dialog_open_for_right_drag {
-            self.cancel_mouse_ring_flick();
-            self.cancel_mouse_gesture();
-            self.fs_secondary_press.cancel();
-        }
-        let video_in_audio_mode = is_video
-            && self
-                .fullscreen_idx
-                .is_some_and(|idx| self.fs_music_view_active(idx));
-        let right_drag_context = self.current_right_drag_context();
-        let right_drag_mode = self
-            .settings
-            .ring_shortcuts
-            .right_drag_mode(right_drag_context);
-        let secondary_down = ctx.input(|i| i.pointer.secondary_down());
-        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
-        let secondary_released = !overflow_pointer_input
-            .owns_release(egui::PointerButton::Secondary)
-            && ctx.input(|i| i.pointer.secondary_released());
-        let press_owner = overflow_pointer_input.secondary_owner;
-        if overflow_pointer_input.secondary_owned {
-            self.cancel_mouse_ring_flick();
-            self.cancel_mouse_gesture();
-            return FsSecondaryAction::None;
-        }
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
-        let passive_secondary_pos = fullscreen_pointer_pos_or(
-            ctx,
-            full_rect,
-            self.fs_secondary_press
-                .start_pos()
-                .unwrap_or(full_rect.center()),
-        );
         let secondary_in_overlay_chrome = fullscreen_secondary_in_overlay_chrome(
             secondary_pos,
             full_rect,
@@ -40815,218 +41012,14 @@ impl App {
             seek_panel_rect,
             seek_panel_interactive,
         );
-        // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
-        // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
-        let popup_open = self.spread_popup_open
-            || self.fit_popup_open
-            || self.panorama_projection_popup_open
-            || fs_rotation_popup_open(ctx)
-            || fs_still_seek_strip_popup_open(ctx);
-        let right_drag_gate_reject = if is_video && !video_in_audio_mode {
-            Some("native_video")
-        } else if self.analysis_mode {
-            Some("analysis")
-        } else if dialog_open_for_right_drag {
-            Some("dialog")
-        } else if self.fs_context_menu_idx.is_some() {
-            Some("context_menu")
-        } else if popup_open {
-            Some("popup")
-        } else {
-            None
-        };
-        let passive_press_owner = fullscreen_secondary_press_owner_for_frame(
-            press_owner,
-            &right_drag_mode,
-            right_drag_context,
-            right_drag_gate_reject.is_some(),
+        self.recognize_viewer_right_drag_frame(
+            ctx,
+            full_rect,
+            is_video,
             secondary_in_overlay_chrome,
-        );
-        let passive_press_outcome = self.fs_secondary_press.advance(
-            passive_press_owner,
-            FullscreenSecondaryPressSample {
-                pressed: secondary_pressed,
-                down: secondary_down,
-                released: secondary_released,
-                pos: passive_secondary_pos,
-                now: std::time::Instant::now(),
-            },
-        );
-        #[cfg(windows)]
-        if self.viewer_session_is_detached_or_switching()
-            && Self::detached_image_window_debug_enabled()
-        {
-            let (
-                focused,
-                event_count,
-                key_pressed_count,
-                wheel_event_count,
-                secondary_button_events,
-            ) = ctx.input(|i| {
-                let key_pressed_count = i
-                    .events
-                    .iter()
-                    .filter(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
-                    .count();
-                let wheel_event_count = i
-                    .events
-                    .iter()
-                    .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
-                    .count();
-                let secondary_button_events = i
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        matches!(
-                            event,
-                            egui::Event::PointerButton {
-                                button: egui::PointerButton::Secondary,
-                                ..
-                            }
-                        )
-                    })
-                    .count();
-                (
-                    i.viewport().focused.unwrap_or(false),
-                    i.events.len(),
-                    key_pressed_count,
-                    wheel_event_count,
-                    secondary_button_events,
-                )
-            });
-            let right_drag_probe_event_frame =
-                secondary_pressed || secondary_released || secondary_button_events > 0;
-            if right_drag_probe_event_frame {
-                let foreground = current_foreground_hwnd();
-                let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
-                self.log_detached_image_window_debug(format!(
-                    "right_drag_probe fs_idx={:?} window_id={:?} window_state={:?} \
-                 session={:?} is_video={} video_audio_mode={} analysis={} \
-                 dialog={} popup={} context_menu={} focused={} \
-                 foreground=0x{foreground:x} active_hwnd=0x{active_hwnd:x} \
-                 foreground_matches={} prev_foreground=0x{:x} \
-                 secondary_down={} secondary_pressed={} secondary_released={} \
-                 secondary_pos=({:.1},{:.1}) secondary_in_overlay_chrome={} \
-                 right_drag_context={right_drag_context:?} right_drag_mode={right_drag_mode:?} \
-                 gate={} events={} key_pressed={} wheel_events={} secondary_button_events={} \
-                 frame={}",
-                    self.fullscreen_idx,
-                    self.active_detached_window_id(),
-                    self.active_detached_window_state(),
-                    self.active_detached_session,
-                    is_video,
-                    video_in_audio_mode,
-                    self.analysis_mode,
-                    dialog_open_for_right_drag,
-                    popup_open,
-                    self.fs_context_menu_idx.is_some(),
-                    focused,
-                    foreground != 0 && foreground == active_hwnd,
-                    prev_foreground_hwnd,
-                    secondary_down,
-                    secondary_pressed,
-                    secondary_released,
-                    secondary_pos.x,
-                    secondary_pos.y,
-                    secondary_in_overlay_chrome,
-                    right_drag_gate_reject.unwrap_or("ok"),
-                    event_count,
-                    key_pressed_count,
-                    wheel_event_count,
-                    secondary_button_events,
-                    self.frame_counter
-                ));
-            }
-        }
-        if (!is_video || video_in_audio_mode)
-            && !self.analysis_mode
-            && !dialog_open_for_right_drag
-            && self.fs_context_menu_idx.is_none()
-            && !self.spread_popup_open
-            && !self.fit_popup_open
-            && !self.panorama_projection_popup_open
-            && !fs_rotation_popup_open(ctx)
-            && !fs_still_seek_strip_popup_open(ctx)
-        {
-            match right_drag_mode {
-                crate::ring_shortcut::RightDragMode::RingShortcut => {
-                    let Some(ring_context) = right_drag_context.ring_context() else {
-                        return FsSecondaryAction::None;
-                    };
-                    if secondary_in_overlay_chrome {
-                        self.cancel_mouse_ring_flick();
-                    } else if secondary_pressed {
-                        self.start_mouse_ring_flick(
-                            ctx,
-                            crate::ring_shortcut::RightDragOwner::Root,
-                            ring_context,
-                            secondary_pos,
-                            None,
-                        );
-                    }
-                    let recognition = self.recognize_mouse_ring_flick_with_pos(
-                        ctx,
-                        crate::ring_shortcut::RightDragOwner::Root,
-                        ring_context,
-                        secondary_pos,
-                        secondary_down,
-                        secondary_released,
-                    );
-                    return FsSecondaryAction::Recognized {
-                        context: right_drag_context,
-                        pos: secondary_pos,
-                        recognition,
-                    };
-                }
-                crate::ring_shortcut::RightDragMode::MouseGesture => {
-                    if secondary_in_overlay_chrome {
-                        self.cancel_mouse_gesture();
-                    } else if secondary_pressed {
-                        self.start_mouse_gesture(
-                            ctx,
-                            crate::ring_shortcut::RightDragOwner::Root,
-                            right_drag_context,
-                            secondary_pos,
-                            None,
-                        );
-                    }
-                    let recognition = self.recognize_mouse_gesture_with_pos(
-                        ctx,
-                        crate::ring_shortcut::RightDragOwner::Root,
-                        right_drag_context,
-                        secondary_pos,
-                        secondary_down,
-                        secondary_released,
-                    );
-                    return FsSecondaryAction::Recognized {
-                        context: right_drag_context,
-                        pos: secondary_pos,
-                        recognition,
-                    };
-                }
-                crate::ring_shortcut::RightDragMode::Disabled
-                | crate::ring_shortcut::RightDragMode::Unknown(_) => {
-                    if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
-                        return FsSecondaryAction::None;
-                    }
-                    match passive_press_outcome {
-                        FullscreenSecondaryPressOutcome::ShortTap(pos) => {
-                            return FsSecondaryAction::ShortTap {
-                                context: right_drag_context,
-                                pos,
-                            };
-                        }
-                        FullscreenSecondaryPressOutcome::LongPress(pos) => {
-                            return FsSecondaryAction::LongPress(pos);
-                        }
-                        FullscreenSecondaryPressOutcome::Cancelled
-                        | FullscreenSecondaryPressOutcome::None => {}
-                    }
-                }
-            }
-        }
-
-        FsSecondaryAction::None
+            prev_foreground_hwnd,
+            overflow_pointer_input,
+        )
     }
 
     fn apply_fs_secondary_input(
@@ -41044,8 +41037,10 @@ impl App {
         match action {
             FsSecondaryAction::None => FsSecondaryInputOutcome::Continue,
             FsSecondaryAction::LongPress(pos) => {
-                self.fs_context_menu_idx = self.fullscreen_idx;
-                self.fs_context_menu_pos = pos;
+                if self.page_overview.session().is_none() {
+                    self.fs_context_menu_idx = self.fullscreen_idx;
+                    self.fs_context_menu_pos = pos;
+                }
                 FsSecondaryInputOutcome::Continue
             }
             FsSecondaryAction::ShortTap { context, pos } => short_click_outcome(
@@ -41095,6 +41090,12 @@ impl App {
         pos: egui::Pos2,
     ) -> bool {
         use crate::ring_shortcut::ViewerShortRightClickAction;
+
+        // An overview owns its tiles and cancel operation; image close/menu shortcuts
+        // must not escape the overview action set. Passive dispatch has the same policy.
+        if self.page_overview.session().is_some() {
+            return false;
+        }
 
         match self
             .settings
@@ -43470,6 +43471,7 @@ impl App {
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
         let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
         if self.slideshow_playing
+            && self.page_overview.session().is_none()
             && !self.viewer_mutation_modal_active()
             && !close_fs
             && !self.fs_nav_is_locked()
@@ -60413,7 +60415,7 @@ mod tests {
         let trim = egui::Rect::from_min_max(egui::pos2(0.2, 0.1), egui::pos2(0.8, 0.9));
         let window = crate::app::DeferredDetachedImageWindowView {
             id: 1,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: crate::gpu_lanczos::FullscreenPaintResource::direct(texture).into(),
             location_display: String::new(),
             image_dims: Some((8, 6)),
             rotation: crate::rotation_db::Rotation::Cw90,
@@ -64959,6 +64961,16 @@ mod tests {
                                     disabled_reason: None,
                                 },
                             );
+                            root_rows.insert(
+                                0,
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::PageOverview,
+                                    label: "本のページ一覧 [O]".into(),
+                                    status: String::new(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                            );
                             let view = FsOverflowPanelView {
                                 state,
                                 root_rows,
@@ -64976,7 +64988,7 @@ mod tests {
                 });
             });
         harness.run();
-        if size.y >= 600.0 {
+        if size.y >= 614.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
                 data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                     .unwrap()
@@ -65006,7 +65018,9 @@ mod tests {
 
     #[test]
     fn fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height() {
-        for size in [egui::vec2(720.0, 600.0), egui::vec2(720.0, 720.0)] {
+        // Ten root rows need a viewport at least 608pt high, including the
+        // toolbar, header, panel padding and outer margins.
+        for size in [egui::vec2(720.0, 614.0), egui::vec2(720.0, 720.0)] {
             // The shared fixture retains its original Fits assertion; no PNG is
             // needed to detect the 8pt viewport shrink from build_ui's outer frame.
             let _ = fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
@@ -65038,7 +65052,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root_tall",
             FsOverflowPanelState::Root,
-            egui::vec2(720.0, 600.0),
+            egui::vec2(720.0, 614.0),
             false,
         );
     }
@@ -65067,31 +65081,31 @@ mod tests {
     fn page_turn_animation_overflow_row_follows_shared_setting_and_keymap() {
         let mut app = crate::app::setup_app_for_test();
         assert!(!app.settings.page_turn_animation_enabled);
-        let row = |app: &App| {
+        let row = |app: &mut App| {
             app.fullscreen_overflow_panel_view(false)
                 .root_rows
                 .into_iter()
                 .find(|row| row.item == FullscreenOverflowItemId::PageTurnAnimationToggle)
                 .unwrap()
         };
-        assert_eq!(row(&app).label, "ページめくりアニメーション");
-        assert_eq!(row(&app).status, "OFF");
+        assert_eq!(row(&mut app).label, "ページめくりアニメーション");
+        assert_eq!(row(&mut app).status, "OFF");
         app.keymap = Keymap::from_ini_str("[FsImage]\nFsPageTurnAnimationToggle = Ctrl+Shift+A\n");
         let mut settings = app.settings.clone();
         settings.page_turn_animation_enabled = true;
         app.install_preferences_settings(settings);
-        assert_eq!(row(&app).status, "ON");
+        assert_eq!(row(&mut app).status, "ON");
         assert_eq!(
-            row(&app).label,
+            row(&mut app).label,
             app.keymap.first_chord_bracket_label(
                 "ページめくりアニメーション",
                 KeyAction::FsPageTurnAnimationToggle
             )
         );
-        assert!(row(&app).enabled);
+        assert!(row(&mut app).enabled);
         app.reading_flow = ReadingFlow::Vertical;
         assert!(
-            row(&app).enabled,
+            row(&mut app).enabled,
             "the global preference remains accessible in an unsupported flow"
         );
     }

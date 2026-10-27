@@ -1383,15 +1383,39 @@ STALE checkpointは従来どおりworker pop直後、ZIP/Folder heavy I/O resolv
 RAW deferred callback/follow-upとEPUB fallbackも元のID・世代・操作sequence・immutable PDF render ticketを保つ。
 [寿命計画・回帰・検証証拠](thumbnail-request-lifecycle-plan.md)。
 
-静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを
-要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の bounded exact set
-を `keep_set` へ合流する。要求は priority とし、worker は同 set の read-only shared
-projection で上記 3 箇所の STALE 判定を行う。これにより数万ページ先を指しても bbox の
-間を埋めず、指示位置が変わった後の ZIP/PDF 処理も次の checkpoint で取り消せる。
+静止画ページシークの列 / hover preview と閲覧中のページ一覧（§1.340）はグリッド保持帯から
+遠いページを要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の
+bounded exact set を `keep_set` へ合流する。集合の名前は維持し、
+`ensure_foreground_thumbnail_requests` が同一viewerのSeek／PageOverviewの一方だけを
+前面consumerとして選ぶ。非表示stripの更新／clearはOpen中の一覧需要を撤回しない。
+要求はpriorityとし、workerは同setのread-only shared projectionで上記3箇所のSTALE判定を行う。
+これにより数万ページ先を指してもbboxの間を埋めない。
 
-この集合の更新者は overlay で、各描画フレームに列と preview の要求を置換する。
+各描画フレームにstrip＋preview、または一覧の可視セル＋上下overscanへ需要を置換する。
+一覧は可視順を先に保ち、新規enqueueを1 frame 32件／2msで区切る。全ページを生成しない。
+`ensure_page_overview_requests` は通常画像／ZIP画像／`PdfPage` を同じ要求境界へ渡す。
+PDF／変換済みEPUBは、master取込み後に§1.377の既存 `PdfRenderEpochOwner`／ticketと
+`promote_viewer_pdf_keys`／`PdfVisiblePromotionState` へ接続済み。
+同じowner・current要求世代・同keyだけを昇格・追跡し、遅着再評価も既存状態を使う。
+別のcancel identity API、Unscopedへの迂回、新しいretry ownerは作らない。
+一覧のcloseはこの前面需要の撤回であり、PDF render owner全体のadvance／retireではない。
+需要置換／取消は既存のkeep投影を再計算し、相関付き局所queued pruneとRAW ticket取消へ渡す。
+通常surfaceではGridの保持帯・VRAM cap・ROOTのtouch余白を既存bookkeepingと同じ計算で保ち、
+detachedではGrid保持を足さない。parkはbounded描画投影を採取後、Open metadataを保持して
+当該contextのexact需要を撤回する。worker取得後の要求は保存終端まで既存ownerに残る。
+PDF接続・最終修正の独立レビューはACCEPT、自動検証はfull 1回後のaffected範囲・vendor gateを補完済み。所有契約は
+[一覧計画§18](detached-book-page-overview-plan.md#18-t2-pdf昇格は1377の既存owner-scoped-apiへ接続する2026-10-12決定)、検証実数・残工程は同書§20を参照する。
+
+一覧Open／incarnationとprepared metadata／実ページprojectionは同じViewerContextBundleに属し、
+mount／depositで移譲、forkはClosed、items／読み順の置換とteardownで当該ownerだけを閉じる。
+passive描画はimmutable metadata全体と可視近傍のtextureを参照してstamped commandを返し、
+context／items世代／読み順revision／一覧incarnationと、実行時のactual active ownerを検証する。
+非active Selectを着地・再activation・再配送せずOpenを保持し、受理したSelectだけを通常の
+LatestSeek navigationへ渡す。描画更新だけでforeground／raiseを要求しない。
+
 同じ items 世代内のページ着地は集合を終了しない。単ページ / 見開きの通常着地と
-縦 / 横連結読みは同じ寿命を持つ。全消去は overlay の非表示、fullscreen 終了、
+縦 / 横連結読みは同じ寿命を持つ（一覧選択の受理ではoverviewを閉じてその需要を解除する）。
+全消去は前面consumerの非表示／一覧取消、fullscreen 終了、
 idx 空間の無効化、および `set_items_generation` での世代変更に限定する。
 コンテナ差し替えも `install_new_items` の世代更新で旧集合を失効させる。
 通常 worker の pop 後、heavy I/O 後、PDF レンダ前は、いずれも

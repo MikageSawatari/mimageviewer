@@ -886,6 +886,7 @@ impl FullscreenNavigatorCorner {
 /// このパネルだけ表示項目を変更できるのは不自然で過剰なため、並びは固定する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FullscreenOverflowItemId {
+    PageOverview,
     SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
@@ -899,6 +900,7 @@ pub enum FullscreenOverflowItemId {
 impl FullscreenOverflowItemId {
     pub fn fixed_order() -> &'static [Self] {
         &[
+            Self::PageOverview,
             Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
@@ -912,6 +914,7 @@ impl FullscreenOverflowItemId {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::PageOverview => "ページ一覧",
             Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",

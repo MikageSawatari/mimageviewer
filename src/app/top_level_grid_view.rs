@@ -1804,6 +1804,12 @@ impl TopLevelGridView {
             .is_some_and(|pending| pending.accumulate_outer(fullscreen, forward))
     }
 
+    pub(crate) fn collection_outer_navigation_available(&self, fullscreen: bool) -> bool {
+        self.collection_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.accepts_outer(fullscreen))
+    }
+
     pub(in crate::app) fn accumulate_collection_manual_navigation(
         &mut self,
         delta: i32,

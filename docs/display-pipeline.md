@@ -621,6 +621,80 @@ RotationDb read-only open / SELECT 回数が増えないこと、未確定セル
 向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
 `still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
 
+### 1.6.1 閲覧中のページ一覧 (§1.340、2026-10-27 独立レビューP2追補・指定自動検証済み)
+
+通常 fullscreen／メイン内閲覧／F12連動窓／独立窓は既存surface内で
+`ui_page_overview::draw_page_overview` を使う。現在の可視実ページ列を仮想行として描き、
+未生成／回転未確定／失敗セルも番号とidentityを持つ選択可能なplaceholderにする。
+列数・scroll・cursorはviewer内のセッション値で、入場／取消は読書位置とmain Gridを変更しない。
+新規入場とSelectは既存`page_overview_available()`へ集約したnavigation-sequence／page-turnの
+両admissionを共用し、animationのON／OFFにかかわらず未提示の受理済み移動があれば拒否する。
+通常出力の採用と受理済みcontinuationを保持する。O／HUD／ring／padは共通受付を使い、
+完了後にもう一度操作する。入場要求の保留・replay・新しい取消処理は作らない。
+Oの既存operation観測が通常flat完了を始める場合も、入場受付自体はpage-turn ownerを変更しない
+（2026-10-27の新coordinator手順2、一覧設計書§25.4）。旧選択肢2の即退役は採用しない。
+独立レビューP2-1の通常表示待ちへの拡張とP2-2の前面キー／共通chrome終了の指定自動検証は同§25.7で成功。
+新しいpredicate・pending・replay・取消は作らず、HUDのenabledはavailability、理由は既存optional reasonを使う。
+受理した共通入場だけが`dismiss_fs_transient_menu_state()`でspread／fit／panoramaのApp boolと
+overflowを終了し、通常`close_fullscreen`も同helperを使う。keyboard次キー／HUD Close／HUD Overviewの
+overflow-only終了は`dismiss_fs_overflow_panel()`へ揃える。rotation／seek等のegui Popupは
+表示／keepされなくなった所有viewportの`Memory::end_pass`で自然に退役するため、明示popup closeや
+兄弟viewportも消す`Popup::close_all`は加えない。keyboard seekの既存優先、context／modal／edit／pickerの
+入場拒否、physical stream、info lock、拒否されたring入場の旧chromeは維持する。
+front pointer captureは`fs_front_menu_presented`とoverflow rectだけを読む。通常adjustment／metadata／
+infoはその集合外で、非focused adjustmentは入場可能な場合もある。focused TextEdit／IMEは既存ownerで止める。
+tag pickerは既存common modal、overlay編集は既存availabilityの拒否を使う。hover tooltipは
+PopupKind::Tooltip／Sense::hoverと既定inactiveのArea／描画寿命であり、durable panelとともに一括resetしない。
+Selectはstamp／binding／items・projection revision／incarnation／stable identity／active資格の
+既存照合を全通過したら一覧をClosedにし、`land_still_page_navigation_target`の`LatestSeek`を
+ちょうど一度呼ぶ。即時着地・Checking後許可・後着拒否・同期拒否は通常navigation ownerが扱い、
+一覧の再open／待機／追加pending／受付証明を作らない。通常／連動のGrid追従、独立窓の
+main非干渉も通常ページ移動と同じ時点・規則で扱う（2026-10-27 coordinator判断、一覧設計書§25.1追補）。
+`LatestSeek`は既存seek／jumpと同じく、隣ページでも新curlを開始しない。
+`offer_page_turn_with_operation`の対象は`Sequential`だけ。選択先の通常flatが実表示受理された後、
+D3の次unit先読みは`prefetch_next_final_unit`の既存ON／paged／non-split／入力素材資格へ合流する。
+一覧専用policyや、同期停止・Checking後の結果から一覧を復元する経路は追加しない。
+
+一覧を描くCentralPanelのearly returnより前に、既存共通入力・案内へ到達する経路を持つ。
+`ui_fullscreen/viewer_chrome.rs`は通常viewerとactive一覧が共用するprimary suppression終端、
+右ドラッグ／gesture認識、中ボタン短押し、F11 borderless step、overlay／dialogの境界である。
+physical primaryはviewerのCentralPanel入口でkey handler前に一度advanceし、終端frameの
+抑止decisionを通常pointer／一覧へ渡す。Esc／Oで一覧が閉じてもPointerStreamのreleaseを
+取り逃さず、そのframeの背面clickを抑止したまま次の通常clickへ戻す（一覧設計書§24）。
+2026-10-27のmaster合流では、CentralPanelで一度captureした同frameのfront pointer入力値を
+primary終端／一覧／通常canvasへ渡し、一覧のright recognizerはmasterのrecognize／apply分離APIを使う。
+old-owned releaseの実renderer3surface回帰は追加したが未実行（一覧設計書§25.3）。
+通常callerのguard・タイミング・描画順を維持し、一覧は保存済み割当を一覧設計書§4.1の実行可能集合へ配送する。
+mouse ring／gesture／X長押しring、feedback、既存job進捗・picker／modalは既存guardで描く。
+passive guideは描画元のimmutable `overview.executable_actions`を使い、activeな別窓の集合を流用しない。
+F11のPrimeBlackFrame→ApplyWindowMode→Settleも同じconsumerを使い、prime black frame中は
+一覧body／guideを描かない。通常の画像ページ送り、wheel pan／zoom、中ドラッグzoom、
+短右click／long-press画像menu、編集canvas／navigator／stripは一覧へ開放しない。
+接続漏れの根因・限定レビュー・実renderer検証は
+[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)を参照する。
+
+画像は既存 `ThumbnailState::Loaded` と在メモリの `thumb_adjust_tex` を投影する。
+調整drag中は元のLoaded texture、それ以外は評価済みtextureを優先し、保存回転の確定値から
+寸法とUVを解く。描画でDB読取、補正texture生成、GPU upload、元画像decodeを始めない。
+回転は§1.6の既存workerを使い、未確定値を0°と推測しない。
+一覧のactive需要dispatcherはconsumer適格性を確認した後、同contextの既存回転workerの
+完了を`poll_still_seek_rotations`で回収してから要求・投影する。通常stripを描画しない一覧中も
+完了consumerを省略しない。Loaded済み／回転未確定は新規decodeではなく完了採用で解消する。
+通常ログ`[page-overview-demand]`はSurface経路、Admissionの型付き終了理由、
+requested／keep／表示可否と局所Pruneを記録し、同じAdmission観測の反復を抑える。
+passive投影は全実ページのimmutable metadataと可視近傍のtexture handleだけを保持し、
+resize／DPI変更後の新セルもmetadataからtargetを解決する。full-image textureを入場条件にしない。
+
+前面需要は同一viewerのstrip／hoverと一覧のいずれか一つをdispatcherで選び、
+可視セルを先に、上下overscanを後に要求する。非表示stripが一覧のexact setを解除しない。
+一覧新規要求は通常画像／ZIP画像／PDFページ（変換済みEPUBを含む）を共通dispatcherへ渡す。
+PDFは§1.377の既存viewer ticket付き要求・owner-scoped昇格へ接続済み。
+2026-10-27のmaster統合では構成採用後の可視実items順とhiddenを反映する。
+白紙補助annotationは`None`のまま未接続で、fixtureの補助表示を製品接続済みとは扱わない。
+2026-10-12〜13のfull補完・独立ACCEPTと§25.6の統合commit `1c134703b`までの指定自動検証は履歴。
+独立レビューP2追補後の検証は§25.7で別に扱い、再レビュー・残工程はcoordinatorへ引き継ぐ。
+[所有・入力・統合の正本§25](detached-book-page-overview-plan.md#25-2026-10-27-master統合記録)を参照する。
+
 ### 1.7 サムネイル画質ダイアログのプレビュー寸法
 
 `src/ui_dialogs/thumb_quality.rs` は viewport と実際の利用可能幅から A/B プレビューを配置する。
