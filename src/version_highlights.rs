@@ -1139,6 +1139,29 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "4.9.0",
+        // 操作・既定の変更は無いので必読は空。新しい操作と表示の追加だけを並べる。
+        must_read: &[],
+        highlights: &[
+            HighlightItem {
+                title: "O キーで本のページを一覧表示",
+                body: "閲覧中に O を押すと、本のページを並べて表示し、選んだページへ移れます。上部の「…」→「ページ一覧」からも開けます。Esc か O で元のページに戻ります。",
+            },
+            HighlightItem {
+                title: "一覧の並び順で前後の本へ (Ctrl+Shift+↑↓)",
+                body: "通常のフォルダ一覧で絞り込み・並べ替えをした順に、次の本・前の本を開きます。Ctrl+↑↓ はこれまでどおりフォルダツリーの順です。",
+            },
+            HighlightItem {
+                title: "検索欄をツールバーに常に表示",
+                body: "コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索の入力欄を、ツールバーの空き領域の右クリックから個別に表示できます。",
+            },
+            HighlightItem {
+                title: "Everything 検索の結果にフォルダも表示",
+                body: "Ctrl+R の結果に、ファイルに加えてフォルダも並び、そのまま開けます。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]
