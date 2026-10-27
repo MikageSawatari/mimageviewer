@@ -567,9 +567,7 @@ impl App {
                 return true;
             }
             if self.effective_folder().is_some_and(|current| {
-                crate::path_key::physical_path_is_within(&current, logical_source)
-                    && crate::path_key::physical_path_spelling(&current)
-                        != crate::path_key::physical_path_spelling(logical_source)
+                crate::path_key::physical_path_is_strict_descendant(&current, logical_source)
             }) {
                 // Resolve reserves selection of the child. Dispatch directly rather than
                 // re-entering handle_grid_parent_folder_action's active-search gate.

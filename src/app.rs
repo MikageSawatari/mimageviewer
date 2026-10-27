@@ -24202,7 +24202,10 @@ impl App {
     }
 
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
-        if let Some(nav) = self.collection_grid_parent_nav() {
+        if let Some((nav, selection)) = self.collection_grid_parent_navigation() {
+            if selection.is_some() {
+                self.select_after_load = selection;
+            }
             return Some(nav);
         }
         if let Some(nav) = self.bookmark_view_back_nav() {
