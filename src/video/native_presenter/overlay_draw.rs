@@ -7445,39 +7445,6 @@ pub(super) fn finite_video_volume(value: f64) -> f64 {
     }
 }
 
-pub(crate) use crate::video::native_touch::OverlaySliderDrag;
-
-/// Released uses the receipt position, never a later pointer move. Cancelled
-/// restores the pre-gesture value and ignores synthetic release coordinates.
-pub(crate) fn overlay_slider_value(
-    response: &egui::Response,
-    input: crate::video::native_touch::OverlayPressInput,
-    current: f64,
-    drag: &mut Option<OverlaySliderDrag>,
-    value_at: impl Fn(egui::Pos2) -> f64,
-) -> Option<(f64, bool)> {
-    use crate::video::native_touch::{
-        OverlayPressMotion, OverlayPressPhase, OverlaySliderValue, overlay_press_update,
-    };
-    let update = overlay_press_update(response, input, drag, |_| OverlaySliderValue {
-        original: current,
-        last: current,
-    })?;
-    let moved = update.press.motion == OverlayPressMotion::Dragging;
-    match update.phase {
-        OverlayPressPhase::Cancelled => moved.then_some((update.press.data.original, true)),
-        OverlayPressPhase::Released => Some((value_at(update.pos), true)),
-        OverlayPressPhase::Held if moved => {
-            let value = value_at(update.pos);
-            if let Some(press) = drag {
-                press.data.last = value;
-            }
-            Some((value, false))
-        }
-        OverlayPressPhase::Held => None,
-    }
-}
-
 /// 音量 dB フェーダースライダー (動画 HUD / 音楽 HUD 共有、Inc 5c-B1)。
 ///
 /// `vol_rect` にトラック背景 + fill (0dB 未満 = グレー / 0dB 超 = ブースト黄) +
@@ -7491,8 +7458,8 @@ pub(crate) fn overlay_slider_value(
 /// ドラッグ中は false)。動画は `NativeOverlayCommand::SetVolume` へ、音楽は
 /// `settings.video_volume` + `player.set_volume` へ翻訳する。
 ///
-/// `last_volume_target` は開始値・最新値・実pressの所有を持つ frame 跨ぎ state。
-/// 実 release の位置で確定し、取消では開始値へ戻す。App / overlay が所有する。
+/// `last_volume_target` はドラッグ確定 (`drag_stopped`) 時に最後のドラッグ値を
+/// 永続化するための frame 跨ぎ state。呼び出し側 (App / overlay) が所有する。
 /// `tooltip` が `Some` ならダーク配色のホバーチップを付ける (`None` = 付けない)。
 pub(crate) fn draw_overlay_volume_slider(
     ui: &egui::Ui,
@@ -7501,8 +7468,7 @@ pub(crate) fn draw_overlay_volume_slider(
     volume: f64,
     id: egui::Id,
     tooltip: Option<String>,
-    last_volume_target: &mut Option<OverlaySliderDrag>,
-    input: crate::video::native_touch::OverlayPressInput,
+    last_volume_target: &mut Option<f64>,
 ) -> Option<(f64, bool)> {
     painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
     let volume = finite_video_volume(volume);
@@ -7569,24 +7535,28 @@ pub(crate) fn draw_overlay_volume_slider(
         Some(text) => vol_resp.hover_tip_dark(text),
         None => vol_resp,
     };
-    let result = overlay_slider_value(&vol_resp, input, volume, last_volume_target, |pos| {
-        crate::settings::video_volume_fader_pos_to_linear(
-            ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0) as f64,
-        )
-    });
-    // Keep the existing primary double-click reset, except in a cancelled gesture.
-    if vol_resp.double_clicked()
-        && result.is_some()
-        && !matches!(
-            input.termination(ui.ctx(), None),
-            Some(crate::video::native_touch::NativePointerTermination::Cancelled { .. })
-        )
+    let mut out = None;
+    // リセットはダブルクリックのみ。右クリック (secondary) はフルスクリーンの通常
+    // 右クリック挙動 (リング/ジェスチャ/閉じる) に譲り、ここでは扱わない。以前は
+    // secondary_clicked でも 0dB リセットしていたが、同じ右クリックが背後のフルスクリーン
+    // ハンドラにも届いて「リセット後に再生終了」する二重動作になっていた (実機 FB 2026-07-02)。
+    if vol_resp.double_clicked() {
+        *last_volume_target = Some(1.0);
+        out = Some((1.0, true));
+    } else if (vol_resp.clicked() || vol_resp.dragged())
+        && let Some(pos) = vol_resp.interact_pointer_pos()
     {
-        *last_volume_target = None;
-        Some((1.0, true))
-    } else {
-        result
+        let value = crate::settings::video_volume_fader_pos_to_linear(
+            ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0) as f64,
+        );
+        *last_volume_target = Some(value);
+        out = Some((value, vol_resp.clicked() && !vol_resp.dragged()));
     }
+    if vol_resp.drag_stopped() {
+        let value = last_volume_target.take().unwrap_or(volume);
+        out = Some((value, true));
+    }
+    out
 }
 
 /// 再生速度ボタン + プリセット popup (動画 HUD / 音楽 HUD 共有、Inc 5c-B2)。

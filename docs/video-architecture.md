@@ -16,19 +16,6 @@ native overlayは必須のGPU資源 `NativeEguiOverlayGpu` とCPU側の入力・
 configure / submissionは製品rendererの既存境界に残る。検証範囲は
 [locked chrome抑制の実装追補](fullscreen-locked-chrome-suppression-plan.md#13-実装レビュー追補2026-10-08)を参照。
 
-動画/音楽HUDの音量・音楽seek・native seek rowは `overlay_press_update` を共用し、
-実pressからrelease/取消までの `OverlayPress<T>` が同じResponse Id・viewport・連続logical passを所有する。
-音量と音楽seekのpayloadは `OverlaySliderValue`、native seek rowは既存の `SeekRowGesture`。
-clicked/drag_started/drag_stoppedを確定条件にせず、Pressedのまま届く移動+releaseも最終座標を採用する。
-描かれなかった表示のownerは失効し、古いeguiの押下候補だけでは操作を開始しない。
-入力元は `OverlayPressInput::Native(receipt) / Egui` で入口だけを分け、所有ボタンの終端判定を共通化する。
-音量/音楽seekの表示中の取消は開始値を復元し、native seek rowは§1.192どおり新しいSeekを出さない。
-ビューの閉鎖/非表示による中断は最後の適用値を保持する。
-音楽の既存teardownは音量ownerを破棄し、nativeのsource/モード切替も音量とseek rowを終了する。
-native HUDのhidden cleanupで音量ownerも破棄し、window close時はoverlay自身のdropで終了する。
-detached述語・viewport配送・入力通知は変更しない。§1.440実機退行の検証記録は
-[GPU/HUD作業記録 §12.6](gpu-init-fallback-plan.md#126-実pressから終端までの共通所有2026-10-27)を参照。
-
 §1.387 I1（2026-10-16、v4.7.1の次のリリース向け、実装・自動検証済み）では、CPU logical passの
 中間hiddenによるDComp detachを外し、既存batchの最終visibilityをGPU finalizerへ渡す。
 最終表示・非表示とも既存のclear/submit/Present後にattach/detachを一回だけ適用し、
@@ -2218,8 +2205,8 @@ Seekには0.10秒の間引きを適用せず、最後に送った値と同値な
 drag開始時の原点と鍵ボタンの除外判定は `pointer - total_drag_delta` で押下点を復元して使う。
 HUD hiddenの片付けは従来どおり所有を捨てるだけで、Cancel時のCommit規則を適用しない。
 
-§1.192では音量slider、音楽HUD seek、減光HUDがbutton入力を捨てる既存経路、最初のbatch内で完結するgestureは
-対象外だった。音量/音楽seekは後述の§1.440/§1.441で対応する。GPU不要の実overlay fixtureとbatch targetで自動検証し、実HWND配送は別の実機確認とする。
+音量slider、音楽HUD seek、減光HUDがbutton入力を捨てる既存経路、最初のbatch内で完結するgestureは
+本修正の対象外。GPU不要の実overlay fixtureとbatch targetで自動検証し、実HWND配送は別の実機確認とする。
 
 2026-10-25の未コミット§1.192差分での検証（通常feature、nextest default）:
 
@@ -2230,23 +2217,6 @@ HUD hiddenの片付けは従来どおり所有を捨てるだけで、Cancel時�
   ログ `target/nextest-1192-focused.log`。full lib / test-fullは実行していない。
 - `.\scripts\build-dev.ps1 -PreserveRuntime`: exit 0、core / remote service / EPUB worker生成成功。
   PE検査はruntime=4 / pe=3で成功。通常profileの成果物は起動しておらず、実機確認は未実施。
-
-#### 音量sliderと音楽seekの終端 (§1.440 / §1.441、2026-10-27)
-
-共有 `overlay_slider_value` が実releaseのreceipt座標から最後の値を求める。
-音量のframe跨ぎstateは `OverlaySliderDrag` (押下中/ドラッグ中/取消済み) の単一ownerへまとめ、開始button・開始値・最新値を保持する。
-動画は既存 `NativePointerTermination` をproducerから渡し、音楽はeguiの実releaseとIME非変換中の
-Escapeから同じ型へ変換する。capture喪失等の動画の合成releaseは座標を使わず開始値へ戻す。
-届いたEscapeも開始値へ戻し、その後buttonを離すまではgestureを再取得しない。
-音楽は開始buttonのreleaseだけを選び、同じpassの別buttonや後続moveを値に使わない。
-既存のPrimary以外のdragも保持し、Secondaryのクリックだけでは値変更も0dBリセットもしない。
-eguiがEscapeでResponseのdrag所有を先に外しても、取消のreceiptを処理するまで開始値を保持する。
-音楽seekのstateは実widgetのIdに対応するegui一時データとして保持する。
-既存の上位Escape配送/終了規則は変更せず、HUDへ届いた場合だけ取り消す。
-
-音楽のfocusを保ったcapture喪失はwinit 0.30.13が通知しないため現状維持とする (coordinator判断)。
-新しい取消通知・HWND入力境界やdetached経路は追加しない。
-release後のmove、取消後のrelease、HUDの非対話表示/省略、および§1.192の論理pass境界を回帰検査する。
 
 #### `native_touch.rs` (`NativeTouchAdapter`)
 

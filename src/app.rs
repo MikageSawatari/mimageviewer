@@ -18648,9 +18648,9 @@ pub struct App {
     pub(crate) music_probe: Option<crate::audio_decode::AudioProbe>,
     /// 音楽 HUD 音量フェーダーのドラッグ確定用の frame 跨ぎ state (Inc 5c-B1)。
     /// 動画 overlay の `last_volume_target` と同じ役割。共有の
-    /// `draw_overlay_volume_slider` が開始値・最新値と実pressの所有をまとめて保持し、
-    /// 実 release の位置で確定、取消では開始値へ戻す。
-    pub(crate) music_hud_last_volume_target: Option<crate::video::native_touch::OverlaySliderDrag>,
+    /// `draw_overlay_volume_slider` がドラッグ中に最後の目標値を書き、`drag_stopped`
+    /// で取り出して永続化する。
+    pub(crate) music_hud_last_volume_target: Option<f64>,
     /// 音楽 HUD 速度ボタンのプリセット popup 開閉 (Inc 5c-B2)。動画 overlay の
     /// `video_speed_popup_open` と同じ役割。共有の `draw_overlay_speed_control` が
     /// トグルし、選択 / popup 外クリックで閉じる。
@@ -77175,9 +77175,6 @@ impl App {
     }
 
     pub(crate) fn clear_music_view_state(&mut self) {
-        // Closing/replacing this display ends its slider gesture, retaining the
-        // last volume already applied to settings/player rather than rolling back.
-        self.music_hud_last_volume_target = None;
         if self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor {
             self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
         }

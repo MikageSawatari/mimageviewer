@@ -414,6 +414,9 @@ vendor/egui-wgpu/src/startup_diagnostics.rs
 
 ## 12. §1.429 surface 非対応の Err 終了 (2026-10-27、v4.9.0)
 
+同時に実装した §1.440・§1.441 は利用者判断で v4.9.0 から外し差し戻した
+(経緯・学びは backlog §1.440、試作はブランチ `hud-1440-1441-trial`)。
+
 状態: 実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)。
 現行§1.448の `native_adapter_candidates` は既に `is_surface_supported` で候補を除外し、
 対応候補なしはAdapterSelectionのErrにしているため、候補選択・APIの試行順は変更しない。
@@ -426,7 +429,8 @@ resize/再設定/モニター移動等は変更前のexpectによるpanicへ戻�
 それだけではErr化しない。rootかつrender stateを初めて生成するinstall入口でのみ失敗方針を選び、
 runtime入口は常にpanicとする。新しい永続flag・viewport stateは持たない。
 失敗surface/depth/MSAAを除去して描画を続ける仕組みと、そのためのhelper/testは撤去する。
-起動後の資源寿命は変更前と同じなので、detached計画§11の追加記録は不要 (coordinator判断)。
+起動後の資源寿命は変更前と同じ。共有viewport入口の変更範囲と構造的修正の合意は、
+ClaudeCodeが `ce2e15760` で `docs/detached-rework-plan.md` §11へ記録済み。
 初回rootのErrは既存のrun_native終了処理でPainterごと終了し、続行や再試行はしない。
 
 coordinator判断: 既定uncaptured-error handlerのpanicは今回は変えず、起動中止の伝播経路を追加しない (§1.448と同じ)。
@@ -437,78 +441,40 @@ GPU不要のfailure injectionは `require_surface_configuration(None, ...)` で�
 Err/GPU名/段階と成功値・startup通知の範囲をvendorテストで検査し、製品側では通知本文・ログへの接続を検査する。
 実HWNDによるsurface失敗注入flagは追加せず、製品は起動しない。
 
-検証結果と同時実装のHUD回帰は以下。本体lib全件・build-dev・独立レビューはClaudeCodeへ引き継ぐ。
+§1.429の検証結果は以下。本体lib全件・build-dev・独立レビューはClaudeCodeへ引き継ぐ。
 
-### 12.1 同時実装の§1.440/§1.441
+### 12.2 初回実装の自動検証 (8cbf9e38e時点の履歴)
 
-- 確認した原因: 共有音量sliderは `drag_stopped` で最後のMove値を保存し、音楽seekは `clicked || dragged` だけで更新していた。
-  双方ともreleaseフレームだけ位置が変わる場合に最終値を取りこぼす。音量は `src/video/native_presenter/overlay_draw.rs`、音楽seekは `src/ui_music_panels.rs`。
-- `NativePointerTermination` と既存§1.192のreceipt判定を共通入口へ寄せ、動画のproducer receiptと音楽のegui実releaseを同じ `overlay_slider_value` へ渡す。
-  押下中/ドラッグ中/取消済みと開始button・開始値・最新値は `OverlaySliderDrag` が所有する。実releaseはreceiptの位置で確定し、取消は開始値へ戻す。
-- 音楽seekのwidget所有がEscapeで先に消えても、取消receiptの処理前に開始値を捨てない。取消後のmove/releaseから再取得しない。
-  音楽のfocusを保った未通知capture喪失は現状維持、上位Escapeの配送/終了規則は変更しない (coordinator判断)。
-- 前回8cbf9e38eで加えたテストは10関数: native実overlay/batchでrelease→後続moveとcapture喪失/Escape、音楽実HUD行でrelease→後続move/別buttonとEscape、
-  音楽seek handlerでrelease/Escape (HUD計5関数)。Primary/Secondaryのdragを維持し、Secondaryのクリックだけでは値変更しないことも同じfixtureで検査する。
-  製品失敗通知のGPU名/SurfaceCapabilitiesが1関数、vendorのNone注入/成功値・通知範囲とinstall失敗時の自context除去/成功時の資源保持が4関数。
-  §1.192の既存pass境界・省略/非対話HUD・§1.448/§1.428の既存回帰も維持する。
-  このうちruntimeの失敗資源除去に関する2関数は、独立レビューP2の方針変更に従い撤去した (§12.4)。
-
-### 12.2 旧動作でのREDと自動検証 (8cbf9e38e時点の履歴)
-
-HEAD `7a8a25b06`、ブランチ `hud-gpu-1440-1441-1429` の未コミット差分を検証。全build/testで `MSBUILDDISABLENODEREUSE=1`。
+基準 `7a8a25b06`、ブランチ `hud-gpu-1440-1441-1429`。全build/testで `MSBUILDDISABLENODEREUSE=1`。
 初回native依存を直列で用意した後、最終検証は `CARGO_BUILD_JOBS=24`。
-コマンド全文・exit・所要時間は `target/hud-gpu-validation/*.json`、stdout/stderrは対応する `.log` に保存。
+コマンド全文・exit・所要時間は `target/hud-gpu-validation/*.json`、出力は同名logへ保存した。
 
-`red.py` はHEADの旧音量関数を原文のまま同じmoduleへ置き、新しいstate引数だけ互換shimで接続した。
-音楽seek handlerも旧 `clicked || dragged` の判定/位置計算へ差し替えた (抽出後の引数名だけ対応)。
-全checkoutを旧版へ戻した試験ではない。コンパイル成功後、同じHUD新規5件が全てassertionで失敗 (nextest exit 100)。
-現在の実装へ戻した2ファイルは前後のSHA-256が一致 (`red_restore.json`)。現実装では5件成功し、さらに関連nextestへ含めて検査した。
+§1.429では製品失敗通知のGPU名/SurfaceCapabilitiesの検査と、vendorのNone注入/成功値/通知範囲を追加した。
+初期案のinstall失敗時の資源除去/成功時の保持テストは、独立レビューP2の方針変更で撤去した (§12.4)。
 
 | 検証 | exit | 結果 |
 | --- | ---: | --- |
-| cargo fmt (引数なし) | 0 | exit 0。`fmt-complete.log` |
-| 通常core check | 0 | exit 0。`check-complete.log` |
-| test-script core check | 0 | exit 0。`check-script-complete.log` |
-| 関連nextest (通常、§1.192/§1.448/§1.428を含む) | 0 | 726件、726 passed, 13890 skipped。`focused-complete.log` |
-| 関連nextest (test-script) | 0 | 35件、35 passed, 14727 skipped。`focused-script.log` |
-| cargo test -p mimageviewer --test ui_snapshot | 0 | 213成功 / 0失敗。`snapshot.log` |
-| egui-wgpu nextest (winit / lib、全件) | 0 | 49件、49 passed, 0 skipped。`vendor-complete.log` |
-| 変更vendorのrustfmt --check | 0 | exit 0。`vendor-fmt.log` |
-| viewer context audit (再ビルド済みtoolを最新ソースへ実行) | 0 | 指摘0件。`audit-complete.log` |
-| cargo fmt --check | 0 | exit 0。`fmt-check.log` |
-| UI glyph check | 0 | 危険グリフ0件。`glyphs-complete.log` |
-| git diff --check | 0 | exit 0。`whitespace.log` |
+| cargo fmt (引数なし) | 0 | `fmt-complete.log` |
+| 通常core check | 0 | `check-complete.log` |
+| test-script core check | 0 | `check-script-complete.log` |
+| cargo test -p mimageviewer --test ui_snapshot | 0 | 213成功。`snapshot.log` |
+| egui-wgpu nextest (winit / lib、全件) | 0 | 49件成功 (初期案)。`vendor-complete.log` |
+| 変更vendorのrustfmt --check | 0 | `vendor-fmt.log` |
+| viewer context audit | 0 | 指摘0件。`audit-complete.log` |
+| cargo fmt --check / UI glyph / git diff --check | 0 | `fmt-check.log` / `glyphs-complete.log` / `whitespace.log` |
 
-途中の非ゼロ結果も成功扱いにしない:
+最初の通常check/lib testビルドはturbojpeg-sysのCMake `--parallel 24` がexit 1。
+Cargo並列数1でnative前提を構築した後に再検査した。失敗を成功扱いにはしていない。
+headless unit/fake-input/offscreenのみで、実環境の非対応surfaceと実MessageBoxの表示は未確認。
 
-- 最初の通常check / lib testビルドはturbojpeg-sysのCMake `--parallel 24` がexit 1。Cargo並列数1でnative前提を構築した後に再検査した。
-- 実装途中の通常checkに `insert_temp` の戻り型とunitの不一致が1件あり修正済み。
-- 新規HUDの初回は4成功/1失敗。音楽seekテストのf32丸めに対する期待値を、正確に表せる50/75秒の座標へ修正した。
-  次の実行でEscape時の開始値破棄を検出し、receipt優先の所有解除順へ修正した。最終結果は上表。
-- 最初のRED準備scriptはCRLFの境界検索で停止 (テスト未実行)。newlineを正規化し、finallyで原本bytesを復元する形で再実行した。
-- ボタン所有を追加した途中のcompileで、別helperのPrimary参照へ置換が及んだE0425が1件あり、その行を原状へ戻した。
-  その置換によるoverlay_draw.rsの差分はslider領域だけと確認し、開始buttonを保持したPrimary/Secondary両方の回帰を追加して再検査した。
-
-全てheadless unit / fake-input / offscreen検証。実HWND配送・実環境での非対応surface・最初の失敗ダイアログの実表示は未確認。
-製品バイナリは起動せず、通常profileの設定DBなどをテスト準備で操作していない。依頼どおり本体lib全件とbuild-devは未実施。
-uncaptured-error handlerの既定panicと音楽の未通知capture喪失は、追加判断待ちではなくcoordinator採択済みの維持範囲。
-
-### 12.3 前回実装8cbf9e38eの変更ファイル (16ファイル)
+### 12.3 §1.429の変更ファイル (基準7a8a25b06)
 
 ```text
 docs/README.md
+docs/detached-rework-plan.md
 docs/gpu-init-fallback-plan.md
-docs/keymap-spec.md
 docs/next-release-backlog.md
-docs/video-architecture.md
-src/app.rs
 src/run_native_failure.rs
-src/ui_music_panels.rs
-src/ui_music_panels/slider_tests.rs
-src/video/native_presenter/overlay_draw.rs
-src/video/native_presenter/render_core.rs
-src/video/native_presenter/slider_terminal_tests.rs
-src/video/native_touch.rs
 vendor/egui-wgpu/PATCHES.md
 vendor/egui-wgpu/src/lib.rs
 vendor/egui-wgpu/src/winit.rs
@@ -525,9 +491,8 @@ vendor/egui-wgpu/src/winit.rs
   同じGPU名/段階/ログフォルダーを含む通知本文が届くことを検査する。scripted_runでも保存し、通知だけを抑止する。
   OnceLockを隔離する単体テスト子processを用い、製品exe・HWND・実MessageBox・通常profileは使わない。
   logger.rsのdependency target filterを広げず、製品の直接logger::log経路で保存されることを確認する。
-- P3 (タッチ): 音楽HUDのMove=A/End=BでAが採用される残件は§1.441へ明記した。native動画側はBを使う。
-  全eguiタッチへの影響を避けるcoordinator判断に従い、v4.9.0ではegui-winitのTouch End処理を変更しない。
-- P3 (detached記録): 起動後のviewport資源寿命の変更を撤去したため、§11への追加記録は行わない。
+- P3 (detached記録): ClaudeCodeが `ce2e15760` で§11に記録済み。
+  初回rootとruntimeの失敗契約を分ける共有入口の変更範囲、および独立レビュー/ClaudeCodeの構造的修正としての合意を残している。
 
 §12.2は前回の検証履歴。今回の最終結果は以下 (HEAD 8cbf9e38eからの未コミット差分)。
 全build/testでMSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=24。
@@ -557,175 +522,36 @@ MessageBoxのOS呼出だけをcaptureへ置換し、保存済みのファイル�
 vendorはNone注入で初回root Err、child/root再設置のpanic、起動観測pending中でもruntimeはpanicであることを検査した。
 以前の資源除去/保持に関する2件を撤去し、限定方針の検査1件を追加したためvendor全件は49→48件。
 
-HUDコードとegui-winitのタッチ処理は変更していない。起動後の資源寿命を戻したためdetached計画§11の追加記録なし。
+起動後の資源寿命は従来どおり。共有viewport入口の契約変更はdetached計画§11に記録済み。
 製品は起動せず、通常profileをテスト準備で操作していない。本体lib全件/build-devは前回同様ClaudeCodeへ引き継ぐ。
 実GPUでの非対応surfaceと実MessageBoxの表示は未実施。既定uncaptured-error handlerは変更しない。
 
-今回の変更ファイルは6件:
+#### §1.429単独の再検証 (2026-10-27)
 
-```text
-docs/README.md
-docs/gpu-init-fallback-plan.md
-docs/next-release-backlog.md
-src/run_native_failure.rs
-vendor/egui-wgpu/PATCHES.md
-vendor/egui-wgpu/src/winit.rs
-```
+指定の8ファイルを `git show 7a8a25b06:<path>` のbytesへ復元し、追加テスト2ファイルを削除した。
+§1.429のコードと保存ログ/通知テスト、vendor patch、README、detached記録は差し戻し前のハッシュと一致させる。
+撤回した型/helperへの依存がsrc/vendorに残っていないことと、単独でのcompile/testを検査する。
+差し戻し後の最終検証は以下。全段で `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=24`。
+実引数・exit・所要秒は `target/hud-gpu-validation/rollback-*.json`、出力は同名logへ保存した。
 
-
-### 12.5 §1.440 表示を閉じた後の古いドラッグ所有 (2026-10-27)
-
-ClaudeCodeが隔離data-dirのbuild-dev (`ce2e15760`) で、音量ドラッグ中にEscで音楽ビューを閉じ、
-一覧でreleaseして再び開くと、再生ボタンのclickで音量が最小になる退行を2回観測した。
-修正前master (`3dbd94a6e`) では再現しなかった。Codexによる製品起動・実機確認ではない。
-原因はAppの音量ドラッグ状態が表示終了後も残り、共通helperが別Responseのreleaseを確定値にしたこと。
-音楽seekにも、eguiが保持するdragged Idによって非表示後の操作を再開する同型があった。
-
-修正の所有規則:
-
-- `OverlaySliderOwner` はResponse Id / viewport / logical passを持つ。連続した描画だけが同じ操作を継続し、
-  省略されたpassで表示寿命が終わる。失効した保管値は入力処理より先に退役し、releaseにも移動にも使わない。
-  非表示を逐一通知するcallback・新しいApp flagは追加せず、所有ticket自身の有効範囲で終了を表す。
-- 実際のpressでPressedを作り、そのResponseのdrag開始から継続したActiveだけが開始buttonの実releaseで
-  release座標を採用する。eguiの古いdragged Idや、HUDの別ボタンのreleaseでは再開/確定しない。
-  音量と音楽seekで同じhelperを使い、seek側にあった別の失効判定は撤去した。
-  eguiのdrag_stoppedは別buttonのreleaseでも立つため、終了の正本はResponse所有ticketとtyped receiptにする。
-  別buttonを途中で押して離しても、開始buttonのreleaseまで所有を保持する回帰も追加した。
-- ビュー終了はmasterに合わせ最後に適用した値を保持する。音楽teardownで音量ownerを破棄し、
-  nativeのsource/モード切替で音量・seek rowの所有を終了、hidden cleanupで音量も破棄する。
-  window closeはoverlayのdropで終了する。native seekの既存hidden cleanupとstrip取消規則は維持する。
-- 表示中に届いたEscape/capture取消の開始値復元、音楽の未通知capture喪失、音楽Touch End未対応は前回どおり。
-  keymap、detached述語、viewport配送、GPU surface、永続データ形式は変更しない。
-
-回帰テストはheadlessの実Responseとnative CPU logical passを使用する。
-最初のREDでは追加した音量/seekの2件が `ce2e15760` の製品コードで失敗した (compile成功、2 failed)。
-記録: `target/hud-gpu-validation/lifecycle-red.{json,log}`。
-
-最終REDは、実装5ファイルだけを `git show ce2e15760:<path>` の内容へ一時差し替え、
-追加した6テストすべてが失敗した (compile成功、0 passed / 6 failed)。App close→reopen→再生clickも
-保持値 `0.8058421877614819` が `0.0` になることを検出した。
-`lifecycle-red-final.{json,log}` が実行記録、`lifecycle-red-restored.json` が実装5ファイルの
-byte単位の復元SHA-256証跡。復元後、press-onlyの中断と同一passの新規clickの分岐も追加してGREEN側で検査した。
-
-最終検証は全段で `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=24`。
-command/実exit/所要秒は `target/hud-gpu-validation/lifecycle-*.json`、出力は同名logへ保存した。
-本体lib全件/build-dev/実アプリ再確認はClaudeCodeの担当。製品起動・gitの書き込みは行っていない。
-viewer context auditは既存の同一tool sourceからビルド済みのexeで現在の作業ツリーを検査した。
-
-| 検査 (log/json basename) | exit | 結果 |
-| --- | --- | --- |
-| lifecycle-fmt-final | 0 | 成功 |
-| lifecycle-check | 0 | PASS (cargo check) |
-| lifecycle-check-script | 0 | PASS (cargo check --features test-script) |
-| lifecycle-nextest | 0 | Summary [  16.401s] 747 tests run: 747 passed, 13877 skipped |
-| lifecycle-nextest-script | 0 | Summary [   2.743s] 54 tests run: 54 passed, 14716 skipped |
-| lifecycle-snapshot | 0 | test result: ok. 213 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.69s |
-| lifecycle-audit-final | 0 | 成功 (audit/glyphは0件) |
-| lifecycle-fmt-check | 0 | 成功 |
-| lifecycle-include-fmt-check | 0 | 成功 |
-| lifecycle-glyphs-final | 0 | 成功 (audit/glyphは0件) |
-| lifecycle-diff-check | 0 | 成功 |
-
-関連nextestは既存§1.192/§1.428/§1.448の範囲に今回のHUD表示寿命・音楽full-width HUD・既存music teardownテストを追加した。
-normal/test-scriptで共通helper、実release最終座標、Escape/capture取消、右drag、中断/reopen、source/モード切替を検査した。
-UI snapshotは見た目の変更を伴わず全件成功。vendorコードは変更していないため前回のegui-wgpu結果をそのまま保持する。
-実機再確認は未実施。音楽Touch Endの既知制限と未通知capture喪失の割り切りは今回も変更していない。
-
-今回の変更ファイル (11件):
-
-```text
-docs/gpu-init-fallback-plan.md
-docs/next-release-backlog.md
-docs/video-architecture.md
-src/app.rs
-src/ui_fullscreen.rs
-src/ui_music_panels.rs
-src/ui_music_panels/slider_tests.rs
-src/video/native_presenter/overlay_draw.rs
-src/video/native_presenter/render_core.rs
-src/video/native_presenter/slider_terminal_tests.rs
-src/video/native_touch.rs
-```
-
-
-### 12.6 実pressから終端までの共通所有 (2026-10-27)
-
-`5bb71527b` の独立レビューP2-1/P2-2をcoordinatorの最終方針に従って修正する。
-前回はPressedのreleaseにclickedを要求し、native seekはdrag_started前の押下を所有しなかった。
-そのため初回Move+releaseが同じpassに入ると音量/seekを落とし、native seekのreset後に古い押下からSeekできた。
-追加した4テストは同commitの製品コードでcompile成功後、4件すべて失敗した。
-記録: `target/hud-gpu-validation/press-red.{json,log}`。
-
-#### 所有の型と入口
-
-`Option<OverlayPress<T>>` だけがpressの有無を表す。pressにはResponse Id/viewport/pass、開始button/座標/時刻、
-Pressed/Draggingの移動分類、payloadを保持する。取消済みを別stateで保持せず、release/取消でNoneへ終端する。
-既存の `OverlaySliderDrag` は `OverlayPress<OverlaySliderValue>` のaliasへ置き換えた。
-移動分類は所有pressの距離/経過時間とegui設定のclickしきい値で一度Draggingへ進み、eguiのframe別フラグで再判定しない。
-primaryの実releaseはPressedのままでも採用し、右クリック単独はno-op、右dragは最終座標を採用する。
-
-全経路の生成・更新・終端は `native_touch::overlay_press_update` を通す。
-生成時だけResponseのhit-test associationと実PointerButton pressを使う。
-終端時はその所有と開始buttonのtyped receiptだけを使い、clicked/drag_started/drag_stoppedを条件にしない。
-release位置を後続PointerMovedで置き換えず、Cancelledの合成座標も使用しない。
-`OverlayPressInput::Egui` は開始buttonを確定してから既存 `NativePointerTermination::from_egui` を呼び、
-`Native(receipt)` はnative producerが決めたReleased/Cancelledを維持する。新しいwinit通知は足さない。
-
-| 経路 | 所有payload | 入力・処理の経路 |
-| --- | --- | --- |
-| 動画HUD音量 | OverlaySliderValue (開始値/最新値) | draw_overlay_volume_slider → overlay_slider_value → overlay_press_update(Native) |
-| 音楽HUD音量 | OverlaySliderValue | draw_music_playback_row → 同じ音量描画/value helper → overlay_press_update(Egui) |
-| 音楽HUDseek | OverlaySliderValue | music_seek_slider_value → overlay_slider_value → overlay_press_update(Egui) |
-| native seek row | SeekRowGesture | row描画 → overlay_press_update(Native) → 既存縦strip/横scrub判定、releaseはfinish_native_seek_row |
-
-native seekのclickだけの独立分岐を撤去した。押下直後からownerが存在するので、既存source/モードresetとhidden cleanupで
-押下のみ/Draggingの両方を終了し、残ったegui候補からrelease/移動が来ても新しいpressなしでは再開しない。
-native seek strip本体の§1.192の所有・軸・取消規則は変更しない。
-音量/音楽seekのpreview取消は開始値復元、native seek取消は新しいSeekなし、閉鎖/非表示は最後の適用値保持を継続する。
-永続データ、detached述語、viewport経路、既知の音楽Touch End制限、未通知capture喪失の割り切りは変更しない。
-
-複数のeguiフラグを組み合わせて例外を補う案は採らず、実press一件のownerへ統合してclick/dragの所有を分けない。
-初回compileでvendor egui 0.37のContext::style呼び出しがE0599になり、現行style_of(theme)へ修正した。
-移行途中のfocusedは39件中38成功/1失敗で、別buttonのrelease時に静止したHeld更新を余分に返す点を検出した。
-共通helperで静止passはownerの更新だけにし、右click単独の非activation判定も共通helperへ置いた。
-修正後の全関連テストは以下のとおり成功した。
-
-全段で `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=24`。
-command/実exit/所要秒は `target/hud-gpu-validation/press-*.json`、出力は同名log。
-
-| 検査 | exit | 結果 | log/json basename |
+| 検証 | exit | 結果 | log/json basename |
 | --- | --- | --- | --- |
-| cargo fmt (no arguments) | 0 | PASS | `press-fmt` |
-| cargo check -p mimageviewer --bin mimageviewer-core | 0 | PASS | `press-check` |
-| cargo check -p mimageviewer --bin mimageviewer-core --features test-script | 0 | PASS | `press-check-script` |
-| related nextest (normal) | 0 | Summary [  16.690s] 751 tests run: 751 passed, 13877 skipped | `press-nextest` |
-| related nextest (--features test-script) | 0 | Summary [   2.808s] 58 tests run: 58 passed, 14716 skipped | `press-nextest-script` |
-| cargo test -p mimageviewer --test ui_snapshot | 0 | test result: ok. 213 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.50s | `press-snapshot` |
-| viewer_context_audit | 0 | PASS (0 findings) | `press-audit-final` |
-| cargo fmt --check | 0 | PASS | `press-fmt-check` |
-| included native test rustfmt --check | 0 | PASS | `press-include-fmt-check` |
-| UI glyph check | 0 | PASS (0 findings) | `press-glyphs-final` |
-| git diff --check | 0 | PASS | `press-diff-check` |
+| cargo fmt (no arguments) | 0 | PASS | `rollback-fmt` |
+| cargo check -p mimageviewer --bin mimageviewer-core | 0 | PASS | `rollback-check` |
+| cargo check -p mimageviewer --bin mimageviewer-core --features test-script | 0 | PASS | `rollback-check-script` |
+| related nextest (normal: sections 1.429/1.428/1.448/1.192) | 0 | Summary [  15.427s] 723 tests run: 723 passed, 13890 skipped | `rollback-nextest` |
+| related nextest (--features test-script) | 0 | Summary [   1.621s] 53 tests run: 53 passed, 14706 skipped | `rollback-nextest-script` |
+| egui-wgpu nextest (winit / lib, all tests) | 0 | Summary [   2.955s] 48 tests run: 48 passed, 0 skipped | `rollback-vendor` |
+| cargo test --test ui_snapshot | 0 | test result: ok. 213 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.94s | `rollback-snapshot` |
+| viewer_context_audit | 0 | PASS (0 findings) | `rollback-audit` |
+| cargo fmt --check | 0 | PASS | `rollback-fmt-check` |
+| vendor rustfmt --check | 0 | PASS | `rollback-vendor-fmt` |
+| UI glyph check | 0 | PASS (0 findings) | `rollback-glyphs` |
+| git diff --check | 0 | PASS | `rollback-diff-check` |
 
-通常関連filterは前回範囲にhud_press_の4件を追加し、既存§1.192/§1.428/§1.448、close/reopen、
-Esc/capture取消、右drag、別buttonのrelease、source/モード切替、音楽HUDレイアウトを検査した。
-UI snapshotは変更なしで全件成功。auditは同一tool sourceのビルド済みexeで現在の作業ツリーを検査し0件。
-最終Rust source hashは `press-final-source.json`、照合は `press-source-verified.json`。
-native UIの大きいclosure内のレイアウト/任意末尾commaだけを整形し、式・文が変わっていないことも照合した (`press-layout-only.json`)。
-それ以外の実装/回帰sourceは最終gate開始後に変更していない。
-製品起動・gitの書き込みは実施していない。本体lib全件/build-dev/実機再確認はClaudeCode担当。
-
-変更ファイル (10件):
-
-```text
-docs/gpu-init-fallback-plan.md
-docs/next-release-backlog.md
-docs/video-architecture.md
-src/app.rs
-src/ui_music_panels.rs
-src/ui_music_panels/slider_tests.rs
-src/video/native_presenter/overlay_draw.rs
-src/video/native_presenter/render_core.rs
-src/video/native_presenter/slider_terminal_tests.rs
-src/video/native_touch.rs
-```
+基準8ファイルのbytesとdiffが一致し、削除対象2ファイルが存在せず、保持対象6ファイルのSHA-256も一致した。
+証跡は `rollback-restore.json` / `rollback-scope-verified.json`。基準から残る差分は§12.3の8ファイルだけ。
+§1.429は撤回した機能の型/helperへの参照を持たず、単独構成で検査した。
+§1.429は通常/test-scriptの両方でcompileし、実logger保存/通知の検査とvendorの初回root Err/runtime panic範囲の検査も成功した。
+実環境の非対応surfaceと実MessageBox表示は未実施。製品起動・gitの書き込みは行っていない。
+本体lib全件/build-dev/実機確認は従来どおりClaudeCodeへ引き継ぐ。
