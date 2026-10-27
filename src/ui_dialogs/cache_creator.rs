@@ -52,6 +52,7 @@ impl App {
             let escape_pressed = self.dialog_escape_pressed(ctx);
             let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
             egui::Window::new("キャッシュ作成")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
@@ -70,6 +71,10 @@ impl App {
                             let fav_scroll_h =
                                 (ctx.content_rect().height() - 260.0).min(480.0).max(80.0);
                             egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
                                 .id_salt("cache_creator_favs")
                                 .max_height(fav_scroll_h)
                                 .auto_shrink([false, true])

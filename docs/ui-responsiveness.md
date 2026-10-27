@@ -400,6 +400,29 @@ Resumed の親 mtime ふるい、通知時のふるい bypass、走査中通知�
 新しい P2 が出続けた。mtime だけの再走査を無視する最小設計で、開いている一覧の代表も安定するため、
 session state／catalog／Remote・IPC の変更を避ける。
 
+次の版の設計変更 (利用者2026-10-13夜、R10・LISTrev13独立設計レビューACCEPT・実装／自動検証完了、2026-10-14):
+[§1.375 R10](section375-operation-reconcile-plan.md) は前回／今回の走査の行signature
+（名前・種類・サイズ・更新日時・投影後順序）をworkerで比較し、一致時だけinstall・世代更新・
+install起因thumb再要求を省く。UIは元context・source・世代・投影条件と前回記録の有効性を確認する。
+全表示snapshot・DB metadata共有storage・UI全件clone・追加同期I/Oを使わない。
+Delete成功行の除去は同じownerの前回記録へ反映し、非表示候補の繰上げは今回走査の差分として扱う。
+購読・dirty／cutoff・rescan・記録を元contextに閉じ、forkは記録を継承して新ownerへ束縛し、
+R10当時は独立購読を登録後scanで始めた。2026-10-15の[C1追補](detached-snapshot-reader-plan.md)では
+非main readerの受動購読を開始せず、promote時もwatch／受動scanを既存workerへ退役する。
+main／linkedの観測と兄弟のdirty／要求は維持し、能動Operation／BookAppend系の終端・保留は残す。
+sidecar stampと別context／RemoteのDB反映資格は判定外。自動更新ではsidecarを取込まず、
+未反映のDB値・外部sidecarは明示GridReload／開き直しで反映する。defer→一覧復帰・restart・
+Resumedでも自動originを保持し、その直後の明示更新／通常openは設定どおり取込む対照試験を行う。
+実Folder mtime-onlyの観測値と表示metadata・sort・代表要求stampの分離（§1.314）は維持する。
+代表選択保持・cache key／payload変更・旧cache移行は撤回し、CPU／GPU eviction・予算・
+画像／保存両終端・request ID相関を変更しない。install省略中は現在の画像と要求が残るが、
+通常のeviction後再読込・idle upgrade等で代表は変わってよい。手動pin設定は解除しない。
+1万／10万行でUI／worker時間・割当量・install回数、Delete後の描画／scroll時の同期DB query数を
+測定済み。opt-level=2の100k行初回記録はmedian 8.353／max 10.949 ms、worker比較0.717 ms。
+Equal UI pollはdebug 0.551 ms、Delete後のheadless描画／scrollの同期DB read差分0回。
+constructor単体・headless測定であり実アプリの最大frameを示さない。自動gateと最新dev成功、
+実機確認待ち。詳しい条件・全結果は設計書§8.2へ残し、旧方式の結果をR10の受入証拠に流用しない。
+
 ## 3. GPU テクスチャアップロード
 
 `ctx.load_texture(name, ColorImage, options)` は UI スレッドで同期実行され、内部で
@@ -447,6 +470,35 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 ---
 
 ## 4. 新機能追加時のチェックリスト
+
+紙めくり D3（2026-10-19）は一般 final の CPU 処理と表示 clamp を既存 final-effect worker へ置く。
+投機 CPU permit は実終了まで1件、結果予約は context 1 unit／全体2 unit／1GiB。表示要求は投機枠を
+待たず、検証済み CpuReady の引取りまたは同期 takeover を行う。未実体化の編集・comic は従来経路を維持する。
+非共有 final 登録と Native prewarm は native wgpu ROOT の全 retry 後の最終 output hook に限定し、
+演出の live dispatch／当該 frame の演出活動と排他、App 共通で新規投機 allocation は outer frame 当たり1件。
+通常 producer や source／AI 先読みを止めてこの枠へ合わせない。
+Native canonical 収集・再照合は既存 installed topology の証拠／索引と resident metadata だけを読み、
+cold DB 回転 read・余白検出・全頁走査／slideshow 列の再構築を追加しない。証拠不足なら投機を見送る。
+CPU需要用resolverに残っていた全頁走査・mixed slideshow列再構築は、D3-5で既存unit owner内の派生cacheへ移す。
+coldだけ現reader order／visible基準との整合と索引を作り、warmはscalar／Arc identity／逆索引で読む。
+需要縮小、visible token／receipt置換、別owner追加で解消せず、共通adoptionでROOT直接経路も覆う。
+準備・登録・配送 submit・Native submit は GPU 実完了とは区別する。解析は
+`python scripts/analyze_perf.py <perf.jsonl> page-turn-d3`、完了範囲・残る停止と正式 gate 未実施は
+[page-turn 計画 §27.17.17](page-turn-animation-plan.md) を参照。
+
+§1.405は全live Nextのfinal/Native成立後だけPreviousを補完する。ROOT最終hookからのCPU開始は
+resident-only Previousの最大1件に限定し、Next通常producer位置は維持する。通常UI/input/permission/
+decode/materialization/DB/font読取へ再入しない。Previousのkeep包含は既存索引とwhole-unit追加規則で証明する。
+Next CPUの実予約不足時だけ、予約表最大2 unitからparkedも訪問して低優先の完成結果を回収し、一度だけ再試行する。
+実計算中のpermit/予約、Current/Next共有素材、表示昇格、legacy、Unknown、held/receipt/batchは保護する。
+Previous Nativeはsmoothing/旧source/容量規則すべての既存entry除去ゼロを、claim等より前と実行入口で検査する。
+新しい全頁・全registry走査、待機、timer、repaintは追加しない。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
+
+本の構成editor（§1.242 G4、next-book）はsource列挙/保存前fingerprint/保存待ち/thumbnail decodeを
+workerへ置く。純粋UIは元ページ・unit・変更previewをvirtualizedで描き、可視thumbnail要求は最大24件。
+全ページの名前・参照map・hidden状態をframeごとに作り直さず、draft変更時のviewを再利用する。
+thumbnail結果はeditor寿命のownerへだけ採用し、背景viewerのqueue/cacheへ要求を混在させない。
+この設計説明は実測結果の代わりではなく、実行証拠は[本の構成計画](book-composition-plan.md)の検証記録を参照する。
 
 機能追加・変更で以下を触るときは、この順で確認する。
 
@@ -496,15 +548,16 @@ OS が諦めるまで UI をブロックし得る。この制約は利用者が�
 
 ### 4.2 意図的な例外: native ファイル D&D のモーダルブロック
 
-ファイル D&D 送出 (`src/file_drag.rs::start_file_drag`) は `SHDoDragDrop` を UI
-スレッドで呼び、ドロップ完了 / キャンセルまで戻らない。`App::update` がその間
-ブロックするが、これは **§1 の禁止対象ではない** — バックグラウンド I/O ではなく、
-ユーザーが明示的に開始したモーダル操作であり、エクスプローラ含め全アプリ共通の
-標準挙動 (ドラッグ元ウィンドウはドラッグ中固まって見えるのが正常)。`SHDoDragDrop`
-自体が独自メッセージループを回すため OS レベルの応答性は保たれる。worker 化は
-不可能 (`DoDragDrop` 系は呼び出しスレッドにマウスキャプチャを要求する)。
-詳細は `docs/file-drag-drop-design.md` §6.2。perf ログを汚さないよう、実行は
-`update` 末尾 (frame_total 計測の後) に置いている。
+ドラッグ操作の OLE モーダル区間は残る。非同期を選択して Drop から早期復帰する target では、
+その後の転送完了を待たない。非対応 target の同期処理と開始前の Shell 解決コストも残る。
+
+ファイル D&D 送出 (`src/file_drag.rs::start_file_drag`) は `SHDoDragDrop` を UI STA から
+呼び、実行中は `App::update` が戻らない。意図的な例外は OLE モーダル区間であり、
+ドロップ後の長いコピー待ち全体を不可避とはしない。送出 object の
+`IDataObjectAsyncCapability` で非同期を交渉し、復帰後は通常の winit message loop で
+STA 宛ての COM 呼び出しを配送する。source 側へ独自 pump・転送完了待ち・周期 repaint は足さない。
+詳細は `file-drag-drop-design.md` §6.2 / §12。実行は従来どおり `update` 末尾
+(frame_total 計測の後) に置き、通常の file_drag ログへ所要時間と InOperation を残す。
 
 ### 4.3 大量一覧の target 構築も分割し、scroll では再走査しない
 
@@ -530,6 +583,12 @@ target clone を全件に行っていた。さらに可視優先範囲が移る�
   記録する。scroll のたびに `target_scan_done.items=500000` が増えていないことを確認する。
 
 ### 4.4 コレクションの区間計測
+
+ナビゲーション preflight の PDF 列挙は前面の要求として既存の Critical 列挙・合流を使う。
+v4.2.0 の staged 化で背景用 Normal に流れていたため、旧本の HighNormal サムネイルを
+待つ退行があった。同期待ちは preflight worker 上だけで行い、結果／取消通知の channel
+select で待ち手単位に離脱する。background 列挙の優先度や pool の admission caps は変えない。
+詳細は [非同期構成](async-architecture.md) の PDF 列挙を参照。
 
 `--perf-log` の `cat="collection"` は、Grid / 管理画面 / Remote の `actor_rtt`、
 Grid `prepare` の `stage=classify/sidecar_scan/pin_db/identity`、UI `install`、

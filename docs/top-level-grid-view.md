@@ -9,8 +9,8 @@ Everythingは新しい最上位surfaceを増やさず `TopLevelGridView::Search`
 取得/prepare中はmainだけのmodalとし、完成payloadだけを既存adoption closureで一回公開する。
 
 Everythingのaccepted位置は `Root` / `PhysicalChild { logical_source, return_anchor, route }`。
-Rootからの物理ZIP/PDF/EPUB/変換書庫openは通常経路へ委譲し、実際に物理表示が採用された境界でだけ
-childへ進む。内部ZIP階層は既存zip navを使い、外側の帰路は保持datasetを共通prepareで再投影する。
+Rootからの実フォルダ・画像フォルダ本・物理ZIP/PDF/EPUB/変換書庫のmain openは通常経路へ委譲し、実際に物理表示が採用された境界でだけ
+childへ進む。Parentは内部ZIP階層を既存zip navで戻り、effective_folderがlogical_sourceの厳密な物理子孫なら通常の親移動、起点なら保持datasetを共通prepareで再投影する。Resultsボタンは途中階層を飛ばして結果へ直帰する。独立viewer openではmainのRootを維持する。
 その復帰でIPC、元queryの再実行、新しいorigin captureをしない。検索終了は既存close/restoreを通す。
 
 sort/★/tag/編集準備の入力はimmutable datasetと送信時stampであり、表示中itemsを第二の正本にしない。
@@ -54,6 +54,48 @@ Delete と右クリック削除は元ファイル操作へ流さず DB 行だけ
 context が所有し、detached / ParkedLive への移動後に main context へ取り残さない。戻り先 state は
 開く直前の stable row ID 列、選択 ID、スクロール offset も所有する。非同期再構築後の ID 列が同一なら
 offset をそのまま復元し、増減・並べ替えがあれば開いた ID を選択して ensure-visible する。
+
+### セッション内のグリッド位置（§1.328）
+
+通常フォルダの位置は既存の `folder_history` が持つ。レーティング一覧（★段ごと）、閲覧履歴、
+サブ展開の位置は viewer context の `TopLevelGridView` が `SessionGridPosition` として所有する。
+選択の安定キー・scroll offset・確定 Auto 比率の seed を対にし、古い index-keyed samples は持ち越さない。
+サブ展開は正規化した root / roots が一致する位置だけを復元する。位置を restore snapshot や
+`SubfolderExpansionRestoreState` に複製せず、context の Clone / fork には継承しない。
+「場所を忘れる」は `clear_session_grid_positions` でこれらの位置を消す。永続データは変更しない。
+
+保存境界は二つに分ける。検索入口、★一覧を閉じる入口、非同期 Collection 入場の入口では
+`note_session_grid_positions` で暫定保存し、元の行を操作できる間は離れたと扱わない。
+行を置き換える採用境界（main adoption、一覧 install、ZIP の即応空表示、検索結果採用、
+Collection 採用、Drive 入場、★固定作成直前）で `save_departing_session_grid_positions` を呼ぶ。
+`departed_items_generation` により同じ行世代では最初の一度だけ保存し、宛先 favorite 適用後の
+再保存や ZIP 列挙待ちの空表示で元の seed / 選択を上書きしない。新しい行の install で世代が進む。
+`install_loading_items_inner` は root / flags の移譲・消去、宛先の表示設定採用より前に保存する。
+
+保存対象の行は既存 `items_are_*` で判定するが、Snapshot 由来の `projection_recipe` は常に除外する。
+固定解除時は surface が先に Folder に戻っても Snapshot の行が残り得るため、surface だけで判定しない。
+空の中間表示と detached physical context も保存しない。detached の述語・viewport 経路は変更しない。
+
+閲覧履歴は `ReadingHistoryEntrance::Menu / Return` を呼び出しの目的から運ぶ。
+`AddressBarNav::ReadingHistory(entrance)` も生成元で目的を確定し、main-frame / immediate dispatcher は
+同じ `enter_reading_history_with_entrance` へ渡す。BS・親ボタン・Pad B・Esc 直帰は Return、
+場所メニュー・明示コマンドは Menu。入力 lane からメニュー入場と推測しない（§1.328 の BS 退行）。
+検索中の history 操作の書換えより前に区別し、Menu は最後の保存後に位置を捨てて先頭に入る。Return は shell の hydration
+continuation に seed を渡し、実 rows の hydrate 後に可視な安定キーの行を選び offset と ensure-visible を戻す。
+履歴への入場時に Ctrl+F を閉じて取り消す既存仕様は維持する。shell 待ち中の検索再適用は変更しない。
+ブックマーク一覧の専用入口・位置 owner は変更しない。
+
+サブ展開は `SubfolderInstallPurpose::New / Return` を scan → prepare → install の adoption が運ぶ。
+履歴 replay と一時ビューからの帰路だけ Return とし、新規展開・並び替え reinstall は先頭に入る。
+prepare は synthetic 宛先の favorite 表示設定を読み取り投影し、その sort / カテゴリ順で行を作る。
+本棚直下の番号順例外と既存の評価読取失敗 fallback は維持する。install では閲覧履歴・Rating と同様に
+宛先の列数・表示モード・比率を初回 layout 前に採用する。Return の位置と seed は同じ install で戻す。
+Ctrl+F 表示中は既存仕様どおり ←/→ の履歴移動が無効なので、検索カーソル方針と R9 は設計担当の判断で撤去した。
+他の入口から検索バーを開いたまま戻る場合も、自動再適用による先頭復帰を従来どおり受け入れ、検索処理は変更しない。
+
+簡素化として位置 owner と採用境界を共通化し、戻り予約・rollback・追加の待機や再 ensure loop は作らない。
+準備中は既存 modal なので並び設定の stamp / 再比較を足さない。shell 中の検索割込み、保存後の稀な失敗、
+Remote からの準備中設定変更は既定の割り切り方針による。保存キーが消失・非可視なら先頭へ戻し、近傍探索しない。
 
 ## 2. スマートフォルダ
 

@@ -7,6 +7,15 @@
 use super::*;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+#[cfg(test)]
+thread_local! {
+    static IMPORT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(super) fn import_starts_for_test() -> usize {
+    IMPORT_STARTS.with(std::cell::Cell::get)
+}
+
 const SIDECAR_WRITER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const SIDECAR_RESTORE_MODAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 const SIDECAR_REUSE_MAX_FOLDERS: usize = 4;
@@ -130,6 +139,18 @@ pub(crate) struct SidecarLoadContinuation {
     pub(super) tx: mpsc::Sender<ThumbMsg>,
     pub(super) cancel: Arc<AtomicBool>,
     pub(super) restore_started_at: std::time::Instant,
+}
+
+impl SidecarLoadContinuation {
+    fn fullscreen_reopen_pending(&self) -> bool {
+        match &self.navigation_after_hydration {
+            Some(super::MainListAfterHydration::Dfs { continuation, .. }) => {
+                continuation.fullscreen
+            }
+            Some(super::MainListAfterHydration::RequiredFullscreen { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -598,6 +619,16 @@ fn reuse_proof_apply(
 }
 
 impl SidecarRestoreState {
+    #[cfg(test)]
+    pub(super) fn connection_request_ids_for_test(&self) -> (u64, Option<u64>) {
+        (
+            self.common.request_id,
+            self.common
+                .book_restore
+                .as_ref()
+                .map(|restore| restore.open_id_for_test()),
+        )
+    }
     pub(super) fn defer_main_list_action(
         &mut self,
         action: super::MainListAfterHydration,
@@ -657,6 +688,7 @@ impl App {
     /// A global memory change supersedes only the shift dependency of an unopened Book.
     /// Its original resume cutoff remains mandatory; an already shown sibling keeps its session.
     pub(super) fn refresh_pending_book_shift_memory_policy(&mut self) {
+        let availability = self.pairing_edit_availability();
         if let Some(restore) = self
             .sidecar_restore
             .as_mut()
@@ -666,6 +698,7 @@ impl App {
                 self.spread_shift_settings_generation,
                 self.settings.remember_spread_shift_per_book,
                 self.spread_shift_service.as_ref(),
+                availability,
             );
         }
     }
@@ -763,6 +796,39 @@ impl App {
                     .as_ref()
                     .is_some_and(|deferred| deferred.matches_item(&self.items))
         })
+    }
+
+    /// Unlike an arbitrary deferred page open, this accepted navigation continuation owns
+    /// fullscreen intent itself. It needs no old-texture/navigation-holdover sentinel.
+    pub(crate) fn sidecar_restore_navigation_fullscreen_wait_active(&self) -> bool {
+        self.sidecar_restore.as_ref().is_some_and(|state| {
+            self.sidecar_restore_context_current(&state.common)
+                && matches!(&state.common.continuation,
+                    ContinuationOwner::Live(continuation)
+                        if continuation.items_len == self.items.len()
+                            && !continuation.cancel.load(Ordering::Relaxed)
+                            && continuation.fullscreen_reopen_pending())
+        })
+    }
+
+    /// A true viewer close consumes only its reopen intent; accepted list hydration and its
+    /// metadata/first-display maintenance still finish on the owning context.
+    pub(super) fn cancel_sidecar_restore_fullscreen_reopen(&mut self) {
+        let current = self
+            .sidecar_restore
+            .as_ref()
+            .is_some_and(|state| self.sidecar_restore_context_current(&state.common));
+        if !current {
+            return;
+        }
+        let common = &mut self.sidecar_restore.as_mut().unwrap().common;
+        common.deferred_fullscreen = None;
+        if let ContinuationOwner::Live(continuation) = &mut common.continuation
+            && continuation.fullscreen_reopen_pending()
+        {
+            // Drop the DFS tail as well: queued navigation must not restart a closed viewer.
+            continuation.navigation_after_hydration = None;
+        }
     }
 
     /// A fresh detached media builder may publish the existing exact open while hydration
@@ -933,7 +999,8 @@ impl App {
         }
         Self::sanitize_sidecar_restore_viewport_input(
             ctx,
-            !self.sidecar_restore_root_lifecycle_close_requested(),
+            ctx.viewport_id() != egui::ViewportId::ROOT
+                && !self.sidecar_restore_root_lifecycle_close_requested(),
         );
         // These owners were derived before the modal began, so filtering RawInput alone cannot
         // release them.  End the gestures explicitly on every mounted-context pass; none of the
@@ -959,7 +1026,10 @@ impl App {
     /// filtering therefore is insufficient: scroll and pointer button state have already been
     /// derived by egui.  Reset those derived values at the viewport boundary as well.
     pub(crate) fn consume_sidecar_restore_viewport_input(ctx: &egui::Context) {
-        Self::sanitize_sidecar_restore_viewport_input(ctx, true);
+        Self::sanitize_sidecar_restore_viewport_input(
+            ctx,
+            ctx.viewport_id() != egui::ViewportId::ROOT,
+        );
     }
 
     fn sanitize_sidecar_restore_viewport_input(ctx: &egui::Context, cancel_close: bool) {
@@ -968,7 +1038,6 @@ impl App {
         }
         ctx.input_mut(|input| {
             input.events.retain(sidecar_restore_retains_egui_event);
-            input.raw_scroll_delta = egui::Vec2::ZERO;
             input.smooth_scroll_delta = egui::Vec2::ZERO;
             input.pointer = egui::PointerState::default();
             input.keys_down.clear();
@@ -1184,7 +1253,7 @@ impl App {
         crate::logger::log(
             "reading position preparation unavailable; display continuation cancelled",
         );
-        self.show_feedback_toast(
+        self.show_feedback_warning(
             "読書位置を準備できませんでした。一覧を再読み込みしてください".into(),
         );
         if self
@@ -1209,13 +1278,28 @@ impl App {
         }
     }
 
+    /// One App-global identity source for live hydration and index-only requests.
+    /// Cancelling a request or mounting another viewer never rewinds this sequence.
+    fn next_sidecar_restore_request_id(&mut self) -> u64 {
+        self.sidecar_restore_request_seq = self
+            .sidecar_restore_request_seq
+            .checked_add(1)
+            .expect("sidecar restore request sequence exhausted");
+        self.sidecar_restore_request_seq
+    }
+
     pub(super) fn begin_sidecar_restore(
         &mut self,
         continuation: SidecarLoadContinuation,
         has_prepared_aggregate: bool,
     ) -> Result<(), SidecarLoadContinuation> {
-        let restore_sidecar =
-            self.sidecar_restore_eligible(&continuation.source_path, has_prepared_aggregate);
+        let restore_sidecar = self
+            .sidecar_restore_eligible(&continuation.source_path, has_prepared_aggregate)
+            && continuation.restore_intent.imports_sidecars();
+        #[cfg(test)]
+        if restore_sidecar {
+            IMPORT_STARTS.with(|calls| calls.set(calls.get() + 1));
+        }
         if self.sidecar_restore.is_some() {
             crate::logger::log(
                 "sidecar restore request rejected: another restore already owns the App"
@@ -1286,10 +1370,7 @@ impl App {
         let source_path = continuation.source_path.clone();
         let clear_sidecar_cache_after_flush = !continuation.detached_physical;
 
-        let request_id = self
-            .frame_counter
-            .wrapping_add(self.input_seq)
-            .wrapping_add(1);
+        let request_id = self.next_sidecar_restore_request_id();
         let started_at = continuation.restore_started_at;
         let book_restore = self.begin_book_shift_restore(request_id);
         self.sidecar_restore = Some(SidecarRestoreState {
@@ -1406,7 +1487,7 @@ impl App {
         }
         if self.sidecar_restore.is_some() {
             crate::logger::log("snapshot page index preparation rejected: hydration owner is busy");
-            self.show_feedback_toast("一覧の準備が完了してから固定してください".into());
+            self.show_feedback_warning("一覧の準備が完了してから固定してください".into());
             return;
         }
         let source_path = self.current_folder.clone();
@@ -1438,12 +1519,9 @@ impl App {
             // ordinary poll cancels any deferred open through the same failure tail.
         }
         let cancel = Arc::new(AtomicBool::new(false));
+        let request_id = self.next_sidecar_restore_request_id();
         let book_restore = if self.spread_shift.scope != self.current_spread_shift_scope() {
-            self.begin_book_shift_restore(
-                self.frame_counter
-                    .wrapping_add(self.input_seq)
-                    .wrapping_add(1),
-            )
+            self.begin_book_shift_restore(request_id)
         } else {
             None
         };
@@ -1451,10 +1529,7 @@ impl App {
             #[cfg(test)]
             checking_relay: None,
             common: Common {
-                request_id: self
-                    .frame_counter
-                    .wrapping_add(self.input_seq)
-                    .wrapping_add(1),
+                request_id,
                 started_at: std::time::Instant::now(),
                 target_context: self.sidecar_restore_projected_context(),
                 items_generation: self.items_generation,
@@ -1488,7 +1563,7 @@ impl App {
 
     fn report_sidecar_restore_flush_failure(&mut self, error: String) {
         crate::logger::log(format!("sidecar restore flush failed: {error}"));
-        self.show_feedback_toast(format!("サイドカーの保存を完了できませんでした: {error}"));
+        self.show_feedback_warning(format!("サイドカーの保存を完了できませんでした: {error}"));
     }
 
     fn sidecar_restore_context_current(&self, common: &Common) -> bool {
@@ -1806,8 +1881,36 @@ impl App {
     }
 
     /// Advance the restore state without waiting. Called once per root frame.
+    #[cfg(test)]
+    pub(crate) fn settle_snapshot_page_index_for_test(&mut self) {
+        let Some(state) = self.sidecar_restore.as_mut() else {
+            return;
+        };
+        if let Phase::PreparingPageIndex(preparing) = &mut state.phase {
+            assert!(matches!(
+                preparing.next,
+                PageIndexContinuation::PrepareOnly(_)
+            ));
+            let index = preparing
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("snapshot identity worker completion");
+            let (sender, receiver) = mpsc::channel();
+            sender.send(index).unwrap();
+            preparing.rx = receiver;
+        }
+        self.poll_sidecar_restore(&egui::Context::default());
+        assert!(
+            !self.sidecar_restore_active(),
+            "snapshot identity publication must reach terminal"
+        );
+    }
+
     pub(crate) fn poll_sidecar_restore(&mut self, ctx: &egui::Context) {
         self.poll_retained_shift_readoption(ctx);
+        if self.service_discarded_sidecar_restore(ctx) {
+            return;
+        }
         let Some(mut state) = self.sidecar_restore.take() else {
             return;
         };
@@ -1847,7 +1950,50 @@ impl App {
         self.poll_sidecar_restore_projected(ctx);
     }
 
+    /// Only the already discarded continuation's global terminal is service work.
+    /// Live hydration, retained shift readoption and preview adoption remain UI-owned.
+    pub(crate) fn service_discarded_sidecar_restore(&mut self, ctx: &egui::Context) -> bool {
+        if !self.sidecar_restore.as_ref().is_some_and(|state| {
+            matches!(
+                state.common.continuation,
+                ContinuationOwner::Discarded { .. }
+            )
+        }) {
+            return false;
+        }
+        let state = self.sidecar_restore.take().unwrap();
+        self.poll_discarded_sidecar_restore(ctx, state);
+        true
+    }
+
+    pub(super) fn cancel_image_zip_hydration_for_exit(&mut self, owner: ViewerContextId) {
+        if let Some(state) = self.sidecar_restore.as_mut()
+            && state.common.target_context == owner
+            && matches!(&state.common.continuation, ContinuationOwner::Live(continuation)
+                if matches!(continuation.navigation_after_hydration,
+                    Some(super::MainListAfterHydration::ImageFolderZip { .. })))
+        {
+            state.common.discard_target();
+        }
+    }
+
+    pub(super) fn image_zip_discarded_hydration_exit_pending(
+        &self,
+        owner: ViewerContextId,
+    ) -> bool {
+        self.sidecar_restore.as_ref().is_some_and(|state| {
+            state.common.target_context == owner
+                && matches!(
+                    state.common.continuation,
+                    ContinuationOwner::Discarded { .. }
+                )
+        })
+    }
+
     fn poll_sidecar_restore_projected(&mut self, ctx: &egui::Context) {
+        // Read session ownership before taking its sidecar continuation out of App.
+        // This is a fact for this poll, not a persistent viewer/viewport latch.
+        let viewer_session_open = self.projected_viewer_session_open();
         let Some(mut state) = self.sidecar_restore.take() else {
             return;
         };
@@ -1875,12 +2021,12 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     if matches!(preparing.next, PageIndexContinuation::PrepareOnly(_)) {
                         crate::logger::log("snapshot reading position worker disconnected");
-                        self.show_feedback_toast("読書位置の準備workerが停止しました".into());
+                        self.show_feedback_warning("読書位置の準備workerが停止しました".into());
                         #[cfg(windows)]
                         let had_deferred_fullscreen = state.common.deferred_fullscreen.is_some();
                         state.common.discard_target();
                         self.finish_visible_container_fs_nav_failed();
-                        if self.fullscreen_idx.is_some() {
+                        if viewer_session_open {
                             self.close_fullscreen();
                         }
                         #[cfg(windows)]
@@ -1895,7 +2041,7 @@ impl App {
                     crate::logger::log(
                         "reading position worker disconnected; display continuation cancelled",
                     );
-                    self.show_feedback_toast(
+                    self.show_feedback_error(
                         "読書位置の準備に失敗しました。一覧を再読み込みしてください".into(),
                     );
                     state.common.discard_target();
@@ -2210,8 +2356,21 @@ impl App {
                         .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
                         .unwrap_or_default();
                     for result in prior_results {
-                        if result.result.is_err() {
-                            state.common.favorite_failures.push(result.command);
+                        match result {
+                            crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                                command,
+                                result,
+                            } => {
+                                if result.is_err() {
+                                    state.common.favorite_failures.push(command);
+                                }
+                            }
+                            crate::favorite_view_state::FavoriteViewStoreResult::Copied {
+                                id,
+                                state,
+                            } => {
+                                self.favorite_view_states.insert(id, state);
+                            }
                         }
                     }
                     for (id, favorite_state) in self.favorite_view_writes.take_all() {
@@ -2241,8 +2400,21 @@ impl App {
                     .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
                     .unwrap_or_default();
                 for result in results {
-                    if result.result.is_err() {
-                        state.common.favorite_failures.push(result.command);
+                    match result {
+                        crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                            command,
+                            result,
+                        } => {
+                            if result.is_err() {
+                                state.common.favorite_failures.push(command);
+                            }
+                        }
+                        crate::favorite_view_state::FavoriteViewStoreResult::Copied {
+                            id,
+                            state,
+                        } => {
+                            self.favorite_view_states.insert(id, state);
+                        }
                     }
                 }
                 if let Some(error) = terminal_error {
@@ -2354,7 +2526,9 @@ impl App {
                 Ok(true) => state.common.book_restore = None,
                 Err(error) => {
                     crate::logger::log(format!("book shift restore failed: {error}"));
-                    self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+                    self.show_feedback_warning(format!(
+                        "見開き調整を復元できませんでした: {error}"
+                    ));
                     state.common.book_restore = None;
                 }
             }
@@ -2376,7 +2550,7 @@ impl App {
         ) {
             if let Some(warning) = state.common.warning.take() {
                 crate::logger::log(format!("snapshot page index preparation: {warning}"));
-                self.show_feedback_toast(warning);
+                self.show_feedback_warning(warning);
             }
             if let Some(deferred) = state.common.deferred_fullscreen.take() {
                 if deferred.matches_item(&self.items) {
@@ -2407,7 +2581,7 @@ impl App {
         debug_assert!(self.install_sidecar_restore_result(None, effects).is_none());
         if let Some(warning) = state.common.warning.take() {
             crate::logger::log(format!("sidecar restore terminal warning: {warning}"));
-            self.show_feedback_toast(format!("サイドカー復元: {warning}"));
+            self.show_feedback_warning(format!("サイドカー復元: {warning}"));
         }
         let deferred = state.common.deferred_fullscreen.take();
         let favorite_failures = std::mem::take(&mut state.common.favorite_failures);
@@ -2611,7 +2785,8 @@ impl App {
                         false
                     }
                     PreviewClearPoll::Cleared => {
-                        self.poll_edit_preview_cache(ctx);
+                        // The clear ACK retires this discarded request. The shared Cleared
+                        // notification remains for the existing UI cache adoption checkpoint.
                         state.phase = self.sidecar_restore_start_cache_refresh(&mut state);
                         false
                     }
@@ -2828,6 +3003,10 @@ fn probe_requires_preview_clear(result: &crate::sidecar_import::SidecarProbeResu
     )
 }
 
+#[expect(
+    deprecated,
+    reason = "Retain the compatibility IME cancellation edge while discarding modal semantic input"
+)]
 fn sidecar_restore_retains_egui_event(event: &egui::Event) -> bool {
     matches!(
         event,
@@ -2839,7 +3018,6 @@ fn sidecar_restore_retains_egui_event(event: &egui::Event) -> bool {
                 ..
             }
             | egui::Event::Ime(egui::ImeEvent::Disabled)
-            | egui::Event::Screenshot { .. }
     )
 }
 
@@ -3099,6 +3277,195 @@ fn marker_clear_warning(
 mod tests {
     use super::*;
 
+    fn install_hydration_identity_book(app: &mut App, source: PathBuf) {
+        app.current_folder = Some(source.clone());
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: source,
+            page_num: 0,
+            content_type: None,
+        }];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+    }
+
+    fn hydration_identity_continuation(app: &App) -> SidecarLoadContinuation {
+        let (tx, _rx) = mpsc::channel();
+        let now = std::time::Instant::now();
+        SidecarLoadContinuation {
+            navigation_after_hydration: None,
+            audio_art_prune: None,
+            first_display_action: FirstDisplayAction::None,
+            restore_intent: super::super::StartupListIntent::PreservePresentation,
+            auto_aspect_seed: None,
+            source_path: app.current_folder.clone().unwrap(),
+            source_is_directory: false,
+            prepared_subfolder: None,
+            prepared_page_edits: None,
+            prepared_aggregate: None,
+            catalog_existing_keys: HashSet::new(),
+            video_items: Vec::new(),
+            sli_seq: 0,
+            sli_t0: now,
+            items_len: app.items.len(),
+            detached_physical: false,
+            tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            restore_started_at: now,
+        }
+    }
+
+    fn hydration_request_with_book_id(app: &App) -> u64 {
+        let common = &app.sidecar_restore.as_ref().unwrap().common;
+        assert_eq!(
+            common.request_id,
+            common.book_restore.as_ref().unwrap().open_id_for_test(),
+            "hydration and its book restore must share one allocated identity"
+        );
+        common.request_id
+    }
+
+    fn cancel_hydration_identity_request(app: &mut App) {
+        let cancel = Arc::clone(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel(),
+        );
+        assert!(
+            app.sidecar_restore
+                .as_mut()
+                .unwrap()
+                .common
+                .discard_target()
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Some(state) = app.sidecar_restore.take() {
+            app.poll_discarded_sidecar_restore(&egui::Context::default(), state);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel did not settle"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn egui037_continuation_hydration_ids_survive_cancel_restart_and_index_only_replacement() {
+        let mut app = crate::app::setup_app_for_test();
+        app.frame_counter = 13;
+        app.input_seq = 29;
+        let first_source = app.tmp.path().join("identity-first.pdf");
+        install_hydration_identity_book(&mut app, first_source);
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        let first = hydration_request_with_book_id(&app);
+        let rejected = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(rejected, false).is_err());
+        assert_eq!(app.sidecar_restore_request_seq, first);
+        cancel_hydration_identity_request(&mut app);
+
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        let restarted = hydration_request_with_book_id(&app);
+        assert_eq!(restarted, first + 1);
+        cancel_hydration_identity_request(&mut app);
+
+        let second_source = app.tmp.path().join("identity-second.pdf");
+        install_hydration_identity_book(&mut app, second_source);
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        let index_only = hydration_request_with_book_id(&app);
+        assert_eq!(index_only, restarted + 1);
+        let superseded_cancel = Arc::clone(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel(),
+        );
+        app.items_generation += 1;
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        assert!(superseded_cancel.load(Ordering::Relaxed));
+        let replacement = app.sidecar_restore.as_ref().unwrap().common.request_id;
+        assert_eq!(replacement, index_only + 1);
+        assert!(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .book_restore
+                .is_none()
+        );
+        cancel_hydration_identity_request(&mut app);
+
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        let index_restarted = app.sidecar_restore.as_ref().unwrap().common.request_id;
+        assert_eq!(index_restarted, replacement + 1);
+        cancel_hydration_identity_request(&mut app);
+
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        assert_eq!(hydration_request_with_book_id(&app), index_restarted + 1);
+        cancel_hydration_identity_request(&mut app);
+        assert_eq!((app.frame_counter, app.input_seq), (13, 29));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn egui037_continuation_hydration_ids_do_not_reset_across_context_mounts() {
+        let mut app = crate::app::setup_app_for_test();
+        app.frame_counter = 13;
+        app.input_seq = 29;
+        let main_source = app.tmp.path().join("identity-main.pdf");
+        let detached_source = app.tmp.path().join("identity-detached.pdf");
+        install_hydration_identity_book(&mut app, main_source);
+        let detached = app.build_active_context_for_test(
+            Some(837),
+            super::super::DetachedSource::Book,
+            |owner| install_hydration_identity_book(owner, detached_source),
+        );
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        let first = hydration_request_with_book_id(&app);
+        cancel_hydration_identity_request(&mut app);
+        let mounted = app
+            .with_viewer_context(detached, |owner| {
+                owner.prepare_current_listing_page_identity_index(Default::default(), None);
+                let id = hydration_request_with_book_id(owner);
+                assert_eq!(id, first + 1);
+                cancel_hydration_identity_request(owner);
+                id
+            })
+            .unwrap();
+        assert_eq!(app.sidecar_restore_request_seq, mounted);
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        assert_eq!(hydration_request_with_book_id(&app), mounted + 1);
+        cancel_hydration_identity_request(&mut app);
+        assert_eq!((app.frame_counter, app.input_seq), (13, 29));
+    }
+
+    #[test]
+    fn egui037_continuation_hydration_sequence_exhaustion_never_reuses_an_id() {
+        let mut app = crate::app::setup_app_for_test();
+        app.sidecar_restore_request_seq = u64::MAX - 1;
+        assert_eq!(app.next_sidecar_restore_request_id(), u64::MAX);
+        for _ in 0..2 {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    app.next_sidecar_restore_request_id()
+                }))
+                .is_err()
+            );
+            assert_eq!(app.sidecar_restore_request_seq, u64::MAX);
+            assert!(app.sidecar_restore.is_none());
+        }
+    }
+
     #[test]
     fn phase_presentation_names_the_actual_restore_step() {
         let cases = [
@@ -3211,7 +3578,7 @@ mod tests {
 
         app.sidecar_restore.as_mut().unwrap().common.started_at =
             std::time::Instant::now() + SIDECAR_RESTORE_MODAL_GRACE;
-        let early = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+        let early = egui::Context::default().run_pass(egui::RawInput::default(), |ctx| {
             app.show_sidecar_restore_dialog(ctx);
         });
         assert!(
@@ -3221,7 +3588,7 @@ mod tests {
 
         app.sidecar_restore.as_mut().unwrap().common.started_at =
             std::time::Instant::now() - SIDECAR_RESTORE_MODAL_GRACE;
-        let visible = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+        let visible = egui::Context::default().run_pass(egui::RawInput::default(), |ctx| {
             app.show_sidecar_restore_dialog(ctx);
         });
         assert!(
@@ -3229,6 +3596,8 @@ mod tests {
             "an active restore must draw its progress modal after the grace"
         );
         assert!(app.sidecar_restore_blocks_projected_context());
+        early.drop_without_applying_deltas();
+        visible.drop_without_applying_deltas();
     }
 
     #[test]
@@ -3463,6 +3832,61 @@ mod tests {
                 }),
             super::super::file_type_resume::PositionResolution::Restored(0)
         );
+    }
+
+    #[test]
+    fn visibility_index_disconnect_ends_only_an_existing_viewer_session() {
+        for viewer in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().to_path_buf();
+            let image = folder.join("page.png");
+            image::RgbImage::new(1, 1).save(&image).unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(image)];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Failed];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            if viewer {
+                app.fullscreen_idx = Some(0);
+                app.capture_fs_nav_holdover(0);
+                app.fullscreen_idx = None;
+                app.items_generation += 1;
+            }
+            app.prepare_current_listing_page_identity_index(Default::default(), None);
+            let (tx, rx) = mpsc::channel();
+            drop(tx);
+            app.sidecar_restore.as_mut().unwrap().phase =
+                Phase::PreparingPageIndex(PreparingPageIndex {
+                    rx,
+                    next: PageIndexContinuation::PrepareOnly(PageIndexPublication::CurrentListing),
+                });
+            let pdf = folder.join("list-only.pdf");
+            if viewer {
+                assert!(app.defer_sidecar_restore_fullscreen(
+                    0,
+                    HistoryTrigger::UserChosen,
+                    FsOpenMaterialization::Eager,
+                    FsPageLoadContract::Sequential,
+                ));
+            } else {
+                app.pdf_password_request =
+                    Some(super::super::PdfPasswordRequest::legacy(pdf.clone()));
+                app.pdf_password_input = "typed password".into();
+            }
+            assert_eq!(app.projected_viewer_session_open(), viewer);
+            app.spread_popup_open = true;
+            app.poll_sidecar_restore(&egui::Context::default());
+            assert!(!app.sidecar_restore_active());
+            assert!(!app.projected_viewer_session_open());
+            if viewer {
+                assert!(!app.spread_popup_open, "waiting reader content must close");
+                assert!(app.fs_holdover_tex.is_none());
+                assert!(!app.fs_nav_is_locked());
+            } else {
+                assert_eq!(app.pdf_password_dialog_path(), Some(pdf));
+                assert_eq!(app.pdf_password_input, "typed password");
+            }
+        }
     }
 
     #[test]
@@ -3966,11 +4390,16 @@ mod tests {
         state.phase = app.sidecar_restore_start_checking(&mut state);
         app.sidecar_restore = Some(state);
         let ctx = egui::Context::default();
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
             app.poll_sidecar_restore(&ctx);
             if app.sidecar_probe_reuse.candidate(&folder).is_some() {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "matching sidecar owner did not publish its proof"
+            );
             std::thread::yield_now();
         }
         assert!(app.sidecars.contains_key(&folder));
@@ -4241,6 +4670,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn semantic_input_is_discarded_but_release_edges_are_retained() {
         let key = |pressed| egui::Event::Key {
             key: egui::Key::A,
@@ -4274,7 +4707,10 @@ mod tests {
             egui::ImeEvent::Enabled
         )));
         assert!(!sidecar_restore_retains_egui_event(&egui::Event::Ime(
-            egui::ImeEvent::Preedit("未確定".into())
+            egui::ImeEvent::Preedit {
+                text: "未確定".into(),
+                active_range_chars: None
+            }
         )));
         assert!(!sidecar_restore_retains_egui_event(&egui::Event::Ime(
             egui::ImeEvent::Commit("入力しない".into())
@@ -4382,6 +4818,8 @@ mod tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, 24.0),
                 modifiers: egui::Modifiers::CTRL,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             },
             egui::Event::Key {
                 key: egui::Key::A,
@@ -4399,15 +4837,22 @@ mod tests {
             },
         ];
 
-        let _ = ctx.run(raw, |ctx| {
+        ctx.run_pass(raw, |ctx| {
             assert!(ctx.input(|input| input.pointer.primary_down()));
-            assert_ne!(ctx.input(|input| input.raw_scroll_delta), egui::Vec2::ZERO);
+            let input_options = ctx.options(|options| options.input_options);
+            assert_ne!(
+                ctx.input(|input| crate::wheel_input::remaining_wheel_delta(input, input_options)),
+                egui::Vec2::ZERO
+            );
             App::consume_sidecar_restore_viewport_input(ctx);
 
             ctx.input(|input| {
                 assert!(!input.pointer.any_down());
                 assert!(input.pointer.latest_pos().is_none());
-                assert_eq!(input.raw_scroll_delta, egui::Vec2::ZERO);
+                assert_eq!(
+                    crate::wheel_input::remaining_wheel_delta(input, input_options),
+                    egui::Vec2::ZERO
+                );
                 assert_eq!(input.smooth_scroll_delta, egui::Vec2::ZERO);
                 assert!(input.keys_down.is_empty());
                 assert_eq!(input.events.len(), 1);
@@ -4420,7 +4865,8 @@ mod tests {
                     }
                 ));
             });
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -4589,6 +5035,98 @@ mod tests {
             .common
             .discard_target();
         assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+    }
+
+    #[test]
+    fn navigation_fullscreen_hydration_wait_requires_live_exact_continuation() {
+        for required in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("navigation-book");
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(folder.join("page.jpg"))];
+            let _rx = app.activate_live_sidecar_restore_for_test(folder.clone());
+            assert!(!app.sidecar_restore_navigation_fullscreen_wait_active());
+            let action = if required {
+                MainListAfterHydration::RequiredFullscreen {
+                    target: crate::snapshot::SnapshotTarget::Fs(folder.join("page.jpg")),
+                    history_trigger: HistoryTrigger::UserChosen,
+                }
+            } else {
+                MainListAfterHydration::Dfs {
+                    continuation: super::super::PhysicalHistoryDfsContinuation {
+                        queued_steps: 0,
+                        mode: super::super::FolderNavMode::Fullscreen,
+                        history_trigger: HistoryTrigger::UserChosen,
+                        restore_video_tile: false,
+                        resume_slideshow: false,
+                        fullscreen: true,
+                    },
+                    ctx: egui::Context::default(),
+                }
+            };
+            app.set_live_sidecar_first_display_for_test(FirstDisplayAction::None, Some(action));
+            // No holdover sentinel is needed: the accepted action owns fullscreen intent.
+            assert!(app.fs_holdover_tex.is_none());
+            assert!(app.fs_nav_deferred_reopen_wait_active());
+            app.items_generation += 1;
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.items_generation -= 1;
+            app.current_folder = Some(app.tmp.path().join("other-book"));
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.cancel_sidecar_restore_fullscreen_reopen();
+            app.current_folder = Some(folder);
+            assert!(
+                app.fs_nav_deferred_reopen_wait_active(),
+                "unrelated source close cannot cancel the owner"
+            );
+            app.items.push(GridItem::Image(PathBuf::from("extra.jpg")));
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.items.pop();
+            let common = &mut app.sidecar_restore.as_mut().unwrap().common;
+            let context = common.target_context;
+            common.target_context = ViewerContextId::for_test(999);
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.cancel_sidecar_restore_fullscreen_reopen();
+            app.sidecar_restore.as_mut().unwrap().common.target_context = context;
+            assert!(
+                app.fs_nav_deferred_reopen_wait_active(),
+                "a mounted sibling cannot consume the owner"
+            );
+            let cancel = Arc::clone(
+                app.sidecar_restore
+                    .as_ref()
+                    .unwrap()
+                    .common
+                    .continuation
+                    .cancel(),
+            );
+            cancel.store(true, Ordering::Relaxed);
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            cancel.store(false, Ordering::Relaxed);
+            if !required {
+                let ContinuationOwner::Live(continuation) =
+                    &mut app.sidecar_restore.as_mut().unwrap().common.continuation
+                else {
+                    unreachable!()
+                };
+                let Some(MainListAfterHydration::Dfs { continuation, .. }) =
+                    &mut continuation.navigation_after_hydration
+                else {
+                    unreachable!()
+                };
+                continuation.fullscreen = false;
+                assert!(
+                    !app.fs_nav_deferred_reopen_wait_active(),
+                    "grid DFS is not a fullscreen wait"
+                );
+            }
+            app.sidecar_restore
+                .as_mut()
+                .unwrap()
+                .common
+                .discard_target();
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+        }
     }
 
     #[test]
@@ -4990,17 +5528,13 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run(raw, |ctx| {
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(raw, |ctx| {
+            let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
             app.consume_input_during_sidecar_restore(ctx);
             assert!(ctx.input(|input| input.viewport().close_requested()));
-            let tray_hide_started = if app.sidecar_restore_blocks_root_tray_hide() {
-                false
-            } else {
-                app.maybe_intercept_close(ctx)
-            };
-            assert!(!tray_hide_started);
+            app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
             app.show_sidecar_restore_dialog(ctx);
-        });
+        }));
         assert!(app.window_visible);
         assert!(
             output
@@ -5028,10 +5562,10 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run(raw, |ctx| {
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(raw, |ctx| {
             app.consume_input_during_sidecar_restore(ctx);
             app.show_sidecar_restore_dialog(ctx);
-        });
+        }));
 
         assert!(
             output

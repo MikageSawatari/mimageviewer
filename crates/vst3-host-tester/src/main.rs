@@ -61,6 +61,7 @@ fn setup_fonts(ctx: &egui::Context) {
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 520.0])
             .with_title("VST3 Host Tester"),
@@ -123,6 +124,10 @@ struct TesterApp {
 
 impl TesterApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.quit_shortcuts.clear());
+        cc.egui_ctx
+            .global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
         setup_fonts(&cc.egui_ctx);
         // 永続ログファイル: %TEMP%\vst3-host-tester.log
         // 起動ごとに上書き (truncate) して 1 セッション分だけ残す。
@@ -274,7 +279,7 @@ impl TesterApp {
             };
             match Bridge::spawn(&self.bridge_exe_path, stderr_cb) {
                 Ok(mut br) => {
-                    // T09 (v0.9.0) round 4: PROTOCOL_VERSION は 2 にbump 済み。tester も
+                    // The tester uses the current frame-scoped GUI protocol.
                     // 同じ定数を使い、Ready の version を比較する (= stale bridge / 古い
                     // tester の組み合わせを早期検出)。
                     if let Err(e) = br.send(&Cmd::Hello {
@@ -285,11 +290,8 @@ impl TesterApp {
                     }
                     match br.recv() {
                         Ok(Event::Ready { version }) => {
-                            if version != bridge::PROTOCOL_VERSION {
-                                self.log(format!(
-                                    "bridge protocol version mismatch (bridge=v{version}, tester=v{})",
-                                    bridge::PROTOCOL_VERSION
-                                ));
+                            if let Err(reason) = bridge::require_current_protocol(version) {
+                                self.log(reason);
                                 return;
                             }
                             self.log(format!("bridge ready (protocol v{version})"));
@@ -535,7 +537,8 @@ impl TesterApp {
 }
 
 impl eframe::App for TesterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root_ui.ctx().clone();
         // ── graceful shutdown ──
         // ウィンドウ × クリック等で close 要求が出たら、bridge とプラグイン GUI を
         // 順番に破棄してから終了する。Rust の Drop だと宣言順の逆で gui_host が
@@ -549,7 +552,7 @@ impl eframe::App for TesterApp {
             // close_requested はそのまま伝播してウィンドウが閉じる
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        egui::Panel::top("top").show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("VST3 Host Tester");
                 ui.separator();
@@ -560,10 +563,10 @@ impl eframe::App for TesterApp {
             });
         });
 
-        egui::SidePanel::left("plugins")
+        egui::Panel::left("plugins")
             .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show(root_ui, |ui| {
                 ui.heading("Plugins");
                 ui.horizontal(|ui| {
                     if ui.button("Rescan").clicked() {
@@ -607,25 +610,30 @@ impl eframe::App for TesterApp {
                 ui.separator();
 
                 let mut clicked: Option<usize> = None;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for &i in &matches {
-                        let p = &self.plugins[i];
-                        let selected = self.selected == Some(i);
-                        if ui
-                            .selectable_label(selected, &p.display_name)
-                            .on_hover_text(p.path.display().to_string())
-                            .clicked()
-                        {
-                            clicked = Some(i);
+                egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        for &i in &matches {
+                            let p = &self.plugins[i];
+                            let selected = self.selected == Some(i);
+                            if ui
+                                .selectable_label(selected, &p.display_name)
+                                .on_hover_text(p.path.display().to_string())
+                                .clicked()
+                            {
+                                clicked = Some(i);
+                            }
                         }
-                    }
-                });
+                    });
                 if let Some(i) = clicked {
                     self.selected = Some(i);
                 }
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 let load_enabled = self.selected.is_some() && self.bridge.is_none();
                 if ui
@@ -750,6 +758,10 @@ impl eframe::App for TesterApp {
             ui.separator();
             ui.heading("Log");
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .auto_shrink([false; 2])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {

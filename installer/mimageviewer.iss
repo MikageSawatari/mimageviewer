@@ -2,7 +2,7 @@
 ; Build: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\mimageviewer.iss
 
 #define MyAppName "mImageViewer"
-#define MyAppVersion "4.6.0"
+#define MyAppVersion "4.8.3"
 #define MyAppPublisher "Mikage Sawatari"
 #define MyAppURL "https://mikage.to/mimageviewer/"
 #define MyAppExeName "mimageviewer.exe"
@@ -61,8 +61,11 @@ Source: "..\vendor\ffmpeg\LICENSE.txt"; DestDir: "{app}"; DestName: "FFmpeg-LICE
 ; RAR 展開には unrar crate 経由で RARLAB UnRAR ソースを組み込むため、
 ; UnRAR ライセンス本文をインストール先にも配置する。
 Source: "..\UNRAR-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
-; Static RAW and JPEG components: full upstream licenses and attributions.
+; Static RAW, AVIF and JPEG components: full upstream licenses and attributions.
 Source: "..\LIBRAW-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LIBAVIF-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\DAV1D-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LIBYUV-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\ZLIB-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LIBJPEG-TURBO-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; ローカル差し替えした egui-wgpu を含む egui 0.33.3 のデュアルライセンス本文。

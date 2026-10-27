@@ -2,11 +2,60 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+/// Preserve the headless renderer's logical client dimensions while fixtures
+/// use the same physical outer placement as a decorated native window.
+#[cfg(windows)]
+pub(crate) fn detached_placement_with_logical_client_for_test(
+    logical_client: egui::Vec2,
+) -> crate::detached_window_geometry::PhysicalWindowPlacement {
+    use crate::detached_window_geometry::{
+        self as geometry, PhysicalRect, PhysicalWindowPlacement,
+    };
+    let anchor = PhysicalRect {
+        left: 80,
+        top: 80,
+        right: 81,
+        bottom: 81,
+    };
+    let monitor = geometry::monitor_for_rect(anchor).expect("test desktop monitor");
+    let frame = geometry::decorated_frame(monitor.dpi).expect("decorated test frame");
+    let placement = PhysicalWindowPlacement {
+        outer: PhysicalRect {
+            left: anchor.left,
+            top: anchor.top,
+            right: anchor.left + (logical_client.x * monitor.scale()).round() as i32 + frame.width,
+            bottom: anchor.top + (logical_client.y * monitor.scale()).round() as i32 + frame.height,
+        },
+        maximized: false,
+    };
+    assert_eq!(
+        geometry::monitor_for_rect(placement.outer).unwrap().id,
+        monitor.id
+    );
+    let actual_client = App::detached_snapshot_client_size(placement);
+    let rounding = 0.5 / monitor.scale() + 0.0001;
+    assert!((actual_client.x - logical_client.x).abs() <= rounding);
+    assert!((actual_client.y - logical_client.y).abs() <= rounding);
+    placement
+}
+
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
 
+#[path = "tests/section1328_session.rs"]
+mod section1328_session;
+
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
+
+#[path = "tests/notification_duration.rs"]
+mod notification_duration;
+
+#[path = "tests/plain_folder_spread.rs"]
+mod plain_folder_spread;
+
+#[path = "tests/startup_notices.rs"]
+pub(super) mod startup_notices;
 
 #[cfg(windows)]
 #[test]
@@ -337,7 +386,7 @@ mod file_organize_tests {
                 FileOrganizeRequest::Hidden
             ));
             assert!(env.fs_feedback_toast.as_ref().unwrap().0.contains("終了"));
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
         env.shutdown_requested.store(false, Ordering::SeqCst);
     }
@@ -378,7 +427,7 @@ mod file_organize_tests {
                 ..Default::default()
             });
             env.show_file_organize_dialog(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             match step {
                 0 | 1 => assert!(matches!(
                     env.file_organize_request,
@@ -422,10 +471,71 @@ mod folder_mtime_rescan_tests {
 
     #[test]
     fn visibility_external_rescan_restores_semantic_cursor_after_actual_hydration() {
-        for case in ["cursor", "explicit", "operation"] {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("external");
+    }
+
+    #[test]
+    fn visibility_manual_reload_restores_semantic_cursor_after_actual_hydration() {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("manual");
+    }
+
+    #[test]
+    fn visibility_append_external_rescan_restores_semantic_cursor_after_actual_hydration() {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("append_external");
+    }
+
+    #[test]
+    fn visibility_snapshot_child_rescan_restores_cursor_without_changing_fixed_root() {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("snapshot_external");
+    }
+
+    #[test]
+    fn visibility_refresh_capture_rejects_missing_synthetic_and_wrong_backing_sources() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("cursor-capture");
+        app.items = vec![GridItem::Image(folder.join("page.png"))];
+        app.selected = Some(0);
+        app.items_are_drive_list = false;
+        app.archive_source_override = None;
+        for case in ["missing", "synthetic", "wrong_backing"] {
+            app.current_folder = match case {
+                "missing" => None,
+                "synthetic" => Some(drive_list_synthetic_path()),
+                _ => Some(folder.clone()),
+            };
+            app.zip_nav = (case == "wrong_backing").then(|| {
+                crate::zip_tree::ZipNavState::new(Arc::new(crate::zip_tree::ZipTree::build(
+                    app.tmp.path().join("other.zip"),
+                    Vec::new(),
+                )))
+            });
+            assert!(
+                matches!(
+                    app.current_list_refresh_intent(),
+                    StartupListIntent::RefreshList { cursor: None, .. }
+                ),
+                "rejected {case} source must not capture a fallback cursor"
+            );
+        }
+        app.current_folder = Some(folder);
+        app.zip_nav = None;
+        assert!(matches!(
+            app.current_list_refresh_intent(),
+            StartupListIntent::RefreshList { cursor: Some(cursor), .. } if cursor.name == "page.png"
+        ));
+    }
+
+    fn assert_refresh_restores_semantic_cursor_after_actual_hydration(route: &str) {
+        for case in ["cursor", "explicit", "missing_explicit", "operation"] {
             let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
             let mut app = setup_app();
-            let folder = app.tmp.path().join("cursor-rescan");
+            let snapshot_parent = app.tmp.path().join("snapshot-rescan-root");
+            let folder = if route == "snapshot_external" {
+                std::fs::create_dir(&snapshot_parent).unwrap();
+                snapshot_parent.join("cursor-rescan")
+            } else {
+                app.tmp.path().join("cursor-rescan")
+            };
             std::fs::create_dir(&folder).unwrap();
             let page = folder.join("page.png");
             let later = folder.join("z.png");
@@ -434,7 +544,6 @@ mod folder_mtime_rescan_tests {
             }
             app.settings.sidecar_backup_enabled = false;
             app.settings.tag_sidecar_backup_enabled = false;
-            app.load_folder_with_scan(folder.clone(), None);
             let settle = |app: &mut App| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while app.sidecar_restore_active() {
@@ -446,15 +555,45 @@ mod folder_mtime_rescan_tests {
                     std::thread::yield_now();
                 }
             };
+            let snapshot_invariants = if route == "snapshot_external" {
+                assert!(app.load_folder_with_scan_owned(
+                    snapshot_parent,
+                    None,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                ));
+                settle(&mut app);
+                app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                app.finish_page_identity_preparation_for_test();
+                let snapshot = app.snapshot.as_ref().expect("captured Folder root");
+                Some((
+                    snapshot.generation_id,
+                    snapshot.origin.clone(),
+                    snapshot.list_view_items.clone(),
+                    snapshot
+                        .items
+                        .iter()
+                        .map(|entry| entry.key.clone())
+                        .collect::<Vec<_>>(),
+                    app.settings.startup_list_restore.clone(),
+                ))
+            } else {
+                None
+            };
+            app.load_folder_with_scan(folder.clone(), None);
             settle(&mut app);
             app.selected = app
                 .items
                 .iter()
                 .position(|item| matches!(item, GridItem::Image(path) if path == &page));
             app.scroll_offset_y = 125.0;
+            app.scroll_selected_to_rows_above = Some(2);
             let old_index = app.selected.unwrap();
             if case == "explicit" {
                 app.select_after_load = Some("z.png".into());
+            }
+            if case == "missing_explicit" {
+                app.select_after_load = Some("missing.png".into());
             }
             if case == "operation" {
                 app.request_post_operation_selection(
@@ -470,12 +609,47 @@ mod folder_mtime_rescan_tests {
                 .unwrap();
             let scan = folder_scan::scan_directory_with_settings(&folder, &app.settings).unwrap();
             let signature = signature_from_scan(&scan);
-            app.apply_external_rescan(
-                folder.clone(),
-                std::time::SystemTime::now(),
-                scan,
-                signature,
-            );
+            match route {
+                "external" | "snapshot_external" => app.apply_external_rescan(
+                    folder.clone(),
+                    std::time::SystemTime::now(),
+                    scan,
+                    signature,
+                ),
+                "append_external" => {
+                    app.apply_external_rescan_with_cause(
+                        folder.clone(),
+                        std::time::SystemTime::now(),
+                        scan,
+                        signature,
+                        book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                    );
+                }
+                "manual" => {
+                    app.reload_current_folder_preserving_override();
+                    assert!(
+                        app.top_level_grid_view
+                            .history_navigation_transition()
+                            .is_some(),
+                        "manual reload must exercise its staged producer"
+                    );
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let ctx = egui::Context::default();
+                    while app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "manual preflight timeout"
+                        );
+                        app.poll_collection_history_transition(&ctx);
+                        std::thread::yield_now();
+                    }
+                }
+                _ => unreachable!(),
+            }
             assert!(
                 app.sidecar_restore_active(),
                 "must exercise the actual asynchronous owner"
@@ -488,8 +662,13 @@ mod folder_mtime_rescan_tests {
                 _ => &page,
             };
             assert!(
-                matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == expected)
+                matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == expected),
+                "route={route} case={case}: selected={:?}, expected={expected:?}",
+                app.items[app.selected.unwrap()]
             );
+            if matches!(case, "cursor" | "missing_explicit") {
+                assert_eq!(app.scroll_selected_to_rows_above, Some(2));
+            }
             if case != "operation" {
                 assert_ne!(
                     app.selected,
@@ -502,8 +681,28 @@ mod folder_mtime_rescan_tests {
             }
             assert!(app.scroll_to_selected);
             assert!(app.select_after_load.is_none());
+            if let Some((generation, origin, root_items, root_keys, startup)) = snapshot_invariants
+            {
+                assert!(app.is_snapshot_active());
+                let snapshot = app.snapshot.as_ref().unwrap();
+                assert_eq!(snapshot.generation_id, generation);
+                assert_eq!(snapshot.origin, origin);
+                assert_eq!(snapshot.list_view_items, root_items);
+                assert_eq!(
+                    snapshot
+                        .items
+                        .iter()
+                        .map(|entry| entry.key.clone())
+                        .collect::<Vec<_>>(),
+                    root_keys
+                );
+                assert_eq!(app.settings.startup_list_restore, startup);
+            }
             if case == "operation" {
                 app.reload_current_folder_preserving_override();
+                super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(
+                    &mut app,
+                );
                 settle(&mut app);
                 assert!(
                     matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == &added)
@@ -518,32 +717,21 @@ mod folder_mtime_rescan_tests {
 
     fn prepare() -> (AppTestEnv, PathBuf) {
         let mut app = setup_app();
+        // Every archive/PDF/EPUB candidate in real_changes is a displayed row here.
+        // Hidden duplicate changes are covered separately by §1.375 projection regressions.
+        app.settings.skip_archive_if_zip_exists = false;
+        app.settings.skip_epub_if_pdf_exists = false;
         let folder = app.tmp.path().join("folder_mtime_rescan");
         std::fs::create_dir(&folder).unwrap();
         let scan = fixture(&folder);
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan));
-        app.items = scan
-            .folders
-            .iter()
-            .map(|entry| entry.item.clone())
-            .chain(scan.all_media.iter().map(|entry| match entry.kind {
-                folder_scan::ScanMediaKind::Image => GridItem::Image(entry.path.clone()),
-                folder_scan::ScanMediaKind::Video => GridItem::Video(entry.path.clone()),
-                folder_scan::ScanMediaKind::Audio => GridItem::Audio(entry.path.clone()),
-            }))
-            .collect();
-        app.image_metas = scan
-            .folders
-            .iter()
-            .map(|entry| entry.display_meta)
-            .chain(
-                scan.all_media
-                    .iter()
-                    .map(|entry| Some((entry.mtime, entry.file_size))),
-            )
-            .collect();
+        app.seed_folder_observation_for_test(&folder, &scan);
+        let listing =
+            materialize_local_folder_listing(&folder, scan.clone_for_projection(), &app.settings);
+        app.items = listing.items;
+        app.image_metas = listing.metas;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
         app.thumbnails[0] = mutation_refresh_loaded_thumb(&egui::Context::default());
         app.thumbnails[1] = ThumbnailState::Evicted;
@@ -651,6 +839,7 @@ mod folder_mtime_rescan_tests {
         let (mut app, folder) = prepare();
         for (label, scan) in real_changes(&folder) {
             app.current_folder_signature = Some(signature_from_scan(&fixture(&folder)));
+            app.seed_folder_observation_for_test(&folder, &fixture(&folder));
             let generation = app.items_generation;
             let signature = signature_from_scan(&scan);
             app.apply_external_rescan(
@@ -680,7 +869,12 @@ mod folder_mtime_rescan_tests {
             real,
             signature,
         );
-        assert_eq!(app.folder_refresh_pending, Some(folder.clone()));
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
         assert_eq!(app.current_folder_signature, initial);
         let generation = app.items_generation;
         let scan = folder_mtime_changed(&folder);
@@ -692,7 +886,12 @@ mod folder_mtime_rescan_tests {
             signature,
         );
         assert_eq!(app.current_folder_signature, Some(signature));
-        assert_eq!(app.folder_refresh_pending, Some(folder));
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
         assert_eq!(app.fullscreen_idx, Some(5));
         assert_eq!(app.items_generation, generation);
     }
@@ -710,10 +909,17 @@ mod folder_mtime_rescan_tests {
             tx.send(if case == "failed" {
                 None
             } else {
-                Some((scan, new_signature))
+                Some(ExternalRescanResult::Equal(
+                    new_signature,
+                    app.folder_observation.as_ref().unwrap().rows.clone(),
+                    Default::default(),
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+                ))
             })
             .unwrap();
             app.external_rescan_pending = Some(ExternalRescanPending {
+                proof: None,
+                cause: Default::default(),
                 owner_context_id: if case == "other owner" {
                     ViewerContextId::for_test(u64::MAX)
                 } else {
@@ -962,18 +1168,19 @@ fn send_activation_open_path(app: &App, path: PathBuf) {
 }
 
 fn mutation_refresh_loaded_thumb(ctx: &egui::Context) -> ThumbnailState {
-    ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    ThumbnailState::loaded_raster(
+        ctx.load_texture(
             "pin-refresh-test",
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             Default::default(),
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        rendered_at_px: 1,
-        source_dims: None,
-        layout_dims: None,
-    }
+        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        1,
+        crate::source_coverage::SourceCoverage::FullSource,
+        None,
+        None,
+    )
 }
 
 // Manual terminal fixtures use the same worker preparation as production, with a captured owner.
@@ -1426,7 +1633,8 @@ fn mutation_refresh_synthetic_pin_keeps_rows_location_selection_and_history() {
         let wake_callback = Arc::clone(&wake);
         ctx.set_request_repaint_callback(move |_| wake_callback.store(true, Ordering::Relaxed));
         for _ in 0..4 {
-            let _ = ctx.run(Default::default(), |_| {});
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
         }
         wake.store(false, Ordering::Relaxed);
         app.thumbnails = vec![mutation_refresh_loaded_thumb(&ctx)];
@@ -1750,7 +1958,14 @@ fn mutation_refresh_navigation_retires_pin_materialization_owner_and_keeps_sibli
             None,
             mounted.settings.file_type_visibility.clone(),
         ));
-        mounted.install_prepared_aggregate_items(items, vec![None], page_identity_index);
+        mounted.install_prepared_aggregate_items(
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Collection,
+            ),
+            items,
+            vec![None],
+            page_identity_index,
+        );
         assert!(sibling_cancel.load(Ordering::Relaxed));
         assert!(!mounted.current_view_pin_refreshes.contains_key(&sibling));
         assert!(!successor_cancel.load(Ordering::Relaxed));
@@ -2305,6 +2520,14 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<crate::ui_dialogs::file_organize::FileOrganizeRequest>()
             <= 2 * size_of::<usize>()
     );
+    assert_eq!(
+        size_of::<Option<Box<crate::ui_dialogs::archive_convert::ArchiveConvertState>>>(),
+        size_of::<usize>()
+    );
+    assert_eq!(
+        size_of::<Option<Box<crate::ui_dialogs::epub_convert::EpubConvertState>>>(),
+        size_of::<usize>()
+    );
     assert!(size_of::<App>() < 110_000);
 }
 
@@ -2312,13 +2535,238 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
 #[test]
 fn test_script_counts_the_actual_refresh_folder_request() {
     let mut app = setup_app_for_test();
+    app.settings.sidecar_backup_enabled = false;
     let folder = app.tmp.path().join("rating-sort-refresh-request");
     std::fs::create_dir(&folder).unwrap();
     std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+    let initial = app.test_script_folder_load_requests;
     app.load_folder(folder);
+    assert_eq!(app.test_script_folder_load_requests, initial + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
     let before = app.test_script_folder_load_requests;
+    let generation = app.items_generation;
     app.reload_current_folder_preserving_override();
     assert_eq!(app.test_script_folder_load_requests, before + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert!(app.items_generation > generation);
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_history_back_once_through_adoption() {
+    let mut app = setup_app_for_test();
+    app.active_quick_folder_slot = None;
+    app.settings.sidecar_backup_enabled = false;
+    let first = app.tmp.path().join("count-history-first");
+    let second = app.tmp.path().join("count-history-second");
+    for folder in [&first, &second] {
+        std::fs::create_dir(folder).unwrap();
+        std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+        app.load_folder(folder.clone());
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    }
+    assert_eq!(
+        app.folder_history_back_target(),
+        Some(&FolderNavHistoryTarget::Path(first.clone()))
+    );
+    let before = app.test_script_folder_load_requests;
+    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+    app.settle_open_path_classification_for_test();
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert_eq!(app.current_folder.as_ref(), Some(&first));
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_superseded_refresh_starts_before_completion() {
+    let mut app = setup_app_for_test();
+    app.settings.sidecar_backup_enabled = false;
+    let folder = app.tmp.path().join("count-superseded-refresh");
+    std::fs::create_dir(&folder).unwrap();
+    app.load_folder(folder);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    let before = app.test_script_folder_load_requests;
+    app.reload_current_folder_preserving_override();
+    app.reload_current_folder_preserving_override();
+    assert_eq!(app.test_script_folder_load_requests, before + 2);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert_eq!(app.test_script_folder_load_requests, before + 2);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_detached_proven_folder_nav_start_once_through_completion() {
+    use crate::folder_tree::{FolderNavLanding, FolderNavLandingKind};
+    for kind in [
+        FolderNavLandingKind::DirectRar,
+        FolderNavLandingKind::ConversionCacheHit,
+    ] {
+        let mut app = setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/archives/multiwindow-rar-nav");
+        let (source, backing) = if kind == FolderNavLandingKind::DirectRar {
+            let source = app.tmp.path().join("direct.rar");
+            std::fs::copy(fixtures.join("01-direct.rar"), &source).unwrap();
+            (source.clone(), source)
+        } else {
+            let source = app.tmp.path().join("cached.7z");
+            let backing = app.tmp.path().join("cached.zip");
+            std::fs::write(&source, b"source").unwrap();
+            std::fs::copy(fixtures.join("06-control.zip"), &backing).unwrap();
+            (source, backing)
+        };
+        // The DFS worker delivers this proven source/backing pair. Drive its UI admission,
+        // then the actual RAR/ZIP enumeration, without involving a viewport or input event.
+        let landing = FolderNavLanding {
+            logical_source: source.clone(),
+            backing_path: backing.clone(),
+            kind,
+        };
+        let before = app.test_script_folder_load_requests;
+        assert_eq!(
+            app.load_folder_nav_target(
+                FolderNavRoute::Detached(landing.clone()),
+                None,
+                StartupListIntent::PageContinuation,
+            ),
+            FolderOpenOutcome::Ignored
+        );
+        assert_eq!(app.test_script_folder_load_requests, before);
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        assert_eq!(
+            app.load_folder_nav_target(
+                FolderNavRoute::Detached(landing),
+                None,
+                StartupListIntent::PageContinuation,
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        assert!(app.zip_enumerate_pending.is_some());
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ctx = egui::Context::default();
+        while app.zip_enumerate_pending.is_some() || app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "proven archive load must settle"
+            );
+            app.poll_zip_enumerate();
+            app.poll_sidecar_restore(&ctx);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&backing));
+        assert_eq!(app.archive_source_override.as_ref(), Some(&source));
+        assert!(app.items.iter().any(
+            |item| matches!(item, GridItem::ZipImage { zip_path, .. } if zip_path == &backing)
+        ));
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_delegated_zip_start_once_through_adoption() {
+    for convert_dispatch in [false, true] {
+        let mut app = setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        let path = app.tmp.path().join("count-delegated.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+        let before = app.test_script_folder_load_requests;
+        if convert_dispatch {
+            assert_eq!(
+                app.load_folder_or_convert_archive(path.clone()),
+                FolderOpenOutcome::Loaded
+            );
+        } else {
+            app.load_folder(path.clone());
+        }
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&path));
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_does_not_count_rejected_folder_starts() {
+    for convert_dispatch in [false, true] {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("count-rejected-owner");
+        std::fs::create_dir(&folder).unwrap();
+        let owner = OpenRequestOwner::QuickFolderSwitch(QuickFolderSwitchLoadOwner {
+            source_context: app.projected_viewer_context_id(),
+            source_surface_generation: app.top_level_grid_view.generation(),
+            source_slot: app.active_quick_folder_slot,
+            source_slot_switch_sequence: app.quick_folder_switch_sequence.wrapping_add(1),
+            target_slot: QuickFolderSlotId::B,
+            target_path: folder.clone(),
+        });
+        let before = app.test_script_folder_load_requests;
+        let outcome = if convert_dispatch {
+            app.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                folder,
+                false,
+                owner,
+                Some(OpenPathKind::Directory),
+                None,
+                StartupListIntent::ExplicitList,
+                None,
+            )
+        } else {
+            app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                folder,
+                None,
+                owner,
+                None,
+                Some(OpenPathKind::Directory),
+                StartupListIntent::ExplicitList,
+                None,
+            )
+        };
+        assert_eq!(outcome, FolderOpenOutcome::Ignored);
+        assert_eq!(app.test_script_folder_load_requests, before);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_does_not_count_stale_preflight_navigation() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("count-stale-navigation");
+    std::fs::create_dir(&folder).unwrap();
+    let navigation = app
+        .capture_physical_open_navigation(&OpenRequestOwner::Navigation, &folder)
+        .unwrap();
+    app.quick_folder_switch_sequence = app.quick_folder_switch_sequence.wrapping_add(1);
+    let before = app.test_script_folder_load_requests;
+    assert!(!app.start_physical_history_transition_classified(
+        PhysicalHistoryIntent::Navigation {
+            replay: None,
+            auto_fullscreen: false
+        },
+        folder,
+        None,
+        Some(OpenPathKind::Directory),
+        StartupListIntent::ExplicitList,
+        navigation,
+        None,
+    ));
+    assert_eq!(app.test_script_folder_load_requests, before);
+    assert!(
+        app.top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
+    );
 }
 
 #[test]
@@ -2751,7 +3199,8 @@ fn epub_modal_rejects_second_direct_open_and_cancel_preserves_history() {
         }],
         ..Default::default()
     };
-    let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(input, |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert_eq!(
         app.folder_nav_history_snapshot().back_stack,
@@ -2804,7 +3253,8 @@ fn epub_published_stale_smart_owner_does_not_reopen_current_view() {
         ),
     );
     let ctx = egui::Context::default();
-    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert_eq!(app.pdf_enumerate_pending.as_ref().unwrap().0, other);
 }
@@ -2835,7 +3285,8 @@ fn epub_navigation_published_after_collection_root_open_cannot_replace_root() {
     app.open_collection_grid(collection_id, None);
     publish();
     let ctx = egui::Context::default();
-    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert!(matches!(
         app.top_level_grid_view.surface(),
@@ -3238,7 +3689,8 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
     });
     app.epub_convert = Some(state);
     let ctx = egui::Context::default();
-    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     let pending = app.pdf_enumerate_pending.as_ref().unwrap();
     assert_eq!(pending.0, other);
     assert_eq!(pending.4.as_ref().unwrap().logical, other);
@@ -4074,7 +4526,8 @@ fn epub_enumeration_failure_preserves_history_and_transfers_owner_to_conversion(
         }],
         ..Default::default()
     };
-    let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(input, |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert_eq!(app.address, previous.to_string_lossy());
 }
@@ -4151,7 +4604,8 @@ fn phase_a2_install_virtual_page(app: &mut App, image: &Path) {
 
 fn phase_a2_wait_for_mask(app: &mut App) {
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_page_edit_reconciliation(&ctx);
         if app.mask_pages.contains(&0) && app.page_edit_snapshot.is_some() {
             return;
@@ -4343,7 +4797,8 @@ fn phase_a2_late_local_adjust_commit_and_delete_reconcile() {
                 .remove_layers(&key)
                 .unwrap();
         }
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_page_edit_reconciliation(&ctx);
             if app.local_adjust_pages.contains(&0) == wanted
                 && app
@@ -4442,19 +4897,22 @@ fn metadata_import_keeps_unaffected_thumb_adjustment() {
         GridItem::Image("C:/pics/import-untouched.jpg".into()),
     ];
     app.thumbnails = (0..2)
-        .map(|idx| ThumbnailState::Loaded {
-            tex: ctx.load_texture(
-                format!("import_original_{idx}"),
-                egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
-                egui::TextureOptions::LINEAR,
-            ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                evaluated_display_px: 1,
-            },
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
+        .map(|idx| {
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
+                    format!("import_original_{idx}"),
+                    egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
+                    egui::TextureOptions::LINEAR,
+                ),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1, 1)),
+                None,
+            )
         })
         .collect();
     for idx in 0..2 {
@@ -4643,7 +5101,8 @@ fn phase_a2_sibling_write_refreshes_parked_bundle_on_remount() {
         .unwrap();
     phase_a2_wait_for_mask(&mut app);
     let mut sibling_ready = false;
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         sibling_ready = app
             .with_viewer_context(sibling, |context| context.mask_pages.contains(&0))
             .unwrap();
@@ -4878,11 +5337,13 @@ fn hidden_detached_host_builder_does_not_request_maximize() {
     app.begin_active_detached_session(12, DetachedSource::Image);
     app.set_detached_window_runtime_placement(
         12,
-        crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 1600.0,
-            h: 1200.0,
+        crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1700,
+                bottom: 1320,
+            },
             maximized: true,
         },
         "test_hidden_builder",
@@ -4908,11 +5369,13 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
     app.begin_active_detached_session(12, DetachedSource::Video);
     app.set_detached_window_runtime_placement(
         12,
-        crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 1600.0,
-            h: 1200.0,
+        crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1700,
+                bottom: 1320,
+            },
             maximized: true,
         },
         "test_visible_commit",
@@ -4942,6 +5405,15 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
     assert_eq!(
         after_capture, before_capture,
         "a hidden recreate scaffold must not publish its temporary restored state or geometry as user placement"
+    );
+    app.set_detached_window_host_for_test(12, 0xD371);
+    let claim = app.detached_window_manager.host_claim_alive(12).unwrap();
+    assert_eq!(
+        app.detached_window_manager.mark_host_placed(
+            claim,
+            crate::app::detached_window_manager::PlacementOutcome::Exact,
+        ),
+        None
     );
     let viewport_id = app.fullscreen_viewport_id();
     let ctx = egui::Context::default();
@@ -4998,6 +5470,7 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
         ],
         "the preserved maximized intent must be applied by the transition owner's Visible commit"
     );
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -5044,7 +5517,7 @@ fn synthetic_f12_reaches_the_fullscreen_detached_handler() {
         }
     ))));
     let _ = app.handle_fs_key_input(&ctx, 0, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(app.settings.detached_viewer_enabled);
     assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
@@ -5061,11 +5534,13 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
         r"C:\pics\borderless-observation.jpg",
     )));
     let idx = 0;
-    let restore = crate::settings::DetachedViewerWindowPlacement {
-        x: 140.0,
-        y: 160.0,
-        w: 1500.0,
-        h: 1000.0,
+    let restore = crate::detached_window_geometry::PhysicalWindowPlacement {
+        outer: crate::detached_window_geometry::PhysicalRect {
+            left: 140,
+            top: 160,
+            right: 1640,
+            bottom: 1160,
+        },
         maximized: true,
     };
     app.fullscreen_idx = Some(idx);
@@ -5132,7 +5607,24 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     );
 
     // F11 OFF still has the paired restore placement and publishes it to the new runtime.
-    app.apply_detached_viewer_borderless_target(&egui::Context::default(), false);
+    app.set_detached_window_host_for_test(recreated_window, 0xF120);
+    let transition = DetachedViewerBorderlessTransition {
+        target_borderless: false,
+        target_outer: restore.outer,
+        phase: DetachedViewerBorderlessTransitionPhase::ApplyWindowMode,
+    };
+    crate::app::detached_placement::with_host_geometry_for_test(
+        recreated_window,
+        app.detached_viewer_borderless_target_rect(),
+        false,
+        || {
+            assert!(app.apply_detached_viewer_borderless_target(
+                &egui::Context::default(),
+                transition,
+                true,
+            ))
+        },
+    );
     assert!(!app.detached_viewer_borderless_fullscreen);
     assert_eq!(app.detached_viewer_restore_placement, None);
     assert_eq!(
@@ -5175,7 +5667,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
     );
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.fs_viewport_shown = true;
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
 
     // A late terminal effect for retired H must be exact-by-lease and leave J untouched.
     app.retire_terminal_detached_viewport_identity(OLD_WINDOW_H, "test_stale_h_cleanup");
@@ -5237,6 +5729,7 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     );
     assert!(
         app.detached_window_hwnd_set_for_reusable_lease(
+            &ctx,
             OLD_WINDOW_H,
             LATE_HWND,
             "test_late_registration_closing",
@@ -5264,6 +5757,7 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     );
     assert!(
         app.detached_window_hwnd_set_for_reusable_lease(
+            &ctx,
             OLD_WINDOW_H,
             LATE_HWND,
             "test_late_registration_removed",
@@ -5303,7 +5797,7 @@ fn hwnd_registration_preserves_previewport_lifecycle_until_render_marker() {
         Some(DetachedWindowState::Opening),
         "post-show HWND adoption is not the viewport-rendered marker"
     );
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
     assert_eq!(
         app.detached_window_state(WINDOW_ID),
         Some(DetachedWindowState::Active)
@@ -5322,7 +5816,7 @@ fn hwnd_registration_preserves_previewport_lifecycle_until_render_marker() {
         Some(DetachedWindowState::Resuming),
         "registration must preserve the typed resume lifecycle"
     );
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
     assert_eq!(
         app.detached_window_state(WINDOW_ID),
         Some(DetachedWindowState::Active),
@@ -5334,11 +5828,13 @@ fn hwnd_registration_preserves_previewport_lifecycle_until_render_marker() {
 #[cfg(windows)]
 fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
     let mut media = phase_c_support::setup_app();
-    let restore = crate::settings::DetachedViewerWindowPlacement {
-        x: 140.0,
-        y: 160.0,
-        w: 1500.0,
-        h: 1000.0,
+    let restore = crate::detached_window_geometry::PhysicalWindowPlacement {
+        outer: crate::detached_window_geometry::PhysicalRect {
+            left: 140,
+            top: 160,
+            right: 1640,
+            bottom: 1160,
+        },
         maximized: false,
     };
     media.items.push(GridItem::Audio(PathBuf::from(
@@ -5376,7 +5872,12 @@ fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
 #[test]
 #[cfg(windows)]
 fn borderless_runtime_state_writes_stay_on_the_observed_path() {
-    let source = include_str!("../app.rs");
+    let source = concat!(
+        include_str!("../app.rs"),
+        include_str!("update_phases.rs"),
+        include_str!("root_lifecycle.rs"),
+        include_str!("ai_terminal_service.rs")
+    );
     assert_eq!(
         source
             .matches("self.detached_viewer_borderless_fullscreen =")
@@ -5396,7 +5897,21 @@ fn borderless_runtime_state_writes_stay_on_the_observed_path() {
 #[test]
 #[cfg(windows)]
 fn detached_child_teardown_has_no_programmatic_viewport_close_producers() {
-    let app_source = include_str!("../app.rs");
+    // These modules contain inline fixtures with root Close assertions. Audit
+    // their product code, just as app.rs excludes its separate test module.
+    let app_source = [
+        include_str!("../app.rs"),
+        include_str!("update_phases.rs"),
+        include_str!("root_lifecycle.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap(),
+        include_str!("ai_terminal_service.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap(),
+    ]
+    .concat();
     let native_video_source = include_str!("native_video.rs");
     let fullscreen_source = include_str!("../ui_fullscreen.rs");
 
@@ -5674,6 +6189,8 @@ fn phase_a_seed_shared_preview() -> (phase_c_support::AppTestEnv, PathBuf, Strin
         1,
         5,
         None,
+        crate::page_dims::CanonicalPageDimensions::new(2, 2),
+        None,
         Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
         None,
         None,
@@ -5780,10 +6297,10 @@ fn phase_a_missing_comic_fonts_close_preserves_shared_preview() {
     let edit_key = app.current_edit_result_key(0);
     app.edit_result_cache.insert(
         edit_key,
-        EditResultEntry {
-            pixels: Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
-            texture: None,
-        },
+        EditResultEntry::raster(
+            Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
+            None,
+        ),
     );
     assert!(matches!(
         app.snapshot_edit_preview_close_update(0),
@@ -5861,7 +6378,8 @@ fn phase_b_search_streaming_result_projects_saved_mask() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.mask_pages.contains(&0) {
             break;
@@ -5894,7 +6412,8 @@ fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
     stream.send(phase_b_search_batch(&first, 1)).unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items_are_global_search_view && app.items.len() == 1 {
             break;
@@ -5912,7 +6431,8 @@ fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items.len() == 2 && app.mask_pages.len() == 2 {
             break;
@@ -5930,7 +6450,7 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
     let (mut app, first) = phase_b_masked_image();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
-    app.global_search.query = "old query".into();
+    app.global_search.metadata_draft = "old query".into();
     app.global_search.last_executed = "old query".into();
     app.rebuild_items_from_global_search();
     stream.send(phase_b_search_batch(&first, 1)).unwrap();
@@ -5940,7 +6460,8 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items.len() == 1 {
             break;
@@ -5949,7 +6470,7 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
     }
     assert_eq!(app.items.len(), 1);
     let old_prepare_cancel = app.search_prepare_cancel_for_test();
-    app.global_search.query = "new query".into();
+    app.global_search.metadata_draft = "new query".into();
     app.reset_global_search_for_query_change(&ctx);
     assert!(old_prepare_cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!std::sync::Arc::ptr_eq(
@@ -5974,7 +6495,8 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
     std::fs::write(&image, b"image").unwrap();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items_are_global_search_view {
             break;
@@ -5992,7 +6514,8 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.search_ready_is_held_for_test() {
             break;
@@ -6008,7 +6531,8 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
         .set(&key, &[true], &[], 1, 1)
         .unwrap();
     app.release_search_ready_for_test();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items.len() == 1 && app.mask_pages.contains(&0) {
             break;
@@ -6218,7 +6742,8 @@ fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
     RATING_INSTALL_UI_TAG_PREWARMS.with(|calls| calls.set(0));
     app.enter_rating_view(3);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.mask_pages.contains(&0) {
@@ -6229,7 +6754,8 @@ fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
     app.set_rating_view_sort(crate::rating_view::RatingViewSort::Normal(
         crate::settings::SortOrder::FileName,
     ));
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.rating_view_pending.is_none() && !app.sidecar_restore_active() {
@@ -6299,7 +6825,8 @@ fn phase_b_rating_pending_result_publishes_after_shared_star_write() {
     app.write_user_rating_shared(&key, 0, Some(&meta)).unwrap();
     let before_install = app.items_generation;
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.rating_view_pending.is_none() {
@@ -6313,7 +6840,8 @@ fn phase_b_rating_pending_result_publishes_after_shared_star_write() {
         app.visible_indices.is_empty(),
         "the prepared row installs once, then the committed star is hidden before paint"
     );
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&egui::Context::default());
         if app.rating_view_pending.is_none() && app.items.is_empty() {
@@ -6373,7 +6901,8 @@ fn phase_b_rating_pending_result_rebases_after_tag_write() {
     tx.send(result).unwrap();
     app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.rating_view_pending.is_none() {
@@ -6420,7 +6949,8 @@ fn phase_b_rating_pending_result_rebases_after_book_page_copy() {
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(app.rating_session_write_generation, local_generation);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.items.len() == 2 && app.rating_view_pending.is_none() {
@@ -6470,7 +7000,8 @@ fn phase_b_rating_rejects_edit_written_without_view_snapshot() {
     assert!(tx.send(result).is_ok());
     app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.mask_pages.contains(&0) {
@@ -6526,7 +7057,8 @@ fn phase_b_reading_history_opened_folder_resolves_masked_member_before_paint() {
         None,
     )]);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_sidecar_restore(&ctx);
         if !app.sidecar_restore_active() {
             break;
@@ -6535,7 +7067,8 @@ fn phase_b_reading_history_opened_folder_resolves_masked_member_before_paint() {
     }
     app.note_reading_history_open(0);
     app.load_folder(folder);
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_sidecar_restore(&ctx);
         if !app.sidecar_restore_active() {
             break;
@@ -6578,7 +7111,8 @@ fn phase_b_reading_history_opened_zip_resolves_masked_member_before_paint() {
         None,
     )]);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_sidecar_restore(&ctx);
         if !app.sidecar_restore_active() {
             break;
@@ -6587,7 +7121,8 @@ fn phase_b_reading_history_opened_zip_resolves_masked_member_before_paint() {
     }
     app.note_reading_history_open(0);
     app.load_zip_as_folder(archive.clone(), crate::app::StartupListIntent::ExplicitList);
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_zip_enumerate();
         app.poll_sidecar_restore(&ctx);
         if app
@@ -6650,7 +7185,7 @@ fn housekeeping_gate_remains_fts_only() {
 /// Esc that closes it - and made a right-click stop closing the image with nothing on screen to
 /// explain why. Its siblings in the same bar have never blocked anything (2026-08-15, before
 /// v3.0.0 went out).
-fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
+fn fullscreen_overflow_panel_holds_no_input_and_survives_file_boundary() {
     let mut app = setup_app_for_test();
     app.fs_overflow_panel_state = FsOverflowPanelState::Root;
     assert!(!app.common_modal_dialog_open());
@@ -6662,7 +7197,40 @@ fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
     );
 
     app.reset_fs_side_panel_runtime_for_file_change();
-    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+}
+
+#[cfg(windows)]
+#[test]
+fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
+    for state in [
+        FsOverflowPanelState::Root,
+        FsOverflowPanelState::NavigatorPosition,
+        FsOverflowPanelState::SpreadAdjustment,
+        FsOverflowPanelState::Slideshow,
+        FsOverflowPanelState::MusicNoteColor,
+    ] {
+        for pause in [true, false] {
+            let mut app = setup_app_for_test();
+            app.items = vec![GridItem::Image(app.tmp.path().join("overflow-owner.jpg"))];
+            app.fullscreen_idx = Some(0);
+            app.fs_overflow_panel_state = state;
+            app.fs_front_pointer =
+                crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+
+            if pause {
+                app.reset_detached_pause_foreground_modes(0);
+            } else {
+                app.close_fullscreen();
+            }
+
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert!(
+                !app.fs_front_pointer.is_active(),
+                "{state:?}, pause={pause}: foreground ownership must end with the panel"
+            );
+        }
+    }
 }
 
 #[test]
@@ -6693,7 +7261,7 @@ fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(app.rating_db.as_ref().unwrap().get(&rating_key), 0);
 }
 
@@ -6726,7 +7294,7 @@ fn epub_single_save_modal_blocks_grid_keyboard() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(app.rating_db.as_ref().unwrap().get(&rating_key), 0);
 }
 
@@ -6857,16 +7425,17 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
             if idx == 0 {
                 ThumbnailState::Pending
             } else {
-                ThumbnailState::Loaded {
-                    tex: portrait_tex.clone(),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                ThumbnailState::loaded_raster(
+                    portrait_tex.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 2,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 2,
-                    source_dims: Some((900, 1400)),
-                    layout_dims: None,
-                }
+                    false,
+                    2,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((900, 1400)),
+                    None,
+                )
             }
         })
         .collect();
@@ -6879,6 +7448,8 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: landscape_tex,
             pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
             source_dims: Some([1800, 1100]),
@@ -6930,15 +7501,18 @@ fn spread_units_rebuild_only_when_saved_rotation_changes_landscape_state() {
         egui::TextureOptions::LINEAR,
     );
     app.thumbnails = (0..app.items.len())
-        .map(|_| ThumbnailState::Loaded {
-            tex: portrait_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                evaluated_display_px: 2,
-            },
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_dims: Some((600, 900)),
-            layout_dims: None,
+        .map(|_| {
+            ThumbnailState::loaded_raster(
+                portrait_tex.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 2,
+                },
+                false,
+                2,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((600, 900)),
+                None,
+            )
         })
         .collect();
     let nav = (0..app.items.len()).collect::<Vec<_>>();
@@ -7075,6 +7649,8 @@ fn spread_dimension_discovery_rebuilds_only_for_landscape() {
     app.fs_cache.insert(
         5,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: ctx.load_texture(
                 "spread_cache_fs_landscape",
                 egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
@@ -7152,11 +7728,23 @@ fn spread_cache_token_tracks_every_pairing_input() {
 fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
     let mut app = phase_c_support::setup_app();
     app.items_generation = 5;
-    app.page_dims_cache.record(5, 0, (1800, 1100));
+    app.page_dims_cache.record(
+        5,
+        0,
+        crate::page_dims::PagePixelDimensions::Canonical(
+            crate::page_dims::CanonicalPageDimensions::new(1800, 1100),
+        ),
+    );
 
     app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
         detached.items_generation = 5;
-        detached.page_dims_cache.record(5, 0, (900, 1400));
+        detached.page_dims_cache.record(
+            5,
+            0,
+            crate::page_dims::PagePixelDimensions::Canonical(
+                crate::page_dims::CanonicalPageDimensions::new(900, 1400),
+            ),
+        );
     });
 
     let detached_dims = app
@@ -7346,29 +7934,39 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
-    FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
-        singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
-        layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
-        pages: vec![FsDisplayUnitHoldoverPage {
-            fit_scale_limits: crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
-            fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
-                crate::settings::FullscreenFitMode::Page,
-            ),
-            occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(page_idx, page_idx),
-            layout_size: texture.size_vec2(),
-            post_filter: crate::adjustment::PostFilter::None,
-            trace_key: None,
-            trace_load_seq: 0,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
-            rotation: crate::rotation_db::Rotation::None,
-            source_size: None,
-            content_bbox: None,
-        }],
-    }))
+    FsHoldover::FolderNavigation(
+        Some(FsDisplayUnitHoldover {
+            singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+            layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
+            pages: vec![FsDisplayUnitHoldoverPage {
+                fit_scale_limits:
+                    crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
+                occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
+                    page_idx, page_idx,
+                ),
+                layout_size: texture.size_vec2(),
+                post_filter: crate::adjustment::PostFilter::None,
+                trace_key: None,
+                trace_load_seq: 0,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                rotation: crate::rotation_db::Rotation::None,
+                source_size: None,
+                content_bbox: None,
+            }],
+        }),
+        crate::app::FsFolderNavigationOrigin::Ordinary,
+    )
 }
 
 #[test]
 #[cfg(windows)]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
@@ -7385,7 +7983,7 @@ fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     });
     app.update_ime_state(&ctx);
     assert!(app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     app.native_video_last_move_client = None;
     app.handle_native_video_window_event(
         &ctx,
@@ -9204,11 +9802,14 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
 
     app.begin_metadata_import_terminal_refresh();
     assert!(!app.advance_metadata_import_terminal_refresh(&root, false));
-    let first_frame_items = app
+    let MetadataImportRefreshState::Collecting(index) = app
         .metadata_import_refresh_index
         .as_ref()
         .expect("index preparation started")
-        .next_item;
+    else {
+        panic!("expected collecting index")
+    };
+    let first_frame_items = index.next_item;
     assert!((1..=2_048).contains(&first_frame_items));
 
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
@@ -9557,19 +10158,20 @@ fn press_ctrl_z_for_metadata_test(app: &mut App) {
     let ctx = egui::Context::default();
     let modifiers = egui::Modifiers::CTRL;
     ctx.begin_pass(egui::RawInput {
-        modifiers,
-        events: vec![egui::Event::Key {
-            key: egui::Key::Z,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        }],
+        events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+            .chain(vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }])
+            .collect(),
         ..Default::default()
     });
     app.keyboard_owner_for_pass(&ctx);
     app.handle_meta_undo_keys(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -9830,7 +10432,7 @@ fn rating_step_grid_key_handler_single_records_rating_and_undo() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
     assert_eq!(app.meta_undo.undo_len(), 1);
@@ -9878,7 +10480,7 @@ fn rating_step_grid_key_handler_checked_multi_records_one_undo() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
         assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
@@ -9935,7 +10537,7 @@ fn rating_step_grid_key_handler_partial_bound_clears_checks_but_all_bound_keeps_
             vec![fullscreen_fixed_key_event(egui::Key::F13)],
         ));
         let _ = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     };
     press_step_up(&mut app);
     assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[0]), 5);
@@ -9991,7 +10593,7 @@ fn rating_step_still_fullscreen_key_handler_item_and_container_record_undo() {
             vec![fullscreen_fixed_key_event(key)],
         ));
         let _ = app.handle_fs_key_input(&ctx, 0, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 2);
@@ -10104,7 +10706,8 @@ fn metadata_panel_plain_folder_container_rating_is_unchanged() {
     std::fs::create_dir_all(&folder).unwrap();
     app.current_folder = Some(folder.clone());
 
-    let (key, source, meta) = app.current_container_rating_target().unwrap();
+    let ContainerRatingTarget { key, source, meta } =
+        app.current_container_rating_target().unwrap();
     assert_eq!(key, crate::adjustment_db::normalize_path(&folder));
     assert_eq!(source, folder);
     assert_eq!(meta.kind, crate::rating_db::RatingItemKind::Folder);
@@ -10152,7 +10755,11 @@ fn metadata_panel_zip_root_and_subdirectory_read_composed_container_keys() {
     let book_key = crate::adjustment_db::normalize_path(&zip.join("book-a"));
     app.rating_db.as_ref().unwrap().set(&book_key, 5).unwrap();
 
-    let (resolved_key, source, meta) = app.current_container_rating_target().unwrap();
+    let ContainerRatingTarget {
+        key: resolved_key,
+        source,
+        meta,
+    } = app.current_container_rating_target().unwrap();
     assert_eq!(resolved_key, book_key);
     assert_eq!(source, zip);
     assert_eq!(meta.kind, crate::rating_db::RatingItemKind::ZipDir);
@@ -10223,13 +10830,16 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
         egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
         egui::TextureOptions::LINEAR,
     );
-    let loaded = || ThumbnailState::Loaded {
-        tex: texture.clone(),
-        origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-        from_edit_preview: true,
-        rendered_at_px: 64,
-        source_dims: Some((1, 1)),
-        layout_dims: None,
+    let loaded = || {
+        ThumbnailState::loaded_raster(
+            texture.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            true,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        )
     };
     let prepare_context = |bundle: &mut App, path: &str| {
         bundle.items = vec![GridItem::Image(PathBuf::from(path))];
@@ -13038,6 +13648,23 @@ pub(crate) mod phase_c_support {
     use super::{App, AppTestConfig};
     use tempfile::TempDir;
 
+    /// Prove that the last admitted position write has committed before a test
+    /// reads the separate resume DB connection. Navigation and tray hide do not
+    /// promise writer completion; no UI pass or polling is needed for this ACK.
+    pub(crate) fn wait_for_book_resume_write(app: &App, book: &std::path::Path) {
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let cutoff = writer.watermarks().admitted;
+        let receipt = writer
+            .read_position_after(&crate::path_key::normalize(book), cutoff)
+            .recv()
+            .expect("resume write completion");
+        receipt.status.expect("resume write succeeded");
+        assert!(
+            receipt.completed_through >= cutoff,
+            "resume receipt must cover the last admitted position write"
+        );
+    }
+
     /// 外部変更の再走査は worker が返すので、テストは結果が届くまで poll する。
     /// UI スレッドで read_dir しない契約 (F14) を、テスト側でも同じ形で待つ。
     pub(crate) fn wait_for_external_rescan(app: &mut App) {
@@ -13329,11 +13956,21 @@ mod paused_similar_feature_tests {
                 screen_rect: Some(full_rect),
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+            ctx.run_pass(input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        assert!(app.draw_metadata_panel(
+                            ui,
+                            ctx,
+                            full_rect,
+                            true,
+                            0.0,
+                            Default::default()
+                        ));
+                    })
                 });
-            });
+            })
+            .drop_without_applying_deltas();
             crate::ui_metadata_panel::take_book_section_heading_rect_for_test()
                 .expect("ready book result must draw the book section heading")
         };
@@ -13947,9 +14584,13 @@ mod startup_open_path_resolve_tests {
             detached.pdf_password_request = Some(super::PdfPasswordRequest::legacy(pdf.clone()));
         });
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| {
-            assert!(app.update_active_viewer_context(ctx, None).updated);
-        });
+        ctx.run_pass(Default::default(), |ctx| {
+            assert!(
+                ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                    .updated
+            );
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.with_active_viewer_context(|detached| detached.fs_viewport_shown)
                 .unwrap_or(false)
@@ -13966,9 +14607,10 @@ mod startup_open_path_resolve_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(input, |ctx| {
-            app.update_active_viewer_context(ctx, None);
-        });
+        ctx.run_pass(input, |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+        })
+        .drop_without_applying_deltas();
         assert!(app.pdf_password_dialog_path().is_none());
     }
 
@@ -14007,7 +14649,7 @@ mod startup_open_path_resolve_tests {
         assert_eq!(app.modal_dialog_block_reason(), Some("pdf_password"));
         assert!(!app.active_detached_owns_pdf_password_prompt());
         assert!(!app.detached_window_can_activate(8107));
-        let output = ctx.run(Default::default(), |ctx| {
+        let output = ctx.run_pass(Default::default(), |ctx| {
             app.show_pdf_password_dialog_window(ctx);
         });
         assert!(!output.shapes.is_empty());
@@ -14016,6 +14658,7 @@ mod startup_open_path_resolve_tests {
         assert!(app.pdf_password_dialog_path().is_none());
         assert!(!app.document_open_modal_admission_blocked());
         assert!(app.detached_window_can_activate(8107));
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -14061,8 +14704,11 @@ mod startup_open_path_resolve_tests {
                 super::PdfOpenFailureRoute::ConversionDialogOpened
             );
         });
-        let output = ctx.run(Default::default(), |ctx| {
-            assert!(app.update_active_viewer_context(ctx, None).updated);
+        let output = ctx.run_pass(Default::default(), |ctx| {
+            assert!(
+                ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                    .updated
+            );
         });
         assert!(!app.detached_window_can_activate(8105));
         app.queue_deferred_detached_window_activation(8105, "modal_gate_test");
@@ -14077,7 +14723,7 @@ mod startup_open_path_resolve_tests {
             output.viewport_output.len()
         );
         assert!(
-            ctx.memory(|memory| memory.area_rect(egui::Id::new("epub_convert_dialog")))
+            ctx.memory(|memory| memory.area_rect(egui::Id::unique("epub_convert_dialog")))
                 .is_some(),
             "conversion dialog must be drawn in the active detached frame"
         );
@@ -14099,14 +14745,16 @@ mod startup_open_path_resolve_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(input, |ctx| {
-            app.update_active_viewer_context(ctx, None);
-        });
+        ctx.run_pass(input, |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+        })
+        .drop_without_applying_deltas();
         assert!(app.active_viewer_context_id().is_none_or(|active| {
             app.with_viewer_context_ref(active, |owner| owner.epub_convert().is_none())
                 .unwrap_or(true)
         }));
         assert!(app.activate_detached_image_window_snapshot(&ctx, 8105));
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -14143,9 +14791,10 @@ mod startup_open_path_resolve_tests {
                 .is_empty())
                 .unwrap()
         );
-        let output = ctx.run(Default::default(), |_| {});
+        let output = ctx.run_pass(Default::default(), |_| {});
         assert!(output.shapes.is_empty());
         assert_eq!(app.modal_dialog_block_reason(), None);
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -14177,9 +14826,10 @@ mod startup_open_path_resolve_tests {
             })
             .unwrap();
         send_done();
-        let _ = ctx.run(Default::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None);
-        });
+        ctx.run_pass(Default::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.with_active_viewer_context(|active| active.epub_convert.is_none())
                 .unwrap_or(true)
@@ -14220,9 +14870,10 @@ mod startup_open_path_resolve_tests {
                 break;
             }
             assert!(std::time::Instant::now() < deadline);
-            let _ = ctx.run(Default::default(), |ctx| {
-                app.update_active_viewer_context(ctx, None);
-            });
+            ctx.run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+            })
+            .drop_without_applying_deltas();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         app.with_window_viewer_context(8101, |detached| {
@@ -14856,7 +15507,8 @@ mod startup_open_path_resolve_tests {
             .unwrap()
             .fake_published_sender_for_test()();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.top_level_grid_view.history_navigation_transition(),
             Some(super::HistoryNavigationTransition::Physical(request))
@@ -15308,28 +15960,32 @@ mod startup_open_path_resolve_tests {
     ) {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: source,
-            input_seq: 0,
-            format,
-            password: None,
-            password_input: String::new(),
-            phase,
-            cancel: Arc::clone(&cancel),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Bookmark(owner),
-            pending_sibling_output: None,
-            auto_fullscreen: true,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: source,
+                input_seq: 0,
+                format,
+                password: None,
+                password_input: String::new(),
+                phase,
+                cancel: Arc::clone(&cancel),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Bookmark(
+                        owner,
+                    ),
+                pending_sibling_output: None,
+                auto_fullscreen: true,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         (tx, cancel)
     }
 
@@ -15408,28 +16064,30 @@ mod startup_open_path_resolve_tests {
     ) {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: source,
-            input_seq: 0,
-            format: ArchiveFormat::SevenZ,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: Arc::clone(&cancel),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: source,
+                input_seq: 0,
+                format: ArchiveFormat::SevenZ,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: Arc::clone(&cancel),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         (tx, cancel)
     }
 
@@ -15528,9 +16186,10 @@ mod startup_open_path_resolve_tests {
     }
 
     fn show_archive_convert_dialog_frame(app: &mut App, ctx: &egui::Context) {
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -16139,7 +16798,7 @@ mod startup_open_path_resolve_tests {
         let source = app.tmp.path().join("escape-normal-scan.7z");
         let (tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
         let ctx = egui::Context::default();
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,
@@ -16151,7 +16810,8 @@ mod startup_open_path_resolve_tests {
                 ..Default::default()
             },
             |ctx| app.show_archive_convert_dialog(ctx),
-        );
+        )
+        .drop_without_applying_deltas();
 
         assert!(cancel.load(Ordering::Relaxed));
         assert!(app.archive_convert.is_none());
@@ -16185,7 +16845,10 @@ mod startup_open_path_resolve_tests {
         let app_for_ui = Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
-            .build(move |ctx| {
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 app_for_ui.borrow_mut().show_archive_convert_dialog(ctx);
             });
 
@@ -16296,9 +16959,10 @@ mod startup_open_path_resolve_tests {
         app.archive_convert.as_mut().unwrap().pending_direct_nav = Some(source.clone());
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(crate::folder_tree::path_eq(
@@ -16333,9 +16997,10 @@ mod startup_open_path_resolve_tests {
         app.archive_convert.as_mut().unwrap().pending_nav = Some(cached.clone());
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         finish_bookmark_cache_adoption(&mut app);
@@ -17161,18 +17826,19 @@ mod phase_c_key_tests {
     ) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -17189,6 +17855,7 @@ mod phase_c_key_tests {
     #[cfg(windows)]
     fn root_right_edge(pressed: bool) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x27,
@@ -17306,6 +17973,7 @@ mod phase_c_key_tests {
         let mut app = setup_stack_refresh_key_app();
         assert!(grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Escape).is_none());
         assert!(!app.stack_mode_requested);
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.grid_item_input_allowed());
     }
 
@@ -17326,7 +17994,7 @@ mod phase_c_key_tests {
             });
             let _owner = app.keyboard_owner_for_pass(&ctx);
             app.handle_delete_key(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             assert_eq!(app.show_delete_confirm, !blocked);
             if blocked {
                 app.stack_return_state = None; // accepted aggregate replacement
@@ -17374,7 +18042,7 @@ mod phase_c_key_tests {
         );
 
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.selected, Some(1));
@@ -19236,7 +19904,7 @@ mod phase_c_key_tests {
         let bogus = uuid::Uuid::new_v4();
         app.global_search.active = true;
         app.global_search.filters.favorite = Some(bogus);
-        app.global_search.query = "x".to_string();
+        app.global_search.metadata_draft = "x".to_string();
         // 準備中/利用不能でも、reject_messageで戻る前にfilterの健全化を行う。
         app.spawn_global_search(&egui::Context::default());
         assert_eq!(
@@ -19298,6 +19966,8 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            precise_stamps: Default::default(),
+            reconcile: None,
             auxiliary_media: Default::default(),
             complete_audio_inventory: None,
             folders: Vec::new(),
@@ -19590,18 +20260,19 @@ mod phase_c_folder_nav_history_tests {
     fn history_key_nav(app: &mut App, key: egui::Key) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers: egui::Modifiers::ALT,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::ALT,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::ALT))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                }])
+                .collect(),
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -20397,9 +21068,51 @@ mod phase_c_folder_nav_history_tests {
         );
     }
 
+    #[test]
+    fn g1_history_back_from_a2_adopts_original_book_view_without_writing_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app();
+        let book = app.tmp.path().join("g1-return-book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("01.jpg"), []).unwrap();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.active_quick_folder_slot = None;
+        let db_path = app.tmp.path().join("g1-return-spread.db");
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &book,
+                SpreadMode::RtlCover,
+                SpreadMode::Single,
+                ReadingFlow::Paged,
+                ReadingDirection::Rtl,
+            )
+            .unwrap();
+        app.current_folder = Some(super::rating_view_synthetic_path());
+        app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating);
+        app.begin_extracted_result_view();
+        app.apply_fullscreen_spread_mode(&egui::Context::default(), 0, SpreadMode::Ltr);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(book.clone()).into()];
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&book),
+            Some(SpreadMode::RtlCover)
+        );
+    }
+
     pub(super) fn finish_staged_physical_history_for_test(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.settle_open_path_classification_for_test();
             app.poll_sidecar_restore(&ctx);
             if app
@@ -20513,7 +21226,8 @@ mod phase_c_folder_nav_history_tests {
             .fake_stale_sender_for_test();
         send_stale();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.epub_convert.as_ref().map(|state| &state.phase),
             Some(crate::ui_dialogs::epub_convert::EpubConvertPhase::Stale)
@@ -20547,7 +21261,8 @@ mod phase_c_folder_nav_history_tests {
             .unwrap()
             .fake_error_sender_for_test();
         send_error();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.epub_convert.as_ref().map(|state| &state.phase),
             Some(crate::ui_dialogs::epub_convert::EpubConvertPhase::Error(_))
@@ -20589,7 +21304,8 @@ mod phase_c_folder_nav_history_tests {
             .fake_published_sender_for_test();
         send();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert!(
             matches!(app.top_level_grid_view.history_navigation_transition(),
@@ -20771,7 +21487,8 @@ mod phase_c_folder_nav_history_tests {
         app.epub_convert = Some(saved);
         drop(old_state);
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(
             matches!(app.top_level_grid_view.history_navigation_transition(),
             Some(super::HistoryNavigationTransition::Physical(request))
@@ -21529,6 +22246,197 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.slideshow_playing);
     }
 
+    fn stage_fullscreen_hydration_for_test(
+        app: &mut super::phase_c_support::AppTestEnv,
+        ctx: &egui::Context,
+        pdf: bool,
+        required: bool,
+    ) {
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = true;
+        app.settings.tag_sidecar_backup_enabled = false;
+        let old = app.tmp.path().join("old-book");
+        std::fs::create_dir(&old).unwrap();
+        let texture = ctx.load_texture(
+            "old-hydration-page",
+            egui::ColorImage::filled([2, 2], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        app.current_folder = Some(old.clone());
+        app.install_new_items(vec![GridItem::Image(old.join("page.png"))], vec![None]);
+        app.visible_indices = vec![0];
+        app.thumbnails[0] = crate::grid_item::ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        );
+        app.fullscreen_idx = Some(0);
+        app.fs_viewport_shown = true;
+        let path = app
+            .tmp
+            .path()
+            .join(if pdf { "next.pdf" } else { "next.zip" });
+        if pdf {
+            std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+        } else {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"fixture").unwrap();
+            zip.finish().unwrap();
+        }
+        if required {
+            assert!(app.start_physical_history_transition(
+                super::PhysicalHistoryIntent::RequiredFullscreen {
+                    target: crate::snapshot::SnapshotTarget::PdfPage {
+                        pdf_path: path.clone(),
+                        page_num: 0,
+                    },
+                    history_trigger: super::HistoryTrigger::UserChosen,
+                    navigation_purpose: super::FsNavigationPurpose::Ordinary,
+                },
+                path.clone(),
+                super::StartupListIntent::PageContinuation,
+            ));
+        } else {
+            assert!(app.supersede_and_begin_fs_folder_navigation_sequence(
+                ctx,
+                super::FsNavigationPurpose::Ordinary,
+            ));
+            // The production Ctrl+Down result/adoption route, with only the DFS worker elided.
+            app.apply_folder_nav_result(
+                ctx,
+                super::FolderNavResult {
+                    target: Some(super::FolderNavTarget {
+                        route: super::FolderNavRoute::FullFeature(path.clone()),
+                        smart_kind: None,
+                        scanned: super::FolderNavScanResult::NotNeeded,
+                    }),
+                    hit_image_folder: true,
+                    forward: true,
+                    mode: super::FolderNavMode::Fullscreen,
+                    queued_steps: 0,
+                },
+            );
+        }
+        app.settle_open_path_classification_for_test();
+        if pdf {
+            replace_physical_history_preflight_for_test(
+                app,
+                crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                    crate::pdf_loader::PdfEnumerateResult {
+                        pages: vec![crate::pdf_loader::PdfPageEntry {
+                            page_num: 0,
+                            mtime: 1,
+                            file_size: 1,
+                        }],
+                        direction: None,
+                        stamp: None,
+                    },
+                ),
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.current_folder.as_ref() != Some(&path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staged adoption timed out"
+            );
+            app.poll_collection_history_transition(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.sidecar_restore_active());
+        assert!(app.fullscreen_idx.is_none());
+    }
+
+    #[test]
+    fn staged_fullscreen_hydration_keeps_pdf_zip_and_required_viewports_alive() {
+        // Native immediate callbacks are thread-local. Isolate the fake adapter from other tests.
+        std::thread::spawn(|| {
+            for (pdf, required) in [(true, false), (false, false), (true, true)] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            ctx.set_embed_viewports(false);
+            let mut app = setup_app();
+            stage_fullscreen_hydration_for_test(&mut app, &ctx, pdf, required);
+            assert!(app.fs_nav_deferred_reopen_wait_active());
+            app.poll_fs_nav_lock(&ctx);
+            assert!(app.fs_nav_locked_gen.is_some());
+            assert!(
+                app.fs_nav_holdover_for_draw().is_some(),
+                "old page survives hydration"
+            );
+            let old_texture = app.fs_holdover_tex.as_ref().unwrap().primary_texture_id();
+            let child_paints = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = child_paints.clone();
+            egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+                let mut child_output = crate::test_ui::headless_paint_output(ctx.run_ui(
+                    egui::RawInput {
+                        viewport_id: viewport.ids.this,
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+                        viewports: [
+                            (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                            (viewport.ids.this, egui::ViewportInfo { parent: Some(egui::ViewportId::ROOT), ..Default::default() }),
+                        ].into_iter().collect(),
+                        ..Default::default()
+                    },
+                    |ui| (viewport.viewport_ui_cb)(ui),
+                ));
+                let painted_old_texture = ctx.tessellate(std::mem::take(&mut child_output.shapes), child_output.pixels_per_point).iter().any(|clipped| {
+                    matches!(&clipped.primitive, egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == old_texture)
+                });
+                let hidden = child_output.viewport_output.values().any(|output| output.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Visible(false))));
+                observed.borrow_mut().push((viewport.ids.this, painted_old_texture, hidden));
+                child_output.drop_without_applying_deltas();
+            });
+            let viewport_id = app.fullscreen_viewport_id();
+            let output =
+                crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    app.keep_fullscreen_viewport_alive(ctx)
+                }));
+            assert!(app.fs_viewport_shown);
+            assert!(!output.viewport_output.values().any(|output| {
+                output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::Visible(false)))
+            }));
+            assert_eq!(*child_paints.borrow(), vec![(viewport_id, true, false)],
+                "the actual keep-alive child frame must draw the retained texture without hiding");
+            finish_staged_physical_history_for_test(&mut app);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            output.drop_without_applying_deltas();
+            }
+        }).join().expect("headless hydration holdover adapter");
+    }
+
+    #[test]
+    fn staged_fullscreen_hydration_true_close_consumes_pdf_zip_and_required_reopen() {
+        for (pdf, required) in [(true, false), (false, false), (true, true)] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            stage_fullscreen_hydration_for_test(&mut app, &ctx, pdf, required);
+            app.finish_fullscreen_navigation_for_true_close();
+            assert!(!app.sidecar_restore_navigation_fullscreen_wait_active());
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            assert!(
+                app.sidecar_restore_active(),
+                "list hydration must finish after viewer close"
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            assert!(app.fullscreen_idx.is_none());
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+        }
+    }
+
     #[test]
     fn failed_quick_folder_switch_preserves_source_slot_and_visible_folder() {
         let mut app = setup_app();
@@ -21880,7 +22788,7 @@ mod phase_c_folder_nav_history_tests {
         app.replace_history_navigation_transition(Some(transition));
         let (_tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+        app.archive_convert = Some(Box::new(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             restore_intent: crate::app::StartupListIntent::ExplicitList,
             src_path: archive.clone(),
             input_seq: app.input_seq,
@@ -21902,7 +22810,7 @@ mod phase_c_folder_nav_history_tests {
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
-        });
+        }));
         assert_eq!(
             app.folder_nav_history_snapshot().back_stack,
             snapshot.back_stack
@@ -21953,28 +22861,30 @@ mod phase_c_folder_nav_history_tests {
         let snapshot = app.folder_nav_history_snapshot();
 
         let (_tx, rx) = mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: archive,
-            input_seq: 0,
-            format: ArchiveFormat::Lzh,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: archive,
+                input_seq: 0,
+                format: ArchiveFormat::Lzh,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         assert!(app.cancel_archive_convert_for_navigation("test_search_conversion_cancel"));
         assert_eq!(
             app.folder_nav_history_snapshot().back_stack,
@@ -21995,28 +22905,30 @@ mod phase_c_folder_nav_history_tests {
         app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(previous).into()];
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
-            input_seq: 0,
-            format: ArchiveFormat::Lzh,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
+                input_seq: 0,
+                format: ArchiveFormat::Lzh,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
 
         let later = app.tmp.path().join("later-history");
         app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(later.clone()).into()];
@@ -22036,28 +22948,30 @@ mod phase_c_folder_nav_history_tests {
             vec![FolderNavHistoryTarget::Path(PathBuf::from(r"C:\miv-test\previous")).into()];
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
-            input_seq: 0,
-            format: ArchiveFormat::Lzh,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
+                input_seq: 0,
+                format: ArchiveFormat::Lzh,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
 
         app.load_folder(current);
 
@@ -22767,7 +23681,8 @@ mod phase_c_folder_nav_history_tests {
 
     fn finish_rating_navigation_for_test(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_rating_view();
             app.poll_sidecar_restore(&ctx);
             if app.rating_view_pending.is_none() && !app.sidecar_restore_active() {
@@ -22778,7 +23693,7 @@ mod phase_c_folder_nav_history_tests {
         panic!("Rating navigation worker did not settle");
     }
 
-    fn write_1328_zip(path: &std::path::Path) {
+    pub(super) fn write_1328_zip(path: &std::path::Path) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         for page in 0..4 {
@@ -22804,6 +23719,8 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
+                precise_stamps: Default::default(),
+                reconcile: None,
                 auxiliary_media: Default::default(),
                 folders: Vec::new(),
                 all_media: Vec::new(),
@@ -23227,35 +24144,40 @@ mod phase_c_folder_nav_history_tests {
         let root_filter = app.settings.facet_filter.clone();
         app.zip_nav_enter("A/");
         app.settings.facet_filter.exts.insert("jpg".into());
+        let level = app.facet_navigation.route().clone();
+        let child_filter = app.settings.facet_filter.clone();
         let back = app.folder_nav_back_stack.clone();
         let forward = app.folder_nav_forward_stack.clone();
         // F5 / "Update to latest information" uses the real full-refresh handler.
         app.reload_current_folder_preserving_override();
         finish_staged_physical_history_for_test(&mut app);
-        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
         assert_eq!(
             app.facet_navigation.route(),
-            &root,
+            &level,
             "SameLocation must still describe the actually prepared ZIP level"
         );
-        assert_eq!(app.settings.facet_filter, root_filter);
+        assert_eq!(app.settings.facet_filter, child_filter);
         assert_eq!(
             app.visible_indices.len(),
-            2,
-            "both root folder rows remain visible"
+            1,
+            "the same child page remains visible"
         );
-        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 2);
         assert_eq!(app.folder_nav_back_stack, back);
         assert_eq!(app.folder_nav_forward_stack, forward);
         // Consuming the remaining root frame manually, then reloading the same level,
         // must preserve its value and must not invent another frame.
         assert!(app.restore_facet_filter_suppression());
+        assert_eq!(app.settings.facet_filter, root_filter);
+        assert!(app.restore_facet_filter_suppression());
         let manual = app.settings.facet_filter.clone();
         assert_eq!(app.facet_navigation.saved_frame_count(), 0);
         app.reload_current_folder_preserving_override();
         finish_staged_physical_history_for_test(&mut app);
-        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
-        assert_eq!(app.facet_navigation.route(), &root);
+        assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
+        assert_ne!(app.facet_navigation.route(), &root);
+        assert_eq!(app.facet_navigation.route(), &level);
         assert_eq!(app.settings.facet_filter, manual);
         assert_eq!(app.facet_navigation.saved_frame_count(), 0);
         assert_eq!(app.folder_nav_back_stack, back);
@@ -23355,6 +24277,529 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.settings.facet_filter, live_parent);
         assert!(app.settings.facet_filter.kinds.is_empty());
         assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+    }
+
+    fn section1353_write_zip(path: &std::path::Path, entries: &[&str]) {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for entry in entries {
+            zip.start_file(*entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn section1353_staged_folder_refresh_reexecutes_submitted_search_on_new_rows() {
+        for during_wait in [0, 1, 2] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let folder = app.tmp.path().join("refresh-search-folder");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("match-old.jpg"), []).unwrap();
+            app.load_folder(folder.clone());
+            finish_staged_physical_history_for_test(&mut app);
+            let ctx = egui::Context::default();
+            app.show_search_bar = true;
+            app.search_query = "match".into();
+            app.search_target =
+                crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+            app.execute_search(&ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while app.search_pending.is_some() {
+                app.poll_search(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let mut submitted = app.submitted_local_search();
+            app.search_query = "unsubmitted draft".into();
+            std::fs::write(folder.join("match-new.jpg"), []).unwrap();
+            std::fs::write(folder.join("other.jpg"), []).unwrap();
+            app.reload_top_level_grid(&ctx);
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            if during_wait == 1 {
+                app.search_query = "match-new".into();
+                app.execute_search(&ctx);
+                submitted = app.submitted_local_search();
+                app.search_query = "latest draft".into();
+            } else if during_wait == 2 {
+                app.show_search_bar = false;
+                app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
+                app.search_filter = None;
+                app.cancel_search_pending();
+                submitted = None;
+            }
+            finish_staged_physical_history_for_test(&mut app);
+            while app.search_pending.is_some() {
+                app.poll_search(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert_eq!(app.show_search_bar, during_wait != 2);
+            assert_eq!(
+                app.search_query,
+                match during_wait {
+                    0 => "unsubmitted draft",
+                    1 => "latest draft",
+                    _ => "",
+                }
+            );
+            assert_eq!(app.submitted_local_search(), submitted);
+            if during_wait == 2 {
+                assert!(app.search_filter.is_none());
+            } else {
+                assert_eq!(
+                    app.search_filter.as_ref().unwrap().len(),
+                    if during_wait == 1 { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1353_grid_reload_key_preserves_zip_level_cursor_facet_and_history() {
+        let _input = crate::key_input::lock_test_input();
+        for ctrl in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let book = app.tmp.path().join("refresh.zip");
+            section1353_write_zip(
+                &book,
+                &["root.jpg", "A/cover.jpg", "A/sub/1.jpg", "A/sub/2.jpg"],
+            );
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.load_folder(book.clone());
+            finish_staged_physical_history_for_test(&mut app);
+            app.zip_nav_enter("A/");
+            app.zip_nav_enter("A/sub/");
+            finish_staged_physical_history_for_test(&mut app);
+            app.selected = Some(1);
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let facet = app.settings.facet_filter.clone();
+            let route = app.facet_navigation.route().clone();
+            let history = app.folder_nav_history_snapshot();
+            let chord = if ctrl { "Ctrl+F5" } else { "F5" };
+            app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                "[Grid]\nGridReload = {chord}\n[Rating]\nRatingItem5 = none\n"
+            ));
+            let ctx = egui::Context::default();
+            let modifiers = egui::Modifiers {
+                ctrl,
+                ..Default::default()
+            };
+            ctx.begin_pass(egui::RawInput {
+                events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                    .chain(vec![egui::Event::Key {
+                        key: egui::Key::F5,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }])
+                    .collect(),
+                ..Default::default()
+            });
+            let _ = app.handle_keyboard(&ctx);
+            ctx.end_pass().drop_without_applying_deltas();
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A/sub");
+            assert_eq!(app.items[app.selected.unwrap()].name(), "2.jpg");
+            assert_eq!(app.settings.facet_filter, facet);
+            assert_eq!(app.facet_navigation.route(), &route);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            // The menu's common entry dispatches the same current physical list.
+            app.reload_top_level_grid(&ctx);
+            finish_staged_physical_history_for_test(&mut app);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A/sub");
+        }
+    }
+
+    #[test]
+    fn section1353_disappeared_level_uses_parent_facet_and_new_backspace_stack() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let book = app.tmp.path().join("refresh-missing.zip");
+        section1353_write_zip(&book, &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]);
+        app.load_folder(book.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        app.zip_nav_enter("A/");
+        app.settings.facet_filter.exts.insert("png".into());
+        let parent_filter = app.settings.facet_filter.clone();
+        app.zip_nav_enter("A/sub/");
+        app.settings.facet_filter.exts.insert("jpg".into());
+        section1353_write_zip(&book, &["root.jpg", "A/cover.jpg"]);
+        app.reload_top_level_grid(&egui::Context::default());
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+        assert_eq!(app.settings.facet_filter, parent_filter);
+        assert!(app.zip_nav_back());
+        assert!(app.zip_nav.as_ref().unwrap().at_root());
+    }
+
+    #[test]
+    fn section1353_disappeared_level_with_root_collapse_restores_actual_parent_facet() {
+        use crate::app::FacetScope;
+
+        for manual in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let parent = app.tmp.path().join("refresh-collapse-parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            let book = parent.join("book.zip");
+            section1353_write_zip(&book, &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]);
+            app.load_folder(parent);
+            finish_staged_physical_history_for_test(&mut app);
+            app.settings.facet_filter.exts.insert("zip".into());
+            let outer_filter = app.settings.facet_filter.clone();
+            assert!(
+                app.start_grid_virtual_open(crate::app::GridVirtualOpenIntent {
+                    path: book.clone(),
+                    source: crate::app::GridVirtualOpenSource::Direct,
+                    effects: crate::app::GridVirtualOpenEffects {
+                        auto_fullscreen: false,
+                        suppress_rating_filter: false,
+                        suppress_facet_filter: true,
+                        reading_history_return_from: None,
+                    },
+                })
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            app.settings.facet_filter.exts.insert("gif".into());
+            app.zip_nav_enter("A/");
+            finish_staged_physical_history_for_test(&mut app);
+            app.settings.facet_filter.exts.insert("png".into());
+            let parent_filter = app.settings.facet_filter.clone();
+            app.zip_nav_enter("A/sub/");
+            finish_staged_physical_history_for_test(&mut app);
+            if manual {
+                assert!(app.restore_facet_filter_suppression());
+                assert_eq!(app.settings.facet_filter, parent_filter);
+            }
+            app.settings.facet_filter = crate::settings::FacetFilter::default();
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let child_filter = app.settings.facet_filter.clone();
+            let history = app.folder_nav_history_snapshot();
+            section1353_write_zip(&book, &["A/cover.jpg"]);
+            app.reload_top_level_grid(&egui::Context::default());
+            finish_staged_physical_history_for_test(&mut app);
+            let nav = app.zip_nav.as_ref().unwrap();
+            assert_eq!(nav.current().join("/"), "A");
+            assert_eq!(nav.effective_levels(), &[vec!["A".to_owned()]]);
+            assert_eq!(app.items.len(), 1);
+            assert_eq!(app.items[0].name(), "cover.jpg");
+            assert_eq!(
+                app.settings.facet_filter,
+                if manual { child_filter } else { parent_filter }
+            );
+            assert_eq!(
+                app.facet_navigation.route().current(),
+                Some(&FacetScope::book(&book, "A"))
+            );
+            let book_scopes = app
+                .facet_navigation
+                .route()
+                .0
+                .iter()
+                .filter(|scope| matches!(scope, FacetScope::Book { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(book_scopes, vec![&FacetScope::book(&book, "A")]);
+            assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+            assert_eq!(app.facet_navigation.saved_filter(0), &outer_filter);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            assert!(
+                !app.zip_nav_back(),
+                "collapsed root has no internal Backspace parent"
+            );
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        }
+    }
+
+    #[test]
+    fn section1353_refresh_cancel_and_stale_results_keep_the_current_location() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let book = app.tmp.path().join("refresh-cancel.zip");
+        section1353_write_zip(&book, &["root.jpg", "A/1.jpg"]);
+        app.load_folder(book.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        app.zip_nav_enter("A/");
+        finish_staged_physical_history_for_test(&mut app);
+        let rows = app.items.clone();
+        let facet = app.facet_navigation.clone();
+        app.reload_top_level_grid(&egui::Context::default());
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        app.retire_main_list_requests_for_surface_switch();
+        assert_eq!(app.items, rows);
+        assert_eq!(app.facet_navigation, facet);
+        let other = app.tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        app.load_folder(other.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&other));
+        assert!(app.zip_nav.is_none());
+    }
+
+    #[test]
+    fn section1353_collection_missing_prefix_restores_synthetic_zip_root_facet() {
+        use crate::collection_store::{
+            CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
+        };
+
+        for (old_collapsed, new_collapsed, deep, preserved, preserve_parent) in [
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+            (true, true, false, false, false),
+            (true, false, false, false, false),
+            (false, true, true, false, false),
+            (false, false, true, false, false),
+            (false, true, true, true, false),
+            (false, true, true, true, true),
+        ] {
+            for manual in [false, true] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                app.settings.sidecar_backup_enabled = false;
+                let book = app.tmp.path().join("collection-refresh-root.zip");
+                section1353_write_zip(
+                    &book,
+                    if old_collapsed {
+                        &["A/cover.jpg", "A/sub/1.jpg"]
+                    } else if deep {
+                        &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]
+                    } else {
+                        &["root.jpg", "A/1.jpg", "B/2.jpg"]
+                    },
+                );
+                let runtime =
+                    CollectionStoreRuntime::start_at(app.tmp.path().join("collection-refresh.db"))
+                        .unwrap();
+                let client = runtime.client();
+                app.install_collection_runtime(runtime);
+                let ctx = egui::Context::default();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+                    assert!(std::time::Instant::now() < deadline);
+                    app.poll_collection_ui(&ctx);
+                    std::thread::yield_now();
+                }
+                let created = client
+                    .create_collection("Refresh synthetic root".into())
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap();
+                let snapshot = client
+                    .add_batch(
+                        created.collection_id(),
+                        created.revision(),
+                        vec![
+                            CollectionRegistration::from_trusted_path(
+                                &book,
+                                CollectionResolvedKind::Zip,
+                            )
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .snapshot;
+                app.open_collection_grid(snapshot.collection_id(), None);
+                loop {
+                    app.poll_collection_ui(&ctx);
+                    app.poll_collection_grid(&ctx);
+                    app.poll_collection_history_transition(&ctx);
+                    app.poll_sidecar_restore(&ctx);
+                    let ready =
+                        app.top_level_grid_view
+                            .collection_session()
+                            .is_some_and(|session| {
+                                session.identity.collection_id == snapshot.collection_id()
+                                    && matches!(
+                                session.load,
+                                crate::app::top_level_grid_view::CollectionGridLoadState::Ready(_)
+                            ) && session.installed_items_generation
+                                    == Some(app.items_generation)
+                            });
+                    if ready && !app.sidecar_restore_active() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Collection root did not settle"
+                    );
+                    std::thread::yield_now();
+                }
+                app.settings.facet_filter.exts.insert("zip".into());
+                let outer_filter = app.settings.facet_filter.clone();
+                let owner = app.collection_grid_physical_load_owner(0, &book).unwrap();
+                assert!(app.load_folder_with_scan_owned(
+                    book.clone(),
+                    None,
+                    crate::app::OpenRequestOwner::CollectionGridPhysical(owner),
+                    crate::app::StartupListIntent::ExplicitList,
+                ));
+                finish_staged_physical_history_for_test(&mut app);
+                let zip_root_route = app.facet_navigation.route().clone();
+                let mut physical_root_route = zip_root_route.clone();
+                while matches!(
+                    physical_root_route.current(),
+                    Some(crate::app::FacetScope::Book { .. })
+                ) {
+                    physical_root_route.0.pop();
+                }
+                assert_eq!(zip_root_route, physical_root_route);
+                let place = app.facet_place_path_for_idx(0).unwrap();
+                app.settings
+                    .facet_filter
+                    .place_keys
+                    .insert(crate::adjustment_db::normalize_path(&place));
+                let root_place_filter = app.settings.facet_filter.clone();
+                app.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
+                assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                assert_eq!(app.settings.facet_filter, root_place_filter);
+                app.settings.facet_filter.place_keys.clear();
+                app.settings.facet_filter.exts.insert("png".into());
+                let zip_root_filter = app.settings.facet_filter.clone();
+                app.zip_nav_enter(if old_collapsed { "A/sub/" } else { "A/" });
+                finish_staged_physical_history_for_test(&mut app);
+                if old_collapsed {
+                    let child_route = app.facet_navigation.route().clone();
+                    assert!(app.zip_nav_back());
+                    assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert_eq!(app.settings.facet_filter, zip_root_filter);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+                    app.zip_nav_enter("A/sub/");
+                    finish_staged_physical_history_for_test(&mut app);
+                    assert_eq!(app.facet_navigation.route(), &child_route);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 2);
+                }
+                if deep {
+                    app.settings.facet_filter.exts.insert("gif".into());
+                    app.zip_nav_enter("A/sub/");
+                    finish_staged_physical_history_for_test(&mut app);
+                }
+                if manual {
+                    assert!(app.restore_facet_filter_suppression());
+                    assert_eq!(
+                        app.settings
+                            .facet_filter
+                            .exts
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        vec![if deep { "gif" } else { "png" }.to_owned()]
+                    );
+                }
+                app.settings.facet_filter = crate::settings::FacetFilter::default();
+                app.settings.facet_filter.exts.insert("jpg".into());
+                let child_filter = app.settings.facet_filter.clone();
+                let history = app.folder_nav_history_snapshot();
+                section1353_write_zip(
+                    &book,
+                    if preserve_parent {
+                        &["A/cover.jpg", "A/sub/1.jpg"]
+                    } else if preserved {
+                        &["A/sub/1.jpg"]
+                    } else {
+                        match (deep, new_collapsed) {
+                            (true, true) => &["A/new/1.jpg"],
+                            (true, false) => &["root.jpg", "A/new/1.jpg"],
+                            (false, true) => &["B/2.jpg"],
+                            (false, false) => &["root.jpg", "B/2.jpg"],
+                        }
+                    },
+                );
+                app.reload_top_level_grid(&ctx);
+                finish_staged_physical_history_for_test(&mut app);
+                let actual_prefix = if preserved {
+                    "A/sub"
+                } else if deep {
+                    "A/new"
+                } else if new_collapsed {
+                    "B"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().current().join("/"),
+                    actual_prefix
+                );
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().at_root(),
+                    !deep || (new_collapsed && !preserve_parent)
+                );
+                let actual_route = if app.zip_nav.as_ref().unwrap().at_root() {
+                    physical_root_route.clone()
+                } else {
+                    physical_root_route.child(crate::app::FacetScope::book(&book, actual_prefix))
+                };
+                assert_eq!(app.facet_navigation.route(), &actual_route);
+                assert_eq!(
+                    app.settings.facet_filter,
+                    if preserved {
+                        child_filter
+                    } else if old_collapsed {
+                        crate::settings::FacetFilter::default()
+                    } else if manual {
+                        child_filter
+                    } else if deep {
+                        let mut filter = crate::settings::FacetFilter::default();
+                        filter.exts.insert("gif".into());
+                        filter
+                    } else {
+                        zip_root_filter
+                    }
+                );
+                assert_eq!(
+                    app.facet_navigation.saved_frame_count(),
+                    1 + usize::from(deep && (!new_collapsed || (preserve_parent && !manual)))
+                );
+                assert_eq!(app.facet_navigation.saved_filter(0), &outer_filter);
+                assert_eq!(app.folder_nav_back_stack, history.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+                assert_eq!(
+                    app.zip_nav_back(),
+                    deep && (!new_collapsed || preserve_parent)
+                );
+                if deep && (!new_collapsed || preserve_parent) {
+                    assert_eq!(
+                        app.zip_nav.as_ref().unwrap().current().join("/"),
+                        if preserve_parent { "A" } else { "" },
+                    );
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert!(app.settings.facet_filter.exts.contains(if preserve_parent {
+                        if manual { "jpg" } else { "gif" }
+                    } else {
+                        "png"
+                    },));
+                }
+                app.shutdown_collection_runtime_for_exit();
+            }
+        }
     }
 
     #[test]
@@ -23703,9 +25148,9 @@ mod phase_c_folder_nav_history_tests {
             })
         });
         assert!(app.handle_fullscreen_root_key_input(&ctx));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(app.fullscreen_idx.is_none());
-        assert!(!app.pending_return_to_parent);
+        assert!(!app.pending_return_to_parent.is_pending());
         assert_eq!(app.visible_indices.len(), 4);
         for _ in 0..3 {
             // Toolbar arrows feed this same dispatcher after input merge.
@@ -23880,7 +25325,8 @@ mod phase_c_folder_nav_history_tests {
             }
             finish_staged_physical_history_for_test(&mut app);
             let ctx = egui::Context::default();
-            for _ in 0..1000 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
                 if !app.sidecar_restore_active() {
                     break;
                 }
@@ -23928,7 +25374,8 @@ mod phase_c_folder_nav_history_tests {
                 );
                 }
                 finish_staged_physical_history_for_test(&mut app);
-                for _ in 0..1000 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
                     if !app.sidecar_restore_active() {
                         break;
                     }
@@ -24047,7 +25494,7 @@ mod phase_c_folder_nav_history_tests {
         let mut frame = 0;
         fn draw(app: &mut App, ctx: &egui::Context, frame: &mut u64) {
             *frame += 1;
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -24057,16 +25504,17 @@ mod phase_c_folder_nav_history_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    app.render_menubar(ctx);
-                    app.render_toolbar(ctx);
-                    app.render_facet_filter_bar(ctx);
-                    app.render_selection_info_bar(ctx);
-                    app.render_folder_pane(ctx);
-                    app.render_checked_selection_overlay(ctx);
-                    assert!(app.render_grid(ctx).is_none());
+                    ctx.root_ui(|ui_arg| app.render_menubar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_facet_filter_bar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_selection_info_bar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_folder_pane(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_checked_selection_overlay(ui_arg));
+                    assert!(ctx.root_ui(|ui_arg| app.render_grid(ui_arg)).is_none());
                     app.render_selection_info(ctx);
                 },
-            );
+            )
+            .drop_without_applying_deltas();
             app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
         }
         fn visible(app: &App) -> bool {
@@ -24375,7 +25823,7 @@ mod phase_c_folder_nav_history_tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         fn draw(app: &mut App, ctx: &egui::Context) {
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -24384,9 +25832,10 @@ mod phase_c_folder_nav_history_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui_arg| app.render_grid(ui_arg)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         }
         fn visible(app: &App) -> bool {
             let row = app
@@ -24538,7 +25987,9 @@ mod phase_c_folder_nav_history_tests {
         rating_1328_folder_or_pdf_return(true, false, true);
     }
 
-    fn rating_1328_install_rows(app: &mut App) -> Vec<crate::rating_view::RatingViewRow> {
+    pub(super) fn rating_1328_install_rows(
+        app: &mut App,
+    ) -> Vec<crate::rating_view::RatingViewRow> {
         let GridItem::Image(previous) = &app.items[0] else {
             panic!("expected an image fixture");
         };
@@ -24589,7 +26040,7 @@ mod phase_c_folder_nav_history_tests {
         app.enter_rating_view(3);
         finish_rating_navigation_for_test(&mut app);
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.open_global_search();
         // These are still the adopted star-3 rows, although the surface is now Search.
         app.selected = Some(4);
@@ -24629,7 +26080,7 @@ mod phase_c_folder_nav_history_tests {
             app.install_rating_view_rows();
             app.selected = Some(0);
             let saved_key = app.rating_path_key(0).unwrap();
-            app.save_leaving_rating_grid_position();
+            app.note_session_grid_positions();
             app.enter_rating_view(3);
             finish_rating_navigation_for_test(&mut app);
             assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(saved_key));
@@ -24667,7 +26118,7 @@ mod phase_c_folder_nav_history_tests {
         app.rating_view_stars = 3;
         app.install_rating_view_rows();
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.open_global_search();
         // Until the first result arrives, the old Rating grid remains interactive.
         app.selected = Some(4);
@@ -24690,7 +26141,7 @@ mod phase_c_folder_nav_history_tests {
         app.rating_view_stars = 3;
         app.install_rating_view_rows();
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.selected = Some(4);
         app.scroll_offset_y = 700.0;
         let expected = app.rating_path_key(4).unwrap();
@@ -24801,7 +26252,7 @@ mod phase_c_folder_nav_history_tests {
         let selected_key = app.rating_view_rows[4].key.clone();
         app.top_level_grid_view.save_rating_grid_position(
             3,
-            super::top_level_grid_view::RatingGridPosition {
+            super::top_level_grid_view::SessionGridPosition {
                 scroll_offset_y: 200.0,
                 selected_key: Some(selected_key),
                 aspect_seed: Some(crate::auto_aspect_cache::AutoAspectCacheEntry {
@@ -25604,7 +27055,8 @@ mod phase_c_folder_nav_history_tests {
         assert!(rating_app.suppress_folder_nav_record_once);
 
         let ctx = egui::Context::default();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             rating_app.poll_rating_view();
             rating_app.poll_sidecar_restore(&ctx);
             if rating_app.items_are_rating_view && rating_app.rating_view_pending.is_none() {
@@ -26025,7 +27477,8 @@ mod phase_c_folder_nav_history_tests {
     #[cfg(windows)]
     fn finish_context_jump_hydration(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if !app.sidecar_restore_active() {
                 return;
             }
@@ -26405,7 +27858,7 @@ mod phase_c_folder_nav_history_tests {
         app.folder_pane.set_cursor(directory.clone());
         app.folder_pane.set_focus_tree();
         // Real pane keyboard gate consumes Enter and starts the real directory scan.
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Enter,
@@ -26419,7 +27872,8 @@ mod phase_c_folder_nav_history_tests {
             |ctx| {
                 assert!(app.handle_folder_pane_keyboard(ctx).is_none());
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert!(app.folder_pane_open_pending.is_some());
         refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -26505,7 +27959,7 @@ mod phase_c_folder_nav_history_tests {
             folder,
             GridItem::ZipFile(book.clone()),
         );
-        app.global_search.query = "book".into();
+        app.global_search.metadata_draft = "book".into();
         app.global_search.last_executed = "book".into();
         app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
             book,
@@ -26710,6 +28164,8 @@ mod phase_c_folder_nav_history_tests {
         let book = parent.join("book.zip");
         write_1328_zip(&book);
         env.load_folder(parent.clone());
+        // Production sanitizes pointer input during hydration; this harness must settle it first.
+        env.finish_page_identity_preparation_for_test();
         env.address = book.to_string_lossy().into_owned();
         env.settings.show_toolbar_folder_tree_button = false;
         env.settings.show_toolbar_effetune = false;
@@ -26728,7 +28184,9 @@ mod phase_c_folder_nav_history_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 crate::ime_focus::install_ime_input_policy(ctx);
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -26737,7 +28195,8 @@ mod phase_c_folder_nav_history_tests {
                 }
                 let mut app = render.borrow_mut();
                 app.update_ime_state(ctx);
-                if let Some(nav) = app.render_toolbar(ctx).1 {
+                app.note_main_chrome_pointer_block_transition(ctx);
+                if let Some(nav) = app.render_toolbar(root_ui).1 {
                     let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
                         panic!("address Enter must produce Direct navigation");
                     };
@@ -27220,9 +28679,10 @@ mod phase_c_folder_nav_history_tests {
             )
             .unwrap();
             let ctx = egui::Context::default();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.show_archive_convert_dialog(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             finish_staged_physical_history_for_test(&mut app);
             finish_context_jump_hydration(&mut app);
             assert!(app.archive_convert.is_none());
@@ -27374,18 +28834,19 @@ mod phase_c_drill_nav_tests {
     ) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -27878,6 +29339,10 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn facet_name_debounce_does_not_apply_during_ime_input() {
         let mut app = setup_app();
         app.facet_name_input = "未確定".to_owned();
@@ -27887,7 +29352,10 @@ mod phase_c_drill_nav_tests {
         ctx.begin_pass(egui::RawInput {
             events: vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("未確定".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "未確定".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
             ..Default::default()
         });
@@ -27901,7 +29369,7 @@ mod phase_c_drill_nav_tests {
                 .is_some_and(|deadline| deadline > std::time::Instant::now()),
             "IME 中は debounce の残り時間を消費しない"
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -28629,7 +30097,8 @@ mod phase_c_drill_nav_tests {
         );
 
         let ctx = egui::Context::default();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -28949,18 +30418,19 @@ mod phase_c_drill_nav_tests {
     fn run_grid_key(app: &mut super::App, modifiers: egui::Modifiers, key: egui::Key) {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let _ = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     /// 2026-05 ユーザー報告: ★フィルタでサムネイルが 0 件になった状態でも、
@@ -29235,16 +30705,17 @@ mod phase_c_drill_nav_tests {
             let pixels = Arc::new(image.clone());
             let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
             (
-                ThumbnailState::Loaded {
+                ThumbnailState::loaded_raster(
                     tex,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 64,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 64,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                },
+                    false,
+                    64,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((1, 1)),
+                    None,
+                ),
                 pixels,
             )
         }
@@ -29350,20 +30821,21 @@ mod phase_c_drill_nav_tests {
         // 編集プレビュー由来は identity でも下地 + 注釈で組み直す。
         app.thumb_edit_preview_layers
             .insert(0, std::sync::Arc::new(Vec::new()));
-        app.thumbnails[0] = ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        app.thumbnails[0] = ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "edit_preview_original",
                 egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
                 egui::TextureOptions::LINEAR,
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 2,
             },
-            from_edit_preview: true,
-            rendered_at_px: 2,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-        };
+            true,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 2)),
+            None,
+        );
         app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(
             app.thumb_adjust_tex.contains_key(&0),
@@ -29384,20 +30856,21 @@ mod phase_c_drill_nav_tests {
         app.settings.global_preset.brightness = 20.0;
         app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(app.thumb_adjust_tex.is_empty());
-        app.thumbnails[0] = ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        app.thumbnails[0] = ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "tray_restored_original",
                 egui::ColorImage::filled([2, 2], egui::Color32::GRAY),
                 egui::TextureOptions::LINEAR,
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 2,
             },
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-        };
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 2)),
+            None,
+        );
         app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(app.thumb_adjust_tex.contains_key(&0));
     }
@@ -29429,6 +30902,8 @@ mod phase_c_drill_nav_tests {
         app.adjustment_page_params.insert(0, after);
         app.adjustment_drag_session = Some(AdjustmentDragSession {
             fs_idx: 0,
+            owner: app.capture_page_edit_owner(0).unwrap(),
+            draft: app.adjustment_page_params.get(&0).cloned(),
             before: Some(before),
         });
         app.thumb_adjust_drag_color_dirty = true;
@@ -29471,15 +30946,18 @@ mod phase_c_drill_nav_tests {
                 egui::TextureOptions::LINEAR,
             );
             app.thumbnails = (0..cells)
-                .map(|_| ThumbnailState::Loaded {
-                    tex: original_tex.clone(),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                        evaluated_display_px: side as u32,
-                    },
-                    from_edit_preview: false,
-                    rendered_at_px: side as u32,
-                    source_dims: Some((side as u32, side as u32)),
-                    layout_dims: None,
+                .map(|_| {
+                    ThumbnailState::loaded_raster(
+                        original_tex.clone(),
+                        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                            evaluated_display_px: side as u32,
+                        },
+                        false,
+                        side as u32,
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        Some((side as u32, side as u32)),
+                        None,
+                    )
                 })
                 .collect();
             app.thumb_pixels.clear();
@@ -30688,11 +32166,15 @@ mod phase_c_drill_nav_tests {
         app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip"));
         assert!(matches!(
             app.reading_history_back_nav(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
         assert!(matches!(
             app.handle_grid_parent_folder_action(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
 
         // 本より深い階層 / 別の場所では通常の親フォルダ遷移 (= 閲覧履歴ではない)。
@@ -30775,7 +32257,9 @@ mod phase_c_drill_nav_tests {
         );
         assert!(matches!(
             app.reading_history_back_nav(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
     }
 
@@ -30923,7 +32407,9 @@ mod phase_c_drill_nav_tests {
         app.archive_source_override = Some(std::path::PathBuf::from("c:/books/a.rar"));
         assert!(matches!(
             app.reading_history_back_nav(),
-            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+            Some(crate::ui_main::AddressBarNav::ReadingHistory(
+                crate::app::ReadingHistoryEntrance::Return
+            ))
         ));
 
         // ブックマーク一覧から開いた変換アーカイブも、cache ZIP ではなく元アーカイブを
@@ -31613,7 +33099,7 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
         Some(crate::ui_main::AddressBarNav::Bookmarks)
     ));
     app.handle_fullscreen_close_request();
-    assert!(app.pending_return_to_parent);
+    assert!(app.pending_return_to_parent.is_pending());
     assert!(matches!(
         app.take_pending_return_to_parent_nav(),
         Some(crate::ui_main::AddressBarNav::Bookmarks)
@@ -31714,7 +33200,7 @@ fn native_immediate_close_consumes_bookmark_return_in_same_dispatch() {
 
     app.handle_fullscreen_close_request_immediate();
 
-    assert!(!app.pending_return_to_parent);
+    assert!(!app.pending_return_to_parent.is_pending());
     assert!(app.items_are_bookmark_view);
     assert!(matches!(
         app.bookmark_view_state,
@@ -32392,6 +33878,8 @@ fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
 #[test]
 fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let pdf = app.tmp.path().join("bookmark.pdf");
     std::fs::write(&pdf, b"%PDF-1.4\n%%EOF\n").expect("create placeholder PDF");
     arm_detached_bookmark_book_open(
@@ -32410,6 +33898,8 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         DetachedBuild::Built(true)
     );
 
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     assert!(app.items_are_bookmark_view);
     assert_eq!(
         app.current_folder.as_deref(),
@@ -32444,12 +33934,16 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         ));
     })
     .expect("PDF bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
 }
 
 #[cfg(windows)]
 #[test]
 fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let zip = app.tmp.path().join("bookmark.zip");
     std::fs::write(&zip, []).expect("create placeholder ZIP");
     arm_detached_bookmark_book_open(
@@ -32467,6 +33961,8 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
         ),
         DetachedBuild::Built(true)
     );
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
         assert!(
@@ -32481,12 +33977,16 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
         ));
     })
     .expect("ZIP bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
 }
 
 #[cfg(windows)]
 #[test]
 fn converted_bookmark_archive_enters_the_same_detached_book_context() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let source = app.tmp.path().join("bookmark.rar");
     let backing = app.tmp.path().join("bookmark-cache.zip");
     std::fs::write(&source, []).expect("create source archive");
@@ -32511,6 +34011,8 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         ),
         Some(true)
     );
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
         assert_eq!(
@@ -32525,12 +34027,16 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         );
     })
     .expect("converted archive bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
 }
 
 #[cfg(windows)]
 #[test]
 fn converted_bookmark_archive_continues_the_existing_loading_session_lease() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let ctx = egui::Context::default();
     let source = app.tmp.path().join("slow-bookmark.rar");
     let backing = app.tmp.path().join("slow-bookmark-cache.zip");
@@ -32597,6 +34103,8 @@ fn converted_bookmark_archive_continues_the_existing_loading_session_lease() {
         ));
     })
     .expect("conversion completion must continue inside the existing loading shell");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
 }
 
 #[cfg(windows)]
@@ -32637,9 +34145,11 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
         if materialized {
             break;
         }
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(
             std::time::Instant::now() < deadline,
             "detached image-folder bookmark scan did not complete"
@@ -32894,6 +34404,206 @@ fn begin_detached_bookmark_media_test(
 
 #[cfg(windows)]
 #[test]
+fn section1419_bookmark_click_terminates_detached_resolver_and_conversion_owner() {
+    for conversion in [false, true] {
+        for classified in [false, true] {
+            let mut app = phase_c_support::setup_app();
+            app.active_quick_folder_slot = None;
+            let ctx = egui::Context::default();
+            let source = app.tmp.path().join("old.rar");
+            std::fs::write(&source, b"fixture").unwrap();
+            arm_detached_bookmark_book_open(
+                &mut app,
+                source.clone(),
+                crate::book_bookmarks::BookContainerKind::OtherArchive,
+                crate::book_bookmarks::PageIdentity::ArchiveEntry("page.jpg".into()),
+            );
+            app.bookmark_open_request_seq = 1;
+            let pending = app.bookmark_open_pending.take().unwrap();
+            let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(source.clone());
+            assert!(app.start_detached_bookmark_loading_context(
+                &ctx,
+                pending,
+                target.clone(),
+                DetachedSource::Book,
+                source.clone()
+            ));
+            let context = app.active_viewer_context_id().unwrap();
+            let window_id = app.active_detached_window_id().unwrap();
+            let cancel = app
+                .startup_open_path_resolve_pending
+                .as_ref()
+                .unwrap()
+                .cancel
+                .clone();
+            let owner = crate::bookmark_browser::BookmarkOpenRequestOwner {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+                target,
+                detached_lease: Some(DetachedSessionLease { window_id }),
+            };
+            let mut conversion_tx = None;
+            let conversion_cancel = Arc::new(AtomicBool::new(false));
+            if conversion {
+                drop(app.startup_open_path_resolve_pending.take());
+                let (tx, rx) = mpsc::channel();
+                conversion_tx = Some(tx);
+                app.archive_convert = Some(Box::new(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                src_path: source, input_seq: 0, format: ArchiveFormat::Rar,
+                password: None, password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: conversion_cancel.clone(), rx, pending_nav: None, pending_direct_nav: None,
+                allow_direct_read: false,
+                completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Bookmark(owner),
+                pending_sibling_output: None, restore_intent: StartupListIntent::ExplicitList,
+                auto_fullscreen: false, deferred_fullscreen: None,
+                suppress_confirm: false, suppress_confirm_next_time: false,
+            }));
+            }
+            let b = app
+                .tmp
+                .path()
+                .join(if classified { "new.epub" } else { "new.pdf" });
+            if classified {
+                std::fs::create_dir(&b).unwrap();
+            } else {
+                std::fs::write(&b, b"fixture").unwrap();
+            }
+            let row = crate::bookmark_browser::BookmarkBrowserRow {
+                source: crate::bookmark_browser::BookmarkRowSource::Book(
+                    crate::book_bookmarks::BookBookmark {
+                        id: 420,
+                        container_key: crate::adjustment_db::normalize_path(&b),
+                        container_path: b.clone(),
+                        container_kind: if classified {
+                            crate::book_bookmarks::BookContainerKind::ImageFolder
+                        } else {
+                            crate::book_bookmarks::BookContainerKind::Pdf
+                        },
+                        page_identity: if classified {
+                            crate::book_bookmarks::PageIdentity::RelativePath("page.jpg".into())
+                        } else {
+                            crate::book_bookmarks::PageIdentity::PdfPage(0)
+                        },
+                        page_index_hint: 0,
+                        created_at_ms: 1,
+                        title: None,
+                    },
+                ),
+                item: GridItem::Folder(b),
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: 1,
+                missing: false,
+            };
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.open_bookmark_browser_row(&ctx, &row);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert_eq!(
+                app.detached_window_state(window_id),
+                Some(DetachedWindowState::Closing)
+            );
+            if conversion {
+                assert!(conversion_cancel.load(Ordering::Relaxed));
+                assert!(
+                    conversion_tx
+                        .unwrap()
+                        .send(
+                            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                                crate::ui_dialogs::archive_convert::ArchiveScanOutcome::Rejected {
+                                    message: "late A".into()
+                                }
+                            ))
+                        )
+                        .is_err()
+                );
+            }
+            assert!(app.archive_convert.is_none());
+            app.with_window_context_for_test(context, |old| {
+                assert!(old.bookmark_open_pending.is_none())
+            });
+            if classified {
+                assert!(app.top_level_grid_view.open_path_classification().is_some());
+            } else {
+                assert!(
+                    matches!(app.startup_open_path_resolve_pending.as_ref().map(|p| &p.owner),
+            Some(StartupOpenPathOwner::Bookmark(owner)) if owner.request_id.0 == 2)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn section1419_main_admission_preserves_independent_detached_media_wait() {
+    for is_audio in [false, true] {
+        let mut app = phase_c_support::setup_app();
+        app.active_quick_folder_slot = None;
+        let (_, target, _) = begin_detached_bookmark_media_test(&mut app, is_audio);
+        let context = app.active_viewer_context_id();
+        let window = app.active_detached_window_id();
+        let generation = app
+            .with_active_viewer_context(|active| active.items_generation)
+            .unwrap();
+        app.admit_explicit_main_open_request();
+        assert_eq!(app.active_viewer_context_id(), context);
+        assert_eq!(app.active_detached_window_id(), window);
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.items_generation, generation);
+            assert!(matches!(&active.bookmark_open_pending,
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(p)) if p.path == target && p.pts_secs == 42.0));
+        }).unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn section1419_main_admission_preserves_independent_detached_page_wait() {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    let pdf = app.tmp.path().join("independent.pdf");
+    std::fs::write(&pdf, b"fixture").unwrap();
+    arm_detached_bookmark_book_open(
+        &mut app,
+        pdf.clone(),
+        crate::book_bookmarks::BookContainerKind::Pdf,
+        crate::book_bookmarks::PageIdentity::PdfPage(0),
+    );
+    assert_eq!(
+        app.open_bookmark_book_in_detached_context(
+            &egui::Context::default(),
+            pdf.clone(),
+            crate::folder_tree::OpenablePathKind::File
+        ),
+        DetachedBuild::Built(true)
+    );
+    let context = app.active_viewer_context_id();
+    let window = app.active_detached_window_id();
+    app.admit_explicit_main_open_request();
+    assert_eq!(app.active_viewer_context_id(), context);
+    assert_eq!(app.active_detached_window_id(), window);
+    app.with_active_viewer_context(|active| {
+        assert!(matches!(
+            active
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(|p| p.book())
+                .map(|p| &p.stage),
+            Some(crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { .. })
+        ));
+        assert!(
+            active
+                .pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|p| p.0 == pdf)
+        );
+    })
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
 fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
     for is_audio in [false, true] {
         let mut app = phase_c_support::setup_app();
@@ -32969,8 +34679,16 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
         })
         .expect("active detached context");
         assert!(
-            app.update_active_viewer_context(&egui::Context::default(), None)
-                .updated
+            {
+                let ctx = egui::Context::default();
+                let mut result = None;
+                ctx.run_ui(Default::default(), |ui| {
+                    result = Some(app.update_active_viewer_context(ui, None))
+                })
+                .drop_without_applying_deltas();
+                result.unwrap()
+            }
+            .updated
         );
 
         assert!(app.active_viewer_context_id().is_none());
@@ -33009,8 +34727,16 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
     })
     .expect("active detached context");
     assert!(
-        app.update_active_viewer_context(&egui::Context::default(), None)
-            .updated
+        {
+            let ctx = egui::Context::default();
+            let mut result = None;
+            ctx.run_ui(Default::default(), |ui| {
+                result = Some(app.update_active_viewer_context(ui, None))
+            })
+            .drop_without_applying_deltas();
+            result.unwrap()
+        }
+        .updated
     );
 
     assert!(app.active_viewer_context_id().is_none());
@@ -33144,8 +34870,11 @@ mod phase_c_drill_address_tests {
 
     fn settle_repaint_state(ctx: &egui::Context) {
         for _ in 0..4 {
-            let output = ctx.run(egui::RawInput::default(), |_| {});
+            let output = crate::test_ui::headless_paint_output(
+                ctx.run_pass(egui::RawInput::default(), |_| {}),
+            );
             if root_repaint_delay(&output) == std::time::Duration::MAX {
+                output.drop_without_applying_deltas();
                 return;
             }
         }
@@ -33284,7 +35013,7 @@ mod phase_c_drill_address_tests {
     fn aggregated_address_marks_unsettled_results_as_searching() {
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "グルグル".to_string();
+        app.global_search.metadata_draft = "グルグル".to_string();
         app.global_search.last_executed.clear();
         app.update_global_search_address();
 
@@ -33300,8 +35029,8 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses -genshin".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses -genshin".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.done = false;
         app.items_are_global_search_view = true;
         let tx = install_search_receiver(&mut app);
@@ -33324,9 +35053,10 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_events(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.address.contains("3 件 / 検索中 · 412,000 件を確認"),
             "streaming progress must be visible in the address: {}",
@@ -33351,9 +35081,10 @@ mod phase_c_drill_address_tests {
         })
         .unwrap();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_events(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_events(ctx);
+            }));
         assert!(app.global_search.done);
         assert!(!app.address.contains("件を確認"), "{}", app.address);
         assert!(!app.address.contains("検索中"), "{}", app.address);
@@ -33362,6 +35093,7 @@ mod phase_c_drill_address_tests {
             std::time::Duration::ZERO,
             "terminal event 後に即時 repaint を継続しない"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -33369,8 +35101,8 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.aggregate = true;
         app.global_search.aggregate_auto = false;
         app.items_are_global_search_view = true;
@@ -33392,9 +35124,10 @@ mod phase_c_drill_address_tests {
         .unwrap();
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_events(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.address.contains("ヒット 3 件 · 412,000 件を確認"),
             "{}",
@@ -33406,21 +35139,23 @@ mod phase_c_drill_address_tests {
     fn debounce_owner_rearms_a_delayed_repaint_each_pass() {
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
+        app.global_search.metadata_draft = "glasses".to_string();
         app.global_search.last_executed.clear();
         app.global_search.last_change_at = Some(std::time::Instant::now());
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_debounce(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_debounce(ctx);
+            }));
         let delay = root_repaint_delay(&output);
         assert!(delay > std::time::Duration::ZERO, "delay={delay:?}");
         assert!(
             delay <= std::time::Duration::from_millis(300),
             "delay={delay:?}"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -33428,16 +35163,17 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.done = false;
         let _tx = install_search_receiver(&mut app);
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_events(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_events(ctx);
+            }));
         let delay = root_repaint_delay(&output);
         assert!(
             delay > std::time::Duration::ZERO,
@@ -33447,6 +35183,7 @@ mod phase_c_drill_address_tests {
             delay <= std::time::Duration::from_secs(1),
             "backstop は最大1秒: {delay:?}"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -33454,8 +35191,8 @@ mod phase_c_drill_address_tests {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
-        app.global_search.query = "glasses".to_string();
-        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.metadata_draft = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.metadata_draft.clone();
         app.global_search.done = false;
         let tx = install_search_receiver(&mut app);
         for page in 1..=8 {
@@ -33470,9 +35207,10 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_events(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_events(ctx);
+            }));
         assert_eq!(
             root_repaint_delay(&output),
             std::time::Duration::ZERO,
@@ -33482,6 +35220,7 @@ mod phase_c_drill_address_tests {
             app.global_search.total_scanned,
             8 * crate::global_search::PAGE_SIZE
         );
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -33517,6 +35256,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR),
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some(size),
@@ -33543,11 +35284,7 @@ mod favorite_adjustment_defaults_tests {
         let texture = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels,
-                texture,
-                generation: app.conceal_generation,
-            },
+            ConcealCacheEntry::raster(pixels, texture, app.conceal_generation),
         );
     }
 
@@ -33566,7 +35303,7 @@ mod favorite_adjustment_defaults_tests {
                 input_gen: 0,
                 mask_gen: 0,
             },
-            EraseResultCacheEntry { pixels, texture },
+            EraseResultCacheEntry::raster(pixels, texture),
         );
     }
 
@@ -33582,10 +35319,7 @@ mod favorite_adjustment_defaults_tests {
         let key = app.current_erase_result_key(idx);
         app.erase_result_cache.insert(
             key,
-            EraseResultCacheEntry {
-                pixels: std::sync::Arc::clone(&pixels),
-                texture,
-            },
+            EraseResultCacheEntry::raster(std::sync::Arc::clone(&pixels), texture),
         );
         pixels
     }
@@ -34152,12 +35886,14 @@ mod favorite_adjustment_defaults_tests {
         (app, folder)
     }
 
-    /// 唯一積まれている保存の (key, generation)。
-    fn only_pending_local_adjust_write(app: &App) -> (String, u64) {
+    /// 唯一積まれている保存の (key, generation, enqueue時のorigin)。
+    fn only_pending_local_adjust_write(
+        app: &App,
+    ) -> (String, u64, crate::app::LocalAdjustWriteOrigin) {
         assert_eq!(app.local_adjust_write_pending.len(), 1);
         app.local_adjust_write_pending
             .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
+            .map(|(key, pending)| (key.clone(), pending.generation, pending.origin.clone()))
             .next()
             .unwrap()
     }
@@ -34212,7 +35948,7 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_write_mirrors_exactly_the_document_that_was_written() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("enqueued"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
         // 完了までの間にもう一度編集された状況を作る。写るのは worker が書いた方。
         app.set_local_adjust_layers_for_idx_memory_only(0, local_adjust_doc("later"));
 
@@ -34220,6 +35956,7 @@ mod favorite_adjustment_defaults_tests {
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("written"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34246,12 +35983,13 @@ mod favorite_adjustment_defaults_tests {
     fn a_write_with_no_store_open_is_not_mirrored_and_is_reported() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("edited"),
                 outcome: crate::app::EditStoreOutcome::Unavailable,
             },
@@ -34277,12 +36015,13 @@ mod favorite_adjustment_defaults_tests {
     fn a_refused_write_is_not_mirrored_and_is_reported() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("edited"),
                 outcome: crate::app::EditStoreOutcome::Failed("disk full".to_string()),
             },
@@ -34344,13 +36083,14 @@ mod favorite_adjustment_defaults_tests {
     fn an_older_committed_completion_still_publishes_while_a_newer_save_is_pending() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("first"));
-        let (key, stale_generation) = only_pending_local_adjust_write(&app);
+        let (key, stale_generation, stale_origin) = only_pending_local_adjust_write(&app);
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("second"));
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation: stale_generation,
+                origin: Some(stale_origin),
                 layers: local_adjust_doc("first"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34377,14 +36117,15 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_save_stays_mirrored_when_the_next_save_fails() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("committed"));
-        let (key, committed_generation) = only_pending_local_adjust_write(&app);
+        let (key, committed_generation, committed_origin) = only_pending_local_adjust_write(&app);
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("doomed"));
-        let (_, doomed_generation) = only_pending_local_adjust_write(&app);
+        let (_, doomed_generation, doomed_origin) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation: committed_generation,
+                origin: Some(committed_origin),
                 layers: local_adjust_doc("committed"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34393,6 +36134,7 @@ mod favorite_adjustment_defaults_tests {
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation: doomed_generation,
+                origin: Some(doomed_origin),
                 layers: local_adjust_doc("doomed"),
                 outcome: crate::app::EditStoreOutcome::Failed("disk full".to_string()),
             },
@@ -34418,11 +36160,12 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_empty_document_removes_the_sidecar_entry() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("edited"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34431,10 +36174,12 @@ mod favorite_adjustment_defaults_tests {
 
         app.set_local_adjust_layers_for_idx(0, local_adjust_core::LocalAdjustmentLayers::default());
         let generation = app.local_adjust_write_pending[&key].generation;
+        let origin = app.local_adjust_write_pending[&key].origin.clone();
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_core::LocalAdjustmentLayers::default(),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34454,7 +36199,7 @@ mod favorite_adjustment_defaults_tests {
     fn the_mirror_target_is_the_one_fixed_when_the_save_was_enqueued() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
 
         // 一覧が入れ替わり、idx 0 は別フォルダの別ページを指すようになった。
         let other = app.tmp.path().join("other");
@@ -34467,6 +36212,7 @@ mod favorite_adjustment_defaults_tests {
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("written"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34500,18 +36246,18 @@ mod favorite_adjustment_defaults_tests {
         insert_stale_conceal_cache(&mut app, &ctx, idx_a, "erase_conceal_stale");
         app.erase_base_cache.insert(
             idx_a,
-            std::sync::Arc::new(egui::ColorImage::new(
+            crate::app::EraseBaseSource::raster(std::sync::Arc::new(egui::ColorImage::new(
                 [1, 1],
                 vec![egui::Color32::LIGHT_BLUE],
-            )),
+            ))),
         );
         app.erase_base_tex_cache.insert(
             idx_a,
-            ctx.load_texture(
+            crate::gpu_lanczos::FullscreenPaintResource::direct(ctx.load_texture(
                 "erase_base_tex_stale",
                 egui::ColorImage::new([1, 1], vec![egui::Color32::LIGHT_BLUE]),
                 egui::TextureOptions::LINEAR,
-            ),
+            )),
         );
 
         app.delete_erase_masks_from_selection();
@@ -35498,6 +37244,7 @@ mod favorite_adjustment_defaults_tests {
         app.settings.global_preset = before.clone();
         app.adjustment_page_params.insert(idx, after.clone());
         app.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
+            draft: after.clone(),
             scope: AdjustmentStandardScope::Global,
             before,
         });
@@ -35845,9 +37592,13 @@ mod favorite_adjustment_defaults_tests {
     fn always_on_top_toggle_has_one_root_command_and_origin_feedback() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.toggle_always_on_top(ctx, crate::app::ActionSurface::MainWindow);
-        });
+        // A cold 0.37 Context emits an independent initial SetTheme command.
+        ctx.run_pass(Default::default(), |_| {})
+            .drop_without_applying_deltas();
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.toggle_always_on_top(ctx, crate::app::ActionSurface::MainWindow);
+            }));
         assert!(app.settings.always_on_top);
         let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
         assert_eq!(commands.len(), 1);
@@ -35860,17 +37611,22 @@ mod favorite_adjustment_defaults_tests {
             Some(crate::app::ActionSurface::MainWindow)
         );
 
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.set_always_on_top(ctx, true, crate::app::ActionSurface::Viewer);
-        });
+        output.drop_without_applying_deltas();
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.set_always_on_top(ctx, true, crate::app::ActionSurface::Viewer);
+            }));
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
                 .is_empty()
         );
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
-        });
+
+        output.drop_without_applying_deltas();
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
+            }));
         assert!(!app.settings.always_on_top);
         assert!(matches!(
             output.viewport_output[&egui::ViewportId::ROOT]
@@ -35884,6 +37640,7 @@ mod favorite_adjustment_defaults_tests {
             app.fs_feedback_toast_surface,
             Some(crate::app::ActionSurface::Viewer)
         );
+        output.drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -36596,14 +38353,15 @@ mod favorite_adjustment_defaults_tests {
         );
         app.items.push(GridItem::Image(PathBuf::from("c:/p/a.jpg")));
         app.image_metas.push(Some((10, 20)));
-        app.thumbnails.push(ThumbnailState::Loaded {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: true,
-            rendered_at_px: 64,
-            source_dims: Some((4000, 3000)),
-            layout_dims: None,
-        });
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            true,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((4000, 3000)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -36691,14 +38449,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([64, 64], egui::Color32::LIGHT_BLUE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails.push(ThumbnailState::Loaded {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((1920, 1080)),
-            layout_dims: None,
-        });
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1920, 1080)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -36768,14 +38527,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([64, 64], egui::Color32::LIGHT_BLUE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails.push(ThumbnailState::Loaded {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((4000, 3000)),
-            layout_dims: None,
-        });
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((4000, 3000)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -36828,14 +38588,15 @@ mod favorite_adjustment_defaults_tests {
         );
         app.items.push(GridItem::Image(image_path.clone()));
         app.image_metas.push(Some((10, 20)));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: cached_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 496,
-            source_dims: Some((884, 444)),
-            layout_dims: None,
-        });
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            cached_texture,
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            496,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((884, 444)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -37145,16 +38906,17 @@ mod favorite_adjustment_defaults_tests {
         app.items
             .push(GridItem::Image(PathBuf::from(r"c:\pics\wide.png")));
         app.image_metas.push(Some((10, 20)));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: initial_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            initial_texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 400,
             },
-            from_edit_preview: false,
-            rendered_at_px: 400,
-            source_dims: Some((884, 444)),
-            layout_dims: None,
-        });
+            false,
+            400,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((884, 444)),
+            None,
+        ));
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
         app.keep_start_shared.store(0, Ordering::Relaxed);
@@ -38068,20 +39830,21 @@ mod favorite_adjustment_defaults_tests {
             label: &str,
             source_dims: (u32, u32),
         ) -> ThumbnailState {
-            ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     label,
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some(source_dims),
-                layout_dims: None,
-            }
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some(source_dims),
+                None,
+            )
         }
 
         let ctx = egui::Context::default();
@@ -38133,20 +39896,21 @@ mod favorite_adjustment_defaults_tests {
             label: &str,
             source_dims: (u32, u32),
         ) -> ThumbnailState {
-            ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     label,
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some(source_dims),
-                layout_dims: None,
-            }
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some(source_dims),
+                None,
+            )
         }
 
         let ctx = egui::Context::default();
@@ -38296,7 +40060,7 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.fullscreen_idx, Some(target_idx));
 
         // ツールが動いている間は戻さない。
-        app.local_adjust_spread_ctx = Some(pivot);
+        app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot);
         app.local_adjust_mode = true;
         app.reconcile_page_edit_spread_pivots();
         assert_eq!(app.spread_mode, SpreadMode::Single, "ツール中は倒したまま");
@@ -38314,7 +40078,14 @@ mod favorite_adjustment_defaults_tests {
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
         app.local_adjust_spread_ctx = None;
-        app.enter_local_adjust_mode();
+        insert_export_static_source(
+            &mut app,
+            &egui::Context::default(),
+            target_idx,
+            [4, 6],
+            "page-edit-pivot-original",
+        );
+        app.enter_local_adjust_mode(&egui::Context::default());
         assert!(app.local_adjust_mode, "モードは立つ");
         assert_eq!(
             app.spread_mode,
@@ -38340,7 +40111,9 @@ mod favorite_adjustment_defaults_tests {
             (2, |app, p| app.text_spread_ctx = Some(p)),
             (3, |app, p| app.export_crop_spread_ctx = Some(p)),
             (4, |app, p| app.sns_split_spread_ctx = Some(p)),
-            (5, |app, p| app.local_adjust_spread_ctx = Some(p)),
+            (5, |app, p| {
+                app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(p)
+            }),
         ] {
             app.enter_page_edit_single_view(target_idx);
             put(&mut app, pivot);
@@ -38384,7 +40157,7 @@ mod favorite_adjustment_defaults_tests {
 
             // Select the physical cover source, as a left/right switch inside the editor does.
             app.enter_page_edit_single_view(0);
-            app.local_adjust_spread_ctx = Some(pivot);
+            app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot);
             app.local_adjust_mode = true;
             assert_eq!(
                 app.fullscreen_idx,
@@ -38404,7 +40177,7 @@ mod favorite_adjustment_defaults_tests {
             // Closing or switching books tears the editor down instead of restoring the spread,
             // but the grid/resume cursor still comes from the saved navigation anchor.
             app.enter_page_edit_single_view(0);
-            app.local_adjust_spread_ctx = Some(pivot);
+            app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot);
             app.local_adjust_mode = true;
             app.close_fullscreen();
             assert_eq!(app.fullscreen_idx, None);
@@ -38425,16 +40198,17 @@ mod favorite_adjustment_defaults_tests {
             name: &str,
             source_dims: (u32, u32),
         ) -> ThumbnailState {
-            ThumbnailState::Loaded {
-                tex: ctx.load_texture(name, egui::ColorImage::example(), Default::default()),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(name, egui::ColorImage::example(), Default::default()),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some(source_dims),
-                layout_dims: None,
-            }
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some(source_dims),
+                None,
+            )
         }
 
         let ctx = egui::Context::default();
@@ -38534,20 +40308,21 @@ mod favorite_adjustment_defaults_tests {
                 .push(GridItem::Image(std::path::PathBuf::from(format!(
                     "c:/rtl/{k}.jpg"
                 ))));
-            app.thumbnails.push(ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails.push(ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     &format!("split-rtl-{k}"),
                     egui::ColorImage::example(),
                     Default::default(),
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some((1600, 900)),
-                layout_dims: None,
-            });
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1600, 900)),
+                None,
+            ));
         }
         app.visible_indices = (0..2).collect();
         app.viewer_navigation_caches.invalidate();
@@ -38589,20 +40364,21 @@ mod favorite_adjustment_defaults_tests {
                 .push(GridItem::Image(std::path::PathBuf::from(format!(
                     "c:/free/{k}.jpg"
                 ))));
-            app.thumbnails.push(ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails.push(ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     &format!("split-free-{k}"),
                     egui::ColorImage::example(),
                     Default::default(),
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 1,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: Some((1600, 900)),
-                layout_dims: None,
-            });
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1600, 900)),
+                None,
+            ));
         }
         app.visible_indices = (0..2).collect();
         app.viewer_navigation_caches.invalidate();
@@ -38964,12 +40740,12 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = true;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip")); // コンテナページ
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
 
         app.handle_fullscreen_close_request();
 
         assert!(
-            app.pending_return_to_parent,
+            app.pending_return_to_parent.is_pending(),
             "設定ON+コンテナは親 (L1) へ戻る予約"
         );
         assert_eq!(
@@ -38994,7 +40770,7 @@ mod favorite_adjustment_defaults_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.settings.auto_fullscreen_zip_pdf = true;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.pdf"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
 
         app.handle_fs_navigation(
             &egui::Context::default(),
@@ -39009,7 +40785,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         assert!(
-            app.pending_return_to_parent,
+            app.pending_return_to_parent.is_pending(),
             "detached viewer close must request parent list return in direct-page mode"
         );
         assert_eq!(
@@ -39027,7 +40803,7 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(parent, std::path::PathBuf::from("c:/manga"));
         assert_eq!(app.select_after_load.as_deref(), Some("book.pdf"));
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "parent return request should be consumed once it is merged"
         );
     }
@@ -39052,7 +40828,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = true;
         app.folder_history.insert(parent.clone(), (240.0, None));
-        app.pending_return_to_parent = true;
+        app.pending_return_to_parent.request_live();
 
         let nav = app
             .take_pending_return_to_parent_nav()
@@ -39091,13 +40867,13 @@ mod favorite_adjustment_defaults_tests {
         app.native_video_in_window_active = true;
         app.current_folder = Some(book.clone());
 
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
         assert!(
             app.handle_fullscreen_root_key_input(&egui::Context::default()),
             "embedded still normally suppresses main-grid keyboard handling"
         );
 
-        app.pending_return_to_parent = true;
+        app.pending_return_to_parent.request_live();
         assert!(
             !app.handle_fullscreen_root_key_input(&egui::Context::default()),
             "parent-return reservation must reach handle_keyboard on the next frame"
@@ -39119,7 +40895,7 @@ mod favorite_adjustment_defaults_tests {
             "parent list load closes fullscreen immediately"
         );
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "parent return request should not survive after the early-return path consumes it"
         );
     }
@@ -39133,10 +40909,10 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = false;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
         app.handle_fullscreen_close_request();
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "設定OFF は親復帰予約を立てない"
         );
         assert_eq!(app.fullscreen_idx, None, "その場で close");
@@ -39150,10 +40926,10 @@ mod favorite_adjustment_defaults_tests {
         app.settings.auto_fullscreen_zip_pdf = true;
         app.settings.auto_fullscreen_image_folders = false;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
         app.handle_fullscreen_close_request();
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "画像フォルダ追加設定 OFF の通常フォルダは親復帰予約を立てない"
         );
         assert_eq!(app.fullscreen_idx, None, "その場で close");
@@ -39170,12 +40946,12 @@ mod favorite_adjustment_defaults_tests {
         app.settings.auto_fullscreen_zip_pdf = true;
         app.settings.auto_fullscreen_image_folders = true;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
 
         app.handle_fullscreen_close_request();
 
         assert!(
-            app.pending_return_to_parent,
+            app.pending_return_to_parent.is_pending(),
             "追加設定 ON の画像のみ通常フォルダは親 (L1) へ戻る予約"
         );
         assert_eq!(app.fullscreen_idx, Some(0), "その場では close しない");
@@ -39939,6 +41715,7 @@ mod favorite_adjustment_defaults_tests {
         app.items.push(GridItem::Image(folder.join("p001.jpg")));
         app.items.push(GridItem::Image(page));
 
+        app.visible_indices = (0..app.items.len()).collect();
         let draft = app
             .current_book_bookmark_draft(1)
             .expect("image-only folder is a book");
@@ -39957,6 +41734,53 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn zip_bookmark_draft_counts_images_only_in_current_reading_order() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from("C:/test/book.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&[
+            "d1/a.jpg", "d2/b.jpg", "p1.jpg", "p2.jpg", "p3.jpg",
+        ]));
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
+        let idx = app
+            .items
+            .iter()
+            .position(|item| {
+                matches!(item,
+            GridItem::ZipImage { entry_name, .. } if entry_name == "p1.jpg")
+            })
+            .unwrap();
+        assert_eq!(idx, 2, "two directory rows precede the first image");
+        assert_eq!(
+            app.current_book_bookmark_draft(idx)
+                .unwrap()
+                .page_index_hint,
+            0
+        );
+    }
+
+    #[test]
+    fn pdf_bookmark_draft_keeps_zero_based_reading_position() {
+        let mut app = setup_app();
+        let pdf = PathBuf::from("C:/test/book.pdf");
+        app.current_folder = Some(pdf.clone());
+        app.items = (0..3)
+            .map(|page_num| GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        app.visible_indices = vec![0, 1, 2];
+        let draft = app.current_book_bookmark_draft(1).unwrap();
+        assert_eq!(draft.page_index_hint, 1);
+        assert_eq!(
+            draft.page_identity,
+            crate::book_bookmarks::PageIdentity::PdfPage(1)
+        );
+    }
+
+    #[test]
     fn converted_archive_bookmark_keeps_original_container_and_full_entry() {
         use crate::book_bookmarks::{BookContainerKind, PageIdentity};
 
@@ -39970,6 +41794,7 @@ mod favorite_adjustment_defaults_tests {
             entry_name: "chapter/inner.cbz/p010.jpg".to_string(),
         });
 
+        app.visible_indices = (0..app.items.len()).collect();
         let draft = app
             .current_book_bookmark_draft(0)
             .expect("converted archive page is bookmarkable");
@@ -40193,7 +42018,8 @@ mod favorite_adjustment_defaults_tests {
     }
 
     fn wait_for_book_op(app: &mut App, ctx: &egui::Context) {
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_book_op_pending(ctx);
             if app.book_op_pending.is_none() {
                 return;
@@ -40260,7 +42086,9 @@ mod favorite_adjustment_defaults_tests {
             .unwrap()
             .snapshot;
 
-        let result = crate::books::rename_book(&books_root, "Old", "New").unwrap();
+        let result =
+            crate::books::rename_book_at(&temp.path().join("data"), &books_root, "Old", "New")
+                .unwrap();
         let crate::books::BookOpResult::Renamed {
             source_folder,
             target_folder,
@@ -40436,26 +42264,21 @@ mod favorite_adjustment_defaults_tests {
         app.start_book_rename(&ctx, "Before".into(), "After".into());
         app.start_book_delete(&ctx, "Before".into());
         assert!(app.book_op_pending.is_none());
+        assert!(app.book_structural_op.is_none());
         let book_folder = app.tmp.path().to_path_buf();
-        assert!(
-            app.start_book_reorder_flush(&ctx, book_folder.clone(), vec![old.clone()])
-                .is_none()
-        );
+        assert!(!app.start_book_reorder_flush(&ctx, book_folder.clone(), vec![old.clone()]));
         for kind in [
             crate::books::BookTransferKind::Move,
             crate::books::BookTransferKind::Copy,
         ] {
-            assert!(
-                app.start_book_transfer(
-                    &ctx,
-                    book_folder.clone(),
-                    vec![old.clone()],
-                    vec![old.clone()],
-                    "Other".into(),
-                    kind,
-                )
-                .is_none()
-            );
+            assert!(!app.start_book_transfer(
+                &ctx,
+                book_folder.clone(),
+                vec![old.clone()],
+                vec![old.clone()],
+                "Other".into(),
+                kind,
+            ));
         }
         app.resolve_collection_migration_for_exit();
         assert_eq!(std::fs::read(&journal).unwrap(), old_bytes);
@@ -40502,7 +42325,7 @@ mod favorite_adjustment_defaults_tests {
         events: Vec<egui::Event>,
         background_clicks: &std::cell::Cell<u32>,
     ) {
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -40512,7 +42335,7 @@ mod favorite_adjustment_defaults_tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::Area::new(egui::Id::new("rename_recovery_background_test"))
+                egui::Area::new(egui::Id::unique("rename_recovery_background_test"))
                     .fixed_pos(egui::pos2(20.0, 20.0))
                     .show(ctx, |ui| {
                         if ui
@@ -40524,7 +42347,8 @@ mod favorite_adjustment_defaults_tests {
                     });
                 app.show_rename_migration_recovery_dialog(ctx);
             },
-        );
+        )
+        .drop_without_applying_deltas();
     }
 
     fn recovery_pointer_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
@@ -40727,18 +42551,15 @@ mod favorite_adjustment_defaults_tests {
         app.invalidate_rename_migrations_for_removed_paths(&[PathBuf::from("queued-removed")]);
 
         app.quarantine_rename_migration_recovery(&ctx);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while app.rename_migration_recovery_quarantine_running()
-            && std::time::Instant::now() < deadline
-        {
-            app.poll_rename_migration_quarantine();
-            std::thread::yield_now();
-        }
-        assert!(!app.rename_migration_recovery_quarantine_running());
-        assert!(matches!(
-            app.rename_migration_journal_admission,
-            RenameMigrationJournalAdmission::Waiting { .. }
-        ));
+        // Observe the completed rename before App adopts it and starts the new
+        // journal writer. A fast replacement save may recreate JOURNAL_FILE as
+        // soon as poll_rename_migration_quarantine publishes the local snapshot.
+        let RenameMigrationJournalAdmission::RecoveryQuarantining { task, .. } =
+            &mut app.rename_migration_journal_admission
+        else {
+            panic!("explicit quarantine must own its worker");
+        };
+        task.join_terminal();
         assert!(!journal.exists());
         let quarantined = std::fs::read_dir(&data_dir)
             .unwrap()
@@ -40753,6 +42574,12 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(quarantined.len(), 1);
         assert_eq!(std::fs::read(quarantined[0].path()).unwrap(), invalid);
 
+        app.poll_rename_migration_quarantine();
+        assert!(!app.rename_migration_recovery_quarantine_running());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Waiting { .. }
+        ));
         app.flush_rename_migration_journal().unwrap();
         let saved = crate::rename_key_migration::journal_load(&data_dir).unwrap();
         assert_eq!(saved.len(), 3);
@@ -41191,18 +43018,22 @@ mod favorite_adjustment_defaults_tests {
             false,
         );
         app.rename_migration_queue.push_back(job);
-        let result = crate::books::delete_book(&actual_root, "Book").unwrap();
+        let result = crate::books::delete_book_at(&data_dir, &actual_root, "Book").unwrap();
         app.settings.book_root = Some(app.tmp.path().join("changed-books-setting"));
         let (tx, rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: actual_book.clone(),
-            },
-        });
+        app.book_structural_op = Some(
+            super::book_structural_op::BookStructuralOp::running_for_test(
+                rx,
+                crate::books::BookOpIntent::Delete {
+                    path: actual_book.clone(),
+                },
+                super::book_structural_op::Completion::Manager,
+            ),
+        );
         tx.send(Ok(result)).unwrap();
 
-        app.poll_book_op_pending(&ctx);
+        app.poll_book_structural_op(&ctx);
+        assert!(app.book_structural_op.is_none());
         assert!(!app.rename_migration_queue[0].generic_pending);
         app.flush_rename_migration_journal().unwrap();
         assert!(!crate::rename_key_migration::journal_load(&data_dir).unwrap()[0].generic_pending);
@@ -41237,17 +43068,6 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.rename_migration_in_flight.is_none());
         app.delete_pending = None;
 
-        let (_book_tx, book_rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx: book_rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: PathBuf::from("new"),
-            },
-        });
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
-        app.book_op_pending = None;
-
         let root = app.tmp.path().join("books");
         let folder = root.join("Book");
         app.settings.book_root = Some(root);
@@ -41255,23 +43075,29 @@ mod favorite_adjustment_defaults_tests {
         app.items
             .push(crate::grid_item::GridItem::Image(folder.join("0001.jpg")));
         app.open_book_reorder_from_current();
-        let (_reorder_tx, reorder_rx) = std::sync::mpsc::channel();
-        app.book_reorder.as_mut().unwrap().flush_pending = Some(crate::books::BookOpPending {
-            rx: reorder_rx,
-            intent: crate::books::BookOpIntent::SourceMutation,
-        });
-        assert!(app.rename_migration_source_changes_pending());
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
-        app.book_reorder.as_mut().unwrap().flush_pending = None;
-        let (_transfer_tx, transfer_rx) = std::sync::mpsc::channel();
-        app.book_reorder.as_mut().unwrap().transfer_pending = Some(crate::books::BookOpPending {
-            rx: transfer_rx,
-            intent: crate::books::BookOpIntent::SourceMutation,
-        });
-        assert!(app.rename_migration_source_changes_pending());
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
+        for completion in [
+            super::book_structural_op::Completion::Manager,
+            super::book_structural_op::Completion::ReorderFlush,
+            super::book_structural_op::Completion::ReorderTransfer,
+        ] {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let intent = if matches!(completion, super::book_structural_op::Completion::Manager) {
+                crate::books::BookOpIntent::Delete {
+                    path: PathBuf::from("new"),
+                }
+            } else {
+                crate::books::BookOpIntent::SourceMutation
+            };
+            app.book_structural_op = Some(
+                super::book_structural_op::BookStructuralOp::running_for_test(
+                    rx, intent, completion,
+                ),
+            );
+            assert!(app.rename_migration_source_changes_pending());
+            app.try_start_next_rename_migration();
+            assert!(app.rename_migration_in_flight.is_none());
+            app.book_structural_op = None;
+        }
     }
 
     #[test]
@@ -42279,7 +44105,8 @@ mod favorite_adjustment_defaults_tests {
 
     fn poll_archive_decisions_for_test(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 return;
@@ -42517,7 +44344,8 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.converted_archive_cache_paths_pending.is_some());
 
         let ctx = egui::Context::default();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -42934,14 +44762,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[0] = ThumbnailState::Loaded {
-            tex: texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: None,
-            layout_dims: None,
-        };
+        app.thumbnails[0] = ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        );
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
             state: crate::app::ConvertedArchiveSourceState::CachedZip {
@@ -43687,7 +45516,8 @@ mod favorite_adjustment_defaults_tests {
         start_archive_decisions_for_test(&mut app, 0..1);
 
         let ctx = egui::Context::default();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -43879,15 +45709,18 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        let loaded = || ThumbnailState::Loaded {
-            tex: tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                evaluated_display_px: 1,
-            },
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
+        let loaded = || {
+            ThumbnailState::loaded_raster(
+                tex.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1, 1)),
+                None,
+            )
         };
         app.thumbnails = vec![loaded(), loaded()];
         app.requested.insert(0, false);
@@ -43920,7 +45753,8 @@ mod favorite_adjustment_defaults_tests {
         ));
         app.reload_queue = Some(Arc::clone(&reload_queue));
         app.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -45738,14 +47572,15 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             Default::default(),
         );
-        app.thumbnails[idx] = ThumbnailState::Loaded {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: true,
-            rendered_at_px: 128,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-        };
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            true,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        );
         let preview_key = "c:/test/outer.zip::book/page1.jpg".to_owned();
         app.thumb_edit_preview_keys.insert(idx, preview_key.clone());
 
@@ -45858,6 +47693,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_spread_left",
                     left_pixels.clone(),
@@ -45872,6 +47709,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_spread_right",
                     right_pixels.clone(),
@@ -46226,9 +48065,17 @@ mod favorite_adjustment_defaults_tests {
 
         app.poll_export_pending(&ctx);
 
-        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
-        app.consume_folder_refresh_pending();
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
+        app.consume_folder_refresh_pending(&egui::Context::default());
         assert!(app.folder_refresh_pending.is_none());
+        assert!(app.external_rescan_pending.is_some());
+        super::phase_c_support::wait_for_external_rescan(&mut app);
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.items.iter().any(|item| {
             matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
         }));
@@ -46275,6 +48122,8 @@ mod favorite_adjustment_defaults_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: std::sync::Arc::new(px),
                     source_dims: None,
@@ -46375,6 +48224,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: new_tex,
                 pixels: std::sync::Arc::new(egui::ColorImage::new(
                     [1, 1],
@@ -46402,22 +48253,23 @@ mod favorite_adjustment_defaults_tests {
             egui::TextureOptions::LINEAR,
         );
         let texture_id = texture.id();
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 3)),
-            layout_dims: None,
-        };
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 3)),
+            None,
+        );
         app.visible_indices = vec![idx];
         app.spread_mode = crate::settings::SpreadMode::Single;
 
         app.capture_fs_nav_holdover(idx);
 
-        let FsHoldover::FolderNavigation(Some(unit)) =
+        let FsHoldover::FolderNavigation(Some(unit), _) =
             app.fs_holdover_tex.as_ref().expect("holdover captured")
         else {
             panic!("folder navigation must own a captured display unit");
@@ -46440,6 +48292,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 7], egui::Color32::WHITE)),
                 source_dims: Some([400, 700]),
@@ -46478,7 +48332,15 @@ mod favorite_adjustment_defaults_tests {
             crate::rotation_db::Rotation::Cw90,
             "holdover geometry must be the capture-time old-item geometry"
         );
-        assert_eq!(held.pages[0].layout_size, egui::vec2(400.0, 700.0));
+        assert_eq!(held.pages[0].layout_size, egui::vec2(4.0, 7.0));
+        assert_eq!(
+            held.pages[0]
+                .fit_input
+                .original_display_dimensions()
+                .map(|basis| basis.as_tuple()),
+            Some((4, 7)),
+            "100% must retain the old texture's display basis after index reuse"
+        );
         assert_eq!(held.pages[0].source_size, Some(egui::vec2(400.0, 700.0)));
     }
 
@@ -46500,26 +48362,28 @@ mod favorite_adjustment_defaults_tests {
         );
         let first_texture_id = first_texture.id();
         let second_texture_id = second_texture.id();
-        app.thumbnails[first] = ThumbnailState::Loaded {
-            tex: first_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[first] = ThumbnailState::loaded_raster(
+            first_texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 3)),
-            layout_dims: None,
-        };
-        app.thumbnails[second] = ThumbnailState::Loaded {
-            tex: second_texture,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 3)),
+            None,
+        );
+        app.thumbnails[second] = ThumbnailState::loaded_raster(
+            second_texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 3)),
-            layout_dims: None,
-        };
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 3)),
+            None,
+        );
         app.visible_indices = vec![first, second];
         app.viewer_navigation_caches.invalidate();
 
@@ -46537,7 +48401,7 @@ mod favorite_adjustment_defaults_tests {
         ] {
             app.spread_mode = mode;
             app.capture_fs_nav_holdover(first);
-            let FsHoldover::FolderNavigation(Some(unit)) = app
+            let FsHoldover::FolderNavigation(Some(unit), _) = app
                 .fs_holdover_tex
                 .as_ref()
                 .expect("spread holdover captured")
@@ -46609,6 +48473,8 @@ mod favorite_adjustment_defaults_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: std::sync::Arc::new(px),
                     source_dims: None,
@@ -46667,6 +48533,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_visible_spread_left",
                     left_pixels.clone(),
@@ -46681,6 +48549,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_visible_spread_right",
                     right_pixels.clone(),
@@ -46770,6 +48640,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_source_dir_reset",
                     pixels.clone(),
@@ -46896,7 +48768,8 @@ mod favorite_adjustment_defaults_tests {
             if !ctx.has_requested_repaint() {
                 break;
             }
-            let _ = ctx.run(Default::default(), |_| {});
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
         }
         assert!(!ctx.has_requested_repaint(), "ここでは静止している");
 
@@ -47122,6 +48995,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ctx.load_texture(
                     "export_pdf_source_dir",
                     pixels.clone(),
@@ -47199,6 +49074,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: None,
@@ -47266,10 +49143,7 @@ mod favorite_adjustment_defaults_tests {
         );
         app.erase_preview_cache.insert(
             idx,
-            ErasePreviewCacheEntry {
-                pixels: std::sync::Arc::clone(&preview_pixels),
-                texture: preview_tex,
-            },
+            ErasePreviewCacheEntry::raster(std::sync::Arc::clone(&preview_pixels), preview_tex),
         );
 
         app.execute_erase_inpaint(&ctx, idx);
@@ -47304,7 +49178,7 @@ mod favorite_adjustment_defaults_tests {
         app.post_filter_bypassed = true;
         app.input_generation.insert(idx, 7);
 
-        let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let (_tx, rx) = std::sync::mpsc::channel::<crate::ui_erase::EraseInpaintResult>();
         let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let key = EraseInpaintPendingKey {
@@ -47316,6 +49190,9 @@ mod favorite_adjustment_defaults_tests {
         app.erase_inpaint_pending.insert(
             key,
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx,
                 items_generation,
                 path_key,
@@ -47326,8 +49203,7 @@ mod favorite_adjustment_defaults_tests {
                 started_at: std::time::Instant::now(),
                 input_generation: 7,
                 mask_generation: 0,
-                log_prefix: "test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit { origin: "test" },
             },
         );
 
@@ -47359,7 +49235,7 @@ mod favorite_adjustment_defaults_tests {
         app.post_filter_bypassed = true;
         app.input_generation.insert(idx, 11);
 
-        let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let (_tx, rx) = std::sync::mpsc::channel::<crate::ui_erase::EraseInpaintResult>();
         let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let key = EraseInpaintPendingKey {
@@ -47371,6 +49247,9 @@ mod favorite_adjustment_defaults_tests {
         app.erase_inpaint_pending.insert(
             key,
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx,
                 items_generation,
                 path_key,
@@ -47381,8 +49260,7 @@ mod favorite_adjustment_defaults_tests {
                 started_at: std::time::Instant::now(),
                 input_generation: 11,
                 mask_generation: 0,
-                log_prefix: "test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit { origin: "test" },
             },
         );
 
@@ -47436,9 +49314,10 @@ mod favorite_adjustment_defaults_tests {
         let erase_pixels =
             insert_current_erase_result_cache(&mut app, &ctx, idx, "conceal_enter_erase_result");
 
-        app.enter_conceal_mode(idx);
+        app.enter_conceal_mode(&egui::Context::default(), idx);
 
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_local_adjust_render(&ctx);
             if app.conceal_mode {
                 break;
@@ -47591,7 +49470,6 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.auto_aspect_cache_target_path().is_none());
     }
 
-    #[test]
     /// 右情報パネルのロックと明示 open は **viewer context ごと**に持つ (backlog §1.158)。
     ///
     /// App-global に置くと、`with_viewer_context` が bundle のフィールドだけを差し替えて
@@ -47786,13 +49664,19 @@ mod favorite_adjustment_defaults_tests {
         let _ = app.query_similar_book(&item);
 
         app.capture_fs_nav_holdover(0);
-        app.close_fullscreen();
+        app.close_fullscreen_for_folder_nav_reopen();
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.fs_holdover_tex.is_some());
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Active(_)
         ));
 
         app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
         app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
         assert_eq!(
             app.similar_panel.book_query_demand_for_test(),
@@ -47800,7 +49684,10 @@ mod favorite_adjustment_defaults_tests {
         );
 
         let _ = app.query_similar_book(&item);
+        // The same continuation owner must not turn an explicit session exit into a reopen.
+        app.capture_fs_nav_holdover(0);
         app.close_fullscreen();
+        assert!(app.fs_holdover_tex.is_none());
         assert_eq!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Withdrawn
@@ -47832,8 +49719,8 @@ mod favorite_adjustment_defaults_tests {
 
     /// ロック中は前後移動でパネルを閉じないが、**フルスクリーンを出たら解除する**。
     ///
-    /// `close_fullscreen` はフォルダ移動の再オープンでも呼ばれるので、「ロック中は reset を
-    /// 飛ばす」だけにすると終了時も残ってしまう (backlog §1.158)。
+    /// 内部 reopen と真の終了は専用の入口で区別する。「ロック中は reset を飛ばす」だけに
+    /// すると真の終了時も残ってしまう (backlog §1.158)。
     #[test]
     fn the_lock_survives_moving_between_files_but_not_leaving_fullscreen() {
         let mut app = setup_app();
@@ -47884,17 +49771,24 @@ mod favorite_adjustment_defaults_tests {
         app.capture_fs_nav_holdover(0);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
-        app.close_fullscreen();
+        app.close_fullscreen_for_folder_nav_reopen();
+        assert!(app.fullscreen_idx.is_none());
         assert!(
             app.fs_info_panel.locked,
             "resource-less folder navigation must survive its internal close"
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
         app.open_fullscreen(0, HistoryTrigger::UserChosen);
         assert_eq!(app.fullscreen_idx, Some(0));
@@ -47903,6 +49797,20 @@ mod favorite_adjustment_defaults_tests {
         app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
         assert!(app.fs_holdover_tex.is_none());
         assert!(!app.fs_info_panel.locked);
+
+        // An explicit true close must release the lock even with a navigation owner present.
+        app.fs_info_panel.locked = true;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+        app.capture_fs_nav_holdover(0);
+        assert!(app.fs_holdover_tex.is_some());
+        app.close_fullscreen();
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(!app.fs_info_panel.locked);
+        assert_eq!(
+            app.fs_info_panel.open,
+            crate::ui_helpers::MetadataPanelOpenState::Closed
+        );
     }
 
     #[test]
@@ -47949,20 +49857,21 @@ mod favorite_adjustment_defaults_tests {
         let mut app = setup_app();
         app.idle_upgrade_cache_bypass_ineligible.insert(7);
         let ctx = egui::Context::default();
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "idle-quality-context",
                 egui::ColorImage::filled([247, 124], egui::Color32::LIGHT_BLUE),
                 egui::TextureOptions::LINEAR,
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 374,
             },
-            from_edit_preview: false,
-            rendered_at_px: 247,
-            source_dims: Some((884, 444)),
-            layout_dims: None,
-        });
+            false,
+            247,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((884, 444)),
+            None,
+        ));
 
         let original = app.stash_mounted_and_start_fresh("test_idle_upgrade_context");
         app.idle_upgrade_cache_bypass_ineligible.insert(99);
@@ -48694,16 +50603,17 @@ mod favorite_adjustment_defaults_tests {
 
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/book/02.7z")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: old_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            old_tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        });
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.fullscreen_idx = Some(0);
         let locked_gen = app.items_generation;
         app.fs_nav_locked_gen = Some(locked_gen);
@@ -48744,23 +50654,27 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails = vec![ThumbnailState::Loaded {
-            tex: new_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails = vec![ThumbnailState::loaded_raster(
+            new_tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        }];
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )];
         assert!(
             app.fs_nav_holdover_for_draw().is_none(),
             "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
         assert!(
             app.fs_nav_is_locked(),
@@ -48781,19 +50695,23 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
-        app.thumbnails = vec![ThumbnailState::Loaded {
-            tex: new_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails = vec![ThumbnailState::loaded_raster(
+            new_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        }];
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )];
         app.poll_fs_nav_lock(&ctx);
         assert!(!app.fs_nav_is_locked());
         assert!(app.fs_holdover_tex.is_none());
@@ -48837,28 +50755,30 @@ mod favorite_adjustment_defaults_tests {
     fn archive_convert_deferred_fullscreen_attaches_for_suppressed_or_direct_read() {
         let mut app = setup_app();
         let (_tx, rx) = std::sync::mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: PathBuf::from(r"C:\books\02.7z"),
-            input_seq: 0,
-            format: ArchiveFormat::SevenZ,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: true,
-            suppress_confirm_next_time: false,
-        });
+                src_path: PathBuf::from(r"C:\books\02.7z"),
+                input_seq: 0,
+                format: ArchiveFormat::SevenZ,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: true,
+                suppress_confirm_next_time: false,
+            },
+        ));
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fullscreen_idx = None;
 
@@ -48879,28 +50799,30 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.fs_nav_is_locked());
 
         let (_tx, rx) = std::sync::mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: PathBuf::from(r"C:\books\03.7z"),
-            input_seq: 0,
-            format: ArchiveFormat::SevenZ,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: PathBuf::from(r"C:\books\03.7z"),
+                input_seq: 0,
+                format: ArchiveFormat::SevenZ,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         app.fs_nav_locked_gen = Some(app.items_generation);
         assert!(
             !app.attach_archive_convert_deferred_fullscreen(
@@ -48913,28 +50835,30 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.archive_convert_deferred_fullscreen_active());
 
         let (_tx, rx) = std::sync::mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: PathBuf::from(r"C:\books\04.rar"),
-            input_seq: 0,
-            format: ArchiveFormat::Rar,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: true,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: PathBuf::from(r"C:\books\04.rar"),
+                input_seq: 0,
+                format: ArchiveFormat::Rar,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: true,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         assert!(
             app.attach_archive_convert_deferred_fullscreen(
                 false,
@@ -48948,9 +50872,10 @@ mod favorite_adjustment_defaults_tests {
         let direct_path = PathBuf::from(r"C:\books\04.rar");
         app.archive_convert.as_mut().unwrap().pending_direct_nav = Some(direct_path.clone());
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(app.archive_convert.is_none());
         assert_eq!(app.current_folder, Some(direct_path));
         assert!(app.zip_enumerate_pending.is_some());
@@ -48974,28 +50899,30 @@ mod favorite_adjustment_defaults_tests {
             )),
         )
         .unwrap();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: PathBuf::from(r"C:\books\locked.rar"),
-            input_seq: 0,
-            format: ArchiveFormat::Rar,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: true,
-            suppress_confirm_next_time: false,
-        });
+                src_path: PathBuf::from(r"C:\books\locked.rar"),
+                input_seq: 0,
+                format: ArchiveFormat::Rar,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: true,
+                suppress_confirm_next_time: false,
+            },
+        ));
         app.fs_nav_locked_gen = Some(app.items_generation);
         assert!(app.attach_archive_convert_deferred_fullscreen(
             false,
@@ -49003,9 +50930,10 @@ mod favorite_adjustment_defaults_tests {
             crate::app::HistoryTrigger::UserChosen,
         ));
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(!app.archive_convert_deferred_fullscreen_active());
         assert!(!app.fs_nav_is_locked());
@@ -49035,32 +50963,34 @@ mod favorite_adjustment_defaults_tests {
             ))),
         )
         .unwrap();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: PathBuf::from(r"C:\books\gone.rar"),
-            input_seq: 0,
-            format: ArchiveFormat::Rar,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
-                progress: std::sync::Arc::new(
-                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
-                ),
+                src_path: PathBuf::from(r"C:\books\gone.rar"),
+                input_seq: 0,
+                format: ArchiveFormat::Rar,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                    progress: std::sync::Arc::new(
+                        crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                    ),
+                },
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: true,
+                suppress_confirm_next_time: false,
             },
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: true,
-            suppress_confirm_next_time: false,
-        });
+        ));
         app.fs_nav_locked_gen = Some(app.items_generation);
         assert!(app.attach_archive_convert_deferred_fullscreen(
             false,
@@ -49068,9 +50998,10 @@ mod favorite_adjustment_defaults_tests {
             crate::app::HistoryTrigger::UserChosen,
         ));
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(!app.archive_convert_deferred_fullscreen_active());
         assert!(!app.fs_nav_is_locked());
@@ -49159,26 +51090,28 @@ mod favorite_adjustment_defaults_tests {
 
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: image_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            image_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 1,
             },
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: None,
-            layout_dims: None,
-        });
+            false,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.items
             .push(GridItem::Video(std::path::PathBuf::from("c:/p/b.mp4")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: video_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: None,
-            layout_dims: None,
-        });
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            video_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
 
         app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
@@ -49203,19 +51136,22 @@ mod favorite_adjustment_defaults_tests {
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/p/{idx}.jpg"))))
             .collect();
         app.thumbnails = (0..3)
-            .map(|idx| ThumbnailState::Loaded {
-                tex: ctx.load_texture(
-                    format!("incremental-evict-{idx}"),
-                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
-                    egui::TextureOptions::LINEAR,
-                ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                    evaluated_display_px: 1,
-                },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: None,
-                layout_dims: None,
+            .map(|idx| {
+                ThumbnailState::loaded_raster(
+                    ctx.load_texture(
+                        format!("incremental-evict-{idx}"),
+                        egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 1,
+                    },
+                    false,
+                    1,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    None,
+                    None,
+                )
             })
             .collect();
 
@@ -49241,19 +51177,22 @@ mod favorite_adjustment_defaults_tests {
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/p/{idx}.jpg"))))
             .collect();
         app.thumbnails = (0..3)
-            .map(|idx| ThumbnailState::Loaded {
-                tex: ctx.load_texture(
-                    format!("generation-evict-{idx}"),
-                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
-                    egui::TextureOptions::LINEAR,
-                ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                    evaluated_display_px: 1,
-                },
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_dims: None,
-                layout_dims: None,
+            .map(|idx| {
+                ThumbnailState::loaded_raster(
+                    ctx.load_texture(
+                        format!("generation-evict-{idx}"),
+                        egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 1,
+                    },
+                    false,
+                    1,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    None,
+                    None,
+                )
             })
             .collect();
         app.keep_set = std::collections::HashSet::from([1]);
@@ -49449,6 +51388,7 @@ mod favorite_adjustment_defaults_tests {
         let _owner = app.keyboard_owner_for_pass(&ctx);
         crate::key_input::set_test_frame(vec![
             crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
@@ -49461,6 +51401,7 @@ mod favorite_adjustment_defaults_tests {
                 alt: false,
             },
             crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
@@ -49476,7 +51417,7 @@ mod favorite_adjustment_defaults_tests {
         let press_count = app
             .keymap
             .consume_action_press_count(&ctx, crate::keymap::KeyAction::FsCtrlNavNext);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(press_count, 2);
 
         app.handle_fs_navigation(
@@ -49696,16 +51637,17 @@ mod favorite_adjustment_defaults_tests {
         // 初期: items_generation = 0、idx 0 が「現在表示中ページ」 (Loaded 済) として置く。
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
-        app.thumbnails.push(ThumbnailState::Loaded {
-            tex: dummy_tex.clone(),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
+            dummy_tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: None,
-            layout_dims: None,
-        });
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        ));
         app.fullscreen_idx = Some(0);
         // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
         let lock_gen = app.items_generation;
@@ -49858,9 +51800,12 @@ mod favorite_adjustment_defaults_tests {
         let mut app = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {
-            let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+            let (_tx, rx) = std::sync::mpsc::channel::<crate::ui_erase::EraseInpaintResult>();
             let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx,
                 items_generation: 0,
                 path_key: None,
@@ -49871,8 +51816,7 @@ mod favorite_adjustment_defaults_tests {
                 started_at: std::time::Instant::now(),
                 input_generation: 0,
                 mask_generation: 0,
-                log_prefix: "test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit { origin: "test" },
             }
         };
         let commit_key = |idx| EraseInpaintPendingKey {
@@ -49934,14 +51878,20 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
         app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
+        let source_ctx = egui::Context::default();
+        insert_export_static_source(&mut app, &source_ctx, 1, [4, 6], "switch_ready_source");
+        app.show_whats_new = false;
+        app.show_mouse_nav_migration_prompt = false;
+        app.network_data_dir_notice = None;
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single;
         app.local_adjust_mode = true;
-        app.local_adjust_spread_ctx = Some(crate::app::PageEditSpreadPivot {
-            saved_mode: SpreadMode::Ltr,
-            pair: (0, 1),
-            navigation_anchor_idx: 0,
-        });
+        app.local_adjust_spread_ctx =
+            app.capture_local_page_edit_pivot(crate::app::PageEditSpreadPivot {
+                saved_mode: SpreadMode::Ltr,
+                pair: (0, 1),
+                navigation_anchor_idx: 0,
+            });
 
         // 左ページで「投げ縄を描きかけ、図形を 1 つ選び、ドラッグ単位 Undo の退避も
         // 持っている」状態を作る。
@@ -49954,7 +51904,7 @@ mod favorite_adjustment_defaults_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(Vec::new()));
         app.local_adjust_selective_color_pick_active = true;
 
-        app.switch_local_adjust_target_in_spread(1);
+        app.switch_local_adjust_target_in_spread(&egui::Context::default(), 1);
 
         assert_eq!(app.fullscreen_idx, Some(1), "右ページへ切り替わる");
         assert_eq!(
@@ -49992,7 +51942,7 @@ mod favorite_adjustment_defaults_tests {
 
         // 同じページへの切替は何もしない。
         app.local_adjust_selected_shape = Some(2);
-        app.switch_local_adjust_target_in_spread(1);
+        app.switch_local_adjust_target_in_spread(&egui::Context::default(), 1);
         assert_eq!(
             app.local_adjust_selected_shape,
             Some(2),
@@ -50011,6 +51961,11 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
         app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
+        let source_ctx = egui::Context::default();
+        insert_export_static_source(&mut app, &source_ctx, 1, [4, 6], "switch_ready_source");
+        app.show_whats_new = false;
+        app.show_mouse_nav_migration_prompt = false;
+        app.network_data_dir_notice = None;
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single; // 消しゴム中
         app.erase_spread_ctx = Some(crate::app::PageEditSpreadPivot {
@@ -50071,8 +52026,14 @@ mod favorite_adjustment_defaults_tests {
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
         app.thumbnails = vec![ThumbnailState::Pending; 2];
+        let source_ctx = egui::Context::default();
+        insert_export_static_source(&mut app, &source_ctx, 1, [4, 6], "switch_ready_source");
+        app.show_whats_new = false;
+        app.show_mouse_nav_migration_prompt = false;
+        app.network_data_dir_notice = None;
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single;
+        app.conceal_mode = true;
         app.conceal_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
@@ -50092,7 +52053,14 @@ mod favorite_adjustment_defaults_tests {
             }),
         }));
 
-        app.switch_conceal_target_in_spread(1);
+        app.switch_conceal_target_in_spread(&source_ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.local_adjust_pending.is_empty() {
+            app.frame_counter += 1;
+            app.poll_local_adjust_render(&source_ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
 
         assert_eq!(app.fullscreen_idx, Some(1));
         assert_eq!(app.spread_mode, SpreadMode::Single);
@@ -50119,6 +52087,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: raw_tex,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -50126,8 +52096,10 @@ mod favorite_adjustment_defaults_tests {
                 animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
-        app.erase_base_cache
-            .insert(idx, std::sync::Arc::new(stale_adjusted));
+        app.erase_base_cache.insert(
+            idx,
+            crate::app::EraseBaseSource::raster(std::sync::Arc::new(stale_adjusted)),
+        );
 
         app.enter_erase_mode(idx);
 
@@ -50136,7 +52108,7 @@ mod favorite_adjustment_defaults_tests {
             .get(&idx)
             .expect("erase base should be recreated");
         assert_eq!(
-            base.pixels[0],
+            base.pixels.pixels[0],
             egui::Color32::from_rgb(10, 20, 30),
             "stale adjusted erase_base_cache must be overwritten by raw fs_cache"
         );
@@ -50163,6 +52135,8 @@ mod favorite_adjustment_defaults_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: raw_tex,
                 pixels: std::sync::Arc::new(raw),
                 source_dims: Some([1, 1]),
@@ -50180,6 +52154,8 @@ mod favorite_adjustment_defaults_tests {
         app.ai_upscale_cache.insert(
             (idx, erase_bg),
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ai_tex,
                 pixels: std::sync::Arc::new(ai),
                 source_dims: None,
@@ -50216,9 +52192,10 @@ mod favorite_adjustment_defaults_tests {
         let ctx = egui::Context::default();
         let blocked = |app: &App| {
             let result = std::cell::Cell::new(false);
-            let _ = ctx.run(Default::default(), |ctx| {
+            ctx.run_pass(Default::default(), |ctx| {
                 result.set(app.shortcuts_blocked_by_text_input(ctx));
-            });
+            })
+            .drop_without_applying_deltas();
             result.get()
         };
         // 全フォーカスフラグが false の初期状態ではブロックされない。
@@ -50269,9 +52246,10 @@ mod favorite_adjustment_defaults_tests {
         let ctx = egui::Context::default();
         let owner = std::cell::Cell::new(crate::keyboard_input::KeyboardOwner::Unclaimed);
 
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_pass(Default::default(), |ctx| {
             owner.set(app.keyboard_owner_for_pass(ctx));
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(matches!(
             owner.get(),
@@ -50283,7 +52261,7 @@ mod favorite_adjustment_defaults_tests {
     fn pending_text_focus_claim_expires_after_the_next_unfocused_app_pass() {
         let app = setup_app();
         let ctx = egui::Context::default();
-        let widget_id = egui::Id::new("pending-bookmark-title");
+        let widget_id = egui::Id::unique("pending-bookmark-title");
 
         ctx.begin_pass(Default::default());
         assert!(matches!(
@@ -50291,7 +52269,7 @@ mod favorite_adjustment_defaults_tests {
             crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
         ));
         app.claim_pending_text_input_focus(ctx.viewport_id(), widget_id, ctx.cumulative_pass_nr());
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         ctx.begin_pass(Default::default());
         assert_eq!(
@@ -50302,14 +52280,14 @@ mod favorite_adjustment_defaults_tests {
                 phase: crate::keyboard_input::TextInputPhase::PendingFocus,
             }
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         ctx.begin_pass(Default::default());
         assert!(matches!(
             app.keyboard_owner_for_pass(&ctx),
             crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     /// 削除確認ダイアログの文言は対象パスのドライブ種別・ゴミ箱設定で変わるため、
@@ -50341,7 +52319,7 @@ mod favorite_adjustment_defaults_tests {
     /// stale な signature が残っていると `check_external_folder_changes` が
     /// 「内容変化あり」と誤判定して数千件の items を再走査して UI が固まる。
     #[test]
-    fn poll_delete_pending_clears_current_folder_signature() {
+    fn section1375_poll_delete_pending_retains_and_updates_previous_scan_rows() {
         use crate::delete_worker::{DeleteMsg, DeletePending};
         use crate::grid_item::{GridItem, ThumbnailState};
         use std::sync::atomic::AtomicBool;
@@ -50355,6 +52333,8 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_signature =
             Some(folder_scan::FolderScanSignature::for_test(0xDEAD_BEEF));
+        app.seed_folder_observation_for_test(&folder, &folder_scan::scan_directory(&folder));
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.items.push(GridItem::Image(target_path.clone()));
         app.thumbnails.push(ThumbnailState::Pending);
         app.rating_cache.insert(0, 5);
@@ -50405,8 +52385,8 @@ mod favorite_adjustment_defaults_tests {
             "Done 受信で delete_pending は take される"
         );
         assert!(
-            app.current_folder_signature.is_none(),
-            "削除完了で signature が None reset されること"
+            app.current_folder_signature.is_some(),
+            "削除後の比較は旧走査行から成功行だけ除去した記録で続く"
         );
         assert_eq!(
             app.items.len(),
@@ -50444,16 +52424,17 @@ mod favorite_adjustment_defaults_tests {
             let pixels = Arc::new(image.clone());
             let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
             (
-                ThumbnailState::Loaded {
+                ThumbnailState::loaded_raster(
                     tex,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 64,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 64,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                },
+                    false,
+                    64,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((1, 1)),
+                    None,
+                ),
                 pixels,
             )
         }
@@ -51072,6 +53053,7 @@ mod thumbnail_progress_tests {
 /// be invalidated on different axes.
 #[cfg(test)]
 mod pipeline_cache_refactor_tests {
+    use super::source_texture_test_support::seed as seed_shared_source;
     use crate::adjustment::PostFilter;
     use crate::colorize::ColorizeMode;
     use crate::ui_fullscreen::SpreadPair;
@@ -51085,6 +53067,236 @@ mod pipeline_cache_refactor_tests {
         app.items.push(GridItem::Image(PathBuf::from(path)));
         app.thumbnails.push(ThumbnailState::Pending);
         app.items.len() - 1
+    }
+
+    #[test]
+    fn source_texture_sharing_two_pages_same_frame_has_no_extra_delta() {
+        for cpu_prefetched in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let ids: Vec<_> = (0..2)
+                .map(|idx| {
+                    push_image(&mut app, &format!("C:/shared/{idx}.jpg"));
+                    seed_shared_source(&mut app, &ctx, idx)
+                })
+                .collect();
+            ctx.tex_manager().write().take_delta().clear();
+            let budget = app.last_edit_materialize_upload_frame;
+            for idx in 0..2 {
+                if cpu_prefetched {
+                    let (key, _) = app.ensure_edit_result_pixels_cpu(&ctx, idx).unwrap();
+                    assert!(app.edit_result_cache[&key].texture.is_none());
+                }
+                let final_tex = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+                let edit_key = app.current_edit_result_key(idx);
+                let edit = &app.edit_result_cache[&edit_key];
+                let params = app.effective_params(idx);
+                let final_key =
+                    app.final_composite_key_for_pixels(edit_key, edit.pixels.size, params);
+                let final_entry = &app.final_composite_cache[&final_key];
+                assert_eq!(edit.texture.as_ref().unwrap().id(), ids[idx]);
+                assert_eq!(final_tex.id(), ids[idx]);
+                assert!(Arc::ptr_eq(
+                    &app.current_raw_source_pixels(idx).unwrap(),
+                    &edit.pixels
+                ));
+                assert!(Arc::ptr_eq(&edit.pixels, &final_entry.pixels));
+                assert!(final_entry.complete);
+                assert_eq!(final_entry.source_size, [4, 6]);
+                assert_eq!(
+                    final_entry.canonical_dims,
+                    Some(crate::page_dims::CanonicalPageDimensions::new(400, 600))
+                );
+            }
+            assert_eq!(app.last_edit_materialize_upload_frame, budget);
+            assert!(ctx.tex_manager().write().take_delta().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_texture_sharing_cpu_entry_ignores_already_spent_upload_budget() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/cpu.jpg");
+        let id = seed_shared_source(&mut app, &ctx, idx);
+        let (key, _) = app.ensure_edit_result_pixels_cpu(&ctx, idx).unwrap();
+        ctx.tex_manager().write().take_delta().clear();
+        app.last_edit_materialize_upload_frame = app.frame_counter;
+        app.ensure_edit_result_pixels(&ctx, idx).unwrap();
+        assert_eq!(
+            app.edit_result_cache[&key].texture.as_ref().unwrap().id(),
+            id
+        );
+        assert!(ctx.tex_manager().write().take_delta().is_empty());
+    }
+
+    #[test]
+    fn source_texture_sharing_excludes_raw_preview_and_animation_frames() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/preview.png");
+        seed_shared_source(&mut app, &ctx, idx);
+        let key = app.current_edit_result_key(idx);
+        let pixels = app.current_raw_source_pixels(idx).unwrap();
+        let FsCacheEntry::Static { animation, .. } = app.fs_cache.get_mut(&idx).unwrap() else {
+            panic!()
+        };
+        *animation = StaticAnimationState::FirstFrameOnly(
+            crate::canonical_image_loader::CanonicalAnimatedFormat::Gif,
+        );
+        assert!(
+            app.shared_source_texture_for_edit(&ctx, &key, &pixels)
+                .is_none()
+        );
+        assert!(app.ensure_edit_result_pixels(&ctx, idx).is_none());
+        assert!(app.ensure_final_composite_texture(&ctx, idx).is_none());
+        let FsCacheEntry::Static { tex, .. } = app.fs_cache.get(&idx).unwrap() else {
+            panic!()
+        };
+        let tex = tex.clone();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::RawPreview {
+                preview: Some(crate::fs_animation::RawPreviewTexture {
+                    tex,
+                    pixels: Arc::clone(&pixels),
+                }),
+                developed_dims: [400, 600],
+                load_seq: 1,
+            },
+        );
+        assert!(
+            app.shared_source_texture_for_edit(&ctx, &key, &pixels)
+                .is_none()
+        );
+        assert!(app.edit_result_cache.is_empty());
+        assert!(app.final_composite_cache.is_empty());
+    }
+
+    #[test]
+    fn source_texture_sharing_rejects_changed_arc_size_options_key_and_identity() {
+        for case in ["arc", "size", "options", "key", "identity"] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = push_image(&mut app, "C:/shared/reject.jpg");
+            seed_shared_source(&mut app, &ctx, idx);
+            let pixels = app.current_raw_source_pixels(idx).unwrap();
+            let mut key = app.current_edit_result_key(idx);
+            let mut candidate = Arc::clone(&pixels);
+            match case {
+                "arc" => candidate = Arc::new((*pixels).clone()),
+                "key" => key.source_gen += 1,
+                "identity" => {
+                    push_image(&mut app, "C:/shared/other.jpg");
+                    let other = app.item_id(1);
+                    let FsCacheEntry::Static { tex, .. } = app.fs_cache.get(&idx).unwrap() else {
+                        panic!()
+                    };
+                    *app.texture_identity.borrow_mut() = Default::default();
+                    app.bind_display_texture_identity(tex, other);
+                }
+                _ => {
+                    let texture = ctx.load_texture(
+                        "incompatible",
+                        egui::ColorImage::filled(
+                            if case == "size" { [2, 3] } else { pixels.size },
+                            egui::Color32::WHITE,
+                        ),
+                        if case == "options" {
+                            egui::TextureOptions::LINEAR
+                        } else {
+                            DISPLAY_IMAGE_TEXTURE_OPTIONS
+                        },
+                    );
+                    let FsCacheEntry::Static { tex, .. } = app.fs_cache.get_mut(&idx).unwrap()
+                    else {
+                        panic!()
+                    };
+                    *tex = texture;
+                }
+            }
+            let _expected = crate::item_identity::expect_mismatch();
+            assert!(
+                app.shared_source_texture_for_edit(&ctx, &key, &candidate)
+                    .is_none(),
+                "{case}"
+            );
+            if case == "identity" {
+                assert!(app.display_identity_error.borrow().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn source_texture_sharing_final_effects_keep_separate_allocations() {
+        for case in ["adjustment", "sharpen", "post", "nearest", "ai"] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = push_image(&mut app, "C:/shared/effects.jpg");
+            let id = seed_shared_source(&mut app, &ctx, idx);
+            match case {
+                "adjustment" => app.settings.global_preset.brightness = 12.0,
+                "sharpen" => app.settings.global_preset.smart_sharpen = 50,
+                "post" => app.settings.global_preset.post_filter = PostFilter::Sepia,
+                "nearest" => app.settings.global_preset.post_filter = PostFilter::Nearest,
+                "ai" => {
+                    enable_pdf_final_ai_params(&mut app);
+                    let key = pdf_final_ai_key(&app, idx, [4, 6]);
+                    app.final_ai_cache.insert(
+                        key,
+                        FinalAiEntry {
+                            canonical_dims: None,
+                            source_size: [4, 6],
+                            pixels: Arc::new(egui::ColorImage::filled(
+                                [8, 12],
+                                egui::Color32::WHITE,
+                            )),
+                            used_upscale: true,
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let final_tex = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+            assert_ne!(final_tex.id(), id, "{case}");
+            assert_eq!(app.current_edit_result_texture(idx).unwrap().id(), id);
+            assert_eq!(
+                app.current_raw_source_pixels(idx).unwrap().pixels[0],
+                egui::Color32::from_rgb(60, 120, 180)
+            );
+            let expected_options = if case == "nearest" {
+                egui::TextureOptions::NEAREST
+            } else {
+                DISPLAY_IMAGE_TEXTURE_OPTIONS
+            };
+            assert_eq!(
+                ctx.tex_manager()
+                    .read()
+                    .meta(final_tex.id())
+                    .unwrap()
+                    .options,
+                expected_options
+            );
+        }
+    }
+
+    #[test]
+    fn source_texture_sharing_pending_ai_does_not_promote_complete() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/pending-ai.jpg");
+        let id = seed_shared_source(&mut app, &ctx, idx);
+        enable_pdf_final_ai_params(&mut app);
+        let key = pdf_final_ai_key(&app, idx, [4, 6]);
+        let (pending, _) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(key, pending);
+        let texture = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+        assert_eq!(texture.id(), id);
+        assert!(!app.current_final_composite_is_complete(idx));
+        assert!(
+            app.ensure_final_composite_pixels_with_key(&ctx, idx)
+                .is_none()
+        );
     }
 
     fn push_pdf_page(app: &mut App, path: &str, page_num: u32) -> usize {
@@ -51158,6 +53370,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([2, 1]),
@@ -51218,21 +53432,20 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: edit_pixels,
-                texture: Some(edit_texture),
-            },
+            EditResultEntry::raster(edit_pixels, Some(edit_texture)),
         );
         let pixels = Arc::new(egui::ColorImage::new([4, 2], vec![color; 8]));
         let texture = ctx.load_texture(label, (*pixels).clone(), egui::TextureOptions::LINEAR);
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: pixels.size,
-                pixels: Arc::clone(&pixels),
+            FinalCompositeEntry::raster(
+                None,
+                pixels.size,
+                Arc::clone(&pixels),
                 texture,
-                complete: true,
-            },
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
         pixels
     }
@@ -51345,10 +53558,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&pixels),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::clone(&pixels), Some(edit_tex)),
         );
 
         let final_key = FinalCompositeKey {
@@ -51363,12 +53573,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: pixels.size,
+            FinalCompositeEntry::raster(
+                None,
+                pixels.size,
                 pixels,
-                texture: final_tex,
-                complete: true,
-            },
+                final_tex,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
         app.final_ai_cache.insert(
             FinalAiKey {
@@ -51377,6 +53589,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new(
                     [1, 1],
@@ -51401,16 +53614,17 @@ mod pipeline_cache_refactor_tests {
             egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[3] = ThumbnailState::Loaded {
-            tex: landscape,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[3] = ThumbnailState::loaded_raster(
+            landscape,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 64,
             },
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_dims: Some((2, 1)),
-            layout_dims: None,
-        };
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 1)),
+            None,
+        );
 
         app.spread_mode = crate::settings::SpreadMode::LtrCover;
         assert_eq!(app.fs_display_unit_page_indices(0), vec![0]);
@@ -51497,13 +53711,8 @@ mod pipeline_cache_refactor_tests {
         let key = app.current_local_adjust_key(idx);
         let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(20, 30, 40)]);
         let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
-        app.local_adjust_cache.insert(
-            key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(image),
-                texture,
-            },
-        );
+        app.local_adjust_cache
+            .insert(key, LocalAdjustCacheEntry::raster(Arc::new(image), texture));
         key
     }
 
@@ -51531,7 +53740,7 @@ mod pipeline_cache_refactor_tests {
         let erase_key = app.current_erase_result_key(idx);
         let (pixels, texture) = make_entry("erase");
         app.erase_result_cache
-            .insert(erase_key, EraseResultCacheEntry { pixels, texture });
+            .insert(erase_key, EraseResultCacheEntry::raster(pixels, texture));
 
         let local_key = insert_local_adjust_cache(app, ctx, idx, &format!("{label}_local"));
 
@@ -51541,7 +53750,7 @@ mod pipeline_cache_refactor_tests {
         };
         let (pixels, texture) = make_entry("bypass");
         app.local_adjust_layer_bypass_cache
-            .insert(bypass_key, LocalAdjustCacheEntry { pixels, texture });
+            .insert(bypass_key, LocalAdjustCacheEntry::raster(pixels, texture));
 
         let prefix_key = LocalAdjustPrefixPreviewKey {
             result_key: local_key,
@@ -51549,16 +53758,12 @@ mod pipeline_cache_refactor_tests {
         };
         let (pixels, texture) = make_entry("prefix");
         app.local_adjust_prefix_preview_cache
-            .insert(prefix_key, LocalAdjustCacheEntry { pixels, texture });
+            .insert(prefix_key, LocalAdjustCacheEntry::raster(pixels, texture));
 
         let (pixels, texture) = make_entry("conceal");
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels,
-                texture,
-                generation: app.conceal_generation,
-            },
+            ConcealCacheEntry::raster(pixels, texture, app.conceal_generation),
         );
 
         (erase_key, local_key, bypass_key, prefix_key)
@@ -51583,6 +53788,8 @@ mod pipeline_cache_refactor_tests {
             app.adjustment_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex: texture,
                     pixels: Arc::new(image),
                     source_dims: None,
@@ -51810,6 +54017,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([1, 1]),
@@ -51855,10 +54064,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.erase_result_cache.insert(
             erase_key,
-            EraseResultCacheEntry {
-                pixels: Arc::new(erase_img),
-                texture: erase_tex,
-            },
+            EraseResultCacheEntry::raster(Arc::new(erase_img), erase_tex),
         );
 
         // local_adjust_cache
@@ -51874,11 +54080,7 @@ mod pipeline_cache_refactor_tests {
         let conceal_generation = app.conceal_generation;
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels: Arc::new(conceal_img),
-                texture: conceal_tex,
-                generation: conceal_generation,
-            },
+            ConcealCacheEntry::raster(Arc::new(conceal_img), conceal_tex, conceal_generation),
         );
 
         // edit_result_cache + final_composite_cache + final_ai_cache
@@ -52165,10 +54367,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&edit_pixels),
-                texture: Some(edit_texture),
-            },
+            EditResultEntry::raster(Arc::clone(&edit_pixels), Some(edit_texture)),
         );
 
         let mut params = crate::adjustment::AdjustParams::default();
@@ -52191,12 +54390,14 @@ mod pipeline_cache_refactor_tests {
         let provisional_id = provisional.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: edit_pixels.size,
-                pixels: Arc::clone(&provisional_pixels),
-                texture: provisional,
-                complete: false,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                edit_pixels.size,
+                Arc::clone(&provisional_pixels),
+                provisional,
+                egui::TextureOptions::LINEAR,
+                false,
+            ),
         );
         let entry_count = app.final_composite_cache.len();
 
@@ -52206,6 +54407,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(ai_key, pending);
         final_ai_tx
             .send(FinalAiResult::Ready {
+                canonical_dims: None,
                 job_id: 0,
                 key: ai_key,
                 retained_key: None,
@@ -52264,13 +54466,16 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
+                canonical_dims: None,
                 source_size: edit_pixels.size,
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: final_effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -52340,12 +54545,14 @@ mod pipeline_cache_refactor_tests {
         let cached_id = cached_texture.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: cached_pixels.size,
-                pixels: cached_pixels,
-                texture: cached_texture,
-                complete: false,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                cached_pixels.size,
+                cached_pixels,
+                cached_texture,
+                egui::TextureOptions::LINEAR,
+                false,
+            ),
         );
 
         let spawned = app.start_final_effect_worker(
@@ -52369,13 +54576,16 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
+                canonical_dims: None,
                 source_size: source.size,
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: prefetch_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(prefetch_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: true,
+                origin: FinalEffectOrigin::LegacyPrefetch,
+                gpu_diagnostics: Default::default(),
             },
         );
         let reused = app.start_final_effect_worker(
@@ -52394,7 +54604,7 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.final_effect_pending
                 .get(&final_key)
-                .is_some_and(|pending| !pending.prefetch),
+                .is_some_and(|pending| !pending.origin.is_prefetch()),
             "the matching prefetch must still be promoted instead of restarted"
         );
         drop(prefetch_tx);
@@ -52428,12 +54638,14 @@ mod pipeline_cache_refactor_tests {
         let provisional_id = provisional.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: provisional_pixels.size,
-                pixels: Arc::clone(&provisional_pixels),
-                texture: provisional,
-                complete: false,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                provisional_pixels.size,
+                Arc::clone(&provisional_pixels),
+                provisional,
+                egui::TextureOptions::LINEAR,
+                false,
+            ),
         );
         // This regression exercises the display-only holdover, not the colorize worker timing.
         // Keep an exact-key result pending so a fast 1x1 worker cannot land between the
@@ -52446,13 +54658,16 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
+                canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: final_effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         let old_holdover = ctx.load_texture(
@@ -52497,12 +54712,14 @@ mod pipeline_cache_refactor_tests {
         let complete_id = complete.id();
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: complete_pixels.size,
-                pixels: complete_pixels,
-                texture: complete,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                complete_pixels.size,
+                complete_pixels,
+                complete,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         let displayed = app
@@ -52574,13 +54791,16 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
+                canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: false,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -52619,13 +54839,16 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
+                canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -52692,6 +54915,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: raw,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -52715,13 +54940,8 @@ mod pipeline_cache_refactor_tests {
         image: egui::ColorImage,
     ) -> EditResultKey {
         let edit_key = dummy_edit_key(app, idx);
-        app.edit_result_cache.insert(
-            edit_key,
-            EditResultEntry {
-                pixels: Arc::new(image),
-                texture: None,
-            },
-        );
+        app.edit_result_cache
+            .insert(edit_key, EditResultEntry::raster(Arc::new(image), None));
         edit_key
     }
 
@@ -52737,6 +54957,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: None,
@@ -53045,7 +55267,8 @@ mod pipeline_cache_refactor_tests {
         assert!(!app.colorize_display_requires_final_effect(idx));
         let entries = app.settings.creative_luts.clone();
         let lut_id = entries.first().unwrap().id;
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.creative_lut_library.poll(&entries, &ctx);
             if app.creative_lut_library.get(Some(lut_id)).is_some() {
                 break;
@@ -53086,7 +55309,8 @@ mod pipeline_cache_refactor_tests {
 
         let entries = app.settings.creative_luts.clone();
         let lut_id = entries.first().unwrap().id;
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.creative_lut_library.poll(&entries, &ctx);
             if app.creative_lut_library.get(Some(lut_id)).is_some() {
                 break;
@@ -53505,14 +55729,8 @@ mod pipeline_cache_refactor_tests {
         for (idx, label) in [(current, "conceal_current"), (other, "conceal_other")] {
             let pixels = Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::BLACK));
             let texture = ctx.load_texture(label, (*pixels).clone(), Default::default());
-            app.conceal_cache.insert(
-                idx,
-                ConcealCacheEntry {
-                    pixels,
-                    texture,
-                    generation,
-                },
-            );
+            app.conceal_cache
+                .insert(idx, ConcealCacheEntry::raster(pixels, texture, generation));
         }
 
         app.bump_conceal_generation();
@@ -53555,6 +55773,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
                 source_dims: Some([2, 2]),
@@ -53564,7 +55784,8 @@ mod pipeline_cache_refactor_tests {
         );
 
         assert!(app.ensure_conceal_texture(&ctx, idx).is_none());
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_local_adjust_render(&ctx);
             if app.conceal_cache.contains_key(&idx) {
                 break;
@@ -53578,7 +55799,8 @@ mod pipeline_cache_refactor_tests {
         app.bump_conceal_generation();
         app.frame_counter = app.frame_counter.wrapping_add(1);
         assert!(app.ensure_conceal_texture(&ctx, idx).is_none());
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_local_adjust_render(&ctx);
             if app.conceal_cache.contains_key(&idx) {
                 break;
@@ -53662,6 +55884,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: Arc::clone(&raw_pixels),
                 source_dims: Some([1, 1]),
@@ -53832,18 +56056,19 @@ mod pipeline_cache_refactor_tests {
                 ..Default::default()
             };
             ctx.begin_pass(egui::RawInput {
-                modifiers: ctrl,
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: ctrl,
-                }],
+                events: std::iter::once(egui::Event::ModifiersChanged(ctrl))
+                    .chain(vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: ctrl,
+                    }])
+                    .collect(),
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(&ctx, idx, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
 
             assert!(!app.erase_mode, "E must remain blocked");
             assert!(!app.local_adjust_mode, "Ctrl+G must remain blocked");
@@ -53953,6 +56178,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             square,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels,
                 source_dims: Some([1, 1]),
@@ -54536,17 +56763,11 @@ mod pipeline_cache_refactor_tests {
         );
         app.local_adjust_layer_bypass_cache.insert(
             bypass_key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(bypass_image),
-                texture: bypass_tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::new(bypass_image), bypass_tex),
         );
         app.local_adjust_prefix_preview_cache.insert(
             prefix_key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(prefix_image),
-                texture: prefix_tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::new(prefix_image), prefix_tex),
         );
 
         // 両方とも独立に lookup できる
@@ -54730,10 +56951,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.local_adjust_layer_bypass_cache.insert(
             bypass_key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(bypass_image),
-                texture: bypass_tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::new(bypass_image), bypass_tex),
         );
 
         // 両方とも生き残っていること
@@ -54899,13 +57117,8 @@ mod pipeline_cache_refactor_tests {
         let key = app.current_local_adjust_layer_bypass_key(idx, 1);
         let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let tex = ctx.load_texture("bypass-guard-cache", img.clone(), Default::default());
-        app.local_adjust_layer_bypass_cache.insert(
-            key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(img),
-                texture: tex,
-            },
-        );
+        app.local_adjust_layer_bypass_cache
+            .insert(key, LocalAdjustCacheEntry::raster(Arc::new(img), tex));
 
         assert!(
             app.local_adjust_layer_bypass_pending.is_none(),
@@ -55035,13 +57248,8 @@ mod pipeline_cache_refactor_tests {
         let key = app.current_local_adjust_prefix_preview_key(idx, 1);
         let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let tex = ctx.load_texture("prefix-guard-cache", img.clone(), Default::default());
-        app.local_adjust_prefix_preview_cache.insert(
-            key,
-            LocalAdjustCacheEntry {
-                pixels: Arc::new(img),
-                texture: tex,
-            },
-        );
+        app.local_adjust_prefix_preview_cache
+            .insert(key, LocalAdjustCacheEntry::raster(Arc::new(img), tex));
 
         assert!(
             app.local_adjust_prefix_preview_pending.is_none(),
@@ -55200,11 +57408,7 @@ mod pipeline_cache_refactor_tests {
         let conceal_generation = app.conceal_generation;
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels: Arc::clone(&conceal_pixels),
-                texture: conceal_tex,
-                generation: conceal_generation,
-            },
+            ConcealCacheEntry::raster(Arc::clone(&conceal_pixels), conceal_tex, conceal_generation),
         );
         app.conceal_pages.insert(idx);
 
@@ -55380,6 +57584,7 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(ready_key, pending);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key: ready_key,
             retained_key: None,
@@ -55404,6 +57609,7 @@ mod pipeline_cache_refactor_tests {
         // (3) Unknown: pending に無い key の Ready → 捨てる (cache に入らない)
         let unknown_key = mk_key(2);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key: unknown_key,
             retained_key: None,
@@ -55518,6 +57724,7 @@ mod pipeline_cache_refactor_tests {
         };
         app.retained_final_ai_orphans.insert(key, 0);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key,
             retained_key: Some(retained_key.clone()),
@@ -55575,6 +57782,7 @@ mod pipeline_cache_refactor_tests {
         let (new_pending, _cancel) = make_fake_final_ai_pending_with_job_id(2);
         app.final_ai_pending.insert(key, new_pending);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 1,
             key,
             retained_key: Some(retained_key.clone()),
@@ -55638,6 +57846,7 @@ mod pipeline_cache_refactor_tests {
         app.retained_final_ai_orphans.insert(key, 0);
         app.clear_retained_final_ai_cache("test_epoch_bump");
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key,
             retained_key: Some(retained_key.clone()),
@@ -55787,6 +57996,649 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn pdf_display_resolution_keeps_identical_inflight_request() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, r"C:\books\display-resolution.pdf", 0);
+        let pixels = Arc::new(egui::ColorImage::filled([786, 1179], egui::Color32::WHITE));
+        let tex = ctx.load_texture("small-pdf", (*pixels).clone(), egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex,
+                pixels,
+                source_dims: Some([786, 1179]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget {
+            width_px: 1400,
+            height_px: 1547,
+            fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+        });
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let cancel = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "first frame must be live"
+        );
+        app.ensure_pdf_display_resolution(idx, None);
+        let requests = probe.take_requests();
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "identical second frame cancelled the first in-flight request; requests={requests:?}"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(Arc::ptr_eq(
+            &cancel,
+            &app.fs_pending.get(&idx).unwrap().cancel
+        ));
+    }
+
+    fn seed_pdf_resolution_static(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: [usize; 2],
+        content_type: crate::pdf_loader::PdfPageContentType,
+    ) -> usize {
+        ctx.input_mut(|input| input.max_texture_side = 8192);
+        let idx = push_pdf_page(app, r"C:\books\resolution.pdf", 0);
+        if let GridItem::PdfPage {
+            content_type: stored,
+            ..
+        } = &mut app.items[idx]
+        {
+            *stored = Some(content_type);
+        }
+        let pixels = Arc::new(egui::ColorImage::filled(size, egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            "pdf-resolution",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex,
+                pixels,
+                source_dims: Some(size),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget {
+            width_px: 1400,
+            height_px: 1547,
+            fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+        });
+        idx
+    }
+
+    #[test]
+    fn pdf_rerender_failure_keeps_static_and_retires_identical_demand() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [80, 120],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        app.fullscreen_idx = Some(idx);
+        let original = match app.fs_cache.get(&idx).unwrap() {
+            FsCacheEntry::Static { pixels, .. } => Arc::clone(pixels),
+            _ => unreachable!(),
+        };
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let requests = probe.take_requests();
+        assert_eq!(requests.len(), 1);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(
+            matches!(app.fs_cache.get(&idx), Some(FsCacheEntry::Static { pixels, .. })
+            if Arc::ptr_eq(pixels, &original)),
+            "rerender failure must preserve the displayed Static"
+        );
+        assert!(
+            app.fs_feedback_toast.take().is_some(),
+            "a retained failed enhancement must notify once"
+        );
+        for _ in 0..3 {
+            app.ensure_pdf_display_resolution(idx, None);
+            app.request_pdf_rerender_at_target(idx, requests[0].1, false);
+        }
+        assert!(
+            probe.take_requests().is_empty(),
+            "failed source/target must not retry"
+        );
+        assert!(app.fs_feedback_toast.is_none());
+        app.request_pdf_rerender_at_target(idx, requests[0].1 + 1000, true);
+        assert_eq!(probe.take_requests(), vec![(idx, requests[0].1 + 1000)]);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        for target in [requests[0].1, requests[0].1 + 1000] {
+            app.request_pdf_rerender_at_target(idx, target, true);
+        }
+        assert!(
+            probe.take_requests().is_empty(),
+            "alternating failed targets must not form a loop"
+        );
+        if let GridItem::PdfPage { pdf_path, .. } = &mut app.items[idx] {
+            *pdf_path = PathBuf::from("C:/books/replacement.pdf");
+        }
+        app.request_pdf_rerender_at_target(idx, requests[0].1, true);
+        assert_eq!(probe.take_requests(), vec![(idx, requests[0].1)]);
+    }
+
+    #[test]
+    fn pdf_rerender_failure_without_static_keeps_initial_load_failure() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [80, 120],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        app.fs_cache.remove(&idx);
+        let probe = PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender_at_target(idx, 1600, true);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(matches!(app.fs_cache.get(&idx), Some(FsCacheEntry::Failed)));
+    }
+
+    #[test]
+    fn pdf_rerender_failure_from_old_source_or_canceled_owner_does_not_poison_static() {
+        for source_changed in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = seed_pdf_resolution_static(
+                &mut app,
+                &ctx,
+                [80, 120],
+                crate::pdf_loader::PdfPageContentType::Vector,
+            );
+            let probe = PdfRerenderRequestProbe::start();
+            app.request_pdf_rerender_at_target(idx, 1600, true);
+            assert_eq!(probe.take_requests(), vec![(idx, 1600)]);
+            if source_changed {
+                if let GridItem::PdfPage { pdf_path, .. } = &mut app.items[idx] {
+                    *pdf_path = PathBuf::from("C:/books/replaced-during-render.pdf");
+                }
+            } else {
+                app.fs_pending.get(&idx).unwrap().cancel();
+            }
+            probe.send_pending(idx, FsLoadResult::Failed);
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            assert!(
+                matches!(app.fs_cache.get(&idx), Some(FsCacheEntry::Static { pdf_rerender_failures, .. })
+                if pdf_rerender_failures.is_empty()),
+                "an obsolete failure must leave both pixels and failure facts untouched"
+            );
+            assert!(app.fs_feedback_toast.is_none());
+            app.request_pdf_rerender_at_target(idx, 1600, true);
+            assert_eq!(
+                probe.take_requests(),
+                vec![(idx, 1600)],
+                "fresh live demand must remain admissible"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_rerender_failure_finishes_native_ai_wait_without_retries() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [80, 120],
+            crate::pdf_loader::PdfPageContentType::Raster { w: 1600, h: 2400 },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some(
+            crate::ai::ModelKind::UpscaleRealEsrGeneralV3
+                .as_str()
+                .into(),
+        );
+        app.settings.ai_upscale_size_limit =
+            Some(crate::ai::upscale::AiProcessSizeLimit::square(4096));
+        assert!(app.display_should_defer_final_ai(idx));
+        let probe = PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender(idx, 1.0, true);
+        probe.send_pending(idx, FsLoadResult::Failed);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(!app.display_should_defer_final_ai(idx));
+        assert!(!app.pdf_prefetch_should_defer_ai(idx));
+        assert!(!app.should_native_rerender_pdf_for_ai(idx));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn crop_drag_context_mount_is_read_only_and_park_cancels_before_stashing() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        let main_idx = push_image(&mut app, "C:/crop/main.jpg");
+        app.fullscreen_idx = Some(main_idx);
+        let main = app.viewer_context_main();
+        let owner = app.build_active_context_for_test(Some(42), DetachedSource::Image, |app| {
+            let idx = push_image(app, "C:/crop/owner.jpg");
+            app.fullscreen_idx = Some(idx);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            app.detached_viewer_independent_active = true;
+            app.set_detached_window_binding_for_test(Some(42));
+            let pixels = Arc::new(egui::ColorImage::filled([100, 100], egui::Color32::WHITE));
+            let tex =
+                ctx.load_texture("crop-park", (*pixels).clone(), egui::TextureOptions::LINEAR);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
+                    tex,
+                    pixels,
+                    source_dims: Some([100, 100]),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        });
+        let (owner_idx, key) = app
+            .with_viewer_context_state(owner, |mounted| {
+                let idx = mounted.fullscreen_idx.unwrap();
+                mounted.export_crop_mode = true;
+                let before = ExportCropDragSnapshot {
+                    owner: mounted.capture_page_edit_owner(idx).unwrap(),
+                    press_frame: ctx.cumulative_frame_nr(),
+                    idx,
+                    image_size: [100, 100],
+                    settings: None,
+                };
+                mounted.export_crop_create_drag = Some(ExportCropCreateDrag {
+                    start: [10.0, 10.0],
+                    before,
+                });
+                mounted.set_export_crop_for_idx_memory_only(
+                    idx,
+                    Some(crate::export_crop::CropSettings::authored(
+                        crate::export_crop::CropRect {
+                            min_x: 10.0,
+                            min_y: 10.0,
+                            max_x: 80.0,
+                            max_y: 80.0,
+                        },
+                        crate::export_crop::CropAspectMode::Free,
+                        [100, 100],
+                    )),
+                    [100, 100],
+                );
+                assert!(mounted.export_crop_page_settings.contains_key(&idx));
+                let key = mounted.page_path_key(idx).unwrap();
+                mounted
+                    .with_viewer_context_state(main, |sibling| {
+                        sibling.cache_current_edit_preview_if_ready();
+                        assert!(sibling.export_crop_page_settings.is_empty());
+                        assert!(
+                            sibling.export_crop_create_drag.is_some(),
+                            "a sibling preview must not consume the editor"
+                        );
+                    })
+                    .unwrap();
+                assert!(mounted.export_crop_page_settings.contains_key(&idx));
+                (idx, key)
+            })
+            .unwrap();
+        assert!(app.pause_current_active_viewer_context(&ctx));
+        assert!(app.export_crop_create_drag.is_none());
+        app.with_viewer_context_state(owner, |mounted| {
+            assert!(!mounted.export_crop_page_settings.contains_key(&owner_idx));
+            assert!(!mounted.export_crop_pages.contains(&owner_idx));
+            assert_eq!(mounted.export_crop_db.as_ref().unwrap().get(&key), None);
+        })
+        .unwrap();
+    }
+
+    fn assert_pdf_rerender_probe_completion_releases_scheduler(via_poll: bool) {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let cancel = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert_eq!(app.fs_page_load_scheduler.stats().waiting, 1);
+        let result = FsLoadResult::StaticPdf {
+            ci: egui::ColorImage::filled([120, 180], egui::Color32::WHITE),
+            source_dims: [120, 180],
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 400.0,
+                height: 600.0,
+            },
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+        };
+        if via_poll {
+            probe.send_pending(idx, result);
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        } else {
+            let generation = app.items_generation;
+            assert!(probe.complete(&mut app, generation, idx, result));
+        }
+        assert!(app.fs_pending.is_empty());
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.fs_page_load_scheduler.stats(),
+            crate::fs_page_load_scheduler::FsPageLoadSchedulerStats::default(),
+            "a completed probe must leave no scheduler request behind"
+        );
+        // Check real admission at both priorities, after proving that acquire cannot block.
+        for priority in [FsPageLoadPriority::High, FsPageLoadPriority::Normal] {
+            let mut ticket = app.fs_page_load_scheduler.request(
+                app.fs_page_load_context_serial(),
+                idx,
+                priority,
+                FsPageLoadContract::Sequential,
+                None,
+                0,
+            );
+            let permit = ticket.waiter().acquire_cancellable().unwrap();
+            assert_eq!(app.fs_page_load_scheduler.stats().running, 1);
+            ticket.disarm();
+            drop(permit);
+            assert_eq!(
+                app.fs_page_load_scheduler.stats(),
+                crate::fs_page_load_scheduler::FsPageLoadSchedulerStats::default()
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_rerender_probe_complete_releases_scheduler_for_next_load() {
+        assert_pdf_rerender_probe_completion_releases_scheduler(false);
+    }
+
+    #[test]
+    fn pdf_rerender_probe_poll_releases_scheduler_for_next_load() {
+        assert_pdf_rerender_probe_completion_releases_scheduler(true);
+    }
+
+    #[test]
+    fn pdf_rerender_identity_is_shared_by_fit_zoom_and_absolute_demand() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender(idx, 1.0, false);
+        let normal = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert!(!normal.load(Ordering::Relaxed));
+        app.ensure_pdf_display_resolution(idx, None);
+        assert!(
+            normal.load(Ordering::Relaxed),
+            "Critical replaces Normal once"
+        );
+        let critical = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        for _ in 0..8 {
+            app.ensure_pdf_display_resolution(idx, None);
+            app.request_pdf_rerender(idx, 1.0, false);
+            app.request_pdf_absolute_demand(idx, 1547.0, false);
+        }
+        assert!(!critical.load(Ordering::Relaxed));
+        assert_eq!(probe.take_requests(), vec![(idx, 1702), (idx, 1702)]);
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(critical.load(Ordering::Relaxed));
+        let zoomed = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(!zoomed.load(Ordering::Relaxed));
+        assert_eq!(probe.take_requests(), vec![(idx, 3404)]);
+
+        // A different PDF page can occupy the same index and require the same target.
+        if let GridItem::PdfPage { page_num, .. } = &mut app.items[idx] {
+            *page_num = 1;
+        }
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(zoomed.load(Ordering::Relaxed));
+        let replacement = app.fs_pending.get(&idx).unwrap();
+        assert_eq!(
+            replacement.pdf_rerender.as_ref().unwrap().source,
+            app.metadata_cache_key(idx).unwrap()
+        );
+        let cancelled = Arc::clone(&replacement.cancel);
+        replacement.cancel();
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(
+            !app.fs_pending
+                .get(&idx)
+                .unwrap()
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+        assert_eq!(probe.take_requests(), vec![(idx, 3404), (idx, 3404)]);
+    }
+
+    #[test]
+    fn pdf_rerender_identity_retires_with_snapshot_cancel_and_close() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let first = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        let transfer = app.take_fs_page_for_snapshot(idx);
+        assert!(first.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+        app.restore_fs_page_from_snapshot(idx, transfer);
+        app.ensure_pdf_display_resolution(idx, None);
+        assert_eq!(probe.take_requests(), vec![(idx, 1702), (idx, 1702)]);
+        let second = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        app.fullscreen_idx = Some(idx);
+        app.close_fullscreen();
+        assert!(second.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+    }
+
+    #[test]
+    fn pdf_display_resolution_completion_converges_for_fit_trim_native_and_thin_pages() {
+        use crate::pdf_loader::{
+            PdfDisplayFitMode, PdfDisplayTarget, PdfPageContentType, PdfPageSizePoints,
+        };
+        for (initial, points, content_type, mode, viewport, bbox) in [
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Width,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(0.25, 0.25),
+                    egui::pos2(0.75, 0.75),
+                )),
+            ),
+            (
+                [100, 150],
+                (600.0, 900.0),
+                PdfPageContentType::Raster { w: 400, h: 600 },
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [1, 80],
+                (1.0, 160.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (10, 232),
+                None,
+            ),
+            (
+                [1, 1000],
+                (1.0, 5000.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (10, 10000),
+                None,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = seed_pdf_resolution_static(&mut app, &ctx, initial, content_type);
+            app.fs_pdf_display_target = Some(PdfDisplayTarget {
+                width_px: viewport.0,
+                height_px: viewport.1,
+                fit_mode: mode,
+            });
+            let points = PdfPageSizePoints {
+                width: points.0,
+                height: points.1,
+            };
+            let layout = points.catalog_layout_dims().unwrap();
+            app.record_page_layout_dims_for_spread(idx, layout);
+            let target = app
+                .pdf_display_render_long_edge_for_idx(idx, Some(content_type), bbox)
+                .unwrap();
+            let probe = PdfRerenderRequestProbe::start();
+            app.ensure_pdf_display_resolution(idx, bbox);
+            app.ensure_pdf_display_resolution(idx, bbox);
+            assert_eq!(
+                probe.take_requests(),
+                vec![(idx, target)],
+                "case={mode:?}/{content_type:?}/{layout:?}"
+            );
+            let dims = crate::pdf_loader::render_dimensions_for_layout(target, layout);
+            probe.send_pending(
+                idx,
+                FsLoadResult::StaticPdf {
+                    ci: egui::ColorImage::filled(
+                        [dims.0 as usize, dims.1 as usize],
+                        egui::Color32::WHITE,
+                    ),
+                    source_dims: [dims.0 as usize, dims.1 as usize],
+                    page_size_points: points,
+                    content_type,
+                },
+            );
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            assert!(app.fs_pending.is_empty());
+            let after = app
+                .pdf_display_render_long_edge_for_idx(idx, Some(content_type), bbox)
+                .unwrap();
+            assert!(
+                target.abs_diff(after) <= 1,
+                "target drift: {target} -> {after}; layout={layout:?}"
+            );
+            assert_eq!(
+                app.fs_page_load_state(idx),
+                FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache)
+            );
+            for _ in 0..8 {
+                app.ensure_pdf_display_resolution(idx, bbox);
+                app.request_pdf_rerender_at_target(idx, after, true);
+            }
+            assert!(
+                probe.take_requests().is_empty(),
+                "completed raster must satisfy target={after}, actual={dims:?}"
+            );
+            assert!(
+                app.lookup_retained_pdf_page_raster(idx, after, "test_completion")
+                    .is_some()
+            );
+            if (dims.0.max(dims.1) as f32) < after as f32 * 0.9 {
+                // A restored pixel cache must also converge after its layout projection was cleared.
+                app.page_dims_cache.clear();
+                assert!(app.current_pdf_page_metadata_snapshot(idx).is_none());
+                app.ensure_pdf_display_resolution(idx, bbox);
+                assert!(app.current_pdf_page_metadata_snapshot(idx).is_some());
+                assert!(app.fs_upload_backlog.is_empty());
+                assert!(probe.take_requests().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn fs_page_load_state_retained_pdf_empty_raster_final_ai_and_clear_are_equivalent() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let idx = push_pdf_page(&mut app, r"C:\books\retained-state.pdf", 0);
+        let other = push_pdf_page(&mut app, r"C:\books\other-state.pdf", 0);
+        let pixels = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::WHITE));
+        assert!(app.retained_pdf_page_cache.is_empty());
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        assert!(app.insert_retained_pdf_page_raster(idx, [4, 6], Arc::clone(&pixels)));
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        store_matching_pdf_final_ai(&mut app, idx, [4, 6], pixels);
+        assert_eq!(
+            app.fs_page_load_state(idx),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+        );
+        assert_eq!(app.fs_page_load_state(other), FsPageLoadState::NeedsLoad);
+        let image_idx = app.items.len();
+        app.items
+            .push(GridItem::Image(PathBuf::from(r"C:\books\ordinary.png")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        assert_eq!(
+            app.fs_page_load_state(image_idx),
+            FsPageLoadState::NeedsLoad
+        );
+        let model = app.settings.global_preset.upscale_model.take();
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        app.settings.global_preset.upscale_model = model;
+        assert!(app.fs_page_load_state(idx).is_display_ready());
+        app.clear_retained_pdf_page_cache("test_empty_fast_path");
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        app.fs_cache.insert(idx, FsCacheEntry::Failed);
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::LoadFailed);
+    }
+
+    #[test]
     fn fs_page_load_state_prevents_same_idx_same_params_reentry() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
@@ -55896,6 +58748,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             resident_idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: resident_tex,
                 pixels: Arc::clone(&resident_pixels),
                 source_dims: Some([2, 2]),
@@ -55942,13 +58796,16 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             effect_key,
             FinalEffectPending {
+                pdf_metadata: None,
+                canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::clone(&effect_cancel),
-                rx: effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
 
@@ -55998,13 +58855,20 @@ mod pipeline_cache_refactor_tests {
             app.final_effect_pending.insert(
                 key,
                 FinalEffectPending {
+                    pdf_metadata: None,
+                    canonical_dims: None,
                     source_size: [1, 1],
                     cancel: Arc::new(AtomicBool::new(false)),
-                    rx,
+                    state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                     items_generation,
                     output_complete: true,
                     nearest_sampler: false,
-                    prefetch: idx != target_idx,
+                    origin: if idx != target_idx {
+                        FinalEffectOrigin::LegacyPrefetch
+                    } else {
+                        FinalEffectOrigin::LegacyDisplay
+                    },
+                    gpu_diagnostics: Default::default(),
                 },
             );
         }
@@ -56329,16 +59193,17 @@ mod pipeline_cache_refactor_tests {
             egui::TextureOptions::LINEAR,
         );
         let catalog_id = catalog.id();
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: catalog,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            catalog,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 2,
             },
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-        };
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 2)),
+            None,
+        );
         app.thumb_pixels.insert(idx, Arc::clone(&source));
 
         let identity = app
@@ -56388,16 +59253,17 @@ mod pipeline_cache_refactor_tests {
             color.as_ref().clone(),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: catalog,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            catalog,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 8,
             },
-            from_edit_preview: false,
-            rendered_at_px: 8,
-            source_dims: Some((800, 1201)),
-            layout_dims: None,
-        };
+            false,
+            8,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((800, 1201)),
+            None,
+        );
         app.thumb_pixels.insert(idx, Arc::clone(&color));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
 
@@ -56476,16 +59342,17 @@ mod pipeline_cache_refactor_tests {
             egui::TextureOptions::LINEAR,
         );
         let catalog_id = catalog.id();
-        app.thumbnails[idx] = ThumbnailState::Loaded {
-            tex: catalog,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
+            catalog,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 8,
             },
-            from_edit_preview: false,
-            rendered_at_px: 8,
-            source_dims: Some((800, 1201)),
-            layout_dims: None,
-        };
+            false,
+            8,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((800, 1201)),
+            None,
+        );
         app.thumb_pixels.insert(idx, Arc::clone(&monochrome));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
         let params = app.effective_params(idx).clone();
@@ -56500,12 +59367,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: monochrome.size,
-                pixels: Arc::clone(&monochrome),
-                texture: final_texture,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                monochrome.size,
+                Arc::clone(&monochrome),
+                final_texture,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
         app.final_composite_cache
             .record_colorize_applied(final_key, false);
@@ -56625,6 +59494,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels,
                 source_dims: Some([2, 2]),
@@ -56742,6 +59613,8 @@ mod pipeline_cache_refactor_tests {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex: texture,
                     pixels,
                     source_dims: Some([1, 1]),
@@ -56840,7 +59713,13 @@ mod pipeline_cache_refactor_tests {
     fn promotion_only_asks_one_predicate_whether_a_page_is_displayed() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
-        for relative in ["src/app.rs", "src/ui_fullscreen.rs"] {
+        for relative in [
+            "src/app.rs",
+            "src/app/update_phases.rs",
+            "src/app/root_lifecycle.rs",
+            "src/app/ai_terminal_service.rs",
+            "src/ui_fullscreen.rs",
+        ] {
             let source = std::fs::read_to_string(manifest_dir.join(relative))
                 .expect("read Rust source as UTF-8");
             let lines: Vec<&str> = source.lines().collect();
@@ -57680,6 +60559,7 @@ mod pipeline_cache_refactor_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.seed_folder_observation_for_test(&folder, &scan_directory(&folder));
         app.items = vec![GridItem::Image(first_image.clone())];
         app.thumbnails = vec![ThumbnailState::Pending];
 
@@ -57728,6 +60608,7 @@ mod pipeline_cache_refactor_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(initial_mtime);
         app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.seed_folder_observation_for_test(&folder, &scan_directory(&folder));
         app.items = vec![GridItem::Image(first_image)];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
@@ -57748,7 +60629,12 @@ mod pipeline_cache_refactor_tests {
             Some(0),
             "rescan must not close the viewer"
         );
-        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
         assert_eq!(
             app.current_folder_last_mtime,
             Some(initial_mtime),
@@ -57763,16 +60649,20 @@ mod pipeline_cache_refactor_tests {
 
         app.close_fullscreen();
         assert!(!app.viewer_session_blocks_main_window());
-        app.consume_folder_refresh_pending();
+        app.consume_folder_refresh_pending(&egui::Context::default());
 
         assert!(app.folder_refresh_pending.is_none());
+        assert!(app.external_rescan_pending.is_some());
+        phase_c_support::wait_for_external_rescan(&mut app);
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.items.iter().any(
             |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
         ));
         assert_ne!(app.current_folder_last_mtime, Some(initial_mtime));
         let generation_after_reload = app.items_generation;
 
-        app.consume_folder_refresh_pending();
+        app.consume_folder_refresh_pending(&egui::Context::default());
+        assert!(app.external_rescan_pending.is_none());
         assert_eq!(
             app.items_generation, generation_after_reload,
             "an empty pending slot must not reload the folder a second time"
@@ -57796,6 +60686,7 @@ mod pipeline_cache_refactor_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.seed_folder_observation_for_test(&folder, &scan_directory(&folder));
         app.items = vec![GridItem::Image(first_image.clone())];
         app.thumbnails = vec![ThumbnailState::Pending];
 
@@ -57844,7 +60735,8 @@ mod pipeline_cache_refactor_tests {
             if !ctx.has_requested_repaint() {
                 break;
             }
-            let _ = ctx.run(Default::default(), |_| {});
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
         }
         assert!(!ctx.has_requested_repaint(), "ここでは静止している");
 
@@ -58024,6 +60916,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             base_key,
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
                 used_upscale: true,
@@ -58059,18 +60952,22 @@ mod pipeline_cache_refactor_tests {
                 params_hash: 0,
                 bg: 0,
             },
-            FinalCompositeEntry {
-                source_size: [1, 1],
-                pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
-                texture: tex.clone(),
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                [1, 1],
+                Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+                tex.clone(),
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         // 旧 AI 経路 (legacy cache) も無効化対象
         app.ai_upscale_cache.insert(
             (0, 0),
             crate::fs_animation::FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
                 source_dims: None,
@@ -58142,13 +61039,8 @@ mod pipeline_cache_refactor_tests {
             [8, 8],
             egui::Color32::from_gray(128),
         ));
-        app.edit_result_cache.insert(
-            edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&source),
-                texture: None,
-            },
-        );
+        app.edit_result_cache
+            .insert(edit_key, EditResultEntry::raster(Arc::clone(&source), None));
         let mut params = crate::adjustment::AdjustParams::default();
         params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
         app.adjustment_page_params.insert(target, params.clone());
@@ -58163,8 +61055,11 @@ mod pipeline_cache_refactor_tests {
             .final_effect_pending
             .remove(&final_key)
             .expect("neighbor colorize prefetch must start");
-        let result = pending
-            .rx
+        let FinalEffectState::Computing(FinalEffectReceiver::Legacy(ref effect_rx)) = pending.state
+        else {
+            panic!("legacy prefetch receiver");
+        };
+        let result = effect_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("colorize prefetch result");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -58172,13 +61067,16 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                pdf_metadata: None,
+                canonical_dims: None,
                 source_size: pending.source_size,
                 cancel: pending.cancel,
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation: pending.items_generation,
                 output_complete: pending.output_complete,
                 nearest_sampler: pending.nearest_sampler,
-                prefetch: pending.prefetch,
+                origin: pending.origin,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -58211,13 +61109,8 @@ mod pipeline_cache_refactor_tests {
             [64, 64],
             egui::Color32::from_gray(128),
         ));
-        app.edit_result_cache.insert(
-            edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&source),
-                texture: None,
-            },
-        );
+        app.edit_result_cache
+            .insert(edit_key, EditResultEntry::raster(Arc::clone(&source), None));
         let mut params = crate::adjustment::AdjustParams::default();
         params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
         app.adjustment_page_params.insert(target, params.clone());
@@ -58245,7 +61138,7 @@ mod pipeline_cache_refactor_tests {
             .get(&final_key)
             .expect("same pending must remain");
         assert!(Arc::ptr_eq(&original_cancel, &promoted.cancel));
-        assert!(!promoted.prefetch);
+        assert!(!promoted.origin.is_prefetch());
         assert!(!original_cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert!(
             displayed.is_none(),
@@ -58285,12 +61178,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             current_key,
-            FinalCompositeEntry {
-                source_size: current_pixels.size,
-                pixels: current_pixels,
-                texture: current_texture,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                current_pixels.size,
+                current_pixels,
+                current_texture,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         let target_edit_key = dummy_edit_key(&app, target);
@@ -58306,6 +61201,8 @@ mod pipeline_cache_refactor_tests {
         app.fs_cache.insert(
             target,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: target_texture,
                 pixels: Arc::clone(&target_pixels),
                 source_dims: Some(target_pixels.size),
@@ -58315,10 +61212,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             target_edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&target_pixels),
-                texture: None,
-            },
+            EditResultEntry::raster(Arc::clone(&target_pixels), None),
         );
         let target_final_key =
             app.final_composite_key_for_pixels(target_edit_key, target_pixels.size, &params);
@@ -58333,12 +61227,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.final_composite_cache.insert(
             target_final_key,
-            FinalCompositeEntry {
-                source_size: prefetched_pixels.size,
-                pixels: prefetched_pixels,
-                texture: prefetched_texture,
-                complete: true,
-            },
+            FinalCompositeEntry::raster(
+                None,
+                prefetched_pixels.size,
+                prefetched_pixels,
+                prefetched_texture,
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
 
         app.open_fullscreen(target, crate::app::HistoryTrigger::UserChosen);
@@ -58401,10 +61297,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::new(edit_image),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::new(edit_image), Some(edit_tex)),
         );
 
         let mut params = crate::adjustment::AdjustParams::default();
@@ -58517,10 +61410,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::new(edit_image),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::new(edit_image), Some(edit_tex)),
         );
 
         let mut params = crate::adjustment::AdjustParams::default();
@@ -58855,10 +61745,7 @@ mod pipeline_cache_refactor_tests {
         );
         app.edit_result_cache.insert(
             edit_key,
-            EditResultEntry {
-                pixels: Arc::new(edit_image),
-                texture: Some(edit_tex),
-            },
+            EditResultEntry::raster(Arc::new(edit_image), Some(edit_tex)),
         );
 
         // ページ個別: シャープ 100 + アップスケール指定
@@ -58877,6 +61764,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             ai_key,
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(ai_image.clone()),
                 used_upscale: true,
@@ -58916,6 +61804,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             dn_key,
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(dn_image.clone()),
                 used_upscale: false,
@@ -59277,6 +62166,69 @@ mod pipeline_display_edit_split_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    #[test]
+    fn source_texture_sharing_waits_for_edits_and_preserves_transparent_raw() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/transparent.png");
+        super::source_texture_test_support::seed(&mut app, &ctx, idx);
+        // An alpha source can share when unchanged; erase flatten must allocate
+        // separate pixels and must never mutate the shared raw/edit/final owners.
+        let raw = Arc::new(egui::ColorImage::filled(
+            [4, 6],
+            egui::Color32::from_rgba_unmultiplied(100, 150, 200, 100),
+        ));
+        let texture = ctx.load_texture(
+            "transparent-source",
+            (*raw).clone(),
+            DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        );
+        let id = texture.id();
+        let FsCacheEntry::Static { tex, pixels, .. } = app.fs_cache.get_mut(&idx).unwrap() else {
+            panic!()
+        };
+        *tex = texture;
+        *pixels = Arc::clone(&raw);
+        assert_eq!(
+            app.ensure_final_composite_texture(&ctx, idx).unwrap().id(),
+            id
+        );
+        let flattened = app.black_flatten_erase_source_if_needed(idx, Arc::clone(&raw));
+        assert!(!Arc::ptr_eq(&flattened, &raw));
+        assert_eq!(flattened.pixels[0].a(), 255);
+        assert_eq!(raw.pixels[0].a(), 100);
+        assert!(
+            app.shared_source_texture_for_edit(&ctx, &app.current_edit_result_key(idx), &flattened)
+                .is_none()
+        );
+
+        app.local_adjust_page_layers
+            .insert(idx, Arc::new(vec![active_tone_layer()]));
+        app.bump_local_adjust_generation(idx);
+        assert!(app.ensure_edit_result_pixels(&ctx, idx).is_none());
+        assert!(app.ensure_final_composite_texture(&ctx, idx).is_none());
+        assert!(!app.current_final_composite_is_complete(idx));
+        assert_eq!(
+            app.current_raw_source_pixels(idx).unwrap().pixels,
+            raw.pixels
+        );
+
+        let edited =
+            insert_current_local_adjust_result(&mut app, &ctx, idx, "edited", egui::Color32::GREEN);
+        app.frame_counter += 1;
+        let (key, pixels) = app.ensure_edit_result_pixels(&ctx, idx).unwrap();
+        assert!(Arc::ptr_eq(&pixels, &edited));
+        assert_ne!(
+            app.edit_result_cache[&key].texture.as_ref().unwrap().id(),
+            id
+        );
+        assert_eq!(raw.pixels[0].a(), 100);
+        assert_eq!(
+            app.current_raw_source_pixels(idx).unwrap().pixels,
+            raw.pixels
+        );
+    }
+
     fn push_image(app: &mut App, path: &str) -> usize {
         app.items.push(GridItem::Image(PathBuf::from(path)));
         app.thumbnails.push(ThumbnailState::Pending);
@@ -59296,6 +62248,8 @@ mod pipeline_display_edit_split_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([1, 1]),
@@ -59332,12 +62286,14 @@ mod pipeline_display_edit_split_tests {
         let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
         app.final_composite_cache.insert(
             final_key,
-            FinalCompositeEntry {
-                source_size: image.size,
-                pixels: Arc::new(image),
+            FinalCompositeEntry::raster(
+                None,
+                image.size,
+                Arc::new(image),
                 texture,
-                complete: true,
-            },
+                egui::TextureOptions::LINEAR,
+                true,
+            ),
         );
     }
 
@@ -59353,10 +62309,7 @@ mod pipeline_display_edit_split_tests {
         let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
         app.erase_result_cache.insert(
             app.current_erase_result_key(idx),
-            EraseResultCacheEntry {
-                pixels: Arc::clone(&pixels),
-                texture: tex,
-            },
+            EraseResultCacheEntry::raster(Arc::clone(&pixels), tex),
         );
         pixels
     }
@@ -59384,10 +62337,7 @@ mod pipeline_display_edit_split_tests {
         let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
         app.local_adjust_cache.insert(
             app.current_local_adjust_key(idx),
-            LocalAdjustCacheEntry {
-                pixels: Arc::clone(&pixels),
-                texture: tex,
-            },
+            LocalAdjustCacheEntry::raster(Arc::clone(&pixels), tex),
         );
         pixels
     }
@@ -59442,6 +62392,8 @@ mod pipeline_display_edit_split_tests {
         app.ai_upscale_cache.insert(
             (idx, ai_bg),
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: ai_tex,
                 pixels: Arc::new(ai),
                 source_dims: None,
@@ -59631,6 +62583,8 @@ mod edit_materialize_worker_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -59676,6 +62630,8 @@ mod edit_materialize_worker_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: raw_texture,
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
@@ -59879,7 +62835,7 @@ mod native_video_display_mode_input_tests {
         begin_generic_v_pass(&mut app, &ctx);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(
             app.video_zoom_state.map(|state| state.scale()),
             Some(crate::video::zoom_view::VIDEO_ZOOM_FIT_SCALE),
@@ -59964,7 +62920,7 @@ mod native_video_display_mode_input_tests {
 
         begin_generic_v_pass(&mut app, &ctx);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.is_panorama_mode_active(idx));
         assert!(app.video_zoom_state.is_none());
@@ -60456,7 +63412,7 @@ mod native_video_rating_key_tests {
             assert!(app.rating_session_generation_for_key(&key) > stale_generation);
 
             // A hydrate result started before the detached write must not win.
-            app.hydrate_ratings_from_xmp(vec![(target.clone(), 2, stale_generation)]);
+            hydrate_ratings_from_xmp(&mut app, vec![(target.clone(), 2, stale_generation)]);
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
             assert_eq!(app.rating_cache.get(&idx), Some(&4));
 
@@ -60470,7 +63426,7 @@ mod native_video_rating_key_tests {
 
             // Even a same-generation XMP result cannot resurrect an explicit
             // user clear while the writer catches up.
-            app.hydrate_ratings_from_xmp(vec![(target.clone(), 3, clear_generation)]);
+            hydrate_ratings_from_xmp(&mut app, vec![(target.clone(), 3, clear_generation)]);
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
             assert_eq!(app.rating_cache.get(&idx), Some(&0));
             app.remove_active_context_for_test();
@@ -60511,8 +63467,8 @@ mod native_video_rating_key_tests {
 
         // clear より前に開始した読み取りと、clear 後だが XMP writer 完了前に開始した読み取りの
         // どちらも、ユーザー最終値 0 を復活させてはならない。
-        app.hydrate_ratings_from_xmp(vec![(path.clone(), 4, pending_generation)]);
-        app.hydrate_ratings_from_xmp(vec![(path, 4, clear_generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path.clone(), 4, pending_generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 4, clear_generation)]);
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
         assert_eq!(app.rating_cache.get(&0), Some(&0));
@@ -60520,6 +63476,251 @@ mod native_video_rating_key_tests {
             assert_eq!(active.rating_cache.get(&0), Some(&0));
         })
         .expect("detached context");
+    }
+
+    fn hydrate_ratings_from_xmp(app: &mut App, reads: Vec<(PathBuf, u8, u64)>) {
+        let reads = reads
+            .into_iter()
+            .map(|(path, stars, rating_generation)| {
+                let key = crate::adjustment_db::normalize_path(&path);
+                crate::tag_prewarm::TagPrewarmResult {
+                    path,
+                    rating: Some(stars),
+                    rating_generation,
+                    ticket: app.rating_xmp_hydration.read_ticket(&key),
+                }
+            })
+            .collect();
+        app.hydrate_ratings_from_xmp(reads);
+    }
+
+    fn settle_xmp_rating_hydration(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        app.poll_tag_prewarm_results();
+        while app.rating_xmp_hydration.is_busy() {
+            app.poll_tag_prewarm_results();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "XMP hydration did not settle"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn exercise_xmp_hydration_after_delete_purge(book_delete: bool) {
+        for completed_before_delete in [false, true] {
+            for delete_tree in [false, true] {
+                if book_delete && !delete_tree {
+                    continue;
+                }
+                let mut app = setup_app();
+                app.settings.write_rating_to_xmp = false;
+                let books = app.tmp.path().join("books");
+                let root = books.join("Book");
+                std::fs::create_dir_all(&root).unwrap();
+                let page = root.join("0001_page.png");
+                image::RgbaImage::new(1, 1).save(&page).unwrap();
+                let untouched = books.join("Book-other.png");
+                image::RgbaImage::new(1, 1).save(&untouched).unwrap();
+                app.settings.book_root = Some(books);
+                let key = crate::adjustment_db::normalize_path(&page);
+                let other_key = crate::adjustment_db::normalize_path(&untouched);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&other_key, 2, None)
+                    .unwrap();
+                let generation = app.rating_session_generation_for_key(&key);
+                assert_eq!(
+                    generation, 0,
+                    "late first reads must not rely on a generation mismatch after purge"
+                );
+                let untouched_ticket = app.rating_xmp_hydration.read_ticket(&other_key);
+                let target = if delete_tree {
+                    root.clone()
+                } else {
+                    page.clone()
+                };
+                app.install_new_items(
+                    vec![
+                        if delete_tree {
+                            GridItem::Folder(target.clone())
+                        } else {
+                            GridItem::Image(target.clone())
+                        },
+                        GridItem::Image(untouched.clone()),
+                    ],
+                    vec![None, None],
+                );
+                app.rebuild_visible_indices();
+                // This accepted read has not returned yet. A deletion must also
+                // prevent it from creating a fresh import after the purge.
+                let late_read = crate::tag_prewarm::TagPrewarmResult {
+                    path: page.clone(),
+                    rating: Some(5),
+                    rating_generation: generation,
+                    ticket: app.rating_xmp_hydration.read_ticket(&key),
+                };
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let (completed_tx, completed_rx) = mpsc::channel();
+                app.rating_xmp_hydration.hold_next_import_for_test(
+                    crate::tag_prewarm::HydrationTestHook {
+                        entered: entered_tx,
+                        release: release_rx,
+                        completed: completed_tx,
+                    },
+                );
+                hydrate_ratings_from_xmp(&mut app, vec![(page.clone(), 4, generation)]);
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                if completed_before_delete {
+                    release_tx.send(()).unwrap();
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+                }
+                let ctx = egui::Context::default();
+                if book_delete {
+                    app.start_book_delete(&ctx, "Book".into());
+                    assert!(app.book_structural_op.is_some());
+                } else {
+                    app.start_delete_files(&ctx, vec![target.clone()]);
+                    assert!(app.delete_pending.is_some());
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while app.book_structural_op.is_some() || app.delete_pending.is_some() {
+                    app.poll_book_structural_op(&ctx);
+                    app.poll_delete_pending();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "delete must finish while the cancelled import is held"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(!target.exists());
+                assert!(!untouched_ticket.load(std::sync::atomic::Ordering::Acquire));
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+                assert!(!app.rating_session_writes.contains_key(&key));
+                if !completed_before_delete {
+                    release_tx.send(()).unwrap();
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                // Reuse the physical path before the old replies are adopted:
+                // the old image's stars must not attach to this new image.
+                std::fs::create_dir_all(&root).unwrap();
+                image::RgbaImage::new(1, 1).save(&page).unwrap();
+                let parked = app.build_window_context_for_test(1272301, |owner| {
+                    owner.tag_prewarm_pending = Some(
+                        crate::tag_prewarm::TagPrewarmPending::from_results_for_test(vec![
+                            late_read,
+                        ]),
+                    );
+                });
+                app.with_owner_viewer_context(parked, |owner| owner.poll_tag_prewarm_results())
+                    .unwrap();
+                app.poll_tag_prewarm_results();
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+                assert!(!app.rating_session_writes.contains_key(&key));
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&other_key), 2);
+                assert!(untouched.exists());
+                assert!(!app.rating_xmp_hydration.is_busy());
+                // A new read at the reused path has a new ticket and remains
+                // functional; deletion is not a persistent path blacklist.
+                hydrate_ratings_from_xmp(&mut app, vec![(page, 3, 0)]);
+                settle_xmp_rating_hydration(&mut app);
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
+                assert_eq!(app.rating_session_value_for_key(&key), Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn xmp_hydration_cannot_restore_rating_after_normal_delete_purge() {
+        exercise_xmp_hydration_after_delete_purge(false);
+    }
+
+    #[test]
+    fn xmp_hydration_cannot_restore_rating_after_book_delete_purge() {
+        exercise_xmp_hydration_after_delete_purge(true);
+    }
+
+    #[test]
+    fn accepted_xmp_hydration_cannot_restore_a_later_user_clear() {
+        // Exercise both SQLite-wait and completed-but-not-adopted boundaries.
+        for clear_after_worker_completion in [false, true] {
+            let mut app = setup_app();
+            app.settings.write_rating_to_xmp = false;
+            let path = app.tmp.path().join("hydration-clear.jpg");
+            let key = crate::adjustment_db::normalize_path(&path);
+            app.items = vec![GridItem::Image(path.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.visible_indices = vec![0];
+            app.rating_cache.insert(0, 0);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            app.rating_xmp_hydration.hold_next_import_for_test(
+                crate::tag_prewarm::HydrationTestHook {
+                    entered: entered_tx,
+                    release: release_rx,
+                    completed: completed_tx,
+                },
+            );
+            hydrate_ratings_from_xmp(&mut app, vec![(path, 4, 0)]);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(app.rating_xmp_hydration.is_busy());
+            if clear_after_worker_completion {
+                release_tx.send(()).unwrap();
+                completed_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                assert!(
+                    app.rating_xmp_hydration.is_busy(),
+                    "UI adoption remains pending"
+                );
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+            }
+            app.write_user_rating_shared(&key, 0, None).unwrap();
+            if !clear_after_worker_completion {
+                release_tx.send(()).unwrap();
+                completed_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            settle_xmp_rating_hydration(&mut app);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+            assert_eq!(app.rating_cache.get(&0), Some(&0));
+            assert!(app.rating_session_writes[&key].explicit_user);
+        }
+    }
+
+    #[test]
+    fn xmp_hydration_preserves_existing_nonzero_db_rating() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("existing-rating.jpg");
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 5, None)
+            .unwrap();
+        let writes = crate::rating_db::RATING_WRITES.sample();
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 2, 0)]);
+        settle_xmp_rating_hydration(&mut app);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+        assert_eq!(
+            crate::rating_db::RATING_WRITES.sample(),
+            writes,
+            "a skipped import must not publish a mutation"
+        );
+        assert!(!app.rating_session_writes.contains_key(&key));
     }
 
     #[test]
@@ -60533,7 +63734,8 @@ mod native_video_rating_key_tests {
         app.rating_cache.insert(0, 0);
         let generation = app.rating_session_generation_for_key(&key);
 
-        app.hydrate_ratings_from_xmp(vec![(path, 3, generation)]);
+        hydrate_ratings_from_xmp(&mut app, vec![(path, 3, generation)]);
+        settle_xmp_rating_hydration(&mut app);
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
         assert_eq!(app.rating_cache.get(&0), Some(&3));
@@ -60997,8 +64199,8 @@ mod still_window_mode_key_tests {
         image_window_id: u64,
         media_window_id: u64,
     ) -> (
-        crate::settings::DetachedViewerWindowPlacement,
-        crate::settings::DetachedViewerWindowPlacement,
+        crate::detached_window_geometry::PhysicalWindowPlacement,
+        crate::detached_window_geometry::PhysicalWindowPlacement,
     ) {
         app.settings.detached_viewer_enabled = true;
         app.settings.detached_viewer_open_images_in_window = false;
@@ -61012,8 +64214,11 @@ mod still_window_mode_key_tests {
         app.update_detached_window_runtime_flags(image_window_id, true, "test_linked_still");
 
         let media_placement = app.detached_viewer_window_placement();
-        let image_placement = crate::settings::DetachedViewerWindowPlacement {
-            w: media_placement.w - 64.0,
+        let image_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                right: media_placement.outer.right - 64,
+                ..media_placement.outer
+            },
             ..media_placement
         };
         app.set_detached_window_runtime_placement(
@@ -61147,7 +64352,8 @@ mod still_window_mode_key_tests {
     }
 
     fn poll_media_navigation_until_done_for_test(app: &mut App, ctx: &egui::Context) {
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_media_navigation_pending(ctx);
             if app.media_navigation_pending.is_none() {
                 return;
@@ -61431,6 +64637,7 @@ mod still_window_mode_key_tests {
             &[old_idx, old_idx + 1],
             old_idx,
             1,
+            false,
             "test_missing",
             ManualMediaNavigationLanding::NativeVideo,
         );
@@ -61485,6 +64692,7 @@ mod still_window_mode_key_tests {
             &[old_idx, next_idx],
             old_idx,
             1,
+            false,
             "test_provisional",
             ManualMediaNavigationLanding::NativeVideo,
         );
@@ -61691,6 +64899,7 @@ mod still_window_mode_key_tests {
                 &display_order,
                 old_idx,
                 1,
+                false,
                 source,
                 ManualMediaNavigationLanding::NativeVideo,
             );
@@ -62580,6 +65789,8 @@ mod still_window_mode_key_tests {
             },
         );
         app.ensure_music_analysis(0, &path, Some((1, 15)));
+        let bass = Arc::new(music_core::bass::TimelineBassTrack::new(960, 48_000));
+        app.music_bass = Some(bass.clone());
         let first = app.music_analysis_source.clone().unwrap();
         let first_cancel = app.music_analysis_pending.as_ref().unwrap().cancel.clone();
         let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
@@ -62591,6 +65802,7 @@ mod still_window_mode_key_tests {
         );
         app.ensure_music_analysis(0, &path, Some((1, 15)));
         assert_eq!(app.music_analysis_source.as_ref(), Some(&first));
+        assert!(Arc::ptr_eq(app.music_bass.as_ref().unwrap(), &bass));
         assert!(!first_cancel.load(std::sync::atomic::Ordering::Relaxed));
         let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
             unreachable!()
@@ -62604,6 +65816,7 @@ mod still_window_mode_key_tests {
             Some(2)
         );
         assert!(first_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.music_bass.is_none());
         assert_eq!(
             app.music_analysis_pending
                 .as_ref()
@@ -62712,6 +65925,9 @@ mod still_window_mode_key_tests {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(MusicAnalysisMsg::Pcm(next_pcm.clone())).unwrap();
+        let first_bass = Arc::new(music_core::bass::TimelineBassTrack::new(960, 48_000));
+        let next_bass = Arc::new(music_core::bass::TimelineBassTrack::new(1920, 48_000));
+        tx.send(MusicAnalysisMsg::Bass(next_bass.clone())).unwrap();
         app.music_analysis_source = Some(old_source.clone());
         app.music_analysis_pending = Some(MusicAnalysisPending {
             source: old_source.clone(),
@@ -62720,6 +65936,7 @@ mod still_window_mode_key_tests {
         });
         app.set_music_analysis(Some(analysis.clone()));
         app.music_pcm = Some(first_pcm.clone());
+        app.music_bass = Some(first_bass.clone());
         let version = app.music_analysis_version;
 
         app.bind_mounted_context_for_test(909);
@@ -62739,6 +65956,7 @@ mod still_window_mode_key_tests {
                 .as_ref()
                 .is_some_and(|pcm| std::sync::Arc::ptr_eq(pcm, &first_pcm))
         );
+        assert!(Arc::ptr_eq(app.music_bass.as_ref().unwrap(), &first_bass));
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
 
         let ctx = egui::Context::default();
@@ -62764,7 +65982,8 @@ mod still_window_mode_key_tests {
                     .as_ref()
                     .is_some_and(|got| std::sync::Arc::ptr_eq(got, &next_pcm))
             );
-            assert_eq!(owner.music_analysis_version, version);
+            assert_eq!(owner.music_analysis_version, version + 1);
+            assert!(Arc::ptr_eq(owner.music_bass.as_ref().unwrap(), &next_bass));
         })
         .unwrap();
         let stashed = app.stash_mounted_and_start_fresh("test_music_fork_old_owner");
@@ -62784,6 +66003,7 @@ mod still_window_mode_key_tests {
                 .is_some_and(|got| std::sync::Arc::ptr_eq(got, &next_pcm))
         );
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(Arc::ptr_eq(app.music_bass.as_ref().unwrap(), &next_bass));
         drop(tx);
     }
 
@@ -63252,6 +66472,21 @@ mod still_window_mode_key_tests {
         app.set_detached_window_live_hwnds_for_test(live_hwnds);
     }
 
+    fn mark_detached_host_placed_for_test(app: &mut App, window_id: u64) {
+        app.set_detached_window_host_for_test(window_id, 0xD000 + window_id);
+        let claim = app
+            .detached_window_manager
+            .host_claim_alive(window_id)
+            .unwrap();
+        assert_eq!(
+            app.detached_window_manager.mark_host_placed(
+                claim,
+                crate::app::detached_window_manager::PlacementOutcome::Exact,
+            ),
+            None
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn detached_context_polls_its_own_fs_nav_lock() {
@@ -63319,9 +66554,12 @@ mod still_window_mode_key_tests {
 
     fn run_active_detached_frame_for_test(app: &mut App, ctx: &egui::Context) {
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated, "the active detached context must be updated");
     }
 
@@ -63629,9 +66867,10 @@ mod still_window_mode_key_tests {
             ],
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
+        ctx.run_pass(input, |ctx| {
             captured = shared.capture_right_drag_event(ctx, true);
-        });
+        })
+        .drop_without_applying_deltas();
         captured
     }
 
@@ -64963,6 +68202,8 @@ mod still_window_mode_key_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some([2, 1]),
@@ -65041,18 +68282,25 @@ mod still_window_mode_key_tests {
         repeat: bool,
         modifiers: egui::Modifiers,
     ) {
-        ctx.begin_pass(egui::RawInput {
-            modifiers,
-            ..Default::default()
-        });
-        ctx.input_mut(|i| {
-            i.events.push(egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat,
-                modifiers,
+        // Backend delivery enters RawInput before egui begins the pass. Seed
+        // the existing level for explicit-repeat fixtures; egui normalizes
+        // repeat from that level rather than trusting the event flag.
+        if repeat {
+            ctx.input_mut(|input| {
+                input.keys_down.insert(key);
             });
+        }
+        ctx.begin_pass(egui::RawInput {
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                }])
+                .collect(),
+            ..Default::default()
         });
     }
 
@@ -65071,7 +68319,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F11, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             handled,
@@ -65104,7 +68352,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F11, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(
             handled,
             "fullscreen root key path should absorb non-action keys"
@@ -65113,7 +68361,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F13, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert!(app.settings.video_in_window_mode);
@@ -65168,14 +68416,18 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let draw_probe_text = |ctx: &egui::Context| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.label("font update probe 日本語");
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    ui.label("font update probe 日本語");
+                })
             });
         };
 
-        let baseline = ctx.run(egui::RawInput::default(), draw_probe_text);
+        let baseline = ctx.run_pass(egui::RawInput::default(), draw_probe_text);
+        let baseline_has_delta = !baseline.textures_delta.set.is_empty();
+        baseline.drop_without_applying_deltas();
         assert!(
-            !baseline.textures_delta.set.is_empty(),
+            baseline_has_delta,
             "the baseline pass must materialize its initial atlas"
         );
 
@@ -65186,9 +68438,11 @@ mod still_window_mode_key_tests {
             "multiple setting edits before the next root pass coalesce into one application"
         );
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.apply_pending_main_font_update(ctx);
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            // 0.37 applies new definitions immediately if no text has used the old ones.
+            // Exercise the deferred contract with a real old-font glyph laid out first.
             draw_probe_text(ctx);
+            app.apply_pending_main_font_update(ctx);
             assert!(
                 !app.main_font_update_pending,
                 "the single settings application must consume its pending state"
@@ -65197,19 +68451,24 @@ mod still_window_mode_key_tests {
                 !ctx.will_discard(),
                 "the old definitions and old atlas remain valid for this pass; no repass is needed"
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
-        let applied = ctx.run(egui::RawInput::default(), draw_probe_text);
+        let applied = ctx.run_pass(egui::RawInput::default(), draw_probe_text);
+        let applied_has_delta = !applied.textures_delta.set.is_empty();
+        applied.drop_without_applying_deltas();
         assert!(
-            !applied.textures_delta.set.is_empty(),
+            applied_has_delta,
             "the next begin_pass must apply the requested definitions and emit their atlas delta"
         );
-        let stable = ctx.run(egui::RawInput::default(), |ctx| {
+        let stable = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.apply_pending_main_font_update(ctx);
             draw_probe_text(ctx);
         });
+        let stable_has_delta = !stable.textures_delta.set.is_empty();
+        stable.drop_without_applying_deltas();
         assert!(
-            stable.textures_delta.set.is_empty(),
+            !stable_has_delta,
             "a consumed setting update must not rebuild the atlas again on a later pass"
         );
         assert!(
@@ -65228,7 +68487,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F11, true);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled, "repeat F11 is still a fullscreen root key");
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -65804,7 +69063,7 @@ mod still_window_mode_key_tests {
             app.detached_window_state(session.window_id),
             Some(DetachedWindowState::Opening)
         );
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         app.bind_mounted_context_for_test(session.window_id);
 
         let request_id = begin_test_video_presentation_transition(
@@ -65916,7 +69175,7 @@ mod still_window_mode_key_tests {
         app.set_detached_window_binding_for_test(Some(window_id));
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
         app.detached_window_hwnd_set(window_id, 0x1000 + window_id);
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
 
         assert_eq!(
             app.detached_window_state(window_id),
@@ -67054,6 +70313,11 @@ mod still_window_mode_key_tests {
 
         app.detached_viewer_borderless_transition = Some(DetachedViewerBorderlessTransition {
             target_borderless: true,
+            target_outer: app
+                .detached_viewer_borderless_transition
+                .as_ref()
+                .unwrap()
+                .target_outer,
             phase: DetachedViewerBorderlessTransitionPhase::Settle {
                 until: std::time::Instant::now() - std::time::Duration::from_millis(1),
             },
@@ -67562,9 +70826,12 @@ mod still_window_mode_key_tests {
         .expect("active detached context must mount");
 
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
         assert!(
             app.with_active_viewer_context(|active| active.folder_pane_open_pending.is_some())
@@ -67587,9 +70854,12 @@ mod still_window_mode_key_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             app.poll_sidecar_restore(&ctx);
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                updated = app.update_active_viewer_context(ctx, None).updated;
-            });
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                updated = ctx
+                    .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                    .updated;
+            })
+            .drop_without_applying_deltas();
             let opened = app
                 .with_active_viewer_context(|active| active.fullscreen_idx.is_some())
                 .unwrap_or(false);
@@ -67750,9 +71020,12 @@ mod still_window_mode_key_tests {
         .expect("active detached context must mount");
 
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
         assert!(
             app.active_viewer_context_id().is_none(),
@@ -67810,9 +71083,11 @@ mod still_window_mode_key_tests {
             context.detached_viewer_open_next_still_detached_once = false;
         });
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.with_active_viewer_context(|active| active.pdf_password_request.is_some())
                 .unwrap_or(false),
@@ -67881,10 +71156,11 @@ mod still_window_mode_key_tests {
             app.pdf_password_save = true;
 
             let mut summary = None;
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 summary = app
                     .take_and_close_current_active_viewer_context(ctx, "test_pdf_terminal_close");
-            });
+            })
+            .drop_without_applying_deltas();
             let summary = summary.expect("the detached context must be closed");
 
             assert!(summary.had_pdf_password_request);
@@ -67928,9 +71204,11 @@ mod still_window_mode_key_tests {
         })
         .expect("the terminal producer must be mounted in its owning context");
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
 
         assert!(
             app.active_viewer_context_id().is_none(),
@@ -68072,37 +71350,62 @@ mod still_window_mode_key_tests {
         let request_id = crate::bookmark_browser::BookmarkOpenRequestId(507);
         let media = app.tmp.path().join("slow-media.mp4");
         let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(media.clone());
+        app.bookmark_browser_rows = vec![crate::bookmark_browser::BookmarkBrowserRow {
+            source: crate::bookmark_browser::BookmarkRowSource::Media {
+                id: 2,
+                path: media.clone(),
+                pts_secs: 3.0,
+                title: None,
+                is_audio: false,
+            },
+            item: GridItem::Video(media.clone()),
+            relative_page_provenance: None,
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 1,
+            missing: false,
+        }];
+        assert!(app.install_bookmark_view_rows());
+        app.finish_page_identity_preparation_for_test();
+        app.selected = Some(0);
         app.bookmark_open_request_seq = request_id.0;
-        app.items_are_bookmark_view = true;
+        app.scroll_offset_y = 145.0;
+        let return_grid = BookmarkViewReturnGridState::capture(
+            &app.bookmark_browser_rows,
+            app.selected,
+            app.bookmark_browser_rows[0].stable_key(),
+            app.scroll_offset_y,
+        );
+        assert_eq!(return_grid.row_keys, vec![(0, 2)]);
+        assert_eq!(return_grid.selected_key, Some((0, 2)));
         app.bookmark_view_state = Some(BookmarkViewState::Opening {
             target: target.clone(),
-            grid: BookmarkViewReturnGridState {
-                row_keys: vec![(2, 2)],
-                selected_key: Some((2, 2)),
-                opened_key: (2, 2),
-                scroll_offset_y: 0.0,
-            },
+            grid: return_grid.clone(),
         });
         let pending_media = media.clone();
         let detached_target = target.clone();
-        app.build_active_context_for_test(Some(window_id), DetachedSource::Video, move |context| {
-            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-            context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_independent_active = true;
-            context.bookmark_open_pending =
-                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
-                    crate::bookmark_browser::PendingMediaOpen {
-                        request_id,
-                        path: pending_media,
-                        pts_secs: 3.0,
-                        started_at: std::time::Instant::now(),
-                        last_wait: None,
-                    },
-                ));
-            context.bookmark_view_state = Some(BookmarkViewState::Detached {
-                target: detached_target,
-            });
-        });
+        let retired_owner = app.build_active_context_for_test(
+            Some(window_id),
+            DetachedSource::Video,
+            move |context| {
+                context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                context.viewer_presentation = ViewerPresentation::DetachedWindow;
+                context.detached_viewer_independent_active = true;
+                context.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+                        crate::bookmark_browser::PendingMediaOpen {
+                            request_id,
+                            path: pending_media,
+                            pts_secs: 3.0,
+                            started_at: std::time::Instant::now(),
+                            last_wait: None,
+                        },
+                    ));
+                context.bookmark_view_state = Some(BookmarkViewState::Detached {
+                    target: detached_target,
+                });
+            },
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let resolver_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
@@ -68128,6 +71431,9 @@ mod still_window_mode_key_tests {
         assert!(app.startup_open_path_resolve_pending.is_none());
         app.with_active_viewer_context(|context| {
             assert!(context.bookmark_open_pending.is_none());
+            assert!(context.items.is_empty());
+            assert!(context.selected.is_none());
+            assert!(context.fullscreen_idx.is_none());
             assert!(matches!(
                 context.bookmark_view_state.as_ref(),
                 Some(BookmarkViewState::Detached {
@@ -68136,6 +71442,16 @@ mod still_window_mode_key_tests {
             ));
         })
         .expect("cancel must retire the exact detached owner, not the main bundle");
+        let session = app.active_detached_session.unwrap();
+        assert_eq!(session.window_id, window_id);
+        assert_eq!(
+            session.content_phase,
+            DetachedSessionContentPhase::Preparing
+        );
+        assert_eq!(
+            app.locate_window_context(window_id).map(|(owner, _)| owner),
+            Some(retired_owner)
+        );
         assert!(
             tx.send(StartupOpenPathResolveResult {
                 rar_volume_proof: None,
@@ -68149,13 +71465,33 @@ mod still_window_mode_key_tests {
             "late resolver completion must not resurrect the retired shell"
         );
 
+        // The surviving main grid can change selection before the retirement consumer.
+        app.selected = None;
         run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.active_detached_session.is_none());
-        assert!(matches!(
-            app.bookmark_view_state,
-            Some(BookmarkViewState::Restoring { .. })
-        ));
+        assert!(app.with_viewer_context_ref(retired_owner, |_| ()).is_none());
+        // This is a root UI dispatch: update_active_viewer_context retires the child and
+        // invokes the existing main consumer in that same dispatch. Non-drawing Close's
+        // Terminal retention is covered separately by close_return_tests.
+        assert_eq!(app.bookmark_open_request_seq, request_id.0);
+        assert!(!app.pending_return_to_parent.is_pending());
+        let Some(BookmarkViewState::Restoring { grid }) = &app.bookmark_view_state else {
+            panic!(
+                "the same-dispatch main consumer must resume bookmark-grid restoration: state={:?}, return={:?}",
+                app.bookmark_view_state, app.pending_return_to_parent
+            );
+        };
+        let mut expected_grid = return_grid;
+        // Main selection can change before the delayed consumer; it is authoritative.
+        expected_grid.selected_key = None;
+        assert_eq!(grid, &expected_grid);
+        let restored = app.bookmark_view_state.clone();
+        assert!(app.take_pending_return_to_parent_nav().is_none());
+        assert_eq!(
+            app.bookmark_view_state, restored,
+            "the same return cannot be consumed twice"
+        );
     }
 
     #[test]
@@ -68529,7 +71865,7 @@ mod still_window_mode_key_tests {
         };
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+        app.archive_convert = Some(Box::new(crate::ui_dialogs::archive_convert::ArchiveConvertState {
 restore_intent: crate::app::StartupListIntent::ExplicitList,
 
             src_path: source,
@@ -68551,7 +71887,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
-        });
+        }));
         (owner, tx, cancel)
     }
 
@@ -68734,6 +72070,70 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
+    #[cfg(all(windows, feature = "test-script"))]
+    fn test_script_counts_detached_archive_owner_once_through_completion() {
+        for (format, direct) in [
+            (ArchiveFormat::Rar, true),
+            (ArchiveFormat::Rar, false),
+            (ArchiveFormat::SevenZ, false),
+        ] {
+            let mut app = setup_app();
+            let source = app.tmp.path().join(if format == ArchiveFormat::Rar {
+                "count.rar"
+            } else {
+                "count.7z"
+            });
+            let backing = if direct {
+                source.clone()
+            } else {
+                app.tmp.path().join("count-converted.zip")
+            };
+            std::fs::write(&source, b"source").unwrap();
+            std::fs::write(&backing, b"cache").unwrap();
+            let (main_folder, generation) =
+                install_convertible_archive_main_grid(&mut app, source.clone(), format);
+            let before = app.test_script_folder_load_requests;
+            let ctx = egui::Context::default();
+            assert!(
+                app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, false)
+            );
+            app.settle_open_path_classification_for_test();
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            assert!(!app.request_archive_convert_owned(
+                source.clone(),
+                format,
+                false,
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+
+            // Keep the real accepted owner, substituting only its worker result transport.
+            let (_tx, rx) = mpsc::channel();
+            let state = app
+                .archive_convert
+                .as_mut()
+                .expect("accepted archive owner");
+            state.cancel.store(true, Ordering::Relaxed);
+            state.cancel = Arc::new(AtomicBool::new(false));
+            state.rx = rx;
+            if direct {
+                state.pending_direct_nav = Some(backing.clone());
+            } else {
+                state.pending_nav = Some(backing.clone());
+            }
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.show_archive_convert_dialog(ctx)
+            })
+            .drop_without_applying_deltas();
+            complete_detached_archive_page_enumeration(&mut app, &backing, &["page.jpg"]);
+            assert_detached_archive_backing(&mut app, &source, &backing);
+            assert_convertible_archive_main_grid_unchanged(&app, &main_folder, &source, generation);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
+    }
+
+    #[test]
     #[cfg(windows)]
     fn detached_grid_archive_direct_read_completion_opens_detached_without_main_navigation() {
         let mut app = setup_app();
@@ -68752,9 +72152,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         let expected_pages = ["page-001.jpg", "page-002.png"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -68789,9 +72190,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         let expected_pages = ["cover.jpg", "page-002.webp"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -68827,9 +72229,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.detached_viewer_open_images_in_window = false;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
@@ -68867,9 +72270,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_grid_archive_open_request_seq += 1;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
@@ -68891,6 +72295,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_archive_non_rar_cache_hit_opens_detached_without_main_navigation() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source = app.tmp.path().join("cached.7z");
         let backing = app.tmp.path().join("cached.zip");
         std::fs::write(&source, b"source").unwrap();
@@ -68921,6 +72327,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
 
         let expected_pages = ["cached-cover.jpg", "cached-page-002.png"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -68934,6 +72342,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert_detached_archive_backing(&mut app, &source, &backing);
         assert_detached_archive_pages(&mut app, &backing, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -69013,6 +72423,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_rar_conversion_cache_hit_opens_detached_after_probe() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source = app.tmp.path().join("cached-solid.rar");
         let backing = app.tmp.path().join("cached-solid.zip");
         std::fs::write(&source, b"source").unwrap();
@@ -69043,6 +72455,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
 
         let (scan_tx, scan_rx) = mpsc::channel();
         let state = app
@@ -69068,9 +72482,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .unwrap();
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         let expected_pages = ["cached-rar-cover.jpg", "cached-rar-page-002.png"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -69084,6 +72499,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert_detached_archive_backing(&mut app, &source, &backing);
         assert_detached_archive_pages(&mut app, &backing, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -69137,9 +72554,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         .unwrap();
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
@@ -70070,9 +73488,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         })
         .unwrap();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.active_detached_session.is_none());
@@ -70125,9 +73545,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         })
         .expect("active detached context must mount");
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         app.finish_page_identity_preparation_for_test();
         app.with_active_viewer_context(|active| {
             let fullscreen_item = active.fullscreen_idx.and_then(|idx| active.items.get(idx));
@@ -70311,14 +73733,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.visible_indices = vec![0, 1];
 
         let mut reason = "";
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             reason = app.reopen_fullscreen_after_folder_nav_load(
                 ctx,
                 false,
                 false,
                 crate::app::HistoryTrigger::UserChosen,
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(reason, "done");
         assert_eq!(
@@ -70357,6 +73780,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.comic_bake_pending.insert(
             0,
             ComicBakePending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::from_sampler(
+                    [1, 1],
+                    crate::source_coverage::SourceCoverage::FullSource,
+                ),
                 comic_gen: 1,
                 items_gen: app.items_generation,
                 base: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)),
@@ -70378,6 +73805,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 kind: crate::ui_erase::EraseInpaintKind::Commit,
             },
             crate::ui_erase::EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                    crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+                ),
                 idx: 0,
                 items_generation: app.items_generation,
                 path_key: None,
@@ -70388,8 +73818,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 started_at: std::time::Instant::now(),
                 input_generation: 0,
                 mask_generation: 0,
-                log_prefix: "context-retire-test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit {
+                    origin: "context-retire-test",
+                },
             },
         );
     }
@@ -70636,9 +74067,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         });
 
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
 
         assert!(
@@ -71328,9 +74762,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             modifiers: egui::Modifiers::NONE,
         });
         let mut updated = false;
-        let _ = ctx.run(input, |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(input, |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
 
         assert!(!app.fs_viewport_shown);
@@ -71966,6 +75403,17 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn remote_session_barriers_keep_modal_until_final_release() {
         let mut app = setup_app();
+        // App startup admits an asynchronous meter read. This test isolates the AI
+        // terminal lease, so first fence that independent work by its actual receipt.
+        // A single UI poll cannot promise that the writer has finished under load.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let cutoff = writer.watermarks().admitted;
+        let startup = writer
+            .read_position_after("remote-session-startup", cutoff)
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("startup resume read completion");
+        startup.status.expect("startup resume read succeeded");
+        assert!(startup.completed_through >= cutoff);
         let ctx = egui::Context::default();
         let handle = crate::remote_ipc::session::SessionHandle::new();
         app.set_remote_session_handle(handle.clone());
@@ -72037,6 +75485,73 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
+    fn remote_session_barriers_wait_for_resume_read_after_local_worker_release() {
+        use crate::remote_ipc::session::RemoteControlPhase;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        assert!(app.spread_shift_service.is_none());
+        assert!(app.book_composition_service.is_none());
+        assert!(app.composition_editor_acquire_ready());
+
+        // This is the same Read command used by BookResumeMeters::reload at startup.
+        // Hold its real worker before admission, without sleeps or UI-poll retries.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let release = writer.pause_for_test();
+        let read = writer.read_all();
+        let pending = writer.watermarks();
+        assert_eq!(pending.admitted, pending.completed_through + 1);
+
+        let local_ai_activity = app.local_ai_activity_lease();
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        drop(local_ai_activity);
+        assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
+        assert_eq!(
+            app.local_viewer_close_state(&ctx, None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            RemoteControlPhase::AcquiringRemote,
+            "AI completion alone cannot release an outstanding resume read"
+        );
+        assert_eq!(
+            app.book_resume_writer.as_ref().unwrap().watermarks(),
+            pending
+        );
+        assert!(app.remote_session_blocks_local_control());
+        assert_eq!(handle.snapshot().acquisition_sequence, 1);
+        assert_eq!(handle.snapshot().control_return_sequence, 0);
+
+        release.send(()).unwrap();
+        read.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("held resume read completion")
+            .expect("held resume read succeeded");
+        let completed = app.book_resume_writer.as_ref().unwrap().watermarks();
+        assert_eq!(completed.admitted, pending.admitted);
+        assert_eq!(completed.completed_through, pending.admitted);
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
+
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        assert_eq!(handle.snapshot().control_return_sequence, 1);
+        assert!(!app.remote_session_blocks_local_control());
+    }
+
+    #[test]
     fn remote_acquire_closes_local_viewer_before_admitting_work_and_blocks_reopen() {
         use crate::grid_item::GridItem;
         use crate::remote_ipc::session::RemoteControlPhase;
@@ -72065,7 +75580,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.fullscreen_idx, None);
         assert!(!app.pending_auto_fs_open);
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
         assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
@@ -72434,7 +75949,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             });
             let (tx, rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            app.archive_convert = Some(Box::new(crate::ui_dialogs::archive_convert::ArchiveConvertState {
                 restore_intent: crate::app::StartupListIntent::ExplicitList,
 
                 src_path: target.clone(),
@@ -72459,7 +75974,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 deferred_fullscreen: None,
                 suppress_confirm: false,
                 suppress_confirm_next_time: false,
-            });
+            }));
             let handle = crate::remote_ipc::session::SessionHandle::new();
             app.set_remote_session_handle(handle.clone());
             handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
@@ -72496,20 +76011,21 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let mut app = setup_app();
         app.fs_viewport_shown = true;
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::InProgress
         );
         assert_eq!(
-            app.local_viewer_close_state(Some(
-                crate::app::LocalViewerCloseFailure::ActiveContextRetire
-            )),
+            app.local_viewer_close_state(
+                &egui::Context::default(),
+                Some(crate::app::LocalViewerCloseFailure::ActiveContextRetire)
+            ),
             crate::app::LocalViewerCloseState::Failed(
                 crate::app::LocalViewerCloseFailure::ActiveContextRetire
             )
         );
         app.fs_viewport_shown = false;
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::Closed
         );
     }
@@ -72519,7 +76035,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let mut app = setup_app();
         app.native_video_parked_live_activation_requests.push(77);
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::InProgress
         );
         assert_eq!(
@@ -72528,7 +76044,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert!(app.native_video_parked_live_activation_requests.is_empty());
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::Closed
         );
     }
@@ -72541,36 +76057,55 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         let viewport_id = app.fullscreen_viewport_id();
         ctx.set_embed_viewports(false);
-        ctx.begin_pass(egui::RawInput::default());
+        ctx.run_ui(Default::default(), |ui| {
+            ctx.show_viewport_deferred(
+                viewport_id,
+                egui::ViewportBuilder::default(),
+                |_ui, _class| {},
+            );
+            // A shown viewport has an actual lifetime and an App-owned command binding.
+            app.fullscreen_viewport_binding =
+                viewport_retirement::ViewportCommandBinding::capture(ui.ctx(), viewport_id);
+        })
+        .drop_without_applying_deltas();
+        let registration = ctx
+            .viewport_registration(viewport_id)
+            .expect("shown loading viewport lifetime");
+        assert!(app.fullscreen_viewport_binding.is_some());
         assert_eq!(
             app.close_all_detached_viewers_for_mode_change(&ctx),
             Ok(true)
         );
-        ctx.show_viewport_deferred(
-            viewport_id,
-            egui::ViewportBuilder::default(),
-            |_ctx, _class| {},
-        );
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.run_ui(Default::default(), |_| {}));
         assert!(!app.fs_viewport_shown);
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
-        assert!(
-            output
-                .viewport_output
-                .get(&viewport_id)
-                .is_some_and(|viewport| viewport
-                    .commands
-                    .contains(&egui::ViewportCommand::Visible(false))),
-            "a detached loading viewport must receive the real hide command before acquisition: {:?}",
-            output
-                .viewport_output
-                .iter()
-                .map(|(id, viewport)| (id, &viewport.commands))
-                .collect::<Vec<_>>()
+        let retired: Vec<_> = output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter_map(|command| {
+                if let egui::ViewportCommand::RetireApproved(approval) = command {
+                    Some(approval.registrations())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            retired,
+            vec![registration],
+            "the exact shown loading viewport must be retired before acquisition"
         );
+        assert!(ctx.viewport_registration(viewport_id).is_none());
+        assert!(
+            !output.viewport_output.contains_key(&viewport_id),
+            "terminal close must not recreate a hidden child"
+        );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -72849,7 +76384,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.detached_image_windows.is_empty());
         assert!(app.detached_window_manager.is_empty());
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
     }
@@ -73101,7 +76636,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(121, DetachedSource::Video);
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&ctx);
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
@@ -73147,7 +76682,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(122, DetachedSource::Video);
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&ctx);
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
@@ -73519,13 +77054,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.local_adjust_pages.contains(&image));
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
         assert!(app.thumb_adjust_tex.contains_key(&image));
-        let same_page_params = app.effective_params(image).clone();
-        app.set_page_params(image, same_page_params);
-        assert!(
-            app.adjustment_page_params.contains_key(&image),
-            "live-park 後も既存ページ個別値を見て、標準への誤フォールバック削除をしない"
-        );
-
+        // Read-only fork must not copy the main editor's projection. Check this
+        // before the first durable page write, which intentionally publishes to
+        // every same-key context under the accepted-page contract.
         let parked_id = app.detached_image_windows[0].id;
         let main_items_len = app.items.len();
         app.with_window_viewer_context(parked_id, |parked| {
@@ -73541,6 +77072,30 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert!(parked.thumb_adjust_tex.is_empty());
         })
         .expect("parked bundle");
+        let same_page_params = app.effective_params(image).clone();
+        app.set_page_params(image, same_page_params.clone());
+        assert!(
+            app.adjustment_page_params.contains_key(&image),
+            "live-park 後も既存ページ個別値を見て、標準への誤フォールバック削除をしない"
+        );
+
+        app.with_window_viewer_context(parked_id, |parked| {
+            assert_eq!(parked.items.len(), main_items_len);
+            assert!(matches!(
+                parked.fs_cache.get(&video),
+                Some(FsCacheEntry::Video { .. })
+            ));
+            assert_eq!(parked.adjustment_page_params.len(), 1);
+            assert_eq!(
+                parked.adjustment_page_params.get(&image),
+                Some(&same_page_params)
+            );
+            assert!(parked.mask_pages.is_empty());
+            assert!(parked.local_adjust_pages.is_empty());
+            assert_eq!(parked.spread_mode, crate::settings::SpreadMode::Single);
+            assert!(parked.thumb_adjust_tex.is_empty());
+        })
+        .expect("accepted page publication to parked bundle");
     }
 
     #[test]
@@ -73918,16 +77473,17 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[image] = ThumbnailState::Loaded {
-            tex: img_tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        app.thumbnails[image] = ThumbnailState::loaded_raster(
+            img_tex,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 128,
             },
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-        };
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        );
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.set_detached_window_binding_for_test(Some(70));
@@ -74437,17 +77993,20 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let new_k = crate::adjustment_db::normalize_path(new);
         let target = push_image(&mut app, "D:/Comics/target.jpg");
         let unrelated = push_image(&mut app, "D:/Comics/unrelated.jpg");
-        let loaded = |name: &str| ThumbnailState::Loaded {
-            tex: ctx.load_texture(
-                name,
-                egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
-                egui::TextureOptions::LINEAR,
-            ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 1,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
+        let loaded = |name: &str| {
+            ThumbnailState::loaded_raster(
+                ctx.load_texture(
+                    name,
+                    egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
+                    egui::TextureOptions::LINEAR,
+                ),
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((1, 1)),
+                None,
+            )
         };
         app.thumbnails[target] = loaded("rename_preview_target");
         app.thumbnails[unrelated] = loaded("rename_preview_unrelated");
@@ -74503,12 +78062,23 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(!app.rename_migration_writers_busy());
 
         // 積んだが完了を回収していない状態。
+        let context = app.projected_viewer_context_id();
         app.local_adjust_write_pending.insert(
             "c:/pics/page.png".to_string(),
             crate::app::LocalAdjustWritePending {
                 generation: 1,
-                idx: 0,
-                sidecar: None,
+                origin: crate::app::LocalAdjustWriteOrigin {
+                    context,
+                    target: crate::app::PageAdjustmentTarget {
+                        page_key: "c:/pics/page.png".to_string(),
+                        location_path: Some(PathBuf::from("c:/pics")),
+                        sidecar_coords: None,
+                        compiled_book: false,
+                        idx_hint: crate::app::PageIndexHint::At(0),
+                    },
+                    revision: 0,
+                },
+                layers: Default::default(),
             },
         );
         assert!(
@@ -75194,6 +78764,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::adjustment_db::normalize_path(std::path::Path::new(r"C:\clips\finished.mp4"));
         let updates = vec![
             MediaResumeUpdate {
+                clear_generation: 0,
                 path: PathBuf::from(r"C:\clips\keep.mp4"),
                 key: kept.clone(),
                 position: 37.5,
@@ -75202,6 +78773,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 audio_track_choice: None,
             },
             MediaResumeUpdate {
+                clear_generation: 0,
                 path: PathBuf::from(r"C:\clips\finished.mp4"),
                 key: finished.clone(),
                 position: 118.0,
@@ -75218,6 +78790,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             &mut watched,
             &mut Default::default(),
             &updates,
+            0,
         );
 
         assert_eq!(resume.get(&kept), Some(&37.5));
@@ -75463,6 +79036,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 viewer_context_media_teardown_plan(
                     context.projected_viewer_context_id(),
                     ContextRef::mounted(context),
+                    context.media_memory_clear_generation,
                 )
             })
             .unwrap();
@@ -75558,6 +79132,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 viewer_context_media_teardown_plan(
                     context.projected_viewer_context_id(),
                     ContextRef::mounted(context),
+                    context.media_memory_clear_generation,
                 )
             })
             .unwrap();
@@ -75572,6 +79147,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             &mut watched,
             &mut Default::default(),
             &plan.resume_updates,
+            0,
         );
 
         assert!(!resume.contains_key(&key));
@@ -75610,6 +79186,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 viewer_context_media_teardown_plan(
                     context.projected_viewer_context_id(),
                     ContextRef::mounted(context),
+                    context.media_memory_clear_generation,
                 )
             })
             .unwrap();
@@ -75621,6 +79198,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             &mut watched,
             &mut choices,
             &plan.resume_updates,
+            0,
         );
         assert_eq!(choices[&key].stream_index, 1);
     }
@@ -76237,6 +79815,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].id, 7);
         assert!(app.detached_window_can_activate(app.detached_image_windows[0].id));
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -76263,6 +79842,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             !output.viewport_output.contains_key(&viewport_id),
             "a closed viewport must not receive a stale CursorVisible command"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -76573,6 +80153,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn detached_book_pdf_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_zip_pdf = true;
@@ -76594,6 +80176,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
 
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert_eq!(app.address, r"C:\books");
         assert_eq!(app.items.len(), 2);
@@ -76642,11 +80226,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 137.0);
         assert_detached_pdf_pages(&mut app, &pdf_path, &[0, 1]);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     }
 
     #[test]
     fn detached_book_zip_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_zip_pdf = true;
@@ -76668,6 +80256,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
 
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert_eq!(app.address, r"C:\books");
         assert_eq!(app.items.len(), 2);
@@ -76718,6 +80308,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.scroll_offset_y, 173.0);
         assert_detached_archive_pages(&mut app, &zip_path, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     }
 
     #[test]
@@ -77018,11 +80610,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             pixels,
             egui::TextureOptions::LINEAR,
         );
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 170.0,
-            y: 190.0,
-            w: 1320.0,
-            h: 880.0,
+        let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 170,
+                top: 190,
+                right: 1490,
+                bottom: 1070,
+            },
             maximized: true,
         };
         let viewport_id_before = App::detached_image_window_viewport_id(WINDOW_ID);
@@ -77174,11 +80768,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             first_pixels,
             egui::TextureOptions::LINEAR,
         );
-        let first_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: second_placement.x + 120.0,
-            y: second_placement.y + 80.0,
-            w: second_placement.w,
-            h: second_placement.h,
+        let first_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: second_placement.outer.left + 120,
+                top: second_placement.outer.top + 80,
+                right: second_placement.outer.right + 120,
+                bottom: second_placement.outer.bottom + 80,
+            },
             maximized: false,
         };
         app.set_detached_window_runtime_placement(42, first_placement, "test_passive_book_first");
@@ -77569,7 +81165,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
             bundle.detached_viewer_independent_active = true;
         });
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
 
         app.open_fullscreen(second_main, crate::app::HistoryTrigger::UserChosen);
 
@@ -77607,12 +81203,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(10));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         let first = push_image(&mut app, r"C:\pics\a.jpg");
@@ -77647,12 +81245,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_binding_for_test(Some(20));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.fs_transparent_bg_mode = 1;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         let first = push_image(&mut app, r"C:\pics\continuous-bg-a.png");
@@ -77696,12 +81296,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_binding_for_test(Some(76));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.spread_mode = crate::settings::SpreadMode::Single;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
@@ -77724,6 +81326,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([300, 900]),
@@ -77765,12 +81369,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(11));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         let left = push_image(&mut app, r"C:\pics\spread-left.jpg");
@@ -77781,6 +81387,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
@@ -77837,6 +81445,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some(size),
@@ -77869,12 +81479,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.detached_viewer_open_images_in_window = true;
             app.settings.singleton_spread_first_enabled = true;
             app.settings.singleton_spread_last_enabled = true;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: 960.0,
-                    h: 720.0,
+            app.settings.detached_viewer_window_physical_placement =
+                Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                    outer: crate::detached_window_geometry::PhysicalRect {
+                        left: 80,
+                        top: 80,
+                        right: 1040,
+                        bottom: 800,
+                    },
                     maximized: false,
                 });
 
@@ -78154,12 +81766,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.detached_viewer_open_images_in_window = true;
             app.settings.singleton_spread_first_enabled = global_enabled;
             app.settings.singleton_spread_last_enabled = global_enabled;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: 960.0,
-                    h: 720.0,
+            app.settings.detached_viewer_window_physical_placement =
+                Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                    outer: crate::detached_window_geometry::PhysicalRect {
+                        left: 80,
+                        top: 80,
+                        right: 1040,
+                        bottom: 800,
+                    },
                     maximized: false,
                 });
             configure_detached_endpoint_singleton(
@@ -78211,14 +81825,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.singleton_spread_last_enabled = true;
             app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
             app.settings.spread_page_gap_px = 0;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: 960.0,
-                    h: 720.0,
-                    maximized: false,
-                });
+            app.settings.detached_viewer_window_physical_placement = Some(
+                crate::app::tests::detached_placement_with_logical_client_for_test(egui::vec2(
+                    960.0, 720.0,
+                )),
+            );
             configure_detached_endpoint_singleton(
                 &mut app,
                 &ctx,
@@ -78279,14 +81890,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.singleton_spread_first_enabled = true;
             app.settings.singleton_spread_last_enabled = true;
             app.settings.spread_page_gap_px = 18;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: window_size.x,
-                    h: window_size.y,
-                    maximized: false,
-                });
+            app.settings.detached_viewer_window_physical_placement = Some(
+                crate::app::tests::detached_placement_with_logical_client_for_test(window_size),
+            );
 
             let placement = ResolvedDisplayPlacement::Z {
                 active,
@@ -78438,14 +82044,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 20;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: window_size.x,
-                h: window_size.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(window_size));
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(313));
@@ -78459,6 +82059,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([100, 200]),
@@ -78556,12 +82158,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         let old_texture_id = old_texture.id();
         app.settings.detached_viewer_open_images_in_window = true;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |mounted| {
@@ -78727,14 +82331,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 20;
         app.settings.global_preset.post_filter = crate::adjustment::PostFilter::Nearest;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: window_size.x,
-                h: window_size.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(window_size));
         configure_detached_endpoint_singleton(
             &mut app,
             &ctx,
@@ -78830,16 +82428,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_single_snapshot_rect_matches_live_fit_input() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
-            maximized: false,
-        };
+        let placement = crate::app::tests::detached_placement_with_logical_client_for_test(
+            egui::vec2(960.0, 720.0),
+        );
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(70));
@@ -78863,17 +82457,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_spread_snapshot_rects_match_live_fit_input() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
-            maximized: false,
-        };
+        let placement = crate::app::tests::detached_placement_with_logical_client_for_test(
+            egui::vec2(960.0, 720.0),
+        );
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 0;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(71));
@@ -78887,6 +82477,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
@@ -78916,17 +82508,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_spread_snapshot_preserves_trim_uv_and_background() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
+        let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 80,
+                top: 80,
+                right: 1040,
+                bottom: 800,
+            },
             maximized: false,
         };
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 0;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(72));
@@ -78955,6 +82549,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
@@ -79016,17 +82612,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             for (window_w, window_h) in [(960.0_f32, 720.0_f32), (953.0, 719.0)] {
                 let mut app = setup_app();
                 let ctx = egui::Context::default();
-                let placement = crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: window_w,
-                    h: window_h,
-                    maximized: false,
-                };
+                let placement = crate::app::tests::detached_placement_with_logical_client_for_test(
+                    egui::vec2(window_w, window_h),
+                );
                 app.settings.detached_viewer_open_images_in_window = true;
                 app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
                 app.settings.spread_page_gap_px = gap;
-                app.settings.detached_viewer_window_placement = Some(placement);
+                app.settings.detached_viewer_window_physical_placement = Some(placement);
                 app.viewer_presentation = ViewerPresentation::DetachedWindow;
                 app.detached_viewer_independent_active = true;
                 app.set_detached_window_binding_for_test(Some(74));
@@ -79046,6 +82638,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_rerender_failures: Vec::new(),
+                            pdf_metadata: None,
                             tex,
                             pixels: std::sync::Arc::new(pixels),
                             source_dims: Some(dims),
@@ -79063,7 +82657,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
                 let pixels_per_point = ctx.pixels_per_point();
                 // 正規化を実寸へ戻して測る。凍結ページはウィンドウ比で持ち出される。
-                let to_px = |value: f32| value * window_w * pixels_per_point;
+                let client_width = App::detached_snapshot_client_size(placement).x;
+                let to_px = |value: f32| value * client_width * pixels_per_point;
                 let seam = to_px(snapshot.frozen_continuous_pages[1].clip_rect_norm.left())
                     - to_px(snapshot.frozen_continuous_pages[0].clip_rect_norm.right());
                 let want = (gap as f32 * pixels_per_point).round();
@@ -79079,17 +82674,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_auto_trim_snapshot_uses_baked_runtime_bbox_after_fs_cache_eviction() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
+        let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 80,
+                top: 80,
+                right: 1040,
+                bottom: 800,
+            },
             maximized: false,
         };
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 0;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.transition_detached_window_state(73, DetachedWindowState::Active, "test");
@@ -79115,20 +82712,23 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
             app.thumbnails.insert(
                 idx,
-                ThumbnailState::Loaded {
-                    tex: tex.clone(),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                ThumbnailState::loaded_raster(
+                    tex.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 20,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 20,
-                    source_dims: Some((20, 20)),
-                    layout_dims: None,
-                },
+                    false,
+                    20,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((20, 20)),
+                    None,
+                ),
             );
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([20, 20]),
@@ -79405,6 +83005,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.sns_split_drag = Some(SnsSplitDrag {
                 handle: crate::export_crop::CropHandle::SouthEast,
                 base: sns_layout,
+                owner: app.capture_page_edit_owner(idx).unwrap(),
+                press_frame: 0,
             });
             app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
                 saved_mode: crate::settings::SpreadMode::Ltr,
@@ -79465,6 +83067,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.adjustment_page_params.insert(idx, after.clone());
         app.adjustment_drag_session = Some(AdjustmentDragSession {
             fs_idx: idx,
+            owner: app.capture_page_edit_owner(idx).unwrap(),
+            draft: Some(after.clone()),
             before: Some(before),
         });
 
@@ -79511,6 +83115,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             );
         });
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 99,
             key,
             retained_key: None,
@@ -79813,7 +83418,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             !handled,
@@ -79854,40 +83459,100 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn eframe_delivers_texture_delta_at_all_unpainted_viewport_returns() {
-        // egui-wgpu の headless test は surface-less Painter を実動作で検査する。
-        // ここでは一段手前の eframe が、FullOutput 取得後の4つの early return すべてで
-        // その Painter API を呼ぶことを vendored caller の source shape として固定する。
+        // Surface-less Painter の実動作回帰に加え、native caller の配送を固定する。
+        // immediate の共通driver抽出後も、消えたviewport/windowがdeltaを落とせない。
         const SOURCE: &str = include_str!("../../vendor/eframe/src/native/wgpu_integration.rs");
+        const DRIVER: &str = include_str!("../../vendor/eframe/src/native/frame_output.rs");
+        let compact = |source: &str| source.split_whitespace().collect::<String>();
         let main_path = SOURCE
-            .split_once("fn run_ui_and_paint")
-            .and_then(|(_, rest)| rest.split_once("fn render_immediate_viewport"))
+            .split_once("// Completing this output never depends on a live surface.")
+            .and_then(|(_, rest)| rest.split_once("handle_viewport_output("))
             .map(|(section, _)| section)
             .expect("eframe main viewport delivery section");
-        let immediate_path = SOURCE
-            .split_once("fn render_immediate_viewport")
-            .and_then(|(_, rest)| rest.split_once("fn egui_installed_atlas_size"))
-            .map(|(section, _)| section)
-            .expect("eframe immediate viewport delivery section");
-
+        let main_path = compact(main_path);
         assert_eq!(
             main_path
-                .matches("painter.apply_textures_delta(&textures_delta);")
+                .matches("}else{painter.apply_textures_delta(pending_deltas);0.0}")
                 .count(),
             2,
-            "missing viewport and missing window/state must both deliver the main FullOutput"
+            "missing viewport and missing window/state must both deliver the pending main delta"
         );
-        assert_eq!(
-            immediate_path
-                .matches("painter.apply_textures_delta(&textures_delta);")
-                .count(),
-            2,
-            "missing viewport and missing window/state must both deliver immediate FullOutput"
+        assert!(
+            main_path
+                .contains("|painter,pending_deltas|painter.apply_textures_delta(pending_deltas),"),
+            "the present-but-unpainted main branch must deliver resources too"
         );
+        assert!(SOURCE.contains(
+            "super::viewport_lifecycle::append_texture_delta(pending_deltas, textures_delta);"
+        ));
+
+        let wrapper = SOURCE
+            .split_once("fn render_immediate_viewport(")
+            .unwrap()
+            .1
+            .split_once("#[derive(Default)]")
+            .unwrap()
+            .0;
+        assert!(
+            compact(wrapper).contains(
+                "super::frame_output::run_immediate_viewport(backend,immediate_viewport);"
+            )
+        );
+        let driver = DRIVER
+            .split_once("pub(super) fn run_immediate_viewport(")
+            .unwrap()
+            .1
+            .split_once("/// Extract actions")
+            .unwrap()
+            .0;
+        let driver = compact(driver);
+        let accepted = driver
+            .find("backend.accept_textures(ids,&ctx,textures_delta);")
+            .expect("immediate must accept the produced delta");
+        let finished = driver
+            .find(".finish_output(ids,&ctx,platform_output,&mutviewport_output)")
+            .expect("immediate output owner");
+        let resources = driver
+            .find("}else{backend.apply_resources(ids,&ctx);}")
+            .expect("missing viewport/window must route to resource delivery");
+        let viewports = driver
+            .find("backend.finish_viewports(ids,&ctx,viewport_output);")
+            .unwrap();
+        assert!(accepted < finished && finished < resources && resources < viewports);
+        assert!(
+            !driver[accepted..].contains("return;"),
+            "an accepted immediate delta must reach paint or resource delivery"
+        );
+
+        let immediate = SOURCE
+            .split_once("impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBackend<'_>")
+            .and_then(|(_, rest)| rest.split_once("fn texture_delta_stats"))
+            .map(|(section, _)| section)
+            .expect("native WGPU immediate output owner");
+        let immediate = compact(immediate);
+        assert!(immediate.contains("super::viewport_lifecycle::append_texture_delta(&mutself.shared.borrow_mut().pending_deltas,delta,);"));
+        assert!(immediate.contains("letviewport=shared.viewports.get_mut(&ids.this)?;"));
+        assert!(immediate.contains("let(Some(window),Some(state))=(&viewport.window,&mutviewport.egui_winit)else{returnNone;};"));
+        let resources = immediate
+            .split_once("fnapply_resources(")
+            .unwrap()
+            .1
+            .split_once("fnfinish_viewports(")
+            .unwrap()
+            .0;
+        assert!(resources.contains("painter.apply_textures_delta(pending_deltas);"));
+        assert!(immediate.contains("letSome(viewport)=viewports.get_mut(&ids.this)else{painter.apply_textures_delta(pending_deltas);return;};"));
+        assert!(immediate.contains("letSome(window)=viewport.window.as_ref()else{painter.apply_textures_delta(pending_deltas);return;};"));
     }
 
     #[test]
     fn app_has_no_viewport_lifecycle_font_resync_state_machine() {
-        const APP_SOURCE: &str = include_str!("../app.rs");
+        const APP_SOURCE: &str = concat!(
+            include_str!("../app.rs"),
+            include_str!("update_phases.rs"),
+            include_str!("root_lifecycle.rs"),
+            include_str!("ai_terminal_service.rs")
+        );
         const VIEWPORT_SOURCE: &str = include_str!("../ui_fullscreen.rs");
         const NATIVE_VIDEO_SOURCE: &str = include_str!("native_video.rs");
 
@@ -79966,13 +83631,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.hide_native_video_black_backdrop_if_shown(ctx);
             assert!(
                 !ctx.will_discard(),
                 "backdrop visibility is unrelated to the main renderer's valid atlas"
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(!app.fs_viewport_shown);
         assert_eq!(app.fs_viewport_presentation, None);
@@ -79994,13 +83660,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.main_font_update_pending,
             "a detached session does not own or relocate the main Context's settings update"
         );
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.apply_pending_main_font_update(ctx);
             assert!(
                 !ctx.will_discard(),
                 "applying real font settings does not require a same-frame repass"
             );
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(!app.main_font_update_pending);
     }
     #[test]
@@ -80014,13 +83681,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
         app.fs_viewport_generation = 4;
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.hide_current_fullscreen_viewport_for_recreate(ctx, idx);
             assert!(
                 !ctx.will_discard(),
                 "recreating a viewport does not invalidate the shared renderer atlas"
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(app.fs_viewport_generation, 5);
         assert!(
@@ -80111,11 +83779,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         set_detached_host_for_test(&mut app, 12, 0x1234, true);
         app.set_detached_window_runtime_placement(
             12,
-            crate::settings::DetachedViewerWindowPlacement {
-                x: 10.0,
-                y: 20.0,
-                w: 800.0,
-                h: 600.0,
+            crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 10,
+                    top: 20,
+                    right: 810,
+                    bottom: 620,
+                },
                 maximized: false,
             },
             "test_folder_nav_reopen",
@@ -80189,11 +83859,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.next_detached_image_window_id = 13;
         app.set_detached_window_runtime_placement(
             12,
-            crate::settings::DetachedViewerWindowPlacement {
-                x: 10.0,
-                y: 20.0,
-                w: 800.0,
-                h: 600.0,
+            crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 10,
+                    top: 20,
+                    right: 810,
+                    bottom: 620,
+                },
                 maximized: false,
             },
             "test_folder_nav_reuse",
@@ -80535,7 +84207,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "publishing materialized content is not a viewport render"
         );
 
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         assert_eq!(
             app.active_detached_session.unwrap().content_phase,
             DetachedSessionContentPhase::Ready
@@ -80571,7 +84243,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             Some(DetachedWindowState::Opening),
             "publishing the session must not erase the lifecycle before its first viewport render"
         );
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Active)
@@ -80599,7 +84271,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             Some(DetachedWindowState::Resuming),
             "resumption remains nonterminal until its viewport is rendered"
         );
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Active)
@@ -80619,21 +84291,25 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_runtime_placement_seeds_from_settings_then_overrides_with_runtime() {
         let mut app = setup_app();
-        let seed = crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 960.0,
-            h: 720.0,
+        let seed = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1060,
+                bottom: 840,
+            },
             maximized: false,
         };
-        let runtime = crate::settings::DetachedViewerWindowPlacement {
-            x: 320.0,
-            y: 220.0,
-            w: 1180.0,
-            h: 760.0,
+        let runtime = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 320,
+                top: 220,
+                right: 1500,
+                bottom: 980,
+            },
             maximized: false,
         };
-        app.settings.detached_viewer_window_placement = Some(seed);
+        app.settings.detached_viewer_window_physical_placement = Some(seed);
 
         app.begin_active_detached_session(41, DetachedSource::Image);
         assert_eq!(app.detached_window_runtime_placement(41), Some(seed));
@@ -80642,7 +84318,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_runtime_placement(41, runtime, "test_runtime_override");
         assert_eq!(app.active_detached_viewer_current_placement(), runtime);
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(seed),
             "live placement updates must not rewrite settings before close"
         );
@@ -80652,18 +84328,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_builder_placement_latch_does_not_follow_live_drag_updates() {
         let mut app = setup_app();
-        let initial = crate::settings::DetachedViewerWindowPlacement {
-            x: 1564.0,
-            y: 240.66667,
-            w: 1167.0,
-            h: 765.0,
+        let initial = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 1564,
+                top: 241,
+                right: 2731,
+                bottom: 1006,
+            },
             maximized: false,
         };
-        let alternate = crate::settings::DetachedViewerWindowPlacement {
-            x: 1578.6666,
-            y: 244.0,
-            w: 1167.0,
-            h: 765.0,
+        let alternate = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 1579,
+                top: 244,
+                right: 2746,
+                bottom: 1009,
+            },
             maximized: false,
         };
 
@@ -80696,18 +84376,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_builder_placement_latch_refreshes_on_real_seed_frame() {
         let mut app = setup_app();
-        let first = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let first = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
-        let latest = crate::settings::DetachedViewerWindowPlacement {
-            x: 740.0,
-            y: 260.0,
-            w: 1340.0,
-            h: 900.0,
+        let latest = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 740,
+                top: 260,
+                right: 2080,
+                bottom: 1160,
+            },
             maximized: false,
         };
 
@@ -80735,18 +84419,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_builder_placement_latch_refreshes_on_active_reentry() {
         let mut app = setup_app();
-        let first = crate::settings::DetachedViewerWindowPlacement {
-            x: 87.3,
-            y: 71.3,
-            w: 1278.0,
-            h: 840.0,
+        let first = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 87,
+                top: 71,
+                right: 1365,
+                bottom: 911,
+            },
             maximized: false,
         };
-        let moved = crate::settings::DetachedViewerWindowPlacement {
-            x: 680.0,
-            y: 220.0,
-            w: 1278.0,
-            h: 840.0,
+        let moved = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 680,
+                top: 220,
+                right: 1958,
+                bottom: 1060,
+            },
             maximized: false,
         };
 
@@ -80779,21 +84467,25 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_runtime_placement_persists_to_settings_on_remove() {
         let mut app = setup_app();
-        let seed = crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 960.0,
-            h: 720.0,
+        let seed = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1060,
+                bottom: 840,
+            },
             maximized: false,
         };
-        let final_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 400.0,
-            y: 240.0,
-            w: 1200.0,
-            h: 820.0,
+        let final_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 400,
+                top: 240,
+                right: 1600,
+                bottom: 1060,
+            },
             maximized: false,
         };
-        app.settings.detached_viewer_window_placement = Some(seed);
+        app.settings.detached_viewer_window_physical_placement = Some(seed);
         app.begin_active_detached_session(42, DetachedSource::Image);
         app.set_detached_window_runtime_placement(42, final_placement, "test_final");
         app.begin_active_detached_session_close("test_close");
@@ -80801,7 +84493,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert_eq!(app.detached_window_state(42), None);
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(final_placement),
             "closing/removing a detached runtime persists the final OS placement"
         );
@@ -80822,25 +84514,31 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        let first = crate::settings::DetachedViewerWindowPlacement {
-            x: 120.0,
-            y: 130.0,
-            w: 900.0,
-            h: 700.0,
+        let first = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 120,
+                top: 130,
+                right: 1020,
+                bottom: 830,
+            },
             maximized: false,
         };
-        let second = crate::settings::DetachedViewerWindowPlacement {
-            x: 260.0,
-            y: 180.0,
-            w: 1000.0,
-            h: 760.0,
+        let second = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 260,
+                top: 180,
+                right: 1260,
+                bottom: 940,
+            },
             maximized: false,
         };
-        let third = crate::settings::DetachedViewerWindowPlacement {
-            x: 340.0,
-            y: 220.0,
-            w: 1100.0,
-            h: 780.0,
+        let third = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 340,
+                top: 220,
+                right: 1440,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.set_detached_window_runtime_placement(43, first, "test_first");
@@ -83695,6 +87393,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             action: MediaNavigationAction::VideoContinuousEof {
                 fs_idx: video,
                 seek_serial: 99,
+                player_identity: 0,
             },
             started_at: std::time::Instant::now(),
         });
@@ -84548,7 +88247,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(eof_result.missing, vec![(missing, missing_path.clone())]);
 
         let manual_candidates =
-            App::collect_manual_media_navigation_candidates(&app.items, &order, current, 1);
+            App::collect_manual_media_navigation_candidates(&app.items, &order, current, 1, false);
         let manual_result = App::resolve_media_navigation_candidates(
             &manual_candidates,
             1,
@@ -84677,6 +88376,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             action: MediaNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity: 0,
             },
             started_at: std::time::Instant::now(),
         });
@@ -84705,16 +88405,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx: key.0,
                 seek_serial: key.1,
+                player_identity: 0,
             },
             MediaNavigationAction::MusicContinuousEof {
                 fs_idx: key.0,
                 seek_serial: key.1,
+                player_identity: 0,
             },
         ];
         #[cfg(windows)]
         actions.push(MediaNavigationAction::VideoAudioModeContinuousEof {
             fs_idx: key.0,
             seek_serial: key.1,
+            player_identity: 0,
         });
 
         for action in actions {
@@ -84916,6 +88619,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         // セッション id 一致 → marker が立つ。
         app.mark_active_detached_viewport_rendered_if_matches(
+            &egui::Context::default(),
             App::detached_image_window_viewport_id(3),
         );
         assert!(app.active_detached_viewport_rendered_this_frame());
@@ -84926,6 +88630,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         // 別 id (= 既存経路が別 viewport を描いた gap) では marker を立てない。
         app.mark_active_detached_viewport_rendered_if_matches(
+            &egui::Context::default(),
             App::detached_image_window_viewport_id(999),
         );
         assert!(!app.active_detached_viewport_rendered_this_frame());
@@ -84943,11 +88648,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let texture_id = texture.id();
         app.conceal_cache.insert(
             idx,
-            ConcealCacheEntry {
-                pixels: std::sync::Arc::new(image),
-                texture,
-                generation: app.conceal_generation,
-            },
+            ConcealCacheEntry::raster(std::sync::Arc::new(image), texture, app.conceal_generation),
         );
         texture_id
     }
@@ -84966,6 +88667,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels: std::sync::Arc::new(image),
                 source_dims: Some(size),
@@ -85014,11 +88717,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             input
                 .viewports
                 .insert(viewport.ids.this, egui::ViewportInfo::default());
-            let output = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            let output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
             *renderer_capture.borrow_mut() = Some((builder, output));
         });
         ctx.set_embed_viewports(false);
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -85027,7 +88730,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 ..Default::default()
             },
             |ctx| app.render_active_detached_viewport_backstop(ctx),
-        );
+        )
+        .drop_without_applying_deltas();
         let output = captured.borrow_mut().take();
         output
     }
@@ -85081,6 +88785,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
             })
             .unwrap();
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -85123,6 +88828,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             );
             assert!(output_uses_texture(&rendered.1, texture));
             assert!(app.active_detached_viewport_rendered_this_frame());
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -85181,6 +88887,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 "the first active backstop render completes Opening"
             );
             assert!(app.active_detached_viewport_rendered_this_frame());
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -85233,6 +88940,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 "the first active backstop render completes Opening"
             );
             assert!(app.active_detached_viewport_rendered_this_frame());
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -85249,7 +88957,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.stash_mounted_as_active_for_test(207);
             set_detached_host_for_test(&mut app, 207, 0x2070, true);
             app.frame_counter = 202;
-            app.mark_active_detached_viewport_rendered();
+            app.mark_active_detached_viewport_rendered(&ctx);
 
             assert!(render_backstop_with_captured_viewport(&mut app, &ctx).is_none());
             assert!(app.active_viewer_context_id().is_some());
@@ -85306,7 +89014,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.capture_fs_nav_holdover(idx);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(_))
+            Some(FsHoldover::FolderNavigation(_, _))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();
@@ -85360,7 +89068,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.capture_fs_nav_holdover(idx);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(_))
+            Some(FsHoldover::FolderNavigation(_, _))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();
@@ -85596,7 +89304,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_suppress_enter_close_until_release = false;
         begin_root_key_pass(&ctx, egui::Key::Enter, false);
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -85624,7 +89332,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.items_generation = app.items_generation.wrapping_add(1);
         begin_root_key_pass(&ctx, egui::Key::Enter, false);
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -85654,7 +89362,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::Enter, false);
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -85713,27 +89421,37 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
-    fn detached_viewer_placement_saves_outer_position_and_inner_size() {
+    fn detached_viewer_placement_saves_physical_host_outer_rect() {
         let mut app = setup_app();
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
         let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
 
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 1.0, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 120,
+                top: 140,
+                right: 1020,
+                bottom: 840,
+            },
+            false,
+            || app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 1.0, false),
+        );
         assert!(restore.is_none());
 
         let placement = app
             .detached_window_runtime_placement(12)
-            .expect("logical placement should be saved in the detached runtime");
-        assert_eq!(placement.x, 120.0);
-        assert_eq!(placement.y, 140.0);
-        assert_eq!(placement.w, 860.0);
-        assert_eq!(placement.h, 640.0);
+            .expect("physical HWND placement should be saved in the detached runtime");
+        assert_eq!(placement.outer.left, 120);
+        assert_eq!(placement.outer.top, 140);
+        assert_eq!(placement.outer.right, 1020);
+        assert_eq!(placement.outer.bottom, 840);
         assert!(!placement.maximized);
         assert_eq!(
-            app.settings.detached_viewer_window_placement, None,
+            app.settings.detached_viewer_window_physical_placement, None,
             "settings should not be updated until the detached runtime is removed"
         );
     }
@@ -85741,28 +89459,47 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn active_detached_default_viewport_geometry_update_is_rejected_after_open() {
         let mut app = setup_app();
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now());
-        app.settings.detached_viewer_window_placement = Some(previous);
+        app.settings.detached_viewer_window_physical_placement = Some(previous);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(420.0, 160.0), egui::vec2(533.0, 400.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1220,
+                bottom: 760,
+            },
+            false,
+            || {
+                app.save_detached_viewer_placement_from_logical_rect(
+                    default_outer,
+                    None,
+                    1.5,
+                    false,
+                )
+            },
+        );
 
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(previous)
         );
         assert_eq!(app.detached_window_runtime_placement(12), Some(previous));
@@ -85776,28 +89513,47 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn active_detached_default_viewport_geometry_update_is_rejected_after_grace() {
         let mut app = setup_app();
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
-        app.settings.detached_viewer_window_placement = Some(previous);
+        app.settings.detached_viewer_window_physical_placement = Some(previous);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(202.0, 202.0), egui::vec2(533.0, 400.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 202,
+                top: 202,
+                right: 1002,
+                bottom: 802,
+            },
+            false,
+            || {
+                app.save_detached_viewer_placement_from_logical_rect(
+                    default_outer,
+                    None,
+                    1.5,
+                    false,
+                )
+            },
+        );
 
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(previous),
             "egui's default detached viewport size must never become the saved placement just because the open grace elapsed"
         );
@@ -85814,11 +89570,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         // 保存せず OS-window restore を要求することを固定する (Codex P1)。
         let mut app = setup_app();
         let idx = push_video(&mut app, r"C:\clips\movie.mp4");
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.fullscreen_idx = Some(idx);
@@ -85829,7 +89587,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             ViewerPresentation::DetachedWindow,
             false,
         );
-        app.settings.detached_viewer_window_placement = Some(previous);
+        app.settings.detached_viewer_window_physical_placement = Some(previous);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Video);
         app.set_detached_window_runtime_placement(12, previous, "test_switch_default_reject");
@@ -85839,8 +89597,25 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(114.0, 114.0), egui::vec2(533.0, 400.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 114,
+                top: 114,
+                right: 914,
+                bottom: 714,
+            },
+            false,
+            || {
+                app.save_detached_viewer_placement_from_logical_rect(
+                    default_outer,
+                    None,
+                    1.5,
+                    false,
+                )
+            },
+        );
 
         assert_eq!(
             restore,
@@ -85848,7 +89623,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "default geometry during the detach switch must be rejected and request an OS-window restore"
         );
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(previous),
             "the transient default size must not overwrite the saved placement mid-switch"
         );
@@ -85856,27 +89631,37 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
-    fn detached_viewer_logical_rect_saves_outer_position_and_inner_size() {
+    fn detached_viewer_logical_notification_uses_physical_host_rect_without_ppp_conversion() {
         let mut app = setup_app();
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
 
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(700.0, 420.0));
         let inner = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(640.0, 360.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 2.0, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 240,
+                top: 280,
+                right: 1640,
+                bottom: 1120,
+            },
+            false,
+            || app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 2.0, false),
+        );
         assert!(restore.is_none());
 
         let placement = app
             .detached_window_runtime_placement(12)
-            .expect("logical placement should be saved in the detached runtime");
-        assert_eq!(placement.x, 120.0);
-        assert_eq!(placement.y, 140.0);
-        assert_eq!(placement.w, 640.0);
-        assert_eq!(placement.h, 360.0);
+            .expect("physical HWND placement should be saved in the detached runtime");
+        assert_eq!(placement.outer.left, 240);
+        assert_eq!(placement.outer.top, 280);
+        assert_eq!(placement.outer.right, 1640);
+        assert_eq!(placement.outer.bottom, 1120);
         assert!(!placement.maximized);
         assert_eq!(
-            app.settings.detached_viewer_window_placement, None,
+            app.settings.detached_viewer_window_physical_placement, None,
             "settings should not be updated until the detached runtime is removed"
         );
     }
@@ -85887,16 +89672,18 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_video(&mut app, r"C:\clips\a.mp4");
-        let host_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 240.0,
-            y: 180.0,
-            w: 1280.0,
-            h: 840.0,
+        let host_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 240,
+                top: 180,
+                right: 1520,
+                bottom: 1020,
+            },
             maximized: false,
         };
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.settings.detached_viewer_window_placement = Some(host_placement);
+        app.settings.detached_viewer_window_physical_placement = Some(host_placement);
 
         app.handle_native_video_window_event(
             &ctx,
@@ -85911,7 +89698,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
 
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(host_placement),
             "detached video is a child HWND; its geometry must not replace the host window placement"
         );
@@ -86129,6 +89916,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         crate::key_input::set_test_frame_for_viewport(
             ctx.viewport_id(),
             vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: ctx.viewport_id(),
                 virtual_key: 0x51,
@@ -86142,7 +89930,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             }],
         );
         assert!(app.handle_fullscreen_root_key_input(&ctx));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(app.fullscreen_idx, Some(2));
         assert!(app.page_overview.session().is_none());
     }
@@ -86194,6 +89982,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::key_input::set_test_frame_for_viewport(
                 ctx.viewport_id(),
                 vec![crate::key_input::KeyEdge {
+                    operation_id: crate::key_input::KeyOperationId::unassigned(),
                     source_hwnd: 1,
                     source_viewport: ctx.viewport_id(),
                     virtual_key,
@@ -86207,7 +89996,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 }],
             );
             let action = app.handle_fs_key_input(&ctx, 0, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             assert_eq!(
                 action.page_transition,
                 crate::ui_fullscreen::FsKeyPageTransition::Rebased { idx: expected_idx }
@@ -86464,6 +90253,108 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
+    fn pending_mode_owns_same_output_f11_close_and_park_until_delivered() {
+        for maximized in [false, true] {
+            for action in ["f11", "close", "park"] {
+                let mut app = setup_app();
+                let ctx = egui::Context::default();
+                ctx.set_embed_viewports(false);
+                ctx.begin_pass(Default::default());
+                let viewport_id = App::detached_image_window_viewport_id(12);
+                ctx.show_viewport_deferred(viewport_id, Default::default(), |_, _| {});
+                let idx = push_image(&mut app, r"C:\pics\queued-mode.jpg");
+                insert_static_fs_entry(&mut app, &ctx, idx, "queued_mode");
+                app.fullscreen_idx = Some(idx);
+                app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                app.window_visible = true;
+                app.set_detached_window_binding_for_test(Some(12));
+                app.begin_active_detached_session(12, DetachedSource::Image);
+                let target = crate::detached_window_geometry::PhysicalWindowPlacement {
+                    maximized,
+                    ..app.default_detached_viewer_window_placement()
+                };
+                app.set_detached_window_runtime_placement(12, target, "test");
+                app.set_detached_window_host_for_test(12, 0x1234);
+                let actual_outer = if maximized {
+                    target.outer
+                } else {
+                    crate::detached_window_geometry::borderless_target_for(target.outer).unwrap()
+                };
+                crate::app::detached_placement::with_host_geometry_for_test(
+                    12,
+                    actual_outer,
+                    !maximized,
+                    || {
+                        crate::app::detached_placement::with_host_normal_outer_for_test(
+                            12,
+                            target.outer,
+                            || {
+                                if maximized {
+                                    // The real placement producer queues remaximization.
+                                    app.apply_detached_window_host_placement(&ctx, 12);
+                                } else {
+                                    let claim =
+                                        app.detached_window_manager.host_claim_alive(12).unwrap();
+                                    app.detached_window_manager.mark_host_placed(claim, crate::app::detached_window_manager::PlacementOutcome::Exact);
+                                    app.send_detached_viewport_mode_command(
+                                        &ctx,
+                                        viewport_id,
+                                        false,
+                                    );
+                                }
+                                assert!(app.detached_window_host_is_placed(12));
+                                assert_eq!(
+                                    app.detached_window_manager.pending_mode(12),
+                                    Some(maximized)
+                                );
+                                assert!(ctx.viewport_for(viewport_id, |viewport| viewport.commands.iter().any(
+                            |command| matches!(command, egui::ViewportCommand::Maximized(value) if *value == maximized)
+                        )));
+                                match action {
+                                    "f11" => {
+                                        app.toggle_detached_viewer_borderless_fullscreen(&ctx);
+                                        assert_eq!(
+                                            app.detached_viewer_restore_placement,
+                                            Some(target)
+                                        );
+                                    }
+                                    "close" => {
+                                        app.retire_terminal_detached_viewport_identity(
+                                            12,
+                                            "test_close",
+                                        );
+                                        assert_eq!(
+                                            app.settings.detached_viewer_window_physical_placement,
+                                            Some(target)
+                                        );
+                                    }
+                                    "park" => {
+                                        assert!(app.park_active_detached_image_window());
+                                        assert_eq!(
+                                            app.detached_window_runtime_placement(12),
+                                            Some(target)
+                                        );
+                                        assert_eq!(
+                                            app.detached_window_state(12),
+                                            Some(DetachedWindowState::Parked)
+                                        );
+                                        assert_eq!(
+                                            app.detached_image_windows.last().unwrap().id,
+                                            12
+                                        );
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            },
+                        );
+                    },
+                );
+                ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
     fn detached_active_snapshot_uses_live_viewport_placement() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -86472,19 +90363,23 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.set_detached_window_binding_for_test(Some(9));
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
-        let live_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1280.0,
-            h: 840.0,
+        let live_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1700,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.begin_active_detached_session(9, DetachedSource::Image);
@@ -86503,24 +90398,33 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn passive_default_viewport_geometry_update_is_rejected() {
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 502.0,
-            y: 138.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 502,
+                top: 138,
+                right: 1780,
+                bottom: 978,
+            },
             maximized: false,
         };
-        let default_candidate = crate::settings::DetachedViewerWindowPlacement {
-            x: 152.0,
-            y: 152.0,
-            w: 533.3333,
-            h: 400.0,
+        let default_candidate = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 152,
+                top: 152,
+                right: 952,
+                bottom: 752,
+            },
             maximized: false,
         };
         assert!(
             App::detached_passive_placement_update_looks_like_default_viewport(
                 previous,
                 default_candidate,
+                [previous.outer.width(), previous.outer.height()],
+                [
+                    default_candidate.outer.width(),
+                    default_candidate.outer.height()
+                ],
                 1.5,
                 false,
             )
@@ -86529,21 +90433,33 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             !App::detached_passive_placement_update_looks_like_default_viewport(
                 previous,
                 default_candidate,
+                [previous.outer.width(), previous.outer.height()],
+                [
+                    default_candidate.outer.width(),
+                    default_candidate.outer.height()
+                ],
                 1.5,
                 true,
             )
         );
-        let moved_without_default_size = crate::settings::DetachedViewerWindowPlacement {
-            x: 152.0,
-            y: 152.0,
-            w: 900.0,
-            h: 700.0,
+        let moved_without_default_size = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 152,
+                top: 152,
+                right: 1052,
+                bottom: 852,
+            },
             maximized: false,
         };
         assert!(
             !App::detached_passive_placement_update_looks_like_default_viewport(
                 previous,
                 moved_without_default_size,
+                [previous.outer.width(), previous.outer.height()],
+                [
+                    moved_without_default_size.outer.width(),
+                    moved_without_default_size.outer.height()
+                ],
                 1.5,
                 false,
             )
@@ -87380,10 +91296,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
             id: 7,
-            viewport_close_requested: false,
             bar_close_requested: false,
             focused: true,
-            placement_update: None,
+            geometry_observed: false,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
             right_drag: None,
@@ -87430,18 +91345,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 502.0,
-            y: 138.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 502,
+                top: 138,
+                right: 1780,
+                bottom: 978,
+            },
             maximized: false,
         };
-        let default_candidate = crate::settings::DetachedViewerWindowPlacement {
-            x: 152.0,
-            y: 152.0,
-            w: 533.3333,
-            h: 400.0,
+        let default_candidate = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 152,
+                top: 152,
+                right: 952,
+                bottom: 752,
+            },
             maximized: false,
         };
         let snapshot = DetachedImageWindowSnapshot {
@@ -87478,56 +91397,122 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
             id: 7,
-            viewport_close_requested: false,
             bar_close_requested: false,
             focused: false,
-            placement_update: Some(default_candidate),
+            geometry_observed: true,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
             right_drag: None,
         });
 
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
+        // The backend publishes all viewport metadata into the next root input;
+        // the deferred Frame wakes root but does not itself provide placement.
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            App::detached_image_window_viewport_id(7),
+            egui::ViewportInfo {
+                outer_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(152.0, 152.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                native_pixels_per_point: Some(1.5),
+                ..Default::default()
+            },
+        );
+        ctx.begin_pass(input);
+
+        mark_detached_host_placed_for_test(&mut app, 7);
+        crate::app::detached_placement::with_host_geometry_for_test(
+            7,
+            default_candidate.outer,
+            false,
+            || {
+                app.process_deferred_detached_image_window_events_for_test(&ctx);
+                assert!(
+                    matches!(
+                        app.detached_window_manager.host_placement(7),
+                        Some(
+                            crate::app::detached_window_manager::HostPlacement::Unplaced {
+                                awaiting_unzoom: false,
+                                ..
+                            }
+                        )
+                    ),
+                    "rejecting the default host observation must invalidate the host's placement"
+                );
+                assert_eq!(app.detached_window_runtime_placement(7), Some(previous));
+
+                app.apply_detached_window_host_placement(&ctx, 7);
+                let claim = app.detached_window_manager.host_claim_alive(7).unwrap();
+                assert_eq!(
+                    app.detached_window_manager.host_placement(7),
+                    Some(crate::app::detached_window_manager::HostPlacement::Placed {
+                        incarnation: claim.incarnation,
+                        outcome: crate::app::detached_window_manager::PlacementOutcome::Exact,
+                        pending_mode: None,
+                    })
+                );
+                assert_eq!(
+                    crate::app::detached_placement::host_geometry_for_test(7),
+                    Some((previous.outer, false)),
+                    "the next root placement pass must restore the physical host outer rect"
+                );
+            },
+        );
+
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(
             app.detached_window_runtime_placement(7),
             Some(previous),
             "deferred PlacementObserved must pass through the same default-geometry rejection as immediate passive windows"
         );
-        assert!(
-            !app.detached_image_windows[0].initial_placement_applied,
-            "rejecting a default geometry observation asks the next deferred registration to re-seed placement"
-        );
     }
 
     #[test]
     fn detached_viewer_maximized_save_preserves_restore_placement() {
         let mut app = setup_app();
-        let seed = crate::settings::DetachedViewerWindowPlacement {
-            x: 120.0,
-            y: 140.0,
-            w: 860.0,
-            h: 640.0,
+        let seed = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 120,
+                top: 140,
+                right: 980,
+                bottom: 780,
+            },
             maximized: false,
         };
-        app.settings.detached_viewer_window_placement = Some(seed);
+        app.settings.detached_viewer_window_physical_placement = Some(seed);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, seed, "test_maximized");
 
         let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
-        let restore = app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+            true,
+            || app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true),
+        );
         assert!(restore.is_none());
 
         let placement = app
             .detached_window_runtime_placement(12)
             .expect("maximized placement should be saved in runtime");
-        assert_eq!(placement.x, 120.0);
-        assert_eq!(placement.y, 140.0);
-        assert_eq!(placement.w, 860.0);
-        assert_eq!(placement.h, 640.0);
+        assert_eq!(placement.outer.left, 120);
+        assert_eq!(placement.outer.top, 140);
+        assert_eq!(placement.outer.right, 980);
+        assert_eq!(placement.outer.bottom, 780);
         assert!(placement.maximized);
-        assert_eq!(app.settings.detached_viewer_window_placement, Some(seed));
+        assert_eq!(
+            app.settings.detached_viewer_window_physical_placement,
+            Some(seed)
+        );
     }
 
     #[test]
@@ -87540,7 +91525,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             handled,
@@ -87559,7 +91544,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, true);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled, "repeat F12 is still a fullscreen root key");
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -87576,7 +91561,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled, "F12 remains a fullscreen root key while editing");
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -87610,7 +91595,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::Modifiers::SHIFT,
         );
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -87650,7 +91635,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
             begin_root_key_pass(&ctx, egui::Key::ArrowRight, false);
             let handled = app.handle_fullscreen_root_key_input(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
 
             assert!(handled);
             assert_eq!(app.fullscreen_idx, Some(expected), "{cursor_direction:?}");
@@ -87676,7 +91661,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::Modifiers::SHIFT,
         );
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -87742,7 +91727,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::Modifiers::SHIFT,
         );
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -87762,7 +91747,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass_with_modifiers(&ctx, egui::Key::ArrowUp, false, egui::Modifiers::SHIFT);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -87783,7 +91768,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::Backspace, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             handled,
@@ -87815,12 +91800,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::Backspace, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(app.fullscreen_idx, None);
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "Backspace must stop at the direct RAR page list instead of using generic close"
         );
         assert_eq!(
@@ -87852,7 +91837,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass_with_modifiers(&ctx, egui::Key::F2, false, egui::Modifiers::SHIFT);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         let source_key = crate::adjustment_db::normalize_path(&src);
@@ -87889,7 +91874,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass_with_modifiers(&ctx, egui::Key::F4, false, egui::Modifiers::SHIFT);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         let literal_key = crate::adjustment_db::normalize_path(&src.join("bookB"));
@@ -87999,7 +91984,7 @@ mod file_operation_selection_tests {
         });
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.show_delete_confirm);
         assert_eq!(app.delete_targets, vec![(folder, folder_path)]);
@@ -88032,7 +92017,7 @@ mod file_operation_selection_tests {
         });
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(!app.show_delete_confirm);
         assert!(app.delete_targets.is_empty());
@@ -88108,7 +92093,7 @@ mod file_operation_selection_tests {
             ..Default::default()
         });
         app.handle_clipboard_shortcuts(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(
             app.fs_feedback_toast.is_none(),
             "割り当て解除後の egui Copy event は既定 Ctrl+C を復活させない"
@@ -88121,7 +92106,7 @@ mod file_operation_selection_tests {
             ..Default::default()
         });
         app.handle_clipboard_shortcuts(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
             toast
                 .0
@@ -88359,7 +92344,8 @@ mod rating_view_navigation_tests {
             "preflight does not commit the child"
         );
         let ctx = egui::Context::default();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if app
                 .top_level_grid_view
                 .history_navigation_transition()
@@ -88380,7 +92366,8 @@ mod rating_view_navigation_tests {
         app.finish_page_identity_preparation_for_test();
         let owner = app.rating_view_physical_load_owner(&path).unwrap();
         assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if app
                 .top_level_grid_view
                 .history_navigation_transition()
@@ -88438,7 +92425,8 @@ mod rating_view_navigation_tests {
         app.rating_view_back();
 
         let ctx = egui::Context::default();
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_rating_view();
             app.poll_sidecar_restore(&ctx);
             if app.items_are_rating_view && !app.sidecar_restore_active() {
@@ -89430,6 +93418,8 @@ mod ai_upscale_livelock_tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: dummy_tex.clone(),
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
                 source_dims: None,
@@ -89501,6 +93491,8 @@ mod ai_upscale_livelock_tests {
             egui::TextureOptions::LINEAR,
         );
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex,
             pixels: std::sync::Arc::new(egui::ColorImage::filled([w, h], egui::Color32::WHITE)),
             source_dims: None,
@@ -89769,6 +93761,27 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
     assert!(!app.any_dialog_open());
 
     let ctx = egui::Context::default();
+    let draw_window = |ctx: &egui::Context| {
+        egui::Window::new("future_dialog_not_in_registry")
+            .fixed_pos(egui::pos2(40.0, 40.0))
+            .fixed_size(egui::vec2(240.0, 160.0))
+            .show(ctx, |ui| {
+                ui.label("dialog body");
+            });
+    };
+    // 0.37 Area's first pass measures an invisible, non-interactable window.
+    // The wheel scenario concerns an existing painted window, independently of App's registry.
+    ctx.run_pass(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        },
+        draw_window,
+    )
+    .drop_without_applying_deltas();
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -89783,18 +93796,16 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
         unit: egui::MouseWheelUnit::Line,
         delta: egui::vec2(0.0, -1.0),
         modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
     });
 
-    let _ = ctx.run(input, |ctx| {
-        egui::Window::new("future_dialog_not_in_registry")
-            .fixed_pos(egui::pos2(40.0, 40.0))
-            .fixed_size(egui::vec2(240.0, 160.0))
-            .show(ctx, |ui| {
-                ui.label("dialog body");
-            });
+    ctx.run_pass(input, |ctx| {
+        draw_window(ctx);
         assert!(App::floating_ui_blocks_background_scroll(ctx));
         app.process_scroll(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
 
     assert_eq!(app.scroll_offset_y, 56.0);
 }
@@ -90010,10 +94021,263 @@ mod smart_folder_transition_tests {
             app.shortcuts_blocked_by_text_input(&ctx),
             "main keyboard and gamepad dispatch must share the modal gate"
         );
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.render_smart_folder_overlay(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(ctx.memory(|memory| memory.top_modal_layer().is_some()));
+    }
+
+    #[test]
+    fn section1353_smart_child_reload_keeps_zip_level_and_root_return() {
+        for converted in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let source = app.tmp.path().join("smart-refresh-source");
+            std::fs::create_dir_all(&source).unwrap();
+            let book = source.join("book.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+            for name in ["root.jpg", "A/1.jpg", "B/2.jpg"] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, b"page").unwrap();
+            }
+            zip.finish().unwrap();
+            let logical = if converted {
+                let logical = source.join("source.7z");
+                std::fs::write(&logical, b"source").unwrap();
+                logical
+            } else {
+                book.clone()
+            };
+            let definition = definition("Refresh", source);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder_staged(id, false);
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            if converted {
+                assert!(
+                    app.begin_smart_physical_navigation_with_backing(
+                        logical.clone(),
+                        book.clone(),
+                        super::smart_folder::SmartChildKind::ConvertibleArchive,
+                        false,
+                        None,
+                        None,
+                        crate::app::StartupListIntent::ExplicitList,
+                        None,
+                    )
+                    .is_ok()
+                );
+            } else {
+                assert!(app.begin_staged_smart_drill(&book));
+            }
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            app.zip_nav_enter("A/");
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let route = app.facet_navigation.route().clone();
+            let back = app.folder_nav_back_stack.clone();
+            let forward = app.folder_nav_forward_stack.clone();
+            if converted {
+                std::fs::remove_file(&logical).unwrap();
+            }
+            app.reload_top_level_grid(&ctx);
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+            assert_eq!(app.facet_navigation.route(), &route);
+            assert_eq!(app.folder_nav_back_stack, back);
+            assert_eq!(app.folder_nav_forward_stack, forward);
+            assert!(app.settings.facet_filter.exts.contains("jpg"));
+            assert!(matches!(
+                app.top_level_grid_view.smart_folder().unwrap().position,
+                crate::app::top_level_grid_view::SmartFolderPosition::Container { .. }
+                    | crate::app::top_level_grid_view::SmartFolderPosition::Scoped { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn section1353_smart_missing_prefix_restores_synthetic_zip_root_facet() {
+        for (old_collapsed, new_collapsed, deep, preserved, preserve_parent) in [
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+            (true, true, false, false, false),
+            (true, false, false, false, false),
+            (false, true, true, false, false),
+            (false, false, true, false, false),
+            (false, true, true, true, false),
+            (false, true, true, true, true),
+        ] {
+            for manual in [false, true] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                app.settings.sidecar_backup_enabled = false;
+                let source = app.tmp.path().join("smart-refresh-root-source");
+                std::fs::create_dir_all(&source).unwrap();
+                let book = source.join("book.zip");
+                let write_zip = |names: &[&str]| {
+                    let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+                    for name in names {
+                        zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                            .unwrap();
+                        std::io::Write::write_all(&mut zip, b"page").unwrap();
+                    }
+                    zip.finish().unwrap();
+                };
+                write_zip(if old_collapsed {
+                    &["A/cover.jpg", "A/sub/1.jpg"]
+                } else if deep {
+                    &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]
+                } else {
+                    &["root.jpg", "A/1.jpg", "B/2.jpg"]
+                });
+                let definition = definition("Refresh synthetic root", source);
+                let id = definition.id;
+                app.settings.smart_folders = vec![definition];
+                let ctx = egui::Context::default();
+                app.open_smart_folder_staged(id, false);
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                app.settings.facet_filter.exts.insert("zip".into());
+                let outer_filter = app.settings.facet_filter.clone();
+                assert!(app.begin_staged_smart_drill(&book));
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                let zip_root_route = app.facet_navigation.route().clone();
+                let mut physical_root_route = zip_root_route.clone();
+                while matches!(
+                    physical_root_route.current(),
+                    Some(crate::app::FacetScope::Book { .. })
+                ) {
+                    physical_root_route.0.pop();
+                }
+                assert_eq!(zip_root_route, physical_root_route);
+                let place = app.facet_place_path_for_idx(0).unwrap();
+                app.settings
+                    .facet_filter
+                    .place_keys
+                    .insert(crate::adjustment_db::normalize_path(&place));
+                let root_place_filter = app.settings.facet_filter.clone();
+                app.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
+                assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                assert_eq!(app.settings.facet_filter, root_place_filter);
+                app.settings.facet_filter.place_keys.clear();
+                app.settings.facet_filter.exts.insert("png".into());
+                let zip_root_filter = app.settings.facet_filter.clone();
+                app.zip_nav_enter(if old_collapsed { "A/sub/" } else { "A/" });
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                if old_collapsed {
+                    let child_route = app.facet_navigation.route().clone();
+                    assert!(app.zip_nav_back());
+                    assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert_eq!(app.settings.facet_filter, zip_root_filter);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+                    app.zip_nav_enter("A/sub/");
+                    wait_for_staged_smart_terminal(&mut app, &ctx);
+                    assert_eq!(app.facet_navigation.route(), &child_route);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 2);
+                }
+                if deep {
+                    app.settings.facet_filter.exts.insert("gif".into());
+                    app.zip_nav_enter("A/sub/");
+                    wait_for_staged_smart_terminal(&mut app, &ctx);
+                }
+                if manual {
+                    assert!(app.restore_facet_filter_suppression());
+                    assert_eq!(
+                        app.settings
+                            .facet_filter
+                            .exts
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        vec![if deep { "gif" } else { "png" }.to_owned()]
+                    );
+                }
+                app.settings.facet_filter = crate::settings::FacetFilter::default();
+                app.settings.facet_filter.exts.insert("jpg".into());
+                let child_filter = app.settings.facet_filter.clone();
+                let history = app.folder_nav_history_snapshot();
+                write_zip(if preserve_parent {
+                    &["A/cover.jpg", "A/sub/1.jpg"]
+                } else if preserved {
+                    &["A/sub/1.jpg"]
+                } else {
+                    match (deep, new_collapsed) {
+                        (true, true) => &["A/new/1.jpg"],
+                        (true, false) => &["root.jpg", "A/new/1.jpg"],
+                        (false, true) => &["B/2.jpg"],
+                        (false, false) => &["root.jpg", "B/2.jpg"],
+                    }
+                });
+                app.reload_top_level_grid(&ctx);
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                let actual_prefix = if preserved {
+                    "A/sub"
+                } else if deep {
+                    "A/new"
+                } else if new_collapsed {
+                    "B"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().current().join("/"),
+                    actual_prefix
+                );
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().at_root(),
+                    !deep || (new_collapsed && !preserve_parent)
+                );
+                let actual_route = if app.zip_nav.as_ref().unwrap().at_root() {
+                    physical_root_route.clone()
+                } else {
+                    physical_root_route.child(crate::app::FacetScope::book(&book, actual_prefix))
+                };
+                assert_eq!(app.facet_navigation.route(), &actual_route);
+                assert_eq!(
+                    app.settings.facet_filter,
+                    if preserved {
+                        child_filter
+                    } else if old_collapsed {
+                        crate::settings::FacetFilter::default()
+                    } else if manual {
+                        child_filter
+                    } else if deep {
+                        let mut filter = crate::settings::FacetFilter::default();
+                        filter.exts.insert("gif".into());
+                        filter
+                    } else {
+                        zip_root_filter
+                    }
+                );
+                assert_eq!(
+                    app.facet_navigation.saved_frame_count(),
+                    1 + usize::from(deep && (!new_collapsed || (preserve_parent && !manual)))
+                );
+                assert_eq!(app.facet_navigation.saved_filter(0), &outer_filter);
+                assert_eq!(app.folder_nav_back_stack, history.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+                assert_eq!(
+                    app.zip_nav_back(),
+                    deep && (!new_collapsed || preserve_parent)
+                );
+                if deep && (!new_collapsed || preserve_parent) {
+                    assert_eq!(
+                        app.zip_nav.as_ref().unwrap().current().join("/"),
+                        if preserve_parent { "A" } else { "" },
+                    );
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert!(app.settings.facet_filter.exts.contains(if preserve_parent {
+                        if manual { "jpg" } else { "gif" }
+                    } else {
+                        "png"
+                    },));
+                }
+            }
+        }
     }
 
     #[test]
@@ -90224,7 +94488,7 @@ mod smart_folder_transition_tests {
         std::fs::write(source.join("page.jpg"), []).unwrap();
         let row = app.tmp.path().join("search-result.jpg");
         app.global_search.active = true;
-        app.global_search.query = "test".into();
+        app.global_search.metadata_draft = "test".into();
         app.global_search.last_executed = "test".into();
         app.top_level_grid_view
             .replace_surface(TopLevelGridSurface::Search(TopLevelSearchView::Global));
@@ -90532,7 +94796,7 @@ mod smart_folder_transition_tests {
             Some(TopLevelGridRestore::SmartFolder(root)),
         );
         app.global_search.active = true;
-        app.global_search.query = "result".into();
+        app.global_search.metadata_draft = "result".into();
         app.global_search.last_executed = "result".into();
         let row = app.tmp.path().join("result.jpg");
         app.items = vec![GridItem::Image(row.clone())];
@@ -91746,7 +96010,7 @@ mod smart_folder_transition_tests {
         std::fs::write(next.join("next.jpg"), []).unwrap();
         let row = app.tmp.path().join("search-result.jpg");
         app.global_search.active = true;
-        app.global_search.query = "test".into();
+        app.global_search.metadata_draft = "test".into();
         app.global_search.last_executed = "test".into();
         app.top_level_grid_view.replace_surface(
             crate::app::top_level_grid_view::TopLevelGridSurface::Search(
@@ -91994,6 +96258,7 @@ mod smart_folder_transition_tests {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let deferred_fullscreen = with_deferred_fullscreen.then(|| {
             crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                owner_context: app.projected_viewer_context_id(),
                 restore_video_tile: false,
                 reopen: DeferredFsReopen {
                     history_trigger: crate::app::HistoryTrigger::UserChosen,
@@ -92008,27 +96273,29 @@ mod smart_folder_transition_tests {
         if with_deferred_fullscreen {
             app.fs_nav_locked_gen = Some(app.items_generation);
         }
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: source.to_path_buf(),
-            input_seq: app.input_seq,
-            format: ArchiveFormat::Rar,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::clone(&cancel),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: Some(source.to_path_buf()),
-            allow_direct_read: true,
-            completion,
-            pending_sibling_output: None,
-            auto_fullscreen: false,
-            deferred_fullscreen,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                src_path: source.to_path_buf(),
+                input_seq: app.input_seq,
+                format: ArchiveFormat::Rar,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: std::sync::Arc::clone(&cancel),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: Some(source.to_path_buf()),
+                allow_direct_read: true,
+                completion,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         cancel
     }
 
@@ -92230,7 +96497,7 @@ mod smart_folder_transition_tests {
         assert_eq!(convertible_archive_main_state(&app), before);
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,
@@ -92242,7 +96509,8 @@ mod smart_folder_transition_tests {
                 ..Default::default()
             },
             |ctx| app.show_archive_convert_dialog(ctx),
-        );
+        )
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert_eq!(convertible_archive_main_state(&app), before);
@@ -92276,9 +96544,10 @@ mod smart_folder_transition_tests {
         )
         .unwrap();
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -93362,6 +97631,107 @@ mod smart_folder_transition_tests {
         assert!(matches!(app.items.as_slice(), [GridItem::Image(path)] if path == &sentinel));
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_direct_archive_owner_without_recounting_cache_hydration() {
+        for format in [ArchiveFormat::Rar, ArchiveFormat::SevenZ] {
+            let mut app = setup_app();
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.settings.sidecar_backup_enabled = false;
+            let folder = app.tmp.path().join("direct-count");
+            std::fs::create_dir(&folder).unwrap();
+            let source = folder.join(if format == ArchiveFormat::Rar {
+                "book.rar"
+            } else {
+                "book.7z"
+            });
+            std::fs::write(&source, b"archive").unwrap();
+            let cached = app.tmp.path().join("direct-count-cache.zip");
+            write_convert_completion_zip(&cached);
+            app.load_folder(folder);
+            super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(
+                &mut app,
+            );
+            let before = app.test_script_folder_load_requests;
+            let started = if format == ArchiveFormat::Rar {
+                app.request_rar_open_owned(
+                    source,
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                )
+            } else {
+                app.request_archive_convert_owned(
+                    source,
+                    format,
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                )
+            };
+            assert!(started);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            publish_convert_done_and_open(&mut app, &cached);
+            wait_for_snapshot_archive_listing(&mut app, &cached);
+            assert_eq!(app.current_folder.as_ref(), Some(&cached));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_direct_cache_owner_without_history_once() {
+        let mut app = setup_app();
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        let source = app.tmp.path().join("direct-cached.7z");
+        let cached = app.tmp.path().join("direct-cached.zip");
+        std::fs::write(&source, b"archive").unwrap();
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        let before = app.test_script_folder_load_requests;
+        let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen(source, false);
+        assert!(matches!(
+            outcome,
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        app.settle_open_path_classification_for_test();
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_does_not_count_zip_foreign_conversion_continuation() {
+        for detached in [false, true] {
+            let mut app = setup_app();
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.settings.detached_viewer_open_images_in_window = false;
+            if detached {
+                app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            }
+            let source = app.tmp.path().join("outer-count.zip");
+            let cached = app.tmp.path().join("outer-count-converted.zip");
+            write_convert_completion_zip(&source);
+            write_convert_completion_zip(&cached);
+            app.load_folder(source.clone());
+            wait_for_snapshot_archive_listing(&mut app, &source);
+            let before = app.test_script_folder_load_requests;
+            app.offer_zip_foreign_archive_conversion(
+                &source,
+                false,
+                StartupListIntent::ExplicitList,
+            );
+            assert!(app.archive_convert.is_some());
+            assert_eq!(app.test_script_folder_load_requests, before);
+            publish_convert_done_and_open(&mut app, &cached);
+            wait_for_snapshot_archive_listing(&mut app, &cached);
+            assert_eq!(app.test_script_folder_load_requests, before);
+        }
+    }
+
     #[test]
     fn snapshot_convertible_archive_cache_hit_uses_owned_source_scope() {
         let mut app = setup_app();
@@ -93371,6 +97741,8 @@ mod smart_folder_transition_tests {
         record_convertible_archive_cache(&mut app, &source, &cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
@@ -93378,6 +97750,10 @@ mod smart_folder_transition_tests {
         );
         app.settle_open_path_classification_for_test();
 
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
         assert!(app.archive_convert.is_none());
         assert_eq!(
             app.current_folder, source_folder,
@@ -93390,6 +97766,8 @@ mod smart_folder_transition_tests {
             Some(source.as_path())
         );
         assert!(app.is_snapshot_active());
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
         // Mutation `scope_cache_zip_instead_of_owned_source`: resolve snapshot ownership from
         // `cached` instead of MainGridArchiveTransitionIntent::source_path. The current-folder and
         // listing assertions fail because the common snapshot guard refuses the implementation
@@ -93404,12 +97782,16 @@ mod smart_folder_transition_tests {
         write_convert_completion_zip(&cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
                 .is_none()
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
         let request_id = match app.top_level_grid_view.history_navigation_transition() {
             Some(super::HistoryNavigationTransition::Physical(request)) => request.request_id,
             _ => panic!("snapshot archive open must retain a typed physical owner"),
@@ -93455,6 +97837,8 @@ mod smart_folder_transition_tests {
         // The same `scope_cache_zip_instead_of_owned_source` mutation reaches this test through
         // ConvertDone -> pending_nav -> load_folder_with_scan_owned and leaves the source grid
         // mounted instead of opening the completed archive.
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -93501,9 +97885,10 @@ mod smart_folder_transition_tests {
         app.fs_feedback_toast = None;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -93538,9 +97923,10 @@ mod smart_folder_transition_tests {
         app.fs_feedback_toast = None;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -93611,9 +97997,10 @@ mod smart_folder_transition_tests {
         assert_eq!(app.snapshot_owner_entry(&current_source), Some(0));
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(
@@ -93680,9 +98067,10 @@ mod smart_folder_transition_tests {
         );
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
@@ -93938,6 +98326,39 @@ mod smart_folder_transition_tests {
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         wait_for_smart_folder_scope(&mut app, &ctx, &child);
         assert!(app.top_level_grid_view.smart_folder_session().is_some());
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_delegated_smart_start_once_through_adoption() {
+        for convert_dispatch in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            let source = app.tmp.path().join("count-smart-source");
+            let entry = source.join("child");
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), b"page").unwrap();
+            let definition = definition("Count Smart", source);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+            let before = app.test_script_folder_load_requests;
+            if convert_dispatch {
+                assert_eq!(
+                    app.load_folder_or_convert_archive(entry.clone()),
+                    FolderOpenOutcome::Loaded
+                );
+            } else {
+                app.load_folder(entry.clone());
+            }
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            assert_eq!(app.current_folder.as_ref(), Some(&entry));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
     }
 
     #[test]
@@ -96580,8 +101001,8 @@ fn tooltip_layer_does_not_disable_normal_grid_wheel() {
         .events
         .push(egui::Event::PointerMoved(egui::pos2(80.0, 80.0)));
 
-    let _ = ctx.run(input, |ctx| {
-        egui::Area::new(egui::Id::new("grid_hover_tooltip"))
+    ctx.run_pass(input, |ctx| {
+        egui::Area::new(egui::Id::unique("grid_hover_tooltip"))
             .order(egui::Order::Tooltip)
             .fixed_pos(egui::pos2(40.0, 40.0))
             .show(ctx, |ui| {
@@ -96589,7 +101010,8 @@ fn tooltip_layer_does_not_disable_normal_grid_wheel() {
                 ui.label("tooltip body");
             });
         assert!(!App::floating_ui_blocks_background_scroll(ctx));
-    });
+    })
+    .drop_without_applying_deltas();
 }
 
 #[test]
@@ -96658,9 +101080,12 @@ fn settings_restore_blocks_background_wheel_scroll() {
         unit: egui::MouseWheelUnit::Line,
         delta: egui::vec2(0.0, -1.0),
         modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
     });
 
-    let _ = ctx.run(input, |ctx| app.process_scroll(ctx));
+    ctx.run_pass(input, |ctx| app.process_scroll(ctx))
+        .drop_without_applying_deltas();
 
     assert_eq!(app.scroll_offset_y, 56.0);
 }
@@ -97046,6 +101471,7 @@ fn main_window_close_ring_action_remains_grid_scoped() {
             .load(std::sync::atomic::Ordering::SeqCst),
         "close-main must remain eligible for tray interception"
     );
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -97078,6 +101504,7 @@ fn quit_ring_action_uses_root_close_in_every_context() {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "explicit quit must bypass tray interception from {context:?}"
         );
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -97235,21 +101662,23 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         crate::settings::FsSidePanelMode::Hover
     );
     assert!(ctx.input(|i| i.events.is_empty()));
-    egui::CentralPanel::default().show(&ctx, |ui| {
-        let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
-        let _ = ui.interact(
-            rect,
-            egui::Id::new("fullscreen_tab_round_trip_surface"),
-            egui::Sense::click_and_drag(),
-        );
+    ctx.root_ui(|root_ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+            let _ = ui.interact(
+                rect,
+                egui::Id::unique("fullscreen_tab_round_trip_surface"),
+                egui::Sense::click_and_drag(),
+            );
+        })
     });
-    assert!(!ctx.wants_keyboard_input());
+    assert!(!ctx.egui_wants_keyboard_input());
     let _ = app.handle_fs_key_input(&ctx, idx, false);
     assert_eq!(
         app.settings.fullscreen_side_panel_mode,
         crate::settings::FsSidePanelMode::Hover
     );
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     begin_fullscreen_tab_pass(&ctx, true);
     let _ = app.handle_fs_key_input(&ctx, idx, false);
@@ -97258,7 +101687,7 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         crate::settings::FsSidePanelMode::Hover
     );
     assert!(ctx.input(|i| i.events.is_empty()));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     ctx.begin_pass(egui::RawInput {
         events: vec![egui::Event::Key {
@@ -97270,7 +101699,7 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         }],
         ..Default::default()
     });
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     begin_fullscreen_tab_pass(&ctx, false);
     let _ = app.handle_fs_key_input(&ctx, idx, false);
@@ -97279,7 +101708,7 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         crate::settings::FsSidePanelMode::ClickToShow
     );
     assert!(ctx.input(|i| i.events.is_empty()));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -97302,7 +101731,7 @@ fn fullscreen_i_key_toggles_side_panel_mode() {
     });
 
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(
         app.settings.fullscreen_side_panel_mode,
@@ -97332,7 +101761,7 @@ fn plain_a_has_no_bookmark_panel_fullscreen_action() {
     });
 
     let action = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(action.page_nav.is_none());
     assert!(!action.close);
@@ -97372,6 +101801,7 @@ fn fullscreen_test_key_edge(
     repeat: bool,
 ) -> crate::key_input::KeyEdge {
     crate::key_input::KeyEdge {
+        operation_id: crate::key_input::KeyOperationId::unassigned(),
         source_hwnd: 1,
         source_viewport: egui::ViewportId::ROOT,
         virtual_key,
@@ -97430,7 +101860,7 @@ fn configured_fs_collection_key_reaches_current_image_handler_once() {
         app.fs_feedback_toast.is_none(),
         "same FS press must not be reused"
     );
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -97456,7 +101886,7 @@ fn configured_media_collection_key_reaches_egui_video_and_music_handlers() {
                 .as_ref()
                 .is_some_and(|(text, _, _)| text.contains("追加先"))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 }
 
@@ -97487,21 +101917,23 @@ fn start_bookmark_title_edit_after_handler(app: &mut App, ctx: &egui::Context, f
         title: String::from("editing"),
         request_focus: true,
     });
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 fn draw_bookmark_title_editor(app: &mut App, ctx: &egui::Context) {
-    egui::CentralPanel::default().show(ctx, |ui| {
-        let edit = app
-            .book_bookmark_title_edit
-            .as_mut()
-            .expect("bookmark title editor must be active");
-        let _ = crate::ui_adjustment_panel::draw_bookmark_title_edit_for_test(
-            ui,
-            edit.id,
-            &mut edit.title,
-            &mut edit.request_focus,
-        );
+    ctx.root_ui(|root_ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            let edit = app
+                .book_bookmark_title_edit
+                .as_mut()
+                .expect("bookmark title editor must be active");
+            let _ = crate::ui_adjustment_panel::draw_bookmark_title_edit_for_test(
+                ui,
+                edit.id,
+                &mut edit.title,
+                &mut edit.request_focus,
+            );
+        })
     });
 }
 
@@ -97521,7 +101953,7 @@ fn focus_bookmark_title_editor(app: &mut App, ctx: &egui::Context, fs_idx: usize
     let action = app.handle_fs_key_input(ctx, fs_idx, false);
     assert_no_fullscreen_fixed_key_action(action);
     draw_bookmark_title_editor(app, ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert!(
         app.pending_text_input_focus.get().is_some(),
         "pending focus claim must survive until the handler observes focused TextEdit"
@@ -97558,7 +101990,7 @@ fn run_bookmark_title_key_pass(
     );
     let action = app.handle_fs_key_input(ctx, fs_idx, false);
     draw_bookmark_title_editor(app, ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     action
 }
 
@@ -97618,12 +102050,14 @@ fn focused_slider_still_allows_fullscreen_arrow_navigation() {
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let mut value = 0.5_f32;
     ctx.begin_pass(Default::default());
-    egui::CentralPanel::default().show(&ctx, |ui| {
-        ui.add(egui::Slider::new(&mut value, 0.0..=1.0))
-            .request_focus();
+    ctx.root_ui(|root_ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            ui.add(egui::Slider::new(&mut value, 0.0..=1.0))
+                .request_focus();
+        })
     });
-    let _ = ctx.end_pass();
-    assert!(ctx.wants_keyboard_input());
+    ctx.end_pass().drop_without_applying_deltas();
+    assert!(ctx.egui_wants_keyboard_input());
 
     ctx.begin_pass(egui::RawInput {
         events: vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
@@ -97635,7 +102069,7 @@ fn focused_slider_still_allows_fullscreen_arrow_navigation() {
         crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
     ));
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(!action.page_nav.is_none());
 }
@@ -97656,7 +102090,7 @@ fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
     });
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(!action.page_nav.is_none());
 }
@@ -97710,7 +102144,7 @@ fn fullscreen_routed_tap_is_consumed_once_after_focus_loss() {
 
     let first = app.handle_fs_key_input(&ctx, fs_idx, false);
     let second = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(first.page_nav, crate::ui_fullscreen::FsPageNav::Delta(1));
     assert_no_fullscreen_fixed_key_action(second);
@@ -97735,7 +102169,7 @@ fn fullscreen_sibling_edge_does_not_authorize_unfocused_egui_event() {
     crate::key_input::add_test_frame_active_viewport(viewport);
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -97750,7 +102184,7 @@ fn fullscreen_unfocused_pass_without_edge_or_event_does_nothing() {
     crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -97773,7 +102207,7 @@ fn fullscreen_modal_owner_blocks_routed_edge_after_focus_loss() {
     );
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -97804,7 +102238,7 @@ fn fullscreen_text_input_owner_blocks_routed_edge_after_focus_loss() {
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
     draw_bookmark_title_editor(&mut app, &ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -97832,7 +102266,7 @@ fn fullscreen_released_auto_repeat_is_dropped_after_focus_loss() {
     );
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -97854,7 +102288,7 @@ fn fullscreen_focus_loss_clears_zoom_transient_without_rearming_from_z_edge() {
     crate::key_input::set_test_frame_for_viewport(viewport, vec![fullscreen_z_edge(true, false)]);
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
     assert!(!app.fs_zoom_aiming);
@@ -97863,6 +102297,10 @@ fn fullscreen_focus_loss_clears_zoom_transient_without_rearming_from_z_edge() {
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
     let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
@@ -97875,19 +102313,23 @@ fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
     ));
     app.update_ime_state(&ctx);
     assert!(app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     ctx.begin_pass(viewport_raw_input(
         viewport_b,
         vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
     ));
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(!action.page_nav.is_none());
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event() {
     let _input_guard = crate::key_input::lock_test_input();
     let (mut app, _fs_idx, ctx) = setup_fullscreen_fixed_key_test();
@@ -97900,15 +102342,19 @@ fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event
     ));
     app.update_ime_state(&ctx);
     assert!(app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     ctx.begin_pass(viewport_raw_input(viewport_b, Vec::new()));
     app.update_ime_state(&ctx);
     assert!(!app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() {
     let _input_guard = crate::key_input::lock_test_input();
 
@@ -97921,48 +102367,54 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
     app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     let ctx = egui::Context::default();
     crate::ime_focus::install_ime_input_policy(&ctx);
-    let field_id = egui::Id::new("ime-bookmark-title-focus-contract");
+    let field_id = egui::Id::unique("ime-bookmark-title-focus-contract");
     let mut title = String::new();
     let mut request_focus = true;
     let draw_field = |ctx: &egui::Context, title: &mut String, request_focus: &mut bool| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let _ = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
-                edit.id(field_id)
-            });
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let _ = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
+                    edit.id(field_id)
+                });
+            })
         });
     };
 
     ctx.begin_pass(Default::default());
     draw_field(&ctx, &mut title, &mut request_focus);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
     ctx.begin_pass(egui::RawInput {
         events: vec![
             egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "あ".to_owned(),
+                active_range_chars: None,
+            }),
         ],
         ..Default::default()
     });
     draw_field(&ctx, &mut title, &mut request_focus);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     let alt = egui::Modifiers {
         alt: true,
         ..Default::default()
     };
     ctx.begin_pass(egui::RawInput {
-        modifiers: alt,
-        events: vec![
-            egui::Event::Ime(egui::ImeEvent::Disabled),
-            egui::Event::Key {
-                key: egui::Key::J,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: alt,
-            },
-        ],
+        events: std::iter::once(egui::Event::ModifiersChanged(alt))
+            .chain(vec![
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::Key {
+                    key: egui::Key::J,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: alt,
+                },
+            ])
+            .collect(),
         ..Default::default()
     });
     // Windows Alt/IME processing can remove egui's focused widget before the
@@ -97977,7 +102429,7 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
         }
     );
     draw_field(&ctx, &mut title, &mut request_focus);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
     ctx.begin_pass(egui::RawInput {
@@ -97991,7 +102443,7 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
         ..Default::default()
     });
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(
         app.adjustment_mode.is_open(),
@@ -98015,18 +102467,19 @@ fn still_seek_strip_toggle_key_uses_shared_setting_and_obeys_keymap() {
 
     let press = |app: &mut App, key: egui::Key, modifiers: egui::Modifiers| {
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     };
     let shift = egui::Modifiers {
         shift: true,
@@ -98071,7 +102524,7 @@ fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(&ctx, idx, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
 
         assert_eq!(
@@ -98101,7 +102554,7 @@ fn music_fullscreen_i_key_toggles_side_panel_mode() {
     });
 
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(
         app.settings.fullscreen_side_panel_mode,
@@ -98131,7 +102584,7 @@ fn music_fullscreen_i_and_tab_return_to_hover_without_repeat_retoggle() {
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(&ctx, idx, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
 
         assert_eq!(
@@ -98160,7 +102613,7 @@ fn video_audio_toggle_normal_video_egui_requests_enter() {
     let _ = app.keyboard_owner_for_pass(&ctx);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(
         crate::app::native_video::take_video_audio_enter_requests_for_test(),
@@ -98202,7 +102655,7 @@ fn video_adjust_slot_egui_loads_saved_slot_when_video_is_visible() {
     let _ = app.keyboard_owner_for_pass(&ctx);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, saved);
 }
@@ -98264,7 +102717,7 @@ fn video_adjust_slot_egui_does_not_load_when_presenter_is_hidden() {
     begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num1);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, before);
 }
@@ -98284,7 +102737,7 @@ fn video_adjust_slot_egui_loads_when_audio_mode_vst_makes_video_visible() {
     begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num1);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, saved);
 }
@@ -98299,7 +102752,7 @@ fn video_adjust_slot_egui_empty_slot_keeps_current_adjustments() {
     begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num2);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, before);
 }
@@ -98329,7 +102782,7 @@ fn video_adjust_slot_egui_modal_guard_leaves_key_unconsumed() {
             )
         })
     }));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, before);
 }
@@ -98391,7 +102844,7 @@ fn video_audio_toggle_audio_mode_egui_requests_exit() {
     });
 
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.video_audio_mode, None);
     assert!(
@@ -98446,7 +102899,7 @@ fn video_audio_toggle_repeat_egui_does_not_request_transition() {
         events: vec![fullscreen_fixed_key_event(egui::Key::Z)],
         ..Default::default()
     });
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     ctx.begin_pass(egui::RawInput {
         events: vec![fullscreen_fixed_key_event_with_state(
             egui::Key::Z,
@@ -98471,7 +102924,7 @@ fn video_audio_toggle_repeat_egui_does_not_request_transition() {
     }));
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.video_audio_mode, None);
     assert_eq!(
@@ -99338,6 +103791,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
     };
 
     app.start_loading_subfolder_items(
+        crate::app::book_materialization::ExtractedSurface::SubfolderExpansion,
         PathBuf::from("__smart_folder__\\test"),
         vec![GridItem::Image(path)],
         vec![Some((1, 5))],
@@ -99753,14 +104207,14 @@ mod rating_write_failure_tests {
                 crate::gamepad::PadAxis::LeftX,
                 0.9,
             ));
-        let _ = app.sample_gamepad_input(&ctx);
-        assert!(!app.gamepad_state.is_idle());
+        let _ = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(!app.gamepad.state.is_idle());
 
         app.settings.gamepad_enabled = false;
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
 
         assert!(batch.session_ended_for_test(), "区切りを batch で伝える");
-        assert!(app.gamepad_state.is_idle(), "物理側は sample が終わらせる");
+        assert!(app.gamepad.state.is_idle(), "物理側は sample が終わらせる");
         assert!(
             app.ring_picker.is_some(),
             "編集の確定は sample の中でやらない"
@@ -99805,7 +104259,7 @@ mod rating_write_failure_tests {
         // パッドが切れる (= 設定 OFF と同じ終端)。sample は物理側だけを終わらせ、
         // リングの確定は通常の配送が所有 context で行う (N01)。
         app.settings.gamepad_enabled = false;
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
         assert!(
             app.ring_picker.is_some(),
             "sample はリングを確定しない (root 投影のため)"
@@ -99973,6 +104427,7 @@ mod rating_write_failure_tests {
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx: 1,
                 seek_serial: 2,
+                player_identity: 0,
             }
             .history_trigger(),
             HistoryTrigger::AutoAdvance
@@ -99982,6 +104437,7 @@ mod rating_write_failure_tests {
             MediaNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx: 1,
                 seek_serial: 2,
+                player_identity: 0,
             }
             .history_trigger(),
             HistoryTrigger::AutoAdvance
@@ -99990,6 +104446,7 @@ mod rating_write_failure_tests {
             MediaNavigationAction::MusicContinuousEof {
                 fs_idx: 1,
                 seek_serial: 2,
+                player_identity: 0,
             }
             .history_trigger(),
             HistoryTrigger::AutoAdvance
@@ -100414,6 +104871,230 @@ mod bulk_adjust_cost_tests {
         println!("  DB 1 行ずつ (いまの発行のしかた)                 : {db_row_by_row_ms:9.1} ms");
         println!("  DB 1 トランザクション (既存 bulk API)            : {db_bulk_ms:9.1} ms");
         println!("  復元先の解決 (U01 で直した部分)                  : {resolve_ms:9.1} ms");
+        println!();
+    }
+
+    fn setup_pages(app: &mut App, tmp: &std::path::Path) -> Vec<PathBuf> {
+        let root = tmp.join("pages");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..PAGES {
+            let path = root.join(format!("p{i:05}.jpg"));
+            std::fs::write(&path, b"not decoded by this test").unwrap();
+            paths.push(path);
+        }
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; PAGES];
+        app.current_folder = Some(root.clone());
+        app.visible_indices = (0..PAGES).collect();
+        paths
+    }
+
+    fn ms(t: Instant) -> f64 {
+        t.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// 1 ページぶんの書き込みが呼ぶ部品を、部品ごとに N 回ずつ測る (§1.176 の残り時間の内訳)。
+    /// 実際の Ctrl+1 経路 (`capture_adjust_full` + `apply_slot_to_grid_selection`) も測る。
+    #[test]
+    #[ignore = "計測。合否ではない"]
+    fn bulk_adjust_cost_parts() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        setup_pages(&mut app, &tmp);
+        for idx in 0..PAGES {
+            app.checked.insert(idx);
+        }
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "計測".into(),
+            params: params(10.0),
+        });
+        let t = Instant::now();
+        app.capture_adjust_full("計測".to_string(), |a| a.apply_slot_to_grid_selection(0));
+        let slot_apply_ms = ms(t);
+        let t = Instant::now();
+        app.apply_meta_undo();
+        let slot_undo_ms = ms(t);
+        let t = Instant::now();
+        app.apply_meta_redo();
+        let slot_redo_ms = ms(t);
+        app.checked.extend(0..PAGES);
+        let t = Instant::now();
+        app.capture_adjust_full("解除の計測".into(), |a| {
+            a.clear_page_params_for_selection()
+        });
+        let clear_ms = ms(t);
+        let mut ai_params = params(10.0);
+        ai_params.upscale_model = Some("measurement-ai".into());
+        // 過去に閲覧済みの AI 世代も含め、全体無効化の反復コストを比較する。
+        for idx in 0..PAGES {
+            app.ai_upscale_generation.insert(format!("viewed-{idx}"), 0);
+        }
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.clear_caches_for_param_change(idx, &params(10.0), &ai_params);
+        }
+        let ai_legacy_cache_ms = ms(t);
+        app.settings.preset_slots.slots[0].as_mut().unwrap().params = ai_params;
+        app.checked.extend(0..PAGES);
+        let t = Instant::now();
+        app.capture_adjust_full("AI適用の計測".into(), |a| {
+            a.apply_slot_to_grid_selection(0)
+        });
+        let ai_slot_apply_ms = ms(t);
+        // setup_app は data_dir のテスト用ロックを持つので、次を作る前に手放す。
+        drop(app);
+
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        setup_pages(&mut app, &tmp);
+        let p = params(10.0);
+        let mut rows: Vec<(&str, f64)> = Vec::new();
+
+        let t = Instant::now();
+        let targets: Vec<_> = (0..PAGES)
+            .map(|idx| app.page_adjustment_target_for_idx(idx).unwrap())
+            .collect();
+        rows.push(("page_adjustment_target_for_idx", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = app.effective_params_for_target(target);
+        }
+        rows.push(("effective_params_for_target", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = app.page_adjustment_indices(target);
+        }
+        rows.push(("page_adjustment_indices", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            let _ = app.effective_params(idx).clone();
+        }
+        rows.push(("effective_params(idx).clone", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = app.adjustment_standard_params_for_target(target);
+        }
+        rows.push(("adjustment_standard_params_for_target", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = App::edit_store_write(
+                app.adjustment_db
+                    .as_ref()
+                    .map(|db| db.set_page_params(&target.page_key, &p)),
+            );
+        }
+        rows.push(("DB set_page_params (1 行ずつ)", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.adjustment_page_params.insert(idx, p.clone());
+            app.sync_prepared_page_edit_key_for_idx(idx);
+        }
+        rows.push(("page_params insert + sync_prepared_page_edit_key", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            App::set_page_key_presence(&mut app.adjusted_page_keys, &target.page_key, true);
+        }
+        rows.push(("set_page_key_presence", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let sp = p.clone();
+            app.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), move |sidecar, rel| {
+                sidecar.set_adjust(rel, sp)
+            });
+        }
+        rows.push(("sidecar set_adjust", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.adjustment_cache.remove(&idx);
+            app.invalidate_compare_prepared_for_idx(idx);
+            app.thumb_adjust_tex.remove(&idx);
+        }
+        rows.push(("adjustment_cache/compare/thumb 除去", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.bump_adjustment_generation(idx);
+        }
+        rows.push(("bump_adjustment_generation", ms(t)));
+
+        let t = Instant::now();
+        for _ in 0..PAGES {
+            app.schedule_current_smart_folder_metadata_refresh(
+                smart_folder::SmartFolderMetadataDependency::Edits,
+            );
+        }
+        rows.push(("schedule_current_smart_folder_metadata_refresh", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
+        rows.push(("record_content_identity_for_idx", ms(t)));
+
+        let old = crate::adjustment::AdjustParams::default();
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.clear_caches_for_param_change(idx, &old, &p);
+        }
+        rows.push(("clear_caches_for_param_change", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            app.publish_accepted_adjustment_page_edits(&HashMap::from([(
+                target.page_key.clone(),
+                Some(p.clone()),
+            )]));
+        }
+        rows.push((
+            "publish_accepted_adjustment_page_edits N 回 (1 件ずつ)",
+            ms(t),
+        ));
+
+        let documents: HashMap<String, Option<crate::adjustment::AdjustParams>> = targets
+            .iter()
+            .map(|target| (target.page_key.clone(), Some(p.clone())))
+            .collect();
+        let t = Instant::now();
+        app.publish_accepted_adjustment_page_edits(&documents);
+        rows.push((
+            "[1 回] publish_accepted_adjustment_page_edits (N 件)",
+            ms(t),
+        ));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            let _ = app.page_adjust_undo_scope(idx);
+        }
+        rows.push(("page_adjust_undo_scope (capture の差分)", ms(t)));
+
+        let t = Instant::now();
+        let _ = app.adjustment_page_params.clone();
+        rows.push(("[1 回] adjustment_page_params.clone", ms(t)));
+
+        println!("\n=== 一括補正の部品ごとの時間 ({PAGES} ページ) ===");
+        println!("  実経路 Ctrl+1 適用  : {slot_apply_ms:9.1} ms");
+        println!("  実経路 取り消し     : {slot_undo_ms:9.1} ms");
+        println!("  実経路 やり直し     : {slot_redo_ms:9.1} ms");
+        println!("  実経路 一括解除     : {clear_ms:9.1} ms");
+        println!("  実経路 AI変更スロット: {ai_slot_apply_ms:9.1} ms");
+        println!("  旧AI全体cache無効化 x N (世代N件): {ai_legacy_cache_ms:9.1} ms");
+        println!("  ── 部品 (N 回の合計) ──");
+        for (name, value) in &rows {
+            println!("  {name:<58}: {value:9.1} ms");
+        }
         println!();
     }
 }
@@ -100956,7 +105637,7 @@ mod ring_picker_owner_tests {
         // メイン一覧が前面のままパッドが切れる。
         app.gamepad
             .push_for_test(crate::gamepad::PadEvent::Disconnected);
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
         assert!(batch.session_ended_for_test(), "区切りを batch で伝える");
         let _ = app.dispatch_gamepad_batch(&ctx, batch);
 
@@ -101255,7 +105936,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
     crate::ui_fonts::configure_fonts(&ctx);
     // TopBottomPanel learns the integrated toolbar height on its first frame.
     // Inspect the settled frame, as the real event loop and Harness do.
-    let _ = ctx.run(
+    ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -101264,10 +105945,11 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_toolbar(ctx);
+            ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
         },
-    );
-    let output = ctx.run(
+    )
+    .drop_without_applying_deltas();
+    let output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -101276,7 +105958,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_toolbar(ctx);
+            ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
         },
     );
     let mut drawn = String::new();
@@ -101295,7 +105977,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
 
     // フォルダバー右クリックの設定で消せること。
     app.settings.show_address_bar_omitted_entries = false;
-    let hidden = ctx.run(
+    let hidden = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -101304,7 +105986,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_toolbar(ctx);
+            ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
         },
     );
     let mut drawn_off = String::new();
@@ -101317,6 +105999,9 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
         }
     }
     assert!(!drawn_off.contains("非表示"), "OFF にしたら出さない");
+    hidden.drop_without_applying_deltas();
+
+    output.drop_without_applying_deltas();
 }
 
 /// 空になった理由は、次の読み込みへ持ち越さない (§1.68)。
@@ -101484,9 +106169,10 @@ fn the_current_window_rect_is_recorded_even_while_maximized() {
     viewport.minimized = Some(false);
     viewport.maximized = Some(true);
 
-    let _ = ctx.run(input, |ctx| {
+    ctx.run_pass(input, |ctx| {
         app.track_window_rect(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
 
     assert_eq!(
         app.last_window_rect,
@@ -101506,9 +106192,10 @@ fn the_current_window_rect_is_recorded_even_while_maximized() {
     viewport.inner_rect = Some(restored);
     viewport.minimized = Some(false);
     viewport.maximized = Some(false);
-    let _ = ctx.run(input, |ctx| {
+    ctx.run_pass(input, |ctx| {
         app.track_window_rect(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
     assert_eq!(app.last_window_rect, Some(restored));
     assert_eq!(app.last_outer_rect, Some(restored));
 }
@@ -101606,30 +106293,62 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
 
     // rustfmt 済みなので、メソッドの終わりはインデント 4 の閉じ括弧の行。
     // 改行コードに依存しないよう行単位で切り出す。
-    const NEWLINE: &str = "
-";
-    let mut body = String::new();
-    let mut inside = false;
-    for line in src.lines() {
-        if line.contains("fn take_and_close_current_active_viewer_context(") {
-            inside = true;
-        }
-        if inside {
-            body.push_str(line);
-            body.push_str(NEWLINE);
-            if line == "    }" {
-                break;
+    let method_body = |name: &str| {
+        let start = format!("fn {name}(");
+        let mut body = String::new();
+        let mut inside = false;
+        for line in src.lines() {
+            if line.contains(&start) {
+                inside = true;
+            }
+            if inside {
+                body.push_str(line);
+                body.push('\n');
+                if line == "    }" {
+                    break;
+                }
             }
         }
-    }
+        assert!(!body.is_empty(), "seam {name} が見つからない");
+        body
+    };
+    // §1.373 の metadata 境界を持つ共有 seam へ移った後も、通常 close は
+    // Manual 境界でそこへ配送され、実際の retire closure が終端を完遂する。
+    let wrapper = method_body("take_and_close_current_active_viewer_context");
     assert!(
-        !body.is_empty(),
-        "seam が見つからない (改名したならこの検査も更新する)"
+        wrapper
+            .contains("self.take_and_close_current_active_viewer_context_with_metadata_boundary(")
+            && wrapper.contains("FsMetadataBoundary::Manual"),
+        "通常 close が metadata 境界付きの共有 seam を通っていない"
     );
+    let body = method_body("take_and_close_current_active_viewer_context_with_metadata_boundary");
+    assert!(body.contains("self.take_and_close_active_context_with_cause(ctx, reason, boundary, ViewerCloseCause::User)"),
+        "metadata境界付きseamがUser causeを持つterminal ownerへ配送されていない");
+    let body = method_body("take_and_close_active_context_with_cause");
     let body = body.as_str();
+    let transfer = body
+        .find("self.transfer_terminal_close_return(id, cause);")
+        .expect("teardown前の帰還移譲がない");
+    let retire = body
+        .find("self.close_and_retire_context(")
+        .expect("typed cause ownerがretire seamを通っていない");
+    assert!(
+        transfer < retire,
+        "帰還の所有値はviewer teardownより前に移譲する"
+    );
+    let terminal_closure = body
+        .split_once("self.close_and_retire_context(")
+        .expect("共有 seam が close-and-retire owner を通っていない")
+        .1
+        .split_once("|app| {")
+        .expect("retire 前の terminal closure がない")
+        .1
+        .split_once("|context| ClosedBookmarkSummary::read(")
+        .expect("retire 後の bookmark 読込がない")
+        .0;
 
     assert!(
-        body.contains("close_fullscreen_to_completion"),
+        terminal_closure.contains("app.close_fullscreen_to_completion(ctx)"),
         "遷移中に TerminalClose を出しただけで context を捨てている。 この closure を抜けた直後に bundle は retire されるので、 effects を実行する「後で」が無い"
     );
     // 非 Windows には遷移そのものが無いので、そちらの素の呼び出しは正しい。
@@ -101686,10 +106405,12 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
 
     // active context が無い = root が前面。batch は配られずに返る。
     assert!(!app.active_detached_context_is_at_rest());
-    let update = app.update_active_viewer_context(
-        &ctx,
-        Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
-    );
+    let update = ctx.root_ui(|ui| {
+        app.update_active_viewer_context(
+            ui,
+            Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
+        )
+    });
     assert!(!update.updated);
     assert!(
         update.gamepad_batch.is_some(),
@@ -101723,10 +106444,12 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
         app.viewer_context_residence(context_id)
     );
 
-    let update = app.update_active_viewer_context(
-        &ctx,
-        Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
-    );
+    let update = ctx.root_ui(|ui| {
+        app.update_active_viewer_context(
+            ui,
+            Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
+        )
+    });
     assert!(
         update.gamepad_batch.is_none(),
         "前面の別ウィンドウへ配らず、root へ返している"
@@ -102150,7 +106873,7 @@ fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport(
     app.detached_window_hwnd_set(SIBLING_WINDOW, SIBLING_HOST);
     app.set_detached_window_live_hwnds_for_test([OLD_HOST, SIBLING_HOST]);
     app.begin_mounted_detached_session_for_test(SIBLING_WINDOW, DetachedSource::Video);
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
     let sibling_context = app
         .locate_window_context(SIBLING_WINDOW)
         .expect("sibling binding before stale cleanup")
@@ -102257,6 +106980,7 @@ fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport(
             .is_some_and(|viewport| !viewport.commands.contains(&egui::ViewportCommand::Close)),
         "DestroyHost(old) must address only the effect-owned viewport identity"
     );
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -102491,6 +107215,8 @@ mod sns_split_p2_transition_tests {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some(source_dims),
@@ -102513,6 +107239,8 @@ mod sns_split_p2_transition_tests {
         app.sns_split_drag = Some(SnsSplitDrag {
             handle: crate::export_crop::CropHandle::SouthEast,
             base: layout,
+            owner: app.capture_page_edit_owner(current_idx).unwrap(),
+            press_frame: 0,
         });
         app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
             saved_mode: crate::settings::SpreadMode::Ltr,
@@ -102654,7 +107382,7 @@ mod sns_split_p2_transition_tests {
         });
         app.keyboard_owner_for_pass(&ctx);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_sns_split_transient_state_cleared(&app);
         assert_eq!(
@@ -104186,6 +108914,7 @@ mod background_click_scroll_regression_tests {
         navs: Vec<crate::ui_main::AddressBarNav>,
         wheels_consumed: Vec<bool>,
         parent_return_scroll: Vec<f32>,
+        root_ui_origin: egui::Pos2,
     }
 
     fn install_items(app: &mut App, folder: &Path, count: usize) {
@@ -104199,12 +108928,21 @@ mod background_click_scroll_regression_tests {
     }
 
     fn harness(app: AppTestEnvForTest) -> Harness<'static, State> {
+        harness_with_size(app, egui::vec2(2000.0, 480.0))
+    }
+
+    fn harness_with_size(app: AppTestEnvForTest, size: egui::Vec2) -> Harness<'static, State> {
         let mut fonts_set = false;
         crate::test_ui::builder()
-            .with_size(egui::vec2(2000.0, 480.0))
+            .with_size(size)
             .with_step_dt(0.01)
-            .build_state(
-                move |ctx, state| {
+            .build_ui_state(
+                move |root_ui, state| {
+                    let ctx = &root_ui.ctx().clone();
+                    // kittest's Ui API wraps the callback in its own outer-margin frame.
+                    // Grid-local probes must include that observed origin, including at DPI.
+                    state.root_ui_origin = root_ui.available_rect_before_wrap().min;
+
                     if !fonts_set {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_set = true;
@@ -104213,10 +108951,22 @@ mod background_click_scroll_regression_tests {
                     }
                     state.app.begin_grid_click_input_frame(ctx);
                     // Match App::update: the wheel owner runs before render_grid.
-                    let had_wheel = ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5);
+                    let input_options = ctx.options(|options| options.input_options);
+                    let had_wheel = ctx.input(|input| {
+                        crate::wheel_input::remaining_wheel_delta(input, input_options)
+                            .y
+                            .abs()
+                            > 0.5
+                    });
                     state.app.process_scroll(ctx);
                     if had_wheel {
-                        assert_eq!(ctx.input(|input| input.raw_scroll_delta), egui::Vec2::ZERO);
+                        assert_eq!(
+                            ctx.input(|input| crate::wheel_input::remaining_wheel_delta(
+                                input,
+                                input_options
+                            )),
+                            egui::Vec2::ZERO
+                        );
                         assert!(!ctx.input(|input| {
                             input
                                 .events
@@ -104228,7 +108978,7 @@ mod background_click_scroll_regression_tests {
                             .push(ctx.input(|input| input.modifiers.ctrl));
                     }
                     let old_folder = state.app.current_folder.clone();
-                    if let Some(nav) = state.app.render_grid(ctx) {
+                    if let Some(nav) = state.app.render_grid(root_ui) {
                         state.navs.push(nav);
                     }
                     if state.app.current_folder != old_folder {
@@ -104240,6 +108990,7 @@ mod background_click_scroll_regression_tests {
                     navs: Vec::new(),
                     wheels_consumed: Vec::new(),
                     parent_return_scroll: Vec::new(),
+                    root_ui_origin: egui::Pos2::ZERO,
                 },
             )
     }
@@ -104283,6 +109034,8 @@ mod background_click_scroll_regression_tests {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, -1.0),
                     modifiers,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
                 modifiers,
             );
@@ -104376,29 +109129,37 @@ mod background_click_scroll_regression_tests {
         app.settings.grid_cols = 4;
         app.settings.grid_background_double_click_parent = true;
         app.selected = Some(0);
-        let mut harness = harness(app);
+        // A square four-column row at this width is taller than the old 480pt viewport.
+        // Keep the complete painted cell, including its bottom badges/caption, visible.
+        let mut harness = harness_with_size(app, egui::vec2(2000.0, 720.0));
         harness.run_steps(6);
         let tex = harness.ctx.load_texture(
             "letterbox-test",
             egui::ColorImage::filled(size, egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        harness.state_mut().app.thumbnails[0] = ThumbnailState::Loaded {
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: size[0].max(size[1]) as u32,
-            source_dims: None,
-            layout_dims: None,
-        };
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            size[0].max(size[1]) as u32,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        );
         harness.run_steps(6);
+        assert!(
+            harness.state().app.last_cell_h <= harness.state().app.last_viewport_h,
+            "letterbox probes require the whole cell, including the lower plates, in view"
+        );
         harness
     }
 
     #[test]
     fn letterbox_real_grid_portrait_single_click_clears_selection() {
         let mut harness = letterbox_harness([40, 120]);
-        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        let cell = cell_rect(&harness);
+        let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
         click(&mut harness, pos);
         assert_eq!(harness.state().app.selected, None);
     }
@@ -104407,7 +109168,8 @@ mod background_click_scroll_regression_tests {
     fn letterbox_real_grid_portrait_double_click_requests_parent() {
         let mut harness = letterbox_harness([40, 120]);
         let parent = harness.state().app.tmp.path().to_path_buf();
-        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        let cell = cell_rect(&harness);
+        let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
         click(&mut harness, pos);
         click(&mut harness, pos);
         assert_eq!(harness.state().navs.len(), 1);
@@ -104418,7 +109180,7 @@ mod background_click_scroll_regression_tests {
 
     fn cell_rect(harness: &Harness<'_, State>) -> egui::Rect {
         egui::Rect::from_min_size(
-            egui::pos2(8.0, 8.0),
+            harness.state().root_ui_origin + egui::vec2(8.0, 8.0),
             egui::vec2(
                 harness.state().app.last_cell_size,
                 harness.state().app.last_cell_h,
@@ -104858,24 +109620,133 @@ mod background_click_scroll_regression_tests {
     }
 
     #[test]
-    fn letterbox_real_grid_folder_and_drive_icons_protect_only_drawn_area() {
-        for drive in [false, true] {
+    fn letterbox_real_grid_folder_icons_own_inner_area_with_setting_on_and_off() {
+        for (drive, virtual_dir, enabled) in [
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
             let mut harness = letterbox_harness([40, 120]);
             harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
-            harness.state_mut().app.items[0] = GridItem::Folder("C:\\".into());
+            let folder = harness.state().app.tmp.path().join("selected-folder");
+            if virtual_dir {
+                harness.state_mut().app.zip_nav = Some(metadata_panel_test_zip_nav(
+                    "book.zip".into(),
+                    &["chapter/page.png"],
+                ));
+            }
+            harness.state_mut().app.items[0] = if virtual_dir {
+                GridItem::ZipDir {
+                    zip_path: "book.zip".into(),
+                    dir_prefix: "chapter/".into(),
+                    is_archive: false,
+                    representative: None,
+                }
+            } else {
+                GridItem::Folder(folder.clone())
+            };
             harness.state_mut().app.items_are_drive_list = drive;
+            harness
+                .state_mut()
+                .app
+                .settings
+                .grid_background_double_click_parent = enabled;
             harness.state_mut().app.selected = None;
             harness.run_steps(4);
             let rect = cell_rect(&harness);
-            click(
-                &mut harness,
-                rect.min + egui::vec2(5.0, rect.height() * 0.5),
-            );
-            assert_eq!(harness.state().app.selected, None);
-            click(&mut harness, rect.center() - egui::vec2(0.0, 14.0));
+            let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            click(&mut harness, pos);
             assert_eq!(harness.state().app.selected, Some(0));
             assert!(harness.state().navs.is_empty());
+            click(&mut harness, pos);
+            if virtual_dir {
+                assert_eq!(
+                    harness.state().app.zip_nav.as_ref().unwrap().current(),
+                    &["chapter"]
+                );
+                assert!(harness.state().navs.is_empty());
+            } else {
+                assert!(matches!(harness.state().navs.as_slice(),
+                    [crate::ui_main::AddressBarNav::Direct(path, _)] if path == &folder));
+            }
         }
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_icon_padding_and_empty_space_still_return_to_parent() {
+        for empty_space in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.state_mut().app.items[0] = GridItem::Folder("folder".into());
+            harness.state_mut().app.thumbnails[0] = ThumbnailState::Failed;
+            harness.run_steps(4);
+            let rect = cell_rect(&harness);
+            let pos = if empty_space {
+                rect.right_center() + egui::vec2(20.0, 0.0)
+            } else {
+                rect.left_center() + egui::vec2(2.0, 0.0)
+            };
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, pos);
+            assert!(matches!(harness.state().navs.as_slice(),
+                [crate::ui_main::AddressBarNav::Direct(path, _)]
+                    if Some(path.as_path()) == harness.state().app.current_folder.as_deref().and_then(|p| p.parent())));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_icon_loading_keeps_drag_press_owner() {
+        let mut harness = letterbox_harness([40, 120]);
+        let loaded = harness.state().app.thumbnails[0].clone();
+        let folder = harness.state().app.tmp.path().join("folder");
+        harness.state_mut().app.items[0] = GridItem::Folder(folder.clone());
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+        harness.run_steps(4);
+        let pos = cell_rect(&harness).left_center() + egui::vec2(5.0, 0.0);
+        press(&mut harness, pos);
+        assert!(matches!(
+            harness.state().app.grid_click_pairing.primary_press,
+            Some((_, _, GridPressTarget::Cell(0)))
+        ));
+        harness.state_mut().app.thumbnails[0] = loaded;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        assert_eq!(
+            harness
+                .state()
+                .app
+                .pending_native_drag
+                .as_ref()
+                .unwrap()
+                .paths,
+            vec![folder]
+        );
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_icon_touch_cancel_and_double_tap() {
+        let mut harness = letterbox_harness([40, 120]);
+        let folder = harness.state().app.tmp.path().join("folder");
+        harness.state_mut().app.items[0] = GridItem::Folder(folder.clone());
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Evicted;
+        harness.state_mut().app.selected = None;
+        harness.run_steps(4);
+        let pos = cell_rect(&harness).left_center() + egui::vec2(5.0, 0.0);
+        touch_event(&mut harness, egui::TouchPhase::Start, pos);
+        touch_event(&mut harness, egui::TouchPhase::Cancel, pos);
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().navs.is_empty());
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        assert!(matches!(harness.state().navs.as_slice(),
+            [crate::ui_main::AddressBarNav::Direct(path, _)] if path == &folder));
     }
 
     #[test]
@@ -105323,3 +110194,63 @@ mod merge_adoption_tests;
 
 #[path = "tests/bookmark_build_adoption.rs"]
 mod bookmark_build_adoption_tests;
+
+#[path = "tests/manual_nav_wrap.rs"]
+mod manual_nav_wrap;
+
+#[cfg(windows)]
+#[test]
+fn front_popup_f12_round_trip_and_passive_handoff_retire_the_foreground_owner() {
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\front-owner.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    for detached in [true, false] {
+        app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+        app.toggle_detached_viewer_mode();
+        assert_eq!(app.settings.detached_viewer_enabled, detached);
+        assert_eq!(
+            app.viewer_presentation == ViewerPresentation::DetachedWindow,
+            detached
+        );
+        assert!(
+            !app.fs_front_pointer.is_active(),
+            "F12 must retire the old viewport input owner"
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.handoff_active_detached_viewport_to_passive("front_popup_owner_test");
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "handoff retires front input even for live-media callers"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_changes() {
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\front-owner.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.settings.video_in_window_mode = false;
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.prepare_viewer_presentation_open(0, false);
+    assert!(
+        app.fs_front_pointer.is_active(),
+        "a same-viewer page open is not a display handoff"
+    );
+    app.settings.video_in_window_mode = true;
+    app.prepare_viewer_presentation_open(0, false);
+    assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+    assert!(!app.fs_front_pointer.is_active());
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.apply_video_presentation_switched(ViewerPresentation::Fullscreen);
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "native commit transfers the presentation owner too"
+    );
+}

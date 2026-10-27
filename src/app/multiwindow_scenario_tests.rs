@@ -354,7 +354,7 @@ impl ScenarioDriver {
             let id = viewport.ids.this;
             child_known.borrow_mut().insert(id);
             let input = Self::input(id, *child_focus.borrow(), CHILD_SIZE, &child_known.borrow());
-            let output = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            let output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
             capture.borrow_mut().push((id, output));
         });
         Self {
@@ -413,7 +413,9 @@ impl ScenarioDriver {
 
     fn root_with_events(&mut self, app: &mut App, events: Vec<egui::Event>) -> ScenarioFrame {
         self.number += 1;
-        self.child_outputs.borrow_mut().clear();
+        for (_, output) in self.child_outputs.borrow_mut().drain(..) {
+            output.drop_without_applying_deltas();
+        }
         let mut input = Self::input(
             egui::ViewportId::ROOT,
             *self.focused.borrow(),
@@ -422,8 +424,9 @@ impl ScenarioDriver {
         );
         input.events = events;
         let output = with_capture(|| {
-            self.ctx.run(input, |ctx| {
-                <App as eframe::App>::update(app, ctx, &mut self.frame);
+            self.ctx.run_ui(input, |ui| {
+                <App as eframe::App>::logic(app, ui.ctx(), &mut self.frame);
+                <App as eframe::App>::ui(app, ui, &mut self.frame);
             })
         });
         let mut records = HashMap::new();
@@ -442,6 +445,7 @@ impl ScenarioDriver {
             records.insert(id, paint_records(id, &output));
             white.insert(id, white_companion_paint_records(id, &output));
             errors.insert(id, error_messages(&output));
+            output.drop_without_applying_deltas();
         }
         let registered = output
             .viewport_output
@@ -452,11 +456,12 @@ impl ScenarioDriver {
         let mut known = registered;
         known.insert(egui::ViewportId::ROOT);
         *self.known.borrow_mut() = known;
-        for (id, viewport) in output.viewport_output {
-            if let Some(callback) = viewport.viewport_ui_cb {
-                self.callbacks.insert(id, callback);
+        for (&id, viewport) in &output.viewport_output {
+            if let Some(callback) = &viewport.viewport_ui_cb {
+                self.callbacks.insert(id, Arc::clone(callback));
             }
         }
+        output.drop_without_applying_deltas();
         ScenarioFrame {
             number: self.number,
             records,
@@ -471,13 +476,14 @@ impl ScenarioDriver {
         self.number += 1;
         let callback = Arc::clone(self.callbacks.get(&id).expect("ROOT registered child"));
         let input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
-        let output = with_capture(|| self.ctx.run(input, |ctx| callback(ctx)));
+        let output = with_capture(|| self.ctx.run_ui(input, |ui| callback(ui)));
         let mut records = HashMap::new();
         let mut white = HashMap::new();
         let mut errors = HashMap::new();
         records.insert(id, paint_records(id, &output));
         white.insert(id, white_companion_paint_records(id, &output));
         errors.insert(id, error_messages(&output));
+        output.drop_without_applying_deltas();
         ScenarioFrame {
             number: self.number,
             records,
@@ -639,6 +645,37 @@ fn stable_content(app: &mut App, window_id: u64) -> Option<StableContent> {
     .expect("window retains its viewer context")
 }
 
+// I2 compares completed content before and after parking. A preview may paint
+// while its final load is still pending, so every baseline uses both facts.
+fn stable_paint_frame(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    window_id: u64,
+    require_white: bool,
+) -> ScenarioFrame {
+    let viewport = App::detached_image_window_viewport_id(window_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let frame = driver.root(app);
+        if !records_for(&frame, viewport).is_empty()
+            && (!require_white
+                || frame
+                    .white
+                    .get(&viewport)
+                    .is_some_and(|records| !records.is_empty()))
+            && stable_content(app, window_id).is_some()
+        {
+            return frame;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "window {window_id}: paint did not reach stable content; frame={} records={:#?}",
+            frame.number,
+            frame.records,
+        );
+    }
+}
+
 fn save_portrait(path: &std::path::Path, color: [u8; 3]) {
     let image = image::RgbImage::from_pixel(600, 900, image::Rgb(color));
     image.save(path).expect("real scenario image");
@@ -700,6 +737,8 @@ fn configure_active_still_pages(
     app.fs_cache.insert(
         page,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: texture,
             pixels: Arc::new(pixels),
             source_dims: Some([600, 900]),
@@ -719,14 +758,8 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
         app.settings.final_cover_spread_enabled = false;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let folder = app.tmp.path().join("page-alone-paint");
         let first = folder.join("first");
         let second = folder.join("second");
@@ -775,18 +808,7 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         app.detached_window_hwnd_set(200, 0x2000);
         let viewport = App::detached_image_window_viewport_id(100);
         driver.focus(viewport);
-        let mut active = driver.root(&mut app);
-        for _ in 0..12 {
-            if !records_for(&active, viewport).is_empty()
-                && active
-                    .white
-                    .get(&viewport)
-                    .is_some_and(|records| !records.is_empty())
-            {
-                break;
-            }
-            active = driver.root(&mut app);
-        }
+        let active = stable_paint_frame(&mut app, &mut driver, 100, true);
         let owner = stable_content(&mut app, 100).expect("active book state");
         assert_eq!(owner.spread_mode, crate::settings::SpreadMode::LtrCover);
         app.with_window_viewer_context(100, |owner| {
@@ -837,18 +859,7 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         app.queue_deferred_detached_window_activation(200, "page_alone_paint_test");
         let second_viewport = App::detached_image_window_viewport_id(200);
         driver.focus(second_viewport);
-        let mut activated = driver.root(&mut app);
-        for _ in 0..12 {
-            if !records_for(&activated, second_viewport).is_empty()
-                && activated
-                    .white
-                    .get(&second_viewport)
-                    .is_some_and(|records| !records.is_empty())
-            {
-                break;
-            }
-            activated = driver.root(&mut app);
-        }
+        let activated = stable_paint_frame(&mut app, &mut driver, 200, true);
         assert_i1_open_or_paint(
             "page-alone-white",
             true,
@@ -924,14 +935,8 @@ fn page_alone_white_companion_does_not_paint_as_a_failed_real_texture() {
         app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let paths = (0..3)
             .map(|i| app.tmp.path().join(format!("missing-{i}.png")))
             .collect::<Vec<_>>();
@@ -980,14 +985,8 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.singleton_spread_first_enabled = true;
         app.settings.singleton_spread_last_enabled = false;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let folder = app.tmp.path().join("scenario-b");
         std::fs::create_dir(&folder).unwrap();
         let first_path = folder.join("portrait-a.png");
@@ -1026,13 +1025,7 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         let first_viewport = App::detached_image_window_viewport_id(100);
         driver.focus(first_viewport);
 
-        let mut before = driver.root(&mut app);
-        for _ in 0..12 {
-            if !records_for(&before, first_viewport).is_empty() {
-                break;
-            }
-            before = driver.root(&mut app);
-        }
+        let before = stable_paint_frame(&mut app, &mut driver, 100, false);
         assert!(
             !records_for(&before, first_viewport).is_empty(),
             "S-B active singleton must reach a real image mesh: frame={} records={:#?}",
@@ -1085,14 +1078,8 @@ fn scenario_b_endpoint_paint_center(
     app.settings.singleton_spread_first_enabled = global_first;
     app.settings.singleton_spread_last_enabled = global_last;
     app.settings.final_cover_spread_enabled = false;
-    app.settings.detached_viewer_window_placement =
-        Some(crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: CHILD_SIZE.x,
-            h: CHILD_SIZE.y,
-            maximized: false,
-        });
+    app.settings.detached_viewer_window_physical_placement =
+        Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
     let folder = app.tmp.path().join(label);
     let first_folder = folder.join("first");
     let second_folder = folder.join("second");
@@ -1140,13 +1127,7 @@ fn scenario_b_endpoint_paint_center(
     app.detached_window_hwnd_set(200, 0x2000);
     let first_viewport = App::detached_image_window_viewport_id(100);
     driver.focus(first_viewport);
-    let mut before = driver.root(&mut app);
-    for _ in 0..12 {
-        if !records_for(&before, first_viewport).is_empty() {
-            break;
-        }
-        before = driver.root(&mut app);
-    }
+    let before = stable_paint_frame(&mut app, &mut driver, 100, false);
     let before_paint = records_for(&before, first_viewport);
     assert_eq!(
         before_paint.len(),
@@ -1690,29 +1671,31 @@ fn run_multiwindow_rar_tree_nav(
         .expect("main context remains mountable");
     let _main_conversion_sender = if pending_main_conversion {
         let (tx, rx) = mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: app.tmp.path().join("pending-main.7z"),
-            input_seq: 0,
-            format: crate::archive_converter::ArchiveFormat::SevenZ,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: Arc::new(AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
+                src_path: app.tmp.path().join("pending-main.7z"),
+                input_seq: 0,
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
 
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         Some(tx)
     } else {
         None
@@ -2124,7 +2107,12 @@ fn collection_order_open(
             Some(path),
             "full grid open before first frame"
         );
-        None
+        // A real fullscreen open moves focus off ROOT. Leaving the fake main
+        // viewport focused correctly triggers the production focus-close guard
+        // after its grace period, making this scenario depend on machine load.
+        let viewport = app.fullscreen_viewport_id();
+        driver.focus(viewport);
+        Some(viewport)
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
@@ -2242,7 +2230,17 @@ fn collection_order_observe(
             return;
         }
         if !pending && !display_pending && actual.as_deref() != Some(expected) {
-            assert_eq!(actual.as_deref(), Some(expected));
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "frame={} detached={detached} slideshow={} idx={:?} items={} records={:#?} errors={:?}",
+                frame.number,
+                app.slideshow_playing,
+                app.fullscreen_idx,
+                app.items.len(),
+                frame.records,
+                frame.errors,
+            );
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -3181,7 +3179,14 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
         let source = first.clone();
         app.push_window_context_for_test(&ctx, window_id, move |owner| {
             owner.top_level_grid_view = grid;
-            owner.install_prepared_aggregate_items(items, metas, page_identity_index);
+            owner.install_prepared_aggregate_items(
+                crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                    crate::app::book_materialization::ExtractedSurface::Collection,
+                ),
+                items,
+                metas,
+                page_identity_index,
+            );
             owner
                 .top_level_grid_view
                 .collection_session_mut()
@@ -3190,13 +3195,13 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
             owner.fullscreen_idx = Some(0);
             owner.viewer_presentation = ViewerPresentation::DetachedWindow;
             owner.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
-            owner.video_continuous_last_eof = Some((0, 1));
+            let player = crate::video::VideoPlayer::disconnected_for_test(source, 3.0);
+            // The EOF request must own the player's actual transport generation.
+            owner.video_continuous_last_eof = Some((0, player.current_seek_serial()));
             owner.fs_cache.insert(
                 0,
                 FsCacheEntry::Video {
-                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
-                        source, 3.0,
-                    )),
+                    player: Box::new(player),
                     load_seq: 0,
                 },
             );
@@ -3209,10 +3214,11 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
         );
         assert!(
             app.with_window_viewer_context(window_id, |owner| {
+                let (_, seek_serial) = owner.video_continuous_last_eof.unwrap();
                 if is_audio {
-                    owner.start_collection_music_eof_navigation(&ctx, 0, 1)
+                    owner.start_collection_music_eof_navigation(&ctx, 0, seek_serial)
                 } else {
-                    owner.start_collection_video_eof_navigation(&ctx, 0, 1)
+                    owner.start_collection_video_eof_navigation(&ctx, 0, seek_serial)
                 }
             })
             .unwrap()

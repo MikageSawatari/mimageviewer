@@ -27,20 +27,21 @@ fn setup_thumbnail_app(count: usize) -> AppTestEnvForTest {
 }
 
 fn loaded_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
-    ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    ThumbnailState::loaded_raster(
+        ctx.load_texture(
             name,
             egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
             evaluated_display_px: 2,
         },
-        from_edit_preview: false,
-        rendered_at_px: 2,
-        source_dims: Some((2, 2)),
-        layout_dims: None,
-    }
+        false,
+        2,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((2, 2)),
+        None,
+    )
 }
 
 fn main_grid_to_overview_app(kind: &str, ctx: &egui::Context) -> AppTestEnvForTest {
@@ -83,7 +84,7 @@ fn draw_overview_frame(app: &mut App, ctx: &egui::Context) {
     // Each test frame has one renderer pass, so a fast worker cannot be drained by an
     // implicit egui discard pass before the explicit completion-wait checkpoint.
     ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
-    let _ = ctx.run(
+    ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -91,14 +92,15 @@ fn draw_overview_frame(app: &mut App, ctx: &egui::Context) {
             )),
             ..Default::default()
         },
-        |ctx| {
+        |root_ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
+                .show(root_ui, |ui| {
                     app.render_page_overview_surface(ui, ui.max_rect());
                 });
         },
-    );
+    )
+    .drop_without_applying_deltas();
 }
 
 #[test]

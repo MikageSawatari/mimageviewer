@@ -172,12 +172,41 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Read-only submission evidence; presentation materials do not need their original source.
+#[cfg(feature = "test-script")]
+pub(crate) trait TestScriptPaintResource {
+    fn paint_texture_id(&self) -> egui::TextureId;
+    fn test_script_content_proof(&self) -> Option<&TestScriptContentProof>;
+}
+
+#[cfg(feature = "test-script")]
+impl TestScriptPaintResource for crate::gpu_lanczos::FullscreenPaintResource {
+    fn paint_texture_id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    fn test_script_content_proof(&self) -> Option<&TestScriptContentProof> {
+        self.test_script_content_proof()
+    }
+}
+
+#[cfg(feature = "test-script")]
+impl TestScriptPaintResource for crate::gpu_lanczos::FullscreenPaintPayload {
+    fn paint_texture_id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    fn test_script_content_proof(&self) -> Option<&TestScriptContentProof> {
+        self.test_script_content_proof()
+    }
+}
+
+#[cfg(feature = "test-script")]
 /// Called immediately after the paint resource submits its mesh. Read the
 /// actual egui shape rather than recomputing geometry from a layout DTO.
-#[cfg(feature = "test-script")]
-pub(crate) fn record_drawn_paint(
+pub(crate) fn record_drawn_paint<R: TestScriptPaintResource + ?Sized>(
     painter: &egui::Painter,
-    resource: &crate::gpu_lanczos::FullscreenPaintResource,
+    resource: &R,
     placement: String,
 ) {
     let Some(content) = resource.test_script_content_proof().cloned() else {
@@ -2519,6 +2548,12 @@ impl RunnerBridge {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let (move_receipt, target_receipt) = self.reveal_native_top_panorama_receipts(remaining)?;
         self.validate_selected_owner_fresh(&identity, deadline)?;
+        let (target_move_receipt, target_receipt) =
+            crate::video::native_ui_smoke::move_to_native_top_panorama(
+                &target_receipt,
+                deadline,
+                || self.validate_selected_owner_fresh(&identity, deadline),
+            )?;
         let prepared = crate::video::native_ui_smoke::prepare_native_top_panorama_click(
             &target_receipt,
             host_incarnation,
@@ -2543,6 +2578,10 @@ impl RunnerBridge {
         result.insert(
             "click".into(),
             Dynamic::from(native_top_panorama_click_receipt_to_rhai_map(click_receipt)),
+        );
+        result.insert(
+            "target_mouse".into(),
+            Dynamic::from(native_mouse_receipt_to_rhai_map(target_move_receipt)),
         );
         Ok(result)
     }
@@ -4825,7 +4864,7 @@ fn peek_pending_action_from(
 }
 
 fn action_pass_observation_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new("miv.test_script.action_pass_observation").with(viewport_id)
+    egui::Id::unique("miv.test_script.action_pass_observation").with(viewport_id)
 }
 
 fn action_pass_observation(ctx: &egui::Context) -> Option<TestScriptActionPassObservation> {
@@ -5763,12 +5802,14 @@ mod tests {
             ));
             ctx.begin_pass(input);
             let mut clicked = false;
-            egui::CentralPanel::default().show(&ctx, |ui| {
-                let response = ui.button("Test button");
-                super::register_clickable_widget("Test button", &response);
-                clicked = response.clicked();
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let response = ui.button("Test button");
+                    super::register_clickable_widget("Test button", &response);
+                    clicked = response.clicked();
+                })
             });
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             clicked
         };
 
@@ -5835,12 +5876,14 @@ mod tests {
                 }
                 ctx.begin_pass(input);
                 let mut result = (false, false);
-                egui::CentralPanel::default().show(&ctx, |ui| {
-                    let response = ui.button("row");
-                    super::register_clickable_widget("row", &response);
-                    result = (response.clicked(), response.double_clicked());
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let response = ui.button("row");
+                        super::register_clickable_widget("row", &response);
+                        result = (response.clicked(), response.double_clicked());
+                    })
                 });
-                let _ = ctx.end_pass();
+                ctx.end_pass().drop_without_applying_deltas();
                 result
             };
             assert_eq!(render(0.0, false), (false, false));
@@ -5992,7 +6035,8 @@ mod tests {
             };
             super::append_widget_click_events(&mut input);
             let mut navigation = None;
-            let _ = ctx.run(input, |ctx| navigation = app.render_grid(ctx));
+            ctx.run_ui(input, |ctx| navigation = app.render_grid(ctx))
+                .drop_without_applying_deltas();
             navigation
         };
         assert!(draw(&mut app).is_none());
@@ -6547,8 +6591,9 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(input, |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 let (rect, response) =
                     ui.allocate_exact_size(egui::vec2(60.0, 24.0), egui::Sense::hover());
                 super::register_details_preview_pointer(
@@ -6567,7 +6612,8 @@ mod tests {
                 assert_eq!(point, rect.center());
                 assert_eq!(ppp, ctx.pixels_per_point());
             });
-        });
+        })
+        .drop_without_applying_deltas();
         WIDGET_CLICK_DRIVER.with(|driver| assert!(driver.borrow().details_preview_move.is_none()));
     }
 
@@ -6597,12 +6643,14 @@ mod tests {
             ));
             ctx.begin_pass(input);
             let mut clicked = false;
-            egui::CentralPanel::default().show(&ctx, |ui| {
-                let response = ui.add_enabled(false, egui::Button::new("評価↑"));
-                super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
-                clicked = response.clicked();
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let response = ui.add_enabled(false, egui::Button::new("評価↑"));
+                    super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
+                    clicked = response.clicked();
+                })
             });
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             clicked
         };
         assert!(!render(egui::RawInput {
@@ -6643,13 +6691,15 @@ mod tests {
             ));
             ctx.begin_pass(input);
             let mut contains_pointer = false;
-            egui::CentralPanel::default().show(&ctx, |ui| {
-                let response = ui.add_enabled(false, egui::Button::new("評価↑"));
-                super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
-                contains_pointer = response.contains_pointer();
-                assert!(!response.clicked());
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let response = ui.add_enabled(false, egui::Button::new("評価↑"));
+                    super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
+                    contains_pointer = response.contains_pointer();
+                    assert!(!response.clicked());
+                })
             });
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             contains_pointer
         };
         assert!(!render(egui::RawInput {
@@ -6682,8 +6732,9 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run(input.clone(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(input.clone(), |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 super::begin_collection_sort_popup(ctx, false, ui.is_enabled());
                 let manual = ui.button("手動");
                 let rating = ui.add_enabled(false, egui::Button::new("評価↑"));
@@ -6694,7 +6745,8 @@ mod tests {
                 super::record_collection_sort_popup_row("手動", &manual, clip);
                 super::record_collection_sort_popup_row("評価↑", &rating, clip);
             });
-        });
+        })
+        .drop_without_applying_deltas();
         let observed = super::collection_sort_popup_snapshot(&ctx);
         assert!(observed.open);
         assert!(observed.needs_scrolling);
@@ -6710,7 +6762,8 @@ mod tests {
         assert!(observed.rows[1].disabled);
         assert!(observed.rendered_tooltip.is_none());
         for _ in 0..2 {
-            let _ = ctx.run(input.clone(), |_| {});
+            ctx.run_ui(input.clone(), |_| {})
+                .drop_without_applying_deltas();
         }
         assert!(!super::collection_sort_popup_snapshot(&ctx).open);
     }
@@ -6725,8 +6778,9 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(input, |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 super::begin_collection_sort_popup(ctx, false, ui.is_enabled());
                 let row = ui.button("シャッフル（再選択で並べ直す）");
                 let clip = egui::Rect::from_min_max(
@@ -6739,7 +6793,8 @@ mod tests {
                     clip,
                 );
             });
-        });
+        })
+        .drop_without_applying_deltas();
         let popup = super::collection_sort_popup_snapshot(&ctx);
         assert!(!popup.needs_scrolling);
         assert!(!popup.rows[0].visible);
@@ -6848,12 +6903,18 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
-    fn phase_3b_tray_projection_absence_is_an_environment_failure() {
-        let (bridge, _, _) = runner_bridge(ready_snapshot());
+    fn release_check_close_requires_an_active_release_check_session() {
+        // Phase 3b is connected. Without release_check_begin this call now fails
+        // at the session precondition, before observing any tray projection.
+        let (bridge, commands, wakes) = runner_bridge(ready_snapshot());
+        let interrupt = Arc::clone(&bridge.interrupt);
         let outcome = evaluate_source("release_check_close(\"after-loading\");", bridge);
-        assert_eq!(outcome.kind, ScriptOutcomeKind::EnvironmentFailure);
-        assert_eq!(outcome.kind.exit_code(), 2);
-        assert!(outcome.message.contains("Phase 3b"));
+        assert_eq!(outcome.kind, ScriptOutcomeKind::ScriptFailure);
+        assert_eq!(outcome.kind.exit_code(), 1);
+        assert!(outcome.message.contains("begin release checks first"));
+        assert!(interrupt.failure_message().is_none());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(wakes.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[cfg(feature = "test-script")]
@@ -7286,7 +7347,8 @@ mod tests {
             runtime.capture = Some(capture::Coordinator::new(Path::new(&run_dir)).unwrap());
             runtime.begin_finish(ScriptOutcome::script_failure(ORIGINAL_MESSAGE), 1);
             let ctx = egui::Context::default();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let ctx = &ui.ctx().clone();
                 runtime.request_failure_capture(ctx, |outcome| {
                     assert_eq!(outcome.message, ORIGINAL_MESSAGE);
                     PROCESS_EXIT_CODE.store(outcome.kind.exit_code(), Ordering::Release);
@@ -7294,7 +7356,8 @@ mod tests {
                     std::io::Write::flush(&mut std::io::stdout()).unwrap();
                     arm_shutdown_watchdog(outcome.kind.exit_code(), "failure-capture-test");
                 });
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(runtime.capture.as_ref().unwrap().is_pending(1));
             // No second ctx.run or capture.poll: only the process watchdog can
             // complete this child. The parent kills it if that guarantee fails.
@@ -8042,6 +8105,59 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn drawn_paint_records_native_presentation_after_source_release() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "native-paint-observation",
+            egui::ColorImage::filled([8, 8], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_texture_id = texture.id();
+        let proof = TestScriptContentProof {
+            context_serial: 7,
+            items_generation: 3,
+            page_index: 2,
+            item_identity: "captured-page".into(),
+            source_texture_id,
+            source_kind: TestScriptPaintSourceKind::FullOrProcessed,
+            final_composite_complete: false,
+        };
+        let source = crate::gpu_lanczos::test_native_resource(
+            crate::gpu_lanczos::FullscreenPaintResource::resampleable(
+                2,
+                texture,
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 3, input: 5 },
+            )
+            .with_test_script_content_proof(proof.clone()),
+            [4, 4],
+        );
+        let payload = crate::gpu_lanczos::FullscreenPaintPayload::PresentationMaterial(
+            source.capture_presentation(&ctx),
+        );
+        drop(source);
+        assert!(ctx.tex_manager().read().meta(source_texture_id).is_none());
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.image(
+                payload.paint_texture_id(),
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(8.0, 8.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            record_drawn_paint(&painter, &payload, "presentation".into());
+        })
+        .drop_without_applying_deltas();
+        let paints = take_drawn_paint(egui::ViewportId::ROOT);
+        assert_eq!(paints.len(), 1);
+        assert_eq!(paints[0].content, proof);
+        assert_eq!(paints[0].texture, payload.paint_texture_id());
+        assert_eq!(paints[0].placement, "presentation");
+        assert!(payload.source_texture().is_none());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn drawn_paint_records_each_submitted_mesh_with_resource_provenance() {
         let ctx = egui::Context::default();
         let texture = ctx.load_texture(
@@ -8063,7 +8179,8 @@ mod tests {
         };
         let first = make("folder");
         let second = make("zip");
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             let painter = ctx.layer_painter(egui::LayerId::background());
             for (index, resource) in [&first, &second].into_iter().enumerate() {
                 let rect = egui::Rect::from_min_size(
@@ -8078,7 +8195,8 @@ mod tests {
                 );
                 record_drawn_paint(&painter, resource, "normal".into());
             }
-        });
+        })
+        .drop_without_applying_deltas();
         let paints = take_drawn_paint(egui::ViewportId::ROOT);
         assert_eq!(paints.len(), 2);
         assert_eq!(paints[0].content.item_identity, "folder");
@@ -8871,7 +8989,10 @@ mod tests {
                 if guard == "ime" {
                     input.events.extend([
                         egui::Event::Ime(egui::ImeEvent::Enabled),
-                        egui::Event::Ime(egui::ImeEvent::Preedit("未確定".into())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "未確定".into(),
+                            active_range_chars: None,
+                        }),
                     ]);
                 }
                 if guard == "modal" {
@@ -8880,28 +9001,32 @@ mod tests {
                 if guard == "edit" {
                     app.erase_mode = true;
                 }
-                let field_id = egui::Id::new("semantic-action-text-owner");
+                let field_id = egui::Id::unique("semantic-action-text-owner");
                 let mut text = String::new();
                 let mut request_focus = true;
-                let draw_field = |ctx: &egui::Context,
-                                  text: &mut String,
-                                  request_focus: &mut bool| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        crate::ime_focus::add_singleline(ui, text, Some(request_focus), |edit| {
-                            edit.id(field_id)
+                let draw_field =
+                    |ctx: &egui::Context, text: &mut String, request_focus: &mut bool| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                crate::ime_focus::add_singleline(
+                                    ui,
+                                    text,
+                                    Some(request_focus),
+                                    |edit| edit.id(field_id),
+                                );
+                            })
                         });
-                    });
-                };
+                    };
                 if guard == "text" {
                     ctx.begin_pass(Default::default());
                     draw_field(&ctx, &mut text, &mut request_focus);
-                    let _ = ctx.end_pass();
+                    ctx.end_pass().drop_without_applying_deltas();
                     assert_eq!(ctx.memory(|m| m.focused()), Some(field_id));
                 }
                 ctx.begin_pass(input);
                 if guard == "text" {
                     draw_field(&ctx, &mut text, &mut request_focus);
-                    assert!(ctx.wants_keyboard_input());
+                    assert!(ctx.egui_wants_keyboard_input());
                 }
                 let mut active = local_runtime();
                 active
@@ -8943,7 +9068,7 @@ mod tests {
                         "guard={guard} action={action:?}"
                     );
                 }
-                let _ = ctx.end_pass();
+                ctx.end_pass().drop_without_applying_deltas();
             }
         }
     }
@@ -9423,7 +9548,7 @@ mod tests {
 
         assert_eq!(observation.owner, Some(owner));
         assert!(observation.eligible);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -9464,7 +9589,7 @@ mod tests {
             KeyAction::GridToggleDetailsView
         ));
         assert_eq!(pending.len(), 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -9921,7 +10046,7 @@ mod tests {
                 region_geometry_token: 1,
                 press_page_index: 2,
                 press_item_identity: "page-2".to_string(),
-                widget_id: egui::Id::new("poisoned-pointer-track"),
+                widget_id: egui::Id::unique("poisoned-pointer-track"),
                 press_rect: rect,
                 coordinate_frame: rect,
                 press_pixels_per_point: 1.0,
@@ -9948,14 +10073,16 @@ mod tests {
             },
         );
         ctx.begin_pass(warmup_input);
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = ui.interact(
-                rect,
-                egui::Id::new("poisoned-pointer-track"),
-                egui::Sense::click_and_drag(),
-            );
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let _ = ui.interact(
+                    rect,
+                    egui::Id::unique("poisoned-pointer-track"),
+                    egui::Sense::click_and_drag(),
+                );
+            })
         });
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let mut child_input = egui::RawInput {
             viewport_id: viewport,
@@ -9986,31 +10113,33 @@ mod tests {
         ctx.begin_pass(child_input.clone());
         pointer_input::record_delivery_proof(&prepared, &child_input);
         pointer_input::begin_pass(&ctx, 29, 2, "page-2".to_string(), mode);
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let response = ui.interact(
-                rect,
-                egui::Id::new("poisoned-pointer-track"),
-                egui::Sense::click_and_drag(),
-            );
-            assert!(
-                response.is_pointer_button_down_on(),
-                "test precondition: egui must hit the actual track response"
-            );
-            pointer_input::record_region(
-                pointer_input::RegionId::StillSeekTrack,
-                &response,
-                rect,
-                None,
-            );
-            pointer_input::observe_region_handler(
-                &response,
-                pointer_input::RegionId::StillSeekTrack,
-                None,
-            );
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let response = ui.interact(
+                    rect,
+                    egui::Id::unique("poisoned-pointer-track"),
+                    egui::Sense::click_and_drag(),
+                );
+                assert!(
+                    response.is_pointer_button_down_on(),
+                    "test precondition: egui must hit the actual track response"
+                );
+                pointer_input::record_region(
+                    pointer_input::RegionId::StillSeekTrack,
+                    &response,
+                    rect,
+                    None,
+                );
+                pointer_input::observe_region_handler(
+                    &response,
+                    pointer_input::RegionId::StillSeekTrack,
+                    None,
+                );
+            })
         });
         pointer_input::finish_pass(&ctx);
         let output = show.finish();
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let poisoned_catalog = pointer_input::new_shared_catalog();
         let poison_target = Arc::clone(&poisoned_catalog);

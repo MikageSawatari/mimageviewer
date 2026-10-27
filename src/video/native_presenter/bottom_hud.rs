@@ -229,8 +229,9 @@ mod tests {
         use Item::*;
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(Default::default(), |root_ui| {
+            let ctx = root_ui.ctx();
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 let metrics = Metrics::measure(
                     ui.painter(),
                     28.0,
@@ -296,14 +297,16 @@ mod tests {
                 }
             });
         });
+        crate::egui_output::discard_headless_output(output);
     }
 
     #[test]
     fn native_tracks_hud_measured_layout_packs_every_width_and_keeps_essentials() {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(Default::default(), |root_ui| {
+            let ctx = root_ui.ctx();
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 for time in ["0:05 / 0:30", "100:59:59 / 999:59:59"] {
                     for strip in [false, true] {
                         let metrics = Metrics::measure(
@@ -355,6 +358,7 @@ mod tests {
                 }
             });
         });
+        crate::egui_output::discard_headless_output(output);
     }
 }
 

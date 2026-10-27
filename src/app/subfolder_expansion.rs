@@ -221,7 +221,7 @@ pub(crate) struct SubfolderExpansionOptions {
     pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     skip_image_if_video_exists: bool,
     skip_duplicate_images: bool,
-    skip_zip_if_folder_exists: bool,
+    same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     video_thumb_use_sidecar_image: bool,
     image_folder_books: bool,
     include_convertible_archives: bool,
@@ -237,7 +237,7 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
             file_type_visibility: settings.file_type_visibility.clone(),
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             skip_duplicate_images: settings.skip_duplicate_images,
-            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             image_folder_books: settings.auto_fullscreen_image_folders_enabled(),
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
@@ -410,7 +410,14 @@ pub(crate) enum SubfolderExpansionEvent {
     Cancelled,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubfolderInstallPurpose {
+    New,
+    Return,
+}
+
 pub(crate) struct SubfolderExpansionAdoption {
+    purpose: SubfolderInstallPurpose,
     navigation: MainListNavigation,
     removed_paths: HashSet<String>,
 }
@@ -872,9 +879,20 @@ fn scan_one_directory(
         return;
     }
 
-    if options.skip_zip_if_folder_exists {
-        containers.retain(|entry| !real_folder_names.contains(&super::stem_lower(&entry.path)));
-    }
+    // Traversal and child book cells retain the existing recursive scope.
+    let folders: Vec<_> = real_folder_names
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    let mask = crate::same_name_folder_book::keep_mask(
+        options.same_name_folder_book,
+        folders
+            .iter()
+            .map(|path| (path.as_path(), true))
+            .chain(containers.iter().map(|entry| (entry.path.as_path(), false))),
+    );
+    let mut mask = mask.into_iter().skip(folders.len());
+    containers.retain(|_| mask.next().unwrap());
     containers.retain(|entry| {
         options
             .scan_filter
@@ -1054,7 +1072,7 @@ fn sorted_entry_indices_for_view(
     display_order: &crate::settings::GridDisplayOrder,
     root: &Path,
     cancel: Option<&AtomicBool>,
-    mut progress: Option<&mut dyn FnMut(usize)>,
+    progress: Option<&mut dyn FnMut(usize)>,
     chunk_size: usize,
 ) -> Option<Vec<usize>> {
     sorted_entry_indices_for_request(
@@ -1789,11 +1807,11 @@ impl App {
             return;
         }
         let Some(root) = self.current_folder.clone() else {
-            self.show_feedback_toast("サブ展開は通常フォルダでのみ使えます".into());
+            self.show_feedback_warning("サブ展開は通常フォルダでのみ使えます".into());
             return;
         };
         if !self.subfolder_expansion_available() {
-            self.show_feedback_toast("サブ展開は通常フォルダでのみ使えます".into());
+            self.show_feedback_warning("サブ展開は通常フォルダでのみ使えます".into());
             return;
         }
         let selected_roots = self.selected_subfolder_expansion_roots();
@@ -1812,20 +1830,33 @@ impl App {
     ) {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            SubfolderInstallPurpose::New,
             HashSet::new(),
             self.copied_destination_source_proof(),
         );
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Subfolder),
+            navigation.as_ref().is_some_and(|adoption| {
+                matches!(
+                    adoption.navigation.history,
+                    MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
+                )
+            }),
+        );
+        self.cancel_pending_folder_nav();
         self.start_subfolder_expansion_scan_roots_owned(root, roots, navigation);
     }
 
     fn capture_subfolder_expansion_adoption(
         &mut self,
         history: MainHistoryOperation,
+        purpose: SubfolderInstallPurpose,
         removed_paths: HashSet<String>,
         proof: MainListSourceProof,
     ) -> Option<SubfolderExpansionAdoption> {
         self.main_folder_history_available()
             .then(|| SubfolderExpansionAdoption {
+                purpose,
                 navigation: self.capture_main_list_navigation(history, proof),
                 removed_paths,
             })
@@ -1838,9 +1869,9 @@ impl App {
         navigation: Option<SubfolderExpansionAdoption>,
     ) {
         let roots = normalize_expansion_roots(&root, roots);
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Subfolder));
+        // Policy changes can restart an accepted scan. Its retained history operation does
+        // not make that continuation a new navigation which may retire newer requests.
         self.cancel_subfolder_expansion_pending();
-        self.cancel_pending_folder_nav();
         self.subfolder_expansion_progress = Some(SubfolderExpansionProgress::default());
         self.subfolder_expansion_diag = None;
         let options = SubfolderExpansionOptions::from(&self.settings);
@@ -1875,7 +1906,7 @@ impl App {
             }
             Err(message) => {
                 self.subfolder_expansion_progress = None;
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
             }
         }
     }
@@ -2016,7 +2047,7 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.subfolder_expansion_pending = None;
                     self.subfolder_expansion_progress = None;
-                    self.show_feedback_toast("サブ展開の走査が中断されました".into());
+                    self.show_feedback_warning("サブ展開の走査が中断されました".into());
                     return;
                 }
             }
@@ -2061,14 +2092,14 @@ impl App {
                 Ok(SubfolderExpansionPrepareEvent::Error(message)) => {
                     self.subfolder_expansion_install_pending = None;
                     self.subfolder_expansion_progress = None;
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     return true;
                 }
                 Err(mpsc::TryRecvError::Empty) => return true,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.subfolder_expansion_install_pending = None;
                     self.subfolder_expansion_progress = None;
-                    self.show_feedback_toast("サブ展開の表示準備が中断されました".into());
+                    self.show_feedback_warning("サブ展開の表示準備が中断されました".into());
                     return true;
                 }
             }
@@ -2083,6 +2114,7 @@ impl App {
     ) {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            SubfolderInstallPurpose::New,
             HashSet::new(),
             MainListSourceProof::Row,
         );
@@ -2129,6 +2161,7 @@ impl App {
     ) {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            SubfolderInstallPurpose::New,
             HashSet::new(),
             MainListSourceProof::Row,
         );
@@ -2187,6 +2220,7 @@ impl App {
         };
         let navigation = self.capture_subfolder_expansion_adoption(
             operation,
+            SubfolderInstallPurpose::New,
             self.subfolder_expansion_removed_paths.clone(),
             MainListSourceProof::Row,
         );
@@ -2213,7 +2247,8 @@ impl App {
             );
             return;
         }
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Subfolder));
+        // Scan completion, confirmation and reprepare keep the original accepted owner.
+        // Only the input admission may retire competing navigation requests.
         if let Some(pending) = self.subfolder_expansion_install_pending.take() {
             pending.cancel();
         }
@@ -2225,17 +2260,21 @@ impl App {
             &snapshot.roots,
             Some(&snapshot.scan_filter),
         );
+        let destination_view =
+            self.favorite_view_state_for_path(&subfolder_expansion_synthetic_path());
+        let mut listing_settings = self.settings.clone();
+        listing_settings.sort_order = destination_view.sort_order;
+        let request = if crate::books::is_direct_book_folder(&self.book_root_path(), &snapshot.root)
+        {
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::Numeric)
+        } else {
+            crate::rating_sort::ListingOrderRequest::from_settings(&listing_settings)
+        };
         let options = SubfolderExpansionPrepareOptions {
-            request: if self.book_sort_order_for_path(&snapshot.root) != self.settings.sort_order {
-                crate::rating_sort::ListingOrderRequest::Standard(
-                    self.book_sort_order_for_path(&snapshot.root),
-                )
-            } else {
-                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
-            },
+            request,
             rating_write_generation: self.rating_session_write_generation,
             order: self.settings.subfolder_expansion_order,
-            display_order: self.settings.grid_display_order.clone(),
+            display_order: destination_view.grid_display_order,
             load_ratings: self.rating_db.is_some(),
             load_tags: self.tags_db.is_some(),
             load_local_adjust: self.local_adjust_db.is_some(),
@@ -2256,7 +2295,7 @@ impl App {
             }
             Err(message) => {
                 self.subfolder_expansion_progress = None;
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
             }
         }
     }
@@ -2427,7 +2466,19 @@ impl App {
         let removed_paths = state
             .map(|state| state.removed_paths.clone())
             .unwrap_or_else(|| self.subfolder_expansion_removed_paths.clone());
+        if snapshot.is_none() && root.is_none() {
+            return false;
+        }
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Subfolder),
+            matches!(
+                navigation.history,
+                MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
+            ),
+        );
+        self.cancel_pending_folder_nav();
         let owned = Some(SubfolderExpansionAdoption {
+            purpose: SubfolderInstallPurpose::Return,
             navigation,
             removed_paths,
         });
@@ -2458,6 +2509,7 @@ impl App {
         if let Some(state) = state {
             let owned = self.capture_subfolder_expansion_adoption(
                 MainHistoryOperation::Restore { route: None },
+                SubfolderInstallPurpose::Return,
                 state.removed_paths,
                 if state.snapshot.is_some() {
                     MainListSourceProof::Row
@@ -2486,7 +2538,14 @@ impl App {
         if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
             return false;
         }
-        if self.reinstall_subfolder_expansion_snapshot() {
+        if let Some(snapshot) = self.subfolder_expansion_snapshot.clone() {
+            let owned = self.capture_subfolder_expansion_adoption(
+                MainHistoryOperation::Restore { route: None },
+                SubfolderInstallPurpose::Return,
+                self.subfolder_expansion_removed_paths.clone(),
+                MainListSourceProof::Row,
+            );
+            self.start_subfolder_expansion_prepare_owned(snapshot, false, None, owned);
             return true;
         }
         if let Some(root) = self
@@ -2501,13 +2560,14 @@ impl App {
             };
             let navigation = self.capture_subfolder_expansion_adoption(
                 MainHistoryOperation::Restore { route: None },
+                SubfolderInstallPurpose::Return,
                 self.subfolder_expansion_removed_paths.clone(),
                 self.copied_destination_source_proof(),
             );
             self.start_subfolder_expansion_scan_roots_owned(root, roots, navigation);
             return true;
         }
-        self.show_feedback_toast("サブ展開ビューを復元できませんでした".into());
+        self.show_feedback_warning("サブ展開ビューを復元できませんでした".into());
         true
     }
 
@@ -2585,10 +2645,15 @@ impl App {
                 app.stack_view = None;
                 app.stack_return_state = None;
                 app.stack_showing_flat = false;
-                app.install_prepared_subfolder_expansion_memory(prepared, ctx, token)
+                app.install_prepared_subfolder_expansion_memory(prepared, ctx, token, owned.purpose)
             });
         } else {
-            let hydration = self.install_prepared_subfolder_expansion_memory(prepared, ctx, token);
+            let hydration = self.install_prepared_subfolder_expansion_memory(
+                prepared,
+                ctx,
+                token,
+                SubfolderInstallPurpose::New,
+            );
             self.hydrate_installed_main_list(hydration);
         }
     }
@@ -2598,6 +2663,7 @@ impl App {
         prepared: PreparedSubfolderExpansion,
         ctx: Option<&egui::Context>,
         token: PreparedVisibleInstall,
+        purpose: SubfolderInstallPurpose,
     ) -> MainListHydration {
         self.capture_main_list_restore_cursor();
         let install_t0 = Instant::now();
@@ -2639,7 +2705,7 @@ impl App {
         let start_loading_t0 = Instant::now();
         let local_search =
             (ctx.is_some() && self.show_search_bar).then(|| self.search_query.clone());
-        let hydration = self.install_loading_items_inner(
+        let mut hydration = self.install_loading_items_inner(
             subfolder_expansion_synthetic_path(),
             items,
             image_metas,
@@ -2651,9 +2717,26 @@ impl App {
             None,
             None,
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection {
+                recipe: super::book_materialization::ProjectionRecipe::ExtractedResult(
+                    super::book_materialization::ExtractedSurface::SubfolderExpansion,
+                ),
+            },
             token,
         );
+        let position_key =
+            super::top_level_grid_view::SubfolderExpansionPositionKey::new(&root, &roots);
+        let position = (purpose == SubfolderInstallPurpose::Return)
+            .then(|| {
+                self.top_level_grid_view
+                    .subfolder_expansion_position(&position_key)
+                    .cloned()
+            })
+            .flatten();
+        if let Some((continuation, _)) = hydration.as_mut() {
+            continuation.auto_aspect_seed =
+                position.as_ref().and_then(|position| position.aspect_seed);
+        }
         if let Some(generation) = rating_write_generation {
             self.overlay_rating_session_writes_since(generation);
             self.rebuild_visible_indices_after_rating_publication();
@@ -2662,7 +2745,7 @@ impl App {
             snapshot.stack_rating_source,
             crate::filename_stack_ui::StackRatingSource::ReadFailed
         ) {
-            self.show_feedback_toast("評価順を読み込めなかったため名前順で表示しました".into());
+            self.show_feedback_warning("評価順を読み込めなかったため名前順で表示しました".into());
         }
         if perf_on {
             crate::perf::event(
@@ -2708,10 +2791,21 @@ impl App {
                 )],
             );
         }
-        if let Some(&idx) = self.visible_indices.first() {
-            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+        let restored = position
+            .as_ref()
+            .and_then(|position| position.selected_key.as_deref())
+            .and_then(|key| {
+                self.visible_indices
+                    .iter()
+                    .copied()
+                    .find(|&index| self.rating_path_key(index).as_deref() == Some(key))
+            });
+        if restored.is_some() {
+            self.scroll_offset_y = position.as_ref().unwrap().scroll_offset_y;
         }
+        let selected = restored.or_else(|| self.visible_indices.first().copied());
+        self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
+        self.scroll_to_selected = selected.is_some();
         if perf_on {
             crate::perf::event(
                 "subfolder",
@@ -2737,7 +2831,7 @@ impl App {
             return hydration;
         }
         if skipped > 0 {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "サブ展開: {item_count}件 (読めなかった項目 {skipped}件)"
             ));
         } else if roots.len() > 1 {
@@ -2762,7 +2856,7 @@ impl App {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned());
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("subfolder_expansion_scan_modal")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("subfolder_expansion_scan_modal")).show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -2806,7 +2900,7 @@ impl App {
             let item_count = confirm.snapshot.entries.len();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("subfolder_expansion_confirm")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("subfolder_expansion_confirm")).show(ctx, |ui| {
                 ui.set_min_width(420.0);
                 ui.heading("大量の項目をサブ展開");
                 ui.add_space(8.0);
@@ -2850,7 +2944,7 @@ impl App {
         };
         let progress = pending.progress.clone();
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("subfolder_expansion_install_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("subfolder_expansion_install_modal")).show(ctx, |ui| {
             // 数百万件の進捗でも件数行が折り返されない幅を確保する。
             ui.set_min_width(460.0);
             ui.horizontal(|ui| {
@@ -2894,7 +2988,7 @@ impl App {
                     .book_address_label_for_path(&current)
                     .unwrap_or_else(|| current.to_string_lossy().to_string());
             }
-            self.show_feedback_toast("サブ展開の表示準備を中止しました".into());
+            self.show_feedback_warning("サブ展開の表示準備を中止しました".into());
         }
         ctx.request_repaint_after(Duration::from_millis(50));
     }
@@ -2984,6 +3078,215 @@ fn remove_paths_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1285_subfolder_scan_handoff_preserves_later_activation() {
+        for restart_scan in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let root = app.tmp.path().join("expansion");
+            std::fs::create_dir(&root).unwrap();
+            app.current_folder = Some(root.clone());
+            let initial = app.tmp.path().join("initial");
+            let (initial_tx, initial_cancel) = section1285_pending_resolver(
+                &mut app,
+                StartupOpenPathOwner::InitialStartup,
+                initial,
+            );
+
+            // A is accepted before B. Acceptance retires the old resolver exactly once.
+            app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
+            assert!(initial_cancel.load(Ordering::Relaxed));
+            assert!(initial_tx.send(section1285_resolver_result(&root)).is_err());
+            let activation = app.tmp.path().join("later-activation");
+            let (activation_tx, activation_cancel) = section1285_pending_resolver(
+                &mut app,
+                StartupOpenPathOwner::Activation,
+                activation.clone(),
+            );
+
+            // Publish A's scan deterministically after B starts resolving. A policy change
+            // exercises the scan restart through the same accepted navigation owner.
+            let (scan_tx, scan_rx) = mpsc::channel();
+            app.subfolder_expansion_pending.as_mut().unwrap().rx = scan_rx;
+            let file_type_visibility = app.settings.file_type_visibility.clone();
+            if restart_scan {
+                app.settings
+                    .file_type_visibility
+                    .excluded_extensions
+                    .insert("png".into());
+            }
+            scan_tx
+                .send(SubfolderExpansionEvent::Done(SubfolderExpansionResult {
+                    file_type_visibility,
+                    root: root.clone(),
+                    roots: vec![root],
+                    scan_filter: Default::default(),
+                    entries: Vec::new(),
+                    video_thumb_overrides: HashMap::new(),
+                    diag: Default::default(),
+                }))
+                .unwrap();
+            app.poll_subfolder_expansion(&egui::Context::default());
+
+            assert!(!activation_cancel.load(Ordering::Relaxed));
+            let pending = app.startup_open_path_resolve_pending.as_ref().unwrap();
+            assert_eq!(pending.requested.as_path(), activation.as_path());
+            assert!(matches!(pending.owner, StartupOpenPathOwner::Activation));
+            assert!(Arc::ptr_eq(&pending.cancel, &activation_cancel));
+            assert!(
+                activation_tx
+                    .send(section1285_resolver_result(&activation))
+                    .is_ok()
+            );
+            if restart_scan {
+                assert!(app.subfolder_expansion_pending.is_some());
+            } else {
+                assert!(app.subfolder_expansion_install_pending.is_some());
+            }
+            app.cancel_subfolder_expansion_pending();
+        }
+    }
+
+    fn section1285_pending_resolver(
+        app: &mut App,
+        owner: StartupOpenPathOwner,
+        requested: PathBuf,
+    ) -> (mpsc::Sender<StartupOpenPathResolveResult>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(requested).unwrap(),
+            owner,
+            navigation: None,
+            cancel: Arc::clone(&cancel),
+            rx,
+            started_at: Instant::now(),
+            toast_shown: false,
+            held_resolve_for_activation_admission: None,
+            diagnostic: None,
+        });
+        (tx, cancel)
+    }
+
+    fn section1285_resolver_result(requested: &Path) -> StartupOpenPathResolveResult {
+        StartupOpenPathResolveResult {
+            requested: requested.to_path_buf(),
+            resolved: None,
+            rar_volume_proof: None,
+            bookmark_relative_page_openable: None,
+            elapsed_ms: 1.0,
+            direct_media: None,
+        }
+    }
+
+    #[test]
+    fn g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return() {
+        use crate::app::book_materialization::ExtractedSurface;
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let ctx = egui::Context::default();
+        for saved_flow in [None, Some(ReadingFlow::Vertical)] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.detached_viewer_open_images_in_window = false;
+            // Explicit compiled Books remain Books without making the extraction scan
+            // collapse every image-only directory into a Folder row.
+            app.settings.auto_fullscreen_image_folders = false;
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.settings.default_reading_flow = ReadingFlow::Vertical;
+            app.settings.default_reading_direction = ReadingDirection::Rtl;
+            let books_root = app.tmp.path().join("books");
+            let book = books_root.join("subfolder-a2-original-book");
+            app.settings.book_root = Some(books_root);
+            std::fs::create_dir_all(&book).unwrap();
+            for name in ["a_1.png", "a_2.png"] {
+                image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+            }
+            let synthetic = subfolder_expansion_synthetic_path();
+            if let Some(flow) = saved_flow {
+                let db = app.spread_db.as_ref().unwrap();
+                db.set(
+                    &synthetic,
+                    SpreadMode::RtlCover,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+                db.set_flow(
+                    &synthetic,
+                    flow,
+                    ReadingDirection::Rtl,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+            }
+            let stored = app
+                .spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None);
+            app.load_folder(book.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.start_subfolder_expansion_scan_roots(book.clone(), vec![book.clone()]);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_subfolder_expansion_view {
+                assert!(
+                    Instant::now() < deadline,
+                    "Subfolder A2 scan did not settle"
+                );
+                app.poll_subfolder_expansion(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            finish_list_hydration_for_test(&mut app);
+            assert_eq!(
+                app.extracted_result_surface(),
+                Some(ExtractedSurface::SubfolderExpansion)
+            );
+            // Like a new Smart root, this producer uses the legacy synthetic-key
+            // NON_BOOK restore: no saved flow means Paged after a Vertical Book.
+            let expected_flow = saved_flow.unwrap_or(ReadingFlow::Paged);
+            assert_eq!(app.reading_flow, expected_flow);
+            let index = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(_)))
+                .unwrap();
+            for _ in 0..2 {
+                app.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+                assert_eq!(app.fullscreen_idx, Some(index));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.apply_fullscreen_spread_mode(&ctx, index, SpreadMode::RtlCover);
+                assert_eq!(app.spread_mode, SpreadMode::Rtl);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.close_fullscreen();
+            }
+            assert_eq!(
+                app.spread_db
+                    .as_ref()
+                    .unwrap()
+                    .get_state_with_fallback(&synthetic, None),
+                stored
+            );
+            app.exit_subfolder_expansion_view();
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+            assert!(app.extracted_result_surface().is_none());
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        }
+    }
 
     fn finish_list_hydration_for_test(app: &mut App) {
         let ctx = egui::Context::default();
@@ -3148,7 +3451,7 @@ mod tests {
             file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: false,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books,
             include_convertible_archives: false,
@@ -3616,7 +3919,8 @@ mod tests {
                 file_type_visibility: Default::default(),
                 skip_image_if_video_exists: false,
                 skip_duplicate_images: false,
-                skip_zip_if_folder_exists: false,
+                same_name_folder_book:
+                    crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
                 video_thumb_use_sidecar_image: true,
                 image_folder_books: false,
                 include_convertible_archives: false,
@@ -3854,6 +4158,32 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_subfolder_expansion_preserves_child_book_cells() {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy as Policy;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        for policy in [Policy::PreferBook, Policy::PreferFolder, Policy::ShowBoth] {
+            let mut options = test_scan_options(true);
+            options.same_name_folder_book = policy;
+            let result = scan_test_root(&root, options);
+            assert!(result.entries.iter().any(
+                |entry| entry.path == book && entry.kind == SubfolderExpansionEntryKind::Folder
+            ));
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == root.join("book.zip")),
+                policy != Policy::PreferFolder
+            );
+        }
+    }
+
+    #[test]
     fn same_name_zip_is_hidden_in_favor_of_image_folder_book_when_configured() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -3863,7 +4193,8 @@ mod tests {
         std::fs::write(book.join("001.jpg"), b"image").unwrap();
         std::fs::write(root.join("volume.zip"), b"zip").unwrap();
         let mut options = test_scan_options(true);
-        options.skip_zip_if_folder_exists = true;
+        options.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
 
         let result = scan_test_root(&root, options);
 
@@ -3979,7 +4310,7 @@ mod tests {
             file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books: false,
             include_convertible_archives: false,

@@ -59,6 +59,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["文字色", "見やすさ", "contrast"]
     ),
     entry!(
+        "general/notification-duration",
+        General,
+        "通知の表示時間",
+        ["短い", "標準", "長い", "トースト", "メッセージ", "通知時間"]
+    ),
+    entry!(
         "general/restore-position",
         General,
         "環境設定を開き直したときに前回の位置を復元する",
@@ -694,8 +700,16 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "duplicate/archive-folder",
         DuplicateFiles,
-        "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
-        ["重複", "同名", "archive"]
+        "同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合",
+        [
+            "重複",
+            "同名",
+            "archive",
+            "本を表示",
+            "フォルダを表示",
+            "両方表示",
+            "本側をスキップ"
+        ]
     ),
     entry!(
         "duplicate/zip-archive",
@@ -771,6 +785,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/manual-nav-wrap",
+        SpreadMode,
+        "先頭 / 末尾で反対側の端へ移る (ループ)",
+        [
+            "前後移動",
+            "手動",
+            "折り返し",
+            "画像",
+            "動画",
+            "音声",
+            "wrap"
+        ]
+    ),
+    entry!(
         "spread/boundary-notice",
         SpreadMode,
         "先頭 / 末尾の案内を表示",
@@ -795,6 +823,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["単ページ", "見開き", "比較", "構成"]
     ),
     entry!(
+        "spread/page-layout-plain-folders",
+        SpreadMode,
+        "通常フォルダにも既定のページ構成を使う",
+        [
+            "通常フォルダ",
+            "見開き",
+            "既定",
+            "ページ構成",
+            "本として扱わない"
+        ]
+    ),
+    entry!(
         "spread/document-direction",
         SpreadMode,
         "PDF / EPUB の右開き指定に従う",
@@ -813,10 +853,39 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["表紙", "末尾", "見開き", "本ごとの設定"]
     ),
     entry!(
+        "spread/page-turn-animation",
+        SpreadMode,
+        "ページめくりアニメーション",
+        [
+            "紙めくり",
+            "スライドショー",
+            "時間",
+            "演出",
+            "animation",
+            "先頭",
+            "末尾",
+            "実効配置"
+        ]
+    ),
+    entry!(
         "spread/singleton-placement",
         SpreadMode,
         "見開き先頭の単ページを片側に配置",
-        ["単ページ", "先頭", "末尾", "片側", "本ごとの設定"]
+        [
+            "単ページ",
+            "先頭",
+            "末尾",
+            "片側",
+            "本ごとの設定",
+            "ページめくり",
+            "アニメーション",
+            "本来の側",
+            "実効配置",
+            "無効化",
+            "保存済み設定",
+            "連結読み",
+            "mIV Remote"
+        ]
     ),
     entry!(
         "spread/page-alone",
@@ -1281,6 +1350,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
+        "video/effetune-taskbar",
+        Video,
+        "音響調整の窓をタスクバーに表示する",
+        ["音響調整", "タスクバー", "taskbar", "復元", "EffeTune"]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
         "video/effetune-minimized",
         Video,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -1383,6 +1459,28 @@ mod tests {
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
     const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
+
+    #[test]
+    fn same_name_folder_book_choice_queries_target_the_existing_anchor() {
+        for query in [
+            "本を表示",
+            "フォルダを表示",
+            "両方表示",
+            "ZIP フォルダ",
+            "本側をスキップ",
+        ] {
+            let results = search_preferences(query, |_| ("ファイル", 0, 0));
+            let result = results
+                .iter()
+                .find(|entry| entry.anchor == "duplicate/archive-folder")
+                .unwrap_or_else(|| panic!("same-name preference missing for {query}"));
+            assert_eq!(result.page, PreferencesPage::DuplicateFiles);
+            assert_eq!(
+                result.title,
+                "同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合"
+            );
+        }
+    }
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1624,6 +1722,30 @@ mod tests {
     }
 
     #[test]
+    fn plain_folder_spread_search_reaches_its_anchor() {
+        for query in ["通常フォルダ", "見開き 既定", "ページ構成"] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.anchor == "spread/page-layout-plain-folders"
+                        && entry.page == PreferencesPage::SpreadMode)
+            );
+        }
+    }
+
+    #[test]
+    fn effetune_taskbar_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune タスクバー", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-taskbar")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn effetune_minimized_search_matches_the_build_flavor() {
         let result = search_preferences("EffeTune 最小化", test_tree_position);
         #[cfg(not(feature = "portable"))]
@@ -1674,6 +1796,26 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn page_turn_endpoint_effective_placement_is_searchable() {
+        for query in [
+            "先頭 アニメーション 実効配置",
+            "末尾 アニメーション 無効化",
+            "保存済み設定 連結読み",
+            "本来の側 mIV Remote",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| {
+                        entry.page == PreferencesPage::SpreadMode
+                            && entry.anchor == "spread/singleton-placement"
+                    }),
+                "missing endpoint setting for {query}"
+            );
+        }
     }
 
     #[test]
@@ -1789,6 +1931,17 @@ mod tests {
             .find(|entry| entry.anchor == "spread/seek-strip")
             .expect("静止画サムネイル列の最大高さが検索できる");
         assert_eq!(still_height.page, PreferencesPage::SpreadMode);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_is_searchable() {
+        for query in ["手動 ループ", "前後移動 折り返し", "動画 wrap"] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/manual-nav-wrap")
+                .expect("手動の前後移動ループ設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
     }
 
     #[test]

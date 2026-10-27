@@ -1,7 +1,7 @@
 {
   "README.md": {
     "include": true,
-    "reason": "Select VST-applicable operations by exact heading; platform-only clauses corrected in README.json.",
+    "reason": "Select VST-applicable operations by exact heading; standalone player, LAN remote and MCP sections are excluded. Tour guidance is inserted in README.json using bundled ja locale tour.menu.",
     "title": "基本操作 - EffeTune",
     "sections": [
       "Visualizerで音を表示する",
@@ -24,7 +24,7 @@
   },
   "controller-mapping.md": {
     "include": true,
-    "reason": "v0.13.0 vst-bootstrap.js:35 exposes physical-control-section; effect/automation and non-player app targets are available. VST-specific limits in controller-mapping.json."
+    "reason": "v0.14.0 vst-bootstrap.js:41 exposes physical-control-section; effect/automation and non-player app targets are available. VST-specific limits in controller-mapping.json."
   },
   "double-blind-test.md": {
     "include": false,
@@ -44,7 +44,7 @@
   },
   "pipeline-analyzer.md": {
     "include": false,
-    "reason": "Explicitly disabled: bundled ui-manager.js:197-201,601-611; JS analysis would not measure native VST DSP."
+    "reason": "v0.14.0 ui-manager.js disables Pipeline Analyzer in VST mode; JS analysis would not measure native VST DSP."
   },
   "bus-function.md": {
     "include": true,

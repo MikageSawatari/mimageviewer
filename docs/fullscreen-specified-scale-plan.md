@@ -168,13 +168,17 @@ canonical寸法を「原寸の画素数」として渡さない。共通resolver
 | content bbox・rotation | §5.1で解決したsource座標の正規化bboxと保存回転。分割・trimの優先を解決してから渡し、回転とbbox変換を一度だけ行う |
 | 表示先・構成 | 実image rect（point）、そのContextのeffective ppp、ページのlogical scale・slot・実効gap。frozenはcapture時の入力を使う |
 
-**新方式ではAI到着前後にOを変えない。** AIなしの通常画像は、各consumerの既存原寸と
+**新方式ではAI到着前後にOを変えない。** §1.165最終P2追補（2026-10-22）では通常rasterの
+Oを単ページ・見開き・連結読みで共通化する。本画像未到着のthumbnailも生成時rasterまたは
+producerと同じGPU clamp予測値を使い、thumbnail実寸・clamp前のsource原寸へ戻さない。
+通常全面素材のAも同じAI前rasterから取り、cache到着でcanonical aspectとraster aspectを
+切り替えない。部分coverage／RAW／PDFのaspect ownerと正準source座標は維持する。
+これは従来のconsumer別原寸維持からの明示的な仕様変更で、他4方式には適用しない。
 no_upscale / no_downscaleの順序を保つ。AIが有効なら、その画像の**AI前の表示原寸基準**を
 同じsource identity / geometryへ対応付ける。単ページ / 見開きで現在textureを原寸にする
 経路を、そのままAI出力textureへ適用しない。AI前inputの寸法はfinal_pipeline:110 / :25で
 既に扱うが、RAWのdeveloped_dims等、consumerがcanonical pixel原寸を使う場合はその基準を
-維持する。AI inputがdecode / GPU clampで小さくても、canonical原寸を使うconsumerのOまで
-小さくしない。逆に通常consumerが既存の非AI rasterを原寸にするなら、AI前のその基準を使う。
+維持する。通常rasterはAI前のGPU raster基準を使い、RAWのdeveloped原寸とPDF固定Oは維持する。
 AI倍率で結果texture寸法を割り戻す推測や、初めて到着したAI結果をOとして保存する案は採らない。
 AI前のsource / layout ownerの値を、派生textureの既存source metadataとの対応に使う。
 必要な対応を同じsource / contextの既存metadataから得られなければ、実装時に止めて報告する。
@@ -182,7 +186,7 @@ AI前のsource / layout ownerの値を、派生textureの既存source metadata�
 見開きの:40879はcanonical layoutをそのまま基準寸法へ採る枝もあるため、新方式へ
 その単位を物理原寸として持ち込まない。新方式adapterは媒体ごとのOを画素基準へ解決して正規化し、
 既存4方式のその枝は変更しない。
-連結もAI前のraw/source基準を使い、AIだけの画素数増加・丸めをアスペクト変更として扱わない。
+連結も同じAI前raster基準（RAWではdeveloped原寸）を使い、AIだけの画素数増加を原寸変更にしない。
 denoise、retained AI、final composite、注釈 / mask / conceal等をAI結果の上へ合成したtextureも、
 親sourceの同じA / Oを引き継ぐ。派生画像のGPU clamp寸法を原寸へ戻さない。
 AI以外の明示的な編集でページ構成・canvas / bboxが本当に変わる場合は既存のsource / geometry
@@ -999,6 +1003,18 @@ P2を確認した。§18の描画fixtureは数値編集にフォーカスせず�
 数値欄へ届け、変換中のEnter / EscとCommit / Disabled→同frameのキーを検証する。
 全画面とpopupの継続、IME keyboard owner、数値の確定／取消を確認する。
 DragValueのEnterによる編集終了はwidgetの既存動作として区別し、popup／全画面終了とは扱わない。
+
+2026-10-14 I2 段 2a: 上記は旧入力モデルでの検証履歴。現在の両回帰は実機記録に合わせ、
+IME 確定／取消を press なし・Ime 列＋release で渡し、実bufferとfocusの維持を確認する。
+続く通常 Enter／Esc による数値編集の終了・値の確定／取消も別に検証する。
+
+2026-10-14 I2 段 2b: grace を撤去し、確定／取消後の通常キーを同じ pass と次 pass の両方で検証する。
+前提照合で、raw DragValue の通常 Esc は IME 無しでも begin-pass の focus 解除後に fullscreen を閉じる
+既存経路であることを確認した。従来テストの「直後の Esc でも fullscreen 継続」は grace に依存していた。
+利用者承認済みの「確定直後も通常時と同じ」に合わせ、IME 無しの対照も同じ実 handler に通して終了を確認する。
+数値欄の所有設計を変更する修正は混ぜない。IME の終端 event だけなら欄・fullscreen を維持する。
+また、旧 fixture の pass 終了後の `keyboard_owner_for_pass` 呼び出しは次 pass に古い composing owner を
+キャッシュしていたため、owner の検証は実際の pass 内へ移した。
 
 検出力はAppのclose経路へキー所有権を迂回する一時mutationを入れて確認した。
 Enterは変換中、EscはDisabledと同frameのキーで`fullscreen_idx=None`となり、両テストが

@@ -154,7 +154,7 @@ impl App {
             .unwrap_or(false);
 
         // ── タイトルバー含めた全体の dark Frame ──
-        // egui::Window のタイトルバーは ctx.style() の visuals を使うため、
+        // egui::Window のタイトルバーは ctx.global_style() の visuals を使うため、
         // .show(ctx, |ui| ui.style_mut().visuals = dark()) では **タイトルバーだけ
         // light のまま** になる (= "再表示すると白背景" の根本原因)。
         // .frame(custom_frame) でウィンドウ全体の outer Frame を黒で塗り、その上に
@@ -164,11 +164,13 @@ impl App {
             1.0,
             egui::Color32::from_rgba_unmultiplied(120, 120, 120, 200),
         );
-        let frame = egui::Frame::window(&ctx.style()).fill(bg).stroke(stroke);
+        let frame = egui::Frame::window(&ctx.global_style())
+            .fill(bg)
+            .stroke(stroke);
 
         let window_response = crate::os_theme::with_dark_context_style(ctx, || {
-            egui::Window::new("VST3")
-            .id(egui::Id::new("vst3-playback-panel"))
+            egui::Window::new("VST3").drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("vst3-playback-panel"))
             .frame(frame)
             .open(&mut open)
             .default_pos(initial_pos)

@@ -213,6 +213,9 @@ fn wire_reply_preserves_unicode_unc_flags_totals_and_actual_sort() {
     assert_eq!(reply.rows[0].full_path, unc);
     assert!(reply.rows[0].is_file());
     assert!(reply.rows[1..].iter().all(|r| !r.is_file()));
+    assert!(!reply.rows[0].is_folder());
+    assert!(reply.rows[1].is_folder());
+    assert!(reply.rows[2..].iter().all(|r| !r.is_folder()));
 }
 
 #[test]
@@ -434,6 +437,72 @@ fn busy_and_timeout_messages_are_distinct_from_client_not_running() {
             .user_message()
             .contains("クライアントを起動")
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn fake_not_responding_slow_timeout_and_unavailable_have_distinct_guidance() {
+    // Inject Windows observations rather than waiting for a real HWND to hang.
+    // Status ABORTIFHUNG can fail with error 0; query timeout is error 1460.
+    use windows::Win32::Foundation::ERROR_TIMEOUT;
+    let not_responding = EverythingError::NotResponding.user_message();
+    let slow = EverythingError::Busy.user_message();
+    let absent = EverythingError::Unavailable.user_message();
+    assert_ne!(not_responding, slow);
+    assert_ne!(not_responding, absent);
+    assert_ne!(slow, absent);
+    assert!(not_responding.contains("処理が終わるまで待って"));
+    assert!(!not_responding.contains("絞って"));
+
+    for (win32_error, hung, expected) in [
+        (0, true, EverythingError::NotResponding),
+        (ERROR_TIMEOUT.0, true, EverythingError::NotResponding),
+        (ERROR_TIMEOUT.0, false, EverythingError::Busy),
+        (0, false, EverythingError::SendFailed),
+        (5, false, EverythingError::SendFailed),
+    ] {
+        let classified = super::native::classify_send_failure(win32_error, hung);
+        assert_eq!(classified, expected);
+        let mut status = FakeEverythingEndpoint {
+            version: Err(classified.clone()),
+            ..Default::default()
+        };
+        let error =
+            query_with_endpoint("a", &CancelHandle::new().unwrap(), &mut status).unwrap_err();
+        assert_eq!(error.user_message(), expected.user_message());
+        assert!(
+            status.sends.is_empty(),
+            "no query/cancel/retry after status failure"
+        );
+
+        let mut query = FakeEverythingEndpoint {
+            send_error: Some(classified),
+            send_duration: SEND_TIMEOUT,
+            ..Default::default()
+        };
+        let error =
+            query_with_endpoint("a", &CancelHandle::new().unwrap(), &mut query).unwrap_err();
+        assert_eq!(error, expected);
+        assert_eq!(error.user_message(), expected.user_message());
+        assert_eq!(
+            query.sends.len(),
+            2,
+            "one query and existing best-effort cancel"
+        );
+        assert_eq!(query_text(&query.sends[1]), "nothing:");
+        assert_eq!(query.active, None);
+    }
+    let mut endpoint = FakeEverythingEndpoint {
+        version: Err(EverythingError::Unavailable),
+        ..Default::default()
+    };
+    assert_eq!(
+        query_with_endpoint("a", &CancelHandle::new().unwrap(), &mut endpoint)
+            .unwrap_err()
+            .user_message(),
+        absent
+    );
+    assert!(endpoint.sends.is_empty());
 }
 
 #[test]

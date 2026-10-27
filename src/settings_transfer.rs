@@ -213,7 +213,13 @@ macro_rules! preferences_policy {
         }
         fn parse_items(items: &Map<String, Value>) -> ParsedPreferences {
             let mut result = ParsedPreferences { accepted: Vec::new(), issues: Vec::new(), unknown_count: 0 };
-            for (key, raw) in items { match key.as_str() {
+            let mut items = items.clone();
+            if crate::same_name_folder_book::canonicalize(&mut items).is_err() {
+                items.remove(crate::same_name_folder_book::KEY);
+                items.remove(crate::same_name_folder_book::LEGACY_KEY);
+                result.issues.push(issue("同名のフォルダと本"));
+            }
+            for (key, raw) in &items { match key.as_str() {
                 $( stringify!($field) => match validated::<$ty>(raw, $check) {
                     Some(value) => result.accepted.push(Accepted::$field(value)),
                     None => result.issues.push(issue($label)),
@@ -258,6 +264,7 @@ macro_rules! preferences_policy {
 preferences_policy! {
     export {
         ui_theme: UiTheme => ("テーマ", |v, _raw| matches!(v, UiTheme::System | UiTheme::Light | UiTheme::Dark), plain, plain);
+        notification_duration: NotificationDuration => ("通知の表示時間", |v, _raw| !matches!(v, NotificationDuration::Unknown), plain, plain);
         preferences_restore_position: bool => ("環境設定の前回位置を復元", |_, _| true, plain, plain);
         text_contrast: TextContrast => ("文字コントラスト", |v, _raw| matches!(v, TextContrast::Standard | TextContrast::Strong), plain, plain);
         raw_brightness: crate::raw::RawBrightness => ("RAW の明るさ", |v, _raw| matches!(v, crate::raw::RawBrightness::MatchPreview | crate::raw::RawBrightness::None), plain, plain);
@@ -317,7 +324,7 @@ preferences_policy! {
         edit_restore_prompt_enabled: bool => ("編集の復元確認", |_, _| true, plain, plain);
         sidecar_backup_enabled: bool => ("編集データのサイドカーバックアップ", |_, _| true, plain, plain);
         tag_sidecar_backup_enabled: bool => ("タグのサイドカーバックアップ", |_, _| true, plain, plain);
-        skip_zip_if_folder_exists: bool => ("同名フォルダがあるZIPを省略", |_, _| true, plain, plain);
+        same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy => ("同名のフォルダと本", |_, _| true, plain, plain);
         skip_archive_if_zip_exists: bool => ("同名ZIPがあるアーカイブを省略", |_, _| true, plain, plain);
         skip_epub_if_pdf_exists: bool => ("同名PDFがあるEPUBを省略", |_, _| true, plain, plain);
         skip_image_if_video_exists: bool => ("同名の動画・音声がある画像を省略", |_, _| true, plain, plain);
@@ -331,8 +338,11 @@ preferences_policy! {
         write_rating_to_xmp: bool => ("評価をXMPに保存", |_, _| true, plain, plain);
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
+        apply_default_spread_to_plain_folders: bool => ("通常フォルダにも既定のページ構成を使う", |_, _| true, plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
         remember_spread_shift_per_book: bool => ("見開きの調整を本ごとに記憶する", |_, _| true, plain, plain);
+        page_turn_animation_enabled: bool => ("ページめくりアニメーション", |_, _| true, plain, plain);
+        page_turn_animation_duration_ms: u32 => ("ページめくりアニメーションの時間", |v, _| (100..=600).contains(v), plain, plain);
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
@@ -351,6 +361,7 @@ preferences_policy! {
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
         fullscreen_side_panel_mode: FsSidePanelMode => ("閲覧表示の左右パネル", |v, _raw| FsSidePanelMode::all().contains(v), plain, plain);
         fullscreen_chrome_suppression: FullscreenChromeSuppression => ("全画面中の固定表示の一時抑制", |_, _| true, plain, plain);
+        fullscreen_manual_nav_wrap: bool => ("閲覧表示の手動前後移動ループ", |_, _| true, plain, plain);
         fullscreen_boundary_notice_visible: bool => ("閲覧表示の境界通知", |_, _| true, plain, plain);
         fullscreen_processing_status_visible: bool => ("閲覧表示の処理状況", |_, _| true, plain, plain);
         fullscreen_prefetch_status_visible: bool => ("閲覧表示の先読み状況", |_, _| true, plain, plain);
@@ -408,6 +419,7 @@ preferences_policy! {
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
         effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         effetune_keep_visible_when_minimized => "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
+        effetune_show_in_taskbar => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         grid_cols => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         grid_view_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_sort_key => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -528,6 +540,10 @@ preferences_policy! {
         folder_tree_pane_visible => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_sort_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_pane_width_ratio => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_toolbar_search_container => "環境設定外のツールバー検索欄";
+        show_toolbar_search_local => "環境設定外のツールバー検索欄";
+        show_toolbar_search_metadata => "環境設定外のツールバー検索欄";
+        show_toolbar_search_everything => "環境設定外のツールバー検索欄";
         show_toolbar_folder => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_folder_tree_button => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_effetune => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -601,6 +617,7 @@ preferences_policy! {
         gamepad_enabled => "既存の操作カスタマイズ共有が正本";
         margin_fit_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         ui_scale_factor => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        music_note_color_scheme => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         ui_font => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         first_setup_completed => "初回/学習/通知/保存版の内部記録";
         toolbar_cols_items => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -701,6 +718,7 @@ preferences_policy! {
         video_in_window_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_window_placement => "runtime overlay / PC のウィンドウ配置";
+        detached_viewer_window_physical_placement => "runtime overlay / PC のウィンドウ配置";
         vst3_enabled => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugins => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugin_path => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
@@ -714,6 +732,7 @@ preferences_policy! {
         audio_normalize_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         audio_normalize_target_lufs_milli => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         last_seen_version => "初回/学習/通知/保存版の内部記録";
+        whats_new_acknowledged_version => "初回/学習/通知/保存版の内部記録";
     }
 }
 
@@ -861,6 +880,44 @@ pub fn write_preferences(path: &Path, json: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_name_folder_book_legacy_transfer_partial_and_new_precedence() {
+        use crate::same_name_folder_book::{KEY, LEGACY_KEY, SameNameFolderBookPolicy as Policy};
+        for (old, expected) in [(true, Policy::PreferBook), (false, Policy::ShowBoth)] {
+            let parsed = parse_items(serde_json::json!({LEGACY_KEY: old}).as_object().unwrap());
+            let mut destination = Settings::default();
+            destination.same_name_folder_book = Policy::PreferFolder;
+            let report = parsed.apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 1);
+            assert_eq!(report.unknown_count, 0);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.same_name_folder_book, expected);
+        }
+        let mut destination = Settings::default();
+        destination.same_name_folder_book = Policy::PreferFolder;
+        parse_items(&serde_json::Map::new()).apply_to(&mut destination);
+        assert_eq!(destination.same_name_folder_book, Policy::PreferFolder);
+        let parsed = parse_items(
+            serde_json::json!({KEY:"show_both",LEGACY_KEY:true})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(parsed.apply_to(&mut destination).accepted_count, 1);
+        assert_eq!(destination.same_name_folder_book, Policy::ShowBoth);
+        let parsed = parse_items(
+            serde_json::json!({KEY:"future",LEGACY_KEY:true,"slideshow_interval_secs":9.0})
+                .as_object()
+                .unwrap(),
+        );
+        let report = parsed.apply_to(&mut destination);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(destination.same_name_folder_book, Policy::ShowBoth);
+        assert_eq!(destination.slideshow_interval_secs, 9.0);
+        let (map, _) = project(capture_export(&destination));
+        assert_eq!(map[KEY], "show_both");
+        assert!(!map.contains_key(LEGACY_KEY));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -881,6 +938,7 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings.apply_default_spread_to_plain_folders = true;
         settings
             .file_type_visibility
             .excluded_categories
@@ -924,6 +982,7 @@ mod tests {
         settings.fullfeature_media_window = !settings.fullfeature_media_window;
         settings.restore_last_cursor = !settings.restore_last_cursor;
         settings.preferences_restore_position = !settings.preferences_restore_position;
+        settings.notification_duration = NotificationDuration::Long;
         settings.startup_window_state = different_enum(
             &settings.startup_window_state,
             &[
@@ -1116,7 +1175,8 @@ mod tests {
         settings.edit_restore_prompt_enabled = !settings.edit_restore_prompt_enabled;
         settings.sidecar_backup_enabled = !settings.sidecar_backup_enabled;
         settings.tag_sidecar_backup_enabled = !settings.tag_sidecar_backup_enabled;
-        settings.skip_zip_if_folder_exists = !settings.skip_zip_if_folder_exists;
+        settings.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
         settings.skip_archive_if_zip_exists = !settings.skip_archive_if_zip_exists;
         settings.skip_epub_if_pdf_exists = !settings.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = !settings.skip_image_if_video_exists;
@@ -1140,6 +1200,8 @@ mod tests {
         );
         settings.follow_document_reading_direction = !settings.follow_document_reading_direction;
         settings.remember_spread_shift_per_book = !settings.remember_spread_shift_per_book;
+        settings.page_turn_animation_enabled = true;
+        settings.page_turn_animation_duration_ms = 600;
         settings.default_reading_flow = different_enum(
             &settings.default_reading_flow,
             &[
@@ -1185,6 +1247,7 @@ mod tests {
             &[FsSidePanelMode::Hover, FsSidePanelMode::ClickToShow],
         );
         settings.fullscreen_boundary_notice_visible = !settings.fullscreen_boundary_notice_visible;
+        settings.fullscreen_manual_nav_wrap = !settings.fullscreen_manual_nav_wrap;
         settings.fullscreen_processing_status_visible =
             !settings.fullscreen_processing_status_visible;
         settings.fullscreen_prefetch_status_visible = !settings.fullscreen_prefetch_status_visible;
@@ -1860,30 +1923,43 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 457);
+        assert_eq!(entries.len(), 470);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            144
+            149
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            313
+            321
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
+        for key in [
+            "show_toolbar_search_container",
+            "show_toolbar_search_local",
+            "show_toolbar_search_metadata",
+            "show_toolbar_search_everything",
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(field, reason)| *field == key && reason.is_some()),
+                "toolbar state must remain classified outside Preferences: {key}"
+            );
+        }
         assert!(
             entries
                 .iter()
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 142);
+        assert_eq!(wire.len(), 147);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1897,6 +1973,92 @@ mod tests {
                 .map(String::as_str)
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_transfer_roundtrip_missing_and_invalid_values() {
+        let source = Settings {
+            page_turn_animation_enabled: true,
+            page_turn_animation_duration_ms: 350,
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert!(destination.page_turn_animation_enabled);
+        assert_eq!(destination.page_turn_animation_duration_ms, 350);
+        parse_preferences(INITIAL_V1)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(destination.page_turn_animation_enabled);
+        assert_eq!(destination.page_turn_animation_duration_ms, 350);
+
+        for duration in [
+            json!(99),
+            json!(601),
+            json!(-1),
+            json!(200.5),
+            json!("200"),
+            Value::Null,
+        ] {
+            let report = parse_preferences(&document(
+                json!({"page_turn_animation_duration_ms": duration}),
+            ))
+            .unwrap()
+            .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1);
+            assert_eq!(destination.page_turn_animation_duration_ms, 350);
+        }
+        let report = parse_preferences(&document(json!({"page_turn_animation_enabled": "true"})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(report.issues.len(), 1);
+        assert!(destination.page_turn_animation_enabled);
+        for duration in [100, 600] {
+            let report = parse_preferences(&document(
+                json!({"page_turn_animation_duration_ms": duration}),
+            ))
+            .unwrap()
+            .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.page_turn_animation_duration_ms, duration);
+        }
+    }
+
+    #[test]
+    fn removed_single_page_turn_spine_transfer_is_ignored_and_not_exported() {
+        let mut destination = Settings {
+            page_turn_animation_enabled: true,
+            page_turn_animation_duration_ms: 350,
+            ..Settings::default()
+        };
+        for legacy_value in [
+            json!("OwnPage"),
+            json!("Moving"),
+            json!("FutureMode"),
+            json!(true),
+            Value::Null,
+        ] {
+            let report =
+                parse_preferences(&document(json!({"page_turn_single_spine": legacy_value})))
+                    .unwrap()
+                    .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(report.unknown_count, 1);
+            assert_eq!(report.accepted_count, 0);
+            assert!(report.changed_fields.is_empty());
+            assert!(destination.page_turn_animation_enabled);
+            assert_eq!(destination.page_turn_animation_duration_ms, 350);
+        }
+        assert!(
+            !export_preferences(&destination)
+                .unwrap()
+                .json
+                .contains("page_turn_single_spine")
         );
     }
 
@@ -1924,6 +2086,39 @@ mod tests {
             assert_eq!(parsed.issues.len(), 1);
             parsed.apply_to(&mut destination);
             assert_eq!(destination.preferences_restore_position, enabled);
+        }
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_transfer_roundtrip_missing_and_invalid_values() {
+        for enabled in [false, true] {
+            let source = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                fullscreen_manual_nav_wrap: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let parsed =
+                    parse_preferences(&document(json!({"fullscreen_manual_nav_wrap": invalid})))
+                        .unwrap();
+                assert_eq!(parsed.issues.len(), 1);
+                parsed.apply_to(&mut destination);
+                assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            }
         }
     }
 
@@ -1990,6 +2185,16 @@ mod tests {
         let exported = export_preferences(&source).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
         let mut destination = private_destination();
+        assert_ne!(
+            source.music_note_color_scheme,
+            destination.music_note_color_scheme
+        );
+        let exported_document: Value = serde_json::from_str(&exported.json).unwrap();
+        assert!(
+            exported_document["preferences"]
+                .get("music_note_color_scheme")
+                .is_none()
+        );
         // The overlay's common projection is transferable. Align it before this
         // generic exclusion check, whose full runtime-owner equality stays strict.
         // The focused specified-scale test covers importing a changed common value.
@@ -2037,6 +2242,7 @@ mod tests {
     fn private_destination() -> Settings {
         let sentinel = r"C:\Users\private-alice\SECRET_PIN_184729";
         let mut settings = Settings::default();
+        settings.music_note_color_scheme = crate::music_note_color::MusicNoteColorScheme::Chromatic;
         settings.last_folder = Some(sentinel.into());
         settings.startup_list_restore = Some(crate::settings::StartupListRestore::V1 {
             target: crate::settings::StartupListTarget::PhysicalList {
@@ -2168,6 +2374,7 @@ mod tests {
         source.effetune_pre_limiter_enabled = false;
         source.effetune_auto_open_on_video = true;
         source.effetune_keep_visible_when_minimized = true;
+        source.effetune_show_in_taskbar = false;
         source.window_pos = Some([100.0, 200.0]);
         source.toolbar_section_order.reverse();
         let exported = export_preferences(&source).unwrap();
@@ -2184,6 +2391,7 @@ mod tests {
                 "effetune_keep_visible_when_minimized",
                 serde_json::json!(true),
             ),
+            ("effetune_show_in_taskbar", serde_json::json!(false)),
             ("window_pos", serde_json::json!([100.0, 200.0])),
             (
                 "toolbar_section_order",
@@ -2201,7 +2409,7 @@ mod tests {
         let before = destination.clone();
         let parsed = parse_preferences(&document.to_string()).unwrap();
         let report = parsed.apply_to(&mut destination);
-        assert_eq!(report.unknown_count, 12);
+        assert_eq!(report.unknown_count, 13);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
 
@@ -2211,6 +2419,96 @@ mod tests {
         assert_eq!(report.issues.len(), 1);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn detached_placement_transfer_excludes_both_formats_and_keeps_destination() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+        use crate::settings::DetachedViewerWindowPlacement;
+
+        let source = Settings {
+            detached_viewer_window_placement: Some(DetachedViewerWindowPlacement {
+                x: 4000.0,
+                y: 100.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            }),
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: 6000,
+                    top: 150,
+                    right: 7440,
+                    bottom: 1230,
+                },
+                maximized: true,
+            }),
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+        for key in [
+            "detached_viewer_window_placement",
+            "detached_viewer_window_physical_placement",
+        ] {
+            assert!(document["preferences"].get(key).is_none(), "{key}");
+            document["preferences"][key] = serde_json::to_value(&source).unwrap()[key].clone();
+        }
+        let mut destination = Settings {
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: -1920,
+                    top: 0,
+                    right: -960,
+                    bottom: 720,
+                },
+                maximized: false,
+            }),
+            ..Settings::default()
+        };
+        let before = destination.clone();
+        let report = parse_preferences(&document.to_string())
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(report.unknown_count, 2);
+        assert_eq!(
+            destination.detached_viewer_window_placement,
+            before.detached_viewer_window_placement
+        );
+        assert_eq!(
+            destination.detached_viewer_window_physical_placement,
+            before.detached_viewer_window_physical_placement
+        );
+        assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn effetune_taskbar_transfer_excludes_and_preserves_destination_in_both_flavors() {
+        for destination_value in [false, true] {
+            let source = Settings {
+                effetune_show_in_taskbar: !destination_value,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+            assert!(
+                document["preferences"]
+                    .get("effetune_show_in_taskbar")
+                    .is_none()
+            );
+            // An externally supplied excluded key must not change the destination either.
+            document["preferences"]["effetune_show_in_taskbar"] =
+                serde_json::json!(!destination_value);
+            let mut destination = Settings {
+                effetune_show_in_taskbar: destination_value,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&document.to_string())
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.unknown_count, 1);
+            assert_eq!(destination.effetune_show_in_taskbar, destination_value);
+        }
     }
 
     #[test]

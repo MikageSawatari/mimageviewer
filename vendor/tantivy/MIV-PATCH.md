@@ -9,6 +9,12 @@ that package, not a junction/symlink; the registry copy is never modified.
 Upstream's MIT license is retained in [LICENSE](LICENSE), with AUTHORS and
 the original package/source files.
 
+2026-10-15: upstream 0.26.1 -> 0.26.2 (tag commit `72d1ef9a6468aa68bbc69dcc80cdf60aaf64364d`) was applied on top of
+this copy with the GitHub compare diff (aggregation count/flush fixes, buffered union
+`seek_danger` override removal + `src/query/seek_danger_tests.rs`). It touches none of the
+files changed by the local patch below. Only the version lines of Cargo.toml /
+Cargo.toml.orig were edited by hand. The 0.26.1 baseline text below is kept as history.
+
 Local changes, designed in `docs/fts-integrity-plan.md` r3 §§5/6.1:
 
 - `src/directory/mmap_directory/mod.rs`: retry only a completed TempPath's
@@ -63,3 +69,20 @@ real automatic end-merge rejection during 20 upsert commits, with complete and
 partial source removal, verify exact live/reopened contents and unchanged
 scan/rebuild/notification state, preserve the explicit Future error, and prove
 that an identical-text InvalidArgument from another origin still reports.
+
+2026-10-24: `src/query/intersection.rs`: keep the upstream `Intersection::score`
+expression, routing only the right-hand score through `score_out_of_line` with
+`#[inline(never)]`. Rust 1.95+ combined the two BM25 bodies into SIMD whose
+stale upper lanes cause denormal assists and slow two-term AND scoring. An
+explicit loop improved the bench bin but still left the problematic SIMD in the
+product exe. With the helper, ClaudeCode's disassembly of the Rust 1.99 product
+release build (`mimageviewer-core`) shows scalar code only. `#[inline(never)]`
+is a hint, not a guarantee, so keep it and recheck the product function after
+toolchain or Tantivy updates. The original sum and addition/call order are
+unchanged.
+Tests cover two- and four-term Must AND scores, negative zero, call order and
+rounding. Upstream 0.27 and main still use the original expression. The full investigation (measurements and rejected
+options) is backlog §1.424 in `docs/next-release-backlog.md` at commit
+`94017f82e`; the section was removed after v4.8.1 shipped. Rerun the bench regression check and the
+product disassembly check (`docs/release-checklist.md` §9.5) when updating the
+Rust toolchain or Tantivy.

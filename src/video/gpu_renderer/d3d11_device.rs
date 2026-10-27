@@ -5,11 +5,11 @@
 //! `ID3D11VideoProcessor` を管理する。
 //!
 //! ## 共有テクスチャの作り方
-//! wgpu (d3d12) と D3D11 の間でフレームを受け渡すには **NT shared handle** を使う。
+//! decoder と native presenter の D3D11 device 間は **NT shared handle** でフレームを渡す。
 //! D3D11 側で `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`
 //! でテクスチャを作り、`IDXGIResource1::CreateSharedHandle` で HANDLE を取り、
-//! それを `ID3D12Device::OpenSharedHandle` で D3D12 側で開く。Keyed Mutex は
-//! 書き込み (D3D11) と読み取り (D3D12) の同期に使う。
+//! native presenter が `ID3D11Device1::OpenSharedResource1` で開く。GPU 完了は共有 D3D11 fence、
+//! 出力 slot の書き込み・読み取りの排他は keyed mutex で同期する。
 //!
 //! ## エラー方針
 //! D3D11 / VideoDevice の作成は **失敗してもパニックしない**。失敗時は呼び出し側に
@@ -73,9 +73,9 @@ const OUTPUT_RING_SIZE: usize = 16;
 
 /// 1 フレームの GPU 出力。
 ///
-/// 同期は **D3D11/D3D12 共有 fence** で行う:
+/// GPU 完了の同期は **D3D11 共有 fence** で行う:
 /// - decoder thread で `CopyResource` 完了後に `ID3D11DeviceContext4::Signal(fence, value)`
-/// - UI thread (egui_wgpu) は wgpu の DX12 command queue で `Wait(fence, value)` してから
+/// - native render thread は `ID3D11DeviceContext4::Wait(fence, value)` してから
 ///   このフレームを sample する
 ///
 /// SAFETY: `shared_handle` は NT HANDLE で `*mut c_void` 相当だが、本構造体は
@@ -88,7 +88,7 @@ pub struct D3d11Frame {
     pub pts_secs: f64,
     /// シーク世代。
     pub seek_serial: u64,
-    /// NT shared handle (テクスチャ用、フレーム毎に新規)。wgpu 側で `OpenSharedHandle` する。
+    /// NT shared handle (テクスチャ用)。native presenter が `OpenSharedResource1` で開く。
     /// `Drop` で `CloseHandle` する責任は所有者にある。
     pub shared_handle: HANDLE,
     pub close_shared_handle_on_drop: bool,
@@ -103,16 +103,16 @@ pub struct D3d11Frame {
     /// sources and this flag is false.
     pub ten_bit: bool,
     /// このフレームの GPU 完了に対応する fence 値。`ID3D11DeviceContext4::Signal` で
-    /// この値まで進めてあるので、wgpu 側は `Wait(fence, fence_value)` してから
+    /// この値まで進めてあるので、native presenter は `Wait(fence, fence_value)` してから
     /// テクスチャを sample すれば 中身が確実に書き込まれている。
     pub fence_value: u64,
-    /// fence の NT shared handle。wgpu 側でこれを `ID3D12Fence` として開くが、
-    /// `GpuVideoDevice` の寿命中は同じ値が来るので、wgpu 側でキャッシュ判定キーに使う。
+    /// fence の NT shared handle。native presenter が `OpenSharedFence` で `ID3D11Fence` として開く。
+    /// `GpuVideoDevice` の寿命中は同じ値が来るので、presenter 側でキャッシュ判定キーに使う。
     /// **HANDLE 自体の所有権は `GpuVideoDevice` にあり、本フレームは値を借りているだけ。
     /// `Drop` で close してはいけない**。
     pub fence_shared_handle: HANDLE,
     /// プロセス内ユニークな fence 世代 ID。HANDLE 値だけだと kernel が値を
-    /// 再利用したときに stale な D3D12 fence をキャッシュしたまま使ってしまうため、
+    /// 再利用したときに stale な D3D11 fence をキャッシュしたまま使ってしまうため、
     /// この値で再 open 判定する (Codex P1)。
     pub fence_gen: u64,
     /// この出力テクスチャ slot の世代 ID。fence と同様、NT shared handle の値は
@@ -165,10 +165,10 @@ impl D3d11Frame {
 
 impl Drop for D3d11Frame {
     fn drop(&mut self) {
-        // NT shared HANDLE は CreateSharedHandle で取得しているので明示的に
-        // CloseHandle で解放しないと毎フレームのリークになる。
-        // wgpu 側 (D3D12 OpenSharedHandle) は HANDLE 値を内部複製しているので、
-        // ここで close しても D3D12 リソースは生存する。
+        // フレームが所有する NT shared HANDLE だけを CloseHandle で解放する。
+        // pool から借りた HANDLE は close_shared_handle_on_drop=false で返される。
+        // native presenter が OpenSharedResource1 で開いた COM リソースの寿命は、
+        // HANDLE の close とは別にその参照で保持される。
         if self.close_shared_handle_on_drop && !self.shared_handle.is_invalid() {
             unsafe {
                 let _ = windows::Win32::Foundation::CloseHandle(self.shared_handle);
@@ -399,15 +399,15 @@ pub struct GpuVideoDevice {
     /// CopyResource 完了の signaling 用。device 寿命中 1 個。各フレームは
     /// `next_fence_value.fetch_add(1)` で得た値で `Signal(fence, value)` する。
     fence: ID3D11Fence,
-    /// `fence` の NT shared handle (D3D12 側で `OpenSharedHandle` するため)。
+    /// `fence` の NT shared handle (presenter が `OpenSharedFence` するため)。
     /// `Drop` で `CloseHandle` する責任は本構造体にある。
     fence_shared_handle: HANDLE,
     /// 次に Signal する fence 値 (1, 2, 3, ... と単調増加)。
     next_fence_value: std::sync::atomic::AtomicU64,
     /// プロセスグローバルにユニークな fence の世代 ID。HANDLE 値だけだと
-    /// kernel が値を再利用したときに stale な D3D12 fence をキャッシュ
+    /// kernel が値を再利用したときに stale な D3D11 fence をキャッシュ
     /// したまま使ってしまう (= sync race 復活、または永久 Wait)。
-    /// wgpu 側は `fence_gen` で再 open 判定する。
+    /// presenter 側は `fence_gen` と HANDLE で再 open 判定する。
     fence_gen: u64,
     /// `ID3D11DeviceContext` / `ID3D11VideoContext` の同時呼び出しを直列化するための
     /// **再入可能 (recursive)** lock。**FFmpeg の D3D11VA decode (`avcodec_send_packet` /
@@ -450,11 +450,11 @@ pub enum VideoColorHint {
 }
 
 /// `blit_nv12_to_rgba` の戻り値。
-/// - `output_texture` は呼び出し側でこのフレームの寿命中保持する責任を負う
-///   (= drop すると D3D11 側のテクスチャ解放、ただし NT shared handle は別命数管理なので
-///   D3D12 側からは引き続き参照可能)
+/// - `output_texture` は producer 側の COM 参照。pool の参照または NT shared HANDLE が
+///   共有出力を保持し、presenter は `OpenSharedResource1` で自分の COM 参照を得る。
+///   slot の使用権と HANDLE の所有権は下記のフレームへ別々に渡す。
 /// - `shared_handle` is either owned by `D3d11Frame` or by the shared-output pool
-/// - `fence_value` を `D3d11Frame` に乗せて wgpu 側 `Wait(fence, fence_value)` に渡す
+/// - `fence_value` を `D3d11Frame` に乗せて presenter の Context4::Wait へ渡す
 pub struct BlitOutput {
     pub output_texture: ID3D11Texture2D,
     pub shared_handle: HANDLE,
@@ -606,7 +606,7 @@ impl GpuVideoDevice {
         let mut feature_level: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL::default();
         let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
 
-        // BGRA_SUPPORT: wgpu 側で BGRA8UnormSrgb を使うため
+        // BGRA_SUPPORT: native presenter 用の BGRA8 共有出力を扱うため
         // VIDEO_SUPPORT: ID3D11VideoDevice / ID3D11VideoContext の取得に必要
         let flags = D3D11_CREATE_DEVICE_FLAG(
             D3D11_CREATE_DEVICE_BGRA_SUPPORT.0 | D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0,
@@ -926,8 +926,8 @@ impl GpuVideoDevice {
         let in_h = in_desc.Height;
         let in_format = in_desc.Format;
         // mIV does not expose an HDR display path. Normalize even P010/P016
-        // sources to SDR BGRA8 here so native DComp and legacy wgpu consume one
-        // display texture format.
+        // sources to SDR BGRA8 here so the native presenter consumes one
+        // unambiguous display texture format.
         let out_format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
         // 2. processor / enumerator を確保。owned ProcessorState を持ち帰ることで、
@@ -946,16 +946,16 @@ impl GpuVideoDevice {
 
         // 3. 出力先を 2 段構成にする (vsr_probe で driver 仕様確定):
         //    - 中間 RT テクスチャ (NT/KM なし) → VideoProcessorBlt の宛先
-        //    - 共有 RGBA テクスチャ (NT|KEYEDMUTEX) → wgpu D3D12 OpenSharedHandle 用
+        //    - 共有 RGBA テクスチャ (NT|KEYEDMUTEX) → native presenter の OpenSharedResource1 用
         //    NVIDIA driver:
         //      * NT shared 単独 (= NTHANDLE のみ) は CreateTexture2D で E_INVALIDARG
         //        (vsr_probe の flags-probe で全 size/format 一様に確認)
         //      * 同 driver は KEYEDMUTEX 付き NT shared を VideoProcessorBlt 出力として
         //        E_INVALIDARG で拒否する (= 過去観察)
         //    ⇒ VPP 出力は NT/KM どちらも持たない intermediate に出して、CopyResource で
-        //       NT|KM 持ちの共有テクスチャに転送する。同期は keyed mutex には依存せず
-        //       (D3D12 側で IDXGIKeyedMutex 取得不可)、ID3D11Fence ↔ ID3D12Fence の
-        //       共有 fence で行う (`Signal`/`Wait`)。
+        //       NT|KM 持ちの共有テクスチャに転送する。writer/reader key の排他は
+        //       producer と presenter が AcquireSync/ReleaseSync で受け渡し、共有 D3D11 fence の
+        //       Signal/Wait で GPU 完了を同期する。
         let intermediate = self.create_intermediate_rt(out_w, out_h, out_format)?;
         let (
             out_tex,
@@ -1144,21 +1144,21 @@ impl GpuVideoDevice {
             // Blt 完了後、中間テクスチャ (NT/KM なし) の内容を NT|KM 共有テクスチャに
             // コピーする。同 D3D11 device 内 GPU copy なので latency は ~0.1ms オーダ。
             //
-            // **重要**: KEYEDMUTEX 付きテクスチャは IDXGIKeyedMutex の AcquireSync/
-            // ReleaseSync を D3D11 側で呼ばないと、D3D12 OpenSharedHandle 経由で
-            // 読み取った時に内容ゼロ (= 黒画面) になる。out_tex は毎フレーム新規作成で
-            // 初期 key=0 から始まるので、毎回 AcquireSync(0) → write → ReleaseSync(1)
-            // を呼べば独立に完結する (key 状態を frame 間で持ち越す必要なし)。
-            // 同期自体はこの mutex には依存せず ID3D11Fence ↔ ID3D12Fence で行う。
-            // INFINITE timeout は危険 (driver state 異常で永久ブロック)。
-            // 100ms timeout で fail-fast、タイムアウト時はそのフレームを諦めて Err を返す。
-            // 通常は fresh out_tex (= released-with-key-0 状態) なので即取れる。
+            // acquire_shared_output が確保した pool slot の writer key=0 を保持した状態。
+            // CopyResource 後に ReleaseSync(1) で native presenter の reader へ渡す。
+            // presenter は OpenSharedResource1 した D3D11 texture で AcquireSync(1) し、
+            // コピー後は次の再描画にも使える reader key=1 を返す。
+            // slot を再利用する producer が reader key を回収して writer key=0 に戻すため、
+            // フレーム間の key 状態は shared_output_released_to_reader に保持される。
+            // GPU copy 完了の待ち合わせは、これとは別に共有 ID3D11Fence の Signal/Wait で行う。
+            // acquire の有限待機と未提示 slot の回収は acquire_shared_output が所有する。
+            // この描画処理で追加の待機や未提示フレームの同期回収は行わない。
             self.context.CopyResource(&out_tex, &intermediate);
-            // KeyedMutex を release (key=1) — D3D12 OpenSharedHandle 側はこれ以降の状態
-            // (= "key=1 で release 済み") を読み取れる。AcquireSync 自体はしない (= D3D12 の
-            // ID3D12Resource は IDXGIKeyedMutex を取得できないため)。実 sync は fence 任せ。
-            // ReleaseSync 失敗時は frame を発行しない (Codex P3): release されないと D3D12
-            // 側の OpenSharedHandle が空テクスチャしか読めなくなる。
+            // KeyedMutex を release (key=1) — native presenter の reader が取得できる状態へ。
+            // reader 側も AcquireSync/ReleaseSync で共有テクスチャの排他を所有する。
+            // GPU 完了は後段の共有 D3D11 fence の Signal/Wait で別に保証する。
+            // ReleaseSync 失敗時は frame を発行しない (Codex P3): writer key を保持した
+            // テクスチャを reader へ渡さず、slot_guard に返却を任せる。
             if let Some(km) = km_acquired {
                 if let Err(e) = km.ReleaseSync(1) {
                     crate::logger::log(format!("KeyedMutex ReleaseSync(1) failed: {e:?}"));
@@ -1174,7 +1174,7 @@ impl GpuVideoDevice {
             }
             self.context.Flush();
         }
-        // 共有 fence を 1 進めて Signal。D3D12 側が `Wait(fence, fence_value)` で
+        // 共有 fence を 1 進めて Signal。native presenter が `Wait(fence, fence_value)` で
         // GPU レベルの待ち合わせをする。Flush() は queue にコマンドを投入するだけで
         // GPU 完了は待たないが、Signal はその queue に入れた直後に置かれるので、
         // GPU 上では「CopyResource 完了 → Signal」の順序が保証される。
@@ -1678,9 +1678,9 @@ impl GpuVideoDevice {
     ///   - `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` 単独は CreateTexture2D で E_INVALIDARG
     ///   - `NTHANDLE | KEYEDMUTEX` の組合せは全 size/format で OK
     /// よって NT 共有を作るには KEYEDMUTEX flag が必須 (同 driver の隠れ仕様)。
-    /// ただし keyed mutex 同期自体は使わない (D3D12 側で IDXGIKeyedMutex を取得できないため、
-    /// 同期は ID3D11Fence ↔ ID3D12Fence の共有 fence で実装、`AcquireSync/ReleaseSync` も
-    /// 呼ばない)。flag は CreateTexture2D 通すための形式的なもの。
+    /// keyed mutex の writer key=0 / reader key=1 は producer と native presenter が
+    /// `AcquireSync/ReleaseSync` で受け渡す。GPU 完了の同期には、これと別に
+    /// device 間で開いた共有 ID3D11Fence を使う。
     fn create_shared_output(
         &self,
         w: u32,
@@ -1703,10 +1703,10 @@ impl GpuVideoDevice {
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: bind_flags,
             CPUAccessFlags: 0,
-            // KEYEDMUTEX は付けない: 真に正しく実装するなら AcquireSync/ReleaseSync の
-            // ペアを D3D11 側 (write) と D3D12 側 (read) 両方に入れる必要があるが、
-            // ID3D12Resource からは IDXGIKeyedMutex を取れないため D3D12 側で実装が困難。
-            // 代わりに ID3D11Fence ↔ ID3D12Fence の共有 fence で同期している (`Signal`/`Wait`)。
+            // NT shared texture を作るため KEYEDMUTEX も付ける。
+            // writer/reader の AcquireSync/ReleaseSync は、それぞれ producer と
+            // native presenter が所有する。出力 pool の再利用時も key 状態を引き継ぐ。
+            // GPU 完了は共有 ID3D11Fence の Signal/Wait で同期する。
             MiscFlags: misc_flags,
         };
         let mut tex: Option<ID3D11Texture2D> = None;
@@ -1748,9 +1748,9 @@ impl Drop for GpuVideoDevice {
             Err(poisoned) => poisoned.into_inner().clear("gpu_video_device_drop"),
         }
         // fence の NT shared handle は CreateSharedHandle で取得しており、本構造体が
-        // 唯一の所有者。device drop タイミングで close する。D3D12 側で OpenSharedHandle
-        // 経由で得た ID3D12Fence COM オブジェクトは内部参照を持っているので、ここで
-        // close しても D3D12 側の fence は生存する (NT カーネルオブジェクトは refcount)。
+        // 唯一の所有者。device drop タイミングで close する。presenter が OpenSharedFence
+        // 経由で得た ID3D11Fence COM オブジェクトは内部参照を持っているので、ここで
+        // close しても開いた fence の参照は生存する (NT カーネルオブジェクトは refcount)。
         if !self.fence_shared_handle.is_invalid() {
             unsafe {
                 let _ = windows::Win32::Foundation::CloseHandle(self.fence_shared_handle);

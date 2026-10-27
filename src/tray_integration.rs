@@ -14,6 +14,7 @@ enum RetainedViewportPresentation {
     Plain,
     #[cfg(windows)]
     Detached {
+        window_id: u64,
         maximized: bool,
     },
 }
@@ -32,23 +33,26 @@ impl App {
     /// The fullscreen id covers the active F12 host; detached snapshots cover passive and
     /// ParkedLive hosts. Duplicate ids are collapsed before commands are queued.
     fn sync_retained_viewport_visibility_for_tray(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         visible: bool,
     ) -> usize {
         let mut viewports = Vec::new();
         if self.fs_viewport_shown {
             #[cfg(windows)]
-            let presentation = if matches!(
-                self.fs_viewport_presentation,
-                Some(crate::app::ViewerPresentation::DetachedWindow)
-            ) {
-                RetainedViewportPresentation::Detached {
+            let presentation = self
+                .active_detached_hwnd_window_id()
+                .filter(|window_id| {
+                    Self::detached_image_window_viewport_id(*window_id)
+                        == self.fullscreen_viewport_id()
+                        && self.fs_viewport_presentation
+                            == Some(crate::app::ViewerPresentation::DetachedWindow)
+                })
+                .map(|window_id| RetainedViewportPresentation::Detached {
+                    window_id,
                     maximized: self.active_detached_viewport_maximized_on_visible_commit(),
-                }
-            } else {
-                RetainedViewportPresentation::Plain
-            };
+                })
+                .unwrap_or(RetainedViewportPresentation::Plain);
             #[cfg(not(windows))]
             let presentation = RetainedViewportPresentation::Plain;
             viewports.push((self.fullscreen_viewport_id(), presentation));
@@ -64,6 +68,7 @@ impl App {
                     viewports.push((
                         viewport_id,
                         RetainedViewportPresentation::Detached {
+                            window_id: window.id,
                             maximized: self.detached_window_seed_placement(window.id).maximized,
                         },
                     ));
@@ -81,21 +86,23 @@ impl App {
             if transition_owned_viewport == Some(*viewport_id) {
                 continue;
             }
-            if visible {
-                match presentation {
-                    RetainedViewportPresentation::Plain => {
-                        ctx.send_viewport_cmd_to(
-                            *viewport_id,
-                            egui::ViewportCommand::Visible(true),
-                        );
-                    }
-                    #[cfg(windows)]
-                    RetainedViewportPresentation::Detached { maximized } => {
-                        Self::send_detached_viewport_visible_commit(ctx, *viewport_id, *maximized);
-                    }
+            match presentation {
+                RetainedViewportPresentation::Plain => {
+                    ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(visible));
                 }
-            } else {
-                ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(false));
+                #[cfg(windows)]
+                RetainedViewportPresentation::Detached {
+                    window_id,
+                    maximized,
+                } => {
+                    self.request_detached_window_visibility(
+                        ctx,
+                        *window_id,
+                        visible,
+                        Some(*maximized),
+                        false,
+                    );
+                }
             }
             #[cfg(windows)]
             self.observe_viewport_presentation_command(
@@ -220,27 +227,39 @@ impl App {
 
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
+    #[cfg(test)]
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
-        // トレイメニュー「終了」 / インストーラからの shutdown 要求は常に通す。
-        let tray_wants_quit = self
-            .tray_controller
-            .as_ref()
-            .is_some_and(|tc| tc.is_quit_requested());
-        let installer_wants_quit = self
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if tray_wants_quit || installer_wants_quit {
+        if !ctx.input_for(egui::ViewportId::ROOT, |i| i.viewport().close_requested()) {
             return false;
         }
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if !close_requested {
+        if self.image_folder_zip_operation.is_some() {
+            self.defer_image_folder_zip_root_close(ctx);
             return false;
         }
-        if !self.settings.minimize_to_tray_on_close || self.tray_controller.is_none() {
+        let explicit_quit = self.sidecar_restore_root_lifecycle_close_requested();
+        let modal_owner = self.root_tray_hide_modal_owner();
+        self.intercept_root_close_request(ctx, explicit_quit, false, modal_owner)
+    }
+
+    /// Apply the tray policy to an already accepted root lifecycle request.
+    /// Modal ownership was sampled before this pass can harvest its terminal.
+    pub(crate) fn intercept_root_close_request(
+        &mut self,
+        ctx: &egui::Context,
+        explicit_quit: bool,
+        retained_tray_hide: bool,
+        modal_owner: Option<&'static str>,
+    ) -> bool {
+        if explicit_quit {
             return false;
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        if let Some(owner) = self.root_tray_hide_modal_owner() {
+        if !retained_tray_hide
+            && (!self.settings.minimize_to_tray_on_close || self.tray_controller.is_none())
+        {
+            return false;
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
+        if let Some(owner) = modal_owner {
             crate::logger::log(format!(
                 "[tray] kept main window visible for modal owner={owner}"
             ));
@@ -257,7 +276,7 @@ impl App {
     /// Modal state is sampled before polling terminal workers in this frame. A dialog that was
     /// visible when CloseRequested arrived therefore keeps the main window visible for the whole
     /// frame, even if its worker reaches a terminal result later in the pass.
-    fn root_tray_hide_modal_owner(&self) -> Option<&'static str> {
+    pub(crate) fn root_tray_hide_modal_owner(&self) -> Option<&'static str> {
         root_tray_hide_modal_owner(
             self.sidecar_restore_active(),
             self.staged_smart_root_modal_visible(),
@@ -283,6 +302,7 @@ impl App {
         if !self.window_visible {
             return;
         }
+        self.deactivate_all_page_turn_presentations("hidden_to_tray");
         // Preserve the media session and transport. Native presenters enter their existing
         // consume-and-hold state; egui hosts remain registered but become explicitly hidden.
         let routed_presenters = self.prepare_media_session_for_tray_residency();
@@ -565,6 +585,7 @@ impl App {
         let mut close_req = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(80.0, 60.0);
         egui::Window::new("タスクトレイ常駐を有効にしました")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -659,7 +680,137 @@ fn root_tray_hide_modal_owner(
 
 #[cfg(test)]
 mod tests {
-    use super::{root_tray_hide_modal_owner, should_close_fullscreen_for_tray};
+    use eframe::egui;
+
+    #[test]
+    fn egui037_tray_notice_body_mouse_drag_moves_window() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.show_tray_enabled_notice = true;
+        let id = egui::Id::unique(Some("タスクトレイ常駐を有効にしました"));
+        let draw = |app: &mut App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 760.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.show_tray_enabled_notice_dialog(&ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..4 {
+            draw(&mut app, vec![]);
+        }
+        let before = ctx
+            .memory(|memory| memory.area_rect(id))
+            .expect("production Window");
+        // Label/body padding, below the title bar and away from buttons and resize edges.
+        let start = egui::pos2(before.right() - 28.0, before.top() + 60.0);
+        let delta = egui::vec2(65.0, 45.0);
+        draw(&mut app, vec![egui::Event::PointerMoved(start)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![egui::Event::PointerMoved(start + delta)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start + delta,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![]);
+        let after = ctx.memory(|memory| memory.area_rect(id)).unwrap();
+        assert!(
+            (after.min - before.min - delta).length() < 2.0,
+            "body mouse drag must move the actual movable Window: before={before:?}, after={after:?}"
+        );
+    }
+
+    use super::{App, root_tray_hide_modal_owner, should_close_fullscreen_for_tray};
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_restore_retains_detached_visibility_until_the_host_is_placed() {
+        let mut app = crate::app::setup_app_for_test();
+        let window_id = 41;
+        app.begin_active_detached_session(window_id, crate::app::DetachedSource::Video);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(crate::app::ViewerPresentation::DetachedWindow);
+        app.video_presentation_transition
+            .reset_stable(crate::app::ViewerPresentation::DetachedWindow);
+        let viewport_id = App::detached_image_window_viewport_id(window_id);
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+            assert_eq!(app.sync_retained_viewport_visibility_for_tray(ctx, true), 1);
+        });
+        assert!(
+            output.viewport_output[&viewport_id]
+                .commands
+                .iter()
+                .all(|command| {
+                    !matches!(
+                        command,
+                        egui::ViewportCommand::Visible(true)
+                            | egui::ViewportCommand::Maximized(_)
+                            | egui::ViewportCommand::Focus
+                    )
+                }),
+            "an unplaced host must retain the tray restore request"
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+            assert_eq!(
+                app.sync_retained_viewport_visibility_for_tray(ctx, false),
+                1
+            );
+        });
+        assert!(
+            output.viewport_output[&viewport_id]
+                .commands
+                .iter()
+                .any(|command| { matches!(command, egui::ViewportCommand::Visible(false)) }),
+            "tray hide must pass through the request owner to cancel a retained show"
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_restore_keeps_plain_viewport_visibility_immediate() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(crate::app::ViewerPresentation::Fullscreen);
+        let viewport_id = app.fullscreen_viewport_id();
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+            assert_eq!(app.sync_retained_viewport_visibility_for_tray(ctx, true), 1);
+        });
+        assert!(
+            output.viewport_output[&viewport_id]
+                .commands
+                .iter()
+                .any(|command| { matches!(command, egui::ViewportCommand::Visible(true)) })
+        );
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn tray_residency_closes_plain_still_fullscreen_sessions() {
@@ -717,7 +868,8 @@ mod tests {
     }
 
     #[test]
-    fn close_to_tray_keeps_a_saved_group_modal_visible_for_the_whole_frame() {
+    fn egui037_continuation_root_lifecycle_close_to_tray_keeps_a_saved_group_modal_visible_for_the_whole_frame()
+     {
         let mut app = crate::app::setup_app_for_test();
         let root = app.tmp.path().join("books");
         std::fs::create_dir_all(root.join("Current")).unwrap();
@@ -736,12 +888,13 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run(raw, |ctx| {
-            assert!(!app.maybe_intercept_close(ctx));
-            // Simulate a terminal transition later in the same App::update pass. The close
-            // decision already sampled the visible modal and must not hide retroactively.
+        let mut output = ctx.run_pass(raw, |ctx| {
+            let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
+            // Terminal completion cannot change the modal ownership sampled at acceptance.
             assert!(app.cancel_saved_group_open_request(request_id));
+            app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
         });
+        output.textures_delta.clear();
 
         assert!(app.window_visible);
         assert!(

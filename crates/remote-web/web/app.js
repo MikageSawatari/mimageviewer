@@ -34,6 +34,10 @@ import {
   gridIndexForCommand,
   imageQualityPreset,
   isRtlReadingDirection,
+  inputAdvancesRightToLeft,
+  spreadModeWithReadingDirection,
+  viewerPageButtonState,
+  viewerSwipeCommand,
   latestPageLoadRequestPlan,
   pageLoadQueueBusyTransition,
   nextFitMode,
@@ -3195,7 +3199,13 @@ function dispatchCommand(requested, meta = {}) {
         "last"
       ) || changeImageTo(state.pageGroups.length - 1);
     } else if (requested.name === CommandName.SPREAD_CYCLE) {
-      handled = requestSpreadMode(nextSpreadMode(state.spreadMode));
+      handled = requestSpreadMode(extractedResultViewerContext()
+        ? (state.spreadMode === SpreadMode.SINGLE ? SpreadMode.LTR : SpreadMode.SINGLE)
+        : state.container?.compositionManaged
+          ? (state.spreadMode === SpreadMode.SINGLE ? (state.readingDirection === ReadingDirection.RTL ? SpreadMode.RTL : SpreadMode.LTR)
+            : [SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(state.spreadMode) ? SpreadMode.SINGLE
+            : state.readingDirection === ReadingDirection.RTL ? SpreadMode.SPLIT_RTL : SpreadMode.SPLIT_LTR)
+          : nextSpreadMode(state.spreadMode), Boolean(state.container?.compositionManaged));
     } else if (requested.name === CommandName.SET_RATING) {
       const stars = Number(requested.payload.stars);
       if (Number.isInteger(stars) && stars >= 0 && stars <= 5) {
@@ -3272,7 +3282,7 @@ function dispatchCommand(requested, meta = {}) {
         [CommandName.SPREAD_SPLIT_LTR]: SpreadMode.SPLIT_LTR,
         [CommandName.SPREAD_SPLIT_RTL]: SpreadMode.SPLIT_RTL,
       };
-      handled = requestSpreadMode(spreadModes[requested.name]);
+      handled = requestSpreadMode(spreadModes[requested.name], Boolean(state.container?.compositionManaged) && (requested.payload.modeOnly === true || [CommandName.SPREAD_SINGLE, CommandName.SPREAD_SPLIT_LTR, CommandName.SPREAD_SPLIT_RTL].includes(requested.name)));
     } else {
       let fitMode = null;
       if (requested.name === CommandName.FIT_CYCLE) {
@@ -3697,7 +3707,7 @@ function onGlobalKeyDown(event) {
       repeat: event.repeat,
       editable: isShortcutBlockedTarget(event.target),
       menuOpen: Boolean(state.commandMenu?.isOpen()),
-      rtl: isRtlReadingDirection(state.readingDirection),
+      rtl: inputAdvancesRightToLeft(state.spreadMode),
     },
     state.viewer?.isVideoStreamViewer ? "media" : state.screenContext
   );
@@ -4682,6 +4692,8 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     title: data.title ?? "コンテナ",
     address: effectiveAddress,
     requestedAddress: address,
+    compositionManaged: Boolean(data.composition_managed),
+    compositionRevision: data.composition_revision ?? null,
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
     configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
@@ -4775,6 +4787,8 @@ export function containerRuntimeStateForTest() {
     : null;
   return {
     container: state.container ? structuredClone(state.container) : null,
+    spreadMode: state.spreadMode,
+    readingDirection: state.readingDirection,
     entries: state.entries.map(entryIdentity),
     images: state.images.map(entryIdentity),
     pageGroups: state.pageGroups.map((group) => ({
@@ -5065,8 +5079,6 @@ async function showSavedCollection(route) {
   state.requestController = controller;
   const data = await apiJson("/api/saved-collection", {
     id: route.collectionId,
-    spread: state.spreadMode,
-    direction: state.readingDirection,
     single: forceSinglePage ? 1 : 0,
   }, controller.signal);
   if (!persistentCollectionRouteRequestIsCurrent({
@@ -5445,9 +5457,12 @@ export function normalizePagePresentationSlots(
   const slots = presentation.map((slot) => ({
     entry: byAddress.get(addressIdentity(slot?.address)),
     role: slot?.role,
+    ...(slot?.display_slot === undefined || slot?.display_slot === null ? {} : { displaySlot: slot.display_slot }),
   }));
   if (
-    slots.some(({ entry, role }) => !entry || !PAGE_PRESENTATION_ROLES.has(role))
+    slots.some(({ entry, role, displaySlot }) => !entry || !PAGE_PRESENTATION_ROLES.has(role)
+      || (displaySlot !== undefined && (slots.length !== 1 || role !== "navigation"
+        || !["spread_left", "spread_right"].includes(displaySlot))))
   ) return null;
   const slotIdentities = slots.map(({ entry }) =>
     addressIdentity(entryAddress(entry))
@@ -5455,6 +5470,8 @@ export function normalizePagePresentationSlots(
   if (new Set(slotIdentities).size !== slotIdentities.length) return null;
   if (
     slots.filter(({ role }) => role === "front_cover_supplement").length !== 1
+    && !(slots.length === 1 && slots[0].role === "navigation"
+      && ["spread_left", "spread_right"].includes(slots[0].displaySlot))
   ) return null;
   const navigationIdentities = slots
     .filter(({ role }) => role === "navigation")
@@ -5511,7 +5528,7 @@ export function pageRenderContextForSlot(
     : entryAddress(slots[partnerIndex].entry);
   return {
     context_address: contextAddress,
-    display_slot: viewerPageDisplaySlot(slots.length, pageIndex),
+    display_slot: slots[pageIndex].displaySlot ?? viewerPageDisplaySlot(slots.length, pageIndex),
     spread_partner: spreadPartner,
   };
 }
@@ -5521,7 +5538,7 @@ export function pageGroupPresentationIdentity(group) {
   return [
     group.slice ?? PageSlice.FULL,
     ...pageGroupPresentationSlots(group).map(
-      ({ entry, role }) => `${role}:${entryIdentity(entry)}`
+      ({ entry, role, displaySlot }) => `${role}${displaySlot ? `:${displaySlot}` : ""}:${entryIdentity(entry)}`
     ),
   ].join("\n");
 }
@@ -6193,7 +6210,22 @@ function shouldForceSinglePageForViewport() {
   }).forceSinglePage;
 }
 
-function requestSpreadMode(mode) {
+function extractedResultViewerContext() {
+  return !state.container && (Boolean(persistentDirectViewerContext()) ||
+    ["rating", "smart"].includes(state.collection?.kind));
+}
+
+export function extractedResultViewMode(mode, direction) {
+  if ([SpreadMode.LTR, SpreadMode.LTR_COVER, SpreadMode.RTL, SpreadMode.RTL_COVER].includes(mode)) {
+    return spreadModeWithReadingDirection(SpreadMode.LTR, direction);
+  }
+  if ([SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(mode)) {
+    return spreadModeWithReadingDirection(SpreadMode.SPLIT_LTR, direction);
+  }
+  return SpreadMode.SINGLE;
+}
+
+export function requestSpreadMode(mode, modeOnly = false) {
   const collectionRoute = refreshableCollectionRoute();
   const persistentContext = persistentDirectViewerContext();
   if (
@@ -6205,10 +6237,13 @@ function requestSpreadMode(mode) {
   // アドレス (書庫そのもの) と、本体が見開き設定を引くときのキー (書庫の中のフォルダ)
   // がずれる。要求側へ書くと、書いた行が二度と読まれず**モードを変えられなくなる**
   // (2026-08-26 に実際に起きた: 書庫側の行が 1ページ表示、内側の行が横長分割のまま)。
+  const extracted = extractedResultViewerContext();
+  if (extracted) mode = extractedResultViewMode(mode, state.readingDirection);
   const address = state.container?.address ?? null;
   const spreadIntent = planSpreadIntent({
     address,
     selectedMode: mode,
+    modeOnly,
     currentDirection: state.readingDirection,
     portraitSinglePage: state.localSettings.portraitSinglePage,
     viewportWidth: window.innerWidth,
@@ -6216,7 +6251,8 @@ function requestSpreadMode(mode) {
   });
   const writeRequest = spreadIntent.writeRequest;
   if (!writeRequest && !persistentContext) return false;
-  const readingDirection = writeRequest?.reading_direction ?? spreadIntent.readingDirection;
+  const readingDirection = extracted ? state.readingDirection : writeRequest?.reading_direction ?? state.readingDirection;
+  mode = spreadModeWithReadingDirection(mode, readingDirection);
   // 一方、文脈の同一性は要求側で見る (`activeSpreadContextIdentity` と揃える)。
   const identity = collectionRoute
     ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
@@ -6226,6 +6262,7 @@ function requestSpreadMode(mode) {
   const sequence = ++spreadWriteSequence;
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
+  state.viewer?.syncPagePositionFeedback();
   spreadWriteTail = spreadWriteTail.then(async () => {
     let writeError = null;
     if (!collectionRoute && !persistentContext) {
@@ -7981,7 +8018,6 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const bottom = element("div", "viewer-ui bottom");
   const previous = textElement("button", "‹", "viewer-button");
   previous.type = "button";
-  previous.setAttribute("aria-label", "前の画像");
   const seek = element("div", "viewer-seek");
   const counter = textElement("output", "", "viewer-counter");
   const seekInput = element("input", "viewer-seek-input");
@@ -7991,7 +8027,6 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   seek.append(counter, seekInput);
   const next = textElement("button", "›", "viewer-button");
   next.type = "button";
-  next.setAttribute("aria-label", "次の画像");
   bottom.append(previous, seek, next);
   viewerRoot.append(stage, top, bottom);
   state.commandMenu = new CommandMenu(viewerRoot, "viewer", viewerRoot);
@@ -8040,18 +8075,18 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   });
   previous.addEventListener("click", (event) => {
     event.stopPropagation();
-    dispatchCommand(command(isRtlReadingDirection(state.readingDirection)
-      ? CommandName.NEXT_PAGE
-      : CommandName.PREV_PAGE), {
+    dispatchCommand(command(viewerPageButtonState(
+      "left", inputAdvancesRightToLeft(state.spreadMode)
+    ).commandName), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
   });
   next.addEventListener("click", (event) => {
     event.stopPropagation();
-    dispatchCommand(command(isRtlReadingDirection(state.readingDirection)
-      ? CommandName.PREV_PAGE
-      : CommandName.NEXT_PAGE), {
+    dispatchCommand(command(viewerPageButtonState(
+      "right", inputAdvancesRightToLeft(state.spreadMode)
+    ).commandName), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
@@ -8253,7 +8288,7 @@ function changeImage(delta) {
     currentIndex: state.pageGroupIndex,
     count: state.pageGroups.length,
     delta,
-    readingDirection: state.readingDirection,
+    rtl: inputAdvancesRightToLeft(state.spreadMode),
   });
   if (message) {
     state.viewer?.showBoundaryMessage(message);
@@ -10113,6 +10148,8 @@ function remoteBookContainerIdentity(address) {
 export function viewerMenuDefinitions({
   hasContainer,
   barsVisible,
+  extractedResult = false,
+  compositionManaged = false,
   supportsFinalCoverSetting = false,
   finalCoverPreference = "follow_global",
   finalCoverEnabled = true,
@@ -10133,7 +10170,7 @@ export function viewerMenuDefinitions({
     [MenuPageAction.RATING, "レーティング", "★を選択", { menuPage: "rating" }],
     [MenuPageAction.DISPLAY, "表示", "フィット / 原寸", { menuPage: "display" }],
     ...(hasContainer
-      ? [[MenuPageAction.SPREAD, "見開き設定", "1〜5", { menuPage: "spread" }]]
+      ? [[MenuPageAction.SPREAD, extractedResult ? "一時表示" : "見開き設定", extractedResult ? "記憶しません" : "1〜5", { menuPage: "spread" }]]
       : []),
     [
       CommandName.TOGGLE_VIEWER_BARS,
@@ -10157,7 +10194,7 @@ export function viewerMenuDefinitions({
         ["ズーム", "+ / −"],
         ["表示モード", "0 (全体 → 幅 → 原寸)"],
         ...(hasContainer
-          ? [["見開き", "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]]
+          ? [["見開き", extractedResult ? "1: 単 / 2〜5: 一時見開き" : compositionManaged ? "方向と表紙はPCの本の構成で設定" : "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]]
           : []),
         ["操作メニュー", "?"],
         ["先頭 / 最後", "Home / End"],
@@ -10188,16 +10225,26 @@ export function viewerMenuDefinitions({
       ],
     },
     spread: {
-      title: "見開き設定",
-      actions: [
+      title: extractedResult ? "一時表示（記憶しません）" : compositionManaged ? "本の構成を使用中（方向・表紙はPCで編集）" : "見開き設定",
+      actions: extractedResult ? [
         back,
         [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
-        [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
-        [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
-        [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
-        [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
-        [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
-        [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
+        [CommandName.SPREAD_LTR, "見開き", "2〜5"],
+        [CommandName.SPREAD_SPLIT_LTR, "横長分割", "6 / 7"],
+      ] : [
+        back,
+        [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
+        ...(compositionManaged ? [
+          [CommandName.SPREAD_LTR, "見開き", "表示方法のみ", { modeOnly: true }],
+          [CommandName.SPREAD_SPLIT_LTR, "横長分割", "表示方法のみ", { modeOnly: true }],
+        ] : [
+          [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
+          [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
+          [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
+          [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
+          [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
+          [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
+        ]),
         ...(supportsFinalCoverSetting
           ? [[
               MenuPageAction.FINAL_COVER,
@@ -10352,8 +10399,10 @@ export function viewerMenuDefinitions({
 function menuDefinition(context, page = "main") {
   if (context === "viewer") {
     const definitions = viewerMenuDefinitions({
-      hasContainer: Boolean(state.container || refreshableCollectionRoute()),
+      hasContainer: Boolean(state.container || refreshableCollectionRoute() || persistentDirectViewerContext()),
       barsVisible: state.viewerBarsVisible,
+      extractedResult: extractedResultViewerContext(),
+      compositionManaged: Boolean(state.container?.compositionManaged),
       supportsFinalCoverSetting: Boolean(state.container),
       finalCoverPreference: state.finalCoverSpreadPreference,
       finalCoverEnabled: state.finalCoverSpreadEnabled,
@@ -14671,6 +14720,9 @@ export class ImageViewer {
   }
 
   syncPagePositionFeedback() {
+    const rtl = inputAdvancesRightToLeft(state.spreadMode);
+    this.previous?.setAttribute("aria-label", viewerPageButtonState("left", rtl).label);
+    this.next?.setAttribute("aria-label", viewerPageButtonState("right", rtl).label);
     const requested = this.requestedPagePresentation;
     if (!requested?.seekState) return;
     const position = viewerPositionOwner.current();
@@ -15718,15 +15770,7 @@ export class ImageViewer {
       ) {
         const swipeLeft = gesture === ViewerGesture.SWIPE_LEFT;
         dispatchCommand(
-          command(
-            swipeLeft
-              ? (isRtlReadingDirection(state.readingDirection)
-                  ? CommandName.PREV_PAGE
-                  : CommandName.NEXT_PAGE)
-              : (isRtlReadingDirection(state.readingDirection)
-                  ? CommandName.NEXT_PAGE
-                  : CommandName.PREV_PAGE)
-          ),
+          viewerSwipeCommand(gesture, inputAdvancesRightToLeft(state.spreadMode)),
           { source, detail: swipeLeft ? "swipe_left" : "swipe_right" }
         );
       } else if (panelAction === ViewerPanelAction.OPEN) {
@@ -15743,7 +15787,7 @@ export class ImageViewer {
         dispatchCommand(viewerTapCommand(
           event.clientX,
           this.root.clientWidth,
-          isRtlReadingDirection(state.readingDirection)
+          inputAdvancesRightToLeft(state.spreadMode)
         ), {
           source,
           detail: "tap_zone",

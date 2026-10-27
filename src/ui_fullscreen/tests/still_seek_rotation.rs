@@ -219,16 +219,17 @@ fn load_textures(app: &mut crate::app::App, ctx: &egui::Context, rotations: &[Ro
         .enumerate()
         .map(|(idx, &rotation)| {
             let tex = page_texture(ctx, idx, rotation);
-            ThumbnailState::Loaded {
-                source_dims: Some((tex.size()[0] as u32, tex.size()[1] as u32)),
-                layout_dims: None,
-                rendered_at_px: 120,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            ThumbnailState::loaded_raster(
+                tex.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 120,
                 },
-                from_edit_preview: false,
-                tex,
-            }
+                false,
+                120,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((tex.size()[0] as u32, tex.size()[1] as u32)),
+                None,
+            )
         })
         .collect();
 }
@@ -254,7 +255,7 @@ fn overlay_output(
     hover: Option<egui::Pos2>,
 ) -> egui::FullOutput {
     let before = crate::rotation_db::read_operations_for_test();
-    let output = ctx.run(
+    let output = crate::test_ui::headless_paint_output(ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -264,11 +265,13 @@ fn overlay_output(
             ..Default::default()
         },
         |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.draw_fullscreen_seek_overlay(ui, ctx, ctx.content_rect(), 3, false, false);
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    app.draw_fullscreen_seek_overlay(ui, ctx, ctx.content_rect(), 3, false, false);
+                })
             });
         },
-    );
+    ));
     assert_eq!(
         crate::rotation_db::read_operations_for_test(),
         before,
@@ -818,61 +821,65 @@ fn still_seek_f6_real_overlay_rotation_snapshots() {
         let hover = std::cell::Cell::new(egui::Pos2::ZERO);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 480.0))
-            .build(|ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !initialized {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    load_textures(&mut app, ctx, &rotations);
-                    initialized = true;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let full = ctx.content_rect();
-                        let media = app.fullscreen_media_rect(full, 3, false);
-                        let pages = if spread.is_spread() {
-                            if spread.is_rtl() {
-                                vec![3, 2]
+            .build_ui(|root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !initialized {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        load_textures(&mut app, ctx, &rotations);
+                        initialized = true;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let full = ctx.content_rect();
+                            let media = app.fullscreen_media_rect(full, 3, false);
+                            let pages = if spread.is_spread() {
+                                if spread.is_rtl() {
+                                    vec![3, 2]
+                                } else {
+                                    vec![2, 3]
+                                }
                             } else {
-                                vec![2, 3]
-                            }
-                        } else {
-                            vec![3]
-                        };
-                        for (pane, &idx) in pages.iter().enumerate() {
-                            let ThumbnailState::Loaded { tex, .. } = &app.thumbnails[idx] else {
-                                unreachable!()
+                                vec![3]
                             };
-                            let bounds = egui::Rect::from_min_size(
-                                media.min
-                                    + egui::vec2(
-                                        media.width() / pages.len() as f32 * pane as f32,
-                                        0.0,
+                            for (pane, &idx) in pages.iter().enumerate() {
+                                let ThumbnailState::Loaded { tex, .. } = &app.thumbnails[idx]
+                                else {
+                                    unreachable!()
+                                };
+                                let bounds = egui::Rect::from_min_size(
+                                    media.min
+                                        + egui::vec2(
+                                            media.width() / pages.len() as f32 * pane as f32,
+                                            0.0,
+                                        ),
+                                    egui::vec2(media.width() / pages.len() as f32, media.height()),
+                                );
+                                crate::app::draw_rotated_image(
+                                    ui.painter(),
+                                    tex.id(),
+                                    fit_texture_rect(
+                                        rotated_display_size(tex.size_vec2(), rotations[idx]),
+                                        bounds.shrink(8.0),
                                     ),
-                                egui::vec2(media.width() / pages.len() as f32, media.height()),
-                            );
-                            crate::app::draw_rotated_image(
-                                ui.painter(),
-                                tex.id(),
-                                fit_texture_rect(
-                                    rotated_display_size(tex.size_vec2(), rotations[idx]),
-                                    bounds.shrink(8.0),
-                                ),
-                                rotations[idx],
-                            );
-                        }
-                        app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                        let strip = app
-                            .still_seek_geometry_for_idx(full, 3, false)
-                            .strip_rect(full)
-                            .unwrap();
-                        let lock =
-                            crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
-                        hover.set(egui::pos2(
-                            (strip.left() + lock.left()) * 0.5,
-                            strip.center().y,
-                        ));
-                    });
+                                    rotations[idx],
+                                );
+                            }
+                            app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                            let strip = app
+                                .still_seek_geometry_for_idx(full, 3, false)
+                                .strip_rect(full)
+                                .unwrap();
+                            let lock =
+                                crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
+                            hover.set(egui::pos2(
+                                (strip.left() + lock.left()) * 0.5,
+                                strip.center().y,
+                            ));
+                        });
+                });
             });
         harness.run();
         harness.hover_at(hover.get());

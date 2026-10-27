@@ -15,6 +15,7 @@ impl App {
     pub(super) fn advance_viewer_primary_pointer_frame(
         &mut self,
         ctx: &egui::Context,
+        front_primary_owned: bool,
     ) -> FullscreenPrimarySuppressionDecision {
         const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
         let (primary_pressed, pointer_primary_down, primary_released) = ctx.input(|i| {
@@ -26,7 +27,7 @@ impl App {
         });
         if self.cancel_mouse_right_drag_on_primary_press(
             crate::ring_shortcut::RightDragOwner::Root,
-            primary_pressed,
+            primary_pressed && !front_primary_owned,
         ) {
             self.fs_primary_suppression.arm_pointer_stream();
         }
@@ -49,36 +50,15 @@ impl App {
         primary_suppression
     }
 
-    pub(super) fn handle_viewer_right_drag_frame(
+    pub(super) fn recognize_viewer_right_drag_frame(
         &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
         is_video: bool,
         secondary_in_overlay_chrome: bool,
         prev_foreground_hwnd: usize,
-    ) -> bool {
-        let mut close = false;
-        // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
-        // コンテキストメニュー表示中は右クリック処理をスキップ
-        // 表示モード / フィットのポップアップ表示中も、右クリックはメニューを閉じる
-        // 用途 (popup 側の外クリック判定) に専念させ、フルスクリーン終了 / コンテキスト
-        // メニューを誤発火させない。handle_fs_wheel_and_click は hover bar 描画より前に
-        // 走るため、ここで読む popup 状態はまだ閉じられていない。
-        // Native video owns all of its own right-click handling (ring start/update/cancel,
-        // close, long-press menu) through the presenter window — see
-        // `handle_native_video_mouse_button`. The egui viewport behind the presenter never
-        // receives the video's mouse events, so running this block for video would report
-        // `secondary_down == false` every frame and cancel the presenter-created flick. In
-        // the non-detached path `render_fullscreen_viewport` early-returns before reaching
-        // here; in the detached path the egui body runs, so we must skip video explicitly.
-        //
-        // Exception (Inc 7 動画→音声モード): a video toggled into audio mode has its native
-        // presenter *hidden* (SW_HIDE, consume-and-hold) with the egui music view on top, so
-        // this viewport DOES receive the right-click and `handle_video_input` is gated off
-        // (see `fs_music_view_active` at handle_fs_keyboard). The native path never runs, so we
-        // must run this egui block instead — otherwise right-click (close) and the right-drag
-        // ring shortcut do nothing (実機 FB 2026-07). The context is `current_right_drag_context()`
-        // = VideoFullscreen (item is Video), so it shows the video ring, not the image ring.
+        overflow_pointer_input: FsFrontPointerFrameInput,
+    ) -> FsSecondaryAction {
         let dialog_open_for_right_drag = self.any_dialog_open();
         if dialog_open_for_right_drag {
             self.cancel_mouse_ring_flick();
@@ -96,7 +76,15 @@ impl App {
             .right_drag_mode(right_drag_context);
         let secondary_down = ctx.input(|i| i.pointer.secondary_down());
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
-        let secondary_released = ctx.input(|i| i.pointer.secondary_released());
+        let secondary_released = !overflow_pointer_input
+            .owns_release(egui::PointerButton::Secondary)
+            && ctx.input(|i| i.pointer.secondary_released());
+        let press_owner = overflow_pointer_input.secondary_owner;
+        if overflow_pointer_input.secondary_owned {
+            self.cancel_mouse_ring_flick();
+            self.cancel_mouse_gesture();
+            return FsSecondaryAction::None;
+        }
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
         let passive_secondary_pos = fullscreen_pointer_pos_or(
             ctx,
@@ -109,7 +97,6 @@ impl App {
         // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
         let popup_open = self.spread_popup_open
             || self.fit_popup_open
-            || self.slideshow_popup_open
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
             || fs_still_seek_strip_popup_open(ctx);
@@ -127,16 +114,7 @@ impl App {
             None
         };
         let passive_press_owner = fullscreen_secondary_press_owner_for_frame(
-            self.fullscreen_idx.map(|fs_idx| {
-                FullscreenSecondaryPressOwner::new(
-                    // This existing helper is the cross-platform current projection owner;
-                    // edit requests and physical pointer sequences need the same exact scope.
-                    self.edit_request_owner_context(),
-                    self.items_generation,
-                    fs_idx,
-                    right_drag_context,
-                )
-            }),
+            press_owner,
             &right_drag_mode,
             right_drag_context,
             right_drag_gate_reject.is_some(),
@@ -244,7 +222,6 @@ impl App {
             && self.fs_context_menu_idx.is_none()
             && !self.spread_popup_open
             && !self.fit_popup_open
-            && !self.slideshow_popup_open
             && !self.panorama_projection_popup_open
             && !fs_rotation_popup_open(ctx)
             && !fs_still_seek_strip_popup_open(ctx)
@@ -252,7 +229,7 @@ impl App {
             match right_drag_mode {
                 crate::ring_shortcut::RightDragMode::RingShortcut => {
                     let Some(ring_context) = right_drag_context.ring_context() else {
-                        return close;
+                        return FsSecondaryAction::None;
                     };
                     if secondary_in_overlay_chrome {
                         self.cancel_mouse_ring_flick();
@@ -265,25 +242,19 @@ impl App {
                             None,
                         );
                     }
-                    match self.update_mouse_ring_flick_with_pos(
+                    let recognition = self.recognize_mouse_ring_flick_with_pos(
                         ctx,
                         crate::ring_shortcut::RightDragOwner::Root,
                         ring_context,
                         secondary_pos,
                         secondary_down,
                         secondary_released,
-                    ) {
-                        crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                            close |= self.apply_viewer_short_right_click_action(
-                                right_drag_context,
-                                self.fullscreen_idx,
-                                secondary_pos,
-                            );
-                        }
-                        crate::ring_shortcut::MouseFlickOutcome::Fired
-                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
-                        | crate::ring_shortcut::MouseFlickOutcome::None => {}
-                    }
+                    );
+                    return FsSecondaryAction::Recognized {
+                        context: right_drag_context,
+                        pos: secondary_pos,
+                        recognition,
+                    };
                 }
                 crate::ring_shortcut::RightDragMode::MouseGesture => {
                     if secondary_in_overlay_chrome {
@@ -297,44 +268,34 @@ impl App {
                             None,
                         );
                     }
-                    match self.update_mouse_gesture_with_pos(
+                    let recognition = self.recognize_mouse_gesture_with_pos(
                         ctx,
                         crate::ring_shortcut::RightDragOwner::Root,
                         right_drag_context,
                         secondary_pos,
                         secondary_down,
                         secondary_released,
-                    ) {
-                        crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                            close |= self.apply_viewer_short_right_click_action(
-                                right_drag_context,
-                                self.fullscreen_idx,
-                                secondary_pos,
-                            );
-                        }
-                        crate::ring_shortcut::MouseFlickOutcome::Fired
-                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
-                        | crate::ring_shortcut::MouseFlickOutcome::None => {}
-                    }
+                    );
+                    return FsSecondaryAction::Recognized {
+                        context: right_drag_context,
+                        pos: secondary_pos,
+                        recognition,
+                    };
                 }
                 crate::ring_shortcut::RightDragMode::Disabled
                 | crate::ring_shortcut::RightDragMode::Unknown(_) => {
                     if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
-                        return close;
+                        return FsSecondaryAction::None;
                     }
                     match passive_press_outcome {
                         FullscreenSecondaryPressOutcome::ShortTap(pos) => {
-                            close |= self.apply_viewer_short_right_click_action(
-                                right_drag_context,
-                                self.fullscreen_idx,
+                            return FsSecondaryAction::ShortTap {
+                                context: right_drag_context,
                                 pos,
-                            );
+                            };
                         }
                         FullscreenSecondaryPressOutcome::LongPress(pos) => {
-                            if self.page_overview.session().is_none() {
-                                self.fs_context_menu_idx = self.fullscreen_idx;
-                                self.fs_context_menu_pos = pos;
-                            }
+                            return FsSecondaryAction::LongPress(pos);
                         }
                         FullscreenSecondaryPressOutcome::Cancelled
                         | FullscreenSecondaryPressOutcome::None => {}
@@ -342,7 +303,31 @@ impl App {
                 }
             }
         }
-        close
+
+        FsSecondaryAction::None
+    }
+
+    pub(super) fn handle_viewer_right_drag_frame(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        is_video: bool,
+        secondary_in_overlay_chrome: bool,
+        prev_foreground_hwnd: usize,
+        front: FsFrontPointerFrameInput,
+    ) -> bool {
+        let action = self.recognize_viewer_right_drag_frame(
+            ctx,
+            full_rect,
+            is_video,
+            secondary_in_overlay_chrome,
+            prev_foreground_hwnd,
+            front,
+        );
+        matches!(
+            self.apply_fs_secondary_input(ctx, action),
+            FsSecondaryInputOutcome::CloseRequested
+        )
     }
 
     pub(super) fn paint_viewer_presentation_interlude(

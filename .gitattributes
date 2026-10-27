@@ -33,3 +33,7 @@ third_party/effetune-mixwright/** -text
 third_party/effetune-mixwright/supplemental/NOTICES.txt -text
 # Japanese upstream documentation and referenced images are verbatim snapshots.
 third_party/effetune-docs/** -text
+
+LIBAVIF-LICENSE.txt -text
+DAV1D-LICENSE.txt -text
+LIBYUV-LICENSE.txt -text

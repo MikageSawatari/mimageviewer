@@ -600,15 +600,15 @@ impl App {
             || self.edit_bundle_apply_pending.is_some()
             || self.edit_bundle_paste_pending.is_some()
         {
-            self.show_feedback_toast("別の編集内容を処理しています".to_string());
+            self.show_feedback_warning("別の編集内容を処理しています".to_string());
             return;
         }
         if !self.edit_bundle_databases_available() {
-            self.show_feedback_toast("編集データベースを利用できません".to_string());
+            self.show_feedback_warning("編集データベースを利用できません".to_string());
             return;
         }
         let Some(clipboard) = self.edit_bundle_clipboard.clone() else {
-            self.show_feedback_toast("コピーされた編集内容がありません".to_string());
+            self.show_feedback_warning("コピーされた編集内容がありません".to_string());
             return;
         };
         // **要求を出した viewer context をここで焼き付ける** (F08)。以降の確認・fence・
@@ -616,7 +616,7 @@ impl App {
         let owner_context_id = self.edit_request_owner_context();
         let (targets, dropped_non_targets) = self.bulk_page_edit_targets(cursor_idx);
         if targets.is_empty() {
-            self.show_feedback_toast(if dropped_non_targets > 0 {
+            self.show_feedback_warning(if dropped_non_targets > 0 {
                 format!("成功 0 件 / 対象外 {dropped_non_targets} 件")
             } else {
                 "編集内容を貼り付ける対象がありません".to_string()
@@ -656,7 +656,7 @@ impl App {
             || self.edit_bundle_apply_pending.is_some()
             || self.edit_bundle_paste_pending.is_some()
         {
-            self.show_feedback_toast("別の編集内容を処理しています".to_string());
+            self.show_feedback_warning("別の編集内容を処理しています".to_string());
             return;
         }
         let owner_context_id = self.edit_request_owner_context();
@@ -720,9 +720,7 @@ impl App {
     }
 
     fn next_local_adjust_drain_stage(&self) -> Result<Option<LocalAdjustDrainStage>, String> {
-        if self.local_adjust_lut_pending.is_some()
-            || self.local_adjust_segmentation_pending.is_some()
-        {
+        if self.has_page_edit_producers() {
             return Ok(Some(LocalAdjustDrainStage::Producers));
         }
         if self.local_adjust_write_pending.is_empty() {
@@ -743,7 +741,7 @@ impl App {
         &mut self,
         request: crate::edit_bundle::EditBundlePasteRequest,
     ) -> bool {
-        self.commit_local_adjust_pending_edits();
+        self.prepare_page_edit_history_boundary();
         match self.next_local_adjust_drain_stage() {
             Ok(None) => false,
             Ok(Some(stage)) => {
@@ -756,7 +754,7 @@ impl App {
                 true
             }
             Err(error) => {
-                self.show_feedback_toast(error);
+                self.show_feedback_error(error);
                 true
             }
         }
@@ -770,7 +768,7 @@ impl App {
         op: BulkPageEditOp,
     ) {
         if targets.is_empty() {
-            self.show_feedback_toast(if dropped_non_targets > 0 {
+            self.show_feedback_warning(if dropped_non_targets > 0 {
                 format!("成功 0 件 / 対象外 {dropped_non_targets} 件")
             } else {
                 "一括編集の対象がありません".to_string()
@@ -778,18 +776,18 @@ impl App {
             return;
         }
         if self.edit_bundle_apply_pending.is_some() || self.edit_bundle_paste_pending.is_some() {
-            self.show_feedback_toast("別の編集内容を処理しています".to_string());
+            self.show_feedback_warning("別の編集内容を処理しています".to_string());
             return;
         }
         if op.needs_bundle_worker() && !self.edit_bundle_databases_available() {
-            self.show_feedback_toast("編集データベースを利用できません".to_string());
+            self.show_feedback_warning("編集データベースを利用できません".to_string());
             return;
         }
 
         if op.needs_bundle_worker() {
             // 直前の補正レイヤー編集と、LUT / mask producer の結果を先に durable にする。
             // これを待たないと bulk transaction の後から古い保存が着地して上書きする。
-            self.commit_local_adjust_pending_edits();
+            self.prepare_page_edit_history_boundary();
             match self.next_local_adjust_drain_stage() {
                 Ok(None) => {}
                 Ok(Some(stage)) => {
@@ -807,7 +805,7 @@ impl App {
                     return;
                 }
                 Err(error) => {
-                    self.show_feedback_toast(error);
+                    self.show_feedback_error(error);
                     return;
                 }
             }
@@ -818,7 +816,7 @@ impl App {
                 app.snapshot_bulk_kept_overrides(&mut targets, &op);
             });
             if snapshotted.is_none() {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "編集を開始したウィンドウが閉じられたため、一括編集を開始できませんでした"
                         .to_string(),
                 );
@@ -852,7 +850,7 @@ impl App {
                     },
                 ),
                 Err(error) => {
-                    self.show_feedback_toast(error);
+                    self.show_feedback_error(error);
                     return;
                 }
             },
@@ -1114,7 +1112,12 @@ impl App {
         else {
             return;
         };
-        self.show_feedback_toast(bulk_summary_text(&run, cancelled));
+        self.show_feedback_result(
+            bulk_summary_text(&run, cancelled),
+            crate::feedback::FeedbackKind::result(
+                cancelled || run.failed > 0 || run.dropped_non_targets > 0,
+            ),
+        );
     }
 
     fn poll_bulk_page_edit(&mut self, ctx: &egui::Context) {
@@ -1127,18 +1130,16 @@ impl App {
         if waiting_for_local_adjust {
             // producer 完了が新しい保存を enqueue し得るため、producer → write result の順で
             // 進めてからフェンス状態を判定する。
-            self.poll_local_adjust_lut_load(ctx);
-            self.poll_local_adjust_segmentation(ctx);
+            self.poll_all_page_edit_producers(ctx);
             self.poll_local_adjust_write_results();
         }
+        let producers_pending = self.has_page_edit_producers();
         let action = match self.edit_bundle_bulk_pending.as_mut() {
             Some(BulkPageEditPending {
                 phase: BulkPageEditPhase::WaitingForLocalAdjust(wait),
             }) => match &wait.stage {
                 LocalAdjustDrainStage::Producers => {
-                    if self.local_adjust_lut_pending.is_none()
-                        && self.local_adjust_segmentation_pending.is_none()
-                    {
+                    if !producers_pending {
                         Some(BulkPollAction::LocalAdjustFenceReady)
                     } else {
                         None
@@ -1250,13 +1251,13 @@ impl App {
                     }
                     Err(error) => {
                         self.edit_bundle_bulk_pending = None;
-                        self.show_feedback_toast(error);
+                        self.show_feedback_error(error);
                     }
                 }
             }
             Some(BulkPollAction::LocalAdjustFenceFailed) => {
                 self.edit_bundle_bulk_pending = None;
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "補正レイヤー保存ワーカーが停止したため、一括編集を開始できませんでした"
                         .to_string(),
                 );
@@ -1311,7 +1312,7 @@ impl App {
                     BulkPageEditOp::Reset { .. } => "コピー元",
                 };
                 egui::Window::new("編集内容をまとめて貼り付け")
-                    .id(egui::Id::new("edit_bundle_bulk_paste_confirm"))
+                    .id(egui::Id::unique("edit_bundle_bulk_paste_confirm"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1348,7 +1349,7 @@ impl App {
                     action = BulkDialogAction::CloseConfirm;
                 }
                 egui::Window::new("編集内容をリセット")
-                    .id(egui::Id::new("edit_bundle_bulk_reset_confirm"))
+                    .id(egui::Id::unique("edit_bundle_bulk_reset_confirm"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1434,7 +1435,7 @@ impl App {
                     AfterLocalAdjustFence::Single { .. } => (None, 0),
                 };
                 egui::Window::new("編集内容を処理する準備")
-                    .id(egui::Id::new("edit_bundle_local_adjust_fence"))
+                    .id(egui::Id::unique("edit_bundle_local_adjust_fence"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1463,7 +1464,7 @@ impl App {
                 }
                 let cancel_requested = run.cancel.load(Ordering::Relaxed);
                 egui::Window::new("編集内容を一括処理")
-                    .id(egui::Id::new("edit_bundle_bulk_progress"))
+                    .id(egui::Id::unique("edit_bundle_bulk_progress"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1553,7 +1554,7 @@ impl App {
                                 summary.push_str(
                                     "（キャンセルしました。適用済みの内容は保持されます）",
                                 );
-                                self.show_feedback_toast(summary);
+                                self.show_feedback_warning(summary);
                             }
                             AfterLocalAdjustFence::Single { .. } => self.show_feedback_toast(
                                 "編集内容の貼り付けをキャンセルしました".to_string(),

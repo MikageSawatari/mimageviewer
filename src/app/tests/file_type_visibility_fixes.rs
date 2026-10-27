@@ -251,10 +251,16 @@ fn visibility_in_book_pc_projects_nested_archive_provenance_and_legacy_notice() 
     app.archive_source_override = Some(source.clone());
     app.top_level_grid_view
         .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
-    app.items = vec![GridItem::ZipImage {
-        zip_path: cached.clone(),
-        entry_name: "root.jpg".into(),
-    }];
+    app.install_new_items(
+        vec![GridItem::ZipImage {
+            zip_path: cached.clone(),
+            entry_name: "root.jpg".into(),
+        }],
+        vec![None],
+    );
+    // This fixture represents an already mounted legacy reader. Bookmark drafts
+    // resolve their page hint through its accepted reader order.
+    app.rebuild_visible_indices();
     app.settings.file_type_visibility = policy_excluding("zip");
     settle_bookmarks(&mut app, 0);
     assert_eq!(
@@ -1185,7 +1191,7 @@ fn visibility_staged_rating_handler_notifies_legacy_and_restores_after_regenerat
 fn visibility_search_notice_keeps_nonterminal_search_active() {
     let mut app = setup_app_for_test();
     app.global_search.active = true;
-    app.global_search.query = "pages".into();
+    app.global_search.metadata_draft = "pages".into();
     app.global_search.last_executed = "pages".into();
     app.global_search.done = false;
     let (tx, rx) = crossbeam_channel::unbounded();

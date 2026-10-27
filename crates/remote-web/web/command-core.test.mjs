@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
+import * as commandCore from "./command-core.mjs";
 
 import {
   PageSlice,
@@ -1226,6 +1229,105 @@ test("RTL reverses only physical horizontal viewer keys and tap zones", () => {
   assert.equal(viewerTapCommand(290, 300, true).name, CommandName.PREV_PAGE);
 });
 
+// Exercise the actual app keyboard adapter as well as the pure command mapping.
+// This catches passing readingDirection (or effectiveSpreadMode) at the call site.
+function remoteHorizontalKey(keyName, configuredSpreadMode, effectiveSpreadMode = configuredSpreadMode) {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const handler = source.slice(source.indexOf("function onGlobalKeyDown(event) {"),
+    source.indexOf("function updateKeyboardAvailability()"));
+  let requested = null;
+  runInNewContext(`${handler}\nonGlobalKeyDown(event);`, {
+    ...commandCore,
+    state: {
+      authenticated: true, keyboardInputSeen: true, screenContext: "viewer",
+      spreadMode: configuredSpreadMode, effectiveSpreadMode,
+      readingDirection: ReadingDirection.RTL,
+    },
+    event: { ...key(keyName), preventDefault() {} },
+    isCommandInteractiveTarget: () => false,
+    isShortcutBlockedTarget: () => false,
+    dispatchCommand: (value) => { requested = value; },
+  });
+  return requested.name;
+}
+
+test("remote Single with saved RTL advances on ArrowRight", () => {
+  assert.equal(remoteHorizontalKey("ArrowRight", SpreadMode.SINGLE), CommandName.NEXT_PAGE);
+  assert.equal(remoteHorizontalKey("ArrowLeft", SpreadMode.SINGLE), CommandName.PREV_PAGE);
+});
+
+test("configured mode owns horizontal keys, taps, buttons, labels and swipes", () => {
+  for (const mode of Object.values(SpreadMode)) {
+    const expectedRtl = [SpreadMode.RTL, SpreadMode.RTL_COVER, SpreadMode.SPLIT_RTL].includes(mode);
+    const rtl = commandCore.inputAdvancesRightToLeft(mode);
+    assert.equal(rtl, expectedRtl, mode);
+    const left = expectedRtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE;
+    const right = expectedRtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE;
+    assert.equal(remoteHorizontalKey("ArrowLeft", mode), left, mode);
+    assert.equal(remoteHorizontalKey("ArrowRight", mode), right, mode);
+    assert.equal(viewerTapCommand(10, 300, rtl).name, left, mode);
+    assert.equal(viewerTapCommand(290, 300, rtl).name, right, mode);
+    assert.deepEqual(commandCore.viewerPageButtonState("left", rtl), {
+      commandName: left, label: expectedRtl ? "次の画像" : "前の画像",
+    }, mode);
+    assert.deepEqual(commandCore.viewerPageButtonState("right", rtl), {
+      commandName: right, label: expectedRtl ? "前の画像" : "次の画像",
+    }, mode);
+    // A swipe moves the page with the finger, opposite to a tap on that side.
+    assert.equal(commandCore.viewerSwipeCommand(ViewerGesture.SWIPE_LEFT, rtl).name, right, mode);
+    assert.equal(commandCore.viewerSwipeCommand(ViewerGesture.SWIPE_RIGHT, rtl).name, left, mode);
+    assert.equal(viewerBoundaryMessage({ currentIndex: 0, count: 2, delta: -1, rtl }),
+      expectedRtl ? "先頭ページです（右→左綴じ：次は左をタップ）" : "先頭ページです", mode);
+    assert.equal(commandFromKey(key("ArrowDown", { rtl }), "viewer").name, CommandName.NEXT_PAGE);
+    assert.equal(commandFromKey(key("PageUp", { rtl }), "viewer").name, CommandName.PREV_PAGE);
+  }
+});
+
+test("portrait display-only Single keeps configured RTL horizontal input", () => {
+  for (const mode of [SpreadMode.RTL, SpreadMode.RTL_COVER, SpreadMode.SPLIT_RTL]) {
+    assert.equal(remoteHorizontalKey("ArrowLeft", mode, SpreadMode.SINGLE), CommandName.NEXT_PAGE);
+    assert.equal(remoteHorizontalKey("ArrowRight", mode, SpreadMode.SINGLE), CommandName.PREV_PAGE);
+  }
+});
+
+test("spread direction normalization preserves viewing class and cover like the core", () => {
+  for (const [ltr, rtl] of [[SpreadMode.LTR, SpreadMode.RTL],
+    [SpreadMode.LTR_COVER, SpreadMode.RTL_COVER], [SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL]]) {
+    for (const mode of [ltr, rtl]) {
+      assert.equal(commandCore.spreadModeWithReadingDirection(mode, ReadingDirection.LTR), ltr);
+      assert.equal(commandCore.spreadModeWithReadingDirection(mode, ReadingDirection.RTL), rtl);
+    }
+  }
+  for (const direction of Object.values(ReadingDirection)) {
+    assert.equal(commandCore.spreadModeWithReadingDirection(SpreadMode.SINGLE, direction), SpreadMode.SINGLE);
+  }
+});
+
+test("mode-only normalization follows binding while explicit spread follows the planned direction", () => {
+  for (const modeOnly of [true, false]) {
+    const { writeRequest } = planSpreadIntent({ selectedMode: SpreadMode.LTR,
+      currentDirection: ReadingDirection.RTL, modeOnly });
+    const direction = writeRequest.reading_direction ?? ReadingDirection.RTL;
+    assert.equal(commandCore.spreadModeWithReadingDirection(SpreadMode.LTR, direction),
+      modeOnly ? SpreadMode.RTL : SpreadMode.LTR);
+  }
+});
+
+test("RTL to Single releases input reversal while saved reading direction keeps seek RTL", () => {
+  let mode = SpreadMode.RTL;
+  const direction = ReadingDirection.RTL;
+  for (const expectedRtl of [true, false]) {
+    const rtl = commandCore.inputAdvancesRightToLeft(mode);
+    assert.equal(rtl, expectedRtl);
+    assert.equal(remoteHorizontalKey("ArrowRight", mode), expectedRtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
+    assert.equal(viewerTapCommand(290, 300, rtl).name, expectedRtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
+    assert.equal(commandCore.viewerPageButtonState("right", rtl).label, expectedRtl ? "前の画像" : "次の画像");
+    assert.equal(viewerSeekState({ groupPageIndexes: [[0], [1]], currentGroupIndex: 0,
+      pageCount: 2, rtl: isRtlReadingDirection(direction) }).direction, ReadingDirection.RTL);
+    mode = SpreadMode.SINGLE;
+  }
+});
+
 test("spread cycle, RTL predicate and portrait fallback match the viewer contract", () => {
   assert.equal(nextSpreadMode(SpreadMode.SINGLE), SpreadMode.LTR);
   assert.equal(nextSpreadMode(SpreadMode.LTR), SpreadMode.LTR_COVER);
@@ -1280,6 +1382,14 @@ test("an explicit portrait selection writes the selected mode, not effective Sin
     spread_mode: SpreadMode.RTL_COVER,
     reading_direction: ReadingDirection.RTL,
   });
+});
+
+test("composition mode-only switching carries no binding direction or cover", () => {
+  const address = { path: "C:/books/book.pdf", subresource: { kind: "file" } };
+  for (const [selectedMode, mode] of [[SpreadMode.SINGLE, "single"], [SpreadMode.RTL_COVER, "spread"], [SpreadMode.SPLIT_RTL, "landscape_split"]]) {
+    const plan = planSpreadIntent({ address, selectedMode, currentDirection: ReadingDirection.RTL, modeOnly: true });
+    assert.deepEqual(plan.writeRequest, { kind: "set_view_mode", address, mode });
+  }
 });
 
 test("fit mode cycle and request width use the actual rendered image width", () => {
@@ -1611,7 +1721,7 @@ test("page edge messages distinguish start, end and RTL guidance", () => {
       currentIndex: 0,
       count: 5,
       delta: -1,
-      readingDirection: ReadingDirection.RTL,
+      rtl: true,
     }),
     "先頭ページです（右→左綴じ：次は左をタップ）"
   );
@@ -1620,7 +1730,7 @@ test("page edge messages distinguish start, end and RTL guidance", () => {
       currentIndex: 4,
       count: 5,
       delta: 1,
-      readingDirection: ReadingDirection.RTL,
+      rtl: true,
     }),
     "最終ページです（右→左綴じ：前は右をタップ）"
   );

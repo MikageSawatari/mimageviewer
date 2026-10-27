@@ -14,6 +14,9 @@ use crate::book_fs_journal::{
 pub const DEFAULT_BOOK_NAME: &str = "名前なし";
 pub const MAX_BOOK_PAGES: usize = 9999;
 
+#[cfg(test)]
+mod structural_tests;
+
 #[derive(Clone, Debug)]
 pub struct BookInfo {
     pub name: String,
@@ -27,7 +30,7 @@ pub struct BookPageEntry {
     pub display_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BookAppendSummary {
     pub book_name: String,
     pub folder: PathBuf,
@@ -36,6 +39,9 @@ pub struct BookAppendSummary {
     pub edit_copies: Vec<BookPathMapping>,
     pub semantic_copies: Vec<BookPathMapping>,
     pub erase_fallback_pages: usize,
+    pub skipped_hidden: usize,
+    pub(crate) undo_files: Option<crate::book_append_undo::AppendFilesReceipt>,
+    pub(crate) metadata_copy: crate::book_append_undo::BookAppendMetadataCopySummary,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +54,14 @@ pub struct BookPathMapping {
 pub enum BookTransferKind {
     Copy,
     Move,
+}
+
+/// Post-filesystem path-store changes performed by the same structural worker.
+/// Failures are warnings: the filesystem has already committed and is not rolled back.
+#[derive(Debug, Default)]
+pub struct BookStoreSummary {
+    pub store_mutations: crate::rename_key_migration::StoreMutationEffects,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -63,11 +77,23 @@ pub struct BookTransferSummary {
     /// Filesystem 変更前に永続化した本ブックマーク移行 intent。
     /// UI は `edit_moves` と一緒に bookmark worker へ渡し、DB commit と同時に消去する。
     pub bookmark_migration_journal_id: Option<String>,
+    pub metadata: BookStoreSummary,
 }
 
 #[derive(Debug)]
 pub enum BookOpResult {
     Append(BookAppendSummary),
+    AppendPresencePrepared {
+        summary: BookAppendSummary,
+        presence: Result<Option<BookAppendEditPresence>, String>,
+    },
+    AppendRefreshPrepared {
+        summary: BookAppendSummary,
+        scan: crate::app::folder_scan::ScannedDir,
+        composition: crate::book_append_undo::BookCompositionStamp,
+        request: crate::app::book_append_refresh::BookAppendRefresh,
+    },
+    UndoAppend(crate::book_append_undo::BookAppendUndoResult),
     Transfer(BookTransferSummary),
     List(Vec<BookInfo>),
     Created {
@@ -83,18 +109,33 @@ pub enum BookOpResult {
         target_folder: PathBuf,
         edit_moves: Vec<BookPathMapping>,
         bookmark_migration_journal_id: Option<String>,
+        metadata: BookStoreSummary,
     },
     Deleted {
         name: String,
         /// Exact folder removed by this worker, independent of later settings changes.
         path: PathBuf,
+        metadata: BookStoreSummary,
     },
     Reordered {
         folder: PathBuf,
         count: usize,
         edit_moves: Vec<BookPathMapping>,
         bookmark_migration_journal_id: Option<String>,
+        metadata: BookStoreSummary,
     },
+}
+
+pub(crate) struct BookAppendEditPresence(
+    pub(crate) crate::app::page_edit_snapshot::StablePageEditProjection,
+);
+
+impl std::fmt::Debug for BookAppendEditPresence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BookAppendEditPresence")
+            .field("stamp", &self.0.stamp)
+            .finish()
+    }
 }
 
 /// Filesystem と SQLite を跨ぐ本ページ移動の phase-aware journal owner。
@@ -107,6 +148,7 @@ struct PreparedBookmarkMigration {
 
 impl PreparedBookmarkMigration {
     fn prepare(
+        data_dir: &Path,
         job_id: String,
         mappings: &[BookPathMapping],
         plan: &BookFsOperationPlan,
@@ -115,8 +157,13 @@ impl PreparedBookmarkMigration {
             .iter()
             .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
             .collect::<Vec<_>>();
-        let journal = crate::book_bookmarks::prepare_path_migration(&job_id, &mappings, plan)
-            .map_err(|error| format!("本ブックマークの移行準備に失敗しました: {error}"))?;
+        let journal = crate::book_bookmarks::prepare_path_migration_writer_at(
+            &data_dir.join("book_bookmarks.db"),
+            &job_id,
+            &mappings,
+            plan,
+        )
+        .map_err(|error| format!("本ブックマークの移行準備に失敗しました: {error}"))?;
         Ok(Self {
             journal,
             discard_if_prepared: true,
@@ -207,6 +254,7 @@ pub struct BookOpPending {
 
 /// The physical operation owned by a pending book worker. A delete retains its
 /// exact requested root until the success result supplies the removed path.
+#[derive(Clone)]
 pub enum BookOpIntent {
     Unrelated,
     /// A manager refresh can also carry one read-only, cancelable grid-navigation request.
@@ -217,15 +265,33 @@ pub enum BookOpIntent {
     Delete {
         path: PathBuf,
     },
+    Append {
+        operation_id: u64,
+        source_context: crate::app::ViewerContextId,
+        accepted_revision: u64,
+        target_folder: PathBuf,
+        observations: crate::book_append_undo::AppendObservations,
+    },
+    UndoAppend {
+        receipt: crate::book_append_undo::BookAppendUndoReceipt,
+    },
 }
 
 impl BookOpIntent {
     pub fn blocks_rename_migration(&self) -> bool {
-        matches!(self, Self::SourceMutation | Self::Delete { .. })
+        matches!(
+            self,
+            Self::SourceMutation | Self::Delete { .. } | Self::UndoAppend { .. }
+        )
     }
 }
 
 pub enum BookPageSource {
+    /// A worker admission wrapper; it never becomes an output page or source image.
+    Qualified {
+        source: Box<BookPageSource>,
+        check: crate::book_composition::CompositionOutputCheck,
+    },
     File {
         src: PathBuf,
         original_name: String,
@@ -258,6 +324,37 @@ pub enum BookPageSource {
         format: crate::capture::CaptureFormat,
         jpeg_matte: crate::capture::JpegMatte,
     },
+}
+
+impl BookPageSource {
+    pub(crate) fn qualify(
+        self,
+        check: Option<crate::book_composition::CompositionOutputCheck>,
+    ) -> Self {
+        match check {
+            Some(check) => Self::Qualified {
+                source: Box::new(self),
+                check,
+            },
+            None => self,
+        }
+    }
+
+    fn permitted_source(
+        self,
+        resolver: &mut crate::book_composition::CompositionOutputResolver,
+    ) -> Result<Option<Self>, String> {
+        match self {
+            Self::Qualified { source, check } => {
+                if check.permits_with(resolver)? {
+                    source.permitted_source(resolver)
+                } else {
+                    Ok(None)
+                }
+            }
+            source => Ok(Some(source)),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -704,6 +801,15 @@ pub fn create_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
 }
 
 pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOpResult, String> {
+    rename_book_at(&crate::data_dir::get(), root, old_name, new_name)
+}
+
+pub(crate) fn rename_book_at(
+    data_dir: &Path,
+    root: &Path,
+    old_name: &str,
+    new_name: &str,
+) -> Result<BookOpResult, String> {
     let old_name = normalize_book_name(old_name);
     let new_name = normalize_book_name(new_name);
     if old_name == new_name {
@@ -715,6 +821,7 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
             target_folder: folder,
             edit_moves: Vec::new(),
             bookmark_migration_journal_id: None,
+            metadata: BookStoreSummary::default(),
         });
     }
     let from = book_folder(root, &old_name);
@@ -723,23 +830,20 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     if to.exists() {
         return Err(format!("同名の本が既にあります: {new_name}"));
     }
-    let edit_moves = book_page_paths(&from)?
-        .into_iter()
-        .filter_map(|old_path| {
-            let name = old_path.file_name()?.to_owned();
-            Some(BookPathMapping {
-                from: old_path,
-                to: to.join(name),
-            })
-        })
-        .collect::<Vec<_>>();
+    // Keep missing bookmarks and folder-scoped settings in the same mapping as
+    // existing pages, including startup journal recovery.
+    let edit_moves = vec![BookPathMapping {
+        from: from.clone(),
+        to: to.clone(),
+    }];
     let job_id = crate::book_bookmarks::new_path_migration_job_id();
     let plan = BookFsOperationPlan::new(vec![BookFsStep::Rename {
         from: from.clone(),
         to: to.clone(),
     }]);
-    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
+    let metadata = maintain_book_paths(data_dir, &edit_moves, &[]);
     Ok(BookOpResult::Renamed {
         old_name,
         new_name,
@@ -747,16 +851,40 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
         target_folder: to,
         edit_moves,
         bookmark_migration_journal_id,
+        metadata,
     })
 }
 
 pub fn delete_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
+    delete_book_at(&crate::data_dir::get(), root, name)
+}
+
+pub(crate) fn delete_book_at(
+    data_dir: &Path,
+    root: &Path,
+    name: &str,
+) -> Result<BookOpResult, String> {
     let name = normalize_book_name(name);
     let path = book_folder(root, &name);
     ensure_direct_book_target(root, &path)?;
+    let scopes = [crate::delete_worker::DeleteSourceScope::Tree(path.clone())];
+    let guard = crate::rename_key_migration::acquire_delete_epub_guard(data_dir, &scopes)?;
     fs::remove_dir_all(&path)
         .map_err(|e| format!("本を削除できません: {}: {e}", path.display()))?;
-    Ok(BookOpResult::Deleted { name, path })
+    let report = crate::rename_key_migration::purge_removed_scopes_guarded_at(
+        data_dir,
+        &scopes,
+        &[],
+        &guard,
+    );
+    Ok(BookOpResult::Deleted {
+        name,
+        path,
+        metadata: BookStoreSummary {
+            store_mutations: report.store_mutations,
+            errors: report.errors,
+        },
+    })
 }
 
 pub fn append_pages(
@@ -765,7 +893,9 @@ pub fn append_pages(
     sources: Vec<BookPageSource>,
     raw: &crate::raw::RawDecodeContext,
 ) -> Result<BookOpResult, String> {
-    append_pages_at_with_raw(crate::data_dir::get(), root, book_name, sources, Some(raw))
+    let data_dir = crate::data_dir::get();
+    let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data_dir);
+    append_pages_at_with_raw(data_dir, root, book_name, sources, stores, Some(raw))
 }
 
 pub(crate) fn append_pages_at(
@@ -774,7 +904,8 @@ pub(crate) fn append_pages_at(
     book_name: String,
     sources: Vec<BookPageSource>,
 ) -> Result<BookOpResult, String> {
-    append_pages_at_with_raw(data_dir, root, book_name, sources, None)
+    let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data_dir);
+    append_pages_at_with_raw(data_dir, root, book_name, sources, stores, None)
 }
 
 pub(crate) fn append_pages_at_with_raw(
@@ -782,17 +913,59 @@ pub(crate) fn append_pages_at_with_raw(
     root: PathBuf,
     book_name: String,
     sources: Vec<BookPageSource>,
+    stores: crate::book_append_undo::AppendMetadataStores,
     raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<BookOpResult, String> {
+    append_pages_at_with_raw_observed(data_dir, root, book_name, sources, stores, raw, |_, _| {})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppendPageBoundary {
+    BeforeMetadata,
+    BeforeFileCreate,
+    AfterFileCreate,
+}
+
+fn append_pages_at_with_raw_observed(
+    data_dir: PathBuf,
+    root: PathBuf,
+    book_name: String,
+    sources: Vec<BookPageSource>,
+    stores: crate::book_append_undo::AppendMetadataStores,
+    raw: Option<&crate::raw::RawDecodeContext>,
+    mut observe: impl FnMut(AppendPageBoundary, &Path),
 ) -> Result<BookOpResult, String> {
     if sources.is_empty() {
         return Err("追加するページがありません".to_string());
     }
+    // Resolve every selected source before creating/mutating the destination.
+    // This is output admission, separate from result membership/thumbnail ordering.
+    let mut accepted = Vec::with_capacity(sources.len());
+    let mut skipped_hidden = 0;
+    let mut resolver = crate::book_composition::CompositionOutputResolver::default();
+    for source in sources {
+        match source.permitted_source(&mut resolver)? {
+            Some(source) => accepted.push(source),
+            None => skipped_hidden += 1,
+        }
+    }
+    if accepted.is_empty() {
+        return Err(crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE.into());
+    }
+    let sources = accepted;
     let added = sources.len();
     let book_name = normalize_book_name(&book_name);
     let folder = book_folder(&root, &book_name);
     fs::create_dir_all(&folder)
         .map_err(|e| format!("本フォルダを作成できません: {}: {e}", folder.display()))?;
     ensure_direct_book_target(&root, &folder)?;
+
+    let mut receipt_builder =
+        crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, book_name.clone())
+            .map_err(|error| {
+                crate::logger::log(format!("[book-append-undo] initial receipt: {error}"))
+            })
+            .ok();
 
     let start = next_page_number(&folder)?;
     if start + sources.len() - 1 > MAX_BOOK_PAGES {
@@ -804,6 +977,7 @@ pub(crate) fn append_pages_at_with_raw(
         ));
     }
 
+    let mut metadata = crate::book_append_undo::AppendMetadataWriter::open_at(&data_dir, stores)?;
     let mut first_path = None;
     let mut edit_copies = Vec::new();
     let mut semantic_copies = Vec::new();
@@ -817,7 +991,15 @@ pub(crate) fn append_pages_at_with_raw(
             BookPageSource::File { src, .. } => Some(src.clone()),
             _ => None,
         };
-        if let Some(copy) = source_edit_copy_path(&root, &folder, &source) {
+        observe(AppendPageBoundary::BeforeMetadata, &dest);
+        let copy = source_edit_copy_path(&root, &folder, &source);
+        let (full, semantic) = match &copy {
+            Some(BookSourceCopy::Full(path)) => (Some(*path), None),
+            Some(BookSourceCopy::Semantic(path)) => (None, Some(*path)),
+            None => (None, None),
+        };
+        metadata.prepare_destination(&dest, full, semantic)?;
+        if let Some(copy) = copy {
             let mapping = BookPathMapping {
                 from: copy.path().to_path_buf(),
                 to: dest.clone(),
@@ -827,8 +1009,23 @@ pub(crate) fn append_pages_at_with_raw(
                 BookSourceCopy::Semantic(_) => semantic_copies.push(mapping),
             }
         }
-        if write_source(source, &dest, raw)? {
-            erase_fallback_pages += 1;
+        observe(AppendPageBoundary::BeforeFileCreate, &dest);
+        match write_source(source, &dest, raw) {
+            Ok(true) => erase_fallback_pages += 1,
+            Ok(false) => {}
+            Err(error) => {
+                // Initialized rows for a failed output are deliberately retained.
+                // The error is logged and returned for the existing notification.
+                crate::logger::log(format!("[book-append-undo] output creation: {error}"));
+                return Err(error);
+            }
+        }
+        observe(AppendPageBoundary::AfterFileCreate, &dest);
+        if let Some(builder) = receipt_builder.as_mut()
+            && let Err(error) = builder.record(&dest)
+        {
+            crate::logger::log(format!("[book-append-undo] output receipt: {error}"));
+            receipt_builder = None;
         }
         if let Some(source_path) = byte_copy_source {
             restore_declines.record(&source_path, &dest);
@@ -848,7 +1045,15 @@ pub(crate) fn append_pages_at_with_raw(
         restore_declines.errors.len(),
     ));
 
-    Ok(BookOpResult::Append(BookAppendSummary {
+    let undo_files = receipt_builder.and_then(|builder| {
+        builder
+            .finish()
+            .map_err(|error| {
+                crate::logger::log(format!("[book-append-undo] file terminal receipt: {error}"))
+            })
+            .ok()
+    });
+    let mut summary = BookAppendSummary {
         book_name,
         folder,
         added,
@@ -856,10 +1061,29 @@ pub(crate) fn append_pages_at_with_raw(
         edit_copies,
         semantic_copies,
         erase_fallback_pages,
-    }))
+        skipped_hidden,
+        undo_files,
+        metadata_copy: metadata.finish(),
+    };
+    crate::book_append_undo::finalize_append_receipt(&mut summary);
+    crate::logger::log(format!(
+        "[book-append-undo] metadata pages={} database_ms={:.3} database_us_per_page={:.3}",
+        summary.added,
+        summary.metadata_copy.database_elapsed.as_secs_f64() * 1_000.0,
+        summary.metadata_copy.database_elapsed.as_secs_f64() * 1_000_000.0 / summary.added as f64,
+    ));
+    Ok(BookOpResult::Append(summary))
 }
 
 pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<BookOpResult, String> {
+    flush_reorder_at(&crate::data_dir::get(), folder, ordered_paths)
+}
+
+fn flush_reorder_at(
+    data_dir: &Path,
+    folder: PathBuf,
+    ordered_paths: Vec<PathBuf>,
+) -> Result<BookOpResult, String> {
     let edit_moves = plan_reorder_paths(&folder, &ordered_paths)?;
     let job_id = crate::book_bookmarks::new_path_migration_job_id();
     let plan = BookFsOperationPlan::new(plan_reorder_filesystem_steps(
@@ -868,18 +1092,40 @@ pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<Boo
         &job_id,
         "reorder",
     )?);
-    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
+    let metadata = maintain_book_paths(data_dir, &edit_moves, &[]);
     let count = edit_moves.len();
     Ok(BookOpResult::Reordered {
         folder,
         count,
         edit_moves,
         bookmark_migration_journal_id,
+        metadata,
     })
 }
 
 pub fn transfer_pages_between_books(
+    root: PathBuf,
+    source_folder: PathBuf,
+    current_order_paths: Vec<PathBuf>,
+    selected_paths: Vec<PathBuf>,
+    target_book_name: String,
+    kind: BookTransferKind,
+) -> Result<BookOpResult, String> {
+    transfer_pages_between_books_at(
+        &crate::data_dir::get(),
+        root,
+        source_folder,
+        current_order_paths,
+        selected_paths,
+        target_book_name,
+        kind,
+    )
+}
+
+pub(crate) fn transfer_pages_between_books_at(
+    data_dir: &Path,
     root: PathBuf,
     source_folder: PathBuf,
     current_order_paths: Vec<PathBuf>,
@@ -1039,8 +1285,9 @@ pub fn transfer_pages_between_books(
         )?);
     }
     let plan = BookFsOperationPlan::new(filesystem_steps);
-    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
+    let metadata = maintain_book_paths(data_dir, &edit_moves, &edit_copies);
 
     let source_after_paths = if kind == BookTransferKind::Move {
         compact_mappings
@@ -1072,7 +1319,52 @@ pub fn transfer_pages_between_books(
         edit_moves,
         edit_copies,
         bookmark_migration_journal_id,
+        metadata,
     }))
+}
+
+/// Called only after the journal's filesystem commit, on the structural worker.
+/// The App owner keeps page writers quiescent until this result is adopted.
+fn maintain_book_paths(
+    data_dir: &Path,
+    moves: &[BookPathMapping],
+    copies: &[BookPathMapping],
+) -> BookStoreSummary {
+    let coverage = moves
+        .iter()
+        .chain(copies)
+        .flat_map(|mapping| [&mapping.from, &mapping.to])
+        .cloned()
+        .map(crate::pdf_loader::EpubPinCoverage::PathAndDescendants)
+        .collect::<Vec<_>>();
+    if coverage.is_empty() {
+        return BookStoreSummary::default();
+    }
+    let guard = match crate::rename_key_migration::acquire_store_maintenance(data_dir, &coverage) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return BookStoreSummary {
+                errors: vec![format!("本のメタデータ移行の準備に失敗しました: {error}")],
+                ..Default::default()
+            };
+        }
+    };
+    let pairs = |mappings: &[BookPathMapping]| {
+        mappings
+            .iter()
+            .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+            .collect::<Vec<_>>()
+    };
+    let report = crate::rename_key_migration::migrate_book_paths_at(
+        data_dir,
+        &pairs(moves),
+        &pairs(copies),
+        &guard,
+    );
+    BookStoreSummary {
+        store_mutations: report.store_mutations,
+        errors: report.errors,
+    }
 }
 
 fn compose_book_path_mapping_phases(phases: &[&[BookPathMapping]]) -> Vec<BookPathMapping> {
@@ -1197,6 +1489,7 @@ fn write_source(
     raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<bool, String> {
     match source {
+        BookPageSource::Qualified { .. } => Err("output source was not admitted".into()),
         BookPageSource::File { src, .. } => {
             copy_file_snapshot(&src, dest)?;
             Ok(false)
@@ -1308,20 +1601,16 @@ fn decode_file_color_image(
             .map_err(|error| format!("RAW を現像できません: {}: {error}", path.display()))?;
         return Ok(dynamic_image_to_color_image(&image));
     }
-    let image = image::open(path)
-        .or_else(|_| {
-            crate::wic_decoder::decode_to_dynamic_image(path).ok_or_else(|| {
-                image::ImageError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "wic decode failed",
-                ))
-            })
-        })
-        .or_else(|_| {
-            crate::susie_loader::decode_file(path, true, None).map_err(image::ImageError::IoError)
-        })
-        .map_err(|e| format!("画像をデコードできません: {}: {e}", path.display()))?;
-    let image = crate::thumb_loader::apply_exif_orientation(image, path);
+    let source = crate::image_decode::Source::Path(path);
+    let image = crate::image_decode::decode_with_susie_cancel(
+        source,
+        crate::avif_decoder::Workload::Background,
+        true,
+        Some(cancel),
+        None,
+    )
+    .map_err(|e| format!("画像をデコードできません: {}: {e}", path.display()))?
+    .oriented(source);
     Ok(dynamic_image_to_color_image(&image))
 }
 
@@ -1345,28 +1634,16 @@ fn decode_bytes_color_image(
             .map_err(|error| format!("ZIP RAW を現像できません: {hint}: {error}"))?;
         return Ok(dynamic_image_to_color_image(&image));
     }
-    let image = image::load_from_memory(bytes)
-        .or_else(|_| {
-            crate::wic_decoder::decode_to_dynamic_image_from_bytes(
-                bytes,
-                Path::new(hint)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or(""),
-            )
-            .ok_or_else(|| {
-                image::ImageError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "wic decode failed",
-                ))
-            })
-        })
-        .or_else(|_| {
-            crate::susie_loader::decode_bytes(hint, bytes, true, None)
-                .map_err(image::ImageError::IoError)
-        })
-        .map_err(|e| format!("ZIP 内画像をデコードできません: {hint}: {e}"))?;
-    let image = crate::thumb_loader::apply_exif_orientation_from_bytes(image, bytes);
+    let source = crate::image_decode::Source::Bytes { bytes, hint };
+    let image = crate::image_decode::decode_with_susie_cancel(
+        source,
+        crate::avif_decoder::Workload::Background,
+        true,
+        Some(cancel),
+        None,
+    )
+    .map_err(|e| format!("ZIP 内画像をデコードできません: {hint}: {e}"))?
+    .oriented(source);
     Ok(dynamic_image_to_color_image(&image))
 }
 
@@ -2273,6 +2550,7 @@ fn destination_for_source(
     source: &BookPageSource,
 ) -> Result<PathBuf, String> {
     let raw_name = match source {
+        BookPageSource::Qualified { .. } => return Err("output source was not admitted".into()),
         BookPageSource::File { original_name, .. } => sanitize_filename(original_name, "page"),
         BookPageSource::ZipEntry { original_name, .. } => sanitize_filename(original_name, "page"),
         BookPageSource::Composited {
@@ -2469,6 +2747,161 @@ fn sanitize_filename(input: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1373_append_metadata_precedes_file_and_later_eight_store_edits_win() {
+        use crate::book_append_undo::append_test_support::TestMetadata;
+        use std::sync::mpsc;
+        // Freeze the real Append worker before metadata, before publication and
+        // after publication. The final result stays unpolled during user writes.
+        for clear in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("books");
+            let source_folder = root.join("source");
+            fs::create_dir_all(&source_folder).unwrap();
+            let source = source_folder.join("0001_source.jpg");
+            fs::write(&source, b"source image").unwrap();
+            let data = tmp.path().join("data");
+            let mut dbs = TestMetadata::open(&data);
+            let source_key = crate::adjustment_db::normalize_path(&source);
+            dbs.set_all(&source_key, 4);
+            let unrelated = root.join("other/0001_other.jpg");
+            let unrelated_key = crate::adjustment_db::normalize_path(&unrelated);
+            dbs.set_all(&unrelated_key, 2);
+            let destination = root.join("destination/0001_0001_source.jpg");
+            let destination_key = crate::adjustment_db::normalize_path(&destination);
+            dbs.set_all(&destination_key, 2);
+            let stores = dbs.stores();
+            let (boundary_tx, boundary_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = append_pages_at_with_raw_observed(
+                    data,
+                    root,
+                    "destination".into(),
+                    vec![BookPageSource::File {
+                        src: source,
+                        original_name: "0001_source.jpg".into(),
+                    }],
+                    stores,
+                    None,
+                    |boundary, path| {
+                        boundary_tx.send((boundary, path.to_path_buf())).unwrap();
+                        resume_rx.recv().unwrap();
+                    },
+                );
+                result_tx.send(result).unwrap();
+            });
+            let next = |expected| {
+                let (actual, path) = boundary_rx
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(path, destination);
+            };
+            next(AppendPageBoundary::BeforeMetadata);
+            assert!(!destination.exists());
+            dbs.assert_all(&destination_key, Some(2));
+            // Source edits committed before initialization are copied.
+            dbs.set_all(&source_key, 5);
+            resume_tx.send(()).unwrap();
+            next(AppendPageBoundary::BeforeFileCreate);
+            assert!(!destination.exists());
+            dbs.assert_all(&destination_key, Some(5));
+            resume_tx.send(()).unwrap();
+            next(AppendPageBoundary::AfterFileCreate);
+            assert_eq!(fs::read(&destination).unwrap(), b"source image");
+            dbs.assert_all(&destination_key, Some(5));
+            // A manual reload/open can now expose the destination. All normal
+            // metadata writes, including tag remove/all-clear, must win.
+            if clear {
+                dbs.clear_all(&destination_key);
+            } else {
+                dbs.set_all(&destination_key, 3);
+                dbs.tags
+                    .set_item_tags(&destination_key, ["v3", "added"], "test")
+                    .unwrap();
+                dbs.tags.toggle_item_tag(&destination_key, "added").unwrap();
+            }
+            // Editing the source after publication cannot mutate the output.
+            dbs.set_all(&source_key, 4);
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap();
+            // The terminal report is delivered only after those user writes.
+            let BookOpResult::Append(summary) = result_rx.recv().unwrap().unwrap() else {
+                panic!("expected final Append");
+            };
+            assert!(summary.undo_files.is_some());
+            assert!(summary.metadata_copy.errors.is_empty());
+            assert_eq!(summary.metadata_copy.ratings, [destination_key.clone()]);
+            assert_eq!(summary.metadata_copy.tags, [destination_key.clone()]);
+            dbs.assert_all(&destination_key, (!clear).then_some(3));
+            dbs.assert_all(&unrelated_key, Some(2));
+            dbs.assert_all(&source_key, Some(4));
+        }
+    }
+
+    #[test]
+    fn section1373_append_initialization_failure_never_creates_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("books");
+        let source = tmp.path().join("source.jpg");
+        fs::write(&source, b"source").unwrap();
+        let result = append_pages_at_with_raw(
+            tmp.path().join("missing-data"),
+            root.clone(),
+            "destination".into(),
+            vec![BookPageSource::File {
+                src: source.clone(),
+                original_name: "source.jpg".into(),
+            }],
+            crate::book_append_undo::AppendMetadataStores {
+                adjustment: true,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(result.is_err());
+        assert!(!root.join("destination/0001_source.jpg").exists());
+        assert!(!tmp.path().join("missing-data").exists());
+        assert_eq!(fs::read(source).unwrap(), b"source");
+    }
+
+    #[test]
+    fn section1373_failed_file_creation_retains_initialized_rows_without_rollback() {
+        use crate::book_append_undo::append_test_support::TestMetadata;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("books");
+        let source = root.join("source/0001_source.jpg");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let data = tmp.path().join("data");
+        let mut dbs = TestMetadata::open(&data);
+        let source_key = crate::adjustment_db::normalize_path(&source);
+        dbs.set_all(&source_key, 4);
+        let stores = dbs.stores();
+        let result = append_pages_at_with_raw_observed(
+            data,
+            root.clone(),
+            "destination".into(),
+            vec![BookPageSource::File {
+                src: source.clone(),
+                original_name: "0001_source.jpg".into(),
+            }],
+            stores,
+            None,
+            |boundary, _| {
+                if boundary == AppendPageBoundary::BeforeFileCreate {
+                    fs::remove_file(&source).unwrap();
+                }
+            },
+        );
+        assert!(result.is_err());
+        let destination = root.join("destination/0001_0001_source.jpg");
+        assert!(!destination.exists());
+        dbs.assert_all(&crate::adjustment_db::normalize_path(&destination), Some(4));
+    }
 
     #[cfg(windows)]
     #[test]
@@ -3721,7 +4154,11 @@ mod tests {
         fs::write(&page_a, b"a").unwrap();
         fs::write(&page_b, b"b").unwrap();
 
-        let result = flush_reorder(folder.clone(), vec![page_a.clone(), page_b.clone()]);
+        let result = flush_reorder_at(
+            &tmp.path().join("data"),
+            folder.clone(),
+            vec![page_a.clone(), page_b.clone()],
+        );
 
         assert!(result.is_err());
         assert_eq!(fs::read(&conflict).unwrap(), b"conflict");
@@ -3754,7 +4191,8 @@ mod tests {
         fs::write(&b, b"b").unwrap();
         fs::write(&c, b"c").unwrap();
 
-        let result = transfer_pages_between_books(
+        let result = transfer_pages_between_books_at(
+            &tmp.path().join("data"),
             root.clone(),
             source.clone(),
             vec![c.clone(), a.clone(), b.clone()],
@@ -3812,7 +4250,8 @@ mod tests {
         fs::write(&b, b"b").unwrap();
         fs::write(&c, b"c").unwrap();
 
-        let result = transfer_pages_between_books(
+        let result = transfer_pages_between_books_at(
+            &tmp.path().join("data"),
             root,
             source.clone(),
             vec![a.clone(), b.clone(), c.clone()],
@@ -3860,7 +4299,8 @@ mod tests {
         fs::write(&b, b"b").unwrap();
         fs::write(&c, b"c").unwrap();
 
-        let result = transfer_pages_between_books(
+        let result = transfer_pages_between_books_at(
+            &tmp.path().join("data"),
             root,
             source.clone(),
             vec![c.clone(), a.clone(), b.clone()],
@@ -3929,7 +4369,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_book_reports_edit_move_mappings() {
+    fn rename_book_reports_folder_mapping_for_missing_bookmarks() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("books");
         let source = root.join("old");
@@ -3937,7 +4377,7 @@ mod tests {
         fs::write(source.join("0001_a.jpg"), b"a").unwrap();
         fs::write(source.join("0002_b.jpg"), b"b").unwrap();
 
-        let result = rename_book(&root, "old", "new").unwrap();
+        let result = rename_book_at(&tmp.path().join("data"), &root, "old", "new").unwrap();
 
         let BookOpResult::Renamed { edit_moves, .. } = result else {
             panic!("expected rename result");
@@ -3947,16 +4387,160 @@ mod tests {
                 .iter()
                 .map(|m| (m.from.clone(), m.to.clone()))
                 .collect::<Vec<_>>(),
-            vec![
-                (
-                    root.join("old").join("0001_a.jpg"),
-                    root.join("new").join("0001_a.jpg")
-                ),
-                (
-                    root.join("old").join("0002_b.jpg"),
-                    root.join("new").join("0002_b.jpg")
-                ),
-            ]
+            vec![(root.join("old"), root.join("new"))]
         );
+    }
+    #[test]
+    fn qualified_append_filters_latest_hidden_preserves_selection_order_and_dense_numbering() {
+        use crate::book_composition::{
+            BookComposition, BookCompositionService, CandidatePage, CompositionOutputCheck,
+            CompositionPageRef, PageDomain, ReadingDirection,
+        };
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("input.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        for page in 0..4 {
+            writer
+                .start_file(
+                    format!("{page}.jpg"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(format!("page {page}").as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+        let tree = Arc::new(crate::zip_tree::ZipTree::build(
+            archive.clone(),
+            crate::zip_loader::enumerate_image_entries(&archive).unwrap(),
+        ));
+        let data = temp.path().join("data");
+        let (service, owner) = BookCompositionService::spawn_at(data.clone(), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&archive, &[]).unwrap();
+        service
+            .prepare(
+                scope.clone(),
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let checks = [2, 0, 1, 3].map(|page| {
+            CompositionOutputCheck::new(
+                service.clone(),
+                CandidatePage {
+                    identity: crate::book_resume_db::PageIdentity::Archive {
+                        container: crate::path_key::normalize_keep_drive(&archive),
+                        entry_name: format!("{page}.jpg"),
+                    },
+                    physical_archive: Some(archive.clone()),
+                    raw_tree: Some(Arc::clone(&tree)),
+                },
+            )
+        });
+        let mut record = BookComposition::new(
+            ReadingDirection::Ltr,
+            (0..4)
+                .map(|page| CompositionPageRef::ArchiveEntry {
+                    entry_name: format!("{page}.jpg"),
+                })
+                .collect(),
+        );
+        record.hidden_pages.push(CompositionPageRef::ArchiveEntry {
+            entry_name: "1.jpg".into(),
+        });
+        service
+            .save(
+                scope,
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+                record,
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let sources = [2, 0, 1, 3]
+            .into_iter()
+            .zip(checks)
+            .map(|(page, check)| {
+                BookPageSource::ZipEntry {
+                    zip_path: archive.clone(),
+                    entry_name: format!("{page}.jpg"),
+                    original_name: format!("{page}.jpg"),
+                }
+                .qualify(Some(check))
+            })
+            .collect();
+        let root = temp.path().join("books");
+        let BookOpResult::Append(summary) =
+            append_pages_at(data, root.clone(), "out".into(), sources).unwrap()
+        else {
+            panic!("append expected");
+        };
+        assert_eq!(summary.added, 3);
+        assert_eq!(summary.skipped_hidden, 1);
+        for (number, page) in [2, 0, 3].into_iter().enumerate() {
+            assert_eq!(
+                fs::read(
+                    root.join("out")
+                        .join(format!("{:04}_{page}.jpg", number + 1))
+                )
+                .unwrap(),
+                format!("page {page}").as_bytes()
+            );
+        }
+        assert_eq!(fs::read_dir(root.join("out")).unwrap().count(), 3);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn all_hidden_qualified_append_does_not_create_book_folder() {
+        use crate::book_composition::{
+            BookComposition, BookCompositionService, CandidatePage, CompositionOutputCheck,
+            CompositionPageRef, PageDomain, ReadingDirection,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let (service, owner) = BookCompositionService::spawn_at(data.clone(), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::document("C:/all-hidden.pdf").unwrap();
+        let page = CompositionPageRef::PdfPage { page_num: 0 };
+        let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+        record.hidden_pages.push(page);
+        service
+            .save(scope, PageDomain::Document, record)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let check = CompositionOutputCheck::new(
+            service,
+            CandidatePage {
+                identity: crate::book_resume_db::PageIdentity::Document {
+                    container: "C:/all-hidden.pdf".into(),
+                    page_num: 0,
+                },
+                physical_archive: None,
+                raw_tree: None,
+            },
+        );
+        let source = BookPageSource::File {
+            src: temp.path().join("never-read.jpg"),
+            original_name: "hidden.jpg".into(),
+        }
+        .qualify(Some(check));
+        let root = temp.path().join("books");
+        assert_eq!(
+            append_pages_at(data, root.clone(), "out".into(), vec![source])
+                .err()
+                .unwrap(),
+            crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE
+        );
+        assert!(!root.exists());
+        owner.shutdown_and_join();
     }
 }

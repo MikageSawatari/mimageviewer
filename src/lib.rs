@@ -22,15 +22,25 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
+mod egui037_stage4_gpu_tests;
+mod egui_output;
+mod gpu_startup_diagnostics;
+mod run_native_failure;
+#[cfg(test)]
+mod test_native_focus;
+#[cfg(test)]
 #[path = "../tests/support/ui_harness.rs"]
 pub(crate) mod test_ui;
 mod wgpu_backend_policy;
+mod wheel_input;
 
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+pub mod detached_window_geometry;
+pub(crate) mod feedback;
 #[cfg(feature = "dev-tools")]
 pub mod raw;
 #[cfg(not(feature = "dev-tools"))]
@@ -48,11 +58,16 @@ pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapsh
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_notification_duration_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_restore_position_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use ui_main::draw_effetune_show_only_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
 pub mod archive_origin;
@@ -63,7 +78,9 @@ pub(crate) mod audio_thumbnail;
 pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod bake_stage;
+pub(crate) mod book_append_undo;
 pub mod book_bookmarks;
+pub mod book_composition;
 mod book_fs_journal;
 pub mod book_resume_db;
 pub(crate) mod book_scope;
@@ -109,13 +126,16 @@ pub mod file_type_visibility;
 mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
+mod material_display_basis;
 pub mod metadata_transfer;
+mod page_turn_animation;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
 pub(crate) mod spread_shift;
 mod startup_window_geometry;
 #[cfg(windows)]
 mod startup_windows_diag;
+pub mod ui_composition_editor;
 mod window_activation;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
@@ -151,7 +171,11 @@ pub mod filename_sort;
 pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
+mod image_folder_zip;
+mod image_folder_zip_job;
+mod image_folder_zip_metadata;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
+mod adjustment_parameter_edit;
 mod everything_ipc;
 mod everything_results;
 mod filename_stack_ui;
@@ -171,7 +195,9 @@ pub mod gamepad;
 pub mod global_search;
 mod global_search_ui;
 pub use global_search_ui::{
-    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_everything_progress_snapshot_fixture,
+    draw_everything_search_disabled_menu_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_global_search_reject_snapshot_fixture,
 };
 pub mod gpu_info;
 #[cfg(any(test, feature = "dev-tools"))]
@@ -197,6 +223,7 @@ pub mod known_folders;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
+pub(crate) mod local_adjust_parameter_edit;
 pub(crate) mod local_adjust_write_worker;
 pub(crate) mod log_writer;
 pub mod logger;
@@ -218,6 +245,8 @@ pub mod name_bulk_indexer;
 pub mod name_index_manager;
 pub mod name_index_supervisor;
 pub mod native_context_menu;
+#[cfg(windows)]
+mod native_exception_log;
 mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
@@ -231,6 +260,7 @@ pub mod reading_history_db;
 pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]
 mod settings_override;
+pub mod source_coverage;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
 mod vram_budget;
@@ -283,6 +313,7 @@ pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
 pub mod sidecar_import;
+mod similar_array_owner;
 mod similar_book_engine;
 mod similar_book_mih;
 mod similar_book_query;
@@ -348,19 +379,23 @@ mod ui_folder_pane;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
+#[doc(hidden)]
+pub use ui_fullscreen::draw_composition_editor_hud_snapshot_fixture;
 pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
+    draw_fs_composed_view_snapshot_fixture, draw_fs_extracted_result_view_snapshot_fixture,
     draw_fs_fit_popup_snapshot_fixture, draw_fs_page_wait_indicator_snapshot_fixture,
     draw_fs_prefetch_indicator_snapshot_fixture, draw_music_locked_panel_snapshot_fixture,
-    draw_music_panel_reach_snapshot_fixture, draw_spread_shift_hud_snapshot_fixture,
-    draw_still_panel_reach_snapshot_fixture, draw_still_seek_strip_snapshot_fixture,
-    draw_still_touch_first_run_help_snapshot_fixture,
+    draw_music_panel_reach_snapshot_fixture, draw_singleton_spread_endpoint_popup_snapshot_fixture,
+    draw_spread_shift_hud_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
+    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
 mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
 pub mod ui_page_overview;
+pub mod ui_pinned_search;
 pub mod ui_toolbar_layout;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_details_name_color_settings_snapshot_fixture;
@@ -377,6 +412,7 @@ pub use ui_metadata_panel::{
     draw_comfyui_provenance_snapshot_fixture, draw_paused_metadata_panel_snapshot_fixture,
     draw_similar_panel_snapshot_fixture, draw_similar_states_snapshot_fixture,
 };
+pub mod music_note_color;
 pub mod ui_music_panels;
 pub mod ui_music_spectrum;
 pub mod ui_music_timeline;
@@ -414,7 +450,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-static NATIVE_EXCEPTION_LOGGING: AtomicBool = AtomicBool::new(false);
 static UI_HEARTBEAT: OnceLock<Arc<UiHeartbeatState>> = OnceLock::new();
 
 struct UiHeartbeatState {
@@ -508,8 +543,8 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
         Err(_) => Some(1),
     };
 
-    wgpu_options.present_mode = present_mode;
-    wgpu_options.desired_maximum_frame_latency = desired_maximum_frame_latency;
+    wgpu_options.surface.present_mode = present_mode;
+    wgpu_options.surface.desired_maximum_frame_latency = desired_maximum_frame_latency;
     logger::log(format!(
         "wgpu presentation: present_mode={present_mode:?} \
          desired_maximum_frame_latency={desired_maximum_frame_latency:?}"
@@ -524,6 +559,30 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
 /// docs/briefs/pdf-page-turn-and-stale-composite-plan.md の ③。
 fn install_texture_delta_ledger() {
     egui_wgpu::atlas_diag::set_sink(|message| logger::log(message));
+    egui_wgpu::install_texture_delivery_observer(perf::is_enabled, |delivery| {
+        let site = match delivery.site {
+            egui_wgpu::atlas_diag::Site::ProducedMain => "produced_main",
+            egui_wgpu::atlas_diag::Site::ProducedImmediate => "produced_immediate",
+            egui_wgpu::atlas_diag::Site::ProducedPresenter => "produced_presenter",
+            egui_wgpu::atlas_diag::Site::AppliedPaint => "applied_paint",
+            egui_wgpu::atlas_diag::Site::AppliedNoPaint => "applied_no_paint",
+            egui_wgpu::atlas_diag::Site::AppliedPresenter => "applied_presenter",
+        };
+        perf::event(
+            "gpu",
+            "texture_delivery_submitted",
+            None,
+            0,
+            &[
+                ("renderer", delivery.renderer.into()),
+                ("texture", format!("{:?}", delivery.texture_id).into()),
+                ("batch", delivery.batch.into()),
+                ("bytes", delivery.bytes.into()),
+                ("mipmap", delivery.mipmap.into()),
+                ("site", site.into()),
+            ],
+        );
+    });
 }
 
 fn install_panic_log_hook() {
@@ -850,80 +909,6 @@ pub(crate) fn set_ui_heartbeat_suspended(suspended: bool, detail: String) {
     }
 }
 
-#[cfg(windows)]
-fn install_native_exception_log_hook() {
-    use windows::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
-
-    unsafe {
-        let handle = AddVectoredExceptionHandler(1, Some(native_exception_handler));
-        if handle.is_null() {
-            logger::log("native exception logger: AddVectoredExceptionHandler failed");
-        } else {
-            logger::log("native exception logger: installed vectored exception handler");
-        }
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn native_exception_handler(
-    info: *mut windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
-) -> i32 {
-    use windows::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
-
-    let Some(info) = (unsafe { info.as_ref() }) else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let Some(record) = (unsafe { info.ExceptionRecord.as_ref() }) else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let code = record.ExceptionCode.0 as u32;
-    if !matches!(
-        code,
-        0xC000_0005 // EXCEPTION_ACCESS_VIOLATION
-            | 0xC000_00FD // EXCEPTION_STACK_OVERFLOW
-            | 0x8000_0003 // EXCEPTION_BREAKPOINT
-            | 0xC000_001D // EXCEPTION_ILLEGAL_INSTRUCTION
-            | 0xC000_0094 // EXCEPTION_INT_DIVIDE_BY_ZERO
-            | 0xC000_0095 // EXCEPTION_FLT_OVERFLOW
-            | 0xC000_0374 // STATUS_HEAP_CORRUPTION
-    ) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-
-    if NATIVE_EXCEPTION_LOGGING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        // ⚠ このハンドラはスレッド終了処理の内側でも、ヒープが壊れている状態でも走る。
-        // スレッド ID は `logger::current_thread_id_num` が TLS を経由しないので安全だが、
-        // **下の `format!` と `append_panic_log_entry` はヒープを使う**。一次例外が
-        // `RtlFreeHeap` から来た場合、その thread がヒープロックを握ったまま来ている可能性が
-        // あり、ここでの確保が再入で詰まり得る。残存リスクとして backlog §1.123 に記録済み
-        // (固定バッファ + 起動時に開いた handle へ書く形が本来の姿)。
-        let tid = logger::current_thread_id_num()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".to_owned());
-        let mut details = format!(
-            "NATIVE EXCEPTION code=0x{code:08X} flags=0x{:08X} address={:p} thread={tid}",
-            record.ExceptionFlags, record.ExceptionAddress
-        );
-        if code == 0xC000_0005 {
-            let access_kind = match record.ExceptionInformation[0] {
-                0 => "read",
-                1 => "write",
-                8 => "execute",
-                _ => "unknown",
-            };
-            let access_address = record.ExceptionInformation[1] as *const core::ffi::c_void;
-            details.push_str(&format!(" access={access_kind} target={access_address:p}"));
-        }
-        append_panic_log_entry(&details);
-        NATIVE_EXCEPTION_LOGGING.store(false, Ordering::Release);
-    }
-
-    EXCEPTION_CONTINUE_SEARCH
-}
-
 /// `--version` / `-V` / `--help` / `-h` を処理する。該当すれば文面を親コンソールへ
 /// 出力して `true` を返す (呼び出し側は GUI を開かず exit する)。GUI アプリ
 /// (`windows_subsystem="windows"`) でも `mimageviewer-core.exe --version` でバージョンを
@@ -950,6 +935,7 @@ fn maybe_handle_version_or_help() -> bool {
              Options:\n  \
              -V, --version  Print version and exit\n  \
              -h, --help     Print this help and exit\n  \
+             --gpu-backend auto|dx12|vulkan  Select the startup graphics API\n  \
              --diag-startup-windows  Record startup HWND diagnostics (Windows)\n  \
              \n\
              PATH  Open the given image file or folder on startup.\n",
@@ -1128,6 +1114,8 @@ pub fn run() -> eframe::Result {
     };
     #[cfg(all(feature = "test-script", windows))]
     let scripted_run = test_script_path.is_some();
+    #[cfg(not(all(feature = "test-script", windows)))]
+    let scripted_run = false;
     // run() 入口の Instant を起動時間計測の t=0 とする。
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
     // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。
@@ -1264,10 +1252,31 @@ pub fn run() -> eframe::Result {
         Some(guard)
     };
 
+    let gpu_args: Vec<String> = std::env::args_os()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    let gpu_request = match wgpu_backend_policy::GpuBackendRequest::parse_args(&gpu_args) {
+        Ok(request) => request,
+        Err(error) => {
+            data_dir::show_fatal_messagebox(&error.to_string());
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup(2);
+        }
+    };
+    #[cfg(feature = "test-script")]
+    let gpu_fail_dx12 = match wgpu_backend_policy::parse_fail_device_args(&gpu_args) {
+        Ok(request) => request,
+        Err(error) => {
+            data_dir::show_fatal_messagebox(&error.to_string());
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup(2);
+        }
+    };
+
     install_panic_log_hook();
     install_texture_delta_ledger();
     #[cfg(windows)]
-    install_native_exception_log_hook();
+    let native_exception_log_result = native_exception_log::install();
 
     // 通常ログ (mimageviewer.log) は常時記録する。logger 側が 16MiB で
     // ローテーション (現行 + .bak の 2 世代) し、起動時に前回分を .prev へ
@@ -1276,6 +1285,8 @@ pub fn run() -> eframe::Result {
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     startup_operation(miv_startup::Stage::Logger, "Logger", || logger::init());
+    #[cfg(windows)]
+    native_exception_log::report_install_result(native_exception_log_result);
 
     #[cfg(all(windows, not(feature = "portable")))]
     {
@@ -1531,15 +1542,12 @@ pub fn run() -> eframe::Result {
         }
     }
 
-    // wgpu のバックエンドは **DX12 を優先 + Vulkan フォールバック**。
-    // wgpu 既定のスコアリングでは Vulkan が DX12 より優先選択される環境があるため、
-    // カスタムアダプタセレクタで明示的に DX12 アダプタを最優先する。DX12 が無ければ
-    // Vulkan、それも無ければ任意の adapter を返す (eframe / egui 自体は描画される)。
-    // native video は独立した D3D11 device、HUD は別の DX12 Instance を使い、
-    // root GUI の選択 backend に依存しない。
+    // Finite root API selection completes before AppCreator runs.
+    // Native video and its separate DX12 HUD remain independent.
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
+        gpu_startup_diagnostics::observe(&event);
         use egui_wgpu::{StartupDiagnosticEvent as Event, StartupGpuStage as Gpu};
         let stage = |gpu| match gpu {
             Gpu::TextureDelivery => miv_startup::Stage::TextureDelivery,
@@ -1584,32 +1592,38 @@ pub fn run() -> eframe::Result {
                 ),
             ),
             Event::RootPresented { normal, .. } => miv_startup::mark_present(normal),
+            Event::DeviceAttempt { .. } => {}
         }
     }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends = wgpu_backend_policy::native_backends();
-        create_new.native_adapter_selector = Some(std::sync::Arc::new(
-            |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
-                if let Some(a) = adapters
+        configure_root_gpu_descriptor(&mut create_new.instance_descriptor, gpu_request);
+        create_new.native_adapter_candidates = Some(Arc::new(move |adapters, surface| {
+            let candidates = gpu_request.native_adapter_candidates(adapters, surface);
+            gpu_startup_diagnostics::candidates(
+                &candidates
                     .iter()
-                    .find(|a| a.get_info().backend == wgpu::Backend::Dx12)
-                {
-                    return Ok(a.clone());
-                }
-                if let Some(a) = adapters
-                    .iter()
-                    .find(|a| a.get_info().backend == wgpu::Backend::Vulkan)
-                {
-                    return Ok(a.clone());
-                }
-                adapters
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| "no wgpu adapter available".to_string())
-            },
-        ));
+                    .map(|a| a.get_info().backend)
+                    .collect::<Vec<_>>(),
+            );
+            Ok(candidates)
+        }));
+        #[cfg(feature = "test-script")]
+        {
+            let descriptor = Arc::clone(&create_new.device_descriptor);
+            create_new.device_descriptor = Arc::new(move |adapter| {
+                let mut desc = descriptor(adapter);
+                wgpu_backend_policy::inject_device_failure(
+                    gpu_fail_dx12,
+                    &adapter.get_info(),
+                    &mut desc,
+                );
+                desc
+            });
+        }
     }
+
     let options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport,
         wgpu_options,
         ..Default::default()
@@ -1735,6 +1749,11 @@ pub fn run() -> eframe::Result {
         None::<spread_shift::SpreadShiftProcessOwner>,
     ));
     let creator_spread_shift_owner = Arc::clone(&spread_shift_owner);
+    let book_composition_owner = Arc::new(std::sync::Mutex::new(
+        None::<book_composition::BookCompositionProcessOwner>,
+    ));
+    let creator_book_composition_owner = Arc::clone(&book_composition_owner);
+    gpu_startup_diagnostics::begin(gpu_request);
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -1756,10 +1775,13 @@ pub fn run() -> eframe::Result {
             #[cfg(windows)]
             startup_windows_diag::mark("app.creator.start", 0, || serde_json::json!({}));
             #[cfg(windows)]
+            cc.egui_ctx
+                .options_mut(|options| options.quit_shortcuts.clear());
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
+            crate::key_input::install_operation_input_plugin(&cc.egui_ctx);
             ui_fullscreen::install_fs_navigator_input_tracking(&cc.egui_ctx);
             double_click_time::configure_context(&cc.egui_ctx);
             let t = Instant::now();
@@ -1815,8 +1837,25 @@ pub fn run() -> eframe::Result {
                 }
                 Err(error) => {
                     logger::log(format!("spread_shift: worker startup failed: {error}"));
-                    app.show_feedback_toast(format!(
+                    app.show_feedback_warning(format!(
                         "見開き調整の保存を開始できませんでした: {error}"
+                    ));
+                }
+            }
+            match book_composition::BookCompositionService::spawn_at(
+                data_dir::get(),
+                app.content_identity_recorder
+                    .as_ref()
+                    .map(|recorder| recorder.producer()),
+            ) {
+                Ok((service, owner)) => {
+                    *creator_book_composition_owner.lock().unwrap() = Some(owner);
+                    app.install_book_composition_runtime(service);
+                }
+                Err(error) => {
+                    logger::log(format!("book_composition: worker startup failed: {error}"));
+                    app.show_feedback_warning(format!(
+                        "本の構成の保存を開始できませんでした: {error}"
                     ));
                 }
             }
@@ -1928,55 +1967,60 @@ pub fn run() -> eframe::Result {
             Ok(Box::new(app))
         }),
     );
-    native_trace.finish(if run_result.is_ok() {
-        miv_startup::Outcome::Ok
-    } else {
-        miv_startup::Outcome::Error
-    });
-    // Stop public admission before named-pipe workers, then close the only Remote collection
-    // producer before joining the actor. The App normally completed its drain in on_exit; this
-    // outer fallback also covers creator failure/panic and is deliberately idempotent.
-    if let Some(control) = remote_ipc_control.as_ref() {
-        control.begin_app_exit();
-    }
-    drop(remote_service_manager.take());
-    if let Some(handle) = remote_session_handle.as_ref() {
-        handle.retire_app_without_ui_owner();
-    }
-    drop(remote_ipc_server.take());
-    if let Some(producer) = collection_remote_producer.as_ref() {
-        producer.close_and_drain();
-    }
-    if let Ok(runtime) = collection_runtime {
-        runtime.shutdown_and_join();
-    }
-    if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
-        for result in owner.shutdown_and_join() {
-            if let Err(error) = result.status {
-                logger::log(format!("spread_shift: exit save failed: {error}"));
+    let run_succeeded = run_result.is_ok();
+    run_native_failure::finish_run_native(
+        run_result,
+        scripted_run,
+        &data_dir::get(),
+        || {
+            native_trace.finish(if run_succeeded {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            });
+            // Stop public admission before named-pipe workers, then close the only Remote collection
+            // producer before joining the actor. The App normally completed its drain in on_exit; this
+            // outer fallback also covers creator failure/panic and is deliberately idempotent.
+            if let Some(control) = remote_ipc_control.as_ref() {
+                control.begin_app_exit();
             }
-        }
-    }
-    // Rendering and normal shutdown are complete. Preserve the buffered tail for
-    // every perf category without adding another periodic log write on the UI.
-    perf::flush();
-    #[cfg(all(feature = "test-script", windows))]
-    if scripted_run && run_result.is_ok() {
-        miv_startup::terminal(if test_script::process_exit_code() == Some(0) {
-            miv_startup::Outcome::Ok
-        } else {
-            miv_startup::Outcome::Error
-        });
-        finish_logs();
-        test_script::exit_after_run_native();
-    }
-    miv_startup::terminal(if run_result.is_ok() {
-        miv_startup::Outcome::Ok
-    } else {
-        miv_startup::Outcome::Error
-    });
-    finish_logs();
-    run_result
+            drop(remote_service_manager.take());
+            if let Some(handle) = remote_session_handle.as_ref() {
+                handle.retire_app_without_ui_owner();
+            }
+            drop(remote_ipc_server.take());
+            if let Some(producer) = collection_remote_producer.as_ref() {
+                producer.close_and_drain();
+            }
+            if let Ok(runtime) = collection_runtime {
+                runtime.shutdown_and_join();
+            }
+            if let Some(owner) = book_composition_owner.lock().unwrap().take() {
+                owner.shutdown_and_join();
+            }
+            if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
+                for result in owner.shutdown_and_join() {
+                    if let Err(error) = result.status {
+                        logger::log(format!("spread_shift: exit save failed: {error}"));
+                    }
+                }
+            }
+            // Rendering and normal shutdown are complete. Preserve the buffered tail for
+            // every perf category without adding another periodic log write on the UI.
+            perf::flush();
+            #[cfg(all(feature = "test-script", windows))]
+            if scripted_run && run_succeeded {
+                miv_startup::terminal(if test_script::process_exit_code() == Some(0) {
+                    miv_startup::Outcome::Ok
+                } else {
+                    miv_startup::Outcome::Error
+                });
+                finish_logs();
+                test_script::exit_after_run_native();
+            }
+        },
+        run_native_failure::NativeExit,
+    )
 }
 
 /// `--window-size WxH` 引数をパース（例: `--window-size 1400x860`）。
@@ -2160,6 +2204,8 @@ fn cli_flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "--data-dir"
+            | "--gpu-backend"
+            | "--gpu-test-fail-device"
             | "--test-script"
             | "--settings-override"
             | "--window-size"
@@ -2176,6 +2222,14 @@ fn cli_flag_takes_value(flag: &str) -> bool {
             // ここに登録しないと、続く <ver> が startup パスとして開かれてしまう (Codex P3)。
             | "--whatsnew-from"
     )
+}
+
+fn configure_root_gpu_descriptor(
+    descriptor: &mut wgpu::InstanceDescriptor,
+    request: wgpu_backend_policy::GpuBackendRequest,
+) {
+    descriptor.backends = request.backends();
+    descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
 }
 
 /// メインウィンドウの最小 inner サイズ (論理ポイント)。これ以下ではアドレスバーの
@@ -2210,6 +2264,40 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn gpu_startup_root_descriptor_uses_requested_api_and_fxc() {
+        use wgpu_backend_policy::GpuBackendRequest as Request;
+        for request in [Request::Auto, Request::Dx12, Request::Vulkan] {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            configure_root_gpu_descriptor(&mut descriptor, request);
+            assert_eq!(descriptor.backends, request.backends());
+            assert!(matches!(
+                descriptor.backend_options.dx12.shader_compiler,
+                wgpu::Dx12Compiler::Fxc
+            ));
+        }
+    }
+
+    #[test]
+    fn gpu_startup_values_never_become_core_open_paths() {
+        for flag in ["--gpu-backend", "--gpu-test-fail-device"] {
+            for value in ["auto", "dx12", "vulkan"] {
+                let args = os_args(&["core.exe", flag, value]);
+                assert_eq!(parse_startup_open_path_arg_from(&args), None);
+                let args = os_args(&["core.exe", flag, value, "C:\\images"]);
+                assert_eq!(
+                    parse_startup_open_path_arg_from(&args),
+                    Some(PathBuf::from("C:\\images"))
+                );
+                let args = os_args(&["core.exe", flag, value, "--", "--book"]);
+                assert_eq!(
+                    parse_startup_open_path_arg_from(&args),
+                    Some(PathBuf::from("--book"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn panic_and_watchdog_direct_log_remains_independent_of_full_stalled_writer() {
@@ -2343,3 +2431,13 @@ pub use ui_dialogs::preferences::{
 pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
 
 pub(crate) mod archive_visibility;
+
+pub mod same_name_folder_book;
+
+pub use ui_dialogs::preferences::draw_same_name_folder_book_settings_snapshot_fixture;
+
+mod ui_image_folder_zip;
+pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;
+
+pub mod avif_decoder;
+pub mod image_decode;

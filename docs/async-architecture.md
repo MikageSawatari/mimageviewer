@@ -1,9 +1,196 @@
 # 非同期・並列アーキテクチャ
 
+## 本の列生成の共通境界（§1.242 G1）
+
+`app/book_materialization`は既存のsource準備結果からZIP/PDF/EPUB/folder行を投影する。
+folder rating lookupは従来の準備worker経路を保ち、新しい列挙・待機・UI-thread I/Oは追加しない。
+cached documentの早期adoption、password/EPUB取消、policy/generationによるstale reply拒否は
+既存request ownerが担う。raw ZIP manifestと採用済みpolicyの表示列を混同しない。
+
+完成itemsと`ProjectionRecipe`を同じ採用境界で公開し、以後は同じViewerContextBundleで所有する。
+構成投影の回転入力は同じworkerで新itemsのindexへ準備する。UI採用はidentityでlive回転を移し、
+新items・回転・binding・着地・facetを揃えてからpending targetの提示許可を生成する。
+採用済みのページキー別回転入力はmemoのcold時にも使い、同期DB fallbackを構成表示へ持ち込まない。
+回転失効は既存projection準備へ戻し、準備中の旧入力をlive memoへ書き戻さない。
+固定snapshotは元一覧と固定一覧それぞれのrecipeを保存し、子の物理本を離れた復帰で対応する
+保存列と同時に戻す。Smart rootも既存準備済みrootの復帰境界でExtractedResultを採用する。
+read-only mount/fork/closeから兄弟のgeneration/queue/cancel/cacheを変更しない。
+A2のmode切替は既存表示owner内のsession操作であり、新しいworker/store/失効通知は持たない。
+連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
+元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
+一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
+検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
+Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+
+
+
 「どの処理がどのスレッド/プロセスで走るか」「どうやってキャンセルするか」「キャッシュ競合をどう避けるか」
 の一覧。並列処理を追加・変更するときの設計テンプレートとして使う。
 
 ---
+
+## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）
+
+§1.165 B1（2026-10-21、実装・自動検証済み・独立レビュー受入可・ClaudeCode の隔離環境で実アプリ確認済み、利用者の実機確認は未）は編集 preview の既存 worker が
+切り出し前 raster と実 `pixel_bounds` から生成由来を作り、WebP 参照と同じ DB upsert で保存する。
+released v6 の nullable coverage migration では旧行を保持する。crop DB の更新と preview Delete
+の間を新しい待機や共有 transaction で同期させず、preview 自身の generation-time metadata を
+thumbnail 応答／CPU 下地／既存 paint・presentation resource に継承する。
+PDF page-box は既知の cache 値を coverage と独立の nullable layout 列へ同時保存し、preview hit
+から復元する。通常画像／旧行は `None`。早期 preview のために追加の PDF IPC／待機は入れない。
+読み込み側は現在 crop から範囲を再構成せず、旧 Unknown の表示可否だけを共通 typed policy で解く。
+metadata は nullable `metadata_content_hash` により対応する WebP 生成物へ束縛する。
+worker は cached_path の hash が不一致／束縛なしなら Unknown／layout None として読み、
+旧 writer が新列を残して画像を上書きしても古い由来を採用しない。UI thread に I/O を追加しない。
+thumbnailのworker受理では、source寸法・coverageと共通GPU clamp規則から不変の表示基準を
+確定しLoadedへ保持する。派生workerのpending／結果、CPU下地、通過素材も実入力ownerの
+`MaterialDisplayBasis` を継承する。selectorは素材のまま返し、保持後の退去でidxから寸法を
+引き直さない。現在cropのUnknown利用許可は選択時に判定し、受理値へ固定しない。
+旧catalog行の通常thumbnailでsource寸法が省略されている場合は、指定倍率も既存のsampler契約で
+受理する。RAW旧行は受理済みRawInfoを使い、thumbnail先着時もRawInfo／preview受理境界で
+live descriptorを再受理する。PDFと共通のpublish処理で、その変更に依存する通過素材だけを退役する。
+
+snapshot capture・保持・再描画も同じ resource と由来を保持する。mount／park／promote の所有移譲、
+context の要求世代／取消／channel、兄弟 context の cache は既存 owner のままである。
+追加の idx map、全 context reset、失効 ACK 待機、専用 worker は作らない。まれな DB／保存失敗は
+既定の割り切り（ログ＋既存通知・単純な作り直し）とする。幾何・互換契約は
+[表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ) を参照。
+
+画像producerと通常GPU prepareの実行配置は従来どおりで、演出用workerや待機queueを作らない。
+安定viewでは既存bindと共有するview比較と通常cache keyでNativeの需要一致を確認して出力を再利用する。
+品質publication後の新sourceのresampleは従来どおりthaw後に始め、view/key変更時は通常prepareへ進む。
+需要は保持transform・寸法で導出し、source再pinや追加の待機状態を作らない（plan §27.11.1）。
+source不在でも同じview/key/coverage判定を通し、不成立は既存thumbnail/loadingへ戻す。
+元画像等の表示modeも通常selectorと共有し、候補切れは既存no_page退役で終える（plan §27.11.4）。
+resident-only acceptの一時Normal入力leaseは、通常prepareの生成・submit後に描画素材へ置き換える。
+Native素材は`Arc<LanczosOutput>`の登録leaseだけを保持し、source handle/CPU pixelsを演出durationへ持ち越さない。
+source自体を描くManagedは実ハンドルとmip policyを保持する。native IDだけの寿命代用はしない。
+同じ素材をFlat/Turning/Completingと採用済みready/navigatorへ渡し、in-flight paint callbackが最終batchまで保持する。
+receiptは実提出unitの内容bindingを値で持ち、遅延readyの内容変更をsource cacheに依存せず拒否する。
+ON由来のOFF-Completingも同じ素材handoffを維持し、通常OFFではbinding snapshotを作らない。
+取消/close/入力supersessionは既存contextの状態を退役させ、残るbatchのleaseだけが最後に解放される。
+通常resident会計はcontext registryのmounted/at-rest/parked cacheを共通walkerで読むため、
+presentationからsource参照を外しても兄弟の通常source会計は消えない。共有TextureIdは全体で重複排除する。
+D2単独では通常OFF fast pathとaccepted_at clockを維持した。次版D4はONのTurning内だけを
+AwaitingAcceptedOutput / Runningへ分離し、operation固有submission ledgerから初回採用curlの時刻を一回渡す。
+output hookはoperation/destinationと既存終端を照合し、取消/close後に開始を復活させない。
+準備待ち、専用tick/worker/queue、UI同期I/Oは追加しない。OFF・slideshow等の既存timerを維持する。
+素材所有は[page-turn計画 §27.11](page-turn-animation-plan.md)、時計と検証は同§27.12を正本とする。
+
+D3-1（2026-10-18）は既存 final-effect の receiver と context-local cache のまま、
+`collect_final_prepare_results` と `adopt_final_prepare_results_before_lookup` に分離する。
+採用可能な既存結果は呼出し内の一時 Vec で移譲し、未 admit の legacy rendition 仕事は元の receiver に残す。
+この段階では新しい CpuReady owner・permit・容量予約・投機 worker は作らなかった。
+
+D3-2 は同じ pending を `Computing | CpuReady` に拡張する。新 D3 の worker は App 共通の
+実行 permit（1件）と出力予約（context 1 unit／全体2 unit／1GiB）を同時に取得してから開始する。
+取消・receiver 除去・同期 takeover でも permit は実終了まで保持し、出力予約は channel と結果へ追随する。
+返却は同じ資源 owner に登録した既存 service 宛先を非 blocking repaint で起こす。新しい要求 queue や heartbeat はない。
+CPU-ready の採用は selector を呼ばず、要求時 identity と世代を照合して既存 final cache へ move する。
+既存 legacy 表示/先読みの要求範囲と通常登録は維持し、これらを含む全 CPU 仕事が1件になるとは主張しない。
+park は開始済み final-effect を保持し、新しい D3 開始を止める。詳細は [D3計画](page-turn-animation-plan.md) §27.17.13。
+入力・permission の再開・実表示復帰は selector 非依存の共通 service を通るが、単なる context mount は通さない。
+app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
+通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。
+
+D3-4(b) の Native 候補は既存 App 共通 frame owner に当該 pass の値だけを置く。
+最終 hook は全 live Next final登録→Next Native→全Next成立を再照合し、成立後だけPreviousの登録/Native/
+resident-only CPU開始へ進む（§1.405の限定拡張）。同じ canonical 入力を再照合してから
+非生成 query・全 pool の出力＋一時 allocation 会計・backing 再検査・直前 claim の順で進む。
+renderer lock を context 訪問／会計へ持ち越さず、通常 `fs_lanczos_cache`／submit／Native lease を使う。
+park／mount／fork の新しい非同期 owner は作らず、cold metadata 準備も追加しない。
+
+D3-5整理（2026-10-19）: Native canonical の完全性・位置検索は既存 installed topology の証拠／索引を使い、
+未採用なら skip する。slideshow の nav/unit 列も収集・再照合から再構築しない。最新 callback の値は
+既存 frame owner に置き、最終 hook の処理後に消費する。別 cache owner／queue／heartbeat は作らない。
+source／AI の既存先読み要求範囲と producer は維持する。D3-3 の編集入力・comic CPU-only 化は
+次の版の後の [backlog §1.401](next-release-backlog.md) へ延期し、通常表示要求の従来経路は保持する。
+横断監査と計測／未確認事項の正本は [page-turn 計画 §27.17.17](page-turn-animation-plan.md)。
+CPU 需要用の従来 resolver に残っていた全頁走査・mixed slideshow 列再構築も、D3-5 で同じ既存
+`SpreadDisplayUnitsCache` 内の派生 record へ移す。cold だけ導出し、warm は scalar／Arc identity と索引で読む。
+共通adoption／producer／keepのprefixで同pass採用し、ROOT直接採用も覆う。visible token／units／証拠は変更せず、
+同じ枝は既存索引を参照し、異なる枝だけ完全recordを持つ。forkのfresh owner、mount／park／promoteの移譲は維持する。
+
+## 音楽タイムラインのベース計算（鍵盤設計 §13）
+
+`run_music_analysis` はデコード成功と取消なしを確認し、必要な `TimelineComplete` の送信後に
+独立したベース計算を始める。LRUヒットでも実行し、失敗／取消時の `MusicPcm::mark_complete`
+を成功の印には使わない。スコープ付きスレッドは最大 `min(4, available_parallelism)` 本、
+Windowsでは `THREAD_PRIORITY_BELOW_NORMAL`。atomicの次区間番号を取得し、20秒ごとの区間に
+58フレームの助走を付け、各推論フレームで既存の取消トークンを確認する。
+
+区間workerは番号と区間の値だけをmpscで持ち主へ返す。持ち主が `TimelineBassTrack` へ結合して
+計算済みの印を立て、全体のimmutable snapshotを `MusicAnalysisMsg::Bass` で公開する唯一の
+公開者になる。送信間隔は最短250ms、最後の区間は必ず公開する。大きな配列のcloneは持ち主の
+workerでのみ行う。UIはsource一致の内側で1 drainの最新Bassだけを採用し、Timelineと共通の
+`music_analysis_version` を1回進める。row raster要求はBassのArcも共有し、計算済みbinだけで
+リズム区間の投票を行う。未計算binの色は既定値のまま。結果と同じ票をtextureへ持たせ、
+tooltipはその表示中textureの票を参照する。旧snapshotをUIで複製したり投票し直したりしない。
+
+曲／適用済み音声トラックの変更・closeではBassを破棄し、park／復帰は同じsourceの状態を保持する。
+スレッド生成のまれな失敗はログを残し、生成できた本数で続ける。再試行や回復機構は追加しない。
+ベース結果のLRU保存も行わない。
+
+## 実Folderの自動観測（§1.375 R10）
+
+前回走査の行記録、watch購読、dirty／cutoff、ExternalRescanPending、一覧復帰時の
+FolderRefreshRequestは既存viewer bundleに属する。OS購読の登録と登録後の確認scan、
+行投影・利用可能な精度のstamp取得・比較は既存rescan workerで実行する。
+Equal応答は軽い行記録と観測値だけを返し、不要な走査・準備済み一覧はworkerで破棄する。
+UIはowner／source／generation／投影条件／記録revision／購読epochを確認し、受理した
+cutoffまでだけをackする。走査中に届いた後続通知は元ownerのdirtyと既存restartへ残す。
+mainのpark／mountでは元購読と要求を保持する。C1追補ではfork先は記録だけを共有し、
+独立readerの受動購読は開始しない。元mainの購読・dirtyは維持する。
+旧記録の大きなpayloadは既存retirement workerへ渡す。
+
+2026-10-15の[C1追補](detached-snapshot-reader-plan.md)により、受動観測資格はregistryのmain identityと
+採用済みProjectionRecipeから決める。非main readerはpromote時にwatch／受動scanを退役し、
+再mount／Resumed／restartでも復活させない。検索UIを閉じてもExtractedResultのitemsを物理scanで上書きしない。
+能動Operation（整理・export・Delete）／BookAppend系の由来は既存causeで保持し、
+旧購読proof付きscanは既存holdへ戻す。通常linkedの観測・最初のpromoteは維持する。
+
+Differentは走査済み入力とworker準備済み投影を既存load／hydrationへ渡す。
+自動originをdefer／restart／Resumedでも維持し、sidecar取込を行わない。
+page identityと通常のDB hydrationは継続し、全体設定を一時変更しない。
+Stackの二度目のhydrationには既存GroupingSourceとInternalHydrationで同じ取込policyを渡し、
+既消費のcursor／Append receipt／local searchを再適用しない。
+明示GridReload／通常openでは設定どおりsidecarを取り込む。
+operation IDの自己通知照合、代表保持、cache形式変更、新しいpending ownerは追加しない。
+自己Delete時のStack member／対応表と保持aggregateの準備も既存delete workerに属する。
+purge lease解放後にStack candidateを読み、同じ削除終端でowner／世代／元view Arcを照合して
+表示行除去と同時に受理する。背景Stack採用とclose reconcileはこの既存modalの終端まで延期する。
+共有された兄弟view Arcは変更せず、UIの全件clone・sort・同期I/Oは増やさない。
+初回Stack分類の入力変更では、元のtyped pendingの所有資格を確認して取消・workerへ退役させる。
+通常Folderは観測不明から既存rescanで再準備し、サブ展開は現在行とsnapshot／tombstoneから
+元のhydration intentを持つ既存分類入口へ戻す。成功ゼロは元要求を保持する。
+詳細は [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md)。
+
+## EffeTuneのタスクバー設定・通常矩形（§1.378、未リリース）
+
+Preferences OKと起動時は`effetune-host-control`へ設定を配送するだけで、UIはIPCを送信しない。
+workerの一つの最新targetをRegisterBridgeで将来attachへ継承し、作成済みframeは同じhost GUI threadで
+通常caption/exstyleを保ったままITaskbarListへAddTab/DeleteTabする。正当な表示/復元と
+TaskbarButtonCreatedも同じGUI threadで現在の設定を適用する。
+再attach、新しいvisibility owner、minimized bool、復帰queueは追加しない。
+Shell Restoreも既存GuiVisibility permitを通し、Closeとtaskbar OFF時の最小化はuser-hideでDSPを維持する。
+通常配置のwriterもhost GUI threadであり、WINDOWPLACEMENTをscreen物理pxに正規化した
+immutable snapshotを初回attach・移動/resize完了・最小化前・Hide前に公開する。
+native Closeは同じ通知にframe identityと通常矩形を載せ、coreはbridge/slot/current HWNDを照合して
+矩形を適用してからuser-hidden処理を行う。checked Hideは通常矩形の公開後にACKを返す。
+音響調整の全保存callerはFIFOの完成通知をdrainしてsnapshotを読むだけで、同期geometry取得や完了待機をしない。
+pluginへのサイズ通知もhost GUI threadの通常client確認入口が所有する。iconic中は復元配置だけを更新し、
+child layout/`onSize`/最終寸法を更新しない。SW_SHOWNAの再表示/Remote復帰はiconicを維持し得るため、
+明示Restore/通常WM_SIZEでallocationが確定してから通知する。hidden normalの初回attachは維持する。
+protocol v7のhello/readyで旧v6を拒否し、source identityとは独立にdebug buildでも互換性を検査する。
+一般VSTの矩形保存、owner、custom chromeは維持する。まれな失敗はログ＋通知、前の有効値を保持し、retryを追加しない。
+設計・実装台帳は[音響調整計画 §17](effetune-integration-plan.md)を参照。
+
+2026-10-13の利用者決定で、音響調整ボタンは表示・前面化だけを行う（計画§17.12）。
+mouse/keyboardとも既存host-control workerへManual Showを配送し、host GUI threadが表示/復元/activateする。
+前面判定・ClickForeground入力捕捉・ボタン専用Hide/pending_hideは撤去し、UIは可視結果やIPC完了を待たない。
+main subclassはmainの表示・最小化を既存GuiGateへ配送するだけにする。入力hookやvendor注釈はない。
+×/Shellのuser-hide通知と正常矩形snapshotは従来どおり採用し、Close由来のcapture_on_hideとDSPは維持する。
+ボタンの点灯はDSP EffectiveStateを示し、窓のvisibility ownerや開閉toggleにはしない。
 
 ## Everything の取得と共通Search採用（§1.374、未リリース）
 
@@ -204,7 +391,52 @@ recorderの既存終了時hash取消契約は変えない。shift UI callbackに
 捕捉rootをhard purgeへ登録する。lease中もroot操作を同一ownerのread/countと共有する待機FIFOへ
 受理して受付sequenceを進める。End/再読込後に順番に実行し、後続readは先行root操作の完了を待つ。
 正常exitの受付closeは保守/起動待ちの位相とleaseの終了送信経路を保持し、受理済依存をdrainする。
-root migrationは相対payload表記とdestination優先を維持する。ページ一枚の削除では親scopeを消さない。
+root migrationは相対payload表記を維持する。汎用改名はdestination優先、本の構造操作は
+要求の`PathMigrationCollision::SourceWins`により移行元優先とする（§1.272、下記）。
+ページ一枚の削除では親scopeを消さない。
+
+## 本の構造操作と path キーの移行（§1.272/§1.273、2026-10-21、関連自動検証済み）
+
+`app/book_structural_op::BookStructuralOp` が並べ替えの保存・別本転送・本の改名/削除の
+Requested/Runningと終端採用を所有する。待機中は UI frame で producer の静止を確認し、
+受理済みの完了から続く保存・記録は通常経路で完了させる。新規入力の拒否と Remote lease は
+受付側に置き、保存関数へ拒否条件を追加しない。producer 列挙と最終的な受付境界の記録は
+[本のキー移行計画 §8](book-key-migration-plan.md#8-実装記録) を正本とする。
+
+D2c（同計画 §3.10）の未採用 open は、全 context の既存 source/navigation owner と
+受付済み fullscreen 継続を一つの admission 判定へ集め、構造要求を理由付きで拒否する。
+同本・別本を区別せず、元の open が通常採用された後の再要求で進める。
+採用済み session の retained 再照合や、通常表示の permission・decoder 読取とは区別する。
+
+本のページ移動で scope 外へ出た構成参照・見開き基点は、本操作専用の service 要求が各 transaction 内で外す。
+汎用移動の Missing 保持とは要求で区別する。完了時の表示 cache 更新は既存 reload の対象 main に限り、
+独立別窓・Snapshot の items / accepted shift を直接作り直さず、cache を新キーへ付け替えない。
+既存の通知による旧 path の再照合は従来どおり残る（同計画 §3.10）。
+
+静止の `book_structural_writers_busy` は副作用を持たない。UI frame の明示 poll が parked を含む
+受理済み XMP 読込結果を回収し、App 共通の `XmpRatingHydration` worker へ DB 処理を渡す。
+未評価行だけを transaction で補充し、明示評価・クリアとの競合は path ごとの取消票と既存の
+rating 世代で照合する。同じ取消票を XMP 読込受付から DB 完了・UI 採用まで持ち、
+通常削除・本削除・追加 Undo・明示整理は purge 前に対象票を失効する。
+削除 purge journal の再実行は受付済み票の snapshot を worker へ渡し、既存の孤児判定後に対象だけを失効する。
+遅い読込は新しい票で再投入せず、取消済み import は DB transaction 内・UI 採用の両方で無作用となる。
+有効な import は DB 完了だけでなく UI 採用まで静止条件に含める。
+汎用改名・sidecar 復元は従来の狭い writer 条件を維持し、この新しい DB writer だけを追加する。
+
+既存の製本 worker が FS 確定後に EPUB 範囲 → shift → composition の保守 lease を取り、
+`rename_key_migration::migrate_book_paths_at` を呼ぶ。`STORES` の `book_policy` が
+Follow・編集preview所有・service所有を宣言し、同一ストアを UI と worker の両方から移さない。
+Follow は一つの transaction 内で全移行元を一時キーへ退避し、移行先の exact・`/`・`::` の
+3 面を消してから最終キーへ移す。コピーは移動後のキーから従来の編集・★・タグ8種だけを写し、
+写さないストアもコピー先を初期化する。resume identity・pin source_rel・ratings source_path は
+その transaction で、preview のファイル配置と JSON 内 path はpreviewモジュールで更新する。
+本削除は FS 前から持つ既存 guarded purge lease を通して同じ `STORES` を消す。
+
+bookmark は既存 journal、shift/composition は各 service FIFO、collections は既存参照移行へ
+完了採用から送る。UI の記憶内 presence/cache は DB を読まず付け替え・失効し、再準備へ戻す。
+汎用改名と内容同一性復元の移行先優先は維持する。汎用改名のpreviewファイル配置は今回の対象外。
+まれな失敗はログ＋通知で扱い、ストア完了印・自動再実行・新しいスキーマを追加しない。
+この節はコードの実装方針の記録であり、自動検証・独立完了レビュー・実機確認の成功を表さない。
 
 
 §1.241 Phase A: `crates/startup-diagnostics` の常時timelineはlauncher/coreの共通QPC基準と
@@ -242,6 +474,13 @@ active値は従来の`settings.facet_filter`で、設定・履歴DBのschema/key
 採用後に既存sidecar continuationを開始し、復元後にselection、startup intent、folder/ZIPの
 first-displayとdeferred fullscreenを仕上げる。sidecarのwarning/resumeでも履歴/facetを再採用しない。
 新items世代を検証するhydration ownerと、採用前のsource proofは目的が異なる。
+after-hydration のフルスクリーン再オープン予約（DFS の fullscreen 継続／RequiredFullscreen）も
+sidecar continuation が所有し、待機述語は current context・世代・source・live/cancel・items数を
+照合してその所有者から答える。任意の deferred page open に必要な旧 holdover の所有ゲートとは
+分け、true close は予約だけを消費して一覧の hydration を継続する。
+`56c11e621`（v4.5.0）で再オープンを採用直後から hydration 後へ移した際、この予約が待機判定から
+漏れたため、v4.7.0 で PDF 間 Ctrl+↑↓ の viewport hide／ちらつきが報告された。
+再オープンの時点は戻さず、ZIP・変換 cache を含む共通 continuation の待機と取消を補う。
 row依存要求は既存items世代・revision証明を維持し、Smartのsurface leaseは同じownerの
 PDF verification/Collection revision更新を許す。別context/path/同ID再openは許さない。
 ブックマークのresolver/書庫要求はnative request IDとreturn targetを証明に使い、同じ要求中の
@@ -437,10 +676,12 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | 旧 runtime / EffeTune 世代清掃 | `std::thread` (`runtime-cleanup`、短命) | 起動ごとに最大1本、portable／App単体testでは生成しない | core のstartup完了かつ初回egui frame後、UIはdata-dirと固定bundle pathを渡すだけ。workerが他SemVer版／inactive世代をcanonical confinement・全tree reparse検査後にbest-effort削除する。workerでprocess画像を一度だけ列挙し、候補内の実行中画像／同版別coreによる旧世代を保守的に保持する。全cooperative lockを削除しないruntime/.locksの永久fileに置く。候補の使用中lockをexclusiveで一度だけ非blocking取得し、版の抽出／公開lockも削除完了まで保持する。coreはexe所属版のshared leaseをrun入口から保持し、世代解決とpinはegui構築前／既存retry workerで実行。旧publisher互換lockも外側publisherの後で併用する。launcherは版directory作成前にshared leaseを取り、保持したままcoreの引き渡しeventまたは終了をOS waitし、core側は待たない。未確定reader／未知layout／current異常／busyは清掃を見送る。失敗はlogのみ、次回起動へ回す。清掃のtimer・retry loop・UI通知・終了joinは無い。詳細は[配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01) |
 | 合成ビューの pin 資産更新 (§1.313) | `std::thread` + 既存 `metadata_import_refresh::run` | viewer context ごとに最新要求 1 件 | `CurrentViewRefresh::Pins` が変更コンテナ／動画集合を所有。同一 items generation の先行範囲を統合し、FS metadata・cascade DB・catalog DELETE・video pin read／seed write を既存 metadata worker 内で完了し、live cache を変更せず private map を準備する。完了は egui を起こし、mounted context／generation と cache／catalog／policy identity が一致する結果だけを既存 metadata-pin 適用へ渡す。UI terminal は DB handle を持たず準備済みメモリだけを採用する。無関係な Loaded 資産を保持し、token 交換時は変更／未完了動画の producer を再開する。置換・世代切替・retired context・App drop で cancel。同世代の metadata import が pin materialization を置き換える場合も、準備済み対象要求を確定して旧 context owner を取消してから successor worker を開始する。取消する unpin の可視 container keys は既存の無効化対象集合へ引き継ぐ。pin 以外の import や対象外 context は退役させない。詳細は [pin-reload-audit.md](pin-reload-audit.md) |
 | Windows file clipboard cut 観測 | message-only window STA (`cut-clipboard-listener`) + OLE reader STA (`cut-clipboard-reader`) | process ごとに各 1 | production install は UI を待たず `Starting` を返し、同じ backend generation の reader / listener `Ready` が揃った時だけ `Running` にする。起動中の通知・読取結果は順序を保って後から適用し、失敗時は `Disabled` へ収束する。listener は `WM_CLIPBOARDUPDATE` を sequence と単調 request serialで latest slotへ発行するだけで、OLE/clipboard I/Oを行わない。readerが `IDataObject` を自thread内で読み、path正規化と不変集合構築を完了してApp-global reducerへ返す。sequence変更時は旧表示をPendingへ失効し、競合中だけ上限付きbackoffで再取得する。SetData完了もprivate tokenで同じreducerへ入りrepaintを要求する。終了時はlistenerを解除・joinし、起動中または外部COM内で停止不能なthreadは無条件joinしない。testの既定backendはinertで、実clipboard/HWNDを作らない |
+| 類似索引の検索配列 | `std::thread` (`similar-array-owner`) + 一つの state mutex / Condvar、要求ごとの ack channel | 有効 manager の固定 data_dir ごとに1本、未要求時はI/Oなしで休眠 | base load/rebuild/compaction/replace・snapshot/revision採用・history pruneを直列実行。後着refreshをpendingへ保持し、公開→到達ack→永続base cutoffまでprune。root/除外/passwordの変更でloadを捨てない。UIはensure/状態読取/close通知のみ。Faultedは公開済み配列を保持し再起動を案内、closeはUIでjoinしない。詳しくは[所有計画・検証記録](similar-index-array-owner-plan.md#16-実装記録) |
 | 類似候補の長押し画像準備 | `std::thread` (`similar-preview`) + request専用mpsc/cancel | viewer ownerごとに実行中1件（取消drainを含む）＋最新待機1件 | `SimilarPanelState.preview` が要求・表示gesture・assetを所有し、既存viewer bundleと交換する。workerは毎pressのsource stamp確認と必要時の通常画像/ZIP/PDF decodeを行う。release/focus lossは表示だけを終了し、同じ要求の有効な遅延完了は隠れたcacheとして受ける。source/page/session変更やcloseは当該ownerを失効し、取消中に次workerを重ねない。ROOT updateがmounted/AtRest双方の終端をpollし、worker完了がROOTを一度起こす。UIはDB/ファイル待ちやdecodeを行わない。R4段階検証の現況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
 | サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。起動時に設定された PDFium pool の並列度を活かすためここに置く) |
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile の全体走査 (本物の同期 I/O。`fs::read_dir` 再帰探索 / ZIP セントラルディレクトリ読み込みなどメインプロセス内ブロッキング) |
 | 製本並べ替えサムネイル | `std::thread` + mpsc | 最大 4 in-flight | 本の並べ替え専用ビューの焼き込み済みページを小サムネとして先行 decode。通常グリッドのキャッシュ/drag-out 経路とは分離し、UI 側は結果 backlog から `load_texture` を 1 フレーム 1 枚だけ実行する |
+| 本の構造操作 | 既存の短命製本 worker + mpsc、App の `BookStructuralOp` | process 内の構造操作は受理から採用まで最大 1 | FS 前に受理済み producer の完了を UI frame で静止させる。FS 確定後の STORES 移行・preview ファイル配置・削除 purge まで同じ worker が所有し、完了採用は記憶内の失効と既存 service FIFO への移行要求を行う。専用 retry/journal/常駐 worker は追加しない。詳細・検証結果・保留事項は [本のキー移行計画](book-key-migration-plan.md) §8 |
 | フルスクリーンロード | `std::thread` (使い捨て) | 1 枚ごとに spawn | フルサイズ画像デコード + アニメ展開 |
 | RAW 現像 | App 共有 `RawDevelopExecutor` | 設定 1〜10、既定 3 | High / Normal / Background の優先度付き LibRaw Full / half 現像。RAW fullscreen worker は ZIP/verified bytes を fs scheduler permit 内で解決し、permit を返してから Full の結果 channel を待つ。fs ticket の cancel flag は permit 解放後も executor job と共有し、executor ticket は context-owned `fs_pending` が保持して prefetch → displayed の High 昇格と cancel を行う。UI drop は queued job を取消し、実行中 native call は join しない |
 | 通常／perf log | `std::thread` (`log-writer`) | processごとに一つ | 全ファイルI/O・通常batch即flush・perf250ms flush、有界非blocking受付、drop summary、barrier／snapshot、終了合計2秒 |
@@ -501,7 +742,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | VST3 host bridge | **別プロセス** (`mimageviewer-vst3-host.exe`、C++) | ユーザー VST と音響調整で最大 2 本。配信開始で増えない | 1 process が 1 chain 全体を host する。App の `DspProcessingCoordinator` がローカル pump とリモート世代の process/reset/flush をブロック単位で排他する。bridge 内部は audio loop + GUI message pump + stdin pump。詳細は [docs/vst3-integration.md](vst3-integration.md) |
 | VST3 plugin GUI worker | bridge 内 per-slot STA thread (lazy) | editor を生成した slot ごと。表示した plugin 数まで増え得る | C++ bridge の plugin loader が slot ごとに STA message thread を lazy 生成し、bridge-owned editor surface と `IPlugView::attached()` を管理する。Rust 側に単一 `vst3-plugin-gui` thread はない |
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、**実消費サンプル数 (= `real_consumed`) 分のみ** `next_pts_secs` を進めて `AvClock::set_audio_pts` でマスタークロックを更新。silence 出力中 (= `real_consumed=0`) は pts 進行 skip。`!clock.is_playing()` (= 一時停止 / EOF) と `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) は早期 return。`AvClock::set_audio_pts` 側に defensive wall-rate cap (= `wall_dt + 5ms` で pts 進行を頭打ち) を保持し、buffer 非空 pre-fill burst の異常前進への保険にしている (Phase 9 後の cleanup refactor、詳細は [docs/video-engine-redesign.md](video-engine-redesign.md) の「Phase 9 後の Post-cleanup refactor」節) |
-| 起動 / activation パス解決 | `std::thread` (`startup-open-resolve`) | 起動引数 / 2 重起動 activation ごとに最大 1 本 | `resolve_openable_path_detailed` (`Path::is_dir` / `is_file` + 親探索) を UI スレッド外で実行する。400ms 以上未完了ならメインウィンドウに「パスを確認しています…」toast を出し、完了後だけ UI スレッドで既存の `load_folder_or_convert_archive...` に戻す。新しい activation または Remote 取得時には旧 pending を終了し、古い結果は適用しない。Remote が操作権を持つ間の二重起動パスはログ・toast とともに拒否して返却後へ持ち越さない |
+| 起動 / activation パス解決 | `std::thread` (`startup-open-resolve`) | 起動引数 / 2 重起動 activation ごとに最大 1 本 | `resolve_openable_path_detailed` (`Path::is_dir` / `is_file` + 親探索) を UI スレッド外で実行する。400ms 以上未完了ならメインウィンドウに「パスを確認しています…」toast を出し、完了後だけ UI スレッドで既存の `load_folder_or_convert_archive...` に戻す。明示 activation としおり行は共通の main 受付で先行の未採用要求を退役し、分類・走査・resolver の完了は継続として扱う（§1.419）。snapshot 中の activation は範囲判定まで先行要求を保留し、その間に開始した BookmarkRow 継続の resolver も同じ held 側へ置く。範囲内なら受付して load、拒否なら同じ receiver を再開し、しおりの各時計へ min(保留時間, その時計の経過時間) を補償する。独立 detached context のページ・動画待ちは取消しない。Remote 取得時は既存の旧 pending 終了を保ち、操作権を持つ間の二重起動パスはログ・toast とともに拒否して返却後へ持ち越さない |
 | RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。閲覧RARのscanはsecretなしのheaderが後続巻と示したら`Rejected`で先頭ファイルを案内する。許可された先頭巻／単巻は`ArchiveScanOutcome::Direct` / `CachedZip` / `NeedsConversion`のどれか一つを返し、password後の0画像・入れ子なしも案内付き`Rejected`とする。UI側のclicked-volume cache lookup／`fallback_cached_zip`は持たず、Directに確定したRAR backingを履歴のZip-kind prepareでcacheへ再振替しない。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmark、Remote 取得も同じ規約で古いworkerとlate resultを無効化する。Remote 取得では閲覧を開く completion だけを終了し、閲覧を開かない sibling ZIP の出力は続ける。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
 | EPUB → PDF 変換 (S2a、呼出元は S2b) | 背景 worker + 子プロセス + Job Object + mpsc | 変換 1 冊につき子プロセス 1 本 | `epub_convert` が書き込み排除した元ファイルから一時コピーを作る。子を suspended で生成し `KILL_ON_JOB_CLOSE` の Job に割り当ててから再開する。stdout の JSON 進捗は channel へ、stderr は別スレッドでログへ流す。cancel event または timeout で Job を停止し、一時フォルダと `.part` を回収する。公開前の PDF 検証器は必須注入で、S2b 接続時に PDFium を使う。成功時の世代ファイルは不変で、廃止分と未完了予約だけを `epub_cache` の次回起動ゲートで掃除し、完了予約行を削除する。ファイル削除は root と各親ディレクトリを再解析ポイントを辿らずに開いて確認した後、対象ハンドルから行う |
 | フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 全候補を UI 側で `Pending` 登録するが、worker へは visible + keep + その item の pin 依存先だけを渡す。RAR は volume header 解決 → cache DB peek → miss 時だけ full inspection の順。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知ごとに `items_generation` を照合する。range 移動時は共有 scope を差し替え、既に開始済みの 1 冊だけを完了可として旧 range の queued 候補を skip する。現 batch 終了後に新 range の未解決候補を追加する。folder 切替・再読込・drop は cancel token を立てる。rollup edit filter 時だけ folder 全体 scope。batch 完了時は `nav/archive_cache_peek`、各候補は `nav/archive_cache_candidate` を記録する |
@@ -509,9 +750,9 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | 物理フォルダ open 事前走査 | `std::thread` + mpsc | viewer context ごとに最大 1 | フォルダペイン / detached open と、お気に入り表示状態の OFF・リセットでカテゴリ順または一覧ソートが変わった通常フォルダの再構築に使う。`FolderOpenScanPurpose` が用途を型で所有し、後者は path と並び設定 snapshot が現在値に一致するときだけ pre-scan 付きロードへ戻す。別 navigation / 後続要求は同じ pending を cancel するため、UI スレッドで `read_dir` / metadata scan を追加しない |
 | メディア前後送り候補の存在確認 | 常駐 `std::thread` (`media-nav-resolver`) + mpsc mailbox | App-global 0 or 1 (初回要求時に lazy 起動) | EOF / 手動前後送り時、UI が bundle items から抽出した方向付き候補列の実ファイルだけを `Path::exists` で順次検証する。worker は受信時に mailbox を drain して最新 request だけを処理し、キャンセル不能な `Path::exists` 中の新要求も同じ 1 thread に滞留させる。結果は単調増加 request id が最新 pending と一致する場合だけ検討し、`items_generation` / owner window / 開始時 `fullscreen_idx` を context-local stale 条件とする。App-global `input_seq` の一致は owner なしの mounted context だけで要求し、ParkedLive では無関係な main 入力を stale 理由にしない。owner 不一致中は結果を受信せず保留する。EOF action を stale / superseded / context close・load / resolver 切断 / apply 拒否のいずれかで捨てる場合は、対応する `(fs_idx, seek_serial)` と現在値が一致するときだけ video / 動画音声モード / music 共通 dedup latch を解除して次 tick の再試行を許す。ZIP/PDF 仮想 entry は I/O せず候補に残す。App drop で request sender が drop され、in-flight I/O が戻った後に receiver disconnect で自然終了する (終了時 join なし)。 |
 | ファイル名スタック分類 | `std::thread` (`stack-script`) + mpsc | スタックモード ON かつスクリプト有効時、フォルダ読込ごとに最大 1 本 | ユーザー定義 Rhai スクリプト ([`filename_stack_script`](../src/filename_stack_script.rs)) でフォルダ内画像のグループキーを算出する。重くなり得る (実測 10 万件 ~1 秒) ので UI スレッドから外す。通常フォルダを先に表示し、完了後 `poll_stack_script` が `start_loading_items` 経由で集約ビューへ差し替える。`StackScriptPending` の cancel + folder 一致で stale 判定、別フォルダ移動 / スタック OFF / 再ロードで cancel、失敗は組み込み既定へフォールバック。組み込み既定 (separator) ルールは軽量なので同期構築のまま。詳細 [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
-| 音楽ビュー解析 | `std::thread` (`miv-music-analysis`) + mpsc | 音楽ビューを開くごとに最大 1 本 | `run_music_analysis` が FFmpeg 全尺 decode + `analyze_stereo_timeline` を**全て UI スレッド外**で行う (Inc 3b)。**永続 DB (`audio_analysis.db`) はやめ in-memory LRU に置換 (2026-07-03)**: 結果は UI スレッドが `music_analysis_lru` (直近 N 曲、path+stream index+size+mtime キー) に保持し、`ensure_music_analysis` が `image_metas` の (mtime,size) で LRU を楽観的に lookup (UI スレッド stat しない) してヒットならタイムラインを即セット + ワーカーを `want_analysis=false` で起動、miss なら `want_analysis=true`。ワーカーは DB は触らないが背景で実ファイルを **fresh stat** し、ヒットに使った `hit_meta` と食い違えば (外部更新) 解析し直す + LRU 挿入キーに検証済み (mtime,size) を返す (`TimelineComplete{analysis,meta}`、image_metas スナップショットが stale でも正しい key)。**Inc 4**: 同ワーカーが spectrum 用に全尺 PCM も**1 回だけ**デコードし (timeline と共有)、`MusicAnalysisMsg::{Timeline(progressive 部分), TimelineComplete(全尺確定=LRU 挿入), Pcm, Probe}` を送る。`poll_music_analysis` が届いた分を Disconnected まで drain (pending は取り出して末尾で戻す)、pending 中は `request_repaint_after(50ms)`。新ファイル / `close_fullscreen` で cancel。decode ループは cancel を確認するが post-decode の解析パスは単一 pass で cancel 不可 (支配的コストの decode はキャンセル可)。**progressive spectrum PCM (2026-07-07)**: `Pcm` は**デコード開始前**に空の共有バッファ (`Arc<MusicPcm>` = `RwLock<Vec<f32>>` 追記式) として送り、デコードは新 API `audio_decode::decode_audio_file_progressive` (差分 `on_delta` を渡す) で回して差分を `append` (write)。timeline partial / 最終確定は同じ共有バッファのプレフィックス (`with_prefix` = read ロック下解析) から作る。これで下段スペクトラムが全尺デコード完了を待たず出る (§5.6)。**`RwLock`** なのは、長い解析 read (`with_prefix`) と spectrum の窓コピー read (`copy_window`) を並行させて spectrum を固まらせないため (`Mutex` だと解析中フリーズの実機 FB → RwLock で解消)。共通セットアップ `open_audio_decode` / partial スケジュール `PartialEmitSchedule` は既存 streaming decode と共有 |
+| 音楽ビュー解析 | `std::thread` (`miv-music-analysis`) + 区間worker最大4本 + mpsc | 音楽sourceにつき解析owner 1本、デコード後のみ区間並列 | `run_music_analysis` がFFmpeg progressive decode、取消可能な部分／確定timeline解析、独立Bass計算を全てUI外で行う。`TimelineComplete`のみをin-memory LRU（path+applied stream+size+mtime）へ保存し、UIの楽観ヒットはworkerのfresh statで検証する。PCMはデコード開始前に空の追記式 `Arc<MusicPcm>` を送り、以降appendする。`RwLock`のreadによりtimeline／Bassの長い読取とspectrumの短い窓コピーを並行できる。メッセージは `MusicAnalysisMsg::{Probe,Pcm,Timeline,TimelineComplete,Bass}`。デコード成功・取消なし→必要なTimelineComplete送信→最大 `min(4,available_parallelism)` 本のBELOW_NORMAL区間workerによるBass計算（LRUヒットでも実行）。各推論フレームで既存cancelを確認し、唯一の公開者である解析ownerが区間を結合し、全体snapshotを最短250ms間隔と完了時に公開する。UIは既存source一致内でdrainし最新Bassだけを採用、共有版数更新は1回。新source／closeでcancelとBass破棄、同じ音源のpark／復帰では保持。詳細は本書冒頭と鍵盤設計§13。 |
 | 音楽ビュー row raster | `std::thread` (`miv-music-timeline-raster`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`TimelineTextureCache`) | `TimelineAnalysis` から DJ 風波形タイムラインを **1 行 (row) ずつ** `egui::ColorImage` にラスタライズ。UI は request に `Arc<TimelineAnalysis>` を渡すだけ (行ウィンドウ切り出しは worker 側で zero-copy) で、結果は generation / row_version / key が現要求と一致するものだけを 1 フレーム 1 枚 `load_texture` する。旧 key / generation の結果は採用側で破棄。`ensure` (key 変更) / `clear` (ファイル変更・close) で worker を作り直す。詳細は [`src/ui_music_timeline.rs`](../src/ui_music_timeline.rs) |
-| 音楽ビュー spectrum | `std::thread` (`miv-music-spectrum`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`MusicSpectrumState`) | 常駐 `SpectrumAnalyzer` (E0-C#10 の MIDI 半音バー、多解像度 FFT) を所有し、UI から `Arc<MusicPcm>` + `center_secs` を受けて再生位置周辺 **±1 秒**の窓を worker 側でスライス (`copy_window`、lock 下で ~1MB 未満コピー) → `analyze_moving_window`。cpal ring buffer は約 100ms 分しか無く ±1s 窓に足りないため、ラボと同じく展開済み PCM をスライスする (案A、[music-integration-plan.md](music-integration-plan.md) §11)。**`MusicPcm` は追記式共有バッファ (`RwLock<Vec<f32>>` + `complete: AtomicBool`)**: 解析ワーカーがデコード進行に合わせて末尾 `append` (write) し、spectrum worker は現デコード済み範囲から窓を read で取る (未デコード領域が中心なら `None`)。`RwLock` = 長い解析 read と spectrum 窓コピー read を並行させ spectrum を固まらせない。高々 1 リクエスト in-flight + 溜まった分は最新へ coalesce。UI (`update`) は playing / 位置変化時に throttle (16ms) 付きで送り、pending / 再生中は `request_repaint_after(16ms)`。窓がまだ取れない間は空バンド = 鍵盤ベースライン + 「解析中…」表示 (`source_complete` で抑制)。新ファイル / close で `clear`。詳細は [`src/ui_music_spectrum.rs`](../src/ui_music_spectrum.rs) |
+| 音楽ビュー spectrum | `std::thread` (`miv-music-spectrum`) + mpsc | App 全体で 1 本 (`MusicSpectrumState`) | 常駐 `SpectrumAnalyzer` と `HarmNetTracker` を所有する。UI から `Arc<MusicPcm>` + `center_secs` を受け、棒グラフ／倍音比率は再生位置周辺 **±1 秒**を `copy_window` で短くコピーして `analyze_moving_window`、鍵盤中央は HarmNet L の基音確率から求める。tracker は PCM の `Arc::ptr_eq` と絶対フレーム番号で継続を判断し、別 PCM・後退・58 フレームを超える移動なら約 1 秒の助走から作り直す。20ms hop・160ms 先読みの推定を同じ要求の `SpectrumAnalysis` に入れ、既存の 1 本の結果チャネルで返す。助走／先読みの PCM は `copy_range` で取得し、デコード完了後の末尾より後は 0 埋め、未デコードの先端は未取得 (`pitch_probabilities: None`) とする。UI は確率未取得を入力 0 として残光を減衰し、一時停止中も直近の確率が `None` なら 16ms 間引きで再要求／repaint を予約する (有効な全 0 の `Some` と区別)。in-flight は高々 1 件で最新へ coalesce、曲全体の事前計算・保存や別 pending は追加しない。追記式 `MusicPcm` の `RwLock` により timeline の長い read と窓コピーの短い read を並行させる。新ファイル／close の既存 `clear` は worker ごと捨て、park／復帰は同じ PCM を保持する。棒グラフの窓も取れない間は空バンドと「解析中…」表示。詳細は [鍵盤の基音推定設計](music-keyboard-harmnet-plan.md) と [`src/ui_music_spectrum.rs`](../src/ui_music_spectrum.rs) |
 
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
 | EPUB 変換結果の管理 | `epub-cache-maint` + `mpsc` | 管理画面で最大 1 本 | 開く・再読込で現在の変換結果を DB から読み、選択・全件・元ファイル消失の削除は対象ごとにその場で実行する。本ごとの読取リースがあれば待たずに使用中として残し、無ければ排他的な削除境界を取る。PDF worker の文書解放だけ総 10 秒を上限に待ち、応答なしの対象は残して理由を返す。`App::epub_cache_maint_pending` が受信まで所有し、UI は一覧 snapshot と結果だけを描画する。内部廃止世代の起動時回収は残す。RAR/7z の容量集計とは別 DB・別 pending |
@@ -564,6 +805,19 @@ convert failure の素材だけ成功セルを維持したまま software full-f
 file-local fallback する。close / 動画切替 / fullscreen 終了の cancel owner は変わらない。
 
 通常 PDF と固定済み EPUB の列挙は呼出元で合流登録し、新しい実行要求だけ `pdf-enumerate-nav` スレッドを起こす。未固定 EPUB の admission は専用の背景スレッドで source stat・DB 照合・登録・エンコードを行う。固定表 mutex はメモリ検索・挿入だけを保護し、stat・DB 照合中は保持しない。同じ実読込パスへの追加 waiter はスレッドを増やさない。
+
+ナビゲーション preflight（物理 staged／履歴、コレクション候補、PDF パスワード再開）の
+PDF 列挙も、利用者が採用を待つため同じナビ用列挙（Critical）と実行中要求の合流を使う。
+v4.2.0 の staged 化で背景用の同期列挙（Normal）を通るようになり、旧本の可視サムネイル
+（HighNormal）を待つ退行が入っていた。背景の metadata／cache／Remote 等は Normal を維持する。
+preflight worker は結果と取消通知を channel select で待ち、取消時はその待ち手の lease だけを
+離脱させる。最後の待ち手だけが既存の source cancel を立てる。候補間で待ち手を持ち越さない。
+登録で `Start` を得た admission は、起点の UI 待ち手が取り消されても共有 worker の起動責任を保つ。
+起動を省略するのは、全待ち手の離脱で `source_cancel` が立った場合だけとし、合流済み待ち手を残して起動を捨てない。
+read target は従来と同じ worker 解決・EPUB lease を使い、合流キーは
+`(read_path, password, want_direction)` のまま。取消監視の polling や新しい優先度枠は追加しない。
+既存の連続ナビを保つためモーダル化は行わず、列挙と取消の所有を既存 coordinator に揃える。
+Critical 同士は既存レーンを共有するため、前面描画に対する専用の追加予約はない。
 
 EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、対象範囲lease内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。範囲外の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 
@@ -631,6 +885,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | `ContentIdentityIndexLoadPending.cancel` | `Arc<AtomicBool>` | UI (台帳 snapshot 再失効、設定 OFF、App drop) | content identity index load worker | Low permit 待ちと台帳行境界で全件 snapshot 読込を中断し、cancel 後の結果を publish しない |
 | `ContentIdentityBackfillPending.cancel` | `Arc<AtomicBool>` | UI (フォルダ切替、設定 OFF、App drop) | content identity backfill worker | Low permit 待ち、物理ファイル境界、hash chunk 境界で既存編集の遡り記録を中断する |
 | `NativeVideoOutput.source_epoch` | `Arc<AtomicU64>` | UI / native presenter | UI / native presenter | native presenter 再利用時の stale event 防止。`SwitchSource` ごとに epoch を進め、presenter から UI へ送る `NativeVideoOutputEvent` に付与する。UI は現在の player epoch と一致しない event を破棄する |
+| `NativeVideoOutput.faulted` | `Arc<AtomicBool>` | native render / window pump | UI / window pump | output lifetime の一方向故障印 (§1.135)。詳細ログ・init_error の lock より先に公開し、closed 公開前の source swap を拒否する。通知の take や source switch で下ろさず、通常 open の新 output だけが false から始まる。詳細は [動画ライフサイクル](video-architecture.md#ライフサイクル管理) |
 | `VideoDynamicState.present_path` | `Arc<AtomicU8>` | native-video-presenter (= `record_present`) | UI (右パネル overlay 描画) | per-frame のプレゼン経路 (Pending / GPU / CPU)。`d3d11_shared` なら GPU、`cpu_upload` なら CPU を store。デインターレース ON で CPU 経路に落ちた場合の右パネル「フレーム表示」表示根拠 |
 | `VideoDynamicState.deinterlace_status` | `Arc<AtomicU8>` | video-decode (`run_video_decode`) | UI (右パネル overlay 描画) | bwdif フィルタの動的状態 (Pending / Inactive / Active / Failed)。フィルタ初期化成功 → Active、失敗 → Failed、Auto モードで素材プログレッシブ判定 → Inactive、seek 直後 → Pending。Settings = Off は decode 開始時に Inactive |
 | `VideoDynamicState.interlace_detected` | `Arc<AtomicBool>` | video-decode (`run_video_decode`) | UI (右パネル overlay 描画) | `stream_interlaced || frame_interlaced` の latched 検出。一度 true になったら同 source 再生中は維持 (= 微小な interlaced フレーム混入でも表示安定)。`VideoPlayer::open` ごとに新 Arc 生成で false 初期化 |
@@ -659,7 +914,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | Ctrl+G `SearchStreamEvent` | Ctrl+G ワーカー → UI | `Batch { hits, scanned_candidates, valid_hits }` / `Done { truncated, reason }` / `Error`。毎フレーム `try_recv` を MAX_EVENTS_PER_FRAME=8 までループ消費 |
 | `DebouncedChange` (notify-rs) | FsWatcher → supervisor | 500ms ウィンドウで集約した変更イベント (`favorite_id`, `path`, `ChangeKind`) |
 | `SupervisorCommand` | UI (`IndexerManager`) → supervisor | 一時停止 / 再開 / フル再スキャン要求 |
-| `SimilarIndexNotifier` | 既存 favorite supervisor → 別バージョン索引 scheduler | 同じ `FsWatcher` の追加・変更・削除通知を軽量な再照合要求へ変換する。進行中なら revision だけ進め、終了後の 1 回へ coalesce するため watcher を追加しない。coalesce された中間 pass では Complete 済みの検索 snapshot を保持し、最終 pass の全 in-flight 回収後だけ再読込する。検索用メモリ表は起動時 configure と索引 worker の DB open 時に専用 `similar-index-load` worker で先行ロードし、パネルは実行中に未ロードでも新たなロードを開始しない。`similar.compact` が DB store ID・内容世代・行数・hash/proxy version・SHA-256 と一致すれば順次読込し、不一致なら SQLite snapshot へ戻して sidecar を作り直す。更新中の右パネルは変更が完了後に反映されることを明示する |
+| `SimilarIndexNotifier` | 既存 favorite supervisor → 別バージョン索引 scheduler | 同じ `FsWatcher` の通知を event sequence 付き dirty scope / Full へ合流する。scan / prefill commit 後の配列更新は同じ store の `SimilarArrayHandle` へ要求し、scheduler は公開済み store/seq の ack と job-current 確認後に Full 完了印を書く。構成変更は query scope を失効するが、store の初期ロードを再起動しない。更新中も公開済み snapshot で検索できる |
 | `similar_index` bounded work queue | 別バージョン索引 coordinator → 16 scan worker | ルーズ画像 1 枚または本 1 冊を単位に、全体 16・ドライブ文字または UNC server/share ごと 8 まで実行する。操作中は既存 `ActivityGate` で 1 / 1 へ縮退し、cancel 時は未開始を捨てても in-flight 全件の終了を待ってから Cancelled を返す。本のページ処理と generation publish は 1 worker 内に閉じる |
 | `local_adjust_write_handle` の job / result | UI ↔ 補正レイヤー書き込みワーカー | job = `LocalAdjustWriteJob { key, generation, layers }` (`layers` は `Arc` 共有なので積んでも複製しない)。result = `LocalAdjustWriteCompletion`: `Settled { key, generation, layers, outcome }` / `Superseded { key, generation }`。**`layers` を結果にも載せる**のは、UI がミラーする文書を「worker が実際に書いたもの」に固定するため (メモリから取り直すと、積んでから完了までの間に入った編集を写す)。`Superseded` は成功でも失敗でもないので、ミラーもトーストも出さない |
 | `IndexerManager.writer` | 全 FTS 書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。ingest と purge/cleanup は dispatcher に job を `submit` し、writer に直接触らない (§5.5)。通常の tag_write_worker は tags.db のみを更新し、この writer を使わない。 |
@@ -827,6 +1082,7 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
 | --- | --- | --- |
 | `Grid` | `navigate()` の Ctrl+↑↓ (通常グリッド) | `load_folder_nav_target(p)` のみ。RAR/7z/LZH などは変換ダイアログまたはキャッシュ経由で開く |
 | `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder_nav_target(p)` → `open_fullscreen(先頭 image-like idx)` |
+| `ListOrder { snapshot, from_index }` | Ctrl+Shift+↑↓ | 通常フォルダ一覧の凍結した本の行を同じ停止条件で前後に探す。行き先の事前scan・採用・再openは Fullscreen と共有。sequence / 表示待ち中は拒否し、累積・乗り換えをしない |
 | `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `load_folder_nav_target + nav_stack.push + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
 | `Favsearch { root, fullscreen: true }` | フルスクリーン中の Ctrl+S スコープナビ | 上記に加えて `close_fullscreen` → `open_fullscreen(先頭 image-like idx)` でフルスクリーンを維持 |
 | `SmartFolder { state, fullscreen }` | スマートフォルダ root / scoped drill / root 直下の本のグリッド、リング、ゲームパッド、フルスクリーン | Folder `entry_root` 内だけを DFS。端または root 直下の本からは、最終 root items 表示順の Folder/PDF/ZIP/変換書庫 entry へ移る（単体画像・動画は除外）。worker に渡した単一の型付き root 列と可視列が異なれば旧結果は採用しない。新しい Folder/PDF/ZIP は offscreen `SmartFolderTransition` で準備し、可視採用時に `SmartFolderViewState` と fullscreen 継続を一度だけ更新する |
@@ -1013,6 +1269,13 @@ permit を保持する。cancel だけで枠を返さないため、取消済み
 通常の先読みは context の有限な prefetch window、直接シークは後述の latest-only、
 順送りは既存の typed navigation sequence の受理境界で増加を止める。同じ idx の重複は
 `fs_pending` の map key で合流する。
+
+PDF 再レンダは同じ idx でも解像度が変わるため、`FsPendingValue::pdf_rerender` に
+source key・target_px・PDF pool priority を載せる。`request_pdf_rerender_at_target` が
+同じ source/target の生きた要求へ合流し、Critical が Normal 需要も満たす。
+Normal → Critical は一度だけ置き換える。異なる source/target と取消済み ticket は置き換える。
+identity の寿命は receiver / ticket と同じで、viewer bundle の交換にも一緒に付いていく。
+snapshot の既存 cancel / 再ロードでも古い identity は残らない。第二の index や時間窓は作らない。
 
 Normal の先読みが表示対象になった場合は同じ ticket を High に昇格し、待機順だけを変える。
 順送りは `Sequential` として受理済み target を supersede せず、シークバー / Home / End 等の
@@ -1213,6 +1476,31 @@ transaction で消す。起動設定は最初の構成でだけ採用し、実�
   writer kill による未実行 merge task は実 I/O failure と区別する。detach/abrupt termination が
   全整合や marker 完了を保証するとはしない。runtime wipe/reopen、自動 Full retry は追加しない。
 
+### 類似索引の配列と query の寿命（§1.404）
+
+`SimilarArrayOwner` の生成権限は固定 data_dir の manager 初期化に限り、notifier / query / scan は
+clone可能な handle だけを使う。旧 `similar-index-load` / `similar-array-update` / `similar-array-compact`
+とその bool / memory epoch / CAS 公開は撤去した。scan writer / scheduler の config epoch・cancel・
+ActivityGate・watch・purge・Full/Delta は従来の所有を維持する。
+
+owner の一つの mutex が Published（snapshotとrevision）、要求合流、ack、Faulted / Closing / Closedを所有する。
+ack は同 store / 到達 seq の公開事実だけで成功し、worker停止を複数lockから推測しない。
+refresh は identity / batch を同一read TXで得る。pruneは既存IMMEDIATE write transactionでidentityを
+照合し、置換と採用の完了後に永続baseのcutoffだけを削除する。後着commitは後続refreshへ残る。
+空refreshは公開revisionを進めず、bookのsoft refreshも送らない。
+UIのprogress読取はowner lock内でfailureだけを複製し、snapshotの参照を持ち出さない。
+closeは公開snapshotをClosingへ移し、呼出元の旧状態に参照を残さずowner workerで退役する。
+
+itemは `QueryScopeState` のimmutable roots / scope revision / 6件cacheとpublication revisionを照合する。
+lock順は owner → query scope、query workerは受付時rootsを使い、遅い旧完了でcacheを再充填しない。
+bookは共有snapshotの取得元とreadinessだけをownerへ替え、同一TXの私有fallback・MIH・limitsを維持する。
+Missing / Faulted / worker異常終了もdispatchを通知し、Waitを追加UI入力なしで再評価する。
+
+shutdownはscan cancel・book停止・owner close通知までで、UIからI/O / join / Condvar待機を行わない。
+workerは実処理の帰還後に採用/未開始pruneを見送り、資源解放後にClosedを公開する。
+同じdata_dirの擬似再オープンだけ、headless fixtureでscan joinとowner Closed receiptを待つ。
+まれな実I/O障害はログ＋既存「更新未完了」への投影と再起動案内で止め、稼働中の自動再試行を行わない。
+
 ### 3.5 新ワーカー追加時のテンプレ
 
 ```rust
@@ -1301,8 +1589,14 @@ mImageViewer は 2 つのリストを使い分ける:
 
 `app/vram_accounting.rs` は `fs_cache` から表示系の各派生 cache、連結 transition、
 `thumbnails` / `thumb_textures` / `thumb_adjust_tex` までを横断する。推定表示サイズではなく
-`TextureHandle::size()` と完全な mip chain を使い、同じ `TextureId` は cache をまたいでも
+`TextureHandle::size()` と登録時 options に対応する mip chain を使い、同じ `TextureId` は cache をまたいでも
 1 回だけ数える。チェック柄・スタンプ・font preview など小さく有界な texture は対象外とする。
+
+D3 の final は実登録 options の mip 有無を使い、Native 出力は RGBA8・mip なしで数える。
+mounted だけでなく registry の at-rest／parked の通常cacheも共通walkerで加算する。
+presentation の Native は出力だけをpinし、元sourceを重複pinしない。cache退去後も最後の実batch leaseが
+生存する間は既存weak inventoryから会計し、弱参照自体は寿命を延ばさない。Native admissionは出力に加え
+当該branchの実一時allocationも含める。offer前の専用pin予約・演出専用cacheは作らない。
 
 `--perf-log` が有効な場合だけ、約 1 秒に 1 回 `gpu.vram_accounting` を記録する。イベントには
 モード、全 texel/byte、共有 pool と両配分の上限、無制限フラグ、および subsystem ごとの
@@ -1656,13 +1950,12 @@ spawn 失敗と panic はどちらも「以後すべての書き込みが消え�
    指し得るので、そのとき解決し直すと無関係なページへ書く
    (`with_sidecar_coords_mut` がこの用途)。idx 依存の後続処理は
    `page_path_key(idx)` が同じ key を返すときだけ走らせる。
-2. **worker を経由しない同 DB 操作の前に drain / gate する。**製本ページの key 付け替え
-   (`copy_entry_key` / `move_entry_key`) は UI スレッドが直接書くので、待たずに
-   走らせると「付け替えの後に古い key の保存が着地して行を書き戻す」順序が起き得る。
-   同期保存だった頃は構造的に起きなかった。**既存の直接書き込み barrier
-   (`rename_migration_writers_busy`) にも自分を足すこと** — こちらは待つのではなく
-   「終わるまで始めない」形。未回収の完了も「終わっていない」に数える (完了を適用すると
-   サイドカーへミラーが書かれるため)。
+2. **別所有者から同 DB を変える前に、先行 producer の完了を採用する。**製本ページの
+   key 付け替えは §1.272 で UI の直接書き込みから製本 worker へ移したが、FS 後に
+   旧 key の保存が届くと別画像の情報を作り直してしまうため、FS 前の静止が必要。
+   **共通の `rename_migration_writers_busy` に新しい producer も足すこと**。
+   UI frame の「終わるまで始めない」形を使い、未回収の完了とそこから続く保存・記録も
+   「終わっていない」に数える。受理済み完了を捨てたり、保存関数を拒否して静止扱いにしない。
 3. **終了経路で在庫を書き切ってからサイドカーを flush する。**正本は worker が
    drain-on-shutdown で書き切るので編集自体は消えないが、飛ばすとサイドカー
    (フォルダ移動時の復元源) だけが古くなる。
@@ -1930,3 +2223,75 @@ Loading／host-control queue へ合流する。AutoVideo permit は成功時 rev
 設定OFF・root hide・全画面・最小化・Remote は各正本の境界で公開し、復帰でも古い permit は再利用しない。
 成功した手動表示も古い AutoVideo を失効させる。自動表示は非アクティブとし、既存 Manual と表示済み窓の
 visibility lifecycle、worker 数、owner=0 を維持する。
+
+## §1.242 G2B 本の構成worker（未リリース）
+
+`book_composition::BookCompositionService`はprocess所有の単一SQLite writer。
+front handleはPrepare/Save/Remove/root rename/purge/page移行をFIFOへ送るだけで、I/Oやjoinをしない。
+読み取りはimmutable Arc snapshotとscope token。viewerのAccepted recordはcontext bundle/snapshotへ所属し、
+Prepare receiverはそのcontextだけが回収する。Remote SessionHandleは同じserviceのread経路を登録する。
+構成serviceの通知drain/retained readは`eframe::App::update`の描画pass後、早期returnの外で処理する。
+mounted `ContextAsyncOwner::BookCompositionRead`はPreparingだけでなくAutomatic/Acceptedのscopeも照合し、
+専用fullscreenでも初回open・本切替・同scope更新の読取を開始する。
+Prepare応答は採用直前のscope tokenと一致した時だけAccepted/Blockedへ移す。不一致なら最新Prepareへ
+置換し、Preparingのまま既存context pollへ残す。変更通知を先に消化しても旧応答を採用しない。
+Preparing中は既存pending workerと同じ50ms遅延repaintをROOTへ予約する。rootは退避contextの完了も
+回収するため、専用viewportや一覧が静止していても利用者入力に依存しない。採用時は一度repaintし、
+Accepted/Blockedの同token読取は起床を予約しない。新しいpending fieldやworker側UI ownerは作らない。
+既存maintenance workerはEPUB→spread_shift→book_compositionの順でquiesceし、DB接続を解放してから共通rename/import/restore/cleanupを行う。
+lease終了時のwriter再読込が実変更scopeだけを公開する。UI側でmaintenance待ちやDB/FS読取を追加しない。
+終了時はcomposition writerをjoinしてから、保持されたcontent-identity recorderを所有するshift ownerを終了し、捕捉済みEdit観測を落とさない。
+まれな失敗はログ＋通知。未知/破損は利用者作成recordを保持して書込停止し、新DBのmigration/recreate/自動retryを作らない。
+B2の編集結果はsession専用workerで生成し、未送信draftは最新にまとめる。結果generationが最新のときだけ保存可能。
+組生成には通常builderを使い、UI側にはI/Oと別pairing実装を置かない。
+製本/一括出力の構成資格は実Sourceを受け付けるworkerで確定する。
+出力runだけのarchive identity/scope索引を一回準備し、その後に最新service snapshot/tokenでhiddenを判定する。
+別窓のimmutable raw treeと物理sourceを区別し、hiddenの変更は索引再利用時も最新値を使う。
+
+
+### G4 editorの非同期owner（next-book、2026-10-11）
+
+`CompositionEditorOperations`の単一ownerはcontext/scope/requestを相関し、
+そのcontextの`CompositionEditorState`だけがPreparing/Editing/Saving/Reloadingを保持する。
+sessionのLocal phase確認とowner/ticketの採用は既存lifecycle mutex内の短い受付で行う。
+prepareのsource列挙、保存前fingerprint照合、writerの応答待ちは専用workerが担い、UI側はchannelを収穫する。
+長い操作をmodalにすることで、別open/history/context切替や複数draftとのsupersessionを作らない。
+
+Remote取得/窓closeが後から来ても、すでに送信したsave ticketの受取ownerはprocess側へ残す。
+その一回の終端を既存Remote close barrierへ含め、draft dropだけで完了を捨てない。
+metadata preview/import/exportとGeneric改名maintenanceも、同じticketの完了・採用まで開始を待つ。
+previewには既存WaitingForWritersの型付き待ち先を使い、追加のpending ownerやUI待機を作らない。
+G4Fは2026-10-12の利用者決定で切り離し。folder sidecar v1 restoreは構成maintenanceを使わず、開始条件を変更しない。
+DB成功後のreloadは保存済みrecordを使用する。reload失敗の再操作は利用者へ案内し、DB成功を巻き戻さない。
+捕捉した編集元のresume intentは保存完了ownerだけが一回記録し、兄弟/退避のreloadはresumeを追加記録しない。
+
+`EditorThumbnails`はeditorのsource/policyを固定した独立worker。一回の可視要求は24件まで、
+request/result channelは有界で、UIからの送信は非blocking。decode/回転DB読取はworkerで行い、
+結果とtextureはeditorにだけ返す。policy除外・Missingはdecodeせず、editor closeでcancel/dropする。
+元ページを表示するために、通常viewerのthumbnail queueをresetしたりhidden許可を書き換えたりしない。
+viewのページ名/状態/unitの投影はdraft変更時に更新し、静止中のUI frameではcacheを読む。
+詳細な受入条件・未実施の確認は[本の構成計画 G4](book-composition-plan.md)に記録する。
+
+### master統合時の変換stateの格納（2026-10-14）
+
+書庫／EPUB変換の既存stateは`Option<Box<State>>`で格納する。両側の機能追加を統合した
+`App`のサイズが既存上限を超えたため、開始時の一回のallocationへ寄せる。
+poll、context退避／復帰、変換終端は同じBoxを移し、owner、modal、receiver、lease、
+取消・Dropの境界は変更しない。新しいpending stateや受付の排他は追加しない。
+Appサイズ上限と通常stackでのcapture回帰を維持し、poll／context移譲のallocation保持も検査する。
+
+
+## 紙めくりD3-4(a)の配送観測（2026-10-18）
+
+CPU worker/pending/permit/予約の所有はD3-2のまま。早期serviceは受信・検証・通常採用を続け、
+非共有の新規投機GPU登録だけROOT最終outputへ移す。ON/pagedのLegacyPrefetchも同じ枠を使う。
+既存frame ownerのpass観測と単調活動を使い、待機queueを増やさない。
+TextureDelivery observerは既存queue提出後・renderer lock外・free前の診断だけを通知する。
+通常UI/入力/permissionへの再入、追加submit、GPU完了ticketはない。詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.15を参照。
+
+§1.405ではNext CPUの実予約拒否時だけ、BudgetState.units最大2 unitのmetadata snapshotからownerを特定する。
+mutex外で`with_viewer_context_ref`/`with_viewer_context_state`によりparkedも訪問し、未昇格PreviousのCpuReady/
+未受信channelを破棄する。一時値までdrop後、元Next/keyを再照合して一度だけ再試行する。
+Current/Next共有素材・DisplayPrepared・legacy・Unknown・held/receipt/batchは保護し、実計算中のpermit/予約は終了まで保持する。
+park単独では取消しない。最新callbackは位置別結果を一体で置換し、Previous Nativeは全削除規則の除去ゼロを検査する。
+新しいqueue/ready latch/全頁・全registry走査や同期I/Oは追加しない。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。

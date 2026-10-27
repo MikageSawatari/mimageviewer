@@ -3,6 +3,14 @@
 画像補正 (adjustment) と AI アップスケール/デノイズ/Inpaint は、複数レイヤーのキャッシュと優先順位の決定ロジックで
 成り立っている。「補正したら元に戻った」「AI 結果が一瞬消える」といった不具合は、ここの無効化ルールの間違いから起きる。
 
+§1.372: 通常ページ補正のdragと部分補正のdraft／選択レイヤーはviewer contextに属する。
+一覧再配置後の確定・Undo／Redoは開始時のpage keyへ保存する。同keyの別contextで新規編集を
+始めるときは、保存待ちも含む最新受付済み文書をbeforeにする。UIの値変更は操作した
+パラメーターだけをその文書へ適用し、旧パネルの全文で先行変更を置換しない。
+未完の線／ラッソは兄弟contextの履歴操作では保持し、そのcontextのUndo受理や終了で取消す。
+同一ページのpointer/key同時入力の既存終端は本件で変更しない。
+[所有・履歴・保存の契約](page-adjustment-owner-plan.md)を参照。
+
 ---
 
 ## 1. スコープ (v2.9.0 で 2 段化)
@@ -115,6 +123,14 @@ content-identity restore 完了時は `is_physical_folder_listing()` が true �
 との等価比較によって保存される。DB 側 (`AdjustmentDb::set_page_params`) の
 `is_removable` 判定は廃止済みで、呼び出し側 (`App::set_page_params`) で
 削除/保存の振り分けを行う構造になっている。
+
+§1.176 の一括操作では、この判定と変更前の実効値・表示位置を先に計画し、
+`AdjustmentDb::apply_page_param_writes` で set/delete を混在させて1トランザクションにする。
+1件版も同じ計画・保存・runtime反映を合成する。書き込み epoch は対象の page key だけに限定する。
+DB拒否時は区間全体をrollbackし、従来どおりruntimeを更新するが、sidecarと他contextへの
+accepted publishは進めない。失敗は区間で1回ログ・通知し、再試行や回復処理は追加しない。
+スロット一括適用・選択解除・標準一致のprune・Undo/Redoの連続Page区間がこの経路を使う。
+UndoのGlobal→Favorite→Page、Redoの既存順序とPage区間ごとのpublish境界は維持する。
 
 ### 1.3 スコープ選択とアクションボタン
 
@@ -778,6 +794,56 @@ raster pixel geometry の分離・表示補正であり、再レンダ要求頻�
 (無効化すると crop ドラッグのたびに
 AI を無駄に再実行してしまう)。
 
+#### crop ドラッグの所有と終了（2026-10-22）
+
+`ExportCropDrag` / `ExportCropCreateDrag` は、開始時の正確な `Option<CropSettings>`（crop なしも含む）、
+その authoring 寸法、対象 idx と既存 `PageEditOwner` を持つ。表示中にスケールした設定を元の設定の代用にしない。
+終了理由を `OverlayDragEnd` にまとめ、その `finish()` の match だけで
+`OverlayDragFinish::Commit` / `Cancel` の二つへ分類する。操作ごとの一覧は
+[keymap-spec.md の終了操作表](keymap-spec.md#crop--sns-枠ドラッグの終了操作)を参照。
+確定は現在値を既存 DB / sidecar / preview 無効化経路へ一度だけ渡す。
+取り消しはメモリ・存在集合・prepared 投影を開始前へ戻し、DB / sidecar / preview へ書かない。
+preview snapshot や items の入替 / remap より先に取り消し、別世代の同じ idx へ復元しない。
+別 context の一時 mount は終了ではなく、兄弟の preview / 終了処理ではドラッグを消費しない。
+F12 は既存の overlay edit policy で受け付けず、detached の述語 / viewport 経路は変更しない。
+
+本の構造操作の開始は `OverlayDragEnd::BookStructure` → `Cancel` とする。
+`poll_book_structural_op` の冒頭で、既存の owner context mount API を使って crop／SNS のドラッグを取り消す。
+入力 handler 内や操作開始の各入口に取消しを分散せず、構造操作の単一 owner が、Requested の FS 開始前と
+Running の結果採用前の両方で終了を保証する。modal によりキー・パネルが呼ばれない場合も同じ扱いとなる。
+取消しは DB に書かず、操作が終わってもボタン保持・移動・release から古いドラッグを再開しない。
+入力側は構造 owner の存在中、キー・パネル・raw pointer を止め、poll 前の release も確定に変換しない。
+SNS に master の専用ガードは無かったが、構造操作中は全編集の新規受付を止める方針に合わせて同じ制限を適用した。
+crop ドラッグ中の構造操作要求を拒否する master の既存受付判定は維持する。取消しの対象は構造 owner が
+実際に存在するときの未確定ドラッグであり、拒否された要求や read-only の context mount では取り消さない。
+bool／pending は足さず、開始時取消しとの二重所有にもしていない。
+
+操作中の Escape をモード終了より先に扱うのは、消しゴムの多角形 / 選択解除と補正レイヤーの編集中操作解除に合わせるため。
+開始 frame 番号も drag に捕捉し、同じ press を layout の複数 pass で処理した場合と次の press とを区別する。
+これは操作 identity の照合であり、時間窓や「一定時間待つ」判定ではない。
+物理ボタンの確認は Windows の左右ボタン入替に従う。タッチ継続中は物理マウスの up を
+タッチの終了とみなさず、egui の logical primary / touch 終了を使う。
+ドラッグが無い Escape は従来どおりモードを終了する。パネルの終了は未確定ドラッグを取り消す。
+一方、`CropExecute`（既定 Ctrl+E）は `execute_export_crop` から現在のドラッグを先に確定・保存し、
+取消を伴う `reset_export_crop_mode` を経由せずにモードを終了して書き出す。
+設計の簡素化として、既存 foreground editor の終了と preview 境界に集約した。短いマウス操作を modal にして
+閲覧や既存の切替を制限する案は採らず、終了理由ごとの bool / pending / 別の保存 owner は足さない。
+
+SNS 分割も `SnsSplitDrag.base` の全 layout と `PageEditOwner` を保持し、同じ二つの終端へ通す。
+ドラッグ中の Escape は枠だけ戻してモードを維持する。枠をパネル上へ運んでも継続し、release で確定する。
+`SnsSplitExecute` とパネルの書き出しボタンは、共通の実行関数で現在のドラッグを先に確定してから枠列を採取する。
+出力準備成功時は `complete_sns_split_mode` で確定終了し、取消の `reset_sns_split_mode` を経由しない。
+出力準備が失敗したときは確定済みの現在の枠でモードを維持する。
+SNS の枠 geometry は元々セッション内だけであり crop と同じ DB 不一致は無いが、以前は入力拒否時に drag だけ
+消して途中の layout が残る穴があったため、同じ終了所有へそろえた。
+
+実アプリ確認（2026-10-23、`52b06df46` 相当の検証ビルド、ClaudeCode の隔離環境での操作。利用者の許可を得て
+実マウス入力で操作）: 3000×4000 画像で左上の角をドラッグして離すと X680 Y652 W2320 H3348 が `export_crop.db` に保存された。
+右辺をドラッグ中（W1178）に Escape を押すと W2320 に戻り、そのまま離しても変わらず、切り取りモードは残り、DB も不変だった。
+右辺をドラッグ中に Ctrl+E を押すと、書き出しダイアログの出力サイズが「そのまま (1179×3349)」で、DB も新しい右端へ保存された
+（ダイアログはキャンセルで閉じ、ファイルは書き出していない）。ドラッグしていないときの Escape では従来どおりモードを抜けた。
+SNS 分割、タッチ / ペン、リモートデスクトップ、ウィンドウ外で離す場合は自動テストのみ。
+
 ### 3.2 final pipeline の適用タイミング
 
 `App::ensure_final_composite_texture(ctx, idx)` が `edit_result_cache` を入力にして:
@@ -1091,6 +1157,9 @@ final composite を切り出す最終段として働く。編集プレビュー�
 結果を `erase_result_cache` に載せる。入力またはマスクが変わると generation key が変わり、
 古い MI-GAN 結果は採用されない。
 
+補完の進捗表示と完了トーストの発行は、そのジョブを所有する viewer context の実描画ページ列 `fullscreen_page_layout`（見開きは両面、連結読みは可視ページ）に限定する。提示許可 Checking 中の旧単ページ保持もこの列を使い、空の列を現在位置や計算上の見開きで補わない。
+先読みページの処理・キャッシュ・ログは継続し、途中のページ移動は通知時点の表示で判定するため追加の可視性状態やモーダル化は不要（まれな失敗は既定の割り切り）。
+
 ### MI-GAN の原寸入力と段階補完 (v2.5.0)
 
 MI-GAN の入力は 512x512 固定だが、512px 未満の mask bbox + context を縦横別倍率で
@@ -1401,7 +1470,8 @@ egui の popup は別レイヤーで生成されるため、パネルの `Visual
 
 ```rust
 enum AdjustUndoScope {
-    Page(usize),       // adjustment_page_params[idx]
+    Page(usize),       // キー取得不可のlegacy退避先
+    PageKey(PageAdjustmentTarget), // 通常のページ補正。適用ごとに現一覧で解決
     Favorite(Uuid),    // adjustment_favorite_params[uuid]
     Global,            // settings.global_preset
 }
@@ -1419,19 +1489,24 @@ struct LocalAdjustmentChange {
 }
 ```
 
+現行の通常補正Undoは既に `PageKey` を使用し、一覧外のページも元の安定キーへ復元する。
+一方、補正レイヤーUndoの `idx` と編集中セッションの対象には再配置時の所有問題が残る。
+§1.372の [編集owner設計案](page-adjustment-owner-plan.md) はその差を明記している。
+同案は設計レビュー待ちであり、local Undo／draftの新設計を実装済みとは扱わない。
+
 `Global` スコープは常に `Some` (`settings.global_preset` は Optional ではない)。
 `Page` / `Favorite` の `None` は「そのスコープにエントリが存在しない =
 下層 (Favorite default / Global) にフォールバック」を表す。
 
-### 適用ロジック (`apply_adjustment_change_to_app`)
+### 適用ロジック (`apply_adjustment_changes_in_order`)
 
-スコープごとに既存の書き込み API を再利用する。ただし `Page(Some)` の復元は
-`set_page_params` の後に `clear_caches_for_param_change(old, new)` を通し、通常の
-スライダー / スロット適用と同じ final AI 差分無効化を行う。`set_page_params`
-単体は DB 更新・サイドカー更新・軽量な表示キャッシュ無効化までを担当し、
-final pipeline / AI cache の差分分類は呼び出し側責務。
+連続する `Page` / `PageKey` を同じ区間へ集め、`restore_page_params_for_targets` で
+計画・DB保存・runtime反映・accepted publishを行う。`Page(Some)` は通常の
+スライダー / スロット適用と同じ `clear_caches_for_param_change(old, new)` も通す。
+1件の `set_page_params` 単体は軽量な表示キャッシュ無効化までを担当し、
+final pipeline / AI cache の差分分類は従来どおり呼び出し側責務。
 
-`Page(None)` は `clear_page_params`、お気に入りとグローバルは
+`Page(None)` は1件の解除と同じruntime反映、お気に入りとグローバルは
 `set_favorite_default` / `clear_favorite_default` / `copy_params_to_global` を使う。
 これらの経路は通常操作と同じ副作用に乗せ、Undo 用に別の永続化経路を作らない。
 

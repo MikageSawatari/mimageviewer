@@ -11,23 +11,20 @@ fn overview_label(action: &RingActionId) -> String {
 }
 
 fn snapshot_guide(name: &str, draw: impl Fn(&egui::Ui) + 'static) {
-    let mut fonts_ready = false;
     let mut harness = crate::test_ui::builder()
+        .with_context_setup(crate::ui_fonts::configure_fonts)
         .with_size(egui::vec2(520.0, 440.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
             crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
-                .show(ctx, |ui| {
-                    crate::os_theme::apply_dark_ui(ui);
-                    draw(ui);
-                });
+            crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+                    .show(root_ui, |ui| {
+                        crate::os_theme::apply_dark_ui(ui);
+                        draw(ui);
+                    });
+            });
         });
     harness.run();
     harness.snapshot(name);

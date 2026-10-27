@@ -78,9 +78,7 @@ pub(crate) struct ContextResult {
 }
 
 pub(crate) struct ContainerStateResult {
-    pub(crate) spread_mode: Option<crate::settings::SpreadMode>,
-    pub(crate) reading_flow: Option<crate::settings::ReadingFlow>,
-    pub(crate) reading_direction: Option<crate::settings::ReadingDirection>,
+    pub(crate) spread: crate::spread_db::StoredSpreadState,
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     pub(crate) singleton_spread_endpoint_preferences:
         crate::settings::SingletonSpreadEndpointPreferences,
@@ -447,9 +445,13 @@ fn build_context_result(
             if let Some(db) = rotation_db {
                 let loaded = db.get_many(page_keys.iter().copied());
                 for (index, key) in &page_items {
-                    if let Some(rotation) = loaded.get(*key) {
-                        state.rotation_cache.insert(*index, *rotation);
-                    }
+                    state.rotation_cache.insert(
+                        *index,
+                        loaded
+                            .get(*key)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
+                    );
                 }
             }
             for item in chunk.iter().filter(|item| item.page_key().is_some()) {
@@ -460,7 +462,10 @@ fn build_context_result(
                     || state.mask_pages.contains(&item.index)
                     || state.conceal_pages.contains(&item.index)
                     || state.comic_pages.contains(&item.index)
-                    || state.rotation_cache.contains_key(&item.index);
+                    || state
+                        .rotation_cache
+                        .get(&item.index)
+                        .is_some_and(|rotation| !rotation.is_none());
                 if item.had_page_state || has_new_state {
                     state.thumbnail_reset_indices.push(item.index);
                 }
@@ -564,9 +569,6 @@ fn build_context_result(
                 let stored = spread_db
                     .map(|db| db.get_state_with_fallback(path, fallback))
                     .unwrap_or_default();
-                let spread_mode = stored.mode;
-                let reading_flow = stored.flow;
-                let reading_direction = stored.direction;
                 let final_cover_spread_preference = spread_db
                     .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
                     .unwrap_or_default();
@@ -598,9 +600,7 @@ fn build_context_result(
                 };
                 let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
                 Some(ContainerStateResult {
-                    spread_mode,
-                    reading_flow,
-                    reading_direction,
+                    spread: stored,
                     final_cover_spread_preference,
                     singleton_spread_endpoint_preferences,
                     page_alone_preferences,
@@ -1135,6 +1135,18 @@ mod tests {
                         video_path: None,
                         video_size: 0,
                     },
+                    ItemKey {
+                        index: 30,
+                        key: "c:/pictures/unrotated.jpg".to_owned(),
+                        rating: false,
+                        tags: false,
+                        page: true,
+                        had_page_state: false,
+                        alternate_page_key: None,
+                        container_path: None,
+                        video_path: None,
+                        video_size: 0,
+                    },
                 ],
                 current_rating_key: None,
                 spread_container_path: None,
@@ -1153,6 +1165,14 @@ mod tests {
         .expect("refresh should complete");
         let page = result.contexts[0].page_state.as_ref().unwrap();
         assert_eq!(page.thumbnail_reset_indices, vec![10, 20]);
+        assert_eq!(
+            page.rotation_cache.get(&20),
+            Some(&crate::rotation_db::Rotation::None)
+        );
+        assert_eq!(
+            page.rotation_cache.get(&30),
+            Some(&crate::rotation_db::Rotation::None)
+        );
         assert_eq!(
             page.rotation_cache.get(&10),
             Some(&crate::rotation_db::Rotation::Cw90)

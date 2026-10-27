@@ -256,6 +256,7 @@ fn wheel_actions(
             unit,
             delta,
             modifiers,
+            ..
         } = event
         else {
             continue;
@@ -357,7 +358,7 @@ fn draw_dark_page_overview(
         .with_clip_rect(surface.intersect(ui.clip_rect()));
     painter.rect_filled(surface, 0.0, Color32::BLACK);
     painter.rect_filled(geometry.header, 0.0, ui.visuals().faint_bg_color);
-    let id = ui.id().with((
+    let id = ui.scope_id().with((
         "page-overview",
         view.stamp.context_serial,
         view.stamp.incarnation,
@@ -644,8 +645,8 @@ fn draw_dark_page_overview(
             state
                 .events
                 .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
-            state.raw_scroll_delta = Vec2::ZERO;
             state.smooth_scroll_delta = Vec2::ZERO;
+            state.discard_pending_scroll();
             actions
         });
         actions.extend(wheel);
@@ -721,6 +722,8 @@ mod tests {
                 ctrl,
                 ..Default::default()
             },
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         }
     }
 
@@ -732,12 +735,12 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> PageOverviewRenderOutput {
         let mut output = None;
-        let _ = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), events, ..Default::default() }, |ctx| {
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+        ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), events, ..Default::default() }, |root_ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(root_ui, |ui| {
                 let failed = HashMap::from([(3, PageOverviewThumbnail::Failed)]);
                 output = Some(draw_page_overview(ui, PageOverviewRenderInput { view, title: "A very long book title that must fit without moving the return button", current_items_indices: &[0, 1], thumbnails: Some(&failed), direction: PageOverviewDirection::RightToLeft, input_enabled: enabled }));
             });
-        });
+        }).drop_without_applying_deltas();
         output.unwrap()
     }
 
@@ -823,10 +826,10 @@ mod tests {
         let preference_before = ctx.options(|options| options.theme_preference);
         let view = view(20);
         let mut surface = Rect::NOTHING;
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_ui(egui::RawInput::default(), |root_ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
+                .show(root_ui, |ui| {
                     let parent_visuals = ui.visuals().clone();
                     surface = ui.available_rect_before_wrap();
                     draw_page_overview(
@@ -857,6 +860,7 @@ mod tests {
         assert!(output.shapes.iter().any(|shape| matches!(
             &shape.shape, egui::Shape::Text(text) if text.fallback_color == text_color
         )));
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -958,7 +962,6 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event, egui::Event::MouseWheel { .. }))
         }));
-        assert_eq!(ctx.input(|input| input.raw_scroll_delta), Vec2::ZERO);
         assert_eq!(ctx.input(|input| input.smooth_scroll_delta), Vec2::ZERO);
         let result = frame(&ctx, &view, size, true, vec![wheel(-3.0, true)]);
         assert_eq!(
@@ -993,16 +996,16 @@ mod tests {
         let view = view(20);
         let size = egui::vec2(720.0, 500.0);
         let mut base_id = None;
-        let _ = ctx.run(
+        ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        base_id = Some(ui.id().with((
+                    .show(root_ui, |ui| {
+                        base_id = Some(ui.scope_id().with((
                             "page-overview",
                             view.stamp.context_serial,
                             view.stamp.incarnation,
@@ -1020,7 +1023,8 @@ mod tests {
                         );
                     });
             },
-        );
+        )
+        .drop_without_applying_deltas();
         let base_id = base_id.unwrap();
         for widget in [
             base_id.with("back"),

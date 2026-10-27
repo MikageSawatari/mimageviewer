@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/egui-ime",
     "crates/startup-diagnostics",
     "crates/epub-pdf-worker",
     "crates/susie-worker",
@@ -7,6 +8,7 @@ members = [
     "crates/launcher",
     "crates/local-adjust-core",
     "crates/libraw-sys",
+    "crates/libavif-sys",
     "crates/comic-core",
     "crates/music-core",
     "crates/remote-ipc",
@@ -26,6 +28,8 @@ exclude = [
     "vendor/eframe",
     "vendor/egui",
     "vendor/egui-wgpu",
+    "vendor/egui-winit",
+    "vendor/epaint",
     "vendor/tantivy",
 ]
 
@@ -33,6 +37,8 @@ exclude = [
 eframe = { path = "vendor/eframe" }
 egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
+egui-winit = { path = "vendor/egui-winit" }
+epaint = { path = "vendor/epaint" }
 tantivy = { path = "vendor/tantivy" }
 ort = { path = "crates/ort-patched" }
 
@@ -43,10 +49,10 @@ ort = { path = "crates/ort-patched" }
 # 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "4.6.0"
+version = "4.8.3"
 edition = "2024"
-# let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
-rust-version = "1.88"
+# egui / eframe 0.37 の MSRV。開発 toolchain は 1.99 固定。
+rust-version = "1.95"
 
 [package]
 name = "mimageviewer"
@@ -59,7 +65,7 @@ autobins = false
 manual-e2e = []
 # Opt-in in-process Rhai runner for isolated application tests. Production
 # builds keep this disabled unless the developer explicitly requests it.
-test-script = ["eframe/miv-test-script-window-witness"]
+test-script = ["eframe/miv-test-script-window-witness", "eframe/miv-test-script-wait-witness"]
 # ベンチマーク、配布パック生成、診断用の補助 bin は通常の build/test 対象から外す。
 # 必要なときだけ `--features dev-tools --bin <name>` で明示的に有効化する。
 dev-tools = ["pack-build-tools"]
@@ -279,8 +285,14 @@ required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
 libraw-sys = { path = "crates/libraw-sys" }
+libavif-sys = { path = "crates/libavif-sys" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_Graphics_Dwm",
     "Win32_System_Performance",
     "Win32_System_ProcessStatus",
@@ -291,13 +303,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.61"
-# wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも
-# 公開し、wgpu の hal::Api::Device 経由で得る ID3D12Resource を OpenSharedHandle
-# 経由で生成するときに使う (本体の windows 0.61 とは ID3D12Resource 型互換性なし)。
-windows_058 = { package = "windows", version = "0.58", features = [
-    "Win32_Graphics_Direct3D12",
-    "Win32_Foundation",
-] }
 windows = { version = "0.61", features = [
     "Win32_Globalization",
     "Win32_UI_Accessibility",
@@ -312,6 +317,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_Debug",
@@ -354,15 +360,13 @@ winreg = "0.52"
 
 [dependencies]
 miv-startup = { path = "crates/startup-diagnostics" }
-eframe = { version = "0.33", features = ["wgpu"] }
-egui = "0.33"
-egui-wgpu = "0.33"
-# 動画 GPU レンダリングで wgpu API + dx12 hal 経由の D3D11→wgpu テクスチャ共有が
-# 必要なので、明示的に wgpu / wgpu-hal を依存させる (eframe[wgpu] が間接的に
-# 引いている版に揃える)。wgpu-hal 27 は windows 0.58 系の ID3D12Resource を要求
-# するため、そちらも `windows_058` 別名で導入する (本体側は windows 0.61)。
-wgpu = "27"
-wgpu-hal = { version = "27", features = ["dx12"] }
+eframe = { version = "0.37.0", features = ["wgpu", "glow"] }
+egui = "0.37.0"
+egui-ime = { path = "crates/egui-ime" }
+egui-wgpu = "0.37.0"
+# 静止画縮小・比較・パノラマと native presenter の HUD overlay に使う。
+# eframe[wgpu] / egui-wgpu が使う版に揃える。動画本体は D3D11 native presenter。
+wgpu = "30"
 pollster = "0.4"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 qrcode = { version = "0.14", default-features = false }
@@ -476,15 +480,17 @@ regex = "1"
 mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
+libc = "0.2"
+winit = "0.30.13"
 tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
 tempfile = "3"
-eframe = { version = "0.33", features = ["miv-test-script-window-witness"] }
+eframe = { version = "0.37.0", features = ["miv-test-script-window-witness"] }
 # `examples/bench_pdf_count.rs` (PDFium vs lopdf 比較ベンチマーク) でのみ使用。
 # 本体には組み込まれない (= 配布バイナリサイズに影響なし)。MIT.
 lopdf = "0.36"
 # egui UI の回帰テスト用 (WCAG 検証 + 見た目のスナップショット)。
 # egui 0.33 系統に合わせて 0.33.x を指定。
-egui_kittest = { version = "0.33", features = ["snapshot", "wgpu"] }
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
 
 [build-dependencies]
 winresource = "0.1"

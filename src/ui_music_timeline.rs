@@ -9,15 +9,17 @@
 //!   (黒待ち・古い行の混入を防ぐ最終防衛線)。
 //! - 再生カーソル行を優先要求し、可視範囲・近傍の順にラスタライズする。
 //!
-//! `render_timeline_row_image` 以下のピクセル描画・カラーマッピング・key/bass root 検出は
-//! ラボの実装を字面どおり移植している (ラボが機能の正本、`docs/music-integration-plan.md`
-//! §2.1 の「再利用する」原則)。egui 依存 (`Color32` / `ColorImage`) があるため music-core には
-//! 置けず、本体側モジュールとして持つ。
+//! ピクセル描画・カラーマッピング・key 検出はラボ由来。bass root は別計算の
+//! HarmNet track を使い、リズム区間の投票と既存の重みを維持する。投票結果は texture と
+//! 一緒に保持して、ホバーの音名を表示中の色と一致させる。egui 依存があるため本体側で持つ。
+
+use crate::music_note_color::{MusicNoteColorScheme, note_color};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
+use music_core::bass::{BassEstimate, TimelineBassTrack};
 use music_core::{TimelineAnalysis, WaveformBin};
 
 // ── レイアウト・解析定数 (ラボと同値) ──
@@ -90,6 +92,17 @@ pub struct TimelineTextureCache {
     /// `Arc::as_ptr` の identity 比較はアドレス再利用 (ABA) で差し替えを見逃すため
     /// 版数で判定する (review-v2.3.0 P2-4)。
     last_analysis_version: u64,
+    #[cfg(test)]
+    raster_measurement: TimelineRasterMeasurement,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TimelineRasterMeasurement {
+    submitted: usize,
+    received: usize,
+    max_queue_wait: std::time::Duration,
+    raster_time: std::time::Duration,
 }
 
 struct TimelineRowTexture {
@@ -97,6 +110,7 @@ struct TimelineRowTexture {
     row_version: u64,
     texture: egui::TextureHandle,
     represented_bins: usize,
+    bass_hints: Vec<TimelineBassDisplayBin>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,6 +141,10 @@ struct TimelineRasterRequest {
     /// 切り出し (`timeline_bins_for_raster` 相当) はワーカー側で行う (Codex P2: UI スレッドで
     /// 数千 bin をコピーしない)。
     analysis: Arc<TimelineAnalysis>,
+    bass: Option<Arc<TimelineBassTrack>>,
+    scheme: MusicNoteColorScheme,
+    #[cfg(test)]
+    queued_at: std::time::Instant,
 }
 
 struct TimelineRasterResult {
@@ -136,6 +154,11 @@ struct TimelineRasterResult {
     key: TimelineTextureCacheKey,
     image: egui::ColorImage,
     represented_bins: usize,
+    bass_hints: Vec<TimelineBassDisplayBin>,
+    #[cfg(test)]
+    queue_wait: std::time::Duration,
+    #[cfg(test)]
+    raster_time: std::time::Duration,
 }
 
 impl TimelineTextureCacheKey {
@@ -158,8 +181,8 @@ impl TimelineTextureCache {
     /// 解析結果の版数が変わったら（progressive partial → 成長 / partial → final）、
     /// 既存の全 row を再ラスタ対象にする。`TimelineTextureCacheKey` は x 軸幅（= player duration）
     /// が不変なら同一なので、`ensure` の key 差分だけでは無効化されない（Codex P1）。key を保った
-    /// まま全 `row_version` を進めて古い row texture を stale 化する（worker は残す）。partial は
-    /// 幾何級数で高々十数回なので再ラスタ総コストは有界。`analysis_version` =
+    /// まま全 `row_version` を進めて古い row texture を stale 化する（worker は残す）。bass の
+    /// 新しい snapshot も同じ版数を使う。`analysis_version` =
     /// `App::music_analysis_version`（代入ごとに単調増加、0 は「未取得」sentinel）。
     fn note_analysis_identity(&mut self, analysis_version: u64) {
         if analysis_version == 0 || self.last_analysis_version == analysis_version {
@@ -227,6 +250,15 @@ impl TimelineTextureCache {
                     break;
                 }
             };
+            #[cfg(test)]
+            {
+                self.raster_measurement.received += 1;
+                self.raster_measurement.max_queue_wait = self
+                    .raster_measurement
+                    .max_queue_wait
+                    .max(result.queue_wait);
+                self.raster_measurement.raster_time += result.raster_time;
+            }
             if Some(result.key) != self.key || result.generation != self.generation {
                 continue;
             }
@@ -264,6 +296,7 @@ impl TimelineTextureCache {
                 row_version: result.row_version,
                 texture,
                 represented_bins: result.represented_bins,
+                bass_hints: result.bass_hints,
             });
             uploaded += 1;
             represented_bins += result.represented_bins;
@@ -274,9 +307,11 @@ impl TimelineTextureCache {
     fn row_texture(
         &mut self,
         analysis: &Arc<TimelineAnalysis>,
+        bass: &Option<Arc<TimelineBassTrack>>,
         row: usize,
         row_secs: f64,
         key: TimelineTextureCacheKey,
+        scheme: MusicNoteColorScheme,
     ) -> (Option<(&egui::TextureHandle, usize)>, bool) {
         self.ensure(key);
         if row >= self.rows.len() {
@@ -309,8 +344,16 @@ impl TimelineTextureCache {
                     row_secs,
                     key,
                     analysis: Arc::clone(analysis),
+                    bass: bass.clone(),
+                    scheme,
+                    #[cfg(test)]
+                    queued_at: std::time::Instant::now(),
                 };
                 if tx.send(request).is_ok() {
+                    #[cfg(test)]
+                    {
+                        self.raster_measurement.submitted += 1;
+                    }
                     self.pending[row] = Some(TimelinePendingRow {
                         key,
                         generation: self.generation,
@@ -339,6 +382,23 @@ impl TimelineTextureCache {
                 row_texture.key == key && row_texture.row_version >= row_version
             })
     }
+
+    /// Read the vote that produced the displayed texture, including while a newer
+    /// snapshot is pending. No vote calculation or array copy occurs on the UI thread.
+    fn bass_hint_at_time(&self, row: usize, time_secs: f64) -> TimelinePitchHint {
+        self.rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .map(|texture| bass_display_hint_at_time(&texture.bass_hints, time_secs))
+            .unwrap_or_default()
+    }
+
+    fn key_hint_at_time(&self, row: usize, time_secs: f64) -> Option<TimelineKeyHint> {
+        self.rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .and_then(|texture| key_display_hint_at_time(&texture.bass_hints, time_secs))
+    }
 }
 
 impl Drop for TimelineTextureCache {
@@ -352,6 +412,17 @@ fn run_timeline_raster_worker(
     result_tx: mpsc::Sender<TimelineRasterResult>,
     cancel: Arc<AtomicBool>,
 ) {
+    run_timeline_raster_worker_with_publish_hook(request_rx, result_tx, cancel, |_| {});
+}
+
+// The production worker uses a no-op hook. Tests pause publication to exercise
+// a real old-palette request deterministically, without product timing/sleeps.
+fn run_timeline_raster_worker_with_publish_hook(
+    request_rx: mpsc::Receiver<TimelineRasterRequest>,
+    result_tx: mpsc::Sender<TimelineRasterResult>,
+    cancel: Arc<AtomicBool>,
+    before_publish: impl Fn(&TimelineRasterResult),
+) {
     while !cancel.load(Ordering::Relaxed) {
         let request = match request_rx.recv() {
             Ok(request) => request,
@@ -360,36 +431,46 @@ fn run_timeline_raster_worker(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
+        #[cfg(test)]
+        let raster_started = std::time::Instant::now();
+        #[cfg(test)]
+        let queue_wait = raster_started.duration_since(request.queued_at);
         let row_start = request.row as f64 * request.row_secs;
         // 行ウィンドウの切り出しはワーカー側で行う (UI スレッドは Arc を渡すだけ)。
         // 全 bin をコピーせず、部分スライスを直接 render に渡す (ゼロコピー)。
         let (start_idx, end_idx) =
             timeline_bins_window_range(&request.analysis.bins, row_start, request.row_secs);
-        let (image, represented_bins) = render_timeline_row_image(
+        let (image, represented_bins, bass_hints) = render_timeline_row_with_hints(
             row_start,
             request.row_secs,
             &request.analysis.bins[start_idx..end_idx],
+            request.bass.as_deref(),
             None,
             request.key.width_px,
             request.key.waveform_h_px,
             request.key.gap_px,
             request.key.metrics_h_px,
             request.key.dark,
+            request.scheme,
         );
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if result_tx
-            .send(TimelineRasterResult {
-                generation: request.generation,
-                row_version: request.row_version,
-                row: request.row,
-                key: request.key,
-                image,
-                represented_bins,
-            })
-            .is_err()
-        {
+        let result = TimelineRasterResult {
+            generation: request.generation,
+            row_version: request.row_version,
+            row: request.row,
+            key: request.key,
+            image,
+            represented_bins,
+            bass_hints,
+            #[cfg(test)]
+            queue_wait,
+            #[cfg(test)]
+            raster_time: raster_started.elapsed(),
+        };
+        before_publish(&result);
+        if result_tx.send(result).is_err() {
             break;
         }
     }
@@ -423,6 +504,7 @@ pub struct MusicTimelineOutcome {
 pub fn draw_music_timeline(
     ui: &mut egui::Ui,
     analysis: &Arc<TimelineAnalysis>,
+    bass: &Option<Arc<TimelineBassTrack>>,
     // `App::music_analysis_version` (解析差し替えごとに進む。row 再ラスタ判定に使う)。
     analysis_version: u64,
     duration_secs: f64,
@@ -436,6 +518,7 @@ pub fn draw_music_timeline(
     // ラベルをパネルトリガ帯 (= seek 不要領域) に載せ、波形は中央領域を全幅使う
     // (実機 FB 2026-07)。ラベルは波形左端に右寄せで描く。
     left_label_w: f32,
+    scheme: MusicNoteColorScheme,
 ) -> MusicTimelineOutcome {
     let mut seek_request = None;
     let row_secs = row_secs.max(1.0);
@@ -570,7 +653,8 @@ pub fn draw_music_timeline(
         if !cache.row_is_fresh(row, texture_key) {
             pending_raster = true;
         }
-        let (_, request_sent) = cache.row_texture(analysis, row, row_secs, texture_key);
+        let (_, request_sent) =
+            cache.row_texture(analysis, bass, row, row_secs, texture_key, scheme);
         if request_sent {
             pending_raster = true;
         }
@@ -582,7 +666,8 @@ pub fn draw_music_timeline(
         if !cache.row_is_fresh(row, texture_key) {
             pending_raster = true;
         }
-        let (row_texture, request_sent) = cache.row_texture(analysis, row, row_secs, texture_key);
+        let (row_texture, request_sent) =
+            cache.row_texture(analysis, bass, row, row_secs, texture_key, scheme);
         if request_sent {
             pending_raster = true;
         }
@@ -630,6 +715,7 @@ pub fn draw_music_timeline(
             row_gap,
             rows,
             &analysis.bins,
+            cache,
         );
     }
 
@@ -727,8 +813,13 @@ fn timeline_manual_scroll_requested(
     if !pointer_over_timeline {
         return false;
     }
+    let input_options = ui.ctx().options(|o| o.input_options);
     ui.input(|input| {
-        input.raw_scroll_delta.y.abs() > 0.0 || input.smooth_scroll_delta.y.abs() > 0.5
+        crate::wheel_input::remaining_wheel_delta(input, input_options)
+            .y
+            .abs()
+            > 0.0
+            || input.smooth_scroll_delta.y.abs() > 0.5
     })
 }
 
@@ -795,6 +886,7 @@ fn draw_timeline_metric_hover(
     row_gap: f32,
     rows: usize,
     bins: &[WaveformBin],
+    cache: &TimelineTextureCache,
 ) {
     if row_secs <= 0.0 || rows == 0 || bins.is_empty() || !graph_rect.contains(pos) {
         return;
@@ -830,7 +922,13 @@ fn draw_timeline_metric_hover(
     let Some(bin) = timeline_bin_at_time(bins, time_secs) else {
         return;
     };
-    let value = timeline_metric_hover_value(kind, bins, bin, time_secs).clamp(0.0, 1.0);
+    let key_hint = cache.key_hint_at_time(row, time_secs);
+    if kind == TimelineMetricKind::Key && key_hint.is_none() {
+        return;
+    }
+    let key_hint = key_hint.unwrap_or_default();
+    let value = timeline_metric_hover_value(kind, bin, key_hint).clamp(0.0, 1.0);
+    let bass_hint = cache.bass_hint_at_time(row, time_secs);
     let x = graph_rect.left() + frac * graph_rect.width();
     let (lane_top, lane_bottom) =
         timeline_metric_lane_bounds_f32(metrics_rect.top(), metrics_rect.height(), lane_idx);
@@ -861,7 +959,7 @@ fn draw_timeline_metric_hover(
     let label = format!(
         "{}{} {:.0}%  {}  {}",
         timeline_metric_name(kind),
-        timeline_metric_extra(kind, bins, bin, time_secs),
+        timeline_metric_extra(kind, bass_hint, key_hint),
         value * 100.0,
         format_time(time_secs),
         timeline_metric_description(kind)
@@ -966,6 +1064,7 @@ pub(crate) fn render_timeline_row_image(
     row_start: f64,
     row_secs: f64,
     bins: &[WaveformBin],
+    bass: Option<&TimelineBassTrack>,
     // `Some` はシークストリップの帯。粗い列と窓復号の**どちらも** `Some` を渡す。片方だけ
     // 渡すと、同じ帯なのに中心線の見え方が経路で変わってしまう。`None` は音楽ビューで、
     // 見た目は従来のまま (raster スナップショットが一致し続ける必要がある)。
@@ -976,6 +1075,36 @@ pub(crate) fn render_timeline_row_image(
     metrics_h: usize,
     _dark: bool,
 ) -> (egui::ColorImage, usize) {
+    let (image, represented_bins, _) = render_timeline_row_with_hints(
+        row_start,
+        row_secs,
+        bins,
+        bass,
+        seek_strip,
+        width,
+        waveform_h,
+        gap_h,
+        metrics_h,
+        _dark,
+        MusicNoteColorScheme::default(),
+    );
+    (image, represented_bins)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_timeline_row_with_hints(
+    row_start: f64,
+    row_secs: f64,
+    bins: &[WaveformBin],
+    bass: Option<&TimelineBassTrack>,
+    seek_strip: Option<&SeekStripRowStyle>,
+    width: usize,
+    waveform_h: usize,
+    gap_h: usize,
+    metrics_h: usize,
+    _dark: bool,
+    scheme: MusicNoteColorScheme,
+) -> (egui::ColorImage, usize, Vec<TimelineBassDisplayBin>) {
     let height = waveform_h + gap_h + metrics_h;
     let bg = timeline_bg();
     let mut pixels = vec![bg; width * height];
@@ -1099,18 +1228,17 @@ pub(crate) fn render_timeline_row_image(
     }
 
     // A compact waveform surface has no metrics lane. Avoid doing the metric-only
-    // pitch/chroma voting in that case; the positive-height music-view path is
-    // intentionally unchanged so its raster snapshots remain identical.
+    // pitch/chroma voting in that case.
     let (bass_hints, key_hints) = if metrics_h == 0 {
         (
-            vec![TimelinePitchHint::default(); visible_bins.len()],
-            vec![TimelineKeyHint::default(); visible_bins.len()],
+            vec![None; visible_bins.len()],
+            vec![None; visible_bins.len()],
         )
     } else {
         let rhythm_segments = build_timeline_rhythm_segments(bins, &visible_bins);
         (
-            build_bass_root_display_hints(bins, &visible_bins, &rhythm_segments),
-            build_key_display_hints(bins, &visible_bins, &rhythm_segments),
+            build_bass_root_display_hints(bins, &visible_bins, &rhythm_segments, bass),
+            build_key_display_hints(bins, &visible_bins, &rhythm_segments, bass),
         )
     };
 
@@ -1185,8 +1313,9 @@ pub(crate) fn render_timeline_row_image(
             visible.x0,
             visible.x1,
             bin,
-            bass_hints[visible_idx],
-            key_hints[visible_idx],
+            bass_hints[visible_idx].unwrap_or_default(),
+            key_hints[visible_idx].unwrap_or_default(),
+            scheme,
         );
     }
 
@@ -1233,7 +1362,29 @@ pub(crate) fn render_timeline_row_image(
         );
     }
 
-    (egui::ColorImage::new([width, height], pixels), drawn_bins)
+    let bass_display_bins = if metrics_h == 0 {
+        Vec::new()
+    } else {
+        visible_bins
+            .iter()
+            .zip(bass_hints)
+            .zip(key_hints)
+            .map(|((visible, hint), key_hint)| {
+                let bin = &bins[visible.index];
+                TimelineBassDisplayBin {
+                    start_secs: bin.start_secs.max(row_start),
+                    end_secs: (bin.start_secs + bin.duration_secs).min(row_start + row_secs),
+                    hint,
+                    key_hint,
+                }
+            })
+            .collect()
+    };
+    (
+        egui::ColorImage::new([width, height], pixels),
+        drawn_bins,
+        bass_display_bins,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1247,6 +1398,33 @@ struct TimelineVisibleBin {
 struct TimelinePitchHint {
     pitch_class: u8,
     confidence: f32,
+}
+
+/// `None` retains the uncomputed mark through rasterization and upload. A
+/// computed, silent track is `Some(default)`. Uncomputed bins cannot inherit a neighbour's vote.
+struct TimelineBassDisplayBin {
+    start_secs: f64,
+    end_secs: f64,
+    hint: Option<TimelinePitchHint>,
+    key_hint: Option<TimelineKeyHint>,
+}
+
+fn key_display_hint_at_time(
+    bins: &[TimelineBassDisplayBin],
+    time_secs: f64,
+) -> Option<TimelineKeyHint> {
+    let index = bins.partition_point(|bin| bin.end_secs <= time_secs);
+    bins.get(index)
+        .filter(|bin| time_secs >= bin.start_secs)
+        .and_then(|bin| bin.key_hint)
+}
+
+fn bass_display_hint_at_time(bins: &[TimelineBassDisplayBin], time_secs: f64) -> TimelinePitchHint {
+    let index = bins.partition_point(|bin| bin.end_secs <= time_secs);
+    bins.get(index)
+        .filter(|bin| time_secs >= bin.start_secs)
+        .and_then(|bin| bin.hint)
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1327,12 +1505,18 @@ fn build_bass_root_display_hints(
     bins: &[WaveformBin],
     visible_bins: &[TimelineVisibleBin],
     rhythm_segments: &[TimelineRhythmSegment],
-) -> Vec<TimelinePitchHint> {
-    let mut hints = vec![TimelinePitchHint::default(); visible_bins.len()];
+    bass: Option<&TimelineBassTrack>,
+) -> Vec<Option<TimelinePitchHint>> {
+    let mut hints = vec![None; visible_bins.len()];
     for segment in rhythm_segments {
-        let hint = vote_bass_root_hint(bins, &visible_bins[segment.start..segment.end]);
-        for slot in &mut hints[segment.start..segment.end] {
-            *slot = hint;
+        let hint = vote_bass_root_hint(bins, &visible_bins[segment.start..segment.end], bass);
+        for idx in segment.start..segment.end {
+            if bass
+                .and_then(|track| track.at_secs(bins[visible_bins[idx].index].start_secs))
+                .is_some()
+            {
+                hints[idx] = Some(hint);
+            }
         }
     }
 
@@ -1343,8 +1527,9 @@ fn build_key_display_hints(
     bins: &[WaveformBin],
     visible_bins: &[TimelineVisibleBin],
     rhythm_segments: &[TimelineRhythmSegment],
-) -> Vec<TimelineKeyHint> {
-    let mut hints = vec![TimelineKeyHint::default(); visible_bins.len()];
+    track: Option<&TimelineBassTrack>,
+) -> Vec<Option<TimelineKeyHint>> {
+    let mut hints = vec![None; visible_bins.len()];
     for segment in rhythm_segments {
         if segment.start >= segment.end {
             continue;
@@ -1352,12 +1537,7 @@ fn build_key_display_hints(
         let center_visible = &visible_bins[(segment.start + segment.end - 1) / 2];
         let center_bin = &bins[center_visible.index];
         let center_secs = center_bin.start_secs + center_bin.duration_secs * 0.5;
-        let window_start = center_secs - TIMELINE_KEY_WINDOW_SECS * 0.5;
-        let window_end = center_secs + TIMELINE_KEY_WINDOW_SECS * 0.5;
-        let start_idx =
-            bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
-        let end_idx = bins.partition_point(|bin| bin.start_secs < window_end);
-        let hint = vote_key_hint(&bins[start_idx..end_idx]);
+        let hint = track.and_then(|track| key_hint_at_time(bins, track, center_secs));
         for slot in &mut hints[segment.start..segment.end] {
             *slot = hint;
         }
@@ -1369,29 +1549,36 @@ fn build_key_display_hints(
 fn vote_bass_root_hint(
     bins: &[WaveformBin],
     visible_bins: &[TimelineVisibleBin],
+    bass: Option<&TimelineBassTrack>,
 ) -> TimelinePitchHint {
     let mut votes = [0.0_f32; 12];
     let mut count = 0usize;
     for visible in visible_bins {
         let bin = &bins[visible.index];
-        let weight = timeline_metric_value(TimelineMetricKind::LoudnessBassRoot, bin).powi(2);
-        votes[bin.bass_pitch_class as usize % 12] += weight;
+        let Some(estimate) = bass.and_then(|track| track.at_secs(bin.start_secs)) else {
+            continue;
+        };
+        let weight = bass_vote_weight(bin, estimate).powi(2);
+        votes[estimate.midi as usize % 12] += weight;
         count += 1;
     }
     best_pitch_hint(votes, count)
 }
 
-fn vote_key_hint(bins: &[WaveformBin]) -> TimelineKeyHint {
+fn vote_key_hint(bins: &[WaveformBin], track: &TimelineBassTrack) -> Option<TimelineKeyHint> {
     let mut chroma = [0.0_f32; 12];
     let mut presence = [0.0_f32; 12];
     let mut total_weight = 0.0_f32;
     for bin in bins {
+        // Every selected bin is an input, even when its weight is zero. A
+        // missing frame must not turn an incomplete vote into a computed hint.
+        let frame_chroma = track.chroma_at_secs(bin.start_secs)?;
         let weight = key_chroma_bin_weight(bin);
         if weight <= 1.0e-5 {
             continue;
         }
-        let bin_max = bin.chroma.iter().copied().fold(0.0_f32, f32::max);
-        for (pc, value) in bin.chroma.iter().copied().enumerate() {
+        let bin_max = frame_chroma.iter().copied().fold(0.0_f32, f32::max);
+        for (pc, value) in frame_chroma.iter().copied().enumerate() {
             let value = value.max(0.0);
             chroma[pc] += value.powf(1.08) * weight;
             if bin_max > 1.0e-6 {
@@ -1400,18 +1587,32 @@ fn vote_key_hint(bins: &[WaveformBin]) -> TimelineKeyHint {
         }
         total_weight += weight;
     }
-    profile_key_hint(chroma, presence, total_weight)
+    Some(profile_key_hint(chroma, presence, total_weight))
 }
 
-fn key_hint_at_time(bins: &[WaveformBin], time_secs: f64) -> TimelineKeyHint {
+fn key_hint_at_time(
+    bins: &[WaveformBin],
+    track: &TimelineBassTrack,
+    time_secs: f64,
+) -> Option<TimelineKeyHint> {
     if bins.is_empty() || !time_secs.is_finite() {
-        return TimelineKeyHint::default();
+        return None;
     }
     let window_start = time_secs - TIMELINE_KEY_WINDOW_SECS * 0.5;
     let window_end = time_secs + TIMELINE_KEY_WINDOW_SECS * 0.5;
     let start_idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
     let end_idx = bins.partition_point(|bin| bin.start_secs < window_end);
-    vote_key_hint(&bins[start_idx..end_idx])
+    let window_bins = &bins[start_idx..end_idx];
+    // The first overlapping bin reads chroma at its start, which can precede
+    // the seconds window and round to the previous segment. Include that
+    // reference as well as every real frame in the clipped six-second window.
+    let reference_start = window_bins
+        .first()
+        .map_or(window_start, |bin| window_start.min(bin.start_secs));
+    if !track.window_is_computed(reference_start, window_end) {
+        return None;
+    }
+    vote_key_hint(window_bins, track)
 }
 
 fn key_chroma_bin_weight(bin: &WaveformBin) -> f32 {
@@ -1431,8 +1632,7 @@ fn key_chroma_bin_weight(bin: &WaveformBin) -> f32 {
                 TIMELINE_KEY_DENSITY_PENALTY_END,
                 bin.transient_density,
             );
-    let confidence = 0.36 + bin.key_confidence.clamp(0.0, 1.0) * 0.64;
-    (loudness * transient_keep * density_keep * confidence).clamp(0.0, 1.0)
+    (loudness * transient_keep * density_keep).clamp(0.0, 1.0)
 }
 
 fn profile_key_hint(chroma: [f32; 12], presence: [f32; 12], total_weight: f32) -> TimelineKeyHint {
@@ -1568,6 +1768,7 @@ fn draw_timeline_metric_bins(
     bin: &WaveformBin,
     bass_hint: TimelinePitchHint,
     key_hint: TimelineKeyHint,
+    scheme: MusicNoteColorScheme,
 ) {
     if metrics_h == 0 {
         return;
@@ -1592,7 +1793,7 @@ fn draw_timeline_metric_bins(
             bar_top,
             x1,
             lane_bottom,
-            timeline_metric_color(kind, value, bin, bass_hint, key_hint),
+            timeline_metric_color(kind, value, bin, bass_hint, key_hint, scheme),
         );
         if idx > 0 {
             fill_rect_f32(
@@ -1635,13 +1836,11 @@ fn timeline_metric_lane_bounds_f32(
 fn timeline_metric_display_value(
     kind: TimelineMetricKind,
     bin: &WaveformBin,
-    bass_hint: TimelinePitchHint,
+    _bass_hint: TimelinePitchHint,
     key_hint: TimelineKeyHint,
 ) -> f32 {
     match kind {
-        TimelineMetricKind::LoudnessBassRoot => {
-            timeline_loudness_value(bin) * (0.72 + 0.28 * bass_hint.confidence.clamp(0.0, 1.0))
-        }
+        TimelineMetricKind::LoudnessBassRoot => timeline_low_loudness_value(bin),
         TimelineMetricKind::Key if key_hint.confidence > 0.0 => {
             TIMELINE_KEY_DISPLAY_FLOOR + key_hint.confidence * (1.0 - TIMELINE_KEY_DISPLAY_FLOOR)
         }
@@ -1651,31 +1850,34 @@ fn timeline_metric_display_value(
 
 fn timeline_metric_hover_value(
     kind: TimelineMetricKind,
-    bins: &[WaveformBin],
     bin: &WaveformBin,
-    time_secs: f64,
+    key_hint: TimelineKeyHint,
 ) -> f32 {
     match kind {
-        TimelineMetricKind::LoudnessBassRoot => timeline_loudness_value(bin),
-        TimelineMetricKind::Key => key_hint_at_time(bins, time_secs).confidence,
+        TimelineMetricKind::LoudnessBassRoot => timeline_low_loudness_value(bin),
+        TimelineMetricKind::Key => key_hint.confidence,
     }
 }
 
-fn timeline_metric_value(kind: TimelineMetricKind, bin: &WaveformBin) -> f32 {
-    match kind {
-        TimelineMetricKind::LoudnessBassRoot => (bin.bass_pitch_confidence
-            * normalize_range(bin.band_energy[0], 0.06, 0.48)
-            * timeline_loudness_value(bin).powf(0.90))
-        .sqrt()
-        .clamp(0.0, 1.0),
-        TimelineMetricKind::Key => {
-            (bin.key_confidence * timeline_loudness_value(bin).powf(0.72)).clamp(0.0, 1.0)
-        }
-    }
+fn bass_vote_weight(bin: &WaveformBin, bass: BassEstimate) -> f32 {
+    (bass.confidence
+        * normalize_range(bin.band_energy[0], 0.06, 0.48)
+        * timeline_loudness_value(bin).powf(0.90))
+    .sqrt()
+    .clamp(0.0, 1.0)
 }
 
 fn timeline_loudness_value(bin: &WaveformBin) -> f32 {
     ((bin.loudness_db + 52.0) / 52.0).clamp(0.0, 1.0).powf(0.72)
+}
+
+fn timeline_low_loudness_value(bin: &WaveformBin) -> f32 {
+    let fraction = bin.band_energy[0].clamp(0.0, 1.0);
+    if fraction <= 0.0 {
+        return 0.0;
+    }
+    let low_db = bin.loudness_db + 10.0 * fraction.log10();
+    ((low_db + 52.0) / 52.0).clamp(0.0, 1.0).powf(0.72)
 }
 
 fn normalize_range(value: f32, low: f32, high: f32) -> f32 {
@@ -1702,23 +1904,22 @@ fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
 
 fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
     match kind {
-        TimelineMetricKind::LoudnessBassRoot => "Height RMS, color bass root",
-        TimelineMetricKind::Key => "Transient-suppressed chroma profile",
+        TimelineMetricKind::LoudnessBassRoot => "Height low-band loudness, color bass root",
+        TimelineMetricKind::Key => "Height confidence, color key",
     }
 }
 
 fn timeline_metric_extra(
     kind: TimelineMetricKind,
-    bins: &[WaveformBin],
-    bin: &WaveformBin,
-    time_secs: f64,
+    bass_hint: TimelinePitchHint,
+    key_hint: TimelineKeyHint,
 ) -> String {
     match kind {
-        TimelineMetricKind::LoudnessBassRoot if bin.bass_pitch_confidence > 0.08 => {
-            format!(" {}", pitch_class_name(bin.bass_pitch_class))
+        TimelineMetricKind::LoudnessBassRoot if bass_hint.confidence > 0.06 => {
+            format!(" {}", pitch_class_name(bass_hint.pitch_class))
         }
         TimelineMetricKind::Key => {
-            let hint = key_hint_at_time(bins, time_secs);
+            let hint = key_hint;
             if hint.confidence > 0.01 {
                 format!(
                     " {} {}",
@@ -1739,6 +1940,7 @@ fn timeline_metric_color(
     _bin: &WaveformBin,
     bass_hint: TimelinePitchHint,
     key_hint: TimelineKeyHint,
+    scheme: MusicNoteColorScheme,
 ) -> egui::Color32 {
     let value = value.clamp(0.0, 1.0);
     let base = match kind {
@@ -1746,24 +1948,26 @@ fn timeline_metric_color(
             let color_value = (bass_hint.confidence * 0.78).clamp(0.32, 0.74);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + bass_hint.pitch_class % 12, color_value),
+                    note_color(60 + bass_hint.pitch_class % 12, color_value, scheme),
                     0.86 + value * 0.16 + bass_hint.confidence * 0.12,
                 ),
                 (86.0 + value * 70.0 + bass_hint.confidence * 28.0).min(202.0) as u8,
             );
         }
-        TimelineMetricKind::LoudnessBassRoot => egui::Color32::from_rgb(188, 198, 92),
+        // No bass estimate (not yet computed, or no confident bass): neutral gray so it is not
+        // mistaken for a pitch-class color (the old olive-yellow resembled C#).
+        TimelineMetricKind::LoudnessBassRoot => egui::Color32::from_rgb(150, 156, 162),
         TimelineMetricKind::Key if key_hint.confidence > 0.0 => {
             let color_value = (0.36 + key_hint.confidence * 0.38).min(0.74);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + key_hint.pitch_class % 12, color_value),
+                    note_color(60 + key_hint.pitch_class % 12, color_value, scheme),
                     0.78 + key_hint.confidence * 0.30,
                 ),
                 (70.0 + key_hint.confidence * 120.0).min(190.0) as u8,
             );
         }
-        TimelineMetricKind::Key => egui::Color32::from_rgb(104, 214, 186),
+        TimelineMetricKind::Key => egui::Color32::from_rgb(150, 156, 162),
     };
     color_with_alpha(
         brighten_color(base, 0.42 + value * 0.72),
@@ -2086,37 +2290,6 @@ fn pitch_class_name(pitch_class: u8) -> &'static str {
     NAMES[pitch_class as usize % 12]
 }
 
-fn key_color(midi: u8, value: f32) -> egui::Color32 {
-    let pitch_class = midi % 12;
-    let fifth_index = ((pitch_class as usize * 7) % 12) as f32;
-    let hue = (fifth_index / 12.0 + 0.57) % 1.0;
-    let saturation = 0.62 + value.clamp(0.0, 1.0) * 0.28;
-    let brightness = 0.38 + value.clamp(0.0, 1.0) * 0.58;
-    hsv_to_rgb(hue, saturation, brightness)
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
-    let h = h.rem_euclid(1.0) * 6.0;
-    let i = h.floor() as i32;
-    let f = h - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    egui::Color32::from_rgb(
-        (r.clamp(0.0, 1.0) * 255.0) as u8,
-        (g.clamp(0.0, 1.0) * 255.0) as u8,
-        (b.clamp(0.0, 1.0) * 255.0) as u8,
-    )
-}
-
 fn spectral_weights(band: [f32; 3]) -> [f32; 3] {
     let low = (band[0] * 0.95).sqrt().clamp(0.0, 1.0);
     let mid = (band[1] * 0.88).sqrt().clamp(0.0, 1.0);
@@ -2244,6 +2417,1133 @@ pub fn format_row_secs(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use music_core::bass::{TIMELINE_BASS_SEGMENT_FRAMES, TimelineBassSegment};
+
+    fn bass_segment(track: &TimelineBassTrack, index: usize, midi: u8) -> TimelineBassSegment {
+        let len = (track.frame_count() - index * TIMELINE_BASS_SEGMENT_FRAMES)
+            .min(TIMELINE_BASS_SEGMENT_FRAMES);
+        TimelineBassSegment {
+            segment_index: index,
+            chroma: vec![[0.0; 12]; len],
+            estimates: vec![
+                BassEstimate {
+                    midi,
+                    confidence: if midi == 0 { 0.0 } else { 0.9 }
+                };
+                len
+            ],
+        }
+    }
+
+    fn bass_boundary_bins() -> Vec<WaveformBin> {
+        (0..10)
+            .map(|index| WaveformBin {
+                start_secs: 19.93 + index as f64 * 0.01,
+                duration_secs: 0.01,
+                peak: 0.5,
+                rms: 0.3,
+                loudness_db: -12.0,
+                band_energy: [0.45, 0.2, 0.1],
+                // Deliberately disagree with HarmNet to prove the old fields cannot leak.
+                bass_pitch_class: 2,
+                bass_pitch_confidence: 1.0,
+                ..WaveformBin::default()
+            })
+            .collect()
+    }
+
+    fn bass_boundary_raster(
+        bass: Option<&TimelineBassTrack>,
+    ) -> (egui::ColorImage, usize, Vec<TimelineBassDisplayBin>) {
+        render_timeline_row_with_hints(
+            19.93,
+            0.1,
+            &bass_boundary_bins(),
+            bass,
+            None,
+            200,
+            12,
+            0,
+            20,
+            true,
+            MusicNoteColorScheme::default(),
+        )
+    }
+
+    #[test]
+    fn bass_none_partial_full_keep_uncomputed_bins_default() {
+        let mut partial = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(partial.merge_segment(bass_segment(&partial, 0, 45)));
+        let (uncomputed, _, none_hints) = bass_boundary_raster(None);
+        assert!(none_hints.iter().all(|bin| bin.hint.is_none()));
+        let (partial_image, _, partial_hints) = bass_boundary_raster(Some(&partial));
+        assert!(partial_hints.iter().any(|bin| bin.hint.is_some()));
+        assert!(partial_hints.iter().any(|bin| bin.hint.is_none()));
+        assert_eq!(
+            bass_display_hint_at_time(&partial_hints, 20.02).confidence,
+            0.0
+        );
+        assert_eq!(
+            partial_image.pixels[25 * 200 + 190],
+            uncomputed.pixels[25 * 200 + 190]
+        );
+        assert_ne!(
+            partial_image.pixels[25 * 200 + 10],
+            uncomputed.pixels[25 * 200 + 10]
+        );
+        // Completion fills the same rhythm segment and gives its formerly empty
+        // bins the shared vote. It does not select their instantaneous pitch.
+        assert!(partial.merge_segment(bass_segment(&partial, 1, 48)));
+        assert!(partial.merge_segment(bass_segment(&partial, 2, 48)));
+        let (full_image, _, full_hints) = bass_boundary_raster(Some(&partial));
+        assert!(full_hints.iter().all(|bin| bin.hint.is_some()));
+        assert_ne!(
+            full_image.pixels[25 * 200 + 190],
+            uncomputed.pixels[25 * 200 + 190]
+        );
+        let voted = bass_display_hint_at_time(&full_hints, 20.02);
+        assert_eq!(partial.at_secs(20.02).unwrap().midi, 48);
+        assert_eq!(voted.pitch_class, 9);
+        assert_eq!(
+            timeline_metric_extra(
+                TimelineMetricKind::LoudnessBassRoot,
+                voted,
+                TimelineKeyHint::default()
+            ),
+            " A"
+        );
+    }
+
+    #[test]
+    fn bass_computed_silence_and_absent_track_have_same_color() {
+        let mut silent = TimelineBassTrack::new(40 * 48_000, 48_000);
+        for index in 0..silent.segment_count() {
+            assert!(silent.merge_segment(bass_segment(&silent, index, 0)));
+        }
+        let (absent, _, _) = bass_boundary_raster(None);
+        let (computed, _, hints) = bass_boundary_raster(Some(&silent));
+        assert_eq!(absent.pixels, computed.pixels);
+        assert!(
+            hints
+                .iter()
+                .all(|bin| bin.hint.is_some_and(|hint| hint.confidence == 0.0))
+        );
+    }
+
+    #[test]
+    fn bass_vote_preserves_loudness_low_energy_weights() {
+        let bins = bass_boundary_bins();
+        let bin = &bins[0];
+        let estimate = BassEstimate {
+            midi: 45,
+            confidence: 0.9,
+        };
+        let expected = (estimate.confidence
+            * normalize_range(bin.band_energy[0], 0.06, 0.48)
+            * timeline_loudness_value(bin).powf(0.90))
+        .sqrt()
+        .clamp(0.0, 1.0);
+        assert_eq!(bass_vote_weight(bin, estimate), expected);
+    }
+
+    #[test]
+    fn bass_height_is_low_band_loudness_independent_of_pitch_confidence() {
+        let mut bin = bass_boundary_bins()[0];
+        for fraction in [0.0_f32, 0.001, 0.1, 0.5, 1.0] {
+            bin.band_energy[0] = fraction;
+            let expected = if fraction == 0.0 {
+                0.0
+            } else {
+                ((bin.loudness_db + 10.0 * fraction.log10() + 52.0) / 52.0)
+                    .clamp(0.0, 1.0)
+                    .powf(0.72)
+            };
+            for confidence in [0.0, 0.9] {
+                assert_eq!(
+                    timeline_metric_display_value(
+                        TimelineMetricKind::LoudnessBassRoot,
+                        &bin,
+                        TimelinePitchHint {
+                            confidence,
+                            ..Default::default()
+                        },
+                        TimelineKeyHint::default()
+                    ),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            timeline_low_loudness_value(&bin),
+            timeline_loudness_value(&bin)
+        );
+        bin.band_energy[0] = 0.45; // An unpitched kick retains a gray, nonzero bar.
+        assert!(timeline_low_loudness_value(&bin) > 0.0);
+        assert_eq!(
+            timeline_metric_description(TimelineMetricKind::LoudnessBassRoot),
+            "Height low-band loudness, color bass root"
+        );
+        assert_eq!(
+            timeline_metric_description(TimelineMetricKind::Key),
+            "Height confidence, color key"
+        );
+    }
+
+    fn key_segment(track: &TimelineBassTrack, index: usize, root: usize) -> TimelineBassSegment {
+        let mut segment = bass_segment(track, index, (48 + root) as u8);
+        let mut chord = [0.0; 12];
+        for degree in [0, 4, 7] {
+            chord[(root + degree) % 12] = 1.0;
+        }
+        segment.chroma.fill(chord);
+        segment
+    }
+
+    #[test]
+    fn key_requires_every_real_frame_even_when_missing_region_is_silent() {
+        let bins: Vec<_> = (0..4000)
+            .map(|i| WaveformBin {
+                start_secs: i as f64 * 0.01,
+                duration_secs: 0.01,
+                loudness_db: if i >= 1999 { -100.0 } else { -12.0 },
+                ..WaveformBin::default()
+            })
+            .collect();
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(key_segment(&track, 0, 0)));
+        assert!(key_hint_at_time(&bins, &track, 0.0).is_some());
+        for center in [17.0, 19.98, 20.0, 22.9] {
+            assert!(
+                key_hint_at_time(&bins, &track, center).is_none(),
+                "center={center}"
+            );
+        }
+        assert!(track.merge_segment(key_segment(&track, 1, 0)));
+        assert!(track.merge_segment(key_segment(&track, 2, 0)));
+        for center in [0.0, 17.0, 19.98, 20.0, 22.9, 39.999] {
+            assert!(key_hint_at_time(&bins, &track, center).is_some());
+        }
+        let short_bins = [WaveformBin {
+            start_secs: 0.0,
+            duration_secs: 1.0 / 48_000.0,
+            ..Default::default()
+        }];
+        let mut short = TimelineBassTrack::new(1, 48_000);
+        assert!(short.merge_segment(bass_segment(&short, 0, 0)));
+        assert_eq!(
+            key_hint_at_time(&short_bins, &short, 0.0)
+                .unwrap()
+                .confidence,
+            0.0
+        );
+    }
+
+    #[test]
+    fn key_window_production_bins_wait_for_referenced_segment_in_reverse_order() {
+        use music_core::bass::pitch_frame_at_secs;
+        const SAMPLE_RATE: usize = 48_000;
+        const PCM_FRAMES: usize = 40 * SAMPLE_RATE;
+        let frames_per_bin = (MUSIC_ANALYSIS_BIN_SECS.max(0.01) * SAMPLE_RATE as f64)
+            .round()
+            .max(1.0) as usize;
+        // Use analyze_stereo_timeline's sample-index division, not i * bin_secs:
+        // these differ at the half-hop boundary in floating-point arithmetic.
+        let mut bins: Vec<_> = (0..PCM_FRAMES)
+            .step_by(frames_per_bin)
+            .map(|frame_start| WaveformBin {
+                start_secs: frame_start as f64 / SAMPLE_RATE as f64,
+                duration_secs: ((frame_start + frames_per_bin).min(PCM_FRAMES) - frame_start)
+                    as f64
+                    / SAMPLE_RATE as f64,
+                loudness_db: -12.0,
+                ..Default::default()
+            })
+            .collect();
+        let center = 22.995;
+        let window_start = center - TIMELINE_KEY_WINDOW_SECS * 0.5;
+        let window_end = center + TIMELINE_KEY_WINDOW_SECS * 0.5;
+        let first = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
+        assert_eq!(first, 1999);
+        assert_eq!(
+            (pitch_frame_at_secs(bins[first].start_secs) - 1) as usize,
+            999
+        );
+        assert_eq!((pitch_frame_at_secs(window_start) - 1) as usize, 1000);
+
+        for first_loudness in [-12.0, -100.0] {
+            bins[first].loudness_db = first_loudness;
+            let mut track = TimelineBassTrack::new(PCM_FRAMES, SAMPLE_RATE as u32);
+            assert!(track.merge_segment(key_segment(&track, 1, 2)));
+            // The second segment covers the rounded seconds window, but not the
+            // first overlapping bin's reference. Silence must not hide that gap.
+            assert!(track.window_is_computed(window_start, window_end));
+            assert!(track.chroma_at_secs(bins[first].start_secs).is_none());
+            assert!(key_hint_at_time(&bins, &track, center).is_none());
+
+            assert!(track.merge_segment(key_segment(&track, 0, 0)));
+            let completed = key_hint_at_time(&bins, &track, center).unwrap();
+            assert_eq!(
+                (completed.pitch_class, completed.mode),
+                (2, TimelineKeyMode::Major)
+            );
+            assert!(completed.confidence > 0.0);
+            assert!(track.merge_segment(key_segment(&track, 2, 7)));
+            let unchanged = key_hint_at_time(&bins, &track, center).unwrap();
+            assert_eq!(
+                (completed.pitch_class, completed.mode, completed.confidence),
+                (unchanged.pitch_class, unchanged.mode, unchanged.confidence)
+            );
+        }
+    }
+
+    #[test]
+    fn key_vote_rejects_missing_input_before_zero_weight_omission() {
+        let bins = [
+            WaveformBin {
+                start_secs: 19.98,
+                loudness_db: -12.0,
+                ..Default::default()
+            },
+            WaveformBin {
+                start_secs: 20.0,
+                loudness_db: -100.0,
+                ..Default::default()
+            },
+        ];
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(key_segment(&track, 0, 2)));
+        assert!(vote_key_hint(&bins[..1], &track).is_some());
+        assert_eq!(key_chroma_bin_weight(&bins[1]), 0.0);
+        assert!(track.chroma_at_secs(bins[1].start_secs).is_none());
+        // Reject the whole vote even after accumulating a positive-weight bin.
+        assert!(vote_key_hint(&bins, &track).is_none());
+        assert!(track.merge_segment(key_segment(&track, 1, 0)));
+        let completed = vote_key_hint(&bins, &track).unwrap();
+        let weighted_only = vote_key_hint(&bins[..1], &track).unwrap();
+        assert_eq!(
+            (completed.pitch_class, completed.mode, completed.confidence),
+            (
+                weighted_only.pitch_class,
+                weighted_only.mode,
+                weighted_only.confidence
+            )
+        );
+    }
+
+    #[test]
+    fn key_raster_distinguishes_pending_silent_and_pitched_without_old_chroma() {
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(key_segment(&track, 0, 0)));
+        let (pending, _, pending_hints) = bass_boundary_raster(Some(&track));
+        assert!(pending_hints.iter().all(|bin| bin.key_hint.is_none()));
+        assert!(track.merge_segment(key_segment(&track, 1, 0)));
+        let (computed, _, computed_hints) = bass_boundary_raster(Some(&track));
+        assert!(
+            computed_hints
+                .iter()
+                .all(|bin| bin.key_hint.is_some_and(|hint| hint.confidence > 0.0))
+        );
+        assert_ne!(pending.pixels, computed.pixels);
+        let mut silent = TimelineBassTrack::new(40 * 48_000, 48_000);
+        for index in 0..silent.segment_count() {
+            assert!(silent.merge_segment(bass_segment(&silent, index, 0)));
+        }
+        let (silent_image, _, hints) = bass_boundary_raster(Some(&silent));
+        assert!(
+            hints
+                .iter()
+                .all(|bin| bin.key_hint.is_some_and(|hint| hint.confidence == 0.0))
+        );
+        let bin = &bass_boundary_bins()[0];
+        assert_eq!(
+            timeline_metric_color(
+                TimelineMetricKind::Key,
+                0.0,
+                bin,
+                Default::default(),
+                Default::default(),
+                MusicNoteColorScheme::default()
+            ),
+            timeline_metric_color(
+                TimelineMetricKind::LoudnessBassRoot,
+                0.0,
+                bin,
+                Default::default(),
+                Default::default(),
+                MusicNoteColorScheme::default()
+            )
+        );
+        let absent = bass_boundary_raster(None).0;
+        assert_eq!(silent_image.pixels, absent.pixels);
+        let mut old = *bin;
+        old.key_confidence = 1.0;
+        old.chroma = [100.0; 12];
+        assert_eq!(key_chroma_bin_weight(bin), key_chroma_bin_weight(&old));
+    }
+
+    #[test]
+    fn timeline_bass_partial_raster_snapshot() {
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(bass_segment(&track, 0, 45)));
+        let image = bass_boundary_raster(Some(&track)).0;
+        let mut texture = None;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(240.0, 80.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    let texture = texture.get_or_insert_with(|| {
+                        ctx.load_texture(
+                            "timeline_bass_partial",
+                            image.clone(),
+                            egui::TextureOptions::NEAREST,
+                        )
+                    });
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.image((texture.id(), egui::vec2(200.0, 32.0)));
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("timeline_bass_partial_raster");
+    }
+
+    #[test]
+    fn timeline_key_states_raster_snapshot() {
+        let mut silent = TimelineBassTrack::new(40 * 48_000, 48_000);
+        let mut pitched = silent.clone();
+        for index in 0..silent.segment_count() {
+            assert!(silent.merge_segment(bass_segment(&silent, index, 0)));
+            assert!(pitched.merge_segment(key_segment(&pitched, index, 0)));
+        }
+        let images = [
+            bass_boundary_raster(None).0,
+            bass_boundary_raster(Some(&silent)).0,
+            bass_boundary_raster(Some(&pitched)).0,
+        ];
+        let mut textures = None;
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(660.0, 80.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let textures = textures.get_or_insert_with(|| {
+                        images
+                            .iter()
+                            .enumerate()
+                            .map(|(i, image)| {
+                                ctx.load_texture(
+                                    format!("key_state_{i}"),
+                                    image.clone(),
+                                    egui::TextureOptions::NEAREST,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (texture, label) in
+                                textures
+                                    .iter()
+                                    .zip(["Pending", "No key (silence)", "C major"])
+                            {
+                                ui.vertical(|ui| {
+                                    ui.label(label);
+                                    ui.image((texture.id(), egui::vec2(200.0, 32.0)));
+                                });
+                            }
+                        });
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("timeline_key_states_raster");
+    }
+
+    fn measurement_key(rows: usize, row_secs: f64) -> TimelineTextureCacheKey {
+        TimelineTextureCacheKey {
+            width_px: 1920,
+            waveform_h_px: 68,
+            gap_px: 4,
+            metrics_h_px: 44,
+            row_secs_millis: (row_secs * 1000.0) as u32,
+            rows,
+            dark: true,
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_memory_bytes() -> Option<(usize, usize)> {
+        #[repr(C)]
+        #[derive(Default)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+            private_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut counters = ProcessMemoryCounters {
+            cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+            ..ProcessMemoryCounters::default()
+        };
+        let cb = counters.cb;
+        // Read-only sampling of this test process using PROCESS_MEMORY_COUNTERS_EX.
+        let success = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, cb) };
+        (success != 0).then_some((counters.private_usage, counters.working_set_size))
+    }
+
+    #[cfg(not(windows))]
+    fn process_memory_bytes() -> Option<(usize, usize)> {
+        None
+    }
+
+    #[test]
+    fn note_color_scheme_switch_during_old_request_retains_texture_and_converges() {
+        exercise_note_color_switch(&[MusicNoteColorScheme::Chromatic]);
+    }
+
+    #[test]
+    fn note_color_scheme_rapid_roundtrip_converges_to_latest_request() {
+        exercise_note_color_switch(&[
+            MusicNoteColorScheme::Chromatic,
+            MusicNoteColorScheme::Fifths,
+            MusicNoteColorScheme::Chromatic,
+        ]);
+    }
+
+    fn exercise_note_color_switch(schemes: &[MusicNoteColorScheme]) {
+        use std::time::{Duration, Instant};
+        let timeout = Duration::from_secs(10);
+        let analysis = Arc::new(TimelineAnalysis {
+            bins: bass_boundary_bins(),
+            ..Default::default()
+        });
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(bass_segment(&track, 0, 45)));
+        let bass = Some(Arc::new(track));
+        let ctx = egui::Context::default();
+        let mut cache = TimelineTextureCache::default();
+        let mut key = measurement_key(1, 30.0);
+        key.width_px = 200;
+        cache.ensure(key);
+        cache.cancel_worker();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        cache.raster_tx = Some(request_tx);
+        cache.raster_rx = Some(result_rx);
+        cache.raster_cancel = Some(Arc::clone(&cancel));
+        let worker = std::thread::spawn(move || {
+            run_timeline_raster_worker_with_publish_hook(request_rx, result_tx, cancel, |result| {
+                ready_tx
+                    .send((result.row_version, result.image.clone()))
+                    .unwrap();
+                release_rx.recv_timeout(timeout).unwrap();
+            });
+        });
+        let expected_image = |scheme| {
+            render_timeline_row_with_hints(
+                0.0,
+                30.0,
+                &analysis.bins,
+                bass.as_deref(),
+                None,
+                key.width_px,
+                key.waveform_h_px,
+                key.gap_px,
+                key.metrics_h_px,
+                key.dark,
+                scheme,
+            )
+            .0
+        };
+        let adopt_next = |cache: &mut TimelineTextureCache| {
+            let received_before = cache.raster_measurement.received;
+            release_tx.send(()).unwrap();
+            let deadline = Instant::now() + timeout;
+            while cache.raster_measurement.received == received_before {
+                assert!(Instant::now() < deadline, "publication stalled");
+                cache.poll_finished_rows(&ctx, 1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        cache.note_analysis_identity(1);
+        cache.row_texture(&analysis, &bass, 0, 30.0, key, MusicNoteColorScheme::Fifths);
+        let (_, first_image) = ready_rx.recv_timeout(timeout).unwrap();
+        assert_eq!(
+            first_image.pixels,
+            expected_image(MusicNoteColorScheme::Fifths).pixels
+        );
+        adopt_next(&mut cache);
+        let first_texture_id = cache.rows[0].as_ref().unwrap().texture.id();
+
+        // A real old-scheme raster is processing; its publication is held by the
+        // hook while newer requests are submitted through the production cache.
+        cache.note_analysis_identity(2);
+        cache.row_texture(&analysis, &bass, 0, 30.0, key, MusicNoteColorScheme::Fifths);
+        let (_, old_image) = ready_rx.recv_timeout(timeout).unwrap();
+        assert_eq!(old_image.pixels, first_image.pixels);
+        for (index, &scheme) in schemes.iter().enumerate() {
+            cache.note_analysis_identity(index as u64 + 3);
+            let (shown, sent) = cache.row_texture(&analysis, &bass, 0, 30.0, key, scheme);
+            assert!(sent);
+            assert_eq!(shown.unwrap().0.id(), first_texture_id);
+            assert_eq!(
+                cache.generation, 1,
+                "palette change must not clear the cache"
+            );
+        }
+        adopt_next(&mut cache);
+        assert!(!cache.row_is_fresh(0, key));
+        for (index, &scheme) in schemes.iter().enumerate() {
+            let (row_version, image) = ready_rx.recv_timeout(timeout).unwrap();
+            assert_eq!(row_version, index as u64 + 3);
+            assert_eq!(image.pixels, expected_image(scheme).pixels);
+            assert!(cache.rows[0].is_some());
+            adopt_next(&mut cache);
+        }
+        assert!(cache.row_is_fresh(0, key));
+        assert_eq!(
+            cache.rows[0].as_ref().unwrap().row_version,
+            schemes.len() as u64 + 2
+        );
+        cache.clear();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn note_color_scheme_paused_draw_keeps_existing_rows_and_requests_new_palette() {
+        use std::time::{Duration, Instant};
+        let analysis = Arc::new(TimelineAnalysis {
+            bins: bass_boundary_bins(),
+            ..Default::default()
+        });
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(bass_segment(&track, 0, 45)));
+        let bass = Some(Arc::new(track));
+        let ctx = egui::Context::default();
+        let mut cache = TimelineTextureCache::default();
+        let frame = |cache: &mut TimelineTextureCache, version, scheme| {
+            let mut drawn = 0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx
+                .run_pass(input, |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let outcome = draw_music_timeline(
+                                ui, &analysis, &bass, version, 30.0, 20.0, false, false, cache,
+                                30.0, true, 0.0, scheme,
+                            );
+                            drawn = outcome.displayed_texture_rows;
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
+            drawn
+        };
+        frame(&mut cache, 1, MusicNoteColorScheme::Fifths);
+        let key = cache.key.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.row_is_fresh(0, key) {
+            assert!(Instant::now() < deadline);
+            cache.poll_finished_rows(&ctx, 1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let old_texture = cache.rows[0].as_ref().unwrap().texture.id();
+        assert_eq!(frame(&mut cache, 2, MusicNoteColorScheme::Chromatic), 1);
+        assert_eq!(cache.rows[0].as_ref().unwrap().texture.id(), old_texture);
+        assert!(!cache.row_is_fresh(0, key));
+        assert!(cache.pending[0].is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.row_is_fresh(0, key) {
+            assert!(Instant::now() < deadline);
+            cache.poll_finished_rows(&ctx, 1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(cache.rows[0].as_ref().unwrap().texture.id(), old_texture);
+        assert_eq!(frame(&mut cache, 2, MusicNoteColorScheme::Chromatic), 1);
+    }
+
+    #[test]
+    fn bass_worker_cache_keeps_hover_vote_with_displayed_texture() {
+        let analysis = Arc::new(TimelineAnalysis {
+            bins: bass_boundary_bins(),
+            ..TimelineAnalysis::default()
+        });
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(bass_segment(&track, 0, 45)));
+        let bass = Some(Arc::new(track));
+        let ctx = egui::Context::default();
+        let mut cache = TimelineTextureCache::default();
+        let key = measurement_key(1, 30.0);
+        cache.row_texture(
+            &analysis,
+            &bass,
+            0,
+            30.0,
+            key,
+            MusicNoteColorScheme::default(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cache.row_is_fresh(0, key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "raster worker stalled"
+            );
+            cache.poll_finished_rows(&ctx, 1);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(cache.bass_hint_at_time(0, 19.94).pitch_class, 9);
+        assert_eq!(cache.bass_hint_at_time(0, 20.02).confidence, 0.0);
+        cache.note_analysis_identity(2);
+        // The displayed old row still has the old hint until its replacement arrives.
+        assert_eq!(cache.bass_hint_at_time(0, 19.94).pitch_class, 9);
+        assert!(!cache.row_is_fresh(0, key));
+    }
+
+    #[test]
+    fn key_worker_cache_hover_keeps_pending_and_old_pitched_values() {
+        let analysis = Arc::new(TimelineAnalysis {
+            bins: bass_boundary_bins(),
+            ..Default::default()
+        });
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(key_segment(&track, 0, 0)));
+        let ctx = egui::Context::default();
+        let mut cache = TimelineTextureCache::default();
+        let key = measurement_key(1, 30.0);
+        let adopt = |cache: &mut TimelineTextureCache, track: &TimelineBassTrack, version| {
+            cache.note_analysis_identity(version);
+            cache.row_texture(
+                &analysis,
+                &Some(Arc::new(track.clone())),
+                0,
+                30.0,
+                key,
+                MusicNoteColorScheme::default(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !cache.row_is_fresh(0, key) {
+                assert!(std::time::Instant::now() < deadline);
+                cache.poll_finished_rows(&ctx, 1);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        adopt(&mut cache, &track, 1);
+        assert!(cache.key_hint_at_time(0, 19.94).is_none());
+        assert!(track.merge_segment(key_segment(&track, 1, 0)));
+        cache.note_analysis_identity(2);
+        assert!(cache.key_hint_at_time(0, 19.94).is_none());
+        adopt(&mut cache, &track, 2);
+        let shown = cache.key_hint_at_time(0, 19.94).unwrap();
+        assert_eq!(shown.pitch_class, 0);
+        assert!(shown.confidence > 0.0);
+        let mut other = TimelineBassTrack::new(40 * 48_000, 48_000);
+        for index in 0..other.segment_count() {
+            assert!(other.merge_segment(key_segment(&other, index, 2)));
+        }
+        cache.note_analysis_identity(3);
+        assert_eq!(cache.key_hint_at_time(0, 19.94).unwrap().pitch_class, 0);
+        assert_eq!(
+            timeline_metric_extra(TimelineMetricKind::Key, Default::default(), shown),
+            " C maj"
+        );
+        adopt(&mut cache, &other, 3);
+        assert_eq!(cache.key_hint_at_time(0, 19.94).unwrap().pitch_class, 2);
+    }
+
+    fn legacy_key_hint(bins: &[WaveformBin]) -> TimelineKeyHint {
+        let mut chroma = [0.0_f32; 12];
+        let mut presence = [0.0_f32; 12];
+        let mut total_weight = 0.0;
+        for bin in bins {
+            let weight =
+                key_chroma_bin_weight(bin) * (0.36 + bin.key_confidence.clamp(0.0, 1.0) * 0.64);
+            if weight <= 1.0e-5 {
+                continue;
+            }
+            let peak = bin.chroma.iter().copied().fold(0.0_f32, f32::max);
+            for (pc, value) in bin.chroma.iter().copied().enumerate() {
+                chroma[pc] += value.max(0.0).powf(1.08) * weight;
+                if peak > 1.0e-6 {
+                    presence[pc] += smoothstep(peak * 0.36, peak * 0.70, value) * weight.sqrt();
+                }
+            }
+            total_weight += weight;
+        }
+        profile_key_hint(chroma, presence, total_weight)
+    }
+
+    #[test]
+    fn key_synthetic_harmonic_major_minor_progressions_and_percussion_comparison() {
+        use music_core::bass::calculate_timeline_bass_segment;
+        use music_core::{AnalysisConfig, analyze_stereo_timeline};
+        // Absolute sample phase, ten harmonics per note, 5ms linear fades.
+        // Two seconds per chord. Validate the complete progression and also record
+        // the central six-second production window, which omits half of I and V.
+        let cases = [
+            (
+                "I-IV-V-I",
+                TimelineKeyMode::Major,
+                [[0, 4, 7], [5, 9, 12], [7, 11, 14], [0, 4, 7]],
+            ),
+            (
+                "I-vi-IV-V",
+                TimelineKeyMode::Major,
+                [[0, 4, 7], [9, 12, 16], [5, 9, 12], [7, 11, 14]],
+            ),
+            (
+                "i-iv-v-i",
+                TimelineKeyMode::Minor,
+                [[0, 3, 7], [5, 8, 12], [7, 10, 14], [0, 3, 7]],
+            ),
+            (
+                "i-iv-V-i",
+                TimelineKeyMode::Minor,
+                [[0, 3, 7], [5, 8, 12], [7, 11, 14], [0, 3, 7]],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (label, mode, chords) in cases {
+            for root in [0usize, 2] {
+                let mut stereo = vec![0.0_f32; 8 * 48_000 * 2];
+                for (frame, pair) in stereo.chunks_exact_mut(2).enumerate() {
+                    let chord_index = frame / 96_000;
+                    let local = frame % 96_000;
+                    let fade = (local.min(96_000 - local) as f64 / 240.0).min(1.0);
+                    let mut value = 0.0;
+                    for degree in chords[chord_index] {
+                        let midi = 48 + root + degree;
+                        let hz = 440.0 * ((midi as f64 - 69.0) / 12.0).exp2();
+                        for harmonic in 1..=10 {
+                            value += 0.07
+                                * (harmonic as f64).powf(-1.3)
+                                * fade
+                                * (std::f64::consts::TAU * hz * harmonic as f64 * frame as f64
+                                    / 48_000.0)
+                                    .sin();
+                        }
+                    }
+                    pair.fill(value as f32);
+                }
+                let analysis = analyze_stereo_timeline(
+                    &stereo,
+                    48_000,
+                    AnalysisConfig {
+                        bin_secs: 0.01,
+                        ..Default::default()
+                    },
+                );
+                let mut track = TimelineBassTrack::new(stereo.len() / 2, 48_000);
+                for index in 0..track.segment_count() {
+                    assert!(track.merge_segment(
+                        calculate_timeline_bass_segment(&stereo, 48_000, index, &|| false).unwrap()
+                    ));
+                }
+                let window_hint = key_hint_at_time(&analysis.bins, &track, 4.0).unwrap();
+                let hint = vote_key_hint(&analysis.bins, &track).unwrap();
+                let start = analysis
+                    .bins
+                    .partition_point(|bin| bin.start_secs + bin.duration_secs <= 1.0);
+                let end = analysis.bins.partition_point(|bin| bin.start_secs < 7.0);
+                let legacy_window = legacy_key_hint(&analysis.bins[start..end]);
+                let legacy = legacy_key_hint(&analysis.bins);
+                let no_percussion: Vec<_> = analysis
+                    .bins
+                    .iter()
+                    .map(|bin| WaveformBin {
+                        transient: 0.0,
+                        transient_density: 0.0,
+                        ..*bin
+                    })
+                    .collect();
+                let unpenalized = vote_key_hint(&no_percussion, &track).unwrap();
+                let unpenalized_window = key_hint_at_time(&no_percussion, &track, 4.0).unwrap();
+                println!(
+                    "key_progression {label} root={root} expected={mode:?} full_new={hint:?} full_no_percussion={unpenalized:?} full_legacy={legacy:?} window_new={window_hint:?} window_no_percussion={unpenalized_window:?} window_legacy={legacy_window:?}"
+                );
+                for (scope, result) in [
+                    ("full", hint),
+                    ("full_no_percussion", unpenalized),
+                    ("window", window_hint),
+                    ("window_no_percussion", unpenalized_window),
+                ] {
+                    let exact = (result.pitch_class, result.mode) == (root as u8, mode);
+                    // Accepted limitation (design §14.7): the central 6 s window of I-vi-IV-V
+                    // holds I and V for 1 s each and vi / IV for 2 s each, so even an ideal
+                    // chroma scores the major key and its relative minor almost equally
+                    // (C major 0.849 vs A minor 0.837). Both share the same notes; the user
+                    // accepted occasional misses for this visualization (2026-10-14).
+                    let relative_minor = label == "I-vi-IV-V"
+                        && scope.starts_with("window")
+                        && (result.pitch_class, result.mode)
+                            == (((root + 9) % 12) as u8, TimelineKeyMode::Minor);
+                    if !exact && !relative_minor {
+                        failures.push(format!("{label} root={root} {scope}: {result:?}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "stage 3 key accuracy acceptance unmet: {failures:#?}"
+        );
+    }
+
+    fn benchmark_has_fourth_segment_bass(hint: TimelinePitchHint) -> bool {
+        hint.pitch_class == 0 && hint.confidence > 0.06
+    }
+
+    #[test]
+    fn bass_benchmark_latest_color_rejects_third_segment_snapshot() {
+        let mut track = TimelineBassTrack::new(180 * 48_000, 48_000);
+        for index in 0..3 {
+            assert!(track.merge_segment(bass_segment(&track, index, 45 + index as u8)));
+        }
+        let third_snapshot = track.clone();
+        assert!(track.merge_segment(bass_segment(&track, 3, 48)));
+        let bins: Vec<_> = (6000..9000)
+            .map(|index| WaveformBin {
+                start_secs: index as f64 * 0.01,
+                duration_secs: 0.01,
+                peak: 0.5,
+                rms: 0.3,
+                loudness_db: -12.0,
+                band_energy: [0.45, 0.2, 0.1],
+                chroma: [0.1; 12],
+                ..WaveformBin::default()
+            })
+            .collect();
+        let key = measurement_key(6, 30.0);
+        let raster_hint = |snapshot: &TimelineBassTrack| {
+            let (_, _, hints) = render_timeline_row_with_hints(
+                60.0,
+                30.0,
+                &bins,
+                Some(snapshot),
+                None,
+                key.width_px,
+                key.waveform_h_px,
+                key.gap_px,
+                key.metrics_h_px,
+                key.dark,
+                MusicNoteColorScheme::default(),
+            );
+            bass_display_hint_at_time(&hints, 65.0)
+        };
+        let old_hint = raster_hint(&third_snapshot);
+        // The old pitch-class-only assertion incorrectly accepted this pending bin.
+        assert_eq!(old_hint.pitch_class, 0);
+        assert_eq!(old_hint.confidence, 0.0);
+        assert!(!benchmark_has_fourth_segment_bass(old_hint));
+        let latest_hint = raster_hint(&track);
+        assert!(benchmark_has_fourth_segment_bass(latest_hint));
+        assert!(!benchmark_has_fourth_segment_bass(TimelinePitchHint {
+            confidence: 0.06,
+            ..latest_hint
+        }));
+        assert!(!benchmark_has_fourth_segment_bass(TimelinePitchHint {
+            pitch_class: 11,
+            ..latest_hint
+        }));
+    }
+
+    /// Headless production raster/cache benchmark. Measures the FIFO request/result
+    /// backlog (submitted minus drained), worker queue wait, latest-row adoption,
+    /// retained bass snapshots and raster/texture payload bytes. CPU egui texture
+    /// registration is included; native GPU upload/present and PCM inference are not.
+    #[test]
+    #[ignore]
+    fn timeline_bass_raster_benchmark() {
+        use std::time::{Duration, Instant};
+        assert!(!cfg!(debug_assertions), "run this benchmark with --release");
+        for duration_secs in [180usize, 3600] {
+            for arrival_ms in [0u64, 250] {
+                for full_key in [false, true] {
+                    let baseline_memory = process_memory_bytes();
+                    let mut peak_memory = baseline_memory.unwrap_or_default();
+                    let row_secs = 30.0;
+                    let rows = timeline_row_count(duration_secs as f64, row_secs);
+                    let analysis = Arc::new(TimelineAnalysis {
+                        bins: (0..duration_secs * 100)
+                            .map(|index| WaveformBin {
+                                start_secs: index as f64 * 0.01,
+                                duration_secs: 0.01,
+                                peak: 0.5,
+                                rms: 0.3,
+                                loudness_db: -12.0,
+                                band_energy: [0.45, 0.2, 0.1],
+                                chroma: [0.1; 12],
+                                ..WaveformBin::default()
+                            })
+                            .collect(),
+                        ..TimelineAnalysis::default()
+                    });
+                    let mut track = TimelineBassTrack::new(duration_secs * 48_000, 48_000);
+                    let mut bass = None;
+                    let mut snapshots = Vec::new();
+                    let ctx = egui::Context::default();
+                    let mut cache = TimelineTextureCache::default();
+                    let key = measurement_key(rows, row_secs);
+                    let request_rows =
+                        prioritized_timeline_request_rows(&[0, 1, 2, 3], Some(0), false, rows);
+                    let mut peak_backlog = 0;
+                    let mut peak_snapshot_bytes = 0;
+                    let mut peak_raster_payload_bytes = 0;
+                    let started = Instant::now();
+                    let mut latest_published = started;
+                    let mut next_arrival = started;
+                    let mut next_frame = started;
+                    let deadline = started + Duration::from_secs(60);
+                    let mut arrivals = 0;
+                    loop {
+                        assert!(Instant::now() < deadline, "raster benchmark exceeded 60s");
+                        if arrivals < 4 && Instant::now() >= next_arrival {
+                            if full_key {
+                                track = TimelineBassTrack::new(duration_secs * 48_000, 48_000);
+                                for index in 0..track.segment_count() {
+                                    assert!(track.merge_segment(key_segment(
+                                        &track,
+                                        index,
+                                        9 + arrivals
+                                    )));
+                                }
+                            } else {
+                                assert!(track.merge_segment(bass_segment(
+                                    &track,
+                                    arrivals,
+                                    45 + arrivals as u8
+                                )));
+                            }
+                            let snapshot = Arc::new(track.clone());
+                            snapshots.push(Arc::downgrade(&snapshot));
+                            bass = Some(snapshot);
+                            arrivals += 1;
+                            latest_published = Instant::now();
+                            next_arrival = latest_published + Duration::from_millis(arrival_ms);
+                            cache.ensure(key);
+                            cache.note_analysis_identity(arrivals as u64);
+                            for &row in &request_rows {
+                                cache.row_texture(
+                                    &analysis,
+                                    &bass,
+                                    row,
+                                    row_secs,
+                                    key,
+                                    MusicNoteColorScheme::default(),
+                                );
+                            }
+                        }
+                        let backlog =
+                            cache.raster_measurement.submitted - cache.raster_measurement.received;
+                        peak_backlog = peak_backlog.max(backlog);
+                        let snapshot_bytes: usize = snapshots
+                            .iter()
+                            .filter_map(std::sync::Weak::upgrade)
+                            .map(|track| track.storage_bytes())
+                            .sum();
+                        peak_snapshot_bytes = peak_snapshot_bytes.max(snapshot_bytes);
+                        // Conservative upper bound: each outstanding request/result may
+                        // retain one complete image/hint payload; cached rows hold textures.
+                        let payload_per_row =
+                            key.width_px * key.height_px() * std::mem::size_of::<egui::Color32>()
+                                + 3001 * std::mem::size_of::<TimelineBassDisplayBin>();
+                        let loaded_rows = cache.rows.iter().filter(|row| row.is_some()).count();
+                        peak_raster_payload_bytes = peak_raster_payload_bytes
+                            .max((backlog + loaded_rows) * payload_per_row);
+                        if Instant::now() >= next_frame {
+                            cache.poll_finished_rows(
+                                &ctx,
+                                TIMELINE_ROW_TEXTURE_UPLOAD_BUDGET_PER_FRAME,
+                            );
+                            next_frame = Instant::now() + Duration::from_millis(16);
+                            // Complete the simulated frame's CPU texture submission;
+                            // no native GPU, renderer or application window is started.
+                            let _ = ctx.tex_manager().write().take_delta();
+                            if let Some((private, working_set)) = process_memory_bytes() {
+                                peak_memory.0 = peak_memory.0.max(private);
+                                peak_memory.1 = peak_memory.1.max(working_set);
+                            }
+                        }
+                        if arrivals == 4
+                            && request_rows.iter().all(|&row| cache.row_is_fresh(row, key))
+                        {
+                            let latest_hint = cache.bass_hint_at_time(2, 65.0);
+                            assert!(
+                                benchmark_has_fourth_segment_bass(latest_hint),
+                                "latest snapshot's fourth-segment C must be displayed"
+                            );
+                            if full_key {
+                                let latest_key = cache.key_hint_at_time(2, 65.0).unwrap();
+                                assert_eq!(latest_key.pitch_class, 0);
+                                assert_eq!(latest_key.mode, TimelineKeyMode::Major);
+                                assert!(latest_key.confidence > 0.0);
+                            }
+                            println!(
+                                "timeline_bass_raster: duration_secs={duration_secs}, arrival_ms={arrival_ms}, full_key={full_key}, requests={}, drained={}, peak_outstanding={}, max_worker_queue_ms={:.3}, raster_total_ms={:.3}, latest_color_adoption_ms={:.3}, total_ms={:.3}, peak_bass_snapshot_bytes={}, peak_raster_payload_bytes_upper_bound={}, timeline_bytes={}, mutable_bass_bytes={}",
+                                cache.raster_measurement.submitted,
+                                cache.raster_measurement.received,
+                                peak_backlog,
+                                cache.raster_measurement.max_queue_wait.as_secs_f64() * 1000.0,
+                                cache.raster_measurement.raster_time.as_secs_f64() * 1000.0,
+                                latest_published.elapsed().as_secs_f64() * 1000.0,
+                                started.elapsed().as_secs_f64() * 1000.0,
+                                peak_snapshot_bytes,
+                                peak_raster_payload_bytes,
+                                analysis.bins.capacity() * std::mem::size_of::<WaveformBin>(),
+                                track.storage_bytes()
+                            );
+                            println!(
+                                "timeline_bass_process_memory: baseline_private_working_set={baseline_memory:?}, sampled_peak_private_bytes={}, sampled_peak_working_set_bytes={}, private_delta_bytes={}, working_set_delta_bytes={}, sampling_ms=16, native_gpu_present=false",
+                                peak_memory.0,
+                                peak_memory.1,
+                                peak_memory
+                                    .0
+                                    .saturating_sub(baseline_memory.unwrap_or_default().0),
+                                peak_memory
+                                    .1
+                                    .saturating_sub(baseline_memory.unwrap_or_default().1)
+                            );
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn row_count_handles_edge_durations() {
@@ -2393,7 +3693,7 @@ mod tests {
     fn strip_probe() -> egui::ColorImage {
         let analyzed = [(0.0, 5.0)];
         let style = strip_style(&analyzed, 5.0);
-        render_timeline_row_image(-2.0, 10.0, &[], Some(&style), 10, 6, 0, 0, true).0
+        render_timeline_row_image(-2.0, 10.0, &[], None, Some(&style), 10, 6, 0, 0, true).0
     }
 
     #[test]
@@ -2418,7 +3718,7 @@ mod tests {
     #[test]
     fn seek_strip_center_line_is_far_brighter_than_the_music_view_one() {
         let strip = strip_probe();
-        let music = render_timeline_row_image(-2.0, 10.0, &[], None, 10, 6, 0, 0, true).0;
+        let music = render_timeline_row_image(-2.0, 10.0, &[], None, None, 10, 6, 0, 0, true).0;
         let strip_line = strip.pixels[3 * 10 + 4];
         let music_line = music.pixels[3 * 10 + 4];
         assert!(
@@ -2452,7 +3752,7 @@ mod tests {
     /// 音楽ビューには境界線を引かない (行は常に素材の内側)。
     #[test]
     fn music_view_rows_have_no_material_boundary() {
-        let image = render_timeline_row_image(-2.0, 10.0, &[], None, 10, 6, 0, 0, true).0;
+        let image = render_timeline_row_image(-2.0, 10.0, &[], None, None, 10, 6, 0, 0, true).0;
         for x in 1..9 {
             let p = image.pixels[1 * 10 + x];
             assert_eq!(p, egui::Color32::BLACK, "music view x={x} must stay plain");

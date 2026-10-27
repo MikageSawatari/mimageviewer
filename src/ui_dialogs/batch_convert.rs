@@ -253,7 +253,7 @@ impl App {
             if let Some(msg) =
                 batch_convert_summary(false, 0, skipped_existing.len(), skipped_collision.len(), 0)
             {
-                self.show_feedback_toast(msg);
+                self.show_feedback_warning(msg);
             }
             return;
         }
@@ -355,7 +355,12 @@ impl App {
             skipped_collision,
             failed,
         ) {
-            self.show_feedback_toast(msg);
+            self.show_feedback_result(
+                msg,
+                crate::feedback::FeedbackKind::result(
+                    canceled || failed > 0 || skipped_existing > 0 || skipped_collision > 0,
+                ),
+            );
         }
 
         // スペース選択を解除し、一覧を再構築して新しい zip / 同名 zip 優先の dedup を
@@ -390,7 +395,7 @@ impl App {
         let canceling = pending.cancel.load(Ordering::Relaxed);
 
         let mut cancel_requested = false;
-        egui::Modal::new(egui::Id::new("batch_convert_progress_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("batch_convert_progress_modal")).show(ctx, |ui| {
             ui.set_min_width(320.0);
             ui.heading("ZIP に変換中");
             ui.add_space(4.0);

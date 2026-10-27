@@ -213,7 +213,8 @@ mod adjust_scope_selector_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 72.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -223,7 +224,7 @@ mod adjust_scope_selector_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let mut measured = measured_in_ui.lock().unwrap();
                         measured.clear();
                         for max_chars in [7, 8] {
@@ -254,7 +255,8 @@ mod adjust_scope_selector_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 180.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -264,7 +266,7 @@ mod adjust_scope_selector_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let mut measured = measured_in_ui.lock().unwrap();
                         measured.clear();
                         for label in [
@@ -280,11 +282,109 @@ mod adjust_scope_selector_tests {
             });
         harness.run();
 
+        let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+        std::fs::create_dir_all(dir).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(dir.join("adjust-scope-actions.png"))
+            .unwrap();
         let sizes = measured.lock().unwrap();
+        std::fs::write(
+            dir.join("adjust-scope-actions-sizes.txt"),
+            format!("{sizes:?}"),
+        )
+        .unwrap();
         assert_eq!(sizes.len(), 5, "all action labels were rendered");
         for (label, size) in sizes.iter() {
             assert!(size.x <= 258.0, "{label} was {}px wide", size.x);
-            assert!(size.y <= 24.0, "{label} was {}px high", size.y);
+            // 0.37 の日本語 Button 行高 21pt + 縦 padding 2pt × 2。
+            assert_eq!(size.y, 25.0, "{label} action height changed");
+        }
+    }
+
+    #[test]
+    fn adjust_scope_actions_fit_or_scroll_to_the_last_action() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+
+        for height in [180.0, 80.0] {
+            let observed = Arc::new(Mutex::new(None));
+            let rendered = Arc::clone(&observed);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(300.0, 240.0))
+                .build_ui(move |ui| {
+                    let output = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(258.0, height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .max_height(height)
+                                    .show(ui, |ui| {
+                                        let mut last = None;
+                                        for label in [
+                                            "共通の標準からコピー",
+                                            "現在の設定値を標準に反映",
+                                            ADJUST_ALIGN_ALL_STANDARD_LABEL,
+                                            ADJUST_ALIGN_ALL_PAGE_LABEL,
+                                            "個別設定を解除 [Q]",
+                                        ] {
+                                            let response = ui.button(label);
+                                            assert!(response.rect.width() <= 258.0);
+                                            last = Some((response.id, response.rect));
+                                        }
+                                        last.unwrap()
+                                    })
+                            },
+                        )
+                        .inner;
+                    *rendered.lock().unwrap() =
+                        Some((ScrollLayout::from_output(&output), output.inner));
+                });
+            harness.run();
+            let (before, _) = observed.lock().unwrap().unwrap();
+            before.assert_height(
+                if height == 180.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                harness.ctx.content_rect(),
+                harness.ctx.pixels_per_point(),
+            );
+            if height == 80.0 {
+                harness.event(egui::Event::PointerMoved(before.inner.center()));
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -4000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.run_steps(40);
+                let (after, (id, rect)) = observed.lock().unwrap().unwrap();
+                after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+                assert!(
+                    after.inner.contains_rect(rect),
+                    "last action clipped: {rect:?}"
+                );
+                harness.hover_at(rect.center());
+                harness.run_steps(1);
+                assert!(harness.ctx.read_response(id).unwrap().contains_pointer());
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    harness.run_steps(1);
+                }
+                assert!(harness.ctx.read_response(id).unwrap().clicked());
+            }
         }
     }
 }
@@ -1623,41 +1723,46 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 200.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
-                    let mut add_layer_dialog_open = false;
-                    let mut select_layer: Option<usize> = None;
-                    let mut set_enabled: Option<(usize, bool)> = None;
-                    let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> =
-                        None;
-                    let mut move_layer: Option<(usize, usize)> = None;
-                    let mut duplicate_layer: Option<usize> = None;
-                    let mut delete_layer: Option<usize> = None;
-                    let mut preview_to_selected_layer = false;
-                    super::draw_local_adjust_layer_list(
-                        ui,
-                        260.0,
-                        &layers,
-                        0,
-                        (1920, 1080),
-                        None,
-                        &mut add_layer_dialog_open,
-                        &mut select_layer,
-                        &mut set_enabled,
-                        &mut update_layer,
-                        &mut move_layer,
-                        &mut duplicate_layer,
-                        &mut delete_layer,
-                        &mut preview_to_selected_layer,
-                    );
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
+                        let mut add_layer_dialog_open = false;
+                        let mut select_layer: Option<usize> = None;
+                        let mut set_enabled: Option<(usize, bool)> = None;
+                        let mut update_layer: Option<(
+                            usize,
+                            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                        )> = None;
+                        let mut move_layer: Option<(usize, usize)> = None;
+                        let mut duplicate_layer: Option<usize> = None;
+                        let mut delete_layer: Option<usize> = None;
+                        let mut preview_to_selected_layer = false;
+                        super::draw_local_adjust_layer_list(
+                            ui,
+                            260.0,
+                            &layers,
+                            0,
+                            (1920, 1080),
+                            None,
+                            &mut add_layer_dialog_open,
+                            &mut select_layer,
+                            &mut set_enabled,
+                            &mut update_layer,
+                            &mut move_layer,
+                            &mut duplicate_layer,
+                            &mut delete_layer,
+                            &mut preview_to_selected_layer,
+                        );
+                    });
                 });
             });
 
@@ -1670,20 +1775,23 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 90.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut params = crate::colorize::ColorizeParams::default();
-                    let mut slots = crate::colorize::ColorizePresetSlots {
-                        slots: std::array::from_fn(|_| Some(params.clone())),
-                    };
-                    super::draw_colorize_preset_slots(ui, &mut params, &mut slots);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut params = crate::colorize::ColorizeParams::default();
+                        let mut slots = crate::colorize::ColorizePresetSlots {
+                            slots: std::array::from_fn(|_| Some(params.clone())),
+                        };
+                        super::draw_colorize_preset_slots(ui, &mut params, &mut slots);
+                    });
                 });
             });
 
@@ -1696,19 +1804,22 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 92.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut params = crate::colorize::ColorizeParams::default();
-                    params.palette = crate::colorize::ColorizePalette::Custom;
-                    params.luminance_weight = 35;
-                    super::draw_colorize_gradient_preview(ui, &params);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut params = crate::colorize::ColorizeParams::default();
+                        params.palette = crate::colorize::ColorizePalette::Custom;
+                        params.luminance_weight = 35;
+                        super::draw_colorize_gradient_preview(ui, &params);
+                    });
                 });
             });
 
@@ -1742,42 +1853,49 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let layers = std::sync::Arc::new(layers);
         let layers_for_render = std::sync::Arc::clone(&layers);
-        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut add_layer_dialog_open = false;
-                let mut select_layer: Option<usize> = None;
-                let mut set_enabled: Option<(usize, bool)> = None;
-                let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> =
-                    None;
-                let mut move_layer: Option<(usize, usize)> = None;
-                let mut duplicate_layer: Option<usize> = None;
-                let mut delete_layer: Option<usize> = None;
-                let mut preview_flag = preview_to_selected_layer;
-                super::draw_local_adjust_layer_list(
-                    ui,
-                    260.0,
-                    &layers_for_render,
-                    selected_layer,
-                    (1920, 1080),
-                    None,
-                    &mut add_layer_dialog_open,
-                    &mut select_layer,
-                    &mut set_enabled,
-                    &mut update_layer,
-                    &mut move_layer,
-                    &mut duplicate_layer,
-                    &mut delete_layer,
-                    &mut preview_flag,
-                );
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut add_layer_dialog_open = false;
+                        let mut select_layer: Option<usize> = None;
+                        let mut set_enabled: Option<(usize, bool)> = None;
+                        let mut update_layer: Option<(
+                            usize,
+                            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                        )> = None;
+                        let mut move_layer: Option<(usize, usize)> = None;
+                        let mut duplicate_layer: Option<usize> = None;
+                        let mut delete_layer: Option<usize> = None;
+                        let mut preview_flag = preview_to_selected_layer;
+                        super::draw_local_adjust_layer_list(
+                            ui,
+                            260.0,
+                            &layers_for_render,
+                            selected_layer,
+                            (1920, 1080),
+                            None,
+                            &mut add_layer_dialog_open,
+                            &mut select_layer,
+                            &mut set_enabled,
+                            &mut update_layer,
+                            &mut move_layer,
+                            &mut duplicate_layer,
+                            &mut delete_layer,
+                            &mut preview_flag,
+                        );
+                    });
+                });
             });
-        });
 
         harness.run();
         harness.snapshot(name);
@@ -1892,27 +2010,30 @@ mod local_adjust_segmentation_tests {
         );
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 590.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_min_width(300.0);
-                    ui.set_max_width(300.0);
-                    crate::local_adjust_effect_ui::draw_effect_params(
-                        ui,
-                        &mut layer,
-                        (1920, 1080),
-                        false,
-                        None,
-                        None,
-                        false,
-                        true,
-                    );
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_min_width(300.0);
+                        ui.set_max_width(300.0);
+                        crate::local_adjust_effect_ui::draw_effect_params(
+                            ui,
+                            &mut layer,
+                            (1920, 1080),
+                            false,
+                            None,
+                            None,
+                            false,
+                            true,
+                        );
+                    });
                 });
             });
 
@@ -2372,6 +2493,137 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_page_layers[&0][0].name.clone()
     }
 
+    fn seam_append_receipt(
+        app: &crate::app::AppTestEnvForTest,
+    ) -> crate::book_append_undo::BookAppendUndoReceipt {
+        static NEXT_RECEIPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT_RECEIPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = app
+            .tmp
+            .path()
+            .join(format!("adjustment-append-books-{serial}"));
+        let folder = root.join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                .unwrap();
+        let page = folder.join("0001_page.jpg");
+        std::fs::write(&page, b"generated page").unwrap();
+        builder.record(&page).unwrap();
+        crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 1,
+            source_context: app.virtual_list_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        }
+    }
+
+    fn seam_install_undo_append(app: &mut crate::app::AppTestEnvForTest) {
+        let receipt = seam_append_receipt(app);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::UndoAppend { receipt },
+        });
+    }
+
+    #[test]
+    fn section1372_1373_slider_draft_admission_precedes_release_and_busy_is_unchanged() {
+        for scope in [AdjustScopeSelection::Page, AdjustScopeSelection::Standard] {
+            for busy in [false, true] {
+                let mut app = seam_test_app();
+                app.book_append_undo_receipt = Some(seam_append_receipt(&app));
+                if busy {
+                    seam_install_undo_append(&mut app);
+                }
+                let revision = app.book_append_undo_revision;
+                let original = app.effective_params(0).clone();
+                let mut edited = original.clone();
+                edited.brightness += 0.1;
+                app.apply_adjustment_panel_edit_frame(
+                    0,
+                    scope,
+                    original.clone(),
+                    edited,
+                    true,
+                    true,
+                    false,
+                );
+                if busy {
+                    assert_eq!(app.book_append_undo_revision, revision);
+                    assert!(app.book_append_undo_receipt.is_some());
+                    assert!(!app.adjustment_dragging);
+                    assert!(app.adjustment_drag_session.is_none());
+                    assert!(app.adjustment_standard_drag_session.is_none());
+                    assert_eq!(app.effective_params(0), &original);
+                } else {
+                    assert!(app.book_append_undo_revision > revision);
+                    assert!(app.book_append_undo_receipt.is_none());
+                    assert!(app.adjustment_dragging);
+                    assert_eq!(app.meta_undo.undo_len(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1372_1373_nonresident_local_write_uses_stable_target_admission() {
+        let mut app = seam_test_app();
+        let target = app.page_adjustment_target_for_idx(0).unwrap();
+        let layers = app.local_adjust_page_layers[&0].clone();
+        app.items.clear();
+        app.local_adjust_page_layers.clear();
+        app.book_append_undo_receipt = Some(seam_append_receipt(&app));
+        let revision = app.book_append_undo_revision;
+        app.set_local_adjust_layers_for_target(&target, layers.clone());
+        assert!(app.book_append_undo_revision > revision);
+        assert!(app.book_append_undo_receipt.is_none());
+        assert_eq!(
+            app.local_adjust_write_pending[&target.page_key].layers,
+            layers
+        );
+        app.finish_local_adjust_writes();
+
+        seam_install_undo_append(&mut app);
+        let revision = app.book_append_undo_revision;
+        app.set_local_adjust_layers_for_target(&target, Arc::new(Vec::new()));
+        assert_eq!(app.book_append_undo_revision, revision);
+        assert!(app.local_adjust_write_pending.is_empty());
+    }
+
+    #[test]
+    fn section1372_1373_pending_key_undo_commits_before_pop_but_busy_changes_nothing() {
+        for busy in [false, true] {
+            let mut app = seam_app_with_shape();
+            let before = app.local_adjust_page_layers[&0].clone();
+            assert!(app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.01, 0.0));
+            let after = app.local_adjust_page_layers[&0].clone();
+            assert_eq!(app.meta_undo.undo_len(), 0);
+            if busy {
+                seam_install_undo_append(&mut app);
+            }
+            let revision = app.book_append_undo_revision;
+            app.apply_meta_undo();
+            if busy {
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.local_adjust_shape_key_edit.is_some());
+                assert_eq!(app.local_adjust_page_layers[&0], after);
+                assert_eq!(app.meta_undo.redo_len(), 0);
+                assert!(app.local_adjust_write_pending.is_empty());
+                app.apply_meta_redo();
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.local_adjust_shape_key_edit.is_some());
+            } else {
+                assert!(app.local_adjust_shape_key_edit.is_none());
+                assert_eq!(app.local_adjust_page_layers[&0], before);
+                assert_eq!(app.meta_undo.redo_len(), 1);
+                app.apply_meta_redo();
+                assert_eq!(app.local_adjust_page_layers[&0], after);
+                assert_eq!(app.meta_undo.undo_len(), 1);
+            }
+        }
+    }
+
     /// 保存経路を通ったか。`set_local_adjust_layers_for_idx` が presence を立てるので、
     /// DB を開けたかどうかに依らず判定できる。
     fn seam_took_the_save_path(app: &App) -> bool {
@@ -2382,6 +2634,7 @@ mod local_adjust_canvas_edit_contract_tests {
     fn a_prepare_only_edit_updates_memory_without_saving_or_pushing_undo() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
             layer.name = "prepared".to_string();
@@ -2389,6 +2642,7 @@ mod local_adjust_canvas_edit_contract_tests {
         });
 
         assert!(!applied, "PreparedOnly は「編集が効いた」ではない");
+        assert_eq!(app.book_append_undo_revision, append_revision);
         assert_eq!(
             seam_layer_name(&app),
             "prepared",
@@ -2409,12 +2663,14 @@ mod local_adjust_canvas_edit_contract_tests {
     fn an_untouched_edit_leaves_everything_alone() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |_layer| {
             LocalAdjustCanvasEdit::Untouched
         });
 
         assert!(!applied);
+        assert_eq!(app.book_append_undo_revision, append_revision);
         assert!(!seam_took_the_save_path(&app));
         assert_eq!(app.meta_undo.undo_len(), undo_before);
     }
@@ -2423,6 +2679,7 @@ mod local_adjust_canvas_edit_contract_tests {
     fn an_applied_edit_with_persist_saves_and_pushes_undo() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
             layer.name = "applied".to_string();
@@ -2430,6 +2687,7 @@ mod local_adjust_canvas_edit_contract_tests {
         });
 
         assert!(applied);
+        assert!(app.book_append_undo_revision > append_revision);
         assert_eq!(seam_layer_name(&app), "applied");
         assert!(seam_took_the_save_path(&app));
         assert_eq!(
@@ -2542,8 +2800,9 @@ mod local_adjust_canvas_edit_contract_tests {
         );
     }
 
-    fn brush_stroke(applied: bool) -> crate::app::LocalAdjustMaskBrushStroke {
+    fn brush_stroke(app: &App, applied: bool) -> crate::app::LocalAdjustMaskBrushStroke {
         crate::app::LocalAdjustMaskBrushStroke {
+            owner: app.capture_page_edit_owner(0).expect("editable test page"),
             fs_idx: 0,
             layer_idx: 0,
             target: LocalAdjustMaskEditTarget::OverrideAdd,
@@ -2566,7 +2825,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(false));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, false));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -2585,7 +2844,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, true));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -2920,6 +3179,7 @@ mod local_adjust_canvas_edit_contract_tests {
         let before =
             local_adjust_core::LocalAdjustmentLayers::clone(&app.local_adjust_page_layers[&0]);
         app.local_adjust_canvas_drag = Some(crate::app::LocalAdjustCanvasDrag {
+            owner: app.capture_page_edit_owner(0).expect("editable test page"),
             fs_idx: 0,
             layer_idx: 0,
             kind: crate::app::LocalAdjustCanvasDragKind::LinearGradientStart,
@@ -3018,7 +3278,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, true));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -3039,7 +3299,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, true));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -3156,6 +3416,7 @@ mod local_adjust_fold_audit {
                 && (trimmed.starts_with("fn ")
                     || trimmed.starts_with("pub fn ")
                     || trimmed.starts_with("pub(crate) fn ")
+                    || trimmed.starts_with("pub(super) fn ")
                     || trimmed.starts_with("async fn ")
                     || trimmed.starts_with("pub(crate) async fn "));
             if is_fn_header {
@@ -3272,6 +3533,9 @@ mod local_adjust_fold_audit {
             "persist_local_adjust_canvas_drag",
             "persist_local_adjust_mask_brush_stroke",
             "cancel_local_adjust_canvas_edit_from_shortcut",
+            // Parked bundle owner: take each gesture into its stable-target commit,
+            // then discard only orphaned before payloads, like the mounted terminal.
+            "take_page_edit_commits",
             // キャンバス入力ハンドラ。ジェスチャ自体の開始 / 終了を書く。
             "handle_local_adjust_canvas_input",
             "handle_local_adjust_canvas_pointer",
@@ -3311,28 +3575,65 @@ mod local_adjust_fold_audit {
     /// 到達可能性は実行時テストでは見えないので、位置をソースで固定する。
     #[test]
     fn the_key_run_settle_runs_before_the_embedded_fullscreen_early_return() {
-        let source = std::fs::read_to_string("src/app.rs").unwrap();
-        let update = source
-            .split("fn update_frame(&mut self, ctx: &egui::Context")
-            .nth(1)
-            .expect("App::update_frame が見つからない");
-        let settle = update
-            .find("self.settle_local_adjust_shape_key_edit()")
-            .expect("無操作判定が `App::update_frame` から呼ばれていない");
-        let poll = update
-            .find("self.poll_local_adjust_write_results()")
-            .expect("保存結果の回収が `App::update_frame` から呼ばれていない");
-        let gate = update
-            .find("if embedded_fs_active || embedded_fs_pending {")
-            .expect("in-window フルスクリーンの gate が見つからない");
-        assert!(
-            settle < gate,
-            "無操作判定が in-window フルスクリーンの early return より後ろにある"
-        );
-        assert!(
-            poll < gate,
-            "保存結果の回収が in-window フルスクリーンの early return より後ろにある"
-        );
+        assert!(key_run_settle_precedes_embedded_return(
+            include_str!("app.rs"),
+            include_str!("app/update_phases.rs"),
+        ));
+    }
+
+    fn key_run_settle_precedes_embedded_return(app: &str, phases: &str) -> bool {
+        let method = |source: &str, name: &str| {
+            enclosing_functions(source)
+                .into_iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, lines)| {
+                    lines
+                        .into_iter()
+                        .map(|(_, line)| line)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        };
+        let Some(update) = method(app, "update_frame") else {
+            return false;
+        };
+        let Some(service) = method(phases, "service_edit_completions") else {
+            return false;
+        };
+        let Some(call) = update.find("self.service_edit_completions(ctx, now);") else {
+            return false;
+        };
+        let Some(gate) = update.find("if embedded_fs_active || embedded_fs_pending {") else {
+            return false;
+        };
+        let Some(poll) = service.find("self.poll_local_adjust_write_results()") else {
+            return false;
+        };
+        let Some(settle) = service.find("self.settle_local_adjust_shape_key_edit()") else {
+            return false;
+        };
+        call < gate && poll < settle
+    }
+
+    #[test]
+    fn the_key_run_audit_rejects_late_service_and_missing_work() {
+        let app = include_str!("app.rs");
+        let phases = include_str!("app/update_phases.rs");
+        let call = "self.service_edit_completions(ctx, now);";
+        let gate = "if embedded_fs_active || embedded_fs_pending {";
+        let late = app
+            .replace(call, "")
+            .replace(gate, &format!("{gate}\n{call}"));
+        assert!(!key_run_settle_precedes_embedded_return(&late, phases));
+        for missing in [
+            "self.poll_local_adjust_write_results()",
+            "self.settle_local_adjust_shape_key_edit()",
+        ] {
+            assert!(!key_run_settle_precedes_embedded_return(
+                app,
+                &phases.replace(missing, "REMOVED_WORK"),
+            ));
+        }
     }
 
     /// 確定と取り消しは、保留の種類を同じだけ**扱う** (同じ結末にする、ではない)。
@@ -3407,7 +3708,7 @@ fn local_adjust_target_raster_vector_mask_ref(
 /// 判定せずに `Arc::make_mut` を呼ぶと、落とすものが無い通常のケース (= 図形も筆も
 /// 中身を残して終わったとき) でも原寸マスクを 1 枚複製することになる。文書はマップが
 /// 常に 1 つ握っているので、`make_mut` は必ず実複製になる点に注意。
-fn compact_local_adjust_manual_override_in(
+pub(crate) fn compact_local_adjust_manual_override_in(
     layers: &mut local_adjust_core::LocalAdjustmentLayers,
     layer_idx: usize,
 ) {
@@ -3492,7 +3793,10 @@ fn draw_local_adjust_left_panel(
     effect_picker_dialog_open: &mut bool,
     select_layer: &mut Option<usize>,
     set_enabled: &mut Option<(usize, bool)>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     move_layer: &mut Option<(usize, usize)>,
     duplicate_layer: &mut Option<usize>,
     delete_layer: &mut Option<usize>,
@@ -3622,7 +3926,10 @@ fn draw_local_adjust_layer_list(
     add_layer_dialog_open: &mut bool,
     select_layer: &mut Option<usize>,
     set_enabled: &mut Option<(usize, bool)>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     move_layer: &mut Option<(usize, usize)>,
     duplicate_layer: &mut Option<usize>,
     delete_layer: &mut Option<usize>,
@@ -3695,7 +4002,12 @@ fn draw_local_adjust_layer_list(
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.set_min_width(42.0);
                         let mut enabled = layer.enabled;
-                        if ui.checkbox(&mut enabled, "").changed() {
+                        let enabled_response = ui.checkbox(&mut enabled, "");
+                        crate::ui_helpers::set_accessibility_label(
+                            &enabled_response,
+                            layer.effect.display_label(),
+                        );
+                        if enabled_response.changed() {
                             *set_enabled = Some((idx, enabled));
                         }
                         ui.horizontal(|ui| {
@@ -3711,7 +4023,13 @@ fn draw_local_adjust_layer_list(
                             {
                                 let mut edited = layer.clone();
                                 edited.mask_before_effect = !edited.mask_before_effect;
-                                *update_layer = Some((idx, edited));
+                                *update_layer = Some((
+                                    idx,
+                                    crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                                        before: layer.clone(),
+                                        after: edited,
+                                    },
+                                ));
                             }
                             let after = draw_local_mask_application_button(
                                 ui,
@@ -3724,7 +4042,13 @@ fn draw_local_adjust_layer_list(
                             {
                                 let mut edited = layer.clone();
                                 edited.mask_after_effect = !edited.mask_after_effect;
-                                *update_layer = Some((idx, edited));
+                                *update_layer = Some((
+                                    idx,
+                                    crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                                        before: layer.clone(),
+                                        after: edited,
+                                    },
+                                ));
                             }
                         });
                     });
@@ -3881,7 +4205,10 @@ fn draw_local_adjust_manual_tool_selector(
     btn_size: egui::Vec2,
     selected_layer: usize,
     layer: Option<&local_adjust_core::LocalAdjustmentLayer>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     mask_edit_target: &mut LocalAdjustMaskEditTarget,
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
@@ -4053,7 +4380,13 @@ fn draw_local_adjust_manual_tool_selector(
                         }
                         _ => {}
                     }
-                    *update_layer = Some((selected_layer, edited));
+                    *update_layer = Some((
+                        selected_layer,
+                        crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                            before: layer.clone(),
+                            after: edited,
+                        },
+                    ));
                 }
             });
     } else {
@@ -4328,7 +4661,10 @@ fn draw_selected_local_adjust_layer_editor(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     image_dims: (usize, usize),
     selected_shape: Option<usize>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     effect_clipboard_available: bool,
     selective_color_pick_active: bool,
     rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
@@ -4580,7 +4916,13 @@ fn draw_selected_local_adjust_layer_editor(
         }
     });
     if changed {
-        *update_layer = Some((layer_idx, edited));
+        *update_layer = Some((
+            layer_idx,
+            crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                before: layer.clone(),
+                after: edited,
+            },
+        ));
     }
 }
 
@@ -4859,7 +5201,7 @@ fn local_adjust_subject_refined_alpha(
     alpha
 }
 
-fn apply_local_adjust_subject_refinement(
+pub(crate) fn apply_local_adjust_subject_refinement(
     mask: &mut local_adjust_core::SubjectMask,
     refinement: local_adjust_core::SubjectMaskRefinement,
 ) {
@@ -8941,21 +9283,7 @@ fn draw_local_mask_editor(
                 .on_hover_text("ONにすると、生成直後の元マットから境界向けのマスクを再生成します。")
                 .changed()
             {
-                if refinement_enabled {
-                    apply_local_adjust_subject_refinement(
-                        mask,
-                        local_adjust_core::SubjectMaskRefinement {
-                            enabled: true,
-                            threshold: mask.refinement.threshold,
-                            expand_px: mask.refinement.expand_px,
-                            feather_px: mask.refinement.feather_px.max(0),
-                        },
-                    );
-                } else {
-                    let source = mask.source_alpha.as_ref().unwrap_or(&mask.alpha).clone();
-                    mask.alpha = source;
-                    mask.refinement.enabled = false;
-                }
+                mask.refinement.enabled = refinement_enabled;
                 changed = true;
             }
 
@@ -8971,7 +9299,7 @@ fn draw_local_mask_editor(
                 });
             });
             if let Some(refinement) = preset_refinement {
-                apply_local_adjust_subject_refinement(mask, refinement);
+                mask.refinement = refinement;
                 changed = true;
             }
 
@@ -9003,15 +9331,12 @@ fn draw_local_mask_editor(
                     || expand_response.changed()
                     || feather_response.changed())
             {
-                apply_local_adjust_subject_refinement(
-                    mask,
-                    local_adjust_core::SubjectMaskRefinement {
-                        enabled: true,
-                        threshold,
-                        expand_px: expand,
-                        feather_px: feather.max(0),
-                    },
-                );
+                mask.refinement = local_adjust_core::SubjectMaskRefinement {
+                    enabled: true,
+                    threshold,
+                    expand_px: expand,
+                    feather_px: feather.max(0),
+                };
                 changed = true;
             }
 
@@ -9134,7 +9459,7 @@ fn draw_header_icon_button(
     disabled_tooltip: Option<&str>,
     icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
 ) -> egui::Response {
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let resp = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
     let bg = if !enabled {
         egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
     } else if active {
@@ -9227,7 +9552,7 @@ fn draw_left_panel_tab_button(
 fn draw_left_panel_close_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
     let response = ui.interact(
         rect,
-        egui::Id::new("left_panel_close"),
+        egui::Id::unique("left_panel_close"),
         egui::Sense::click(),
     );
     if response.hovered() {
@@ -9287,6 +9612,7 @@ macro_rules! slider_with_reset {
         } else {
             $ui.add(slider)
         };
+        crate::ui_helpers::set_accessibility_label(&r, $label);
         if r.changed() {
             $changed = true;
         }
@@ -9321,6 +9647,7 @@ macro_rules! slider_log_with_reset {
         } else {
             $ui.add(slider)
         };
+        crate::ui_helpers::set_accessibility_label(&r, $label);
         if r.changed() {
             $changed = true;
         }
@@ -9463,7 +9790,7 @@ fn draw_colorize_settings(
     // OFF にした時点で対象の選択が消える。有効な間の値をセッション内に控えておき、ON に戻す
     // ときに復元する。有効な間は毎フレーム上書きするため、スロット読み込みなど UI 以外の
     // 書き手が mode を変えても追随し、控えが実態からずれない (= 対象の正本は常に mode)。
-    let restore_mode_id = egui::Id::new("colorize_last_enabled_mode");
+    let restore_mode_id = egui::Id::unique("colorize_last_enabled_mode");
     if params.colorize.mode != ColorizeMode::Disabled {
         let mode = params.colorize.mode;
         ui.data_mut(|data| data.insert_temp(restore_mode_id, mode));
@@ -9529,6 +9856,7 @@ fn draw_colorize_settings(
             });
             let mut tolerance = params.colorize.mono_tolerance as f32;
             let response = ui.add(egui::Slider::new(&mut tolerance, 1.0..=64.0).step_by(1.0));
+            crate::ui_helpers::set_accessibility_label(&response, "色味の許容量");
             if response.changed() {
                 params.colorize.mono_tolerance = tolerance as u8;
                 changed = true;
@@ -9610,12 +9938,13 @@ fn draw_colorize_settings(
                     if ui.color_edit_button_srgb(&mut point.color).changed() {
                         changed = true;
                     }
-                    ui.label("強さ");
+                    let strength_label = ui.label("強さ");
                     let response = ui.add(
                         egui::DragValue::new(&mut point.strength)
                             .range(0.0..=10.0)
                             .speed(0.05),
                     );
+                    let response = response.labelled_by(strength_label.id);
                     if response.changed() {
                         changed = true;
                     }
@@ -9688,6 +10017,7 @@ fn draw_colorize_settings(
                 .step_by(1.0)
                 .suffix("%"),
         );
+        crate::ui_helpers::set_accessibility_label(&response, "元画像の明るさを保持");
         if response.changed() {
             params.colorize.luminance_weight = luminance_weight as u8;
             changed = true;
@@ -9763,6 +10093,7 @@ fn draw_colorize_settings(
                     .step_by(1.0)
                     .suffix("%"),
             );
+            crate::ui_helpers::set_accessibility_label(&response, "変換の強さ");
             if response.changed() {
                 params.colorize.tone_strength = strength as u8;
                 changed = true;
@@ -9952,6 +10283,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "黒点");
             if r.changed() {
                 params.black_point = bp as u8;
                 changed = true;
@@ -9986,6 +10318,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "白点");
             if r.changed() {
                 params.white_point = wp as u8;
                 changed = true;
@@ -10020,6 +10353,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "中間点");
             if r.changed() {
                 changed = true;
             }
@@ -10181,6 +10515,7 @@ fn draw_sliders(
                 );
             }
             let r = ui.add(egui::Slider::new(&mut strength, 0.0..=100.0).step_by(1.0));
+            crate::ui_helpers::set_accessibility_label(&r, "シャープ化");
             if r.changed() {
                 params.smart_sharpen = strength as u8;
                 changed = true;
@@ -10231,6 +10566,7 @@ fn draw_sliders(
                             .map(|value| value / 100.0)
                     }),
             );
+            crate::ui_helpers::set_accessibility_label(&response, "適用量");
             changed |= response.changed();
             dragging |= response.dragged();
 
@@ -10564,7 +10900,7 @@ fn draw_image_creative_lut_combo(
             }
         });
     let before = *selected_id;
-    egui::ComboBox::from_id_salt("image_creative_lut")
+    let response = egui::ComboBox::from_id_salt("image_creative_lut")
         .selected_text(selected_name)
         .width(ui.available_width().max(120.0))
         .height(420.0)
@@ -10586,6 +10922,7 @@ fn draw_image_creative_lut_combo(
                     .on_hover_text(hover);
             }
         });
+    crate::ui_helpers::set_accessibility_label(&response.response, "Creative LUT");
     *selected_id != before
 }
 
@@ -10602,22 +10939,25 @@ mod creative_lut_ui_tests {
         let creative_luts = crate::creative_lut::builtin_creative_lut_entries();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(380.0, 520.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
-                    .show(ctx, |ui| {
-                        crate::os_theme::apply_dark_ui(ui);
-                        ui.set_max_width(320.0);
-                        ui.label("Creative LUT");
-                        draw_image_creative_lut_combo(ui, &mut selected_id, &creative_luts);
-                    });
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
+                        .show(root_ui, |ui| {
+                            crate::os_theme::apply_dark_ui(ui);
+                            ui.set_max_width(320.0);
+                            ui.label("Creative LUT");
+                            draw_image_creative_lut_combo(ui, &mut selected_id, &creative_luts);
+                        });
+                });
             });
 
         harness.get_by_role(egui::accesskit::Role::ComboBox).click();
@@ -10632,12 +10972,12 @@ mod creative_lut_ui_tests {
             harness.ctx.options(|options| options.theme_preference),
             egui::ThemePreference::Light
         );
-        assert!(!harness.ctx.style().visuals.dark_mode);
+        assert!(!harness.ctx.global_style().visuals.dark_mode);
     }
 }
 
 pub(crate) fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
-    egui::Id::new("book_bookmark_title_edit").with(bookmark_id)
+    egui::Id::unique("book_bookmark_title_edit").with(bookmark_id)
 }
 
 fn draw_bookmark_title_edit(
@@ -10708,25 +11048,34 @@ mod bookmark_title_edit_tests {
     }
 
     fn draw_editor(
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
         title: &mut String,
         request_focus: &mut bool,
         enter_pressed: bool,
     ) -> (egui::Id, bool) {
         let mut output = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let (response, submit) =
-                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
-            output = Some((response.id, submit));
-        });
+        {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let (response, submit) =
+                    draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
+                output = Some((response.id, submit));
+            })
+        };
         output.expect("bookmark title editor response")
     }
 
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn ime_commit_and_enter_input() -> egui::RawInput {
         egui::RawInput {
             events: vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("\u{3042}".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "\u{3042}".to_owned(),
+                    active_range_chars: None,
+                }),
                 egui::Event::Ime(egui::ImeEvent::Commit("\u{3042}".to_owned())),
                 key_event(egui::Key::Enter),
             ],
@@ -10739,14 +11088,24 @@ mod bookmark_title_edit_tests {
         let ctx = egui::Context::default();
         let mut title = String::new();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
 
         let mut editor_id = None;
-        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-        });
+        let _ = ctx
+            .run_pass(ime_commit_and_enter_input(), |ctx| {
+                editor_id = Some(
+                    ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    })
+                    .0,
+                );
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "\u{3042}");
         assert_eq!(ctx.memory(|memory| memory.focused()), editor_id);
@@ -10757,21 +11116,31 @@ mod bookmark_title_edit_tests {
         let ctx = egui::Context::default();
         let mut title = String::new();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::Text("\u{7d9a}".to_owned())],
-                ..Default::default()
-            },
-            |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-            },
-        );
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(ime_commit_and_enter_input(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![egui::Event::Text("\u{7d9a}".to_owned())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "\u{3042}\u{7d9a}");
     }
@@ -10782,25 +11151,40 @@ mod bookmark_title_edit_tests {
         let mut title = String::from("title");
         let mut request_focus = true;
         let mut submit_count = 0;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::Enter)],
-                ..Default::default()
-            },
-            |ctx| {
-                if draw_editor(ctx, &mut title, &mut request_focus, true).1 {
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::Enter)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    if ctx
+                        .root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, true)
+                        })
+                        .1
+                    {
+                        submit_count += 1;
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                if ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false))
+                    .1
+                {
                     submit_count += 1;
                 }
-            },
-        );
-        let _ = ctx.run(Default::default(), |ctx| {
-            if draw_editor(ctx, &mut title, &mut request_focus, false).1 {
-                submit_count += 1;
-            }
-        });
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(submit_count, 1);
     }
@@ -10811,45 +11195,76 @@ mod bookmark_title_edit_tests {
         let mut title = String::from("bookmark");
         let mut request_focus = true;
         let mut ids = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ids.push(
+                    ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    })
+                    .0,
+                );
+            })
+            .drop_without_applying_deltas();
 
-        let _ = ctx.run(
-            egui::RawInput {
-                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                events: vec![key_event_with_modifiers(
-                    egui::Key::A,
-                    egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                )],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::Backspace)],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: std::iter::once(egui::Event::ModifiersChanged(
+                        egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    ))
+                    .chain(vec![key_event_with_modifiers(
+                        egui::Key::A,
+                        egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    )])
+                    .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::Backspace)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(title.is_empty());
         assert_eq!(ctx.memory(|memory| memory.focused()), ids.last().copied());
 
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "a");
         assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
@@ -10861,27 +11276,31 @@ mod bookmark_title_edit_tests {
         let mut title = String::new();
         let mut request_focus = false;
         let mut editor_id = None;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for row_id in order {
-                    if *row_id == target {
-                        editor_id = Some(
-                            draw_bookmark_title_edit(
-                                ui,
-                                *row_id,
-                                &mut title,
-                                &mut request_focus,
-                                false,
-                            )
-                            .0
-                            .id,
-                        );
-                    } else {
-                        let _ = ui.button(format!("row-{row_id}"));
-                    }
-                }
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        for row_id in order {
+                            if *row_id == target {
+                                editor_id = Some(
+                                    draw_bookmark_title_edit(
+                                        ui,
+                                        *row_id,
+                                        &mut title,
+                                        &mut request_focus,
+                                        false,
+                                    )
+                                    .0
+                                    .id,
+                                );
+                            } else {
+                                let _ = ui.button(format!("row-{row_id}"));
+                            }
+                        }
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         editor_id.expect("target bookmark row")
     }
 
@@ -10900,7 +11319,7 @@ impl App {
     /// 左パネルのボタンと画像フルスクリーンのショートカットは、表示初期状態を
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
-    pub(crate) fn enter_local_adjust_mode(&mut self) {
+    pub(crate) fn enter_local_adjust_mode(&mut self, ctx: &egui::Context) {
         if self
             .fullscreen_idx
             .is_some_and(|fs_idx| !self.fullscreen_edit_mode_entry_allowed(fs_idx))
@@ -10915,8 +11334,22 @@ impl App {
             if !self.raw_edit_target_entry_allowed(target_idx) {
                 return;
             }
+            self.cancel_original_material_entry_intents(None);
+            if self
+                .current_local_adjust_source_pixels(target_idx)
+                .is_none()
+                && !self.ensure_erase_stage_for_entry(
+                    ctx,
+                    target_idx,
+                    crate::app::OriginalMaterialEntry::LocalAdjustment {
+                        requested_fs_idx: fs_idx,
+                    },
+                )
+            {
+                return;
+            }
             if let Some(pivot) = pivot {
-                self.local_adjust_spread_ctx = Some(pivot);
+                self.local_adjust_spread_ctx = self.capture_local_page_edit_pivot(pivot);
                 self.enter_page_edit_single_view(target_idx);
             }
         }
@@ -11023,6 +11456,24 @@ impl App {
         defer_render: bool,
         mutate: impl FnOnce(&mut local_adjust_core::LocalAdjustmentLayer) -> LocalAdjustCanvasEdit,
     ) -> bool {
+        // The closure can report hydration-only or a genuine edit only after
+        // examining the document. It is non-reentrant and cannot publish jobs.
+        // Reject UndoAppend before lending the document, then invalidate only
+        // an Applied edit in this same call, before any render/save publication.
+        if self.book_append_undo_in_progress() {
+            self.show_feedback_warning("本への追加を取り消しています".to_string());
+            return false;
+        }
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
+        if self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .is_none_or(|layers| layer_idx >= layers.len())
+        {
+            return false;
+        }
         // Undo 用の複製は保存する回だけ作る。ドラッグ中は毎フレームここを通り、
         // レイヤー文書には**画像原寸**のラスターマスク (`Vec<f32>`) が入っているので、
         // 使わない複製が 1 枚 24MP で 27.7ms / 96 MB になる (2026-08-29 実測)。
@@ -11039,8 +11490,7 @@ impl App {
             // 文書は共有所有。Undo 履歴や worker が前の姿を握っている間だけ、ここで
             // 1 回だけ実複製を払う (`Arc::make_mut`)。握られていなければ複製は起きない。
             let Some(layer) = self
-                .local_adjust_page_layers
-                .get_mut(&fs_idx)
+                .local_page_edit_layers_mut(fs_idx)
                 .and_then(|layers| Arc::make_mut(layers).get_mut(layer_idx))
             else {
                 return false;
@@ -11051,9 +11501,15 @@ impl App {
             outcome.resolve(layer)
         };
         if !outcome.touched_document() {
+            self.restore_local_page_edit_document_projection();
             return false;
         }
-        self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
+        if outcome.did_apply() {
+            self.admit_book_append_followup_mutation();
+        }
+        self.note_local_page_edit_document_changed();
+        self.project_local_page_edit_document(fs_idx);
+        self.select_local_page_edit_layer(fs_idx, layer_idx);
         if outcome.did_apply()
             && let Some(before_layers) = before_layers
         {
@@ -11135,7 +11591,7 @@ impl App {
         norm: [f32; 2],
     ) {
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -11143,7 +11599,7 @@ impl App {
         };
         let image_dims = local_adjust_image_dims(self, fs_idx);
         if source.size != [image_dims.0, image_dims.1] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
@@ -11192,7 +11648,7 @@ impl App {
             });
         match outcome {
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
             }
@@ -11201,7 +11657,7 @@ impl App {
                 if let Some(message) = crate::ui_helpers::bucket_shape_fit_failed_message(
                     self.local_adjust_bucket_region,
                 ) {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
             }
             crate::mask_db::BucketFillOutcome::Filled
@@ -11215,7 +11671,7 @@ impl App {
 
     fn apply_local_adjust_gradient_drag(
         &mut self,
-        drag: crate::app::LocalAdjustCanvasDrag,
+        drag: &crate::app::LocalAdjustCanvasDrag,
         norm: [f32; 2],
         persist: bool,
     ) -> bool {
@@ -11559,6 +12015,9 @@ impl App {
         target: LocalAdjustMaskEditTarget,
         points: Vec<[f32; 2]>,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
         if points.len() < 3 {
             return false;
         }
@@ -11649,16 +12108,16 @@ impl App {
         if let Some(drag) = shape_drag
             && let Some(before) = self.local_adjust_shape_drag_before_layers.take()
         {
-            self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
+            self.set_local_adjust_layers_for_target_memory_only(&drag.owner.target, before);
         }
         if let Some(drag) = canvas_drag
             && let Some(before) = self.local_adjust_canvas_drag_before_layers.take()
         {
-            self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
+            self.set_local_adjust_layers_for_target_memory_only(&drag.owner.target, before);
         }
         if let Some(stroke) = brush_stroke {
             if let Some(before) = self.local_adjust_mask_brush_before_layers.take() {
-                self.set_local_adjust_layers_for_idx_memory_only(stroke.fs_idx, before);
+                self.set_local_adjust_layers_for_target_memory_only(&stroke.owner.target, before);
             }
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
         }
@@ -11694,6 +12153,12 @@ impl App {
         undo_summary: &'static str,
         mut update: impl FnMut(local_adjust_core::MaskShape) -> local_adjust_core::MaskShape,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return false;
+        };
         let Some(selected) = self.local_adjust_selected_shape else {
             return false;
         };
@@ -11717,7 +12182,8 @@ impl App {
             .local_adjust_shape_key_edit
             .as_ref()
             .is_some_and(|session| {
-                session.fs_idx != fs_idx
+                session.owner.context != owner.context
+                    || session.owner.target.page_key != owner.target.page_key
                     || session.layer_idx != layer_idx
                     || session.target != target
                     || session.shape_idx != selected
@@ -11764,6 +12230,7 @@ impl App {
                 }
                 None => {
                     self.local_adjust_shape_key_edit = Some(crate::app::LocalAdjustShapeKeyEdit {
+                        owner,
                         fs_idx,
                         layer_idx,
                         target,
@@ -11783,16 +12250,12 @@ impl App {
         let Some(session) = self.local_adjust_shape_key_edit.take() else {
             return;
         };
-        let layers = self
-            .local_adjust_page_layers
-            .get(&session.fs_idx)
-            .cloned()
-            .unwrap_or_default();
+        let layers = self.local_page_edit_layers_for_target(&session.owner.target);
         if session.before == layers {
             return;
         }
-        self.set_local_adjust_layers_for_idx_with_undo(
-            session.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &session.owner.target,
             session.before,
             layers,
             session.summary.to_string(),
@@ -11821,6 +12284,9 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
         let Some(selected) = self.local_adjust_selected_shape else {
             return false;
         };
@@ -11915,6 +12381,9 @@ impl App {
         target: LocalAdjustMaskEditTarget,
         shape: local_adjust_core::MaskShape,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
         let image_dims = local_adjust_image_dims(self, fs_idx);
         let before = self
             .local_adjust_page_layers
@@ -11993,7 +12462,7 @@ impl App {
 
     fn apply_local_adjust_shape_drag_from_canvas(
         &mut self,
-        drag: LocalAdjustMaskShapeDrag,
+        drag: &LocalAdjustMaskShapeDrag,
         point: [f32; 2],
         modifiers: egui::Modifiers,
     ) -> bool {
@@ -12022,9 +12491,7 @@ impl App {
         let Some(drag) = self.local_adjust_shape_drag.take() else {
             return;
         };
-        let Some(mut layers) = self.local_adjust_page_layers.get(&drag.fs_idx).cloned() else {
-            return;
-        };
+        let mut layers = self.local_page_edit_layers_for_target(&drag.owner.target);
         compact_local_adjust_manual_override_in(&mut layers, drag.layer_idx);
         let before = self
             .local_adjust_shape_drag_before_layers
@@ -12033,11 +12500,12 @@ impl App {
         if before == layers {
             return;
         }
-        self.local_adjust_selected_layers
-            .insert(drag.fs_idx, drag.layer_idx);
+        if self.page_path_key(drag.fs_idx).as_deref() == Some(drag.owner.target.page_key.as_str()) {
+            self.select_local_page_edit_layer(drag.fs_idx, drag.layer_idx);
+        }
         self.local_adjust_selected_shape = Some(drag.shape_idx);
-        self.set_local_adjust_layers_for_idx_with_undo(
-            drag.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &drag.owner.target,
             before,
             layers,
             "補正レイヤー図形マスク編集".to_string(),
@@ -12058,19 +12526,19 @@ impl App {
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
             return;
         }
-        let Some(mut layers) = self.local_adjust_page_layers.get(&stroke.fs_idx).cloned() else {
-            self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
-            return;
-        };
+        let mut layers = self.local_page_edit_layers_for_target(&stroke.owner.target);
         compact_local_adjust_manual_override_in(&mut layers, stroke.layer_idx);
-        self.local_adjust_selected_layers
-            .insert(stroke.fs_idx, stroke.layer_idx);
+        if self.page_path_key(stroke.fs_idx).as_deref()
+            == Some(stroke.owner.target.page_key.as_str())
+        {
+            self.select_local_page_edit_layer(stroke.fs_idx, stroke.layer_idx);
+        }
         let before = self
             .local_adjust_mask_brush_before_layers
             .take()
             .unwrap_or_else(|| layers.clone());
-        self.set_local_adjust_layers_for_idx_with_undo(
-            stroke.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &stroke.owner.target,
             before,
             layers,
             "補正レイヤー手描きマスク".to_string(),
@@ -12133,15 +12601,13 @@ impl App {
         let Some(drag) = self.local_adjust_canvas_drag.take() else {
             return;
         };
-        let Some(layers) = self.local_adjust_page_layers.get(&drag.fs_idx).cloned() else {
-            return;
-        };
+        let layers = self.local_page_edit_layers_for_target(&drag.owner.target);
         let before = self
             .local_adjust_canvas_drag_before_layers
             .take()
             .unwrap_or_else(|| layers.clone());
-        self.set_local_adjust_layers_for_idx_with_undo(
-            drag.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &drag.owner.target,
             before,
             layers,
             "補正レイヤーキャンバス操作".to_string(),
@@ -12192,17 +12658,28 @@ impl App {
         changed
     }
 
+    fn begin_local_adjust_pointer_edit(&mut self, idx: usize) -> Option<crate::app::PageEditOwner> {
+        self.begin_local_page_edit(idx).then_some(())?;
+        self.capture_page_edit_owner(idx)
+    }
+
     pub(crate) fn handle_local_adjust_canvas_input(
         &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         if !self.local_adjust_mode {
             return;
         }
         if !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::LaToolBucket)
         {
             self.set_local_adjust_mask_tool_from_shortcut(LocalAdjustMaskTool::Bucket);
@@ -12222,7 +12699,7 @@ impl App {
         };
         if !self.ensure_local_adjust_masks_match_source_dims(fs_idx) {
             let bucket_canvas_click = self.local_adjust_mask_tool == LocalAdjustMaskTool::Bucket
-                && ctx.input(|input| input.pointer.primary_pressed())
+                && ctx.input(|input| primary_allowed && input.pointer.primary_pressed())
                 && ctx
                     .input(|input| input.pointer.interact_pos())
                     .is_some_and(|pos| {
@@ -12231,7 +12708,7 @@ impl App {
                             && !self.local_adjust_tool_panel_rect(full_rect).contains(pos)
                     });
             if bucket_canvas_click {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                         .to_string(),
                 );
@@ -12247,10 +12724,12 @@ impl App {
             pointer_pos,
         ) = ctx.input(|i| {
             (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.pointer.secondary_pressed(),
+                primary_allowed && i.pointer.primary_pressed(),
+                primary_allowed && i.pointer.primary_down(),
+                primary_allowed
+                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                    && i.pointer.primary_released(),
+                secondary_allowed && i.pointer.secondary_pressed(),
                 i.modifiers,
                 i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
             )
@@ -12354,7 +12833,7 @@ impl App {
             return;
         }
 
-        if let Some(mut stroke) = self.local_adjust_mask_brush_stroke {
+        if let Some(mut stroke) = self.local_adjust_mask_brush_stroke.clone() {
             if primary_down {
                 if let Some(pos) = pointer_pos
                     && let Some(norm) = local_adjust_screen_to_norm(pos, transform, false)
@@ -12381,7 +12860,7 @@ impl App {
             self.local_adjust_mask_brush_stroke = None;
         }
 
-        if let Some(drag) = self.local_adjust_canvas_drag {
+        if let Some(drag) = self.local_adjust_canvas_drag.clone() {
             if primary_down {
                 if let Some(pos) = pointer_pos
                     && let Some(norm) = if drag.kind
@@ -12392,7 +12871,7 @@ impl App {
                         local_adjust_screen_to_norm(pos, transform, false)
                     }
                 {
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     let cursor = if matches!(
                         drag.kind,
                         crate::app::LocalAdjustCanvasDragKind::LinearGradientStart
@@ -12462,16 +12941,20 @@ impl App {
                         local_adjust_screen_to_norm(pos, transform, false)
                     };
                     if let Some(norm) = drag_norm {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_canvas_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let drag = crate::app::LocalAdjustCanvasDrag {
+                            owner,
                             fs_idx,
                             layer_idx,
                             kind,
                             start: norm,
                         };
-                        self.local_adjust_canvas_drag = Some(drag);
-                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        self.local_adjust_canvas_drag = Some(drag.clone());
+                        self.apply_local_adjust_gradient_drag(&drag, norm, false);
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                         ctx.request_repaint();
                     }
@@ -12490,11 +12973,11 @@ impl App {
                 effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
             });
 
-        if let Some(drag) = self.local_adjust_shape_drag
+        if let Some(drag) = self.local_adjust_shape_drag.clone()
             && primary_down
         {
             let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-            self.apply_local_adjust_shape_drag_from_canvas(drag, [point.0, point.1], modifiers);
+            self.apply_local_adjust_shape_drag_from_canvas(&drag, [point.0, point.1], modifiers);
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             ctx.request_repaint();
             return;
@@ -12631,16 +13114,20 @@ impl App {
                 .and_then(|layers| layers.get(layer_idx))
                 .and_then(|layer| local_adjust_gradient_handle_hit(layer, pos, transform))
             {
+                let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                    return;
+                };
                 self.local_adjust_canvas_drag_before_layers =
                     self.local_adjust_page_layers.get(&fs_idx).cloned();
                 let drag = crate::app::LocalAdjustCanvasDrag {
+                    owner,
                     fs_idx,
                     layer_idx,
                     kind,
                     start: norm,
                 };
-                self.local_adjust_canvas_drag = Some(drag);
-                self.apply_local_adjust_gradient_drag(drag, norm, false);
+                self.local_adjust_canvas_drag = Some(drag.clone());
+                self.apply_local_adjust_gradient_drag(&drag, norm, false);
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 return;
             }
@@ -12654,16 +13141,20 @@ impl App {
                         local_adjust_tilt_shift_range_create_pending(&layer.effect)
                     });
                 if tilt_shift_range_pending {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind: crate::app::LocalAdjustCanvasDragKind::TiltShiftRange,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                     return;
                 }
@@ -12675,16 +13166,20 @@ impl App {
                         local_adjust_tilt_shift_handle_hit_transform(&layer.effect, pos, transform)
                     });
                 if let Some(kind) = tilt_shift_handle {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                     return;
                 }
@@ -12700,16 +13195,20 @@ impl App {
                         )
                     });
                 if let Some(kind) = effect_gradient_handle {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                     return;
                 }
@@ -12721,16 +13220,20 @@ impl App {
                     .and_then(|(center, _)| local_adjust_norm_to_screen(center, transform))
                     .is_some_and(|center| center.distance(pos) <= 14.0);
                 if center_hit {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind: crate::app::LocalAdjustCanvasDragKind::EffectCenter,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Grab);
                     return;
                 }
@@ -12759,6 +13262,9 @@ impl App {
                         == LocalAdjustMaskTool::Select
                         || !matches!(handle, crate::vector_edit::HoverTarget::Body);
                     if should_begin_shape_drag {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_shape_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         self.local_adjust_selected_shape = Some(shape_idx);
@@ -12772,6 +13278,7 @@ impl App {
                         {
                             let vector_shape = local_adjust_shape_to_vector_shape(shape);
                             self.local_adjust_shape_drag = Some(LocalAdjustMaskShapeDrag {
+                                owner,
                                 fs_idx,
                                 layer_idx,
                                 target,
@@ -12803,6 +13310,9 @@ impl App {
                     LocalAdjustMaskTool::Brush
                     | LocalAdjustMaskTool::EdgeBrush
                     | LocalAdjustMaskTool::GapFillBrush => {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_mask_brush_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let tool = self.local_adjust_mask_tool;
@@ -12810,6 +13320,7 @@ impl App {
                             .then(|| sample_local_adjust_rgb(self, fs_idx, norm))
                             .flatten();
                         let stroke = crate::app::LocalAdjustMaskBrushStroke {
+                            owner,
                             fs_idx,
                             layer_idx,
                             target,
@@ -12936,16 +13447,20 @@ impl App {
                         .and_then(|layers| layers.get(layer_idx))
                         .is_some_and(local_adjust_gradient_create_pending);
                     if create_pending {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_canvas_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let drag = crate::app::LocalAdjustCanvasDrag {
+                            owner,
                             fs_idx,
                             layer_idx,
                             kind: crate::app::LocalAdjustCanvasDragKind::LinearGradient,
                             start: norm,
                         };
-                        self.local_adjust_canvas_drag = Some(drag);
-                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        self.local_adjust_canvas_drag = Some(drag.clone());
+                        self.apply_local_adjust_gradient_drag(&drag, norm, false);
                         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                     }
                 }
@@ -12956,16 +13471,20 @@ impl App {
                         .and_then(|layers| layers.get(layer_idx))
                         .is_some_and(local_adjust_gradient_create_pending);
                     if create_pending {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_canvas_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let drag = crate::app::LocalAdjustCanvasDrag {
+                            owner,
                             fs_idx,
                             layer_idx,
                             kind: crate::app::LocalAdjustCanvasDragKind::RadialGradient,
                             start: norm,
                         };
-                        self.local_adjust_canvas_drag = Some(drag);
-                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        self.local_adjust_canvas_drag = Some(drag.clone());
+                        self.apply_local_adjust_gradient_drag(&drag, norm, false);
                         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                     }
                 }
@@ -13540,6 +14059,202 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn apply_local_adjust_parameter_edit_for_test(
+        &mut self,
+        idx: usize,
+        layer_idx: usize,
+        edit: crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    ) {
+        self.apply_local_adjust_panel_actions(
+            idx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some((layer_idx, edit)),
+            None,
+            None,
+            None,
+            false,
+            LocalEffectPanelRequests::default(),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_local_adjust_layers_from_panel_for_test(&mut self, idx: usize) {
+        self.apply_local_adjust_panel_actions(
+            idx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            LocalEffectPanelRequests::default(),
+        );
+    }
+
+    pub(crate) fn apply_adjustment_panel_edit_frame(
+        &mut self,
+        fs_idx: usize,
+        effective_scope_selection_after: AdjustScopeSelection,
+        mut original: AdjustParams,
+        mut edit_params: AdjustParams,
+        changed: bool,
+        is_dragging: bool,
+        reset_all_params: bool,
+    ) {
+        let was_dragging = self.adjustment_dragging;
+        if self.book_structural_op.is_some() && (changed || is_dragging) {
+            return;
+        }
+        if (changed || is_dragging || was_dragging) && self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
+        if changed {
+            if effective_scope_selection_after == AdjustScopeSelection::Page
+                && self.capture_page_edit_owner(fs_idx).is_none()
+            {
+                return;
+            }
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
+        }
+        // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
+        let drag_just_started = is_dragging && !was_dragging;
+        if drag_just_started || (changed && !is_dragging && !was_dragging) {
+            self.prepare_page_edit_history_boundary();
+            let latest = match effective_scope_selection_after {
+                AdjustScopeSelection::Page => self.effective_params(fs_idx).clone(),
+                AdjustScopeSelection::Standard => self.adjustment_standard_params_for_scope(
+                    self.adjustment_standard_scope_for_idx(fs_idx),
+                ),
+            };
+            if !reset_all_params {
+                let mut rebased = latest.clone();
+                crate::adjustment_parameter_edit::AdjustmentParameterEdit {
+                    before: original,
+                    after: edit_params,
+                }
+                .apply(&mut rebased);
+                edit_params = rebased;
+            }
+            original = latest;
+        }
+        self.adjustment_dragging = is_dragging;
+        if drag_just_started {
+            match effective_scope_selection_after {
+                AdjustScopeSelection::Page => {
+                    let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+                        return;
+                    };
+                    let before = self.adjustment_page_params.get(&fs_idx).cloned();
+                    self.adjustment_drag_session = Some(crate::app::AdjustmentDragSession {
+                        owner,
+                        fs_idx,
+                        draft: before.clone(),
+                        before,
+                    });
+                    self.adjustment_standard_drag_session = None;
+                }
+                AdjustScopeSelection::Standard => {
+                    let scope = self.adjustment_standard_scope_for_idx(fs_idx);
+                    self.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
+                        scope,
+                        before: self.adjustment_standard_params_for_scope(scope),
+                        draft: self.adjustment_standard_params_for_scope(scope),
+                    });
+                    self.adjustment_drag_session = None;
+                }
+            }
+        }
+        // ── スライダー変更を選択中スコープへ反映 ──
+        // ドラッグ中はページ / 標準とも in-memory のみ。release で 1 回だけ永続化する。
+        // 非ドラッグのラジオ・コンボボックス・リセットは即時通常パスへ流す。
+        if changed {
+            if is_dragging || was_dragging {
+                if let Some(session) = self.adjustment_standard_drag_session.as_mut() {
+                    session.draft = edit_params.clone();
+                    // scope はドラッグ開始時に固定し、途中の UI 状態変化に追従させない。
+                    let scope = session.scope;
+                    self.set_adjustment_standard_params_in_memory(scope, edit_params.clone());
+                } else if let Some(session) = self.adjustment_drag_session.as_mut() {
+                    session.draft = Some(edit_params.clone());
+                    self.project_adjustment_page_edit_document();
+                }
+            } else {
+                match effective_scope_selection_after {
+                    AdjustScopeSelection::Page => {
+                        let before = self.adjustment_page_params.get(&fs_idx).cloned();
+                        self.set_page_params(fs_idx, edit_params.clone());
+                        let after = self.adjustment_page_params.get(&fs_idx).cloned();
+                        self.capture_adjustment_undo(
+                            self.page_adjust_undo_scope(fs_idx),
+                            before,
+                            after,
+                            "ページ個別の補正".to_string(),
+                        );
+                    }
+                    AdjustScopeSelection::Standard => {
+                        let scope = self.adjustment_standard_scope_for_idx(fs_idx);
+                        let label = self.adjustment_standard_label_for_scope(scope);
+                        let params = edit_params.clone();
+                        self.capture_adjust_full(format!("{label}の補正"), |app| {
+                            app.persist_adjustment_standard_params(scope, params)
+                        });
+                        let remaining = self.page_override_toast_suffix(None);
+                        self.show_feedback_toast(format!("{label}を更新{remaining}"));
+                    }
+                }
+            }
+            // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
+            self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
+            // ドラッグ中に色調が動いたら、release 時の対象ページの失効を予約する。
+            if (is_dragging || was_dragging) && !original.color_settings_eq(&edit_params) {
+                self.thumb_adjust_drag_color_dirty = true;
+            }
+        }
+
+        // ドラッグ終了 (release) フレーム: changed が立たないことが多いので別経路で確定。
+        let drag_just_ended = !is_dragging && was_dragging;
+        if drag_just_ended {
+            if let Some(session) = self.adjustment_standard_drag_session.take() {
+                let after = session.draft;
+                if session.before != after {
+                    // capture_adjust_full が正しい before を取れるよう、プレビューだけに
+                    // 書いた値を一瞬戻してから通常の永続化 API へ最終値を渡す。
+                    self.set_adjustment_standard_params_in_memory(session.scope, session.before);
+                    let label = self.adjustment_standard_label_for_scope(session.scope);
+                    self.capture_adjust_full(format!("{label}の補正"), |app| {
+                        app.persist_adjustment_standard_params(session.scope, after)
+                    });
+                    let remaining = self.page_override_toast_suffix(None);
+                    self.show_feedback_toast(format!("{label}を更新{remaining}"));
+                }
+            } else if let Some(session) = self.adjustment_drag_session.take() {
+                let in_memory = session.draft;
+                if self.thumb_adjust_drag_color_dirty
+                    && self.page_path_key(session.fs_idx).as_deref()
+                        == Some(session.owner.target.page_key.as_str())
+                {
+                    self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
+                }
+                self.commit_adjustment_page_edit_session(crate::app::AdjustmentDragSession {
+                    draft: in_memory,
+                    ..session
+                });
+            }
+        }
+    }
+
     fn apply_local_adjust_panel_actions(
         &mut self,
         fs_idx: usize,
@@ -13548,18 +14263,38 @@ impl App {
         set_layer_effect: Option<(usize, EffectKind)>,
         select_layer: Option<usize>,
         set_enabled: Option<(usize, bool)>,
-        update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+        update_layer: Option<(
+            usize,
+            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+        )>,
         move_layer: Option<(usize, usize)>,
         duplicate_layer: Option<usize>,
         delete_layer: Option<usize>,
         clear_layers: bool,
         effect_requests: LocalEffectPanelRequests,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        let changes_document = add_layer_mask.is_some()
+            || change_layer_mask.is_some()
+            || set_layer_effect.is_some()
+            || set_enabled.is_some()
+            || update_layer.is_some()
+            || move_layer.is_some()
+            || duplicate_layer.is_some()
+            || delete_layer.is_some()
+            || clear_layers
+            || effect_requests.paste_effect.is_some()
+            || effect_requests.reset_effect.is_some();
+        if changes_document && !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
         if let Some(layer_idx) = select_layer {
             if let Some(layers) = self.local_adjust_page_layers.get(&fs_idx)
                 && layer_idx < layers.len()
             {
-                self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
+                self.select_local_page_edit_layer(fs_idx, layer_idx);
             }
         }
 
@@ -13645,7 +14380,7 @@ impl App {
         if let Some((layer_idx, layer)) = update_layer
             && layer_idx < layers.len()
         {
-            Arc::make_mut(&mut layers)[layer_idx] = layer;
+            layer.apply(&mut Arc::make_mut(&mut layers)[layer_idx]);
             selected_after = Some(layer_idx);
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー編集".to_string());
@@ -13694,7 +14429,7 @@ impl App {
                     self.show_feedback_toast(format!("加工パラメータをペースト: {}", kind.label()));
                 }
             } else {
-                self.show_feedback_toast("コピー済みの加工パラメータがありません".to_string());
+                self.show_feedback_warning("コピー済みの加工パラメータがありません".to_string());
             }
         }
         if let Some(layer_idx) = effect_requests.reset_effect
@@ -13739,7 +14474,7 @@ impl App {
                     .get(&fs_idx)
                     .is_some_and(|layers| selected < layers.len())
                 {
-                    self.local_adjust_selected_layers.insert(fs_idx, selected);
+                    self.select_local_page_edit_layer(fs_idx, selected);
                 }
             }
         }
@@ -13766,7 +14501,7 @@ impl App {
             self.local_adjust_selective_color_pick_active = true;
             self.local_adjust_rgb_pick_active = None;
             self.local_adjust_repair_point_pick_active = None;
-            self.show_feedback_toast("画像上の色をクリックして対象色を選択します".to_string());
+            self.show_feedback_warning("画像上の色をクリックして対象色を選択します".to_string());
         }
         if effect_requests.cancel_rgb_pick {
             self.local_adjust_rgb_pick_active = None;
@@ -13784,7 +14519,7 @@ impl App {
             self.local_adjust_repair_point_pick_active = Some(target);
             self.local_adjust_selective_color_pick_active = false;
             self.local_adjust_rgb_pick_active = None;
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "画像上をクリックして{}を指定します",
                 target.label()
             ));
@@ -13806,8 +14541,11 @@ impl App {
     }
 
     fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         if self.local_adjust_lut_pending.is_some() {
-            self.show_feedback_toast("LUT読み込み中です".to_string());
+            self.show_feedback_warning("LUT読み込み中です".to_string());
             return;
         }
         if !self
@@ -13816,7 +14554,7 @@ impl App {
             .and_then(|layers| layers.get(layer_idx))
             .is_some_and(|layer| matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_)))
         {
-            self.show_feedback_toast("3D LUT レイヤーを選択してください".to_string());
+            self.show_feedback_warning("3D LUT レイヤーを選択してください".to_string());
             return;
         }
         let Some(path) = rfd::FileDialog::new()
@@ -13832,6 +14570,17 @@ impl App {
             .unwrap_or("3D LUT")
             .to_string();
         let worker_path = path.clone();
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
+        self.prepare_page_edit_history_boundary();
+        if !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return;
+        };
+        let document = self.local_page_edit_layers_for_target(&owner.target);
         let (tx, rx) = std::sync::mpsc::channel();
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-lut-load".to_string())
@@ -13844,20 +14593,17 @@ impl App {
         match spawn_result {
             Ok(_) => {
                 self.local_adjust_lut_pending = Some(crate::app::LocalAdjustLutLoadPending {
+                    owner,
                     fs_idx,
                     layer_idx,
-                    generation: self
-                        .local_adjust_generation
-                        .get(&fs_idx)
-                        .copied()
-                        .unwrap_or(0),
+                    document,
                     path: path.clone(),
                     rx,
                 });
-                self.show_feedback_toast(format!("LUT読み込み中: {}", path.display()));
+                self.show_feedback_warning(format!("LUT読み込み中: {}", path.display()));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("LUT読み込み worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("LUT読み込み worker 起動失敗: {err}"));
             }
         }
     }
@@ -13874,27 +14620,22 @@ impl App {
                 let Some(pending) = self.local_adjust_lut_pending.take() else {
                     return;
                 };
-                let current_generation = self
-                    .local_adjust_generation
-                    .get(&pending.fs_idx)
-                    .copied()
-                    .unwrap_or(0);
-                if pending.generation != current_generation {
-                    self.show_feedback_toast(
+                if !self.page_edit_owner_is_current(&pending.owner)
+                    || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
+                        != pending.document
+                {
+                    self.show_feedback_warning(
                         "LUT読み込み結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
                 }
-                let mut layers = self
-                    .local_adjust_page_layers
-                    .get(&pending.fs_idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut layers =
+                    self.local_page_edit_document_for_producer(&pending.owner, &pending.document);
                 let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
                 if !layers.get(pending.layer_idx).is_some_and(|layer| {
                     matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_))
                 }) {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "LUT読み込み結果を破棄しました。対象レイヤーが変更されています".to_string(),
                     );
                     return;
@@ -13903,30 +14644,37 @@ impl App {
                 let size = params.size;
                 Arc::make_mut(&mut layers)[pending.layer_idx].effect =
                     local_adjust_core::LocalEffect::CubeLut(params);
-                self.local_adjust_selected_layers
-                    .insert(pending.fs_idx, pending.layer_idx);
-                self.set_local_adjust_layers_for_idx_with_undo(
-                    pending.fs_idx,
+                if self.page_path_key(pending.fs_idx).as_deref()
+                    == Some(pending.owner.target.page_key.as_str())
+                {
+                    self.select_local_page_edit_layer(pending.fs_idx, pending.layer_idx);
+                }
+                self.set_local_adjust_layers_for_target_with_undo(
+                    &pending.owner.target,
                     before_layers,
                     layers,
                     "補正レイヤーLUT読み込み".to_string(),
                 );
                 self.show_feedback_toast(format!(
-                    "LUT読み込み完了: {name} ({size}^3) / {}",
-                    pending.path.display()
+                    "LUT読み込み: {name} ({size}^3) / {}",
+                    pending
+                        .path
+                        .file_name()
+                        .unwrap_or(pending.path.as_os_str())
+                        .to_string_lossy()
                 ));
                 ctx.request_repaint();
             }
             Ok(Err(err)) => {
                 self.local_adjust_lut_pending = None;
-                self.show_feedback_toast(format!("LUT読み込み失敗: {err}"));
+                self.show_feedback_error(format!("LUT読み込み失敗: {err}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.local_adjust_lut_pending = None;
-                self.show_feedback_toast("LUT読み込み worker が停止しました".to_string());
+                self.show_feedback_warning("LUT読み込み worker が停止しました".to_string());
             }
         }
     }
@@ -14007,7 +14755,7 @@ impl App {
             return;
         }
         if self.local_adjust_segmentation_pending.is_some() {
-            self.show_feedback_toast("マスク生成中です".to_string());
+            self.show_feedback_warning("マスク生成中です".to_string());
             return;
         }
         if !self
@@ -14016,7 +14764,7 @@ impl App {
             .and_then(|layers| layers.get(layer_idx))
             .is_some_and(|layer| matches!(layer.mask, local_adjust_core::LocalMask::Subject(_)))
         {
-            self.show_feedback_toast("被写体マスクのレイヤーを選択してください".to_string());
+            self.show_feedback_warning("被写体マスクのレイヤーを選択してください".to_string());
             return;
         }
         self.ensure_ai_runtime();
@@ -14024,20 +14772,26 @@ impl App {
         // 被写体マットモデル (BiRefNet) は編集用追加パックから供給される。
         // App 構造体に毎フレーム I/O を避けてキャッシュしてあるパスを使う。
         let Some(model_path) = self.subject_matte_path.clone() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "被写体マットモデルが見つかりません (編集用追加ファイル未導入)".to_string(),
             );
             return;
         };
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast("被写体マスク生成用の画像を取得できません".to_string());
+            self.show_feedback_warning("被写体マスク生成用の画像を取得できません".to_string());
             return;
         };
-        let generation = self
-            .local_adjust_generation
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(0);
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
+        self.prepare_page_edit_history_boundary();
+        if !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return;
+        };
+        let document = self.local_page_edit_layers_for_target(&owner.target);
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
@@ -14066,16 +14820,17 @@ impl App {
             Ok(_) => {
                 self.local_adjust_segmentation_pending =
                     Some(crate::app::LocalAdjustSegmentationPending {
+                        owner,
                         fs_idx,
                         layer_idx,
-                        generation,
+                        document,
                         cancel,
                         rx,
                     });
-                self.show_feedback_toast("被写体マスク生成中...".to_string());
+                self.show_feedback_warning("被写体マスク生成中...".to_string());
             }
             Err(err) => {
-                self.show_feedback_toast(format!("被写体マスク worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("被写体マスク worker 起動失敗: {err}"));
             }
         }
     }
@@ -14087,7 +14842,7 @@ impl App {
         scope: LocalAdjustRegionSegmentationScope,
     ) {
         if self.local_adjust_segmentation_pending.is_some() {
-            self.show_feedback_toast("マスク生成中です".to_string());
+            self.show_feedback_warning("マスク生成中です".to_string());
             return;
         }
         if !self
@@ -14098,11 +14853,11 @@ impl App {
                 matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_))
             })
         {
-            self.show_feedback_toast("領域分割マスクのレイヤーを選択してください".to_string());
+            self.show_feedback_warning("領域分割マスクのレイヤーを選択してください".to_string());
             return;
         }
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast("領域分割用の画像を取得できません".to_string());
+            self.show_feedback_warning("領域分割用の画像を取得できません".to_string());
             return;
         };
         let subject = if scope.requires_subject() {
@@ -14111,7 +14866,10 @@ impl App {
             None
         };
         if scope.requires_subject() && subject.is_none() {
-            self.show_feedback_toast("利用できる被写体マスクがありません".to_string());
+            self.show_feedback_warning("利用できる被写体マスクがありません".to_string());
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         let color_tolerance = self.local_adjust_region_color_tolerance;
@@ -14119,11 +14877,14 @@ impl App {
         let edge_threshold = self.local_adjust_boundary_edge_threshold.clamp(0.0, 255.0);
         let ink_threshold = self.local_adjust_boundary_ink_threshold.clamp(0.0, 255.0);
         let gap_px = self.local_adjust_boundary_gap_px.round().clamp(0.0, 8.0) as usize;
-        let generation = self
-            .local_adjust_generation
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(0);
+        self.prepare_page_edit_history_boundary();
+        if !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return;
+        };
+        let document = self.local_page_edit_layers_for_target(&owner.target);
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let spawn_result = std::thread::Builder::new()
@@ -14146,16 +14907,17 @@ impl App {
             Ok(_) => {
                 self.local_adjust_segmentation_pending =
                     Some(crate::app::LocalAdjustSegmentationPending {
+                        owner,
                         fs_idx,
                         layer_idx,
-                        generation,
+                        document,
                         cancel,
                         rx,
                     });
                 self.show_feedback_toast(scope.pending_label().to_string());
             }
             Err(err) => {
-                self.show_feedback_toast(format!("領域分割 worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("領域分割 worker 起動失敗: {err}"));
             }
         }
     }
@@ -14172,25 +14934,20 @@ impl App {
                 let Some(pending) = self.local_adjust_segmentation_pending.take() else {
                     return;
                 };
-                let current_generation = self
-                    .local_adjust_generation
-                    .get(&pending.fs_idx)
-                    .copied()
-                    .unwrap_or(0);
-                if pending.generation != current_generation {
-                    self.show_feedback_toast(
+                if !self.page_edit_owner_is_current(&pending.owner)
+                    || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
+                        != pending.document
+                {
+                    self.show_feedback_warning(
                         "マスク生成結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
                 }
-                let mut layers = self
-                    .local_adjust_page_layers
-                    .get(&pending.fs_idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut layers =
+                    self.local_page_edit_document_for_producer(&pending.owner, &pending.document);
                 let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
                 let Some(layer) = Arc::make_mut(&mut layers).get_mut(pending.layer_idx) else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "マスク生成結果を破棄しました。対象レイヤーがありません".to_string(),
                     );
                     return;
@@ -14217,17 +14974,20 @@ impl App {
                         format!("領域分割完了: {label_count} 領域")
                     }
                     _ => {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "マスク生成結果を破棄しました。対象レイヤーが変更されています"
                                 .to_string(),
                         );
                         return;
                     }
                 };
-                self.local_adjust_selected_layers
-                    .insert(pending.fs_idx, pending.layer_idx);
-                self.set_local_adjust_layers_for_idx_with_undo(
-                    pending.fs_idx,
+                if self.page_path_key(pending.fs_idx).as_deref()
+                    == Some(pending.owner.target.page_key.as_str())
+                {
+                    self.select_local_page_edit_layer(pending.fs_idx, pending.layer_idx);
+                }
+                self.set_local_adjust_layers_for_target_with_undo(
+                    &pending.owner.target,
                     before_layers,
                     layers,
                     "補正レイヤーマスク生成".to_string(),
@@ -14237,14 +14997,14 @@ impl App {
             }
             Ok(Err(err)) => {
                 self.local_adjust_segmentation_pending = None;
-                self.show_feedback_toast(format!("マスク生成失敗: {err}"));
+                self.show_feedback_error(format!("マスク生成失敗: {err}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.local_adjust_segmentation_pending = None;
-                self.show_feedback_toast("マスク生成 worker が停止しました".to_string());
+                self.show_feedback_warning("マスク生成 worker が停止しました".to_string());
             }
         }
     }
@@ -14260,7 +15020,7 @@ impl App {
         }
         let mut open = self.local_adjust_add_layer_dialog_open;
         let mut add_requested = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14268,6 +15028,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("補正レイヤーを追加")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
@@ -14287,6 +15048,10 @@ impl App {
                 );
                     ui.separator();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(320.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -14359,7 +15124,7 @@ impl App {
         let mut open = self.local_adjust_change_mask_dialog_open;
         let mut keep_manual_override = self.local_adjust_change_mask_keep_manual_override;
         let mut selected_kind = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14367,6 +15132,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("マスク種類変更")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(70.0, 54.0))
@@ -14387,6 +15153,10 @@ impl App {
                     );
                     ui.separator();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(320.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -14452,7 +15222,7 @@ impl App {
         }
         let mut open = self.local_adjust_effect_picker_dialog_open;
         let mut picked_effect = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14460,6 +15230,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("加工内容を選択")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
@@ -14489,6 +15260,10 @@ impl App {
                     ui.separator();
                     let query = effect_query.trim();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(440.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -14674,7 +15449,10 @@ impl App {
         let mut set_layer_effect: Option<(usize, EffectKind)> = None;
         let mut select_layer: Option<usize> = None;
         let mut set_enabled: Option<(usize, bool)> = None;
-        let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> = None;
+        let mut update_layer: Option<(
+            usize,
+            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+        )> = None;
         let mut move_layer: Option<(usize, usize)> = None;
         let mut duplicate_layer: Option<usize> = None;
         let mut delete_layer: Option<usize> = None;
@@ -14682,14 +15460,17 @@ impl App {
         let mut effect_requests = LocalEffectPanelRequests::default();
         let mut bitmap_mask_op = None;
 
-        egui::Area::new(egui::Id::new("local_adjust_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("local_adjust_panel_click_sink"),
+                    egui::Id::unique("local_adjust_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -14772,6 +15553,10 @@ impl App {
                                 ui.set_max_width(LOCAL_ADJUST_PANEL_W);
                                 ui.set_min_height(body_height);
                                 egui::ScrollArea::vertical()
+                                    .scroll_source(egui::scroll_area::ScrollSource {
+                                        drag: egui::scroll_area::DragScroll::Always,
+                                        ..Default::default()
+                                    })
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
@@ -14856,14 +15641,17 @@ impl App {
                     });
             });
 
-        egui::Area::new(egui::Id::new("local_adjust_tool_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_tool_panel"))
             .fixed_pos(tool_panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     tool_sink_rect,
-                    egui::Id::new("local_adjust_tool_panel_click_sink"),
+                    egui::Id::unique("local_adjust_tool_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -14882,6 +15670,10 @@ impl App {
                         ui.set_min_height(body_height);
                         ui.set_max_height(body_height);
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .max_height(body_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
@@ -14952,6 +15744,7 @@ impl App {
         );
 
         if close_clicked {
+            self.cancel_original_material_entry_intents(None);
             self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
             self.fold_local_adjust_edit_state();
@@ -15032,7 +15825,7 @@ impl App {
         // 左右ボタンで対象ページを切り替える。退避は触らないので、ボタンはそのまま
         // トグルとして使い続けられる (消しゴムの `switch_erase_target_in_spread` と同じ約束)。
         if let Some(new_idx) = switch_target_to {
-            self.switch_local_adjust_target_in_spread(new_idx);
+            self.switch_local_adjust_target_in_spread(ctx, new_idx);
         }
     }
 
@@ -15049,11 +15842,29 @@ impl App {
     ///
     /// `local_adjust_edge_preview_cache` は `source_key` で keyed なので消さない。
     /// `local_adjust_selected_layers` はページごとの `HashMap` なので消さない。
-    pub(crate) fn switch_local_adjust_target_in_spread(&mut self, new_idx: usize) {
+    pub(crate) fn switch_local_adjust_target_in_spread(
+        &mut self,
+        ctx: &egui::Context,
+        new_idx: usize,
+    ) {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
         if self.fullscreen_idx == Some(new_idx) {
+            return;
+        }
+        let Some(request) = self.page_edit_target_switch_request(
+            crate::app::PageEditTargetSwitchTool::LocalAdjustment,
+            new_idx,
+        ) else {
+            return;
+        };
+        self.cancel_original_material_entry_intents(None);
+        if !self.ensure_erase_stage_for_entry(
+            ctx,
+            new_idx,
+            crate::app::OriginalMaterialEntry::Switch { request },
+        ) {
             return;
         }
         // 保留中のブラシ再計算は捨てずに確定させる。捨てると旧ページの cache が
@@ -15081,6 +15892,7 @@ impl App {
         fs_idx: usize,
         body_width: f32,
         body_height: f32,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         if self.current_book_bookmark_draft(fs_idx).is_none() {
             ui.add_space(12.0);
@@ -15162,6 +15974,10 @@ impl App {
         let mut save_title = None;
         let mut cancel_title_edit = false;
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .auto_shrink([false, false])
             .max_height(body_height - 32.0)
             .show(ui, |ui| {
@@ -15227,13 +16043,25 @@ impl App {
                                     let edit = title_edit
                                         .as_mut()
                                         .expect("matching book bookmark title edit");
-                                    let (_, submit_title) = draw_bookmark_title_edit(
-                                        ui,
-                                        bookmark.id,
-                                        &mut edit.title,
-                                        &mut edit.request_focus,
-                                        enter_pressed,
-                                    );
+                                    let (response, submit_title) = ui
+                                        .add_enabled_ui(
+                                            !self.book_append_undo_in_progress(),
+                                            |ui| {
+                                                draw_bookmark_title_edit(
+                                                    ui,
+                                                    bookmark.id,
+                                                    &mut edit.title,
+                                                    &mut edit.request_focus,
+                                                    enter_pressed,
+                                                )
+                                            },
+                                        )
+                                        .inner;
+                                    if response.changed() {
+                                        // The local TextEdit draft is published back to App
+                                        // below. Opening/canceling an unchanged field is read-only.
+                                        self.invalidate_book_append_undo();
+                                    }
                                     if submit_title {
                                         save_title = Some((bookmark.id, edit.title.clone()));
                                         control_clicked = true;
@@ -15273,9 +16101,15 @@ impl App {
                                 );
                                 if resolution.target_item_index.is_none() {
                                     ui.label(
-                                        egui::RichText::new("ページが見つかりません")
-                                            .small()
-                                            .color(egui::Color32::from_rgb(240, 170, 90)),
+                                        egui::RichText::new(
+                                            if self.composition_hides_bookmark(bookmark) {
+                                                "本の構成で非表示になっています"
+                                            } else {
+                                                "ページが見つかりません"
+                                            },
+                                        )
+                                        .small()
+                                        .color(egui::Color32::from_rgb(240, 170, 90)),
                                     );
                                 }
                                 if title_edit.as_ref().map(|edit| edit.id) != Some(bookmark.id) {
@@ -15303,11 +16137,21 @@ impl App {
                         });
                         control_clicked
                     });
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::unique(("fs_bookmark_row_test_rect", bookmark.id)),
+                            inner.response.rect,
+                        )
+                    });
                     // 行全体の click widget を子ボタンの後から重ねると、後勝ちの
                     // interaction が「名前を編集」「削除」の click を奪う。Frame は
                     // hover のままにして、行内の生 click を読み、子 control が処理した
                     // click だけを除外する。
-                    let row_primary_clicked = ui.input(|input| input.pointer.primary_clicked());
+                    let row_primary_clicked = !overflow_pointer_input
+                        .owns(egui::PointerButton::Primary)
+                        && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                        && ui.input(|input| input.pointer.primary_clicked());
                     if bookmark_row_should_jump(
                         inner.response.contains_pointer(),
                         row_primary_clicked,
@@ -15462,6 +16306,7 @@ impl App {
         let mut canceled = false;
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("このお気に入りの標準設定が削除されます")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .collapsible(false)
@@ -15504,6 +16349,7 @@ impl App {
         ui: &mut egui::Ui,
         panel_rect: egui::Rect,
         image_dims: Option<(u32, u32)>,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         // フルスクリーン対象のページ idx
         let Some(fs_root_idx) = self.fullscreen_idx else {
@@ -15542,6 +16388,9 @@ impl App {
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel_rect));
         child.set_clip_rect(panel_rect);
+        if self.book_structural_op.is_some() {
+            child.disable();
+        }
         // ⚠ テーマ非依存で常に DARK visuals を適用。Light テーマで slider/DragValue
         // の bg が near-white になり「白の上に白文字」で読めなくなる問題への対応
         // (= 消しゴム / 隠蔽パネルと同じ方針、CLAUDE.md「フルスクリーン内は黒背景
@@ -15837,7 +16686,8 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_local_adjust",
                 );
-                self.enter_local_adjust_mode();
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+                self.enter_local_adjust_mode(child.ctx());
                 return;
             }
             if activate_erase {
@@ -15861,7 +16711,7 @@ impl App {
                     "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
                 );
                 self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-                self.enter_conceal_mode(fs_root_idx);
+                self.enter_conceal_mode(child.ctx(), fs_root_idx);
                 return;
             }
             if activate_crop {
@@ -15901,7 +16751,7 @@ impl App {
                         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                         return;
                     }
-                    Err(error) => self.show_feedback_toast(error.message().to_string()),
+                    Err(error) => self.show_feedback_error(error.message().to_string()),
                 }
             }
             if activate_export {
@@ -15950,6 +16800,7 @@ impl App {
                         fs_root_idx,
                         content_width,
                         body_height,
+                        overflow_pointer_input,
                     );
                 },
             );
@@ -16012,6 +16863,7 @@ impl App {
             AdjustScopeSelection::Page => self.effective_params(fs_idx).clone(),
         };
         let original = edit_params.clone();
+        let mut reset_all_params = false;
 
         // サイズ上限以上ならスキップされる → その場合は「無効」を UI に反映する
         let ai_denoise_disabled_limit = match image_dims {
@@ -16051,7 +16903,7 @@ impl App {
                 // ScrollArea は親 UI の available_rect を上限にするため、body_rect と
                 // 同じ高さの親領域を明示確保してから置く。これでコンテンツが短い
                 // 場合もパネル下端近くまで暗背景 + 操作領域が伸びる。
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .max_height(body_height)
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, false])
@@ -16233,6 +17085,7 @@ impl App {
                             .clicked()
                         {
                             edit_params = AdjustParams::default();
+                            reset_all_params = true;
                             slider_result.0 = true;
                         }
 
@@ -16303,7 +17156,6 @@ impl App {
             },
         );
         let (changed, is_dragging, settings_changed) = scroll_output.inner;
-        let was_dragging = self.adjustment_dragging;
         // モアレ抑制の強さ等の settings_changed は drag_stopped の release フレームでだけ立つ。
         // `was_dragging` まで除外するとその最終値を失うため、現在ドラッグ中かだけを見る。
         if should_save_settings(settings_changed, is_dragging) {
@@ -16352,122 +17204,15 @@ impl App {
             }
         }
 
-        // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
-        self.adjustment_dragging = is_dragging;
-        let drag_just_started = is_dragging && !was_dragging;
-        if drag_just_started {
-            match effective_scope_selection_after {
-                AdjustScopeSelection::Page => {
-                    self.adjustment_drag_session = Some(crate::app::AdjustmentDragSession {
-                        fs_idx,
-                        before: self.adjustment_page_params.get(&fs_idx).cloned(),
-                    });
-                    self.adjustment_standard_drag_session = None;
-                }
-                AdjustScopeSelection::Standard => {
-                    let scope = self.adjustment_standard_scope_for_idx(fs_idx);
-                    self.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
-                        scope,
-                        before: self.adjustment_standard_params_for_scope(scope),
-                    });
-                    self.adjustment_drag_session = None;
-                }
-            }
-        }
-        // セッションが存在するが fs_idx がズレている (= ページ移動した) 場合は破棄。
-        // 通常は open_fullscreen での clear_meta_undo が落とすが念のため。
-        if let Some(s) = &self.adjustment_drag_session {
-            if s.fs_idx != fs_idx {
-                self.adjustment_drag_session = None;
-            }
-        }
-
-        // ── スライダー変更を選択中スコープへ反映 ──
-        // ドラッグ中はページ / 標準とも in-memory のみ。release で 1 回だけ永続化する。
-        // 非ドラッグのラジオ・コンボボックス・リセットは即時通常パスへ流す。
-        if changed {
-            if is_dragging || was_dragging {
-                if let Some(session) = self.adjustment_standard_drag_session.as_ref() {
-                    // scope はドラッグ開始時に固定し、途中の UI 状態変化に追従させない。
-                    let scope = session.scope;
-                    self.set_adjustment_standard_params_in_memory(scope, edit_params.clone());
-                } else {
-                    self.adjustment_page_params
-                        .insert(fs_idx, edit_params.clone());
-                }
-            } else {
-                match effective_scope_selection_after {
-                    AdjustScopeSelection::Page => {
-                        let before = self.adjustment_page_params.get(&fs_idx).cloned();
-                        self.set_page_params(fs_idx, edit_params.clone());
-                        let after = self.adjustment_page_params.get(&fs_idx).cloned();
-                        self.capture_adjustment_undo(
-                            self.page_adjust_undo_scope(fs_idx),
-                            before,
-                            after,
-                            "ページ個別の補正".to_string(),
-                        );
-                    }
-                    AdjustScopeSelection::Standard => {
-                        let scope = self.adjustment_standard_scope_for_idx(fs_idx);
-                        let label = self.adjustment_standard_label_for_scope(scope);
-                        let params = edit_params.clone();
-                        self.capture_adjust_full(format!("{label}の補正"), |app| {
-                            app.persist_adjustment_standard_params(scope, params)
-                        });
-                        let remaining = self.page_override_toast_suffix(None);
-                        self.show_feedback_toast(format!("{label}を更新{remaining}"));
-                    }
-                }
-            }
-            // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
-            self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
-            // ドラッグ中に色調が動いたら、release 時の対象ページの失効を予約する。
-            if (is_dragging || was_dragging) && !original.color_settings_eq(&edit_params) {
-                self.thumb_adjust_drag_color_dirty = true;
-            }
-        }
-
-        // ドラッグ終了 (release) フレーム: changed が立たないことが多いので別経路で確定。
-        let drag_just_ended = !is_dragging && was_dragging;
-        if drag_just_ended {
-            if let Some(session) = self.adjustment_standard_drag_session.take() {
-                let after = self.adjustment_standard_params_for_scope(session.scope);
-                if session.before != after {
-                    // capture_adjust_full が正しい before を取れるよう、プレビューだけに
-                    // 書いた値を一瞬戻してから通常の永続化 API へ最終値を渡す。
-                    self.set_adjustment_standard_params_in_memory(session.scope, session.before);
-                    let label = self.adjustment_standard_label_for_scope(session.scope);
-                    self.capture_adjust_full(format!("{label}の補正"), |app| {
-                        app.persist_adjustment_standard_params(session.scope, after)
-                    });
-                    let remaining = self.page_override_toast_suffix(None);
-                    self.show_feedback_toast(format!("{label}を更新{remaining}"));
-                }
-            } else if let Some(session) = self.adjustment_drag_session.take() {
-                let in_memory = self.adjustment_page_params.get(&fs_idx).cloned();
-                if self.thumb_adjust_drag_color_dirty {
-                    self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
-                }
-                if session.before != in_memory {
-                    // in-memory に書いた最終値を `set_page_params` で永続化
-                    // (matches_default の正規化もここで走る)
-                    if let Some(p) = in_memory.clone() {
-                        self.set_page_params(fs_idx, p);
-                    } else {
-                        // ありえない (before != in_memory なのに in_memory が None) が念のため
-                        self.clear_page_params(fs_idx);
-                    }
-                    let after = self.adjustment_page_params.get(&fs_idx).cloned();
-                    self.capture_adjustment_undo(
-                        self.page_adjust_undo_scope(fs_idx),
-                        session.before,
-                        after,
-                        "ページ個別の補正".to_string(),
-                    );
-                }
-            }
-        }
+        self.apply_adjustment_panel_edit_frame(
+            fs_idx,
+            effective_scope_selection_after,
+            original,
+            edit_params,
+            changed,
+            is_dragging,
+            reset_all_params,
+        );
 
         // ── アクションボタン処理 ──
         if copy_global_to_favorite_clicked {
@@ -16564,6 +17309,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("画像補正保存スロット名")
+            .drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -16687,5 +17433,80 @@ mod page_edit_switch_audit {
             ),
             offenders.join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod section1445_slider_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn section1445_page_brightness_text_then_standard_keeps_standard_unchanged() {
+        let mut app = crate::app::setup_app_for_test();
+        let page = app.tmp.path().join("slider-page.png");
+        app.items = vec![crate::grid_item::GridItem::Image(page)];
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_left_panel_tab =
+            crate::settings::FullscreenLeftPanelTab::Adjustment;
+        app.settings.adjustment_settings_tab = crate::settings::AdjustmentSettingsTab::ColorTone;
+        app.settings.global_preset.brightness = 3.0;
+        let standard = app.settings.global_preset.clone();
+        let mut individual = standard.clone();
+        individual.brightness = 10.0;
+        app.set_page_params(0, individual);
+        assert_eq!(app.effective_params(0).brightness, 10.0);
+
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1000.0, 1600.0))
+            .build_ui_state(
+                |root_ui, app| {
+                    crate::test_ui::full_viewport_ui(root_ui, |ui| {
+                        app.draw_adjustment_panel(
+                            ui,
+                            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 1500.0)),
+                            Some((100, 100)),
+                            Default::default(),
+                        );
+                    });
+                },
+                app,
+            );
+        harness.run_steps(3);
+        let slider_rect = harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, "明るさ")
+            .rect();
+        let editor = harness
+            .query_by_role_and_label(egui::accesskit::Role::SpinButton, "明るさ")
+            .unwrap_or_else(|| {
+                panic!(
+                    "brightness editor missing; slider={slider_rect:?}; numeric nodes={:#?}",
+                    harness
+                        .get_all_by_role(egui::accesskit::Role::SpinButton)
+                        .collect::<Vec<_>>()
+                )
+            });
+        let editor_rect = editor.rect();
+        assert!(
+            editor_rect.left() >= slider_rect.right()
+                && editor_rect.top() <= slider_rect.bottom()
+                && slider_rect.top() <= editor_rect.bottom(),
+            "named editor must be beside its slider: slider={slider_rect:?}, editor={editor_rect:?}"
+        );
+        editor.click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("2".into()));
+        harness.run_steps(2);
+        harness.event(egui::Event::Text("0".into()));
+        harness.run_steps(2);
+
+        // No Enter or intermediate blur: this is the real scope-radio action.
+        harness.get_by_label("標準（共通）").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.global_preset, standard);
+        assert!(!harness.state().adjustment_page_params.contains_key(&0));
+        assert_eq!(harness.state().effective_params(0), &standard);
     }
 }

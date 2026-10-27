@@ -22,6 +22,23 @@ enum ViewTrimUiMode {
     Manual,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginalViewTrimAction {
+    SeedPage,
+    DetectBook,
+    DetectPage,
+}
+
+/// A single existing source load owns the action. If its partner is still
+/// loading, that same value moves to the partner's pending/upload purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginalViewTrimRequest {
+    pub(crate) requested_fs_idx: usize,
+    pub(crate) spread_pair: SpreadPair,
+    pub(crate) action: OriginalViewTrimAction,
+    state_fingerprint: u64,
+}
+
 fn view_trim_ui_mode_from_internal(
     base_apply_mode: ViewTrimApplyMode,
     page_apply: bool,
@@ -208,6 +225,61 @@ fn store_page_scope_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1373_pending_trim_flush_and_removal_reject_only_undo_without_dropping_drafts() {
+        for undo_pending in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app.tmp.path().join("trim-append-books");
+            let folder = root.join("book");
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut builder =
+                crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                    .unwrap();
+            let page = folder.join("0001_page.jpg");
+            std::fs::write(&page, b"generated page").unwrap();
+            builder.record(&page).unwrap();
+            let receipt = crate::book_append_undo::BookAppendUndoReceipt {
+                files: builder.finish().unwrap(),
+                operation_id: 1,
+                source_context: app.virtual_list_context_id(),
+                accepted_revision: app.book_append_undo_revision,
+            };
+            app.book_append_undo_receipt = Some(receipt.clone());
+            app.items = vec![crate::grid_item::GridItem::Image(page)];
+            let override_value = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+                top: 0.15,
+                ..Default::default()
+            });
+            app.view_trim_page_overrides.insert(0, override_value);
+            app.view_trim_dirty_page_overrides.insert(0);
+            app.view_trim_save_pending = true;
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx,
+                intent: if undo_pending {
+                    crate::books::BookOpIntent::UndoAppend { receipt }
+                } else {
+                    crate::books::BookOpIntent::SourceMutation
+                },
+            });
+            let revision = app.book_append_undo_revision;
+            app.persist_pending_view_trim_state();
+            app.remove_view_trim_page_overrides_for_spread(0, SpreadPair::Single);
+            if undo_pending {
+                assert!(app.view_trim_save_pending);
+                assert!(app.view_trim_dirty_page_overrides.contains(&0));
+                assert_eq!(app.view_trim_page_overrides.get(&0), Some(&override_value));
+                assert_eq!(app.book_append_undo_revision, revision);
+            } else {
+                assert!(!app.view_trim_save_pending);
+                assert!(app.view_trim_dirty_page_overrides.is_empty());
+                assert!(!app.view_trim_page_overrides.contains_key(&0));
+                assert!(app.book_append_undo_revision > revision);
+                assert!(app.book_append_undo_receipt.is_none());
+            }
+        }
+    }
 
     fn assert_close(actual: f32, expected: f32) {
         assert!(
@@ -853,6 +925,9 @@ impl App {
     }
 
     pub(crate) fn view_trim_single_content_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
+        if let Some(side) = self.composed_blank_spread_side(idx) {
+            return self.view_trim_spread_content_bbox(idx, side);
+        }
         match self.effective_view_trim_apply_mode_for_idx(idx) {
             ViewTrimApplyMode::None => None,
             ViewTrimApplyMode::Auto => self.view_trim_auto_content_bbox(idx, "single"),
@@ -953,8 +1028,295 @@ impl App {
         )
     }
 
-    fn auto_detect_view_trim_margins(&mut self, idx: usize) -> Option<ViewTrimMargins> {
-        self.cached_margin_bbox(idx).map(ViewTrimMargins::from_bbox)
+    fn view_trim_original_state_fingerprint(&self, anchor: usize, pair: SpreadPair) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let (left, right) = match pair {
+            SpreadPair::Single => (anchor, anchor),
+            SpreadPair::Double { left, right } => (left, right),
+        };
+        // The existing settings have float margins and therefore no Eq/Hash.
+        // Only the small, currently edited scope is included; caches and raw
+        // adoption are deliberately absent from this settings signature.
+        let state = format!(
+            "{:?}",
+            (
+                self.view_trim_apply_mode,
+                self.view_trim_book_settings,
+                self.view_trim_page_spread_separate,
+                self.view_trim_page_overrides.get(&left),
+                self.view_trim_page_overrides.get(&right),
+            )
+        );
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        state.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn view_trim_original_request_is_current(&mut self, request: OriginalViewTrimRequest) -> bool {
+        let anchor = request.requested_fs_idx;
+        if self.fullscreen_idx != Some(anchor)
+            || self.resolve_visible_spread_pair(anchor) != request.spread_pair
+            || self.view_trim_original_state_fingerprint(anchor, request.spread_pair)
+                != request.state_fingerprint
+            || self.any_modal_dialog_open_for_fullscreen_keys()
+            || self.remote_session_blocks_local_control()
+            || self.is_panorama_mode_active(anchor)
+            || self.analysis_mode
+            || self.erase_mode
+            || self.conceal_mode
+            || self.text_mode
+            || self.local_adjust_mode
+            || self.export_crop_mode
+            || self.sns_split.is_some()
+        {
+            return false;
+        }
+        let base_mode = self.effective_view_trim_base_apply_mode();
+        let page = view_trim_page_scope_selected(
+            &self.view_trim_page_overrides,
+            anchor,
+            request.spread_pair,
+        );
+        match request.action {
+            OriginalViewTrimAction::SeedPage | OriginalViewTrimAction::DetectBook => {
+                base_mode == ViewTrimApplyMode::Book && !page
+            }
+            OriginalViewTrimAction::DetectPage => page && base_mode == ViewTrimApplyMode::Book,
+        }
+    }
+
+    /// Button and Auto-to-page seed share one entry, so pending original pixels
+    /// cannot be mistaken for an image with no margins.
+    pub(crate) fn request_view_trim_original_action(
+        &mut self,
+        ctx: &egui::Context,
+        anchor: usize,
+        pair: SpreadPair,
+        action: OriginalViewTrimAction,
+    ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        self.cancel_original_material_entry_intents(None);
+        let request = OriginalViewTrimRequest {
+            requested_fs_idx: anchor,
+            spread_pair: pair,
+            action,
+            state_fingerprint: self.view_trim_original_state_fingerprint(anchor, pair),
+        };
+        self.resume_view_trim_after_original(ctx, anchor, request);
+    }
+
+    fn view_trim_original_pixels_ready(&self, idx: usize) -> bool {
+        matches!(
+            self.fs_cache.get(&idx),
+            Some(crate::fs_animation::FsCacheEntry::Static { .. })
+                | Some(crate::fs_animation::FsCacheEntry::RawPreview {
+                    preview: Some(_),
+                    ..
+                })
+        )
+    }
+
+    pub(crate) fn resume_view_trim_after_original(
+        &mut self,
+        ctx: &egui::Context,
+        _completed_idx: usize,
+        request: OriginalViewTrimRequest,
+    ) {
+        if !self.view_trim_original_request_is_current(request) {
+            return;
+        }
+        let anchor = request.requested_fs_idx;
+        let indices = match request.spread_pair {
+            SpreadPair::Single => vec![anchor],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        if indices.iter().any(|&idx| {
+            self.fs_entry_is_animated(idx)
+                || matches!(
+                    self.items.get(idx),
+                    Some(
+                        crate::grid_item::GridItem::Video(_) | crate::grid_item::GridItem::Audio(_)
+                    )
+                )
+        }) {
+            return;
+        }
+        if indices.iter().any(|idx| {
+            matches!(
+                self.fs_cache.get(idx),
+                Some(crate::fs_animation::FsCacheEntry::Failed)
+            )
+        }) {
+            self.show_feedback_error("画像の読み込みに失敗しました".to_string());
+            return;
+        }
+        for &idx in &indices {
+            self.ensure_original_material_for_entry(
+                idx,
+                crate::app::OriginalMaterialEntry::MaterialOnly,
+            );
+        }
+        if let Some(&missing) = indices
+            .iter()
+            .find(|&&idx| !self.view_trim_original_pixels_ready(idx))
+        {
+            self.ensure_original_material_for_entry(
+                missing,
+                crate::app::OriginalMaterialEntry::ViewTrim { request },
+            );
+            ctx.request_repaint();
+            return;
+        }
+
+        let mut book = self.view_trim_book_settings;
+        let mut single = page_override_for_editor(
+            self.view_trim_page_overrides.get(&anchor).copied(),
+            book.single,
+            None,
+        );
+        let (left, right) = match request.spread_pair {
+            SpreadPair::Single => (anchor, anchor),
+            SpreadPair::Double { left, right } => (left, right),
+        };
+        let mut left_page = page_override_for_editor(
+            self.view_trim_page_overrides.get(&left).copied(),
+            book_spread_margins(book, ViewTrimSpreadSide::Left),
+            Some(ViewTrimSpreadSide::Left),
+        );
+        let mut right_page = page_override_for_editor(
+            self.view_trim_page_overrides.get(&right).copied(),
+            book_spread_margins(book, ViewTrimSpreadSide::Right),
+            Some(ViewTrimSpreadSide::Right),
+        );
+        let page_separate = page_spread_separate_from_overrides(
+            self.view_trim_page_overrides.get(&left).copied(),
+            self.view_trim_page_overrides.get(&right).copied(),
+            book.spread_separate,
+        );
+        let left_bbox = self.cached_margin_bbox(left);
+        let right_bbox = if left == right {
+            left_bbox
+        } else {
+            self.cached_margin_bbox(right)
+        };
+        let left_m = left_bbox.map(ViewTrimMargins::from_bbox);
+        let right_m = right_bbox.map(ViewTrimMargins::from_bbox);
+        let mut changed = false;
+        let mut page_changed = false;
+        match (request.action, request.spread_pair) {
+            (OriginalViewTrimAction::SeedPage, SpreadPair::Single) => {
+                single = resolve_page_override_for_scope(
+                    enabled_page_override(self.view_trim_page_overrides.get(&anchor).copied()),
+                    book.single,
+                    Some(page_override_from_display_bbox(left_bbox)),
+                    None,
+                );
+                changed = true;
+                page_changed = true;
+            }
+            (OriginalViewTrimAction::SeedPage, SpreadPair::Double { .. }) => {
+                let (auto_left, auto_right) =
+                    page_overrides_from_auto_spread_bboxes(left_bbox, right_bbox);
+                left_page = resolve_page_override_for_scope(
+                    enabled_page_override(self.view_trim_page_overrides.get(&left).copied()),
+                    book_spread_margins(book, ViewTrimSpreadSide::Left),
+                    Some(auto_left),
+                    Some(ViewTrimSpreadSide::Left),
+                );
+                right_page = resolve_page_override_for_scope(
+                    enabled_page_override(self.view_trim_page_overrides.get(&right).copied()),
+                    book_spread_margins(book, ViewTrimSpreadSide::Right),
+                    Some(auto_right),
+                    Some(ViewTrimSpreadSide::Right),
+                );
+                changed = true;
+                page_changed = true;
+            }
+            (OriginalViewTrimAction::DetectBook, SpreadPair::Single) => {
+                if let Some(margins) = left_m {
+                    book.single = margins;
+                    changed = true;
+                }
+            }
+            (OriginalViewTrimAction::DetectBook, SpreadPair::Double { .. }) => {
+                if book.spread_separate {
+                    if let Some(margins) = left_m {
+                        book.spread_left = margins;
+                        changed = true;
+                    }
+                    if let Some(margins) = right_m {
+                        book.spread_right = margins;
+                        changed = true;
+                    }
+                } else if let Some(linked) = linked_from_detected(left_m, right_m) {
+                    book.spread_linked = linked;
+                    changed = true;
+                }
+            }
+            (OriginalViewTrimAction::DetectPage, SpreadPair::Single) => {
+                if let Some(margins) = left_m {
+                    single = ViewTrimPageOverride::from_margins(margins);
+                    changed = true;
+                    page_changed = true;
+                }
+            }
+            (OriginalViewTrimAction::DetectPage, SpreadPair::Double { .. }) => {
+                if page_separate {
+                    if let Some(margins) = left_m {
+                        left_page = ViewTrimPageOverride::from_margins(margins);
+                        changed = true;
+                        page_changed = true;
+                    }
+                    if let Some(margins) = right_m {
+                        right_page = ViewTrimPageOverride::from_margins(margins);
+                        changed = true;
+                        page_changed = true;
+                    }
+                } else if let Some(linked) = linked_from_detected(left_m, right_m) {
+                    set_page_spread_linked_margins(&mut left_page, &mut right_page, linked);
+                    changed = true;
+                    page_changed = true;
+                }
+            }
+        }
+        if !changed {
+            self.show_feedback_warning("自動検出できる余白がありません".to_string());
+            return;
+        }
+        if request.action == OriginalViewTrimAction::DetectBook {
+            book.enabled = true;
+            self.view_trim_book_settings = book;
+        }
+        if page_changed {
+            self.view_trim_page_spread_separate = page_separate;
+            store_page_scope_overrides(
+                &mut self.view_trim_page_overrides,
+                &mut self.view_trim_dirty_page_overrides,
+                anchor,
+                request.spread_pair,
+                single,
+                left_page,
+                right_page,
+                page_separate,
+            );
+            for idx in indices {
+                self.sync_prepared_page_edit_key_for_idx(idx);
+            }
+        }
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique(("view_trim_auto_page_seed_pending", anchor)),
+                false,
+            )
+        });
+        self.view_trim_save_pending = true;
+        if !ctx.input(|input| input.pointer.primary_down()) {
+            self.persist_pending_view_trim_state();
+        }
+        self.reanchor_continuous_reading_after_view_trim_change(anchor);
+        ctx.request_repaint();
     }
 
     pub(crate) fn remove_view_trim_page_overrides_for_spread(
@@ -962,10 +1324,21 @@ impl App {
         editor_root_idx: usize,
         spread_pair: SpreadPair,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        self.cancel_original_material_entry_intents(None);
         let indices = match spread_pair {
             SpreadPair::Single => vec![editor_root_idx],
             SpreadPair::Double { left, right } => vec![left, right],
         };
+        if indices
+            .iter()
+            .any(|idx| self.view_trim_page_overrides.contains_key(idx))
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         for idx in indices {
             self.remove_view_trim_page_override(idx);
             self.view_trim_page_overrides.remove(&idx);
@@ -976,6 +1349,9 @@ impl App {
 
     pub(crate) fn persist_pending_view_trim_state(&mut self) {
         if !self.view_trim_save_pending {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.persist_current_view_trim_book_state();
@@ -1045,6 +1421,9 @@ impl App {
         body_width: f32,
         body_height: f32,
     ) {
+        if self.book_structural_op.is_some() {
+            ui.disable();
+        }
         let is_spread = matches!(spread_pair, SpreadPair::Double { .. });
         let had_any_page_override = match spread_pair {
             SpreadPair::Single => self.view_trim_page_overrides.contains_key(&fs_idx),
@@ -1079,7 +1458,8 @@ impl App {
         };
         // Auto → Manual → このページは 2 クリックになるため、Auto から Manual へ入った
         // 事実だけ UI 一時状態に保持し、次の page_apply ON で従来の自動余白シードを使う。
-        let auto_page_seed_pending_id = egui::Id::new(("view_trim_auto_page_seed_pending", fs_idx));
+        let auto_page_seed_pending_id =
+            egui::Id::unique(("view_trim_auto_page_seed_pending", fs_idx));
         let mut auto_page_seed_pending = ui.ctx().data(|data| {
             data.get_temp::<bool>(auto_page_seed_pending_id)
                 .unwrap_or(false)
@@ -1115,11 +1495,19 @@ impl App {
         let mut clear_page_requested = false;
         let mut create_page_requested = false;
         let mut page_values_changed = false;
+        let append_undo_pending = self.book_append_undo_in_progress();
 
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .max_height(body_height.max(160.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if append_undo_pending {
+                    ui.disable();
+                }
                 ui.set_min_width(body_width);
                 ui.set_max_width(body_width);
 
@@ -1291,6 +1679,9 @@ impl App {
             });
 
         if base_mode_changed {
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
             changed = true;
             match base_apply_mode {
                 ViewTrimApplyMode::Book => {
@@ -1302,121 +1693,32 @@ impl App {
                 self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, FullscreenFitMode::Page);
             }
         }
-        if create_page_requested {
-            if auto_page_seed_pending {
-                match spread_pair {
-                    SpreadPair::Single => {
-                        let auto_seed =
-                            page_override_from_display_bbox(self.cached_margin_bbox(fs_idx));
-                        page_single = resolve_page_override_for_scope(
-                            enabled_page_override(page_single_existing),
-                            book.single,
-                            Some(auto_seed),
-                            None,
-                        );
-                    }
-                    SpreadPair::Double { left, right } => {
-                        let left_bbox = self.cached_margin_bbox(left);
-                        let right_bbox = self.cached_margin_bbox(right);
-                        let (auto_left, auto_right) =
-                            page_overrides_from_auto_spread_bboxes(left_bbox, right_bbox);
-                        page_left = resolve_page_override_for_scope(
-                            enabled_page_override(page_left_existing),
-                            book_spread_margins(book, ViewTrimSpreadSide::Left),
-                            Some(auto_left),
-                            Some(ViewTrimSpreadSide::Left),
-                        );
-                        page_right = resolve_page_override_for_scope(
-                            enabled_page_override(page_right_existing),
-                            book_spread_margins(book, ViewTrimSpreadSide::Right),
-                            Some(auto_right),
-                            Some(ViewTrimSpreadSide::Right),
-                        );
-                    }
-                }
-                auto_page_seed_pending = false;
+        let original_action = if reset_requested || clear_page_requested {
+            None
+        } else if create_page_requested && auto_page_seed_pending {
+            // Keep the page scope unchanged until its original sources arrive.
+            page_apply = false;
+            create_page_requested = false;
+            page_values_changed = false;
+            Some(OriginalViewTrimAction::SeedPage)
+        } else if auto_requested {
+            match apply_mode {
+                ViewTrimApplyMode::Book => Some(OriginalViewTrimAction::DetectBook),
+                ViewTrimApplyMode::Page => Some(OriginalViewTrimAction::DetectPage),
+                ViewTrimApplyMode::None | ViewTrimApplyMode::Auto => None,
             }
+        } else {
+            None
+        };
+        if create_page_requested {
             page_single.enabled = true;
             page_left.enabled = true;
             page_right.enabled = true;
             page_values_changed = true;
             changed = true;
         }
-        if auto_requested {
-            match (apply_mode, spread_pair) {
-                (ViewTrimApplyMode::Book, SpreadPair::Single) => {
-                    if let Some(margins) = self.auto_detect_view_trim_margins(fs_idx) {
-                        book.enabled = true;
-                        book.single = margins;
-                        changed = true;
-                    } else {
-                        self.show_feedback_toast("自動検出できる余白がありません".to_string());
-                    }
-                }
-                (ViewTrimApplyMode::Book, SpreadPair::Double { left, right }) => {
-                    let left_m = self.auto_detect_view_trim_margins(left);
-                    let right_m = self.auto_detect_view_trim_margins(right);
-                    let mut detected = false;
-                    if book.spread_separate {
-                        if let Some(m) = left_m {
-                            book.spread_left = m;
-                            detected = true;
-                            changed = true;
-                        }
-                        if let Some(m) = right_m {
-                            book.spread_right = m;
-                            detected = true;
-                            changed = true;
-                        }
-                    } else if let Some(linked) = linked_from_detected(left_m, right_m) {
-                        book.spread_linked = linked;
-                        detected = true;
-                        changed = true;
-                    }
-                    if detected {
-                        book.enabled = true;
-                    } else {
-                        self.show_feedback_toast("自動検出できる余白がありません".to_string());
-                    }
-                }
-                (ViewTrimApplyMode::Page, SpreadPair::Single) => {
-                    if let Some(margins) = self.auto_detect_view_trim_margins(fs_idx) {
-                        page_single = ViewTrimPageOverride::from_margins(margins);
-                        changed = true;
-                        page_values_changed = true;
-                    } else {
-                        self.show_feedback_toast("自動検出できる余白がありません".to_string());
-                    }
-                }
-                (ViewTrimApplyMode::Page, SpreadPair::Double { left, right }) => {
-                    let left_m = self.auto_detect_view_trim_margins(left);
-                    let right_m = self.auto_detect_view_trim_margins(right);
-                    let mut detected = false;
-                    if page_spread_separate {
-                        if let Some(m) = left_m {
-                            page_left = ViewTrimPageOverride::from_margins(m);
-                            detected = true;
-                            changed = true;
-                            page_values_changed = true;
-                        }
-                        if let Some(m) = right_m {
-                            page_right = ViewTrimPageOverride::from_margins(m);
-                            detected = true;
-                            changed = true;
-                            page_values_changed = true;
-                        }
-                    } else if let Some(linked) = linked_from_detected(left_m, right_m) {
-                        set_page_spread_linked_margins(&mut page_left, &mut page_right, linked);
-                        detected = true;
-                        changed = true;
-                        page_values_changed = true;
-                    }
-                    if !detected {
-                        self.show_feedback_toast("自動検出できる余白がありません".to_string());
-                    }
-                }
-                (ViewTrimApplyMode::None | ViewTrimApplyMode::Auto, _) => {}
-            }
+        if changed || reset_requested || clear_page_requested {
+            self.cancel_original_material_entry_intents(None);
         }
         if reset_requested {
             match (apply_mode, spread_pair) {
@@ -1451,6 +1753,15 @@ impl App {
                 }
                 (ViewTrimApplyMode::None | ViewTrimApplyMode::Auto, _) => {}
             }
+        }
+        // Controls, auto detection, and reset above edit only local values.
+        // Admit a successful edit before its first live draft/publication.
+        // A mode change already admitted before its legacy fit migration.
+        if (changed || clear_page_requested)
+            && !base_mode_changed
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
         }
         if clear_page_requested {
             self.remove_view_trim_page_overrides_for_spread(fs_idx, spread_pair);
@@ -1487,11 +1798,20 @@ impl App {
         }
 
         // Manual の本全体を実際に編集したら、Auto 由来の一時シード候補は古くなる。
-        if changed && ui_mode == ViewTrimUiMode::Manual && !page_apply && !base_mode_changed {
+        if changed
+            && ui_mode == ViewTrimUiMode::Manual
+            && !page_apply
+            && !base_mode_changed
+            && original_action.is_none()
+        {
             auto_page_seed_pending = false;
         }
         ui.ctx()
             .data_mut(|data| data.insert_temp(auto_page_seed_pending_id, auto_page_seed_pending));
+
+        if let Some(action) = original_action {
+            self.request_view_trim_original_action(ctx, fs_idx, spread_pair, action);
+        }
 
         if changed {
             self.view_trim_save_pending = true;
@@ -1522,7 +1842,7 @@ impl App {
         let panel_h = panel_rect.height();
         let mut close = false;
 
-        egui::Area::new(egui::Id::new("view_trim_panel"))
+        egui::Area::new(egui::Id::unique("view_trim_panel"))
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
@@ -1531,7 +1851,7 @@ impl App {
                         egui::Pos2::ZERO,
                         egui::vec2(PANEL_W + 12.0, panel_h + 12.0),
                     ),
-                    egui::Id::new("view_trim_panel_click_sink"),
+                    egui::Id::unique("view_trim_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())

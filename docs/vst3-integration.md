@@ -74,30 +74,37 @@ HUD バー / シークバー / hover thumbnail は VST GUI の裏に潜ってい
 解決策として、HUD overlay を独立 top-level HWND `HudOverlayWindow` として presenter
 HWND と同じ owner (= presenter HWND) の sibling 配置にし、VST GUI と並ぶ z-order
 group に入れる。両方 `WS_EX_TOPMOST`、HUD を後勝ちで `HWND_TOPMOST` に再アサート
-することで VST より前に出す。詳細な構造は
-[video-architecture.md](video-architecture.md) の "HUD overlay HWND" 節参照。
+することで VST より前に出す。構造・要求経路・許可判定の正本は
+[video-architecture.md](video-architecture.md) の「HUD overlay HWND」節
+（「Z-order 再アサート」「Region 計算とアクティベーション検出」）を参照。
 
 **Z-order ポリシー (= HUD raise burst)**:
 
 VST z-order が変動する各経路 (`set_all_guis_topmost` / `set_all_guis_visible_blocking`
 / `set_all_guis_app_active` / `send_chain_z_order` / `show_slot_gui` (sync/async) /
 `hide_slot_gui` / `user_hide_slot_gui` / `remove_plugin` / `disable_with_reason`) の
-末尾で `DspBridge::fire_hud_raise_hook` を呼ぶ → App が unbounded mpsc 経由で受け、
-fullscreen 中の `VideoPlayer::request_hud_raise()` を 1 回 coalesce 発火 → presenter
-thread が **即時/16ms/64ms の short retry burst** で `SetWindowPos(hud, HWND_TOPMOST)`
-を呼ぶ。非同期 VST IPC の z-order 反映を確実に拾うための retry 設計。
+末尾で `DspBridge::fire_hud_raise_hook` が `AtomicBool` latest-value latch を set → App
+`update` が `swap(false)` で coalesce し、fullscreen 中の `VideoPlayer::request_hud_raise()`
+を 1 回呼ぶ → bounded render command と pump control を経て、pump が
+**即時/16ms/50ms の short retry burst** で `SetWindowPos(hud, HWND_TOPMOST)` を呼ぶ。
+非同期 VST IPC の z-order 反映を拾うための retry 設計。
 
-加えて presenter thread の **50ms 周期 cursor polling** が activation zone (= 画面上下端
-の hover 検出帯) で cursor を検知したら、最後の raise から 200ms 以上経過していれば
-helper `schedule_hud_raise_burst` 経由で同じ retry burst を起動する (= VST 手動クリックで
-HUD が裏に回ったあとの復帰経路、Codex P1 反映)。
+加えて render の **50ms 周期 cursor polling** が pump の latest observation を評価する。
+`cursor_input_owned` が true で、cursor が presenter client rect 内かつ activation zone
+(= 画面上下端の hover 検出帯) 内にある場合、同じ raise burst を要求する。
+VST 側に入力所有がある領域では、この polling による HUD 復帰は保証されない。
 
-HUD wndproc の `WM_WINDOWPOSCHANGING` で `hwndInsertAfter` が `HWND_TOP` / `HWND_TOPMOST`
-を指していたら `RequestRaiseHud` event を流す best-effort safety net もある。
+HUD wndproc の `WM_WINDOWPOSCHANGING` は、`SWP_NOZORDER` がなく、`hwndInsertAfter` が
+`HWND_TOP` / `HWND_TOPMOST` の場合に `RequestRaiseHud` を流す best-effort safety net。
+`SWP_NOZORDER` 付きの geometry 通知では要求を生成せず、`DefWindowProcW` は従来どおり呼ぶ。
+移動・サイズ変更のない HUD 自前 raise のみに `SWP_NOSENDCHANGING` を付け、自己通知から
+次の burst が再予約されることを防ぐ。geometry／DPI／ShowWindow／presenter／VST の操作には広げない。
+外部由来の通知・VST hook・hover polling、foreground／transition permit／window epoch の
+判定と上記 burst は維持する。これは不要な HUD 前面化の繰り返しの修正であり、点滅との因果は未確定。
 
 **Raise skip 条件 (allowlist 判定、`foreground_allows_hud_raise`)**:
 
-各 raise burst deadline 実行直前に `try_raise_hud_to_top(presenter_hwnd)` を通って
+各 raise burst deadline 実行直前に `NativeWindowHost::try_raise_hud_to_top()` を通って
 allowlist チェックする (= command / event / polling のすべての raise 経路で同じ判定)。
 **foreground HWND** を以下で判定:
 
@@ -355,8 +362,10 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 
 ## 5. プラグイン GUI ホスティング
 
-EffeTune 専用 bridge は `GuiOwnerPolicy::Unowned` (2026-09-30 利用者決定)。owner=0 の
-tool window なのでメインをクリックするとメインを手前にでき、タスクバーボタンは増えない。
+EffeTune 専用 bridge は `GuiOwnerPolicy::Unowned`。owner=0 を維持し、音響調整の
+タスクバー表示設定は既定ON。専用frameはnative caption / system menu / minimizeを持ち、
+ON/OFFとも通常captionとWS_EX_APPWINDOWを保ち、host GUI threadのITaskbarListでtaskbar項目だけを
+切り替える。EffeTuneは音符を重ねた専用iconを使う。mIV全体のAppUserModelIDやpinは変更しない。
 `main_hwnd` は DPI / 最小化参照であり owner ではない。ユーザー VST の `Auto`、fullscreen の
 owner / TOPMOST / focus handoff は従来どおり。EffeTune は owner 変更 IPC と app-active relay の対象外。
 表示希望と一時非表示理由 (`Minimized` / `RemoteSession`) は host の `GuiVisibility` に集約し、
@@ -384,6 +393,26 @@ plugin UI thread で `IConnectionPoint::notify` に完全snapshotを渡し、同
 収束し、Rustの既存HostLostで素通し・一度の案内・自動再起動無しとなる。ユーザーVSTは別host。
 metadata owner、画像worker、Local/Remote終端と詳細試験は
 [Now Playing 計画](effetune-now-playing-plan.md) を参照。
+
+§1.378のframe付きClose/通常矩形とtaskbar制御は互換性を変えるため、protocolをv7へ上げる。
+core・host・独立testerはhello/readyで旧v6を拒否する。probeもcoreと同じready-version検査を使う。
+source identityは成果物一致を検証する別のgateであり、protocol互換性判定の代わりにしない。
+`show_gui.show_in_taskbar`は一般VSTでfalse、EffeTuneはhost-control workerの最新設定を継承する。
+`set_gui_taskbar { slot_id, value }`は同じGUI threadで現在frameを更新し、再attachしない。
+再表示・TaskbarButtonCreatedでOFFを再適用し、hidden/suppressed frameへ項目を追加しない。
+OFFの最小化およびiconicからOFFへの変更は既存user-hideに揃え、音響調整ボタンで戻す。
+ONの最小化/復元はnative経路のまま。Hide/破棄は明示追加したtaskbar項目を削除する。
+`gui_attached.normal_rect`、`gui_normal_rect { slot_id, container_hwnd, normal_rect }`、
+`gui_user_hidden`内の同じframe/通常矩形はvirtual-screen物理pxのimmutable payload。
+hostがWINDOWPLACEMENTをTOOLWINDOW有無に応じてscreen座標へ正規化してから公開する。
+coreはbridge/slot/current HWNDを照合し、同じFIFOで矩形を先に適用してからCloseを処理する。
+EffeTuneのボタンHide・native Close・終了保存は完了snapshotをdrainして読むだけでWin32再読/IPC待機しない。
+一般VSTのGetWindowRect保存は維持する。iconic状態はOSが所有し、coreに別boolを置かない。
+pluginへのchild layout/`onSize`/最終寸法の更新はhost GUI threadの通常client確認入口へ揃える。
+iconic中のDPI/host/plugin resizeは復元用通常配置だけを更新し、pluginの寸法は通常復元後に通知する。
+Close後のSW_SHOWNAやRemote抑止解除はiconicを保つため、そこでは通知せず、SW_RESTORE/通常WM_SIZEで
+確定したallocationを使う。hidden-but-normalのattach/resizeは維持し、一般VSTのresizeView受領も同じ境界で検査する。
+操作と座標系の契約は[EffeTune計画 §17](effetune-integration-plan.md)を参照。
 
 要件:
 - アプリ起動中ずっとプラグイン GUI を表示しておける

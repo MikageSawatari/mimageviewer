@@ -4,10 +4,16 @@ use crate::app::App;
 use crate::settings::{AiFeatureMode, UiTheme};
 
 impl App {
+    pub(crate) fn first_setup_visible(&self) -> bool {
+        self.settings_boot_problem_source.is_none()
+            && !self.settings.first_setup_completed
+            && !self.startup_notice_viewer_open()
+    }
+
     pub(crate) fn show_first_setup_dialog(&mut self, ctx: &egui::Context) {
         // settings.db を読めず defaults で保護起動した場合は「初回」ではない。
         // 復元案内を優先し、既定値を初回設定として保存しようとする誤解を防ぐ。
-        if self.settings_boot_problem_source.is_some() || self.settings.first_setup_completed {
+        if !self.first_setup_visible() {
             return;
         }
 
@@ -55,7 +61,7 @@ pub fn draw_first_setup_dialog(
     ctx: &egui::Context,
     settings: &mut crate::settings::Settings,
 ) -> egui::ModalResponse<egui::Response> {
-    super::show_startup_modal(ctx, egui::Id::new("first_setup_modal"), |ui| {
+    super::show_startup_modal(ctx, egui::Id::unique("first_setup_modal"), |ui| {
         ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
         ui.heading("初回設定");
         ui.add_space(8.0);
@@ -180,8 +186,9 @@ mod tests {
                 let mut fonts_ready = false;
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(1920.0, 1440.0))
-                    .build_state(
-                        move |ctx, state: &mut State| {
+                    .build_ui_state(
+                        move |root_ui, state: &mut State| {
+                            let ctx = &root_ui.ctx().clone();
                             ctx.options_mut(|o| o.max_passes = max_passes.try_into().unwrap());
                             crate::settings::apply_ui_scale_factor(ctx, scale);
                             if !fonts_ready {
@@ -206,7 +213,11 @@ mod tests {
                 harness.state_mut().watched = ["初回設定", "開始"]
                     .map(|label| {
                         let node = harness.get_by_label(label);
-                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) }
+                        unsafe {
+                            egui::Id::from_high_entropy_bits(
+                                (u128::from(node.accesskit_node().id()) >> 64) as u64,
+                            )
+                        }
                     })
                     .to_vec();
                 for size in [
@@ -265,13 +276,14 @@ mod tests {
             egui::vec2(480.0, 360.0),
         ] {
             let mut fonts_ready = false;
-            let mut harness = crate::test_ui::builder().with_size(size).build_state(
-                move |ctx,
+            let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+                move |root_ui,
                       state: &mut (
                     crate::settings::Settings,
                     bool,
                     Option<(egui::Rect, egui::Rect)>,
                 )| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -301,6 +313,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn first_setup_enter_confirms_defaults_but_ime_enter_and_escape_do_not() {
         for (key, composing, focus_start, expected) in [
             (egui::Key::Enter, false, false, true),
@@ -318,9 +334,11 @@ mod tests {
             // Modal ownership and Area geometry are published on the next frame.
             let mut start_id = None;
             for _ in 0..3 {
-                let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                    start_id = Some(draw_first_setup_dialog(ctx, &mut app.settings).inner.id);
-                });
+                let _ = ctx
+                    .run_pass(egui::RawInput::default(), |ctx| {
+                        start_id = Some(draw_first_setup_dialog(ctx, &mut app.settings).inner.id);
+                    })
+                    .drop_without_applying_deltas();
             }
             if focus_start {
                 ctx.memory_mut(|memory| memory.request_focus(start_id.unwrap()));
@@ -328,7 +346,10 @@ mod tests {
             let mut events = Vec::new();
             if composing {
                 events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
-                events.push(egui::Event::Ime(egui::ImeEvent::Preedit("設定".into())));
+                events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "設定".into(),
+                    active_range_chars: None,
+                }));
             }
             events.push(egui::Event::Key {
                 key,
@@ -337,27 +358,29 @@ mod tests {
                 repeat: false,
                 modifiers: egui::Modifiers::NONE,
             });
-            let _ = ctx.run(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    let enter = app.dialog_enter_pressed(ctx);
-                    let response = draw_first_setup_dialog(ctx, &mut app.settings);
-                    let ime_active = app.ime_input_active(ctx);
-                    assert_eq!(
-                        first_setup_should_confirm(&response, enter, ime_active),
-                        expected
-                    );
-                    if expected && !focus_start {
-                        ctx.memory_mut(|memory| {
-                            memory.request_focus(egui::Id::new("focused_option"))
-                        });
-                        assert!(!first_setup_should_confirm(&response, enter, ime_active));
-                    }
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let enter = app.dialog_enter_pressed(ctx);
+                        let response = draw_first_setup_dialog(ctx, &mut app.settings);
+                        let ime_active = app.ime_input_active(ctx);
+                        assert_eq!(
+                            first_setup_should_confirm(&response, enter, ime_active),
+                            expected
+                        );
+                        if expected && !focus_start {
+                            ctx.memory_mut(|memory| {
+                                memory.request_focus(egui::Id::unique("focused_option"))
+                            });
+                            assert!(!first_setup_should_confirm(&response, enter, ime_active));
+                        }
+                    },
+                )
+                .drop_without_applying_deltas();
             assert!(!app.settings.first_setup_completed);
         }
     }

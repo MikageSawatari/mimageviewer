@@ -98,7 +98,7 @@ impl App {
                 self.clipboard_capture_service
                     .resolve_selection(snapshot.token, false);
             } else {
-                self.show_feedback_toast_on(
+                self.show_feedback_warning_on(
                     "一覧画面で Ctrl+V を押すと開けます".into(),
                     ActionSurface::MainWindow,
                 );
@@ -106,7 +106,7 @@ impl App {
             return;
         }
         if snapshot.html.candidates.is_empty() {
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "取り込める画像がありません".into(),
                 ActionSurface::MainWindow,
             );
@@ -129,7 +129,7 @@ impl App {
                     .ok();
         }
         let Some(service) = &self.capture_fetch_service else {
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "画像の取得を開始できませんでした".into(),
                 ActionSurface::MainWindow,
             );
@@ -238,7 +238,13 @@ impl App {
             }
             self.capture_selection = None;
             self.clipboard_capture_service.set_selection_open(false);
-            self.show_feedback_toast_on(text, ActionSurface::MainWindow);
+            self.show_feedback_result_on(
+                text,
+                ActionSurface::MainWindow,
+                crate::feedback::FeedbackKind::result(
+                    summary.failed > 0 || summary.metadata_failed > 0 || !summary.errors.is_empty(),
+                ),
+            );
             ctx.request_repaint();
         }
     }
@@ -253,7 +259,8 @@ impl App {
         let mut close = can_close && escape;
         let mut save = false;
         let mut window = egui::Window::new("クリップボードの画像を選んで保存")
-            .id(egui::Id::new("clipboard-capture-selection"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("clipboard-capture-selection"))
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
             .default_width(720.0)
             .min_width(450.0)
@@ -295,7 +302,7 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.show_feedback_toast_on(error, ActionSurface::MainWindow);
+                    self.show_feedback_warning_on(error, ActionSurface::MainWindow);
                     return;
                 }
             }
@@ -379,6 +386,10 @@ fn draw_selection_contents(
     ui.style_mut().spacing.scroll =
         super::non_overlapping_dialog_scroll_style(ui.style().spacing.scroll);
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("clipboard-capture-cells")
         .auto_shrink([false, false])
         .max_height(height)
@@ -426,7 +437,8 @@ fn draw_selection_contents(
 pub fn draw_capture_selection_snapshot_fixture(ui: &mut egui::Ui, saving: bool) {
     let ctx = ui.ctx().clone();
     let mut preview = FetchedImage::snapshot_preview();
-    let texture = ctx.load_texture(
+    let texture = crate::ui_helpers::load_snapshot_texture(
+        &ctx,
         "clipboard-capture-snapshot-preview",
         std::mem::replace(
             &mut preview.thumbnail,
@@ -439,7 +451,8 @@ pub fn draw_capture_selection_snapshot_fixture(ui: &mut egui::Ui, saving: bool) 
         image.width = 640;
         image.height = 480;
         image.content_hash = [1; 32];
-        let texture = ctx.load_texture(
+        let texture = crate::ui_helpers::load_snapshot_texture(
+            &ctx,
             "clipboard-capture-snapshot-second",
             std::mem::replace(
                 &mut image.thumbnail,
@@ -526,6 +539,37 @@ mod tests {
     use super::*;
     use base64::Engine;
     use egui_kittest::kittest::Queryable;
+
+    fn settle_pointer_target(
+        harness: &mut egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
+        label: &str,
+    ) {
+        // Window sizes are outer sizes in egui 0.37. Resize expands to the last
+        // content size, while the non-shrinking ScrollArea initially fills its
+        // available height before the footer is laid out. `run` only waits for
+        // repaint requests; it does not establish that this layout has converged.
+        // Keep the real pointer route, but measure its target after convergence.
+        let mut previous = harness.get_by_label(label).rect();
+        let mut stable_passes = 0;
+        for _ in 0..16 {
+            harness.step();
+            let rect = harness.get_by_label(label).rect();
+            stable_passes = if rect == previous {
+                stable_passes + 1
+            } else {
+                0
+            };
+            if stable_passes == 2 {
+                assert!(
+                    harness.ctx.content_rect().contains_rect(rect),
+                    "pointer target must be visible: {label}: {rect:?}"
+                );
+                return;
+            }
+            previous = rect;
+        }
+        panic!("pointer target never settled: {label}: {previous:?}");
+    }
 
     fn ready_dialog() -> crate::app::AppTestEnvForTest {
         let mut bytes = Vec::new();
@@ -645,22 +689,33 @@ mod tests {
         assert_eq!(selected[1].extension, "gif");
         let output = app.tmp.path().join("paste");
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(900.0, 700.0))
-            .build_state(
-                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_capture_selection_dialog(ctx)
                 },
                 app,
             );
         harness.run();
         assert_eq!(harness.get_all_by_label("120 × 100").count(), 2);
+        settle_pointer_target(&mut harness, "選んだ 2 枚を保存");
         harness.get_by_label("選んだ 2 枚を保存").click();
         harness.run();
         let ctx = harness.ctx.clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while harness.state().capture_selection_open() {
             harness.state_mut().poll_capture_selection(&ctx);
-            assert!(std::time::Instant::now() < deadline);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "save did not complete: phase={:?}",
+                harness
+                    .state()
+                    .capture_selection
+                    .as_ref()
+                    .map(|selection| selection.phase)
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let saved: Vec<_> = std::fs::read_dir(output)
@@ -676,14 +731,17 @@ mod tests {
     fn clipboard_fetching_all_three_close_routes_cancel_modal() {
         for route in ["button", "escape", "title"] {
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(900.0, 700.0))
-                .build_state(
-                    |ctx, app: &mut crate::app::AppTestEnvForTest| {
+                .build_ui_state(
+                    |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                        let ctx = &root_ui.ctx().clone();
                         app.show_capture_selection_dialog(ctx)
                     },
                     ready_dialog(),
                 );
             harness.run();
+            settle_pointer_target(&mut harness, "閉じる");
             match route {
                 "button" => harness.get_by_label("閉じる").click(),
                 "escape" => harness.key_press(egui::Key::Escape),
@@ -691,16 +749,26 @@ mod tests {
                 _ => unreachable!(),
             }
             harness.run();
-            assert!(!harness.state().capture_selection_open(), "{route}");
+            assert!(
+                !harness.state().capture_selection_open(),
+                "{route}: phase={:?}",
+                harness
+                    .state()
+                    .capture_selection
+                    .as_ref()
+                    .map(|selection| selection.phase)
+            );
         }
     }
 
     #[test]
     fn clipboard_minimum_dialog_edit_save_reload_sets_next_dialog_initial_value() {
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(900.0, 700.0))
-            .build_state(
-                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_capture_selection_dialog(ctx)
                 },
                 ready_dialog(),
@@ -761,29 +829,29 @@ mod tests {
     #[test]
     fn clipboard_save_and_escape_in_same_frame_keeps_saving_modal() {
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(900.0, 700.0))
-            .build_state(
-                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_capture_selection_dialog(ctx)
                 },
                 ready_dialog(),
             );
         harness.run();
+        settle_pointer_target(&mut harness, "選んだ 1 枚を保存");
         // Follow the Harness click sequence: establish the hovered window and
         // widget in a separate frame before pressing. Only release + Esc are
         // combined; merging the initial hover with press can miss the hit.
         harness.get_by_label("選んだ 1 枚を保存").hover();
         harness.step();
         let pos = harness.get_by_label("選んだ 1 枚を保存").rect().center();
-        harness
-            .input_mut()
-            .events
-            .extend([egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::NONE,
-            }]);
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
         harness.step();
         harness.input_mut().events.extend([
             egui::Event::PointerButton {
@@ -801,7 +869,10 @@ mod tests {
             },
         ]);
         harness.step();
-        assert!(harness.state().capture_selection_open());
+        assert!(
+            harness.state().capture_selection_open(),
+            "save + Escape must retain the Saving modal"
+        );
         assert!(
             !harness
                 .state()

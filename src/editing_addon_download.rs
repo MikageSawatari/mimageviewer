@@ -916,8 +916,8 @@ mod tests {
 
     #[test]
     fn prune_removes_unmanifested_files() {
-        let base = std::env::temp_dir().join("miv_editing_prune_test_a1");
-        let _ = fs::remove_dir_all(&base);
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
         fs::create_dir_all(base.join("fonts")).unwrap();
         fs::create_dir_all(base.join("models")).unwrap();
         fs::write(base.join("pack-manifest.json"), "{}").unwrap();
@@ -948,13 +948,12 @@ mod tests {
             !base.join("README.txt").exists(),
             "manifest 外ファイルは除外される"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn collect_files_rel_recurses() {
-        let base = std::env::temp_dir().join("miv_editing_collect_test_a1");
-        let _ = fs::remove_dir_all(&base);
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
         fs::create_dir_all(base.join("a/b")).unwrap();
         fs::write(base.join("top.txt"), "1").unwrap();
         fs::write(base.join("a/mid.txt"), "2").unwrap();
@@ -966,7 +965,6 @@ mod tests {
         assert!(norm.contains(&"top.txt".to_string()));
         assert!(norm.contains(&"a/mid.txt".to_string()));
         assert!(norm.contains(&"a/b/deep.txt".to_string()));
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

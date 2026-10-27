@@ -291,16 +291,10 @@ impl App {
             .or_else(|| {
                 self.detached_window_runtime_placement(window_id)
                     .map(|placement| {
-                        egui::vec2(
-                            crate::settings::window_geometry_to_viewport_points(
-                                placement.w,
+                        Self::detached_snapshot_client_size(placement)
+                            / crate::settings::normalize_ui_scale_factor(
                                 self.settings.ui_scale_factor,
-                            ),
-                            crate::settings::window_geometry_to_viewport_points(
-                                placement.h,
-                                self.settings.ui_scale_factor,
-                            ),
-                        )
+                            )
                     })
             });
         let Some(size) = size else { return false };

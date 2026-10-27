@@ -9,7 +9,7 @@
 
 mod about;
 #[doc(hidden)]
-pub use about::draw_raw_license_snapshot_fixture;
+pub use about::{draw_avif_license_snapshot_fixture, draw_raw_license_snapshot_fixture};
 pub(crate) mod archive_cache_manager;
 pub(crate) mod archive_convert;
 pub(crate) mod batch_convert;
@@ -224,6 +224,10 @@ fn startup_dialog_scroll_body_with_axes<R>(
         |ui| {
             ui.spacing_mut().scroll = non_overlapping_dialog_scroll_style(ui.spacing().scroll);
             let scroll = egui::ScrollArea::new(axes)
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .id_salt(id)
                 .max_height(height)
                 .min_scrolled_height(0.0)
@@ -231,7 +235,6 @@ fn startup_dialog_scroll_body_with_axes<R>(
                 .show(ui, body);
             if ui.rect_contains_pointer(scroll.inner_rect) {
                 ui.ctx().input_mut(|input| {
-                    input.raw_scroll_delta = egui::Vec2::ZERO;
                     input.smooth_scroll_delta = egui::Vec2::ZERO;
                     input
                         .events
@@ -258,7 +261,8 @@ fn draw_startup_worker_notice(
     let mut retry = false;
     let mut close = false;
     egui::Window::new(title)
-        .id(egui::Id::new(id))
+        .drag_area(egui::WindowDrag::Anywhere)
+        .id(egui::Id::unique(id))
         .default_pos(egui::pos2(
             content.max.x - width - 36.0,
             content.min.y + 56.0,
@@ -382,10 +386,11 @@ mod tests {
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1920.0, 1440.0)] {
             for scale in [1.0, 2.0] {
                 for long in [false, true] {
-                    let mut harness = crate::test_ui::builder().with_size(size).build_state(
-                        move |ctx, rects: &mut Option<(f32, f32, egui::Rect)>| {
+                    let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+                        move |root_ui, rects: &mut Option<(f32, f32, egui::Rect)>| {
+                            let ctx = &root_ui.ctx().clone();
                             crate::settings::apply_ui_scale_factor(ctx, scale);
-                            egui::Modal::new(egui::Id::new("body_sizing")).show(ctx, |ui| {
+                            egui::Modal::new(egui::Id::unique("body_sizing")).show(ctx, |ui| {
                                 ui.set_width(480.0_f32.min(ctx.content_rect().width() - 48.0));
                                 ui.heading("Heading");
                                 ui.add_space(8.0);
@@ -445,10 +450,12 @@ mod tests {
         use eframe::egui;
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1920.0, 1440.0)] {
             for scale in [1.0, 2.0] {
-                let mut harness = crate::test_ui::builder().with_size(size).build_state(
-                    move |ctx, height: &mut Option<f32>| {
+                let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+                    move |root_ui, height: &mut Option<f32>| {
+                        let ctx = &root_ui.ctx().clone();
                         crate::settings::apply_ui_scale_factor(ctx, scale);
                         let response = egui::Window::new("Short startup notice")
+                            .drag_area(egui::WindowDrag::Anywhere)
                             .default_width(460.0)
                             .default_height(ctx.content_rect().height() - 80.0)
                             .default_pos(egui::pos2(60.0, 40.0))
@@ -486,10 +493,11 @@ mod tests {
         for scale in [1.0, 2.0] {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build_state(
-                    move |ctx, rects: &mut Option<(egui::Rect, egui::Rect)>| {
+                .build_ui_state(
+                    move |root_ui, rects: &mut Option<(egui::Rect, egui::Rect)>| {
+let ctx = &root_ui.ctx().clone();
                         crate::settings::apply_ui_scale_factor(ctx, scale);
-                        egui::Window::new("Narrow startup notice")
+                        egui::Window::new("Narrow startup notice").drag_area(egui::WindowDrag::Anywhere)
                             .fixed_size(egui::vec2(200.0, ctx.content_rect().height() - 80.0))
                             .default_pos(egui::pos2(60.0, 40.0))
                             .show(ctx, |ui| {
@@ -524,9 +532,11 @@ mod tests {
         for height in [220.0, 400.0] {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build_state(
-                    move |ctx, rects: &mut Option<(egui::Rect, egui::Rect)>| {
+                .build_ui_state(
+                    move |root_ui, rects: &mut Option<(egui::Rect, egui::Rect)>| {
+                        let ctx = &root_ui.ctx().clone();
                         egui::Window::new("Resizable startup notice")
+                            .drag_area(egui::WindowDrag::Anywhere)
                             .fixed_size(egui::vec2(460.0, height))
                             .default_pos(egui::pos2(60.0, 40.0))
                             .show(ctx, |ui| {
@@ -561,23 +571,26 @@ mod tests {
         use eframe::egui;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(
-                |ctx, state: &mut (f32, bool)| {
+            .build_ui_state(
+                |root_ui, state: &mut (f32, bool)| {
+                    let ctx = &root_ui.ctx().clone();
                     let had_wheel = ctx.input(|input| {
                         input
                             .events
                             .iter()
                             .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
                     });
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         ui.heading("Heading");
                         super::startup_dialog_scroll_body(ui, "wheel_body", 32.0, |ui| {
                             state.0 = ui.cursor().top();
                             ui.label("Long message\n".repeat(80));
                         });
                         if had_wheel {
+                            let wheel_options = ctx.options(|o| o.input_options);
                             state.1 = ctx.input(|input| {
-                                input.raw_scroll_delta == egui::Vec2::ZERO
+                                crate::wheel_input::remaining_wheel_delta(input, wheel_options)
+                                    == egui::Vec2::ZERO
                                     && input.smooth_scroll_delta == egui::Vec2::ZERO
                                     && !input.events.iter().any(|event| {
                                         matches!(event, egui::Event::MouseWheel { .. })
@@ -595,6 +608,8 @@ mod tests {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -150.0),
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         });
         harness.run();
         assert!(harness.state().0 < initial_top - 20.0);
@@ -627,7 +642,7 @@ pub(crate) fn draw_mouse_nav_migration_dialog(
 ) -> Option<crate::ring_shortcut::MouseBackForwardActionId> {
     use eframe::egui;
     let mut choice = None;
-    egui::Window::new("マウス戻る/進むボタン")
+    egui::Window::new("マウス戻る/進むボタン").drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(false)
             .open(open)

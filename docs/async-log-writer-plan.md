@@ -93,7 +93,7 @@ hitchesはrecords_dropped（sink／理由／count／total）とdiagnostic_droppe
 | 診断 | 現行根拠 | 決定案と理由 |
 | --- | --- | --- |
 | Rust panic／panic.log | `src/lib.rs:504–524` は通常logger→panic.logの順。`:532–551` は独立open／append、4MiB＋.bak | **panic.logへ先に直接同期記録**し、その後通常ログへbest-effort enqueue。一般queueをdrain／joinせず、writer mutexに触れない。unwind中やqueue満杯でも主証跡を通常loggerへ依存させない。panic hookからshutdownを実行しない（worker panicでprocessが続く場合もある） |
-| native exception | `src/lib.rs:865–886` は既存例外情報をpanic.logへ記録 | 独立経路を維持。新しいalloc／lock／writer待ちを足さない。既存native handlerの限界は本件で拡張しない |
+| native exception | §1.123 (B) で `src/native_exception_log.rs` の専用 `logs/native-exception.log` へ分離 | 起動時だけ1MiB超で `.bak` へ置換。handlerは固定buffer＋raw WriteFile 1回、256行/session。一般writerを経由せずalloc／lock／待機を足さない。sink初期化・VEH登録失敗だけlogger初期化後に既存one-shot error／toastへ渡す。Rust panic／UI hangは引き続きpanic.log |
 | UI hang watchdog | `src/lib.rs:571–578/:634–638` は専用threadからpanic.logへ直接記録 | panic.log直接同期を維持。通常ログ複写はenqueueだけ。native-healthもpanic.logを先に書く。UIや一般writer停止中でも別の証跡を試みられる |
 | 常時startup JSONL | `crates/startup-diagnostics/src/lib.rs:212–231` の非blocking journal、`output.rs:32–40/:105–140` の独立writer、`lib.rs:654–697` のterminal | **別owner／writerのまま**。一般writerへ統合せず、通常／perf queueが停止・満杯でもstage／watchdog／terminalを公開できる。既存容量・drop／retention／独立watchdog契約を保持。終了時のterminal排出ACKは§5の共有境界で補完する |
 | Remote service log | `src/remote_ipc/service.rs:440–448` はRemoteへ--logを渡し、別processが `crates/remote-web/src/diagnostics.rs:16/:150–161` でrequest JSONLを同期保存 | **Remote側の専用ログは現状の同期のまま**。本体UIのwriterとは別process／別ファイルで、秘匿値除去・request schema・retentionを維持。Remote自身のI/O応答性改善は本件に混ぜない。core側stderr monitor（`service.rs:496–503`）の通常logは今回の非blocking facadeで改善 |

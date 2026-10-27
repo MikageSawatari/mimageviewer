@@ -7,7 +7,7 @@ Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 
 
 ## 0. 目的と決定済み事項
 
-EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.13.0、WebView2 UI、AVX2/FMA 必須) を
+EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.14.0、WebView2 UI、AVX2/FMA 必須) を
 mIV の音声経路へ組み込み、エフェクト処理とビジュアライザーを使えるようにする。
 
 利用者と合意済みの方針 (2026-09-27):
@@ -378,7 +378,7 @@ enum EffectiveState {
 
 ## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
-- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.13.0、未署名)。
+- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.14.0、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
 - 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
@@ -525,6 +525,10 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 ### 10.1 ポータブル版 (利用者決定 2026-09-28、UI方針追記 2026-10-01)
 
 - ポータブル版は **ユーザー VST も音響調整 (EffeTune) も無効のまま** (vst3-host.exe を同梱しない現状を維持)。
+- 非同梱なのは **Mixwright bundle とその音響調整用 host／通知**。音楽ビューの鍵盤に使う
+  Note Spectrogram の HarmNet L 推論・重みは music-core に埋め込み、ポータブル版を含む全形態で
+  使う。外部 bundle／WebView や保存領域を必要とせず、MIT 本文は全形態のバージョン情報に表示する
+  （`third_party/effetune-harmnet/`、[鍵盤の基音推定設計 §7](music-keyboard-harmnet-plan.md#7-ライセンス表記)）。
 - **利用者決定 2026-10-01**: portable は EffeTune のツールバーボタンとカスタマイズ候補を表示しない。
   v4.3.0 の「重要な変更点」からも、同ボタン追加の必読告知と EffeTune 新機能の紹介を除く。
   通常版の表示・告知は維持し、Remote 接続・音声トラック選択・長さ表示の告知は両版に残す。
@@ -590,8 +594,9 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 3種類の通知全文を `third_party/effetune-mixwright/v0.12.0/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
-  でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
-  一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
+  でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は Mixwright
+  一覧・bundle 通知の埋め込みを行わない。HarmNet L の MIT notice は別に core へ埋め込み、全形態で
+  一覧・全文を表示する（§10.1）。bundle 内の元通知も省略せず配布する。
   2026-10-03 の公開前レビュー対応で、JSZip 内の lie / immediate / setImmediate と
   pako の zlib 由来コードの原文を `supplemental/NOTICES.txt` として第4の折り畳み通知に
   埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。
@@ -717,6 +722,111 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 自動削除より単純で誤削除を避けられる残存検査を選択した。現在版の正本は vendor VERSION で、生成時に
 `.htaccess` の印付きブロックも更新する。全他版を一つの301規則で同名ファイルへ、廃止ページは現在版の index.html へ送る。
 公開時はサーバ上の旧版も削除し、生成物と `.htaccess` を同時反映する。sitemap はコミット後に再生成する。
+
+### 10.6 同梱版更新 (2026-10-18)
+
+既存の§10.5（説明ページの更新手順）は保持し、今回の同梱更新を§10.6に記録する。
+
+- 利用者決定: 次のリリースで Mixwright v0.14.0 を同梱する。**歌詞連携は入れない**。
+  bridge protocol、Now Playing の送信内容、mIV の UI・挙動は変更しない。
+  既存の署名前承認hash、署名後stage検証、世代公開・lease・cleanup、portable非同梱を維持する。
+- 原本は `C:/home/miv-tools/effetune-mixwright-0.14.0/EffeTune-Mixwright-windows-x64.zip`。
+  SHA-256 は `9c2586ed3fd19345f0d2b14b98613bc050d393a9bebf94c3ffc83ff86c425c1d`。
+  取得・上流release notes一致・展開物照合はClaudeCodeのcommit `058513108` の検証記録。
+  この実装では外部原本を変更せず、承認manifestも再生成しない。
+- vendorは全462ファイルのbundleと `VERSION`（`v0.14.0` + LF）。全463行の
+  `third_party/effetune-mixwright/v0.14.0/manifest.sha256` と実ファイル集合・SHA-256を照合する。
+  v0.13.0から追加15・削除1（`webview/js/remote/client-csp-guards.js`）。旧版の追跡資料は保持する。
+  3通知はv0.13.0とバイト同一。aboutは新版pathの上流3通知を表示し、補足通知は再開しない。
+  HarmNet重みの `effetune_dsp_0.13.0` と旧版state fixtureは別の根拠なので変更しない。
+- 上流 `docs/host-now-playing.md` は無変更、`PluginStateDocument.formatVersion` は1のまま
+  （ClaudeCode静的照合）。新しいhost契約や歌詞のpayloadは追加しない。
+- Remote静的確認（ClaudeCode）: plugin PEの通信系import
+  WS2_32 / WinHTTP / WinINet / URLMonが見当たらない状況は旧版と同じ。
+  同梱Remote JSは `electronAPI.remoteV1` が無いと起動せず、VSTのelectronAPIには提供されない。
+  `vst-bootstrap.js` の旧版との差はSFZ selectへのoptions引数転送だけ。
+  native全体の通信不使用や実機listen状況の証明とは扱わない。
+- SFZ静的確認（ClaudeCodeおよび実装時の同梱JS照合）: 登録先は引き続き
+  `sfz-references.json`。file/folder選択モード、`bankPaths`、`importedAt` が追加され、
+  サンプルのコピーを示す変更は見当たらない。`NativeSfzLibraryService.selectFiles` /
+  `selectFolder` → `vst-bootstrap.js` のoptions転送と、参照元の直接readを確認した。
+  既存の登録先・元ファイルを残す削除・Adaptive Predictionの説明を変える根拠は無いため、
+  privacy日英・製品ページの本文は変更しない。
+  v0.13.0の実行観測を新版の実行証拠とはしない。
+- 説明書は `third_party/effetune-docs/01c96f00/`（正確なcommitは同directoryのSOURCE.md）を
+  使用。独立版MCP・LANリモートは節選別で除外する。日本語tour.menuの
+  「画面の案内を見る」は同梱localeと一致し、設定メニューから開く案内を加える。
+  Lyricsは追加不可・既存/取込itemの編集だけ可・再生中の歌詞無しと訂正。
+  Lyric Stageは非同梱だが、Cinema StripのLyrics itemは残っているため、
+  同presetの利用可能なグラフ説明は残す。Edge FadeのClean Feed言及を除き、
+  Analog Meter Custom、Note Spectrogramの楽器色、SFZファイル/フォルダ・ARIA・Sample Shiftは維持。
+  詳細は [overrideの記録](effetune-docs-overrides/README.md#現在の同梱版と訂正-2026-10-18)。
+  133 HTML + 4画像を新版に生成し、公開ツリーのv0.13.0を除去、旧URLを新版へ301転送する。
+  入口2本とsitemapも更新する。既存の上流snapshotや過去の検証記録は書き換えない。
+- 最深path gate: 新462ファイルで、vendor入力rootからの最長相対名は104 UTF-16単位。
+  `EffeTune Mixwright.vst3/Contents/Resources/webview/features/measurement/audio-utils/channel-selection.js`。
+  従来と同じ40文字のユーザー名・45文字のgeneration、mIV版 `4.7.1` を使う
+  `C:\Users\<40文字>\AppData\Roaming\mimageviewer\runtime\4.7.1\effetune\<45文字>\`
+  は148単位、合計252単位。`effetune_bundle.rs::check_publish_path_length` の最大259に対し
+  **余裕7単位**。任意のAPPDATA長まで通る保証ではなく、実際の絶対pathのgateを維持する。
+
+非起動検証（今回の未コミット差分）:
+
+- 配布PowerShell回帰はexit 0。欠落・追加・hash改変・偽署名・reparse拒否を維持し、
+  旧v0.13.0と任意VERSIONの拒否も追加。実vendorの承認検査もexit 0、463エントリ一致。
+- 通常 `cargo test -p mimageviewer-launcher effetune` はreleaseのcore / remote /
+  EPUB workerが未作成のためexit 101、build段階で停止。代わりに同じ `build_effetune_source.rs` を
+  `rustc --test` で実行し、実vendor463件の照合を含む4テスト成功・失敗0・ignored 0。
+- 本体 `cargo nextest run -p mimageviewer --lib -E 'test(/effetune|about/)'` はexit 0、
+  122件成功・失敗0（対象外13,203件）。初回はLibRawソース不足とturbojpegのMSBuild失敗。
+  LibRawを別worktreeから実体コピーし、MSBuildのnode reuse無効化・build jobs 1、
+  FFmpeg/VC runtimeのDLL実体を `target/debug/deps` に配置して完走した。
+  同ソースのCMake直列buildもexit 0。ソース・期待値を緩めてbuildを通していない。
+- 生成器テストはexit 0、28件成功。新版 `--check` は137ファイル＋入口＋転送が一致。
+  sitemapは212 URL。カードは49件・超過0、UIグリフは危険文字0。
+  `scripts/test_public_privacy_scope.py` は9件中3件失敗する。原因は今回の更新ではなく、
+  製品ページのカード短縮 (`3fdb14a1d`、2026-10-11) で画像AI見出しの「本体の」と
+  WebView2自身の更新確認の注記が落ちたこと。公開文面の判断が要るため本更新では扱わず別件とする。
+- 承認ZIPのSHA-256、通知3本の旧版とのバイト同一性、全463入力hash、最深pathを再照合。
+  既存§10.2〜§10.5、§11以降、Now Playing計画の本文は保持した。
+  原本、上流repo、承認manifest、HarmNet重み、旧state fixture、bridge protocolは変更しない。
+  証跡は `target/effetune-014-verification/` と `target/effetune-014-core-tests*.log`。
+  製品・pluginの起動とコミットは行わない。最終配布・署名・実機確認はClaudeCodeの検収対象。
+
+実機確認 (2026-10-18、利用者の許可を得て ClaudeCode が隔離 data-dir で操作。build-dev の確認用ビルド):
+
+- 手順: master の確認用ビルド (Mixwright v0.13.0) を `target/hw-0140/data13` で起動し、
+  チェーン Stereo Balance 20%・Volume -3 dB・Level Meter を作って窓を閉じて保存
+  (`effetune/mixwright-state.json`、appVersion 0.13.0)。そのデータの複製 `data14` を本ブランチ
+  (v0.14.0) で起動した。EffeTune の共有保存先3か所は試験前に `target/hw-0140/appdata-backup` へ退避。
+- 観測 (ClaudeCode): v0.14.0 の画面表記は version 0.14.0。v0.13.0 のチェーンと値がそのまま
+  読み込まれ、再生で Level Meter が振れて R が L より 2 dB 大きい (Balance 20% と整合)。
+  窓を閉じると v0.14.0 が状態を書き直し (Balance が float32 の 0.20000000298…)、内容は同じ。
+  ビジュアライザーの Now Playing プリセットに代表画像と曲名 (タグ無しのためファイル名) が出た。
+  ログでは revision 2 で画像 16,308 bytes を notify し tresult=0。
+  初回の案内は保存済み状態がある環境では自動で出ず、設定メニューの「画面の案内を見る」で
+  10 ステップが mIV の窓内に表示され「完了」で閉じた。2 ステップ目は DAW の語を使う
+  (説明書の注記どおり)。最終ステップは「設定の Help からガイド」。
+  SFZ Note Player の「SFZ Library…」→「ファイルを取り込む…」で SineTest.sfz を登録・読み込みできた。
+  `%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json` に名前・path・root・`bankPaths`・`importedAt` を記録し、
+  サンプルのコピーは無く、元フォルダーも変更されなかった。登録を消した状態では「SFZ が見つかりません」と出た。
+  「フォルダーを取り込む…」でも同じ形で登録だけが記録された。音高の変わる合成音
+  (`target/hw-0140/melody/melody.wav`) の再生で Voices 1/32 となり鍵盤表示が反応した (発音を確認)。
+  ビジュアライザー編集の追加メニューは Album〜Text の16種で Lyrics は無かった (説明書の訂正どおり)。
+- 通信 (ClaudeCode、`Get-NetTCPConnection` / `Get-NetUDPEndpoint` で core とその子孫を記録、
+  `target/hw-0140/net-log.txt`): 音響調整を開いた待機中と、再生・SFZ 読み込み中のどちらも
+  Listen と UDP は無し。外向きは WebView2 から `2603:1046:c09:20bf::2:443` と `2620:1ec:33::11:443` だけ
+  (どちらも Microsoft の割り当て帯。WebView2 が独自に名前解決するためホスト名は未確認)。
+  core と専用ホスト自身の TCP は無し。privacy の「WebView2 が Microsoft に更新を確認する」と矛盾しない。
+- 観測 (ClaudeCode、本更新とは別件): 曲が最後まで再生されて Now Playing が消えたあと、
+  リピートを ON にして ▶ で再生し直す・同じ曲や別の曲を一覧から開き直す、のいずれでも
+  mIV が Now Playing を送らなかった (同じ起動中、ログに notify が無い)。送るかどうかは本体の判断で、
+  本体コードは master `76aebc18f` と同じ。EOF 後の再生し直しの不具合 (master `184de0a7b` で修正) が
+  本ブランチの基点に入っていないことと関係する可能性がある。起動し直すと正常に送られた。
+- 後片付け: 利用者の了承を得て、同じ WebView 保存先を使って残っていた別作業の WebView2 本体プロセス
+  4つ (親は終了済み) を止めた。`Frieve\EffeTunePlugin` と `%APPDATA%\mimageviewer-vst3-host.exe` を
+  試験前の退避分に戻し、どちらも退避分と完全一致 (試験後の状態は `target/hw-0140/after-test`)。
+  `%APPDATA%\effetune` は試験の前後で差が無い。
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
@@ -1479,10 +1589,16 @@ worker の hidden attach 前後と host GUI の表示直前でも成功時 revis
 
 ## 17. 音響調整窓のタスクバー表示（2026-10-12 設計メモ）
 
-**状態: 設計・調査のみ。製品コード未変更。** 利用者指定の案A（窓の表示スタイルだけを変更）を
-採用し、設定ON/OFF・既定ONとする。mIVのAppUserModelID、shortcut、pin、Jump Listは変更しない。
+**2026-10-13 利用者決定:** ボタン操作は§17.12の「表示・前面化だけ」を正本とする。
+以下の過去記録の「前面ならボタンでHide」は撤回した。taskbar/Close/通常矩形の契約は維持する。
+
+**状態: R2独立ACCEPT後の実装・実機確認を経て、§17.10の修正を実施。** 以下§17.1–§17.8は
+R2設計時の記録。現在のOFF時のtaskbar方式とiconは§17.10を正とする。
+設定ON/OFF・既定ON、mIVのAppUserModelID、shortcut、pin、Jump Listを変更しない範囲を維持する。
 EV9のCtrl+R修正・検証完了後に着手。調査先はmain worktree、HEAD `e984bab26`、開始時の差分なし。
 別worktreeに残るEV9差分を移動・変更していない。
+上記はR1調査の記録。R2は `C:/home/mimageviewer-nexteffetune` のHEAD `74e735f77`、
+開始時cleanの作業ツリーで、独立レビューのP2 2件を修正する。backlogのP3訂正はcoordinatorがmasterで扱う。
 
 ### 17.1 現コードの前提と、単なるflag追加で終わらない点
 
@@ -1494,6 +1610,8 @@ hostの`show_gui`検査がこれを固定している。main HWNDはDPI・最小
 
 hostの`create_bridge_view_container`はcustom chromeの `WS_POPUP | WS_BORDER` を作り、
 `WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE`でタスクバーから除外する。window classにicon resourceは未設定。
+現行frameにはWS_SYSMENUもWS_CAPTIONもない。APPWINDOWとicon resourceの追加だけで
+taskbar icon・system menu・最小化が成立するとは扱わず、EffeTune専用の通常styleも§17.2.1で定める。
 `gui_button_action` は hidden→Show、visible/front→Hide、visible/back→Activate。
 native closeとSC_CLOSEは既存のuser-hideへ入り、editorを破棄せずDSPを続ける。
 
@@ -1518,7 +1636,8 @@ native closeとSC_CLOSEは既存のuser-hideへ入り、editorを破棄せずDSP
 
 初回作成は新しいGuiWindowOptionsの`show_in_taskbar`（一般VSTの既定false）で決める。
 ONはAPPWINDOWを加えTOOLWINDOWを外す。OFFはTOOLWINDOWを加えAPPWINDOWを外す。
-WINDOWEDGE、TOPMOST等の他bitとstyle/ownerは保持する。
+WINDOWEDGE、TOPMOST等の他exstyle bitとownerは保持する。EffeTuneの通常styleは§17.2.1へ変更し、
+ON/OFFでその通常styleを切り替えない。
 一般VSTの表示は変えず、EffeTuneの設定だけをこのoptionへ渡す。
 
 設定OK後は既存`effetune-host-control` queueへ目標値を送る。workerが一つの目標値を所有し、
@@ -1527,15 +1646,53 @@ current bridgeのGUI作成snapshotと既存frameへの設定commandは同じ目�
 queue順序で連続ON/OFFとLoading→Register→attachのlate arrivalを扱い、別のUI pending stateを足さない。
 IPCはworker、SetWindowLongPtr/ShowWindow/frame操作はhostの既存GUI thread。core UIでIPC待機しない。
 
+### 17.2.1 EffeTuneの通常styleとcustom chrome（R2・P2-1）
+
+[taskbar仕様](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)は、system menuなしの
+taskbar buttonにiconが付かないことを記載する。
+[Window Styles](https://learn.microsoft.com/en-us/windows/win32/winmsg/window-styles)の
+WS_SYSMENUにはWS_CAPTION、WS_MINIMIZEBOXにはWS_SYSMENUが必要である。
+これを満たす **native caption/system menuを使うEffeTune専用frame** を採用する。
+既存のcustom captionを残したままcaption bitだけ付ける、未検証のnon-client描画抑止を加える案は採らない。
+
+通常styleは `WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+WS_CLIPCHILDREN | WS_CLIPSIBLINGS` とし、pluginがresizableのときだけWS_THICKFRAMEを加える。
+WS_MAXIMIZEBOXは加えない。taskbar ON/OFFともこの通常styleを使い、一般VSTのcustom frameは現状維持。
+
+- EffeTuneのタイトル・icon・close/minimize・caption dragはnative captionへ集約する。
+  既存client内custom chromeはlatency表示のstatus bandとして残し、重複するtitle/closeやcaption hit-testを外す。
+  latency表示とplugin editorの機能は残す。EffeTuneではbypass buttonは元から非表示であり、一般VSTのbuttonは変えない。
+- EffeTuneのnon-client hit-test/paintとcaption activationはnative処理へ委譲する。
+  現行のWM_NCHITTESTによるclient座標のedge判定やWM_MOUSEACTIVATEのHTCAPTION抑止を
+  native captionへ適用しない。plugin child/clientの既存入力処理・owner-chainによる前面判定は維持する。
+- 初回サイズとplugin要求resizeは、status bandとnative non-clientを含めて
+  `AdjustWindowRectExForDpi`で計算し、`layout_editor_child`/`resize_frame_for_plugin_client`を同じ計算へ揃える。
+  DPI変更とexstyle切替でもpluginのclient寸法を保ち、status bandとの二重計上や固定サイズviewのclippingを起こさない。
+  保存済み外枠サイズも新しいframe計算とpluginのsize constraintへ照合する。
+  固定サイズviewは必要なclient寸法を優先し、旧custom frameの外枠を無条件に再利用してclipしない。
+- system menuはRestore/Move/Minimize/Closeを扱い、Sizeはresizableの場合だけ有効にする。
+  Maximizeは有効にせず、EffeTune宛SC_MAXIMIZEも採用しない。
+  taskbarクリック・Shell menu・Alt+Space・native captionの操作が、同じWndProcの契約へ入ることを検証する。
+  最小化はOSのiconic状態、Restoreは既存表示permit付き、Closeは既存user-hide。
+
+見た目はnative caption＋latency status bandへ変更する設計であり、現行のcustom titlebarと同じ外観とは主張しない。
+実装前にこの変更も再レビュー対象に含め、native見た目とShell挙動は利用者の実機確認で確定する。
+
 ### 17.3 即時反映と表示状態
 
 [Microsoft taskbar仕様](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)に合わせ、
 表示中は **同じHWNDを短くhide→exstyle変更→FRAMECHANGED→再表示** する。
 styleが同じなら何もしない。非表示ならstyleだけ更新し、表示要求を作らない。
-requested表示、Remote抑止、main最小化の運用、窓の位置/サイズ、plugin view/DSP stateは既存ownerに残す。
+requested表示、Remote抑止、main最小化の運用、plugin view/DSP stateは既存ownerに残す。
+通常位置はscreen上のtop-leftを保ち、pluginのclient寸法も保つ。
+TOOLWINDOWによるnative caption寸法の差は外枠寸法へ反映するため、切替前後で外枠サイズが常に同じとは約束しない。
+新しい通常外枠矩形を§17.3.1の共通経路で配送・保存する。
 変更前のiconic状態は保ち、非activeの窓を前面へ持ってこない。
 再表示直前に既存`gui_surface_should_show()`を再検査し、close/Remote/main抑止でhiddenとなった窓を復活させない。
 前面だった窓の再表示時だけ、既存の許可条件を満たしていれば前面状態を保つ。
+style変更前に通常screen矩形を取得し、変更後のframe metrics/座標種別で通常placementを設定する。
+hidden中のplacement更新自体からshow/activateを発生させず、再表示は既存permitを満たす場合だけ行う。
+iconic中の更新は現在の最小化矩形へSetWindowPosする処理にしない。
 
 簡素化候補の「editorを閉じて既存attach経路で作り直す」は、plugin UIの一時状態を失い得るため不採用。
 次回openまで延期する案も即時反映要求を満たさない。HWND再作成・新しいvisibility owner・復帰queueは不要。
@@ -1548,11 +1705,60 @@ GUI thread内の現在state検査と同HWNDのstyle更新に限定する。
 - ShellのSC_RESTORE入口でも既存の表示permitを検査し、Remote/close/main抑止を迂回しない。
   一般VSTの動作を変えないようEffeTuneのmain-reference付きframeだけを対象にする。
 - taskbarの「閉じる」は既存SC_CLOSE→user-hide。窓が前面のときの音響調整ボタンも従来どおりHide。
+  最小化後のCloseも、通常screen矩形を含むuser-hide通知で保存する（§17.3.1）。
 - OFFにした時点でiconicだった窓は勝手に開かない。mIVの音響調整ボタンで後から復元できる。
 
 [ShowWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow)
 のSW_SHOWは現在stateでの表示、SW_RESTOREは最小化stateからの復元である。
 この違いは実clientを操作して観測した結果ではなく、現コードと公開API契約からの確認。
+
+### 17.3.1 最小化後にも保存する通常矩形（R2・P2-2）
+
+現行はhostのuser-hide通知→`App::poll_effetune`→`save_effetune_gui_rect`→
+`DspBridge::snapshot_all_window_positions`→`gui::get_window_rect`のGetWindowRect再読である。
+iconicの画面外矩形はここで保存を省かれるため、移動→最小化→Closeで最新配置を失う。
+この「通知後に現在矩形を読む」経路を、**hostが取得した通常screen矩形の配送**へ変更する。
+
+保存・将来のCreateWindowExへ渡す正規形は `NormalScreenRect { x, y, outer_width, outer_height }`、
+virtual-screenの物理px。workspace矩形やiconicの現在矩形をsettingsへ保存しない。
+normal取得はhostのGUI threadで、同じframeのstyle変更と直列化する。
+coreがGWL_EXSTYLEとGetWindowPlacementを別々に読んで、途中のTOOLWINDOW切替と競合する方式は採らない。
+
+取得・変換契約:
+1. `WINDOWPLACEMENT.length = sizeof(WINDOWPLACEMENT)`で取得し、rcNormalPositionを使う。
+   `GetWindowRect`のiconic矩形、ptMinPosition、showCmdを通常矩形の代わりにしない。
+2. [WINDOWPLACEMENT仕様](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement)どおり、
+   top-levelかつTOOLWINDOWなしならworkspace座標、TOOLWINDOWありならscreen座標として扱う。
+3. [MonitorFromWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromwindow)は
+   iconic時も最小化前の矩形でmonitorを選ぶ。`MONITOR_DEFAULTTONEAREST`と
+   [MONITORINFO](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-monitorinfo)の
+   rcWork/rcMonitorを使い、workspace→screenは
+   `dx = rcWork.left - rcMonitor.left / dy = rcWork.top - rcMonitor.top`を両cornerへ加える。
+   TOOLWINDOWありでは加算しない。これは仕様の座標系を揃える本設計の変換規則であり、pure回帰で固定する。
+   右/下taskbarのように原点offsetが0でも、負のmonitor座標やwork areaの大きさをprimary固定にしない。
+4. hostの既存Per-Monitor V2 contextで取得し、core側で別DPIへ再換算しない。
+   幅/高さと算術範囲を検査し、screenへ変換した通常矩形に既存のwork-area可視性検査を適用する。
+   正常な通常矩形を、iconicの-32000系矩形を見たことで棄却しない。
+5. exstyle切替前にold styleでscreenへ正規化する。新しいnon-client寸法で外枠を計算し、
+   placementへ戻す必要があれば新styleで逆変換する。screen→workspaceは同offsetを引く。
+   raw rcNormalPositionをstyle変更後へ持ち越さず、workspace値をCreateWindowEx/SetWindowPosへ渡さない。
+   hidden/iconic/非activeを保つplacement更新はfake HWNDでも検証し、抑止中に一度showしてからhideする実装は不可。
+
+配送・保存の所有境界:
+- 初回attach、完了した移動/resize、最小化直前、style変更後に現在frameのnormal snapshotを公開する。
+  interactive dragでは既存の終了通知で最新値を公開し、pluginのprogrammatic resizeも同じ取得経路を使う。
+- user-hide（native close/SC_CLOSE）は**hide前**にこのnormal snapshotを確定し、同じ通知に付ける。
+  coreでは現在bridge/slotとcurrent container HWNDの同一性を検査し、矩形を適用してからuser-hidden処理を行う。
+  単なるpath通知後にWin32で再読する方式や、通知とは別の非同期取得結果にClose保存を依存させない。
+- coreの現在slotにはimmutableな通常screen矩形のsnapshotだけを置く。geometryのwriterはhostであり、
+  coreへ別のminimized bool、復元要求、poll/retry ownerを足さない。GuiAttached/Detach等と同じ配送順序で扱い、
+  退役bridge/slot/旧frameのsnapshotを新frameへ適用しない。
+- `save_effetune_gui_rect`の全caller（user-hide、音響調整ボタンHide、終了時のruntime_ops）をこのsnapshot経路へ揃える。
+  core UIは既存GUI通知をdrainしてから完成snapshotを読むだけで、IPCやgeometry取得の完了を待たない。
+  core側のHide完了も同じ通常矩形を配送してから扱い、旧snapshotによる先行保存が最終Close保存を上書きしない。
+  一般VSTのGetWindowRect読取や描画/hit-test用の現在矩形queryは、このEffeTuneの保存仕様へ巻き込まない。
+- 取得/変換失敗やframe退役はlog＋既存通知で扱い、以前保存した有効値を保持する。
+  iconic矩形・workspace値へのfallback、retry、DB初期化/削除は行わない。
 
 ### 17.4 グループ、タイトル、アイコン
 
@@ -1565,6 +1771,8 @@ Shellのheuristicによる。従って通常はhost実行体側の別項目/グ�
 EffeTune専用frameのwindow titleを`EffeTune`に揃え、preview/window切替時の表示名に使う。
 pluginの識別名・保存state・一般VST editor titleは変えない。
 mIVの`assets/icon.ico`をhost PEのicon resourceへ組み込み、frameの大小iconへ設定する。
+§17.2.1のWS_SYSMENU/WS_CAPTIONと組み合わせて初めてtaskbar iconの前提を満たす。
+resourceがあるだけでShellにiconが出たと判定せず、表示確認は§17.7の実機条件に含める。
 core HWNDからWM_GETICONを同期取得する方法は採らず、core UIへの再入待機を作らない。
 hostの内部group/context menuラベルはShellが決めるもので、window titleとの同一性は保証しない。
 AppUserModelID、FileDescriptionのEffeTuneへの全体改名、shortcut編集で表示名を強制しない。
@@ -1601,6 +1809,8 @@ agentはnormal-profile core/launcherを起動しない。
 
 producer/consumerは Settings draft→OK/起動→controller host queue→current bridge/将来attach snapshot→
 host protocol→GUI thread→CreateWindowEx/既存frame更新。Shell restore/closeは同じWndProc/GuiVisibilityをconsumerとする。
+通常geometryはGUI threadのnormal取得→current bridge/slot/frameのimmutable配送→coreのslot snapshot→
+save_effetune_gui_rect→既存settings保存であり、user-hideの終端通知もこの通常矩形を持つ。
 Loading、Register、Show、Remote/main suppression、user-hide、disable、GUI destroy/dropをこの所有境界で検査する。
 
 実装後に必要な自動確認:
@@ -1608,18 +1818,248 @@ Loading、Register、Show、Remote/main suppression、user-hide、disable、GUI 
 2. fake bridge配送で設定→Register→Show、Loading中変更、連続ON/OFF、一般VST既定falseを確認。
 3. C++のpure style/visibilityテストとhidden fake HWNDで、他exstyle bit/ownerの保持、非表示を開かない、
    suppression中のrestore拒否、iconic状態と手動restore、closeがuser-hideとなることを確認。
+   EffeTuneのWS_CAPTION/SYSMENU/MINIMIZEBOXと、一般VSTのstyle不変、GetSystemMenu、大小iconの設定、
+   native caption hit-test・status band/plugin clientのlayoutと固定サイズ/各DPIを確認する。
+   SC_MINIMIZE/SC_RESTORE/SC_CLOSE、Alt+Space相当のsystem menu経路、Maximize不可、Sizeの可否を確認する。
    本物EffeTuneやExplorerのtaskbar、ユーザー設定には自動テストを依存させない。
+   nativeな最小化/復元のwitnessにshowが必要なら、切替を行わない隔離test desktopを使い、利用者のdesktopへ窓を表示しない。
+   geometryのpureテストは上/左taskbarの原点offset、右/下taskbar、負の副monitor座標、混在DPI、
+   TOOLWINDOW両方と変換round-trip、style切替前後の通常位置/client寸法を含む。
+   fake HWND/bridgeとApp保存の回帰は「移動/resize→最小化→SC_CLOSE→配送→保存→再open」で最新の
+   通常screen位置/サイズが復元されること、iconic状態でON→OFF/ OFF→ON→Closeしても座標がずれないことを確認する。
+   通知を遅らせて直後にstyleを再変更しても、Close payloadの座標種別と値が変わらないこと、旧frame配送の棄却も確認する。
+   user-hide・ボタンHide・runtime終了保存が同じnormal snapshotを使い、iconicの画面外矩形を保存しないことを確認する。
 4. host identity script回帰・CMake/CTest、EffeTune/VST3/Preferences/settings_transfer焦点テスト、
    fmt・通常/portable check・UI glyph・preferencesの明暗/narrow snapshot・manual更新。
 5. 通常のverification artifactを準備し、利用者が隔離data-dirで taskbar ON/OFF、実icon/title/group、
    taskbar最小化/復元、音響調整ボタン、Close後DSP継続、main最小化設定両方、Remote抑止を確認。
+   Windows Shell上でmIV iconの表示、taskbarクリック/右click menu/preview Close/Alt+Space/native caption操作、
+   native captionとlatency bandの重複なし、pluginのclient clippingなしを確認する。
+   上/左taskbarおよび副monitorで「移動→最小化→Close→再open」と最小化中のON/OFF切替を確認する。
+   fake HWND成功だけでShellのicon・操作が成立したとは扱わない。
 
 rareなstyle/resource/DB/host配送失敗は既定のlog＋通知に留める。retry loop、partial復旧owner、
 保存データ削除/再作成、failure内のrecoveryは追加しない。
 
 実装前reviewの焦点は **Shell復元という新しい通常入力と既存GuiVisibility permitの境界**、
 同HWND style変更後のhidden/iconic/foreground保持、queueでのLoading/登録順序。
+R2では通常style/native caption/system menuと、normal geometryの取得・座標変換・Close payloadも焦点に加える。
 AGENTS.mdの `Review important ownership/asynchronous/multi-window designs before substantial implementation`
 をこの新入力経路へ適用し、独立レビューを経てから製品コードを変更する。
 利用者が決める新しい設定選択は増やさず、案A/既定ONは確定事項。上記操作契約をreview対象として提示する。
 現時点ではhost build・製品test・UI起動・署名・commitは行っていない。
+
+### 17.8 R2レビュー指摘の対応記録（2026-10-12）
+
+- P2-1: exstyle/resourceだけを前提にする記述を撤回。§17.2.1でEffeTune専用の通常style、native caption、
+  latency status band、system menuの操作を定義。§17.4/§17.7でfake確認と実Shell確認を分けた。
+- P2-2: 最小化後のGetWindowRect再読を撤回。§17.3.1でhost GUI threadのnormal screen矩形、
+  TOOLWINDOWに応じた座標変換とstyle変更順序、immutableなClose payload、全保存callerと回帰を定義。
+- P3: ownerなしの訂正はcoordinatorがmasterのbacklogへ反映する。このworktreeのbacklogは編集していない。
+- 本turnはnexteffetuneのこの設計メモのみを変更。実装・build・起動・commitは行わず、再レビューへ引き渡す。
+
+### 17.9 §1.378実装台帳（2026-10-12、R2独立ACCEPT後）
+
+設計基点は`de286f035`。設定は既定ONで、Preferences OKと起動時から既存host-control FIFOへ配送する。
+workerの最新targetをRegisterで将来attachへ継承し、作成済みframeはGUI threadで同じHWNDのstyleを更新する。
+targetと現在exstyleが同じなら、child layout・通常矩形公開も含めて何もしない。
+一般VSTはtaskbar既定falseとcustom frameを維持し、EffeTuneのみnative caption / system menu / minimize /
+latency status bandと埋込mIV iconを使う。AppUserModelID、pin、Remoteの操作APIは変更しない。
+
+通常矩形はhostのGUI threadが取得・screen物理pxへ正規化して配送する。
+初回attachのsnapshot、移動/resize完了、最小化前、style変更後、Close payloadを同じ取得経路へ揃えた。
+checked Hideもsnapshot公開後にACKを返す。coreはbridge/slot/current HWNDを照合し、旧frameを棄却する。
+native Close、ボタンHide、runtime終了保存は同じ完成snapshotをdrainして保存し、EffeTuneのGetWindowRect再読を外した。
+GeometryPublicationはGUI thread内のframe変更だけを直列化し、途中のworkspace矩形を公開しない。
+まれな取得/style失敗はframe付き`gui_warning`で既存UIの案内へ配送し、DSPや前の有効な配置を保持する。
+同期Error受信channelへfire-and-forget失敗を残す方式は採らず、retry/復旧ownerは追加しない。
+
+portableは設定項目・検索anchorを非表示とし、互換設定値のみ保持する。settings_transferでは除外し、
+現行件数は全458 / 対象144 / 除外314、wire142。manualの音響調整・設定ページを同時に更新する。
+privacyと製品ページへの影響はなく、ネットワーク通信や保存する個人情報は増えない。
+
+host identityはRCのLF正規化と共有iconのraw SHA256を含み、Cargo再検証にもicon変更を加えた。
+vendor host / CRTはこのworktreeのCMake buildで更新する。外部バックアップはcoordinatorのmaster統合担当であり触らない。
+非署名の確認buildと配布用署名を区別し、配布時のhost→core→launcherの署名順を維持する。
+
+自動検証の最終結果・artifact identity・実機確認手順は`target/ET-1378-impl-msg.txt`へ記録する。
+本体・plugin・入力desktopの起動や操作は行わない。native witnessは切り替えない隔離desktopのinert HWNDを使い、
+実Shellのicon/group/preview操作は利用者の確認待ちとする。コミットせず引き渡す。
+
+自動検証はCMake/CTest 4/4、host source identityとCRT一致、identity script回帰、
+EffeTune 120/120、DSP bridge 16/16、taskbar通常7/7・portable5/5、settings_transfer25/25、
+UI snapshot明暗/narrow3/3、fmt・通常/portable core check・UI glyph zeroを通過。
+`test-full.ps1`は1回実行し、本体libは12,219 PASS / 2 FAIL / 57 ignored、
+UI snapshot全163件と他workspace targetは通過した。失敗は既存の
+`detached_native_video_navigation_syncs_main_selection`と
+`normalize_scan_navigation_without_openable_candidate_keeps_scan`で、共通fixtureの
+10,000回yieldによるworker完了待機上限（`tests.rs:61157`）。個別再実行は各1/1通過し、
+全体負荷時のschedulingによる可能性が高いが、全体gateはexit101のまま記録する。
+この実装で当該製品経路・待機fixtureは変更していない。全体再実行は行わず、
+skipされたvendor egui25/25・egui-wgpu11/11・eframe18/18を個別補完した。
+最終hostの全byteとrelease core埋込、最終coreとlauncher埋込の一致も確認済み。
+最後に`build-dev.ps1 -PreserveRuntime`を完了し、dev core内hostの全byte一致とCRT依存検査を通過。
+release scriptのPreserveRuntimeはインストール版の起動を検出して停止したため、既存processを触らず、
+AGENTS.mdで許可された直接Cargoのcore/helper→launcher経路でrelease確認物を作成した。
+両確認物は非署名であり、配布時の署名・公開とは分ける。agentによるアプリ起動・コミットはない。
+
+### 17.10 利用者実機確認後の修正（2026-10-12、基点26b7dfaf2）
+
+利用者がrelease launcherでtaskbar表示・最小化/復元・最小化後Closeの配置保存・設定即時反映を確認した。
+残る3点はiconの識別、ボタン再押下のHide、OFFの小さいnative captionである。
+
+OFFの小さいcaptionは`WS_EX_TOOLWINDOW`による。EffeTuneはON/OFFとも同じ通常frameと
+`WS_EX_APPWINDOW`を使い、owner=0を保持する。表示設定はhost GUI threadの
+`ITaskbarList::HrInit`→`AddTab`/`DeleteTab`に集約し、frame再作成・exstyle切替・配置変換を起こさない。
+正当な表示/復元と`TaskbarButtonCreated`で現在のOFF要求を適用し、Shell再作成時も再反映する。
+隠れた/抑止されたframeへAddTabしない。Hide/破棄時は明示追加した項目を削除する。
+ownerを持つ補助窓の新設はownerなし契約と寿命を増やすため採らず、mIV全体AppUserModelIDも使わない。
+APIの根拠はMicrosoftの[taskbar仕様](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)、
+[AddTab](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist-addtab)、
+[DeleteTab](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist-deletetab)、
+[TaskbarButtonCreated](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-itaskbarlist3)。
+
+OFF時はtaskbarに復元入口がないため、SC_MINIMIZEを既存user-hideへ合流させる。
+音響調整ボタンで再表示し、DSPは継続する。ONのnative minimize/restoreは維持する。
+すでに最小化した窓をOFFへ変更した場合もuser-hideに合流し、画面上に復元できない最小化枠を残さない。
+表示希望/抑止は既存GuiVisibility、iconicはOSが所有し、coreに最小化boolや復旧stateを増やさない。
+Shell操作のまれな失敗は既存log＋gui_warningに留め、retry、部分復旧、settings削除は行わない。
+
+窓iconは`assets/icon.ico`に図形の音符を右下へ重ねた`assets/effetune.ico`とする。
+16/24/32/48/64/256を各々描画し、font/emojiに依存しないPython/PIL生成スクリプトをscriptsへ置く。
+生成物も追跡し、base icon・生成物・生成scriptをhost source identityとCMake/Cargoの変更検知に含める。
+core/launcherのiconは変更しない。
+
+前面判定に使う登録HWNDはGuiAttachedのouter frameで正しく、GA_ROOT/GW_OWNERの照合も維持する。
+不具合はMainWindowObserverのクリックsnapshotの寿命境界にある。
+`WM_MOUSEACTIVATE(editor)`→`DOWN(main)`→遅着`WA_CLICKACTIVE`でPressedがActivatingへ戻ると、
+eguiのrelease consumerはsnapshotを使わずcurrent main HWNDを返し、HideがActivateへ変わる。
+input queueが異なる場合のWM_ACTIVATEは[公式仕様上非同期](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-activate)。
+native captionが必ずこの順序を作るとは断定せず、実機の通知列は未採取と区別する。
+同じnative message reducerとfake HWNDのroot/owner treeでこの壊れた遷移を再現し、
+前面frame/child/nested popupはHide、別VST/外部窓/mainはActivateになることを検査する。
+
+単一ClickForeground enumでactivation/press/release/完了を所有し、DOWN/UP後の遅着activationは
+snapshotを降格させない。消費/取消を終端とし、遅着で古いクリックを再開しない。
+次のfresh activation/DOWNは新しいgestureを開始する。mouse/touch/pen、keyboard、cancel、
+double-click、独立した次のクリックも同じ所有境界で検査し、delay、PID代替判定、余分なpending boolを追加しない。
+standard winitはpointer/touchをconsumeするため、mouse promotionが実機で二重配送されたとは扱わない。
+実機再確認にはボタン操作時だけのinput provenance・captured/current/editor/root HWND・visible/action logを残し、
+WndProc/毎frameのlogや同期IPC/FSを追加しない。
+
+生成ICOをrootが16pxを含むpreviewで目視確認し、再生成byte一致・6サイズ・identity回帰を通過した。
+CMake/CTestは4/4（21.75秒）、source identity一致、vendor hostを更新済み。
+Windows COM headerのsmallマクロと既存icon local名の衝突は変数名変更で解消した。
+最終検証（2026-10-12/13、未コミット差分）:
+- EffeTune焦点127/127（入力状態の最終12件を含む）、Preferences snapshot3/3、fmt、UI glyph zero、
+  通常/portable core checkを通過。生成ICOの再生成byte一致・identity回帰・canonical CRT4本一致も確認。
+- release wrapperはPreserveRuntimeで稼働中インストール版を検出して停止。既存process/APPDATAを触らず、
+  AGENTS.md許可の直接Cargo core/helper→launcher経路で非署名release確認物を完成した。
+  host source markerは`42ec87a5d776066961245fc23a96a003cc91b1d7d23c1b50d58724d4e71ee907`。
+  最終vendor host全byteとcore内包、最終coreとlauncher内包の一致、CRT依存検査を通過。
+- 初回test-fullは本体lib12,228 PASS / 57 ignored / 0 FAILの後、UI snapshot末尾で記録が途切れ、
+  Codex側中断後にprocess/sessionも消失した。終了status不明のgateをPASS/製品FAILとは扱わない。
+  未完了の`tracks_hud_music_543pt_dark`は単独1/1 PASS（0.98秒）。
+  終了証拠がない条件不成立のため、同じsource/期待値をCARGO_BUILD_JOBS=4・RUST_TEST_THREADS=4で
+  1回再実行し、test-fullを完了した（exit0 / PASS）。本体lib12,228 PASS / 57 ignored、
+  UI snapshot全163件、vendor egui25・egui-wgpu11・eframe18件も通過した。
+  全result集計は13,505 PASS / 0 FAIL / 64 ignored（65 target結果、fixture子実行を含む）。
+  初回中断logと再実行logを両方保持し、期待値の緩和/skip/製品変更は行っていない。
+
+証拠と利用者確認手順は`target/ET-1378-impl-msg.txt`、
+`target/ET-1378-R3-test-full-retry.log`、`target/ET-1378-R3-release-embed-final.json`に集約する。
+R3はhost変更のためrelease確認物を使う。先行R2のdev-runtimeを今回の更新物として扱わない。
+本体起動・desktop操作・外部vendor backup更新・コミットは行っていない。
+
+### 17.11 独立コードレビューP2 2件の修正（2026-10-13、EV13と同じ未コミット差分）
+
+対象レビューはHEAD `26b7dfaf2`。reviewerはwindow/geometryのhost所有とframe付きimmutable配送を
+構造的な修正として認め、症状パッチではないことに同意した。EV13の§17.10を保持して以下を修正する。
+
+P2-1: EV13でstyle変更後のlayout経路は削除済みだが、refresh/再表示・DPI・host resize・
+pluginの`PlugFrame::resizeView`にiconic時の通知経路が残っていた。
+`read_normal_editor_client`→`layout_normal_editor_child`→`apply_normal_editor_client`を共有のallocation入口とし、
+iconic中は復元用normal placementだけを変える。child、`onSize`、既存last_gui_width/heightを更新しない。
+SetWindowPosからのreentrant minimizationも、通知/cache更新前の通常client確認で失効する。
+WM_SIZEのSIZE_MINIMIZEDも通知を起こさず、explicit activateはSW_RESTORE後に通常clientをrefreshする。
+Remote/main suppressionの解除やClose後のSW_SHOWNAはiconicを保持し得るため、その時点では通知しない。
+hidden-but-normalのattach・resize・generic VST受領は維持する。
+実PlugFrameとfake IPlugView、inert childを使う隔離desktop回帰で、最小化中のON/OFF、
+Close→再表示→Restore、Remote抑止解除、通常通知とcached寸法、generic/fixed/resizable/各DPIを検査する。
+新しいminimized bool、pending resize、待機/復旧queueは追加しない。
+
+P2-2: GUI Closeのframe必須payload/通常矩形/taskbar命令は旧v6と互換でないため、
+core・C++ host・独立testerをprotocol v7へ上げる。coreのload/probeは同じready-version検査を使い、
+v6 Readyをaudio open/GUIより前に拒否する。hostはv6 Helloへerrorを返して終了する。
+fake endpointとtesterの旧Ready拒否、実hostのHello7/旧Hello6（従来5も）のheadless疎通を回帰に加える。
+source identityはrelease成果物一致の別gateであり、debug時も必要なhandshake互換性判定を代替しない。
+共有suppression mappingのlayout/versionは変えない。旧hostを受理してCloseを無視するfallbackは置かない。
+
+上記以外のrareな取得/配送/保存失敗は既定のlog＋通知で扱い、部分復旧やretry loopを増やさない。
+host再生成後のCMake Release serial1 buildとCTest 5/5を通過（39.89秒）。fake viewは実PlugFrameを使い、
+公式SDKのcommoniids.cppをfixtureにもlinkする。source identityは
+`027fd0b95b62f17fe97ebefab203e43d9b299179329588ac7e409cb7fc63d10b`と一致。
+vendor hostは1,198,592 bytes、SHA256
+`ba77679f2f953bf1c75937c7d680c7939b8907860cd94b83db8b75613514d337`。
+canonical CRT4本一致、identity回帰、専用ICO再生成チェックも通過。
+Rust bridge18件、EffeTune127件、tester旧Ready拒否1件、fmt、通常/portable core check、UI glyph zeroを通過。
+P2はPreferencesの配置/stringを変えず、§17.10のsnapshot3件の証拠は維持する。
+
+build-release.ps1 -PreserveRuntimeは稼働中インストール版を検出しexit1で停止した。
+process/APPDATAを操作せず、AGENTS.md許可の直接Cargo core/helper→launcherで非署名release確認物を完成。
+最新host全byteとcore内包、最新core全byteとlauncher内包、CRT依存runtime4/pe4・内包pe12の検査を通過。
+full gateはソース変更なし・CARGO_BUILD_JOBS=4/RUST_TEST_THREADS=4で1回実行し、exit0 / PASS。
+本体lib12,230 PASS / 0 FAIL / 57 ignored（1199.10秒）、UI snapshot163/163 PASS（36.01秒）、
+vendor egui25・egui-wgpu11・eframe18件も通過した。
+全result集計13,508 PASS / 0 FAIL / 64 ignored（65 target結果、fixture子実行を含む）。
+最終identity・差分チェックも通過。証拠は`target/ET-1378-EV13-P2-*`、引き渡しは`target/ET-1378-impl-msg.txt`。
+本体起動・外部backup更新・コミットは行っていない。実Shell/pluginと前面ボタンの実機再確認は利用者が行う。
+
+### 17.12 利用者決定: ボタンは表示・前面化だけ（2026-10-13、EV19）
+
+基点はfc5f83ae5（298c33ce8＋host VERSIONINFO表示名）。4bf209ba3のフック方式はrevert済み、
+EV17/EV18の未コミット候補も設計担当が破棄した。今後は音響調整ボタンを押すたびに既存の
+manual Show要求を送る。非表示なら表示し、表示中なら前面に出す。既に手前でも隠さない。
+閉じる操作はEffeTuneの×と既存Shell操作へ任せ、Close=user-hide、DSP継続、通常配置保持を維持する。
+
+経緯: foreground方式では別processからclick-activateされるとforeground/WM_ACTIVATE.otherが0となり、
+main subclassだけでは直前の前面窓を取得できなかった。before-queue LL hook方式は実機でHideを確認したが、
+未使用時もglobal input経路に入る範囲が広く、表示期間限定には未観測入力との対応付けの開始境界が残った。
+z-order案も検討した。その後、利用者が「前面かどうかによってボタン動作を変える」要件自体を撤回した。
+前面判定と別streamの対応付けをなくす単純化であり、時間推測や初回操作だけの制限で補わない。
+
+ボタンは引数なしの一入口にし、mouse/keyboardの違いで分岐しない。既存のhost-control workerへ
+ShowIntent::Manualを配送し、host GUI threadのset_gui_visibility_checked→activate_guiで表示・復元・前面化する。
+UIはFS/DB/IPCやhost完了を待たず、二番目のvisibility owner・foreground cache・入力hook・vendor注釈は不要。
+GuiButtonAction/Hide分岐、ClickForegroundとmouse/pointer/touch捕捉、未使用のDSP foreground predicate、
+ボタン専用HostCommand::Hide/pending_hide/request_hide_guiを撤去する。main subclassはmainの表示・最小化と
+GuiGate配送に必要なので残す。Close由来のcapture_on_hideとhost通常矩形保存、一般VSTの表示処理は残す。
+
+点灯は既存のEffectiveState=EffectiveというDSP状態を表し、窓の開閉toggleとはしない。
+×で閉じても有効なら点灯を維持する。tooltip/manualに表示・前面化、×によるhide、点灯の意味を明記する。
+専用KeyAction/リング項目、Remoteの窓表示/hide操作は存在せず、新しい入口やAPIは増やさない。
+Remote中のPCボタン抑止と「窓を表示できない/接続後に元の表示を戻す」説明、配信の音響調整は維持する。
+portable非表示、settings_transfer/設定field/保存書式は変更しない。privacy/製品ページの通信説明にも影響しない。
+
+回帰は実App toolbar入口→fake HostCommand境界でhidden/back/frontがすべてManual Showを一回だけ送り、
+host結果前にUIがvisibilityを変更しないこと、GuiUserHidden/正常矩形→再表示で位置とDSP/点灯が保たれることを確認する。
+既存のRemote permit、main最小化、Close/frame identity、host allocation/protocol v7の回帰は維持する。
+前面判定専用の旧回帰は要件撤回に合わせて撤去し、成功を装うskipや期待値の緩和に置き換えない。
+まれな保存/配送失敗は既定のlog＋通知、再起動等の単純な入口で扱い、多段回復やretry loopは追加しない。
+
+hostのRC表示名を含むCMake Release再生成とsource identity/CRT一致を確認し、関連試験・fmt・通常/portable check、
+build-release.ps1、test-fullの結果と隔離実機手順をtarget/ET-1378-impl-msg.txt / ET-1378-EV19-*へ記録する。
+実アプリの起動・実入力・外部backup更新・コミットは行わない。独立コードレビューと実機確認は別の受入として残す。
+
+EV19検証完了: EffeTune関連114件、共通tooltip snapshot2件（生成後の通常比較と目視確認）、fmt、glyph zero、
+通常/portable core check、CMake Release、CTest5件、source identityが成功した。build-release.ps1 -PreserveRuntimeを
+*>&1なしで完走しexit0、core10m15s/launcher22.39s。hostのFileDescription/ProductNameはEffeTune (mImageViewer)。
+markerは04e94b0d62c8d4eb0128a708aec1a70c7ecb2c7639d9899fc54f621098a869ad、host SHA256は
+d33d4cd04bcc547b104b825faa8e44893a55f335bc10cc6d0f1f93f9555dd968。CRT runtime4/pe4・内包pe12、
+最新host全byteのcore内包と最新core全byteのlauncher内包を確認した。test-fullは一回完走exit0 / PASS、
+本体lib12,217成功・57 ignored（1436.89s）、UI snapshot165件、vendor egui25/egui-wgpu11/eframe18件成功。
+65 result集計13,497成功・失敗0・64 ignored（fixture子実行を含む）。画像以外に新しい未追跡sourceはない。
+最初のCMake parallel2は診断なしexit1、serial1・/nr:falseへ切り替えて成功し、release script内の再buildも成功。
+製品テストのskip/期待値緩和、全体gateの追加rerun、アプリ起動は行っていない。差分は未コミット。
+証拠はtarget/ET-1378-EV19-final-gate-summary.json / final-test-full*.log / release-embed-final.jsonと
+target/ET-1378-impl-msg.txt。現物Shellの表示・前面化と×後の再表示は利用者が同じ隔離環境で確認する。

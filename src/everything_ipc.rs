@@ -44,6 +44,10 @@ pub struct EverythingRow {
 }
 
 impl EverythingRow {
+    pub fn is_folder(&self) -> bool {
+        self.flags & ITEM_ROOT == 0 && self.flags & ITEM_FOLDER != 0
+    }
+
     /// Indexed file claims only. The prepare worker still validates physical identity
     /// and stats the supported candidate; this must never authorize metadata purges.
     pub fn is_file(&self) -> bool {
@@ -67,6 +71,7 @@ pub enum EverythingError {
     UnsupportedVersion,
     DatabaseNotLoaded,
     Rejected,
+    NotResponding,
     Busy,
     SendFailed,
     Timeout,
@@ -98,6 +103,9 @@ impl EverythingError {
                 "Everything の検索結果が大きすぎます。検索条件を絞ってください。"
             }
             Self::Cancelled => "検索を取り消しました。",
+            Self::NotResponding => {
+                "Everything が応答していません。起動直後の索引の読み込みや更新などの処理が終わるまで待ってから、もう一度検索してください。"
+            }
             Self::Busy | Self::Timeout => {
                 "Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください。"
             }
@@ -219,7 +227,7 @@ static NEXT_REPLY_ID: AtomicU32 = AtomicU32::new(1);
 fn next_reply_id() -> Result<u32, EverythingError> {
     // Never wrap: destroyed HWND reuse cannot alias any earlier run's correlation ID.
     NEXT_REPLY_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| EverythingError::RequestIdsExhausted)
 }
 
@@ -349,6 +357,7 @@ pub fn query_with_endpoint(
             | EverythingError::Timeout
             | EverythingError::Disconnected
             | EverythingError::Busy
+            | EverythingError::NotResponding
             | EverythingError::SendFailed)
     ) {
         let cancellation = encode_query("nothing:", endpoint.reply_hwnd(), cancel_id)?;

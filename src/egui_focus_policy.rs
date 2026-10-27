@@ -13,60 +13,8 @@
 //! before traversal stopped. IME candidate selection with `Tab` is a separate,
 //! field-level focus lock and recovery mechanism in `crate::ime_focus`.
 
-use std::sync::Arc;
-
-const INSTALLATION_ID: &str = "miv_tab_shortcut_focus_policy_installed";
-
-fn tab_pressed(ctx: &egui::Context) -> bool {
-    ctx.input(|input| {
-        input.events.iter().any(|event| {
-            matches!(
-                event,
-                egui::Event::Key {
-                    key: egui::Key::Tab,
-                    pressed: true,
-                    ..
-                }
-            )
-        })
-    })
-}
-
-/// Cancel focus traversal that egui already derived from `Tab`.
-pub(crate) fn cancel_tab_focus_traversal(ctx: &egui::Context) {
-    ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
-}
-
-/// Install mimageviewer's `Tab` shortcut policy on an egui context.
-///
-/// The callback runs before the first focusable widget is registered, resets the
-/// focus direction for every `Tab` press, and deliberately does not consume the
-/// event. The focused UI or the later keymap ownership boundary still receives
-/// the same press.
-pub fn install_tab_shortcut_focus_policy(ctx: &egui::Context) {
-    let installation_id = egui::Id::new(INSTALLATION_ID);
-    let already_installed = ctx.data_mut(|data| {
-        if data.get_temp::<bool>(installation_id).unwrap_or(false) {
-            true
-        } else {
-            data.insert_temp(installation_id, true);
-            false
-        }
-    });
-    if already_installed {
-        return;
-    }
-
-    ctx.on_begin_pass(
-        "miv_tab_shortcut_focus_policy",
-        Arc::new(|ctx| {
-            if !tab_pressed(ctx) {
-                return;
-            }
-            cancel_tab_focus_traversal(ctx);
-        }),
-    );
-}
+pub(crate) use egui_ime::cancel_tab_focus_traversal;
+pub use egui_ime::install_tab_shortcut_focus_policy;
 
 #[cfg(test)]
 mod tests {
@@ -104,22 +52,22 @@ mod tests {
         input
     }
 
-    fn draw_focusable_surface(ctx: &egui::Context, id: egui::Id) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn draw_focusable_surface(ui: &mut egui::Ui, id: egui::Id) {
+        egui::CentralPanel::default().show(ui, |ui| {
             let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
             let _ = ui.interact(rect, id, egui::Sense::click_and_drag());
         });
     }
 
     fn draw_text_fields(
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         first_id: egui::Id,
         second_id: egui::Id,
         first: &mut String,
         second: &mut String,
         request_first_focus: bool,
     ) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let first_response = ui.add(egui::TextEdit::singleline(first).id(first_id));
             let _ = ui.add(egui::TextEdit::singleline(second).id(second_id));
             if request_first_focus {
@@ -133,13 +81,14 @@ mod tests {
         let ctx = egui::Context::default();
         install_tab_shortcut_focus_policy(&ctx);
 
-        let _ = ctx.run(
+        ctx.run_ui(
             raw_input(
                 egui::ViewportId::ROOT,
                 None,
                 vec![tab_event(false, egui::Modifiers::NONE)],
             ),
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 assert!(ctx.input(|input| input.events.iter().any(|event| matches!(
                     event,
                     egui::Event::Key {
@@ -148,11 +97,12 @@ mod tests {
                         ..
                     }
                 ))));
-                draw_focusable_surface(ctx, egui::Id::new("fs_click_test"));
+                draw_focusable_surface(ui, egui::Id::unique("fs_click_test"));
             },
-        );
+        )
+        .drop_without_applying_deltas();
 
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[test]
@@ -160,40 +110,47 @@ mod tests {
         let ctx = egui::Context::default();
         install_tab_shortcut_focus_policy(&ctx);
 
-        let _ = ctx.run(
+        ctx.run_ui(
             raw_input(
                 egui::ViewportId::ROOT,
                 None,
                 vec![tab_event(true, egui::Modifiers::NONE)],
             ),
-            |ctx| draw_focusable_surface(ctx, egui::Id::new("fs_click_repeat_test")),
-        );
+            |ui| draw_focusable_surface(ui, egui::Id::unique("fs_click_repeat_test")),
+        )
+        .drop_without_applying_deltas();
 
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn focused_text_edit_keeps_focus_and_accepts_text_and_ime_input_after_tab() {
         let ctx = egui::Context::default();
         install_tab_shortcut_focus_policy(&ctx);
-        let first_id = egui::Id::new("tab_policy_first_text");
-        let second_id = egui::Id::new("tab_policy_second_text");
+        let first_id = egui::Id::unique("tab_policy_first_text");
+        let second_id = egui::Id::unique("tab_policy_second_text");
         let mut first = String::new();
         let mut second = String::new();
 
-        let _ = ctx.run(Default::default(), |ctx| {
-            draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, true);
-        });
+        ctx.run_ui(Default::default(), |ui| {
+            draw_text_fields(ui, first_id, second_id, &mut first, &mut second, true);
+        })
+        .drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
-        let _ = ctx.run(
+        ctx.run_ui(
             raw_input(
                 egui::ViewportId::ROOT,
                 None,
                 vec![tab_event(false, egui::Modifiers::NONE)],
             ),
-            |ctx| {
-                assert!(ctx.wants_keyboard_input());
+            |ui| {
+                let ctx = &ui.ctx().clone();
+                assert!(ctx.egui_wants_keyboard_input());
                 assert!(ctx.input(|input| input.events.iter().any(|event| matches!(
                     event,
                     egui::Event::Key {
@@ -202,26 +159,31 @@ mod tests {
                         ..
                     }
                 ))));
-                draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
+                draw_text_fields(ui, first_id, second_id, &mut first, &mut second, false);
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
-        let _ = ctx.run(
+        ctx.run_ui(
             raw_input(
                 egui::ViewportId::ROOT,
                 None,
                 vec![
                     egui::Event::Text("x".to_owned()),
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "あ".to_owned(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
                 ],
             ),
-            |ctx| {
-                draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
+            |ui| {
+                draw_text_fields(ui, first_id, second_id, &mut first, &mut second, false);
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
         assert_eq!(first, "xあ");
         assert!(second.is_empty());
@@ -231,24 +193,26 @@ mod tests {
     fn tab_does_not_move_focus_between_two_text_fields() {
         let ctx = egui::Context::default();
         install_tab_shortcut_focus_policy(&ctx);
-        let first_id = egui::Id::new("tab_policy_no_hop_first");
-        let second_id = egui::Id::new("tab_policy_no_hop_second");
+        let first_id = egui::Id::unique("tab_policy_no_hop_first");
+        let second_id = egui::Id::unique("tab_policy_no_hop_second");
         let mut first = String::new();
         let mut second = String::new();
 
-        let _ = ctx.run(Default::default(), |ctx| {
-            draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, true);
-        });
-        let _ = ctx.run(
+        ctx.run_ui(Default::default(), |ui| {
+            draw_text_fields(ui, first_id, second_id, &mut first, &mut second, true);
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
             raw_input(
                 egui::ViewportId::ROOT,
                 None,
                 vec![tab_event(false, egui::Modifiers::NONE)],
             ),
-            |ctx| {
-                draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
+            |ui| {
+                draw_text_fields(ui, first_id, second_id, &mut first, &mut second, false);
             },
-        );
+        )
+        .drop_without_applying_deltas();
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
         assert!(!ctx.memory(|memory| memory.has_focus(second_id)));
@@ -259,38 +223,41 @@ mod tests {
         let ctx = egui::Context::default();
         install_tab_shortcut_focus_policy(&ctx);
         let child_id = egui::ViewportId::from_hash_of("tab_policy_fullscreen_child");
-        let first_id = egui::Id::new("root_first_text");
-        let second_id = egui::Id::new("root_second_text");
+        let first_id = egui::Id::unique("root_first_text");
+        let second_id = egui::Id::unique("root_second_text");
         let mut first = String::new();
         let mut second = String::new();
 
-        let _ = ctx.run(
+        ctx.run_ui(
             raw_input(egui::ViewportId::ROOT, Some(child_id), Vec::new()),
-            |ctx| {
-                draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, true);
+            |ui| {
+                draw_text_fields(ui, first_id, second_id, &mut first, &mut second, true);
             },
-        );
+        )
+        .drop_without_applying_deltas();
 
-        let _ = ctx.run(
+        ctx.run_ui(
             raw_input(
                 child_id,
                 Some(child_id),
                 vec![tab_event(false, egui::Modifiers::SHIFT)],
             ),
-            |ctx| draw_focusable_surface(ctx, egui::Id::new("fullscreen_child_surface")),
-        );
-        assert!(!ctx.wants_keyboard_input());
+            |ui| draw_focusable_surface(ui, egui::Id::unique("fullscreen_child_surface")),
+        )
+        .drop_without_applying_deltas();
+        assert!(!ctx.egui_wants_keyboard_input());
 
-        let _ = ctx.run(
+        ctx.run_ui(
             raw_input(
                 egui::ViewportId::ROOT,
                 Some(child_id),
                 vec![tab_event(false, egui::Modifiers::NONE)],
             ),
-            |ctx| {
-                draw_text_fields(ctx, first_id, second_id, &mut first, &mut second, false);
+            |ui| {
+                draw_text_fields(ui, first_id, second_id, &mut first, &mut second, false);
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 }

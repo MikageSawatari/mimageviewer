@@ -14,11 +14,13 @@ use super::native_cursor::{
     CursorAutoHideReducer, CursorRoutingEvent, CursorRoutingEventKind, CursorRoutingState,
     reduce_cursor_routing_batch,
 };
+use super::native_diagnostics::{DiagnosticSample, NativeDiagnostics};
+#[cfg(any(test, feature = "test-script"))]
+use super::native_window::NativeVideoMouseButton;
 use super::native_window::{
-    NativeCursorOwnershipEdge, NativeVideoMouseButton, NativeVideoTouchPhase,
-    NativeVideoWindowEvent, NativeVideoWindowEventEnvelope, NativeVideoWindowSource,
-    NativeWindowEventReceiver, NativeWindowEventRoute, native_window_event_route,
-    post_typed_pump_quit,
+    NativeCursorOwnershipEdge, NativeRaiseSample, NativeVideoTouchPhase, NativeVideoWindowEvent,
+    NativeVideoWindowEventEnvelope, NativeVideoWindowSource, NativeWindowEventReceiver,
+    NativeWindowEventRoute, native_window_event_route, post_typed_pump_quit,
 };
 use super::native_window_host::{
     NativeHudWindowRequest, NativeRenderTargetTransfer, NativeWindowHost, NativeWindowHostConfig,
@@ -48,6 +50,106 @@ const HUD_RAISE_RETRY_OFFSETS: [Duration; 3] = [
     Duration::from_millis(16),
     Duration::from_millis(50),
 ];
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HudRaiseOrigin {
+    VstHook,
+    Hover,
+    WindowPos,
+}
+
+impl HudRaiseOrigin {
+    fn index(self) -> usize {
+        match self {
+            Self::VstHook => 0,
+            Self::Hover => 1,
+            Self::WindowPos => 2,
+        }
+    }
+    fn replaced_counter(self) -> &'static str {
+        match self {
+            Self::VstHook => "raise_vst_burst_slots_replaced",
+            Self::Hover => "raise_hover_burst_slots_replaced",
+            Self::WindowPos => "raise_windowpos_burst_slots_replaced",
+        }
+    }
+    fn canceled_counter(self) -> &'static str {
+        match self {
+            Self::VstHook => "raise_vst_burst_slots_canceled",
+            Self::Hover => "raise_hover_burst_slots_canceled",
+            Self::WindowPos => "raise_windowpos_burst_slots_canceled",
+        }
+    }
+    fn issued_counter(self) -> &'static str {
+        match self {
+            Self::VstHook => "raise_vst_issued",
+            Self::Hover => "raise_hover_issued",
+            Self::WindowPos => "raise_windowpos_issued",
+        }
+    }
+    fn consumed_counter(self) -> &'static str {
+        match self {
+            Self::VstHook => "raise_vst_consumed",
+            Self::Hover => "raise_hover_consumed",
+            Self::WindowPos => "raise_windowpos_consumed",
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::VstHook => "vst_hook_app_drain",
+            Self::Hover => "render_hover",
+            Self::WindowPos => "hud_windowpos",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HudRaiseRequest {
+    origin: HudRaiseOrigin,
+    sequence: u64,
+    issued_us: u64,
+    flags: u32,
+    insert_after: i64,
+}
+
+impl HudRaiseRequest {
+    fn issued(origin: HudRaiseOrigin) -> Self {
+        static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        let (sequence, issued_us) = if crate::perf::is_enabled() {
+            (
+                NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                crate::perf::program_start().map_or(0, |start| {
+                    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+                }),
+            )
+        } else {
+            (0, 0)
+        };
+        Self {
+            origin,
+            sequence,
+            issued_us,
+            flags: 0,
+            insert_after: 0,
+        }
+    }
+    fn sample(self) -> DiagnosticSample {
+        DiagnosticSample::new()
+            .text("origin", self.origin.name())
+            .u64("request_sequence", self.sequence)
+            .u64("issued_us", self.issued_us)
+            .u64("windowpos_flags", u64::from(self.flags))
+            .i64("windowpos_insert_after", self.insert_after)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledHudRaise {
+    epoch: WindowEpoch,
+    deadline: Instant,
+    request: HudRaiseRequest,
+    slot: u8,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PumpPlacementRequest {
@@ -107,11 +209,15 @@ enum PumpCommand {
     },
     RaiseHud {
         epoch: u64,
+        request: HudRaiseRequest,
     },
     SetZOrderRecoveryPermit {
         permitted: bool,
     },
     CursorActivity {
+        epoch: u64,
+    },
+    InterruptImeComposition {
         epoch: u64,
     },
     RenderFault {
@@ -139,7 +245,8 @@ impl PumpCommand {
             | Self::RaisePresenter { .. }
             | Self::RaiseHud { .. }
             | Self::SetZOrderRecoveryPermit { .. }
-            | Self::CursorActivity { .. } => None,
+            | Self::CursorActivity { .. }
+            | Self::InterruptImeComposition { .. } => None,
         }
     }
 }
@@ -194,10 +301,33 @@ pub(crate) struct PumpObservation {
     pub(crate) value: NativeWindowObservation,
 }
 
-#[derive(Default)]
 struct LatestPumpValues {
     visual: Mutex<Option<NativeWindowVisualUpdate>>,
     observation: Mutex<Option<PumpObservation>>,
+    upstream_raise_diagnostics: Option<UpstreamRaiseDiagnostics>,
+}
+
+struct UpstreamRaiseDiagnostics {
+    tx: Sender<(NativeRaiseSample, bool)>,
+    rx: Receiver<(NativeRaiseSample, bool)>,
+    lost: AtomicU64,
+}
+
+impl Default for LatestPumpValues {
+    fn default() -> Self {
+        Self {
+            visual: Mutex::new(None),
+            observation: Mutex::new(None),
+            upstream_raise_diagnostics: crate::perf::is_enabled().then(|| {
+                let (tx, rx) = crossbeam_channel::bounded(256);
+                UpstreamRaiseDiagnostics {
+                    tx,
+                    rx,
+                    lost: AtomicU64::new(0),
+                }
+            }),
+        }
+    }
 }
 
 pub(crate) struct NativeWindowPumpRenderClient {
@@ -209,6 +339,20 @@ pub(crate) struct NativeWindowPumpRenderClient {
 }
 
 impl NativeWindowPumpRenderClient {
+    pub(crate) fn record_upstream_hud_raise(&self, sample: NativeRaiseSample, replaced: bool) {
+        if let Some(diagnostic) = &self.latest.upstream_raise_diagnostics
+            && diagnostic.tx.try_send((sample, replaced)).is_err()
+        {
+            diagnostic.lost.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_upstream_hud_raise_dropped(&self, dropped: u64) {
+        if let Some(diagnostic) = &self.latest.upstream_raise_diagnostics {
+            diagnostic.lost.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+
     fn send_control(&self, command: PumpCommand) -> Result<(), String> {
         let result = self.command_tx.try_send(command);
         if result.is_err() {
@@ -316,8 +460,29 @@ impl NativeWindowPumpRenderClient {
         self.send_control(PumpCommand::RaisePresenter { epoch })
     }
 
-    pub(crate) fn raise_hud(&self, epoch: u64) -> Result<(), String> {
-        self.send_control(PumpCommand::RaiseHud { epoch })
+    pub(crate) fn raise_hud(&self, epoch: u64, origin: HudRaiseOrigin) -> Result<(), String> {
+        self.send_control(PumpCommand::RaiseHud {
+            epoch,
+            request: HudRaiseRequest::issued(origin),
+        })
+    }
+
+    pub(crate) fn raise_hud_from_upstream(
+        &self,
+        epoch: u64,
+        diagnostic: Option<NativeRaiseSample>,
+    ) -> Result<(), String> {
+        let request = diagnostic.map_or_else(
+            || HudRaiseRequest::issued(HudRaiseOrigin::VstHook),
+            |sample| HudRaiseRequest {
+                origin: HudRaiseOrigin::VstHook,
+                sequence: sample.sequence,
+                issued_us: sample.observed_us,
+                flags: sample.flags,
+                insert_after: sample.insert_after,
+            },
+        );
+        self.send_control(PumpCommand::RaiseHud { epoch, request })
     }
 
     pub(crate) fn set_z_order_recovery_permit(&self, permitted: bool) -> Result<(), String> {
@@ -336,7 +501,19 @@ impl NativeWindowPumpRenderClient {
         let _ = self.send_control(PumpCommand::Shutdown { request });
     }
 
-    pub(crate) fn publish_visual(&self, update: NativeWindowVisualUpdate) {
+    pub(crate) fn publish_visual(&self, mut update: NativeWindowVisualUpdate) {
+        // One-shot commands cannot live in the replaceable visual snapshot.
+        // A failed send uses the existing channel-fault terminal, without retry.
+        update.window_intents.retain(|intent| {
+            if matches!(intent, NativeWindowIntent::InterruptImeComposition) {
+                let _ = self.send_control(PumpCommand::InterruptImeComposition {
+                    epoch: update.epoch,
+                });
+                false
+            } else {
+                true
+            }
+        });
         if let Ok(mut latest) = self.latest.visual.try_lock() {
             *latest = Some(update);
         }
@@ -377,6 +554,7 @@ pub(crate) struct NativeWindowPumpSpawn {
     pub(crate) hwnd_out: Arc<AtomicU64>,
     pub(crate) hud_hwnd_out: Arc<AtomicU64>,
     pub(crate) closed: Arc<AtomicBool>,
+    pub(crate) faulted: Arc<AtomicBool>,
     pub(crate) presenter_visibility: NativePresenterVisibility,
     pub(crate) source_epoch: Arc<AtomicU64>,
     pub(crate) ui_event_tx: NativeOutputEventSender,
@@ -436,6 +614,7 @@ struct PumpRuntime {
     hwnd_out: Arc<AtomicU64>,
     hud_hwnd_out: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
+    faulted: Arc<AtomicBool>,
     presenter_visibility: NativePresenterVisibility,
     source_epoch: Arc<AtomicU64>,
     ui_event_tx: NativeOutputEventSender,
@@ -451,7 +630,10 @@ struct PumpRuntime {
     state: WindowHostState,
     hosts: HashMap<WindowEpoch, NativeWindowHost>,
     requests: HashMap<WindowEpoch, PumpPlacementRequest>,
-    hud_raise_deadlines: VecDeque<(WindowEpoch, Instant)>,
+    hud_raise_deadlines: VecDeque<ScheduledHudRaise>,
+    raise_diagnostics: HashMap<WindowEpoch, NativeDiagnostics>,
+    disabled_diagnostics: NativeDiagnostics,
+    last_diagnostic_sample: Option<Instant>,
     z_order_recovery_permitted: bool,
     deferred_visibility: Option<WindowVisibility>,
     parent_sizes: HashMap<WindowEpoch, (u32, u32)>,
@@ -488,6 +670,7 @@ impl PumpRuntime {
             hwnd_out: spawn.hwnd_out,
             hud_hwnd_out: spawn.hud_hwnd_out,
             closed: spawn.closed,
+            faulted: spawn.faulted,
             presenter_visibility: spawn.presenter_visibility,
             source_epoch: spawn.source_epoch,
             ui_event_tx: spawn.ui_event_tx,
@@ -504,6 +687,14 @@ impl PumpRuntime {
             hosts: HashMap::new(),
             requests: HashMap::new(),
             hud_raise_deadlines: VecDeque::new(),
+            raise_diagnostics: HashMap::new(),
+            disabled_diagnostics: NativeDiagnostics::new(
+                Default::default(),
+                0,
+                "hud",
+                "pump_raise",
+            ),
+            last_diagnostic_sample: None,
             z_order_recovery_permitted: true,
             deferred_visibility: None,
             parent_sizes: HashMap::new(),
@@ -573,6 +764,17 @@ impl PumpRuntime {
     }
 
     fn drain_commands(&mut self) -> Result<(), String> {
+        if let Some(diagnostic) = &self.latest.upstream_raise_diagnostics {
+            let samples: Vec<_> = diagnostic.rx.try_iter().collect();
+            let lost = diagnostic.lost.swap(0, Ordering::Relaxed);
+            for (sample, replaced) in samples {
+                self.record_upstream_hud_raise(sample, replaced);
+            }
+            if lost != 0 {
+                self.raise_diagnostics_for(WindowEpoch(0))
+                    .count("raise_upstream_diagnostic_lost", lost);
+            }
+        }
         loop {
             match self.command_rx.try_recv() {
                 Ok(command) => {
@@ -593,6 +795,24 @@ impl PumpRuntime {
                 }
             }
         }
+    }
+
+    fn record_upstream_hud_raise(&mut self, sample: NativeRaiseSample, replaced: bool) {
+        let diagnostic = self.raise_diagnostics_for(WindowEpoch(sample.epoch));
+        diagnostic.count(
+            if replaced {
+                "raise_vst_app_replaced"
+            } else {
+                "raise_vst_app_issued"
+            },
+            1,
+        );
+        diagnostic.event("raise_upstream", || {
+            DiagnosticSample::new()
+                .u64("request_sequence", sample.sequence)
+                .u64("issued_us", sample.observed_us)
+                .bool("replaced", replaced)
+        });
     }
 
     fn handle_command(&mut self, command: PumpCommand) -> Result<(), String> {
@@ -708,7 +928,13 @@ impl PumpRuntime {
                 let key = WindowEpoch(epoch);
                 if let Some(window) = self.hosts.get(&key) {
                     let (width, height) = window.resize_to_rect(placement, rect);
-                    window.set_hud_geometry(rect.left, rect.top, width, height);
+                    window.set_hud_geometry(
+                        rect.left,
+                        rect.top,
+                        width,
+                        height,
+                        "geometry_resize_request",
+                    );
                     self.parent_sizes.insert(key, (width, height));
                     self.send_lifecycle(PumpLifecycleEvent::Resized {
                         epoch,
@@ -724,10 +950,38 @@ impl PumpRuntime {
                     }))?;
                 }
             }
-            PumpCommand::RaiseHud { epoch } => self.schedule_hud_raise(WindowEpoch(epoch)),
+            PumpCommand::RaiseHud { epoch, request } => {
+                self.raise_diagnostics_for(WindowEpoch(epoch))
+                    .count(request.origin.issued_counter(), 1);
+                self.schedule_hud_raise(WindowEpoch(epoch), request);
+            }
             PumpCommand::SetZOrderRecoveryPermit { permitted } => {
                 self.z_order_recovery_permitted = permitted;
                 if !permitted {
+                    if crate::perf::is_enabled() {
+                        let output = self.health.diagnostic_output_id();
+                        for raise in &self.hud_raise_deadlines {
+                            let diagnostic = self
+                                .raise_diagnostics
+                                .entry(raise.epoch)
+                                .or_insert_with(|| {
+                                    NativeDiagnostics::new(
+                                        output,
+                                        raise.epoch.0,
+                                        "hud",
+                                        "pump_raise",
+                                    )
+                                });
+                            diagnostic.count(raise.request.origin.canceled_counter(), 1);
+                            diagnostic.event("raise_cancel", || {
+                                raise
+                                    .request
+                                    .sample()
+                                    .u64("burst_slot", u64::from(raise.slot))
+                                    .text("reason", "permit_disabled")
+                            });
+                        }
+                    }
                     self.hud_raise_deadlines.clear();
                 } else if let Some(requested_visibility) = self.deferred_visibility.take()
                     && let Some(epoch) = active_epoch(self.state)
@@ -737,6 +991,11 @@ impl PumpRuntime {
                         visibility: requested_visibility,
                     }))?;
                 }
+            }
+            PumpCommand::InterruptImeComposition { epoch } => {
+                apply_ime_interrupt_to_epoch(&self.hosts, WindowEpoch(epoch), |host| {
+                    host.apply_render_intents(&[NativeWindowIntent::InterruptImeComposition]);
+                });
             }
             PumpCommand::CursorActivity { epoch } => {
                 let key = WindowEpoch(epoch);
@@ -968,6 +1227,14 @@ impl PumpRuntime {
             event_sink: hud_sink,
         })?;
         let create_ms = create_t0.elapsed().as_secs_f64() * 1000.0;
+        window.bind_diagnostics(self.health.diagnostic_output_id(), epoch.0);
+        window.diagnostics().snapshot("pump_context", || {
+            DiagnosticSample::new()
+                .u64("request_id", placement.request)
+                .u64("source_epoch", self.source_epoch.load(Ordering::Acquire))
+                .text("placement", placement.placement.label())
+                .u64("owner_hwnd", placement.owner_hwnd)
+        });
         window.set_editor_ui_snapshot(self.config.editor_ui_snapshot.clone());
         window.set_main_hwnd_for_raise_check(self.config.main_hwnd_for_raise);
         let actual_spec = WindowHostSpec {
@@ -1192,7 +1459,11 @@ impl PumpRuntime {
         self.reset_cursor_for_transition(host.epoch);
         self.clear_published_if_matches(host.epoch);
         if let Some(mut window) = self.hosts.remove(&host.epoch) {
+            window.diagnostics().finish("destroy");
             window.destroy();
+        }
+        if let Some(diagnostic) = self.raise_diagnostics.remove(&host.epoch) {
+            diagnostic.finish("destroy");
         }
         #[cfg(feature = "test-script")]
         self.ui_smoke_host_publishers.remove(&host.epoch);
@@ -1209,7 +1480,12 @@ impl PumpRuntime {
     fn remove_lost_host(&mut self, host: HostedWindow) {
         self.reset_cursor_for_transition(host.epoch);
         self.clear_published_if_matches(host.epoch);
-        self.hosts.remove(&host.epoch);
+        if let Some(window) = self.hosts.remove(&host.epoch) {
+            window.diagnostics().finish("host_lost");
+        }
+        if let Some(diagnostic) = self.raise_diagnostics.remove(&host.epoch) {
+            diagnostic.finish("host_lost");
+        }
         #[cfg(feature = "test-script")]
         self.ui_smoke_host_publishers.remove(&host.epoch);
         self.requests.remove(&host.epoch);
@@ -1328,6 +1604,7 @@ impl PumpRuntime {
             for epoch in hosts {
                 if let Some(mut window) = self.hosts.remove(&epoch) {
                     self.clear_published_handles(&window);
+                    window.diagnostics().finish("shutdown_fault");
                     window.destroy();
                 }
             }
@@ -1340,6 +1617,9 @@ impl PumpRuntime {
     fn finish_typed_shutdown(&mut self) {
         if self.quitting {
             return;
+        }
+        for diagnostic in self.raise_diagnostics.values() {
+            diagnostic.finish("shutdown");
         }
         self.hwnd_out.store(0, Ordering::Release);
         self.hud_hwnd_out.store(0, Ordering::Release);
@@ -1374,7 +1654,12 @@ impl PumpRuntime {
     }
 
     fn record_fault(&self, message: &str) {
-        let rendered = format!("native video session quarantined: {message}");
+        // The render thread has already logged its detail before sending RenderFault.
+        // Publish synchronously even when init_error is locked, and log only the first fault.
+        if !self.faulted.swap(true, Ordering::AcqRel) {
+            crate::logger::log(format!("[native-video] session quarantined: {message}"));
+        }
+        let rendered = super::NATIVE_VIDEO_FAULT_MESSAGE.to_string();
         match self.init_error.try_lock() {
             Ok(mut slot) => {
                 if slot.is_none() {
@@ -1415,6 +1700,30 @@ impl PumpRuntime {
     }
 
     fn drain_window_events(&mut self) -> Result<(), String> {
+        let (diagnostics, lost) = self.pump_events.drain_raise_diagnostics();
+        for (sample, replaced) in diagnostics {
+            let diagnostic = self.raise_diagnostics_for(WindowEpoch(sample.epoch));
+            diagnostic.count(
+                if replaced {
+                    "raise_windowpos_replaced"
+                } else {
+                    "raise_windowpos_issued"
+                },
+                1,
+            );
+            diagnostic.event("raise_route", || {
+                DiagnosticSample::new()
+                    .u64("request_sequence", sample.sequence)
+                    .u64("issued_us", sample.observed_us)
+                    .u64("windowpos_flags", u64::from(sample.flags))
+                    .i64("windowpos_insert_after", sample.insert_after)
+                    .bool("replaced", replaced)
+            });
+        }
+        if lost != 0 {
+            self.raise_diagnostics_for(WindowEpoch(0))
+                .count("raise_route_diagnostic_lost", lost);
+        }
         let active_before_drain = cursor_input_epoch(self.state);
         let mut cursor_events = Vec::new();
         #[cfg(feature = "test-script")]
@@ -1422,6 +1731,10 @@ impl PumpRuntime {
         for envelope in self.pump_events.drain() {
             let epoch = WindowEpoch(envelope.epoch);
             if !self.hosts.contains_key(&epoch) {
+                if matches!(envelope.event, NativeVideoWindowEvent::RequestRaiseHud) {
+                    self.raise_diagnostics_for(epoch)
+                        .count("raise_retired_event", 1);
+                }
                 continue;
             }
             if let Some(event) = cursor_routing_event_for_epoch(active_before_drain, &envelope) {
@@ -1489,7 +1802,7 @@ impl PumpRuntime {
                 }
                 NativeVideoWindowEvent::GeometryChanged { x, y, w, h, .. } => {
                     if let Some(window) = self.hosts.get(&epoch) {
-                        window.set_hud_geometry(x, y, w, h);
+                        window.set_hud_geometry(x, y, w, h, "geometry_window_event");
                     }
                 }
                 NativeVideoWindowEvent::DpiChanged { suggested_rect, .. } => {
@@ -1501,10 +1814,23 @@ impl PumpRuntime {
                             suggested_rect.top,
                             width,
                             height,
+                            "geometry_dpi_event",
                         );
                     }
                 }
-                NativeVideoWindowEvent::RequestRaiseHud => self.schedule_hud_raise(epoch),
+                NativeVideoWindowEvent::RequestRaiseHud => {
+                    let request = envelope.raise_diagnostic.map_or_else(
+                        || HudRaiseRequest::issued(HudRaiseOrigin::WindowPos),
+                        |sample| HudRaiseRequest {
+                            origin: HudRaiseOrigin::WindowPos,
+                            sequence: sample.sequence,
+                            issued_us: sample.observed_us,
+                            flags: sample.flags,
+                            insert_after: sample.insert_after,
+                        },
+                    );
+                    self.schedule_hud_raise(epoch, request);
+                }
                 NativeVideoWindowEvent::RequestFocusClaim {
                     foreground_hwnd_at_down,
                 } => {
@@ -1566,6 +1892,21 @@ impl PumpRuntime {
                 );
             }
         }
+        if crate::perf::is_enabled() {
+            self.raise_diagnostics.retain(|epoch, diagnostic| {
+                let live = epoch.0 == 0
+                    || self.hosts.contains_key(epoch)
+                    || self.requests.contains_key(epoch)
+                    || self
+                        .hud_raise_deadlines
+                        .iter()
+                        .any(|raise| raise.epoch == *epoch);
+                if !live {
+                    diagnostic.finish("retired");
+                }
+                live
+            });
+        }
         Ok(())
     }
 
@@ -1620,25 +1961,104 @@ impl PumpRuntime {
             return;
         };
         if let Some(mut regions) = update.hud_regions {
+            window.diagnostics().snapshot("region_requested", || {
+                let mut sample = DiagnosticSample::new()
+                    .u64(
+                        "hash",
+                        super::native_window_host::hash_hud_regions(&regions),
+                    )
+                    .u64("count", regions.len() as u64)
+                    .bool("empty", regions.is_empty());
+                for (index, rect) in regions.iter().take(8).enumerate() {
+                    sample = sample.rect(
+                        [
+                            "region_0", "region_1", "region_2", "region_3", "region_4", "region_5",
+                            "region_6", "region_7",
+                        ][index],
+                        [rect.left, rect.top, rect.right, rect.bottom],
+                    );
+                }
+                sample.u64("rects_omitted", regions.len().saturating_sub(8) as u64)
+            });
             if update.fullscreen_overlay_active
                 && window.has_hud()
                 && !window.foreground_allows_hud_raise(false)
             {
                 regions.clear();
+                window
+                    .diagnostics()
+                    .count("region_foreground_suppressed", 1);
             }
             window.apply_hud_regions(&regions, update.toast_active, update.debug_description);
         }
     }
 
-    fn schedule_hud_raise(&mut self, epoch: WindowEpoch) {
+    fn raise_diagnostics_for(&mut self, epoch: WindowEpoch) -> &NativeDiagnostics {
+        if !crate::perf::is_enabled() {
+            return &self.disabled_diagnostics;
+        }
+        let output = self.health.diagnostic_output_id();
+        self.raise_diagnostics
+            .entry(epoch)
+            .or_insert_with(|| NativeDiagnostics::new(output, epoch.0, "hud", "pump_raise"))
+    }
+
+    fn schedule_hud_raise(&mut self, epoch: WindowEpoch, request: HudRaiseRequest) {
+        self.raise_diagnostics_for(epoch)
+            .count(request.origin.consumed_counter(), 1);
         if !self.z_order_recovery_permitted {
+            self.raise_diagnostics_for(epoch)
+                .count("raise_permit_denied", 1);
             return;
         }
         let now = Instant::now();
+        let diagnostic_enabled = crate::perf::is_enabled();
+        let mut replaced_by_origin = [0u64; 3];
+        if diagnostic_enabled {
+            for queued in &self.hud_raise_deadlines {
+                if queued.epoch == epoch {
+                    replaced_by_origin[queued.request.origin.index()] += 1;
+                }
+            }
+        }
+        let before = if diagnostic_enabled {
+            self.hud_raise_deadlines.len()
+        } else {
+            0
+        };
         self.hud_raise_deadlines
-            .retain(|(queued_epoch, _)| *queued_epoch != epoch);
-        for offset in HUD_RAISE_RETRY_OFFSETS {
-            self.hud_raise_deadlines.push_back((epoch, now + offset));
+            .retain(|queued| queued.epoch != epoch);
+        let replaced = if diagnostic_enabled {
+            before - self.hud_raise_deadlines.len()
+        } else {
+            0
+        };
+        self.raise_diagnostics_for(epoch)
+            .count("raise_burst_slots_replaced", replaced as u64);
+        if diagnostic_enabled {
+            let diagnostic = self.raise_diagnostics_for(epoch);
+            for origin in [
+                HudRaiseOrigin::VstHook,
+                HudRaiseOrigin::Hover,
+                HudRaiseOrigin::WindowPos,
+            ] {
+                diagnostic.count(
+                    origin.replaced_counter(),
+                    replaced_by_origin[origin.index()],
+                );
+            }
+        }
+        self.raise_diagnostics_for(epoch)
+            .event("raise_schedule", || {
+                request.sample().u64("replaced_slots", replaced as u64)
+            });
+        for (slot, offset) in HUD_RAISE_RETRY_OFFSETS.into_iter().enumerate() {
+            self.hud_raise_deadlines.push_back(ScheduledHudRaise {
+                epoch,
+                deadline: now + offset,
+                request,
+                slot: slot as u8,
+            });
         }
     }
 
@@ -1652,13 +2072,62 @@ impl PumpRuntime {
         while self
             .hud_raise_deadlines
             .front()
-            .is_some_and(|(_, deadline)| *deadline <= now)
+            .is_some_and(|raise| raise.deadline <= now)
         {
-            if let Some((epoch, _)) = self.hud_raise_deadlines.pop_front()
-                && self.z_order_recovery_permitted
-                && let Some(window) = self.hosts.get(&epoch)
+            if let Some(raise) = self.hud_raise_deadlines.pop_front() {
+                let outcome = if !self.z_order_recovery_permitted {
+                    "raise_permit_denied"
+                } else if let Some(window) = self.hosts.get(&raise.epoch) {
+                    window.try_raise_hud_to_top()
+                } else {
+                    "raise_no_host"
+                };
+                let diagnostic = self.raise_diagnostics_for(raise.epoch);
+                diagnostic.count("raise_burst_slot_consumed", 1);
+                diagnostic.count(outcome, 1);
+                diagnostic.count(
+                    "raise_apply_attempt",
+                    u64::from(matches!(outcome, "raise_applied" | "raise_apply_failed")),
+                );
+                diagnostic.event("raise_burst", || {
+                    raise
+                        .request
+                        .sample()
+                        .u64("burst_slot", u64::from(raise.slot))
+                        .text("outcome", outcome)
+                });
+            }
+        }
+
+        if crate::perf::is_enabled() {
+            // The source can change while the same HWND/target epoch survives.
+            // Compare only owner-local scalar context on an existing wake; this
+            // does not introduce a sampling timer or query another thread's HWND.
+            for (epoch, window) in &self.hosts {
+                if let Some(request) = self.requests.get(epoch) {
+                    window.diagnostics().snapshot("pump_context", || {
+                        DiagnosticSample::new()
+                            .u64("request_id", request.request)
+                            .u64("source_epoch", self.source_epoch.load(Ordering::Acquire))
+                            .text("placement", request.placement.label())
+                            .u64("owner_hwnd", request.owner_hwnd)
+                    });
+                }
+            }
+            if self
+                .last_diagnostic_sample
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1))
             {
-                let _ = window.try_raise_hud_to_top();
+                self.last_diagnostic_sample = Some(now);
+                for window in self.hosts.values() {
+                    window.sample_diagnostic_windows();
+                }
+            }
+            for window in self.hosts.values() {
+                window.diagnostics().boundary_at(now);
+            }
+            for diagnostic in self.raise_diagnostics.values() {
+                diagnostic.boundary_at(now);
             }
         }
 
@@ -1879,6 +2348,17 @@ fn active_epoch(state: WindowHostState) -> Option<WindowEpoch> {
     }
 }
 
+// The lookup is shared with fake-host regressions; retired epochs are never retargeted.
+fn apply_ime_interrupt_to_epoch<T>(
+    hosts: &HashMap<WindowEpoch, T>,
+    epoch: WindowEpoch,
+    apply: impl FnOnce(&T),
+) {
+    if let Some(host) = hosts.get(&epoch) {
+        apply(host);
+    }
+}
+
 fn cursor_input_epoch(state: WindowHostState) -> Option<WindowEpoch> {
     match state {
         WindowHostState::Visible { host, .. } => Some(host.epoch),
@@ -1904,9 +2384,632 @@ mod tests {
     };
     use windows::core::w;
 
+    #[test]
+    fn native_ime_interrupt_real_focus_output_survives_visual_replacement_and_epoch_retirement() {
+        use std::cell::Cell;
+        let context = egui::Context::default();
+        let id = egui::Id::unique("native-interrupt-source");
+        let destination = egui::Id::unique("native-interrupt-destination");
+        let mut text = "日本語 sample".to_owned();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        // Prime the actual TextEdit, then move focus after it emitted its IME metadata.
+        for _ in 0..2 {
+            let output = context.run_ui(raw(), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(id))
+                    .request_focus();
+            });
+            crate::egui_output::discard_headless_output(output);
+        }
+        let output = context.run_ui(raw(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut text).id(id));
+            ui.add(egui::TextEdit::singleline(&mut String::new()).id(destination))
+                .request_focus();
+        });
+        let ime = output
+            .platform_output
+            .ime
+            .expect("actual focused TextEdit IME metadata");
+        let mut intents = Vec::new();
+        super::super::native_presenter::append_native_platform_window_intents(
+            &output.platform_output,
+            1.5,
+            false,
+            &mut intents,
+        );
+        crate::egui_output::discard_headless_output(output);
+        assert!(ime.should_interrupt_composition);
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| matches!(intent, NativeWindowIntent::InterruptImeComposition))
+                .count(),
+            1
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|intent| matches!(intent, NativeWindowIntent::UpdateImeCursorArea { .. }))
+        );
+
+        let (command_tx, command_rx) = crossbeam_channel::bounded(8);
+        let (_, lifecycle_rx) = crossbeam_channel::bounded(8);
+        let channel_fault = Arc::new(AtomicBool::new(false));
+        let (_, render_events) = native_window_event_route(8, Arc::clone(&channel_fault));
+        let latest = Arc::new(LatestPumpValues::default());
+        let client = NativeWindowPumpRenderClient {
+            command_tx,
+            lifecycle_rx,
+            render_events,
+            latest: Arc::clone(&latest),
+            channel_fault: Arc::clone(&channel_fault),
+        };
+        let update = |epoch, window_intents| NativeWindowVisualUpdate {
+            epoch,
+            window_intents,
+            hud_regions: None,
+            toast_active: false,
+            fullscreen_overlay_active: false,
+            debug_description: None,
+        };
+        // A later logical pass and visual overwrite cannot erase or duplicate the command.
+        client.publish_visual(update(7, intents));
+        client.publish_visual(update(7, Vec::new()));
+        assert!(
+            latest
+                .visual
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .window_intents
+                .is_empty()
+        );
+        let hosts = HashMap::from([
+            (WindowEpoch(7), Cell::new(0)),
+            (WindowEpoch(8), Cell::new(0)),
+        ]);
+        let mut deliveries = 0;
+        while let Ok(command) = command_rx.try_recv() {
+            let PumpCommand::InterruptImeComposition { epoch } = command else {
+                panic!("unexpected control command")
+            };
+            apply_ime_interrupt_to_epoch(&hosts, WindowEpoch(epoch), |host| {
+                host.set(host.get() + 1);
+                deliveries += 1;
+            });
+        }
+        assert_eq!(deliveries, 1);
+        assert_eq!(hosts[&WindowEpoch(7)].get(), 1);
+        assert_eq!(hosts[&WindowEpoch(8)].get(), 0);
+        // try_lock misses also leave the pulse in the reliable existing control channel.
+        let visual_guard = latest.visual.lock().unwrap();
+        client.publish_visual(update(7, vec![NativeWindowIntent::InterruptImeComposition]));
+        drop(visual_guard);
+        let PumpCommand::InterruptImeComposition { epoch } = command_rx.try_recv().unwrap() else {
+            panic!("interrupt control")
+        };
+        let successor_only = HashMap::from([(WindowEpoch(8), Cell::new(0))]);
+        apply_ime_interrupt_to_epoch(&successor_only, WindowEpoch(epoch), |host| {
+            host.set(host.get() + 1)
+        });
+        assert_eq!(successor_only[&WindowEpoch(8)].get(), 0);
+        assert!(command_rx.try_recv().is_err());
+        assert!(!channel_fault.load(Ordering::Acquire));
+
+        // Delivery does not make the next actual run emit the old pulse again.
+        let output = context.run_ui(raw(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut text).id(destination));
+        });
+        let ime = output.platform_output.ime;
+        crate::egui_output::discard_headless_output(output);
+        assert!(
+            !ime.expect("new owner IME output")
+                .should_interrupt_composition
+        );
+    }
+
     const STALL_TEST: &str = "video::native_window_pump::tests::production_parent_destroy_remains_bounded_during_render_stall";
     const STALL_CHILD_ENV: &str = "MIV_STAGE4_PRODUCTION_STALL_CHILD";
     const HUD_FOCUS_CHILD_ENV: &str = "MIV_HUD_FOCUS_TEST_CHILD";
+
+    fn fault_test_runtime() -> (PumpRuntime, Receiver<PumpLifecycleEvent>) {
+        let fault = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_events) = native_window_event_route(64, Arc::clone(&fault));
+        let (render_route, _render_events) = native_window_event_route(64, Arc::clone(&fault));
+        let (_command_tx, command_rx) = crossbeam_channel::bounded(64);
+        let (lifecycle_tx, _lifecycle_rx) = crossbeam_channel::bounded(128);
+        // Keep the receivers connected while exercising commands. No app is launched.
+        let (ui_tx, _ui_rx) = super::super::native_output_event_bus(
+            64,
+            Arc::clone(&fault),
+            Arc::new(super::super::VideoUiWake::default()),
+        );
+        let spawn = NativeWindowPumpSpawn {
+            config: focus_test_config(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            hwnd_out: Arc::new(AtomicU64::new(0)),
+            hud_hwnd_out: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
+            presenter_visibility: NativePresenterVisibility::new(
+                NativeVideoInitialVisibility::Hidden,
+            ),
+            source_epoch: Arc::new(AtomicU64::new(0)),
+            ui_event_tx: ui_tx,
+            init_error: Arc::new(Mutex::new(None)),
+            channel_fault: fault,
+            health: super::super::native_window_health::NativeWindowHealth::new_registered(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: super::super::native_ui_smoke::allocate_output_id(),
+        };
+        // Resized lifecycle sends are tested below, so retain this bounded receiver
+        // in the fixture rather than changing production send semantics.
+        let runtime = PumpRuntime::new(
+            spawn,
+            command_rx,
+            lifecycle_tx,
+            Arc::new(LatestPumpValues::default()),
+            pump_route,
+            render_route,
+            pump_events,
+        );
+        (runtime, _lifecycle_rx)
+    }
+
+    fn geometry_runtime() -> (PumpRuntime, Receiver<PumpLifecycleEvent>) {
+        let (mut runtime, lifecycle_rx) = fault_test_runtime();
+        for epoch in [7, 8] {
+            insert_geometry_host(&mut runtime, epoch, true);
+        }
+        let _ = runtime.pump_events.drain();
+        (runtime, lifecycle_rx)
+    }
+
+    #[test]
+    fn record_fault_latches_before_contended_init_error_can_be_reported() {
+        let (mut runtime, _events) = fault_test_runtime();
+        let output = super::super::NativeVideoOutput::disconnected_for_test();
+        runtime.faulted = Arc::clone(&output.faulted);
+        runtime.init_error = Arc::clone(&output.init_error);
+        let locked = output.init_error.lock().unwrap();
+        assert!(output.reusable_for_swap());
+        runtime.record_fault("contended pump failure");
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.is_closed(), "fault must precede closed publication");
+        assert!(!output.reusable_for_swap());
+        assert!(
+            locked.is_none(),
+            "reporting is still blocked by the held lock"
+        );
+        drop(locked);
+    }
+
+    #[test]
+    fn record_fault_notification_take_never_makes_output_reusable() {
+        let (mut runtime, _events) = fault_test_runtime();
+        let output = super::super::NativeVideoOutput::disconnected_for_test();
+        runtime.faulted = Arc::clone(&output.faulted);
+        runtime.init_error = Arc::clone(&output.init_error);
+        runtime.record_fault("internal pump failure detail");
+        assert_eq!(
+            output.take_init_error().as_deref(),
+            Some(super::super::NATIVE_VIDEO_FAULT_MESSAGE)
+        );
+        assert!(output.take_init_error().is_none());
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.reusable_for_swap());
+        runtime.record_fault("another report cannot clear the fault");
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.reusable_for_swap());
+    }
+
+    #[test]
+    fn normal_typed_shutdown_does_not_mark_fault_or_init_error() {
+        let (mut runtime, _events) = fault_test_runtime();
+        // No HWND or GPU work: exercise the production terminal publication directly.
+        runtime.begin_shutdown(1);
+        assert!(runtime.closed.load(Ordering::Acquire));
+        assert!(!runtime.faulted.load(Ordering::Acquire));
+        assert!(runtime.init_error.lock().unwrap().is_none());
+    }
+
+    fn insert_geometry_host(runtime: &mut PumpRuntime, epoch: u64, with_hud: bool) {
+        let sink = |source| {
+            super::super::native_window::NativeVideoWindowEventSink::new(
+                epoch,
+                epoch,
+                source,
+                runtime.pump_route.clone(),
+                runtime.render_route.clone(),
+            )
+        };
+        let window = NativeWindowHost::create_hidden_for_geometry_test(
+            epoch,
+            sink(NativeVideoWindowSource::Presenter),
+            sink(NativeVideoWindowSource::Hud),
+            with_hud,
+        );
+        assert!(!unsafe { IsWindowVisible(window.hwnd()) }.as_bool());
+        if with_hud {
+            assert!(!unsafe { IsWindowVisible(HWND(window.hud_hwnd() as *mut _)) }.as_bool());
+        }
+        runtime.hosts.insert(WindowEpoch(epoch), window);
+    }
+
+    fn hud_rect(runtime: &PumpRuntime, epoch: u64) -> windows::Win32::Foundation::RECT {
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(
+                HWND(runtime.hosts[&WindowEpoch(epoch)].hud_hwnd() as *mut _),
+                &mut rect,
+            )
+        }
+        .expect("HUD rect");
+        rect
+    }
+
+    fn request_geometry(
+        runtime: &mut PumpRuntime,
+        route: u8,
+        epoch: u64,
+        rect: windows::Win32::Foundation::RECT,
+    ) {
+        if route == 0 {
+            runtime
+                .handle_command(PumpCommand::Resize {
+                    epoch,
+                    placement: NativeVideoPlacement::FullscreenBorderless,
+                    rect,
+                })
+                .expect("resize handler");
+        } else {
+            let sink = super::super::native_window::NativeVideoWindowEventSink::new(
+                epoch,
+                epoch,
+                NativeVideoWindowSource::Presenter,
+                runtime.pump_route.clone(),
+                runtime.render_route.clone(),
+            );
+            sink.send(if route == 1 {
+                NativeVideoWindowEvent::GeometryChanged {
+                    x: rect.left,
+                    y: rect.top,
+                    w: (rect.right - rect.left).max(0) as u32,
+                    h: (rect.bottom - rect.top).max(0) as u32,
+                    maximized: false,
+                }
+            } else {
+                NativeVideoWindowEvent::DpiChanged {
+                    dpi: 144,
+                    suggested_rect: rect,
+                }
+            });
+        }
+        runtime
+            .drain_window_events()
+            .expect("production stamped event drain");
+    }
+
+    #[test]
+    fn hud_geometry_pump_routes_compare_actual_rect_and_preserve_siblings() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
+        };
+        for route in 0..3 {
+            let (mut runtime, _lifecycle_rx) = geometry_runtime();
+            let rect = RECT {
+                left: -1900,
+                top: -1800,
+                right: -1500,
+                bottom: -1560,
+            };
+            let sibling = hud_rect(&runtime, 8);
+            let initial_notifications =
+                runtime.hosts[&WindowEpoch(7)].hud_position_notifications_for_test();
+            for _ in 0..4 {
+                request_geometry(&mut runtime, route, 7, rect);
+            }
+            assert_eq!(
+                runtime.hosts[&WindowEpoch(7)].hud_geometry_attempts_for_test(),
+                1,
+                "route={route}: exact repeats skip actual SetWindowPos"
+            );
+            assert_eq!(
+                runtime.hosts[&WindowEpoch(7)].hud_position_notifications_for_test()
+                    - initial_notifications,
+                1,
+                "actual production wndproc notification"
+            );
+            assert_eq!(hud_rect(&runtime, 7), rect);
+            assert_eq!(hud_rect(&runtime, 8), sibling);
+            assert_eq!(
+                runtime.hosts[&WindowEpoch(8)].hud_geometry_attempts_for_test(),
+                0
+            );
+            assert!(
+                runtime.hud_raise_deadlines.is_empty(),
+                "NOZORDER never seeds recovery"
+            );
+
+            // Same dimensions with a different position still move; negative
+            // screen coordinates remain exact. External mutations are not cached.
+            let moved = RECT {
+                left: rect.left - 20,
+                right: rect.right - 20,
+                ..rect
+            };
+            request_geometry(&mut runtime, route, 7, moved);
+            assert_eq!(
+                runtime.hosts[&WindowEpoch(7)].hud_geometry_attempts_for_test(),
+                2
+            );
+            unsafe {
+                SetWindowPos(
+                    HWND(runtime.hosts[&WindowEpoch(7)].hud_hwnd() as *mut _),
+                    None,
+                    -1400,
+                    -1300,
+                    45,
+                    27,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                )
+            }
+            .expect("external HUD mutation");
+            request_geometry(&mut runtime, route, 7, moved);
+            assert_eq!(
+                runtime.hosts[&WindowEpoch(7)].hud_geometry_attempts_for_test(),
+                3
+            );
+            assert_eq!(hud_rect(&runtime, 7), moved);
+
+            let zero = RECT {
+                left: -1700,
+                top: -1600,
+                right: -1700,
+                bottom: -1600,
+            };
+            request_geometry(&mut runtime, route, 7, zero);
+            request_geometry(&mut runtime, route, 7, zero);
+            assert_eq!(
+                hud_rect(&runtime, 7),
+                RECT {
+                    right: zero.left + 1,
+                    bottom: zero.top + 1,
+                    ..zero
+                }
+            );
+            assert_eq!(
+                runtime.hosts[&WindowEpoch(7)].hud_geometry_attempts_for_test(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn hud_geometry_pump_dpi_order_recreation_retirement_and_failures() {
+        use windows::Win32::Foundation::RECT;
+        let (mut runtime, _lifecycle_rx) = geometry_runtime();
+        let suggested = RECT {
+            left: -1800,
+            top: -1500,
+            right: -1300,
+            bottom: -1200,
+        };
+        let presenter = RECT {
+            left: -1800,
+            top: -1500,
+            right: -1200,
+            bottom: -1100,
+        };
+        request_geometry(&mut runtime, 2, 7, suggested);
+        request_geometry(&mut runtime, 1, 7, presenter);
+        assert_eq!(hud_rect(&runtime, 7), presenter);
+        assert_eq!(
+            runtime.hosts[&WindowEpoch(7)].hud_geometry_attempts_for_test(),
+            2
+        );
+        runtime.hosts.remove(&WindowEpoch(7));
+        insert_geometry_host(&mut runtime, 9, true);
+        let _ = runtime.pump_events.drain();
+        request_geometry(&mut runtime, 2, 7, suggested); // Retired stamped epoch.
+        assert_eq!(
+            runtime.hosts[&WindowEpoch(9)].hud_geometry_attempts_for_test(),
+            0
+        );
+        request_geometry(&mut runtime, 0, 9, presenter);
+        assert_eq!(
+            runtime.hosts[&WindowEpoch(9)].hud_geometry_attempts_for_test(),
+            1
+        );
+        insert_geometry_host(&mut runtime, 10, false);
+        let _ = runtime.pump_events.drain();
+        for route in 0..3 {
+            request_geometry(&mut runtime, route, 10, presenter);
+        }
+
+        // Query failure must take the apply path even when actual rect matches.
+        runtime.hosts[&WindowEpoch(9)].inject_hud_geometry_failure_for_test(true, false);
+        request_geometry(&mut runtime, 2, 9, presenter);
+        assert_eq!(
+            runtime.hosts[&WindowEpoch(9)].hud_geometry_attempts_for_test(),
+            2
+        );
+        runtime.hosts[&WindowEpoch(9)].inject_hud_geometry_failure_for_test(false, true);
+        request_geometry(&mut runtime, 2, 9, suggested);
+        assert_eq!(hud_rect(&runtime, 9), presenter);
+        assert_eq!(
+            runtime.hosts[&WindowEpoch(9)].hud_geometry_attempts_for_test(),
+            3
+        );
+        runtime.hosts[&WindowEpoch(9)].inject_hud_geometry_failure_for_test(false, false);
+        request_geometry(&mut runtime, 2, 9, suggested);
+        assert_eq!(hud_rect(&runtime, 9), suggested);
+        assert_eq!(
+            runtime.hosts[&WindowEpoch(9)].hud_geometry_attempts_for_test(),
+            4
+        );
+        assert!(!runtime.channel_fault.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hud_raise_client_to_pump_preserves_vst_hover_origins_and_upstream_identity() {
+        let (mut runtime, _lifecycle_rx) = geometry_runtime();
+        let (command_tx, command_rx) = crossbeam_channel::bounded(8);
+        runtime.command_rx = command_rx;
+        let (_, render_events) = native_window_event_route(8, Arc::clone(&runtime.channel_fault));
+        let (_, lifecycle_rx) = crossbeam_channel::bounded(8);
+        let client = NativeWindowPumpRenderClient {
+            command_tx,
+            lifecycle_rx,
+            render_events,
+            latest: Arc::clone(&runtime.latest),
+            channel_fault: Arc::clone(&runtime.channel_fault),
+        };
+        client.raise_hud(7, HudRaiseOrigin::Hover).unwrap();
+        client
+            .raise_hud_from_upstream(
+                8,
+                Some(NativeRaiseSample {
+                    epoch: 8,
+                    sequence: 81,
+                    observed_us: 31,
+                    flags: 0,
+                    insert_after: 0,
+                }),
+            )
+            .unwrap();
+        runtime.drain_commands().unwrap();
+        assert_eq!(runtime.hud_raise_deadlines.len(), 6);
+        for raise in runtime.hud_raise_deadlines.iter().take(3) {
+            assert_eq!(raise.epoch, WindowEpoch(7));
+            assert!(matches!(raise.request.origin, HudRaiseOrigin::Hover));
+        }
+        for raise in runtime.hud_raise_deadlines.iter().skip(3) {
+            assert_eq!(raise.epoch, WindowEpoch(8));
+            assert!(matches!(raise.request.origin, HudRaiseOrigin::VstHook));
+            assert_eq!((raise.request.sequence, raise.request.issued_us), (81, 31));
+        }
+    }
+
+    #[test]
+    fn hud_raise_burst_is_finite_and_preserves_offsets_and_permit() {
+        let fault = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_events) = native_window_event_route(16, Arc::clone(&fault));
+        let (render_route, _render_events) = native_window_event_route(16, Arc::clone(&fault));
+        let (_command_tx, command_rx) = crossbeam_channel::bounded(4);
+        let (lifecycle_tx, _lifecycle_rx) = crossbeam_channel::bounded(4);
+        let (ui_tx, _ui_rx) = super::super::native_output_event_bus(
+            4,
+            Arc::clone(&fault),
+            Arc::new(super::super::VideoUiWake::default()),
+        );
+        let spawn = NativeWindowPumpSpawn {
+            config: focus_test_config(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            hwnd_out: Arc::new(AtomicU64::new(0)),
+            hud_hwnd_out: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
+            presenter_visibility: NativePresenterVisibility::new(
+                NativeVideoInitialVisibility::Hidden,
+            ),
+            source_epoch: Arc::new(AtomicU64::new(0)),
+            ui_event_tx: ui_tx,
+            init_error: Arc::new(Mutex::new(None)),
+            channel_fault: Arc::clone(&fault),
+            health: super::super::native_window_health::NativeWindowHealth::new_registered(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: super::super::native_ui_smoke::allocate_output_id(),
+        };
+        let mut runtime = PumpRuntime::new(
+            spawn,
+            command_rx,
+            lifecycle_tx,
+            Arc::new(LatestPumpValues::default()),
+            pump_route,
+            render_route,
+            pump_events,
+        );
+        runtime
+            .handle_command(PumpCommand::RaiseHud {
+                epoch: 7,
+                request: HudRaiseRequest::issued(HudRaiseOrigin::VstHook),
+            })
+            .unwrap();
+        runtime
+            .handle_command(PumpCommand::RaiseHud {
+                epoch: 7,
+                request: HudRaiseRequest::issued(HudRaiseOrigin::VstHook),
+            })
+            .unwrap();
+        assert_eq!(runtime.hud_raise_deadlines.len(), 3, "requests coalesce");
+        let start = runtime.hud_raise_deadlines[0].deadline;
+        let offsets: Vec<_> = runtime
+            .hud_raise_deadlines
+            .iter()
+            .map(|raise| {
+                assert_eq!(raise.epoch, WindowEpoch(7));
+                raise.deadline.duration_since(start).as_millis()
+            })
+            .collect();
+        assert_eq!(offsets, [0, 16, 50]);
+
+        // Expire deadlines without sleeping. This exercises the real pump consumer
+        // with a retired/missing host; actual HUD raises are covered by hud_window.
+        for raise in &mut runtime.hud_raise_deadlines {
+            raise.deadline = Instant::now();
+        }
+        runtime.run_periodic_work();
+        assert!(runtime.hud_raise_deadlines.is_empty());
+        runtime.run_periodic_work();
+        assert!(
+            runtime.hud_raise_deadlines.is_empty(),
+            "burst stays terminated"
+        );
+
+        runtime
+            .handle_command(PumpCommand::RaiseHud {
+                epoch: 7,
+                request: HudRaiseRequest::issued(HudRaiseOrigin::VstHook),
+            })
+            .unwrap();
+        runtime
+            .handle_command(PumpCommand::SetZOrderRecoveryPermit { permitted: false })
+            .unwrap();
+        assert!(runtime.hud_raise_deadlines.is_empty());
+        runtime
+            .handle_command(PumpCommand::RaiseHud {
+                epoch: 7,
+                request: HudRaiseRequest::issued(HudRaiseOrigin::VstHook),
+            })
+            .unwrap();
+        assert!(
+            runtime.hud_raise_deadlines.is_empty(),
+            "blocked requests cannot queue"
+        );
+        runtime
+            .handle_command(PumpCommand::SetZOrderRecoveryPermit { permitted: true })
+            .unwrap();
+        runtime
+            .handle_command(PumpCommand::RaiseHud {
+                epoch: 7,
+                request: HudRaiseRequest::issued(HudRaiseOrigin::VstHook),
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.hud_raise_deadlines.len(),
+            3,
+            "normal recovery resumes"
+        );
+        assert!(!fault.load(Ordering::Acquire));
+    }
 
     #[test]
     fn hud_focus_claim_uses_registered_editor_and_preserves_presenter_return() {
@@ -2054,6 +3157,7 @@ mod tests {
             hwnd_out: Arc::new(AtomicU64::new(0)),
             hud_hwnd_out: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
             presenter_visibility: NativePresenterVisibility::new(
                 NativeVideoInitialVisibility::Visible,
             ),
@@ -2260,9 +3364,13 @@ mod tests {
     }
 
     fn run_hud_focus_child(owner_raw: u64) {
+        use windows::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, NULLREGION, SetWindowRgn,
+        };
+
         let module = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let create = |owner| {
-            unsafe {
+            let hwnd = unsafe {
                 CreateWindowExW(
                     WS_EX_NOACTIVATE,
                     w!("STATIC"),
@@ -2278,15 +3386,35 @@ mod tests {
                     None,
                 )
             }
-            .expect("create popup")
+            .expect("create popup");
+            // Negative coordinates can still be on a monitor. An empty region
+            // prevents pixels on every layout while retaining HWND visibility.
+            let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+            assert!(!region.is_invalid(), "create empty popup region");
+            let assigned = unsafe { SetWindowRgn(hwnd, Some(region), false) };
+            if assigned == 0 {
+                let _ = unsafe { DeleteObject(region.into()) };
+            }
+            assert_ne!(assigned, 0, "assign empty region before showing popup");
+            // SetWindowRgn transfers region ownership to the window on success.
+            hwnd
         };
         let editor = create(Some(HWND(owner_raw as *mut _)));
         let unregistered_owned = create(Some(HWND(owner_raw as *mut _)));
         let external = create(None);
         unsafe {
-            let _ = ShowWindow(editor, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(unregistered_owned, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(external, SW_SHOWNOACTIVATE);
+            for hwnd in [editor, unregistered_owned, external] {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                assert!(IsWindowVisible(hwnd).as_bool());
+                let copy = CreateRectRgn(0, 0, 0, 0);
+                assert!(!copy.is_invalid());
+                let kind = GetWindowRgn(hwnd, copy);
+                let _ = DeleteObject(copy.into());
+                assert_eq!(
+                    kind, NULLREGION,
+                    "shown fixture must have no drawable pixels"
+                );
+            }
         }
         println!(
             "MIV_FOCUS_WINDOWS {} {} {}",
@@ -2344,6 +3472,7 @@ mod tests {
     #[test]
     fn cursor_route_rejects_stale_epoch_and_generation() {
         let mut envelope = NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 1,
             epoch: 8,
             generation: 8,
@@ -2441,6 +3570,7 @@ mod tests {
         let hwnd_out = Arc::new(AtomicU64::new(0));
         let hud_out = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let faulted = Arc::new(AtomicBool::new(false));
         let presenter_visibility =
             NativePresenterVisibility::new(NativeVideoInitialVisibility::Visible);
         let source_epoch = Arc::new(AtomicU64::new(0));
@@ -2492,6 +3622,7 @@ mod tests {
             hwnd_out: Arc::clone(&hwnd_out),
             hud_hwnd_out: hud_out,
             closed: Arc::clone(&closed),
+            faulted: Arc::clone(&faulted),
             presenter_visibility,
             source_epoch,
             ui_event_tx: ui_tx,
@@ -2647,6 +3778,7 @@ mod tests {
             .expect("production pump remained responsive")
             .expect("production pump join");
         assert!(closed.load(Ordering::Acquire));
+        assert!(!faulted.load(Ordering::Acquire));
         assert_eq!(
             init_error.lock().expect("pump init error lock").as_deref(),
             None,

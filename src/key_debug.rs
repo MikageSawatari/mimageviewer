@@ -115,6 +115,7 @@ pub fn record_native_video_key(
     record_raw_edge(
         KeyDebugSource::NativeVideo,
         KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 0,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: key.virtual_key,
@@ -171,7 +172,7 @@ pub fn render_overlay(ctx: &egui::Context) {
         return;
     }
     let lines = snapshot_lines();
-    egui::Area::new("key_debug_overlay".into())
+    egui::Area::new(egui::Id::unique("key_debug_overlay"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_TOP, [-12.0, 72.0])
         .interactable(false)

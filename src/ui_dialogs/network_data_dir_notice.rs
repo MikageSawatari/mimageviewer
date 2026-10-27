@@ -74,6 +74,7 @@ pub fn render_network_data_dir_notice_content(
 impl App {
     pub(crate) fn network_data_dir_notice_visible(&self) -> bool {
         self.network_data_dir_notice.is_some()
+            && !self.startup_notice_viewer_open()
             && self.settings_boot_problem_source.is_none()
             && self.settings.first_setup_completed
             && !self.show_mouse_nav_migration_prompt
@@ -117,6 +118,7 @@ pub(super) fn draw_network_data_dir_notice_dialog(
     let width = 560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0));
     let mut response = NetworkDataDirNoticeResponse::default();
     egui::Window::new("データの保存先について")
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(open)
         .collapsible(false)
         .resizable(true)

@@ -1,12 +1,14 @@
 # 画像閲覧中の本のページ一覧（§1.340）設計
 
+2026-10-27 master取込み追補: **master取り込みの作業ファイルの衝突解消・指定自動検証は完了、未merge。現行gateの新規O回帰2件、通常／test-script check、audit、全UI snapshot 211件、関連lib 1374件と最終整形検査は成功（§25.6）。未決の設計選択はない。進行中curl／通常flat完了待ちの一覧入場は既存barrierで拒否し、受理済み移動を保持する（§25.4）。Select照合後のClosed→既存landing一回は維持。独立レビュー・full-lib・build-dev・実機確認とGitのstage／merge commitはcoordinatorへ引き継ぐ。**
+
 作成: 2026-10-12 / Codex、基準: `next-tile` / `ea060b66e`。
-状態: **R5 `a3bb1775b` は双方の構造合意済み。T1 `588fe1d76`、非PDF `f3d5cbe22` は実装・検証・独立ACCEPT。master取込みの作業ファイルで競合を解消し、§1.377のowner-scoped API上にPDF／EPUBを接続、独立完了レビューACCEPT。最終検証・確認buildの記録は§20。Gitのstage／merge commitはcoordinatorが行う。**
+状態（2026-10-12〜13の履歴）: **R5 `a3bb1775b` は双方の構造合意済み。T1 `588fe1d76`、非PDF `f3d5cbe22` は実装・検証・独立ACCEPT。当時のmaster取込みの作業ファイルで競合を解消し、§1.377のowner-scoped API上にPDF／EPUBを接続、独立完了レビューACCEPT。最終検証・確認buildの記録は§20。今回の状態は冒頭追補と§25を参照。Gitのstage／merge commitはcoordinatorが行う。**
 改訂 R5: R4 `7d0d0cf0a` の再レビュー REVISE（P1 1件）と2026-10-12の利用者／coordinator判断を反映。
 既定キーは **O（Overview）で確定**。一覧からの選択は当該viewerの通常ページ移動と同じ扱いにする。
-利用者の指示により§10のT1→T5で実装する。T1記録は§17、統合前の履歴は§19、現行の検証・残事項は§20へ記録する。
+利用者の指示により§10のT1→T5で実装する。T1記録は§17、2026-10-12〜13の実装・検証履歴は§19〜24、今回の統合状況・残事項は§25へ記録する。
 R3 の非アクティブ context への Select 破棄・一覧維持の契約は保持する。
-公開時期は v4.6.0 の次の版の**後**。次の版の必須成果にはしない。
+公開時期は2026-10-27の利用者決定により**次の版（v4.9.0）**。v4.6.0の次の版の後とした2026-10-12の記録を置き換える。
 項目・出典・時期の正本は [next-release-backlog.md §1.340](next-release-backlog.md#1340-複数ウィンドウの画像ウィンドウ内に本のページをタイル表示する--miv-スレ-509519-2026-10-07)。
 利用者の確定事項と改訂履歴は §12／§15／§16 で区別する。R4のキー候補はOの確定で置き換えた。
 スレ >>509 / >>519 の内容は backlog の要約を参照した。原文の追加調査・製品起動による観測は行っていない。
@@ -113,6 +115,11 @@ R3 の非アクティブ context への Select 破棄・一覧維持の契約は
 バー／「…」の「ページ一覧」に加えて、**既定キーを設けることは利用者決定済み**。
 既定は **O（Overview、利用者決定2026-10-12）**。S は `FsSlideshow`、動画 S は `VideoTileMode` を維持し、
 今回のために再割当しない。コマンド設定・適格なリング／ジェスチャ候補・ヘルプにも同じ入口を出す。
+
+新規入場は既存`page_turn_barrier_active()`が示す`Turning`／`Completing`の間だけ受け付けない。
+Oを押しても一覧は開かず、通常flatの採用と受理済みcontinuationが完了してからもう一度押す。
+HUD／リング／パッドも`open_page_overview_for_viewer`→`open_page_overview`の同じavailability／open受付を使う。
+入場要求を保留・自動再生せず、受付側からpage-turn ownerを取消・変更しない（§25.4）。
 
 一覧用のローカル `KeyContext::FsPageOverview`（仮称）を設け、一覧の scope 集合を
 `[Global, FsCommon, FsPageOverview]` とする。FsImage / Rating は同時 active にしない。
@@ -229,6 +236,10 @@ production context audit を同時に配線する。サムネイルの request /
 同じitemsを使う通常閲覧でも、一覧入場のために`load_folder`／`start_loading_items`／items再採用／
 場所履歴の追加・cursor移動を行わない。元のGrid状態を戻すための全件snapshot／rollbackも作らない。
 **Selectを受理した後は、そのviewerの通常ページ移動と同じ扱い**で既存absolute seekへ渡す。
+受理はstamp／binding／items・projection revision／incarnation／stable identity／active資格の
+既存照合を全通過した時点とし、一覧をClosedにしてから既存landingをちょうど一度呼ぶ。
+即時着地、構成の提示許可Checking後の許可、後着拒否、同期拒否の扱いは通常navigation ownerに任せ、
+結果を理由に一覧を再openしない（2026-10-27 coordinator判断、§25.1追補）。
 単ページの`sync_main_selection_from_viewer_idx`、連結の`seek_to_continuous_page_with_contract`の
 cursor／scroll更新、読書位置・読書履歴記録、連動F12の後続同期を省略・変更しない。
 
@@ -331,9 +342,9 @@ keepalive tick を足さず、既存の window_id と表示先を使う。これ
 
 | 入口／終了 | 一覧 owner と副作用 |
 | --- | --- |
-| Open | 適格性を確認し、現在 viewer の canonical projection を参照。現在ページへ cursor、可視需要を publish。items 再列挙／履歴 write はしない |
+| Open | 既存barrierがTurning／Completingなら入場せず、利用者が完了後に新しく押し直す。入場要求の待機・保留・replay・owner取消はしない。その他の適格性も通れば現在viewerのcanonical projectionを参照し、現在ページへcursor、可視需要をpublish。items再列挙／履歴writeはしない |
 | Cancel / toggle | Closed へ。overview の需要だけを解除し、元のページと strip 設定へ戻す |
-| Select | stamp と identity に加え、処理時の実際の active context を検証。元 owner が非アクティブなら着地も再activationもせず Select を破棄し、Openを維持。activeなら既存 navigation gateへ渡し、受理された場合だけClosed。非受理は一覧を残す |
+| Select | stamp／binding／items・projection revision／incarnation／stable identity／処理時の実際のactive資格を既存経路で照合。全通過を受理とし、Closedにしてから既存landingをちょうど一度呼ぶ。照合不成立ならlandingも再activationもせず破棄し、Openを維持。landingの即時／Checking後許可／後着拒否／同期拒否は通常navigation ownerが扱い、一覧を再openしない |
 | Scroll / resize / columns | 同じ Open の表示範囲と bounded demand を更新。実ページの位置とグローバル grid サイズを変更しない |
 | F11 / 連動窓の同一 context の F12 migration | 一覧状態は同じ bundle とともに移動。新 client rect で layout 再計算。placement の別保存先を作らない。独立静止画窓の F12 は無効のまま |
 | 別本 open / フォルダ移動 | 既存 command が受理された時点で Closed。incoming の loading/holdover と混在させず、既存 open continuation を使用する |
@@ -400,8 +411,10 @@ stamp 不一致・元 context 退役・一覧終了なら元 command を破棄�
 
 ### §1.242 との統合条件
 
-この基準 worktree に本の構成 G1〜G4 は未統合。細部の API 名を既成事実にせず、
-`nextbook` のレビュー済み正本・実装が統合された時点で**本節と page projection adapter を再照合してから実装**する。
+2026-10-12の基準worktreeでは本の構成G1〜G4は未統合だった。2026-10-27のmaster取り込みでは、
+overviewは構成採用後の可視実items順をそのまま消費し、並べ替えとhiddenを反映する。
+白紙補助annotationは既存adapterの`None`のまま未接続で、fixtureの補助表示を製品接続済みとは扱わない。
+構成の非同期提示許可とSelect受理は§25.1追補のcoordinator判断に従う。今回の統合後の検証は未完了。
 backlog §1.242 の 2026-10-12 決定では構成は ZIP/PDF/EPUB が対象、画像フォルダ G4F は切り離し、製本は対象外。
 
 構成がある本は構成側の canonical 読み取り列／navigation projection を唯一の正本にする。
@@ -548,6 +561,8 @@ coordinator は有効な結果を再利用し、項目の最後に `test-full.ps
 予定する **20 ケース群**（実装時にテスト本数と実行数を別記し、下記を実行済み本数と称さない）:
 
 1. Open／cancel／select の状態遷移と、cancel／cursor 操作で読書位置が変わらないこと。
+   Selectの既存照合を全通過したらClosed→landing一回となり、即時着地／Checking後許可／
+   後着拒否／同期拒否でも再openしないこと。照合不成立はOpenを保ちlandingを呼ばないこと（§25.1追補）。
 2. 1／数百／50,000 ページの仮想行、末尾アクセス、空列、縮小 client rect の戻る操作到達性。
 3. RTL／LTR の描画順・カーソル幾何・ページ番号、列数／DPI／resize 時の cursor anchor。
 4. Placeholder／Failed セルも着地可能、生成完了待ちや全件要求が無いこと。
@@ -747,6 +762,8 @@ T1の変更は `src/page_overview.rs` と `src/lib.rs` のmodule宣言。純粋�
 metadata／reader-orderのArc共有、整数index remap、仮想行／有界overscan、RTL／幾何cursor移動、
 scroll／reflow、stamped Selectの検証を実装した。実ページの白紙補助annotationは独立targetを持たない。
 inactive／stale／navigation拒否のSelectはlandingもcloseもせず、受理時だけClosedへ遷移する。
+これはT1当時の履歴。現行のSelect受理と一覧終了は§25.1追補の2026-10-27判断を優先し、
+既存照合を全通過した後のlanding拒否でも一覧はClosedを維持する。
 実際のactive session／surface bindingの検証はT2／T3の接続先が供給する契約であり、
 純粋モデルのcontext serialだけでnative window所有を検証済みと扱わない。
 
@@ -1442,3 +1459,245 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList
 次の通常左clickがページ送りとして成立することを確認する。製品／native実機確認は未実施。
 `--data-dir`を省略すると通常`%APPDATA%/mimageviewer` profileを使い、実設定／dataを更新し得る。
 通常起動ではinstalled／tray常駐版を先に閉じる。
+
+## 25. 2026-10-27 master統合記録
+
+対象は`next-tile` HEAD `319adf60c`と、coordinatorがmergeを開始したmaster
+`3caa9c1a9`。v4.9.0への採用は利用者決定済み。gitのindex／merge状態は操作していない。
+本節は今回の統合をACCEPT／検証済みとする記録ではない。
+
+### 25.1 Select受理と構成の非同期提示許可（停止時の調査履歴）
+
+以下は再開前の調査と判断待ちの履歴。三値返却案は直後のcoordinator判断で不採用とし、
+現在の実装・受入条件は同追補を優先する。
+
+`app/page_overview.rs::handle_page_overview_command`は、Selectで
+`land_still_page_navigation_target(..., LatestSeek, ...)`を呼び、直後の
+`fullscreen_idx == target.items_idx`を成立条件にして一覧を閉じる。
+masterのpaged／continuous landingは、構成の提示許可を既存の
+`OpenPermission::Checking`へ受理した場合、idxを変えずにreturnする。
+後着結果は`poll_book_presentation_permission`→`resume_qualified_book_target`から
+通常navigation／continuous seekを再開するが、一覧Selectの受理・終了には接続されていない。
+
+従って、異なるページへのSelectが許可照会へ受理されると、その場では拒否扱いで一覧が
+Openのまま残り、後から閲覧位置だけが変わる経路がソース上成立する。実行による再現は未実施。
+「通常ページ移動の入口は即時着地する」という旧実装の前提をそのまま使えない。
+
+設計担当へ返す論点は、既存navigation ownerからSelectの受付結果をどう返し、一覧をいつ
+閉じるか。受理時にClosedとする既存§6.2の契約へ揃えるには、共通landing側が
+即時着地／既存ownerへの受理／拒否を区別して返す案がある。
+現在の`defer_book_composition_target_route`のboolは拒否でもtrueを返し、
+包括的な`pending()`には表示occurrenceの受動照会も含まれるため、これらを受付証明へ流用しない。
+追加pending field、背景Selectの再配送、表示許可待ちの同期化は実装していない。
+この境界の変更は新たな設計照合へ返し、独断で着手しない。
+
+### 25.1追補 coordinator判断（2026-10-27、作業再開・検証中）
+
+1. Selectの受理は、既存のstamp／binding／items・projection revision／incarnation／
+   stable identity／処理時のactive資格の照合をすべて通過した時点とする。
+   照合不成立のSelectは従来どおり破棄し、元一覧をOpenのまま維持する。
+2. 受理したら一覧をClosedにし、既存の`land_still_page_navigation_target`をちょうど一度呼ぶ。
+   即時の`fullscreen_idx`一致をSelect受理の条件にしない。終了とlandingの実装順序はClose→landing。
+   closeをlanding直前へ移す理由は、overview需要を先に撤回し、通常landingの
+   `fs_page_turn_ordinary_context_blocker`のpage_overview判定へOpenを持ち込まないため。
+   直後のidx比較は削除する。Selectの`LatestSeek`は既存seek／jumpと同じく新curlの対象外。
+   隣ページでもjump原因で除外し、`offer_page_turn_with_operation`は`Sequential`だけを対象にする
+   （[page-turn計画§6](page-turn-animation-plan.md#6-操作表示機能多窓)）。D3は選択先の通常flatが
+   実表示受理された後、`prefetch_next_final_unit`の既存ON／paged／non-split／入力素材資格に
+   従って次unit先読みに合流する。一覧専用policyは作らない。これは既存経路の静的な接続確認で、
+   animation／D3の実行結果を表すものではない。結果は検証担当が集約する。
+3. 以後の即時着地、`OpenPermission::Checking`後の許可・後着拒否、同期拒否は、
+   通常ページ移動と同じ既存navigation／permission ownerの責務とする。
+   一覧は結果を待たず、拒否でも再openせず、許可完了からSelectを再実行しない。
+4. 一覧専用の待機状態、追加pending、受付証明、再配送、landing結果の監視は作らない。
+   共通landingへ即時着地／既存owner受理／拒否の三値を追加する案は不採用。
+   状態の組み合わせを減らし、通常ページ移動と同じ境界へ揃えるcoordinator判断である。
+5. この判断で統合作業を再開する。既存の所有・入力照合・非active Select破棄を維持し、
+   新しい構造判断は追加しない。統合後の自動検証・独立レビュー・確認build・実機確認は未完了で、
+   以下の停止時記録や§19〜24の過去の成功を今回の成功証拠へ流用しない。
+
+### 25.2 保存した作業と未完了範囲（停止時の履歴）
+
+以下の未完了範囲・実行数は停止時点の記録。再開後の結果は検証担当が確定して追記する。
+
+17競合中のtext16ファイルはマーカーを除去したが、`ui_fullscreen.rs`のAPI合流は途中。
+masterで移動したframe準備、primary suppression引数、分割されたsecondary認識／実行と
+一覧の共通helperの接続が未完了であり、コンパイル可能とは扱わない。
+`overview_guide_snapshots.rs`など非衝突のegui 0.37追従も残る。
+root overflow PNGは未更新・未目視。git indexには17件のunmerged entryがそのまま残る。
+
+静的確認では、overviewとListOrderSnapshotのbundle分類・fork／promote／park／F12契約は
+両立し、構成の可視実items順とoverviewのreader orderは同じ列を使う。
+構成の白紙は独立セル／総数へ増えず、白紙の補助annotationは従来のNoneのまま未接続。
+入力担当はmasterのordered pad batch／operation IDと一覧batchラッチを合流し、
+回帰1件を追加したが未実行。これらは独立レビューや実行成功の代用ではない。
+
+今回の実行確認は、対象text16ファイルの競合マーカー0と`git diff --check`の成功だけ。
+fmt、通常／test-script core check、targeted nextest、全ui_snapshot、audit、glyphは未実行。
+全libとbuild-devは依頼どおりcoordinator担当。製品起動・git add／commitは行っていない。
+詳細handoffは作業領域の`target/next-tile-master-20261027-handoff.md`へ保存する。
+
+### 25.3 再開後の接続範囲（2026-10-27、検証中）
+
+**通常navigation ownerの同期停止経路（実装担当のソース調査）**:
+`poll_and_remap_book_target`が新構成のhidden／missingを検出した場合の通知、構成の
+Unreadable、paged openのremote／`grid_item_input_allowed`再判定（構造操作・画像folderの
+ZIP化・場所履歴のrating遷移・stack復帰refresh）、EPUB削除中のlease拒否通知、idx不在がある。
+独立窓のvideo拒否は一覧の可視実ページ列から到達しない。sidecar待ちとCheckingは継続であり拒否ではない。
+安定した通常読書で頻繁に拒否する経路は見つからなかった。これはソース調査の範囲の結論で、
+発生頻度の実測や実アプリ確認ではない。これらの停止でも§25.1追補のClosedを維持し、
+既存navigation ownerの通知・終了へ任せる。
+
+**master側APIとの機械的合流（親担当の実装記録）**:
+
+- `PhysicalWindowPlacement`から既存`detached_snapshot_client_size`でDPIのみを反映した
+  client sizeを導き、UI scaleで正規化する。overviewのplacement寸法参照3箇所をこの境界へ追従させる。
+  placementの新しい保存先や別の変換ownerは作らない。
+- masterのfront pointerをCentralPanelで一度captureし、その同frame入力値をprimary終端、
+  一覧、通常canvasへ渡す。overviewのright recognizerもmasterのrecognize／apply分離APIを共用する。
+  新owner、追加fallback、時間窓は設けない。
+- old-owned releaseを取り逃さない実renderer回帰を通常fullscreen／メイン内閲覧／active detachedの
+  3surfaceへ追加した。回帰は未実行であり、追加だけを成功証拠にはしない。
+
+本節は接続範囲とソース調査の記録だけで、検証結果は追記しない。統合後の結果は親担当が集約する。
+
+### 25.4 進行中のcurlと一覧入場のcoordinator判断
+
+以下の失敗再現と確認待ちの記録は、同日coordinator判断を採択する前の履歴。
+現行契約は本節末尾の採択記録を優先する。元の失敗を成功扱いにはせず、修正後の再検証を待つ。
+
+親担当が実行した`overview-r3`は113件中110 passed／3 failed。新規の受理済みpermission
+3ケース（a／b／c）、物理old-owned release、deferredのwheel／right command混在の回帰は成功した。
+これは今回の部分的な検証結果であり、全体の検証完了・独立受入・実アプリ確認を意味しない。
+
+失敗した新規回帰
+`ui_fullscreen::overview_page_turn_tests::overview_enter_during_page_turn_keeps_confirm_in_the_overview_scope`
+では、実際の受理経路で600msのcurlを開始し、overviewを開いてから
+`begin_page_turn_viewer_frame`へEnterを渡すと、一覧の確定に留まらずviewerを退出することを確認した。
+これはheadless回帰による再現で、製品起動による観測ではない。
+
+ソース調査では、操作観測によりpage-turn ownerが`Completing`／`NeedFlat`へ移る一方、
+overviewは通常flat描画を省略するため、通常flatの受入を待つbarrierが取り残され得る。
+一覧Selectを既存landingへ渡す§25.1の契約とは別に、**進行中のcurlから一覧へ入場する時点**の
+所有境界を確定する必要がある。
+
+実装担当は、次のどちらにするかをcoordinatorへ非同期で確認中。回答待ちであり、ここでは選択しない。
+
+- 進行中の完了処理を済ませてからoverviewへ入る。
+- 直ちにdeactivateし、未提示flatとcontinuationを取消してoverviewへ入る。
+
+この境界の製品コード変更は行っていない。§25.1の受理済みSelectはClosed→既存landing一回、
+結果を一覧へ戻す追加状態を持たないという採択判断は維持する。残る失敗と最終結果は親担当が集約し、
+当該runの3失敗は履歴として保持する。fixture修正後の結果は§25.5へ集約し、
+curl入場の設計再現は未解決の失敗として残す。
+
+**coordinator判断（2026-10-27、新指示の手順2採択）**:
+
+coordinatorは「受理済みの移動を保持し、追加pendingを作らない」を条件に、既存の同期的な
+保持完了処理があれば使い、無ければcurl中のO入場を受け付けない方針を確定した。
+親担当と入力担当の調査では同期完了経路は無く、既存barrierによる入場拒否を採択した。
+上の即deactivate案は、受理済み移動の保持完了を証明する経路としては採用しない。
+本記録の「case 2」は**新coordinator手順2（同期完了なし→入場拒否）**を指す。
+調査時の旧選択肢2（即退役・未提示flat／continuation取消）ではなく、その旧案は明示的に不採用とした。
+
+- `page_turn_take_continuation`はaccepted receiptのframeが現在のctx frameより前であることを要求する。
+  `SubmissionPlugin::output_hook`が描画後に出力を採用し、productionのcontinuation commitは
+  次frameの`begin_page_turn_viewer_frame`で行われる。同frameで一覧に置き換えて同期完了する入口はない。
+- rapid next／spread nudge／slideshowはcancel→`Completing`／`NeedFlat`と既存continuationを使う。
+  Esc／closeのdeactivateはviewer終了時のretirementであり、有効なflatの採用完了ではない。
+  F11／HUDもflatを採用済みにしない。Ctrl／一覧順移動は演出対象外・通常フォルダ移動の経路で、
+  ring／padも共通handlerを使うため、受理済み移動を保持した同期完了の代用にできない。
+- `page_overview_unavailable_reason`の既存availability／open受付に
+  `page_turn_barrier_active()`を接続し、`Turning`／`Completing`で新規入場を拒否する。
+  O／HUD／ring／padは`open_page_overview_for_viewer`→`open_page_overview`へ揃える。
+  完了後に利用者がもう一度操作する。flag、replay、pending、新しい取消処理は追加しない。
+- O自身の既存operation観測がcurlを通常flat完了へ進めることはあるが、入場受付はownerを取消・変更せず、
+  受理済み移動と既存continuationを保持する。操作観測と入場受付を同じ副作用とみなさない。
+
+製品変更は`app/page_overview.rs`の既存unavailable-reason gateに限定する。
+実O入力→通常flat採用→受理済みcontinuation→後のO／Enterを通す回帰を親担当が追加した。
+現行gateの指定自動検証は§25.6で成功。既存§25.1のSelect受理判断は変えず、独立受入とcoordinator担当の残工程は分けて引き継ぐ。
+
+### 25.5 追加の部分検証と画像確認（2026-10-27、検証中）
+
+以下は§25.4のcase 2 gate導入前に親担当から引き継いだ検証履歴。
+本節の「未完了」「再検証待ち」は当時の状態で、現行gateの指定自動検証成功は§25.6を参照する。
+この履歴自体を最新製品変更後の機能全体の検証完了・独立受入・実アプリ確認とは扱わない。
+
+| 確認対象 | この時点の結果と限界 |
+| --- | --- |
+| `overflow-and-f11-r4`（更新指定） | 9件中8 passed／1 failed。overflow panelの8件はすべて成功。残り1件はF11 fixtureの失敗であり、成功扱いにしない |
+| Root／RootTall／PageTurnOnの実PNG | 再生成した画像を親担当が目視確認。「本の構成を編集」が先頭、次に「ページ一覧 [O]」があり、masterのページめくりとスライドショーの行を保持 |
+| Tall fixtureの高さ | 600→614へ変更。10行×48ptの内容にはviewport高608ptが必要であり、600ptでは8ptのスクロールが正しい。fixtureを調整し、製品layoutは変更していない |
+| guideの実PNG 2枚 | 再生成後に親担当が目視確認。geometry／labelを保持し、egui 0.37由来のglyph変化を確認 |
+| `ui_snapshot`初回全件 | 203 passed、overview 8件で画像差分。8枚の候補をすべて親担当が目視し、geometry・背景・列数・RTLの保持を確認 |
+| `ui-overview-update`（更新指定） | 8 passed、8枚を再生成。コンパイルを含め143.17秒。再生成後のdark／eight columns／narrow lightの実PNGも親担当が開き、確認済み候補と同じ見え方を確認 |
+| `ui-snapshot-final` | 更新指定なしの全件比較はexit 0、211 passed／0 failed／0 ignored。コンパイルを含め87.60秒 |
+| `check-normal-final` | exit 0、107.79秒 |
+| `check-test-script-final` | exit 0、60.54秒。`--features test-script`であり、Cargo／scriptsでもfeature名を照合済み |
+| `audit-final` | tool tests 69 passed、source監査の違反0 |
+| UI glyph／fmt／差分 | 危険glyph 0、引数なし`cargo fmt`と最終`cargo fmt --check`成功、`git diff --check`成功、競合マーカー0 |
+
+通常／test-script check後のソース変更はtest-fixtureの診断だけであり、製品コードの変更はない。
+関連libの広い検証`related-lib-r6`は1372件中1370 passed／2 failed。2件は以下のfixtureを修正した。
+
+- F11回帰は固定sizeのcanvasを期待していた。診断では実際のchild 340×420／inner 326×372の
+  全域に不透明BLACKがあることを確認した。fixtureは同じpass内で実Areaの矩形を取得し、
+  設定でWHITEにした既存CentralPanel背景を独立のcanvas証拠とし、そのcanvas全域を
+  不透明BLACKが覆うことを要求する（Windowのtitle barを含むArea全体とは区別する）。
+  製品layout・描画は変更しない。
+- D3の`d3_entry_connections_and_receiver_contract`は`include_str`の最初の
+  `for event in events`を探しており、新規test fixtureのloopを拾った。製品の
+  `service_final_prepare_before_lookup`はmaster同様、event matchより前にある。
+  既存source gateの探索を`fn dispatch_gamepad_batch_with_admission`へ限定するtest-only修正とした。
+
+`related-lib-r7`は1372件中1371 passed／1 failed。D3 source gateは成功し、残った1件はF11 fixture。
+その後F11 fixtureだけを修正し、最終`overview-f11-final`はnextestの
+`/overview_real_viewer.*f11/`対象2件が2 passed／0 failed、コンパイル込み95.47秒。
+F11以外の製品コード・fixtureは変わらないためr7の他1371件の結果を再利用する。
+focused 2件には重複があるため合算せず、1372件を一度にすべて成功したrunがあるとは記録しない。
+
+最終F11 fixtureはfull rendererでPrime→ApplyのBLACKを検査する。`ctx.run_pass`内の有効なviewer入力で
+既存のplacement境界へlive fake hostを渡し、実際の`step()`でSettleへ進めてtarget geometry／placed／
+borderlessをassertする。SettleのBLACKと期限終了後のoverview復帰は再びfull rendererで検査する。
+rendererが直接呼ぶ実`IsWindow`はfake hostを無効化するため、このheadless検査ではnative placement境界を
+分けている。製品変更、新しいtest seam、Settle phaseの強制代入はない。既存deadlineの未来／過去への
+設定だけをfixtureで行う。実HWND・OSの遷移まで検証済みとは扱わない。
+
+ここまではF11 fixtureだけの変更だったため、当時の通常／test-script check、audit、全ui_snapshot 211件の
+成功結果を再利用した。その後の§25.4 case 2 gateは製品変更であり、最新の検証結果は別に確定する。
+関連libからの除外は既知の設計再現
+`overview_enter_during_page_turn_keeps_confirm_in_the_overview_scope`の1件だけ。
+この失敗は別runの`overview-r3`と§25.4の修正前履歴に保持し、除外を解消としない。
+この時点ではcoordinator判断がcase 2へ確定した段階であり、その実装・回帰と最新全体検証の成功はまだ主張していなかった。
+
+画像の目視確認を製品入力・表示の実アプリ確認へ読み替えない。上記の通常比較と限定再検証は
+当時は成功したが、curl入場gate導入後の再検証はその時点では未完了だった。最新結果は次節を参照する。
+
+### 25.6 現行gate導入後の検証記録
+
+対象の製品変更は`app/page_overview.rs`の既存`page_overview_unavailable_reason`へ加えた
+6行のbarrier gate。以下は新coordinator手順2の実装後に親担当が確定した結果で、§25.5以前の履歴と区別する。
+
+| 確認対象 | 現行gateに対する結果 |
+| --- | --- |
+| 新規overview O回帰（r3） | 2 passed／0 failed、コンパイル込み88.79秒。`overview_o_during_curl_waits_for_normal_flat_before_fresh_o_and_confirm`と`overview_o_preserves_accepted_navigation_until_flat_and_continuation_land` |
+| 通常core check | exit 0、87.15秒 |
+| test-script core check | exit 0、84.49秒 |
+| audit | tool tests 69 passed、source監査違反0、82.36秒 |
+| UI snapshot全件 | 211 passed／0 failed／0 ignored、コンパイル込み135.37秒・テスト実行30.65秒。前回再生成したPNG 13枚は変更せず、通常比較で成功。追加再生成なし |
+| UI glyph | 危険glyph 0 |
+| 整形 | 引数なし`cargo fmt`実行済み。最終`cargo fmt --check`はexit 0 |
+| `related-lib-curl-final` | exit 0、1374 run／1374 passed／0 failed。指定範囲外のfilter-skipped 13,210件、特定testの除外なし。wall 88.25秒・テスト実行86.257秒 |
+
+新規O回帰のr1／r2の失敗はfixtureによるものだった。メイン内閲覧のfixtureで
+`settings.video_in_window_mode`が表示先と揃っていなかったことと、continuation先のtarget 2を描く際に
+通常経路の`emit_fs_page_turn_ready_for_display_unit`を呼ばずnavigation lockを残してEnterを送ったことを
+修正した。製品のbarrier gateはこの修正の間も変更していない。
+
+旧`overview-r3`の失敗を過去の成功へ書き換えず、現行仕様のO拒否→通常flat採用→受理済みcontinuation→
+後の新しいO／Enterを検査する。これらを含む関連1374件は同じ最終runで成功し、
+以前の特定再現の除外は最終runに残していない。今回指定された衝突解消・自動検証は完了、未merge。
+独立レビュー・full-lib・build-dev・実機確認はcoordinatorへ引き継ぐ。full-libとbuild-devは
+利用者の指示により今回の実行範囲から除外し、製品バイナリの起動も行っていない。
+指定範囲の自動検証完了をこれらの受入まで完了したとは扱わない。

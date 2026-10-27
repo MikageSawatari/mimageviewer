@@ -90,7 +90,7 @@ impl App {
     /// 見開き表示中に呼ばれた場合は spread_mode を一時的に Single へ落とし
     /// (消しゴムと同じ振る舞い、`conceal_spread_ctx` に元状態を保存)、
     /// `reset_conceal_mode` で復元する。
-    pub(crate) fn enter_conceal_mode(&mut self, fs_idx: usize) {
+    pub(crate) fn enter_conceal_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
@@ -102,6 +102,24 @@ impl App {
             crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
             crate::ui_fullscreen::SpreadPair::Single => fs_idx,
         };
+        self.cancel_original_material_entry_intents(None);
+        // A current edit-chain result is already the correct conceal input.
+        // Only hydrate the original when neither that result nor the input for
+        // the preceding local-adjustment stage is available.
+        if self.current_conceal_source_pixels(target_idx).is_none()
+            && self
+                .current_local_adjust_source_pixels(target_idx)
+                .is_none()
+            && !self.ensure_erase_stage_for_entry(
+                ctx,
+                target_idx,
+                crate::app::OriginalMaterialEntry::Conceal {
+                    requested_fs_idx: fs_idx,
+                },
+            )
+        {
+            return;
+        }
         if self.local_adjust_pages.contains(&target_idx)
             && !self.local_adjust_page_layers.contains_key(&target_idx)
             || self.has_active_local_adjust_layers(target_idx)
@@ -242,6 +260,7 @@ impl App {
     /// 空マスク経路に揃える)。表示パイプライン側の `conceal_cache` は次回の
     /// composite で自然に再生成されるため、ここでは触らない。
     pub(crate) fn reset_conceal_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         let restore_idx = self.fullscreen_idx;
         let was_conceal_mode = self.conceal_mode;
 
@@ -301,24 +320,59 @@ impl App {
 
     /// 見開き隠蔽加工中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
     /// 現ページのマスクを保存してから単ページ状態のままもう一方へ入り直す。
-    pub(crate) fn switch_conceal_target_in_spread(&mut self, new_idx: usize) {
+    pub(crate) fn switch_conceal_target_in_spread(&mut self, ctx: &egui::Context, new_idx: usize) {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
+        let Some(request) = self.page_edit_target_switch_request(
+            crate::app::PageEditTargetSwitchTool::Conceal,
+            new_idx,
+        ) else {
+            return;
+        };
+        self.cancel_original_material_entry_intents(None);
+        if self.current_conceal_source_pixels(new_idx).is_none()
+            && !self.ensure_erase_stage_for_entry(
+                ctx,
+                new_idx,
+                crate::app::OriginalMaterialEntry::Switch { request },
+            )
+        {
+            return;
+        }
+        self.maybe_start_conceal_materialize(
+            new_idx,
+            crate::app::ConcealMaterializePurpose::Switch { request },
+        );
+    }
+
+    pub(crate) fn complete_conceal_target_switch(
+        &mut self,
+        request: crate::app::PageEditTargetSwitchRequest,
+        pixels: Arc<egui::ColorImage>,
+        source_kind: &'static str,
+        mask: Vec<bool>,
+        shapes: Vec<crate::mask_db::Shape>,
+    ) -> bool {
+        if !self.page_edit_target_switch_is_current(request)
+            || !self.raw_edit_target_entry_allowed(request.target_idx)
+        {
+            return false;
+        }
         self.finish_conceal_edit_for_current("switch_save");
-        // 次ページの DB mask が worker から戻るまでは、前ページの in-memory mask を
-        // 新ページへ重ねず lower layer を表示する。
+        // Both source and saved target mask are ready: commit the old editor and
+        // install the new editor in the same pass.
         self.conceal_mode = false;
         self.conceal_preview_active = false;
         self.conceal_mask = None;
         self.conceal_mask_size = [0, 0];
         self.conceal_mask_texture = None;
         self.conceal_shapes.clear();
-        self.enter_page_edit_single_view(new_idx);
-        self.enter_conceal_mode(new_idx);
+        self.enter_page_edit_single_view(request.target_idx);
+        self.complete_conceal_mode_entry(request.target_idx, pixels, source_kind, mask, shapes)
     }
 
     // ── Undo ────────────────────────────────────────────────────────
@@ -383,6 +437,9 @@ impl App {
         let Some(current) = self.current_conceal_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(prev) = self.conceal_undo_stack.pop_back() else {
             return false;
         };
@@ -399,6 +456,9 @@ impl App {
         let Some(current) = self.current_conceal_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(next) = self.conceal_redo_stack.pop_back() else {
             return false;
         };
@@ -413,6 +473,12 @@ impl App {
     /// 現在のマスク (ビットマップ + Shape) をスロットに保存する。
     /// スロット番号は 1 か 2 (`conceal_db::slot_key` 経由で `__slot_N` キーへ)。
     pub(crate) fn save_conceal_mask_to_slot(&mut self, slot: usize) {
+        if self.conceal_mask.is_some()
+            && self.conceal_db.is_some()
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         let [w, h] = self.conceal_mask_size;
         let saved = if let (Some(mask), Some(db)) = (&self.conceal_mask, &self.conceal_db) {
             db.set_slot(slot, mask, &self.conceal_shapes, w, h).is_ok()
@@ -422,7 +488,7 @@ impl App {
         if saved {
             self.show_feedback_toast(format!("[隠蔽スロット{}に保存]", slot));
         } else {
-            self.show_feedback_toast(format!("[隠蔽スロット{}保存失敗]", slot));
+            self.show_feedback_error(format!("[隠蔽スロット{}保存失敗]", slot));
         }
     }
 
@@ -435,11 +501,14 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((slot_mask, slot_shapes)) = slot_data else {
-            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[隠蔽スロット{}は空です]", slot));
             return;
         };
         if !slot_mask.iter().any(|&m| m) && slot_shapes.is_empty() {
-            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[隠蔽スロット{}は空です]", slot));
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.push_conceal_undo();
@@ -462,6 +531,9 @@ impl App {
     pub(crate) fn delete_all_conceal_mask(&mut self) {
         let [w, h] = self.conceal_mask_size;
         if w == 0 || h == 0 {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.push_conceal_undo();
@@ -493,7 +565,7 @@ impl App {
     /// bump して全 idx を stale 扱いにする (次回 compose で再生成)。
     pub(crate) fn apply_conceal_preset(&mut self, slot: usize) {
         let Some(preset) = self.settings.conceal_presets.get(slot).cloned().flatten() else {
-            self.show_feedback_toast(format!("[プリセット{}は空]", slot + 1));
+            self.show_feedback_warning(format!("[プリセット{}は空]", slot + 1));
             return;
         };
         self.settings.conceal_type = preset.conceal_type;
@@ -548,12 +620,16 @@ impl App {
         ctx: &egui::Context,
         _fs_idx: usize,
     ) -> FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = FsKeyAction {
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
@@ -622,23 +698,25 @@ impl App {
             if self.redo_conceal() {
                 self.show_feedback_toast("[やり直す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
         // Ctrl+Z: Undo
         let ctrl_z = self.keymap.consume_action(ctx, KeyAction::ConcealUndo);
         if ctrl_z {
-            if self.conceal_tool == ConcealTool::Polygon
-                && self.conceal_lasso_points.pop().is_some()
-            {
+            if self.conceal_tool == ConcealTool::Polygon && !self.conceal_lasso_points.is_empty() {
+                if !self.admit_book_append_followup_mutation() {
+                    return action;
+                }
+                self.conceal_lasso_points.pop();
                 self.show_feedback_toast("[頂点を戻す]".to_string());
                 return action;
             }
             if self.undo_conceal() {
                 self.show_feedback_toast("[元に戻す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -650,6 +728,9 @@ impl App {
             && let Some(idx) = self.conceal_selected_shape
             && idx < self.conceal_shapes.len()
         {
+            if !self.admit_book_append_followup_mutation() {
+                return action;
+            }
             self.push_conceal_undo();
             self.conceal_shapes.remove(idx);
             self.conceal_selected_shape = None;
@@ -835,6 +916,12 @@ impl App {
     /// 矢印キー / Ctrl+矢印キーでマスクをシフトする。
     /// 選択中の Shape があればそれだけ、無ければビットマップ + 全 Shape を動かす。
     fn nudge_conceal(&mut self, dx: f32, dy: f32) {
+        if (dx == 0.0 && dy == 0.0) || self.conceal_shapes.is_empty() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_conceal_undo_throttled();
         match self.conceal_selected_shape {
             Some(idx) if idx < self.conceal_shapes.len() => {
@@ -900,6 +987,10 @@ impl App {
     // ── ビットマップ塗り (Brush / Lasso 用) ────────────────────────────
 
     fn paint_brush_line_conceal(&mut self, from: (f32, f32), to: (f32, f32), paint: bool) {
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
         let radius = self.settings.conceal_brush_radius.max(1.0);
         let [w, h] = self.conceal_mask_size;
         let Some(mask) = self.conceal_mask.as_mut() else {
@@ -908,6 +999,8 @@ impl App {
         let dirty = crate::mask_db::brush_line_bbox(w, h, from, to, radius)
             .and_then(|(x0, y0, x1, y1)| MaskDirtyRect::new(x0, y0, x1, y1));
         if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
+            // This call cannot reenter receipt publication before the boundary.
+            self.invalidate_book_append_undo();
             self.mark_conceal_mask_texture_dirty(dirty);
             // brush もマスクを変えるので conceal_cache 失効が必要 (= preview 時に
             // 最新マスクで再合成される、commit_conceal_shape と同じ理由)。
@@ -919,6 +1012,12 @@ impl App {
 
     fn paint_polygon_conceal(&mut self, points: &[(f32, f32)], paint: bool) {
         let [w, h] = self.conceal_mask_size;
+        if points.len() < 3 || w == 0 || h == 0 || self.conceal_mask.is_none() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let Some(mask) = self.conceal_mask.as_mut() else {
             return;
         };
@@ -941,6 +1040,9 @@ impl App {
             return;
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_conceal_undo();
         self.conceal_mask = Some(next);
         self.mark_conceal_mask_texture_dirty(None);
@@ -965,7 +1067,7 @@ impl App {
         seed_y: usize,
     ) {
         let Some((source, _)) = self.current_conceal_source_pixels(fs_idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う加工前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -973,14 +1075,14 @@ impl App {
         };
         let [w, h] = self.conceal_mask_size;
         if source.size != [w, h] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
             return;
         }
         let Some(mask) = self.conceal_mask.as_ref() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使うマスクを準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1005,7 +1107,7 @@ impl App {
         match outcome {
             crate::mask_db::BucketFillOutcome::Filled => {}
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
                 return;
@@ -1015,7 +1117,7 @@ impl App {
                 if let Some(message) =
                     crate::ui_helpers::bucket_shape_fit_failed_message(self.conceal_bucket_region)
                 {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
                 return;
             }
@@ -1023,6 +1125,9 @@ impl App {
             | crate::mask_db::BucketFillOutcome::Invalid => return,
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_conceal_undo();
         self.conceal_mask = Some(next);
         self.mark_conceal_mask_texture_dirty(None);
@@ -1220,15 +1325,25 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
         if self.fs_primary_suppression.is_active() {
             return;
         }
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
-        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| i.pointer.primary_released());
-        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed())
+        let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
+        let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
+        let primary_released = ctx.input(|i| {
+            primary_allowed
+                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                && i.pointer.primary_released()
+        });
+        let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
             && self
                 .settings
                 .ring_shortcuts
@@ -1273,6 +1388,13 @@ impl App {
             return;
         }
 
+        if self.book_append_undo_in_progress() {
+            if primary_down || primary_pressed || primary_released || secondary_pressed {
+                self.admit_book_append_followup_mutation();
+            }
+            return;
+        }
+
         // ⚠ 旧版は「Select 以外のツール開始時に選択を解除」していたが、これだと
         // `commit_conceal_shape` で自動選択した直後のフレームで選択が消されて
         // 「ハンドルが一瞬だけ出る」現象になっていた (Codex P1 / 実機 FB R3)。
@@ -1296,7 +1418,7 @@ impl App {
                         img_pos.1.floor() as usize,
                     );
                 } else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "バケツの対象画像を確認できません。画像を開き直してからもう一度クリックしてください。"
                             .to_string(),
                     );
@@ -1413,6 +1535,11 @@ impl App {
                 let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
                 let drag_idx = drag.idx();
                 if drag_idx < self.conceal_shapes.len() {
+                    if self.conceal_shapes[drag_idx] != new_shape
+                        && !self.admit_book_append_followup_mutation()
+                    {
+                        return true;
+                    }
                     self.conceal_shapes[drag_idx] = new_shape;
                 }
                 // R5: ドラッグ中もマスク overlay + 隠蔽テクスチャを毎フレ再生成。
@@ -1513,6 +1640,11 @@ impl App {
         if let Some(drag) = self.conceal_drag {
             let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
             if drag.idx() < self.conceal_shapes.len() {
+                if self.conceal_shapes[drag.idx()] != new_shape
+                    && !self.admit_book_append_followup_mutation()
+                {
+                    return;
+                }
                 self.conceal_shapes[drag.idx()] = new_shape;
                 // R5: ドラッグ中もマスク overlay + 隠蔽合成キャッシュを毎フレ更新する
                 // (実機 FB: 「ハンドルのドラッグでも楕円は再描画されません」)。
@@ -1576,10 +1708,13 @@ impl App {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
                     // サンプリング間引き (~2px 離れたら追加)
-                    crate::manual_mask_tools::push_freehand_point(
+                    let changed = crate::manual_mask_tools::push_freehand_point(
                         &mut self.conceal_lasso_points,
                         img_pos,
                     );
+                    if changed {
+                        self.invalidate_book_append_undo();
+                    }
                 }
             }
         }
@@ -1637,11 +1772,14 @@ impl App {
                 self.show_feedback_toast("[多角形を確定]".to_string());
             }
         } else {
-            crate::manual_mask_tools::push_polygon_vertex(
+            let changed = crate::manual_mask_tools::push_polygon_vertex(
                 &mut self.conceal_lasso_points,
                 img_pos,
                 scale,
             );
+            if changed {
+                self.invalidate_book_append_undo();
+            }
         }
     }
 
@@ -1658,6 +1796,11 @@ impl App {
         if primary_down {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
+                    if self.conceal_line_start.is_none() || self.conceal_line_end != Some(img_pos) {
+                        if !self.admit_book_append_followup_mutation() {
+                            return;
+                        }
+                    }
                     if self.conceal_line_start.is_none() {
                         self.conceal_line_start = Some(img_pos);
                     }
@@ -1725,6 +1868,13 @@ impl App {
         if primary_down {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
+                    if self.conceal_shape_drag_start.is_none()
+                        || self.conceal_shape_drag_end != Some(img_pos)
+                    {
+                        if !self.admit_book_append_followup_mutation() {
+                            return;
+                        }
+                    }
                     if self.conceal_shape_drag_start.is_none() {
                         self.conceal_shape_drag_start = Some(img_pos);
                     }
@@ -1775,6 +1925,9 @@ impl App {
     /// 消去モードの矩形/楕円/線は既存 Shape を丸ごと削除せず、上から削る
     /// ベクターオブジェクトとして残る。
     fn commit_conceal_shape(&mut self, shape: Shape, paint: bool) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let op = if paint {
             ShapeOp::Add
         } else {
@@ -1819,12 +1972,23 @@ impl App {
         viewport_id: egui::ViewportId,
     ) {
         let (pointer_pos, primary_down) = conceal_preview_pointer_state(ctx, viewport_id);
+        // This pipeline read precedes the target viewport's per-pass input capture. A held
+        // press already has its canonical owner from the previous pass; do not reinterpret
+        // that overflow press as an eye-button hold after entering conceal mode by key.
+        let primary_down = primary_down && !self.fs_front_pointer.owns_primary_in(viewport_id);
         self.conceal_preview_active = conceal_preview_pointer_active(
             self.conceal_mode,
             self.conceal_preview_button_rect,
             pointer_pos,
             primary_down,
         );
+        #[cfg(test)]
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("conceal_pipeline_preview_test_active"),
+                self.conceal_preview_active,
+            )
+        });
     }
 
     /// マスクオーバーレイ + ハンドル + ツールプレビュー + パネルを描画する。
@@ -2097,15 +2261,16 @@ impl App {
         let sink_rect =
             egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, panel_h + 8.0));
 
-        egui::Area::new(egui::Id::new("conceal_panel"))
+        egui::Area::new(egui::Id::unique("conceal_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() { ui.disable(); }
                 // 1. sink を widget より前に登録 (egui の hit test 後勝ちルール対策)
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("conceal_panel_click_sink"),
+                    egui::Id::unique("conceal_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 // 2. Frame::popup で背景 + 内容を描く (auto-size、clipping なし)
@@ -2217,7 +2382,7 @@ impl App {
                                 ui.set_min_width(PANEL_W);
                                 ui.set_max_width(PANEL_W);
                                 ui.set_min_height(body_height);
-                                egui::ScrollArea::vertical()
+                                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
@@ -2907,7 +3072,7 @@ impl App {
                 // は後勝ち) で widget が click を受け取れなくなる。
             });
         if let Some(target) = switch_to {
-            self.switch_conceal_target_in_spread(target);
+            self.switch_conceal_target_in_spread(ctx, target);
         }
         if should_close_after_draw {
             self.reset_conceal_mode();
@@ -2969,6 +3134,46 @@ mod tests {
         conceal_preview_pointer_state,
     };
     use crate::mask_db::{Shape, ShapeOp};
+
+    #[test]
+    fn section1373_conceal_draft_changes_invalidate_but_noop_and_history_capture_do_not() {
+        let mut app = crate::app::setup_app_for_test();
+        app.conceal_mask_size = [4, 4];
+        app.conceal_mask = Some(vec![false; 16]);
+        app.settings.conceal_brush_radius = 1.0;
+        let before = app.book_append_undo_revision;
+        app.push_conceal_undo();
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line_conceal((1.0, 1.0), (1.0, 1.0), false);
+        app.apply_conceal_bitmap_morph_1px(false);
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line_conceal((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+        assert!(
+            app.conceal_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|value| *value)
+        );
+        app.paint_brush_line_conceal((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+    }
+
+    #[test]
+    fn section1373_conceal_bitmap_only_nudge_remains_a_noop_without_revision_change() {
+        let mut app = crate::app::setup_app_for_test();
+        app.conceal_mask_size = [2, 2];
+        app.conceal_mask = Some(vec![true, false, false, false]);
+        app.conceal_shapes.clear();
+        let before = app.book_append_undo_revision;
+        app.nudge_conceal(1.0, 0.0);
+        assert_eq!(
+            app.conceal_mask.as_deref(),
+            Some([true, false, false, false].as_slice())
+        );
+        assert_eq!(app.book_append_undo_revision, before);
+    }
 
     fn conceal_test_shape(revision: usize) -> Shape {
         Shape::Rect {
@@ -3110,7 +3315,7 @@ mod tests {
             ],
             ..Default::default()
         });
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(
             conceal_preview_pointer_state(&ctx, fullscreen_id),

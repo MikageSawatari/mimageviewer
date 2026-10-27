@@ -17,6 +17,9 @@ use crate::{
     displayed_image_transform::{
         VisibleRegionRequest, physical_pixel_extent, physical_scale_is_near_integer,
     },
+    material_display_basis::MaterialDisplayBasis,
+    page_dims::DisplayOriginalDimensions,
+    source_coverage::SourceCoverage,
 };
 use crate::{
     gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler, STILL_IMAGE_ANIME4K_VARIANT},
@@ -140,7 +143,7 @@ impl egui_wgpu::CallbackTrait for FullscreenPaintBatchLifetime {
     }
 }
 
-fn retain_owner_for_fullscreen_paint_batch<T>(painter: &egui::Painter, owner: Arc<T>)
+pub(crate) fn retain_owner_for_fullscreen_paint_batch<T>(painter: &egui::Painter, owner: Arc<T>)
 where
     T: Send + Sync + 'static,
 {
@@ -153,7 +156,67 @@ where
     ));
 }
 
-/// One typed resource shared by live, continuous, holdover, and detached routes.
+/// A partial preview's rounded sampler dimensions carry sampling density, not
+/// the 100% display basis. Preserve the producer's uncropped normal raster;
+/// canonical annotation coordinates may be larger than the GPU-clamped raster.
+fn original_display_dimensions(
+    size: [usize; 2],
+    coverage: SourceCoverage,
+) -> DisplayOriginalDimensions {
+    if coverage.is_partial() {
+        coverage.uncropped_raster_dimensions().unwrap()
+    } else {
+        DisplayOriginalDimensions::new(size[0] as u32, size[1] as u32)
+    }
+}
+
+/// Geometry requests are expressed in full-source coordinates, whereas a
+/// native resampler reads the immutable sampler allocation. Quantize only
+/// after intersecting with the actual material, using that material's texels.
+fn sampler_visible_region(
+    coverage: SourceCoverage,
+    request: Option<VisibleRegionRequest>,
+) -> Option<VisibleRegionRequest> {
+    let request = request?;
+    let coverage = coverage.source_uv_rect()?;
+    if coverage == egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)) {
+        return Some(request);
+    }
+    let intersection = coverage.intersect(request.source_uv_rect);
+    if !intersection.is_finite() || intersection.width() <= 0.0 || intersection.height() <= 0.0 {
+        return None;
+    }
+    let source_uv_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            (intersection.min.x - coverage.min.x) / coverage.width(),
+            (intersection.min.y - coverage.min.y) / coverage.height(),
+        ),
+        egui::pos2(
+            (intersection.max.x - coverage.min.x) / coverage.width(),
+            (intersection.max.y - coverage.min.y) / coverage.height(),
+        ),
+    );
+    let target_size = if intersection == request.source_uv_rect {
+        request.target_size
+    } else {
+        // Compatibility for callers without the coverage-aware geometry
+        // request. Ordinary paint prepares the already intersected pair.
+        [
+            (request.target_size[0] as f32 * intersection.width() / request.source_uv_rect.width())
+                .round()
+                .max(1.0) as u32,
+            (request.target_size[1] as f32 * intersection.height()
+                / request.source_uv_rect.height())
+            .round()
+            .max(1.0) as u32,
+        ]
+    };
+    Some(VisibleRegionRequest {
+        source_uv_rect,
+        target_size,
+    })
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TestPaintProvenance {
@@ -167,6 +230,8 @@ pub(crate) struct TestPaintProvenance {
 pub(crate) enum FullscreenPaintResource {
     Direct {
         source: egui::TextureHandle,
+        coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -176,6 +241,8 @@ pub(crate) enum FullscreenPaintResource {
         source_id: FullscreenPaintSourceId,
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
+        coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -187,6 +254,8 @@ pub(crate) enum FullscreenPaintResource {
         generation: FullscreenPaintSourceGeneration,
         smoothing_percent: u32,
         output: Arc<LanczosOutput>,
+        coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -195,9 +264,51 @@ pub(crate) enum FullscreenPaintResource {
 }
 
 impl FullscreenPaintResource {
+    /// Capture the allocation actually painted, without retaining a native output's input.
+    /// Display sources are immutable allocations: their sampling options do not
+    /// change after load. epaint 0.33 metadata records those initial options.
+    pub(crate) fn capture_presentation(
+        &self,
+        ctx: &egui::Context,
+    ) -> FullscreenPresentationResource {
+        let material = match self.lanczos_output() {
+            Some(output) => PresentationMaterial::Native(Arc::clone(output)),
+            None => {
+                let handle = self.source_texture().clone();
+                let actual_options = ctx
+                    .tex_manager()
+                    .read()
+                    .meta(handle.id())
+                    .expect("a live managed presentation texture has metadata")
+                    .options;
+                PresentationMaterial::Managed {
+                    handle,
+                    actual_options,
+                }
+            }
+        };
+        FullscreenPresentationResource {
+            source_texture_id: self.source_texture_id(),
+            logical_size: self.size(),
+            source_id: self.source_id(),
+            generation: self.source_generation(),
+            material,
+            coverage: self.source_coverage(),
+            display_basis: self.display_basis(),
+            #[cfg(test)]
+            test_paint_provenance: self.test_paint_provenance().cloned(),
+            #[cfg(all(windows, feature = "test-script"))]
+            test_script_content_proof: self.test_script_content_proof().cloned(),
+        }
+    }
+
     pub(crate) fn direct(source: egui::TextureHandle) -> Self {
+        let display_basis =
+            MaterialDisplayBasis::from_sampler(source.size(), SourceCoverage::FullSource);
         Self::Direct {
             source,
+            coverage: SourceCoverage::FullSource,
+            display_basis,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
@@ -230,10 +341,14 @@ impl FullscreenPaintResource {
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
     ) -> Self {
+        let display_basis =
+            MaterialDisplayBasis::from_sampler(source.size(), SourceCoverage::FullSource);
         Self::Resampleable {
             source_id,
             source,
             generation,
+            coverage: SourceCoverage::FullSource,
+            display_basis,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
@@ -246,6 +361,136 @@ impl FullscreenPaintResource {
             Self::Direct { source, .. }
             | Self::Resampleable { source, .. }
             | Self::Lanczos { source, .. } => source,
+        }
+    }
+
+    pub(crate) fn source_coverage(&self) -> SourceCoverage {
+        match self {
+            Self::Direct { coverage, .. }
+            | Self::Resampleable { coverage, .. }
+            | Self::Lanczos { coverage, .. } => *coverage,
+        }
+    }
+
+    /// Coverage is sampling metadata; changing it never re-resolves accepted fit values.
+    /// Initial partial-material acceptance supplies its basis with `with_display_basis`.
+    pub(crate) fn with_source_coverage(mut self, value: SourceCoverage) -> Self {
+        match &mut self {
+            Self::Direct { coverage, .. }
+            | Self::Resampleable { coverage, .. }
+            | Self::Lanczos { coverage, .. } => *coverage = value,
+        }
+        self
+    }
+
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        match self {
+            Self::Direct { display_basis, .. }
+            | Self::Resampleable { display_basis, .. }
+            | Self::Lanczos { display_basis, .. } => *display_basis,
+        }
+    }
+
+    pub(crate) fn with_display_basis(mut self, value: MaterialDisplayBasis) -> Self {
+        match &mut self {
+            Self::Direct { display_basis, .. }
+            | Self::Resampleable { display_basis, .. }
+            | Self::Lanczos { display_basis, .. } => *display_basis = value,
+        }
+        self
+    }
+
+    /// Full-image display basis, independent of a partial sampler's rounded
+    /// dimensions and canonical annotation coordinates. PDF layout and RAW
+    /// display policies remain separate inputs at their existing owners.
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
+    pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
+        self.original_display_dimensions().as_vec2()
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
+    }
+
+    pub(crate) fn paint_geometry(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            geometry.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_source_region(
+        &self,
+        painter: &egui::Painter,
+        full_image_rect: egui::Rect,
+        rotation: crate::rotation_db::Rotation,
+        free_rotation_rad: f32,
+        requested_source_rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            crate::displayed_image_transform::paint_source_coverage_texture(
+                painter,
+                self.paint_texture_id(),
+                full_image_rect,
+                rotation,
+                free_rotation_rad,
+                coverage,
+                requested_source_rect,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    pub(crate) fn paint_texture(
+        &self,
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            transform.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
         }
     }
 
@@ -302,6 +547,15 @@ impl FullscreenPaintResource {
         match self {
             Self::Resampleable { source_id, .. } | Self::Lanczos { source_id, .. } => {
                 Some(*source_id)
+            }
+            Self::Direct { .. } => None,
+        }
+    }
+
+    pub(crate) fn source_generation(&self) -> Option<FullscreenPaintSourceGeneration> {
+        match self {
+            Self::Resampleable { generation, .. } | Self::Lanczos { generation, .. } => {
+                Some(*generation)
             }
             Self::Direct { .. } => None,
         }
@@ -419,7 +673,9 @@ impl FullscreenPaintResource {
                 ..
             } => {
                 let original =
-                    Self::resampleable_for_source(*source_id, source.clone(), *generation);
+                    Self::resampleable_for_source(*source_id, source.clone(), *generation)
+                        .with_source_coverage(self.source_coverage())
+                        .with_display_basis(self.display_basis());
                 #[cfg(test)]
                 let original = if let Some(proof) = self.test_paint_provenance().cloned() {
                     original.with_test_paint_provenance(proof)
@@ -444,6 +700,8 @@ impl FullscreenPaintResource {
             generation,
             smoothing_percent,
             output,
+            coverage: self.source_coverage(),
+            display_basis: self.display_basis(),
             #[cfg(test)]
             test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
@@ -452,8 +710,634 @@ impl FullscreenPaintResource {
     }
 }
 
+/// Headless fixture using the product resource/output lease graph without a GPU allocation.
+#[cfg(test)]
+pub(crate) fn test_native_resource(
+    source: FullscreenPaintResource,
+    output_size: [u32; 2],
+) -> FullscreenPaintResource {
+    test_native_resource_for_region(source, output_size, LanczosSourceRegionKey::Full)
+}
+
+#[cfg(test)]
+pub(crate) fn test_native_resource_with_region(
+    source: FullscreenPaintResource,
+    output_size: [u32; 2],
+    region: egui::Rect,
+) -> FullscreenPaintResource {
+    test_native_resource_for_region(
+        source,
+        output_size,
+        LanczosSourceRegionKey::from_visible_rect(region),
+    )
+}
+
+#[cfg(test)]
+fn test_native_resource_for_region(
+    source: FullscreenPaintResource,
+    output_size: [u32; 2],
+    source_region: LanczosSourceRegionKey,
+) -> FullscreenPaintResource {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEST_NATIVE_ID: AtomicU64 = AtomicU64::new(1 << 48);
+    struct TestReleaser;
+    impl NativeTextureIdReleaser for TestReleaser {
+        fn free_texture(&self, _texture_id: egui::TextureId) {}
+    }
+    let (source_id, texture, generation) = source.resampleable_parts().unwrap();
+    let key = LanczosCacheKey {
+        source_id,
+        source_texture_id: texture.id(),
+        generation,
+        target_size: output_size,
+        smoothing_percent: 0,
+        scale_branch: if source_region == LanczosSourceRegionKey::Full {
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        } else {
+            FullscreenPaintScaleBranch::UpscaleLanczos
+        },
+        source_region,
+    };
+    source.with_lanczos(
+        Arc::new(LanczosOutput {
+            texture_id_lease: NativeTextureIdLease {
+                texture_id: egui::TextureId::User(
+                    NEXT_TEST_NATIVE_ID.fetch_add(1, Ordering::Relaxed),
+                ),
+                releaser: Arc::new(TestReleaser),
+            },
+            key,
+            _texture: None,
+        }),
+        0,
+    )
+}
+
+/// A presentation owns its paint allocation; source identity and dimensions are values only.
+#[derive(Clone)]
+pub(crate) struct FullscreenPresentationResource {
+    source_texture_id: egui::TextureId,
+    logical_size: [usize; 2],
+    source_id: Option<FullscreenPaintSourceId>,
+    generation: Option<FullscreenPaintSourceGeneration>,
+    material: PresentationMaterial,
+    coverage: SourceCoverage,
+    display_basis: MaterialDisplayBasis,
+    #[cfg(test)]
+    test_paint_provenance: Option<TestPaintProvenance>,
+    #[cfg(all(windows, feature = "test-script"))]
+    test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
+}
+
+#[derive(Clone)]
+enum PresentationMaterial {
+    Native(Arc<LanczosOutput>),
+    Managed {
+        handle: egui::TextureHandle,
+        // Preserve the real sampler, including its mip policy, rather than assuming display defaults.
+        actual_options: egui::TextureOptions,
+    },
+}
+
+impl FullscreenPresentationResource {
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        self.display_basis
+    }
+
+    pub(crate) fn source_coverage(&self) -> SourceCoverage {
+        self.coverage
+    }
+
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
+    pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
+        self.original_display_dimensions().as_vec2()
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
+    }
+
+    pub(crate) fn paint_geometry(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            geometry.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_source_region(
+        &self,
+        painter: &egui::Painter,
+        full_image_rect: egui::Rect,
+        rotation: crate::rotation_db::Rotation,
+        free_rotation_rad: f32,
+        requested_source_rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            crate::displayed_image_transform::paint_source_coverage_texture(
+                painter,
+                self.paint_texture_id(),
+                full_image_rect,
+                rotation,
+                free_rotation_rad,
+                coverage,
+                requested_source_rect,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    pub(crate) fn paint_texture(
+        &self,
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.coverage.source_uv_rect() {
+            transform.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+    /// Reuse only the native allocation ordinary preparation would request for
+    /// this held source. A newly published source is deliberately not an input.
+    pub(crate) fn matches_prepare(
+        &self,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_region: Option<VisibleRegionRequest>,
+        post_filter: PostFilter,
+        smoothing_percent: u32,
+        anime_source_limit: AnimeUpscaleSourceLimit,
+    ) -> bool {
+        let PresentationMaterial::Native(output) = &self.material else {
+            return false;
+        };
+        let (Some(source_id), Some(generation)) = (self.source_id, self.generation) else {
+            return false;
+        };
+        let Some(key) = requested_covered_lanczos_key(
+            source_id,
+            self.source_texture_id,
+            generation,
+            [self.logical_size[0] as u32, self.logical_size[1] as u32],
+            logical_scale,
+            pixels_per_point,
+            visible_region,
+            self.coverage,
+            post_filter,
+            smoothing_percent,
+            anime_source_limit,
+        ) else {
+            return false;
+        };
+        lanczos_target_decision(key.scale_branch, key.target_size)
+            == LanczosTargetDecision::Resample
+            && output.key == key
+    }
+
+    pub(crate) fn source_texture(&self) -> Option<&egui::TextureHandle> {
+        match &self.material {
+            PresentationMaterial::Native(_) => None,
+            PresentationMaterial::Managed { handle, .. } => Some(handle),
+        }
+    }
+
+    pub(crate) fn size(&self) -> [usize; 2] {
+        self.logical_size
+    }
+
+    pub(crate) fn size_vec2(&self) -> egui::Vec2 {
+        egui::vec2(self.logical_size[0] as f32, self.logical_size[1] as f32)
+    }
+
+    pub(crate) fn source_texture_id(&self) -> egui::TextureId {
+        self.source_texture_id
+    }
+
+    pub(crate) fn paint_texture_id(&self) -> egui::TextureId {
+        match &self.material {
+            PresentationMaterial::Native(output) => output.texture_id(),
+            PresentationMaterial::Managed { handle, .. } => handle.id(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    pub(crate) fn source_id(&self) -> Option<FullscreenPaintSourceId> {
+        self.source_id
+    }
+
+    pub(crate) fn source_generation(&self) -> Option<FullscreenPaintSourceGeneration> {
+        self.generation
+    }
+
+    pub(crate) fn page_idx(&self) -> Option<usize> {
+        match self.source_id? {
+            FullscreenPaintSourceId::Page(page) => Some(page),
+            FullscreenPaintSourceId::SimilarPreview(_) => None,
+        }
+    }
+
+    pub(crate) fn lanczos_output(&self) -> Option<&Arc<LanczosOutput>> {
+        match &self.material {
+            PresentationMaterial::Native(output) => Some(output),
+            PresentationMaterial::Managed { .. } => None,
+        }
+    }
+
+    pub(crate) fn visible_source_uv_rect(&self) -> Option<egui::Rect> {
+        self.lanczos_output()
+            .and_then(|output| output.visible_source_uv_rect())
+    }
+
+    pub(crate) fn retain_native_output_for_paint(&self, painter: &egui::Painter) {
+        if let Some(output) = self.lanczos_output() {
+            retain_owner_for_fullscreen_paint_batch(painter, Arc::clone(output));
+        }
+    }
+
+    pub(crate) fn account_material(&self, accountant: &mut crate::vram_budget::VramAccountant) {
+        use crate::vram_budget::VramSubsystem;
+        match &self.material {
+            PresentationMaterial::Native(output) => accountant.add_texture_id(
+                VramSubsystem::PageTurnPresentation,
+                output.texture_id(),
+                output.size(),
+                false,
+            ),
+            PresentationMaterial::Managed {
+                handle,
+                actual_options,
+            } => accountant.add_texture(
+                VramSubsystem::PageTurnPresentation,
+                handle,
+                actual_options.mipmap_mode.is_some(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_paint_provenance(&self) -> Option<&TestPaintProvenance> {
+        self.test_paint_provenance.as_ref()
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_content_proof(
+        &self,
+    ) -> Option<&crate::test_script::TestScriptContentProof> {
+        self.test_script_content_proof.as_ref()
+    }
+}
+
+/// Rendering boundaries distinguish ordinary source preparation from immutable presentation.
+#[derive(Clone)]
+pub(crate) enum FullscreenPaintPayload {
+    NormalResource(FullscreenPaintResource),
+    PresentationMaterial(FullscreenPresentationResource),
+}
+
+impl From<FullscreenPaintResource> for FullscreenPaintPayload {
+    fn from(resource: FullscreenPaintResource) -> Self {
+        Self::NormalResource(resource)
+    }
+}
+
+impl FullscreenPaintPayload {
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        match self {
+            Self::NormalResource(resource) => resource.display_basis(),
+            Self::PresentationMaterial(resource) => resource.display_basis(),
+        }
+    }
+
+    pub(crate) fn source_coverage(&self) -> SourceCoverage {
+        match self {
+            Self::NormalResource(resource) => resource.source_coverage(),
+            Self::PresentationMaterial(resource) => resource.source_coverage(),
+        }
+    }
+
+    pub(crate) fn original_display_dimensions(&self) -> DisplayOriginalDimensions {
+        original_display_dimensions(self.size(), self.source_coverage())
+    }
+
+    pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
+        self.original_display_dimensions().as_vec2()
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
+    }
+
+    pub(crate) fn paint_geometry(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            geometry.paint_material_texture(
+                painter,
+                self.paint_texture_id(),
+                coverage,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_source_region(
+        &self,
+        painter: &egui::Painter,
+        full_image_rect: egui::Rect,
+        rotation: crate::rotation_db::Rotation,
+        free_rotation_rad: f32,
+        requested_source_rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        if let Some(coverage) = self.source_coverage().source_uv_rect() {
+            crate::displayed_image_transform::paint_source_coverage_texture(
+                painter,
+                self.paint_texture_id(),
+                full_image_rect,
+                rotation,
+                free_rotation_rad,
+                coverage,
+                requested_source_rect,
+                self.visible_source_uv_rect(),
+                tint,
+            );
+        }
+    }
+
+    pub(crate) fn paint_texture(
+        &self,
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        painter: &egui::Painter,
+        tint: egui::Color32,
+    ) {
+        match self {
+            Self::NormalResource(resource) => resource.paint_texture(transform, painter, tint),
+            Self::PresentationMaterial(resource) => {
+                resource.paint_texture(transform, painter, tint)
+            }
+        }
+    }
+    pub(crate) fn capture_presentation(
+        &self,
+        ctx: &egui::Context,
+    ) -> FullscreenPresentationResource {
+        match self {
+            Self::NormalResource(resource) => resource.capture_presentation(ctx),
+            Self::PresentationMaterial(resource) => resource.clone(),
+        }
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        cache: &mut GpuLanczosCache,
+        render_state: Option<&egui_wgpu::RenderState>,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_region: Option<VisibleRegionRequest>,
+        post_filter: PostFilter,
+        smoothing_percent: u32,
+        anime_source_limit: AnimeUpscaleSourceLimit,
+    ) -> (Self, Option<LanczosPerfEvent>) {
+        match self {
+            Self::NormalResource(resource) => {
+                let (resource, event) = cache.resolve(
+                    render_state,
+                    resource,
+                    logical_scale,
+                    pixels_per_point,
+                    visible_region,
+                    post_filter,
+                    smoothing_percent,
+                    anime_source_limit,
+                );
+                (Self::NormalResource(resource), event)
+            }
+            Self::PresentationMaterial(_) => (self.clone(), None),
+        }
+    }
+
+    pub(crate) fn source_texture(&self) -> Option<&egui::TextureHandle> {
+        match self {
+            Self::NormalResource(resource) => Some(resource.source_texture()),
+            Self::PresentationMaterial(resource) => resource.source_texture(),
+        }
+    }
+
+    pub(crate) fn size(&self) -> [usize; 2] {
+        match self {
+            Self::NormalResource(resource) => resource.size(),
+            Self::PresentationMaterial(resource) => resource.size(),
+        }
+    }
+
+    pub(crate) fn size_vec2(&self) -> egui::Vec2 {
+        match self {
+            Self::NormalResource(resource) => resource.size_vec2(),
+            Self::PresentationMaterial(resource) => resource.size_vec2(),
+        }
+    }
+
+    pub(crate) fn source_texture_id(&self) -> egui::TextureId {
+        match self {
+            Self::NormalResource(resource) => resource.source_texture_id(),
+            Self::PresentationMaterial(resource) => resource.source_texture_id(),
+        }
+    }
+
+    pub(crate) fn paint_texture_id(&self) -> egui::TextureId {
+        match self {
+            Self::NormalResource(resource) => resource.paint_texture_id(),
+            Self::PresentationMaterial(resource) => resource.paint_texture_id(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    pub(crate) fn source_id(&self) -> Option<FullscreenPaintSourceId> {
+        match self {
+            Self::NormalResource(resource) => resource.source_id(),
+            Self::PresentationMaterial(resource) => resource.source_id(),
+        }
+    }
+
+    pub(crate) fn source_generation(&self) -> Option<FullscreenPaintSourceGeneration> {
+        match self {
+            Self::NormalResource(resource) => resource.source_generation(),
+            Self::PresentationMaterial(resource) => resource.source_generation(),
+        }
+    }
+
+    pub(crate) fn page_idx(&self) -> Option<usize> {
+        match self {
+            Self::NormalResource(resource) => resource.page_idx(),
+            Self::PresentationMaterial(resource) => resource.page_idx(),
+        }
+    }
+
+    pub(crate) fn lanczos_output(&self) -> Option<&Arc<LanczosOutput>> {
+        match self {
+            Self::NormalResource(resource) => resource.lanczos_output(),
+            Self::PresentationMaterial(resource) => resource.lanczos_output(),
+        }
+    }
+
+    pub(crate) fn visible_source_uv_rect(&self) -> Option<egui::Rect> {
+        match self {
+            Self::NormalResource(resource) => resource.visible_source_uv_rect(),
+            Self::PresentationMaterial(resource) => resource.visible_source_uv_rect(),
+        }
+    }
+
+    pub(crate) fn retain_native_output_for_paint(&self, painter: &egui::Painter) {
+        match self {
+            Self::NormalResource(resource) => resource.retain_native_output_for_paint(painter),
+            Self::PresentationMaterial(resource) => {
+                resource.retain_native_output_for_paint(painter)
+            }
+        }
+    }
+
+    pub(crate) fn account_material(&self, accountant: &mut crate::vram_budget::VramAccountant) {
+        use crate::vram_budget::VramSubsystem;
+        match self {
+            Self::NormalResource(resource) => {
+                accountant.add_texture(
+                    VramSubsystem::PageTurnPresentation,
+                    resource.source_texture(),
+                    true,
+                );
+                if let Some(output) = resource.lanczos_output() {
+                    accountant.add_texture_id(
+                        VramSubsystem::PageTurnPresentation,
+                        output.texture_id(),
+                        output.size(),
+                        false,
+                    );
+                }
+            }
+            Self::PresentationMaterial(resource) => resource.account_material(accountant),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_paint_provenance(mut self, proof: TestPaintProvenance) -> Self {
+        match &mut self {
+            Self::NormalResource(resource) => {
+                *resource = resource.clone().with_test_paint_provenance(proof);
+            }
+            Self::PresentationMaterial(resource) => resource.test_paint_provenance = Some(proof),
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_paint_provenance(&self) -> Option<&TestPaintProvenance> {
+        match self {
+            Self::NormalResource(resource) => resource.test_paint_provenance(),
+            Self::PresentationMaterial(resource) => resource.test_paint_provenance(),
+        }
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn with_test_script_content_proof(
+        mut self,
+        proof: crate::test_script::TestScriptContentProof,
+    ) -> Self {
+        match &mut self {
+            Self::NormalResource(resource) => {
+                *resource = resource.clone().with_test_script_content_proof(proof);
+            }
+            Self::PresentationMaterial(resource) => {
+                resource.test_script_content_proof = Some(proof)
+            }
+        }
+        self
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_content_proof(
+        &self,
+    ) -> Option<&crate::test_script::TestScriptContentProof> {
+        match self {
+            Self::NormalResource(resource) => resource.test_script_content_proof(),
+            Self::PresentationMaterial(resource) => resource.test_script_content_proof(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct LanczosCacheKey {
+pub(crate) struct LanczosCacheKey {
     source_id: FullscreenPaintSourceId,
     source_texture_id: egui::TextureId,
     generation: FullscreenPaintSourceGeneration,
@@ -461,6 +1345,410 @@ struct LanczosCacheKey {
     smoothing_percent: u32,
     scale_branch: FullscreenPaintScaleBranch,
     source_region: LanczosSourceRegionKey,
+}
+
+impl LanczosCacheKey {
+    /// Exact diagnostic identity, including the bitwise ROI key. Construct only
+    /// while perf logging is enabled.
+    pub(crate) fn perf_key(self) -> String {
+        format!("{self:?}")
+    }
+
+    pub(crate) fn source_texture_id(self) -> egui::TextureId {
+        self.source_texture_id
+    }
+
+    pub(crate) fn target_size(self) -> [u32; 2] {
+        self.target_size
+    }
+
+    pub(crate) fn scale_branch(self) -> FullscreenPaintScaleBranch {
+        self.scale_branch
+    }
+
+    pub(crate) fn visible_source_uv_rect(self) -> Option<egui::Rect> {
+        self.source_region.visible_rect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeAllocationBytes {
+    pub(crate) output_bytes: u64,
+    pub(crate) temporary_bytes: u64,
+}
+
+impl NativeAllocationBytes {
+    pub(crate) fn total(self) -> u64 {
+        self.output_bytes.saturating_add(self.temporary_bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativePrewarmUnavailable {
+    NoRenderer,
+    MissingBacking,
+    BackingMismatch,
+    InvalidPlan,
+    SourceChanged,
+    ClaimDenied,
+    CacheSmoothingClear,
+    CacheSourceReplacement,
+    CacheCapacity,
+}
+
+impl NativePrewarmUnavailable {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRenderer => "no_renderer",
+            Self::MissingBacking => "missing_backing",
+            Self::BackingMismatch => "backing_mismatch",
+            Self::InvalidPlan => "invalid_plan",
+            Self::SourceChanged => "source_changed",
+            Self::ClaimDenied => "claim_denied",
+            Self::CacheSmoothingClear => "cache_smoothing_clear",
+            Self::CacheSourceReplacement => "cache_source_replacement",
+            Self::CacheCapacity => "cache_capacity",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativePrewarmPolicy {
+    Ordinary,
+    NoRemoval,
+}
+
+/// A call-local calculation, never a pending owner and never a source lease.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativePrewarmPlan {
+    key: LanczosCacheKey,
+    work: LanczosWorkPlan,
+    smoothing_percent: u32,
+}
+
+impl NativePrewarmPlan {
+    pub(crate) fn key(self) -> LanczosCacheKey {
+        self.key
+    }
+
+    pub(crate) fn allocation(self) -> NativeAllocationBytes {
+        self.work.allocation_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativePrewarmQuery {
+    NotNeeded,
+    Hit(LanczosCacheKey),
+    Unavailable(NativePrewarmUnavailable),
+    Miss(NativePrewarmPlan),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativePrewarmExecution {
+    Hit,
+    Unavailable(NativePrewarmUnavailable),
+    Submitted {
+        output_texture_id: egui::TextureId,
+        stats: LanczosGenerationStats,
+    },
+}
+
+/// Both normal resolve and speculative planning must use this exact request.
+#[allow(clippy::too_many_arguments)]
+fn resource_lanczos_key(
+    resource: &FullscreenPaintResource,
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    post_filter: PostFilter,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
+    let (source_id, source, generation) = resource.resampleable_parts()?;
+    requested_covered_lanczos_key(
+        source_id,
+        source.id(),
+        generation,
+        [source.size()[0] as u32, source.size()[1] as u32],
+        logical_scale,
+        pixels_per_point,
+        visible_region,
+        resource.source_coverage(),
+        post_filter,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NativeLookupForTest {
+    pub(crate) source_texture_id: egui::TextureId,
+    pub(crate) key: Option<LanczosCacheKey>,
+    pub(crate) outcome: &'static str,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NATIVE_LOOKUPS_FOR_TEST: std::cell::RefCell<Option<Vec<NativeLookupForTest>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn begin_native_lookup_observation_for_test() {
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| *lookups.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_native_lookups_for_test() -> Vec<NativeLookupForTest> {
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| lookups.borrow_mut().take().unwrap_or_default())
+}
+
+fn record_native_lookup(
+    render_state: Option<&egui_wgpu::RenderState>,
+    resource: &FullscreenPaintResource,
+    key: Option<LanczosCacheKey>,
+    outcome: &'static str,
+) {
+    #[cfg(test)]
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| {
+        if let Some(lookups) = lookups.borrow_mut().as_mut() {
+            lookups.push(NativeLookupForTest {
+                source_texture_id: resource.source_texture_id(),
+                key,
+                outcome,
+            });
+        }
+    });
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "fs",
+        "final_prepare_native_lookup",
+        None,
+        0,
+        &[
+            (
+                "renderer",
+                render_state
+                    .map(|state| state.renderer.read().diag_id().into())
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "source_texture_id",
+                format!("{:?}", resource.source_texture_id()).into(),
+            ),
+            (
+                "native_key",
+                key.map(|key| key.perf_key().into())
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            ("outcome", outcome.into()),
+        ],
+    );
+}
+
+/// Pure request identity shared by ordinary preparation and held native reuse.
+#[allow(clippy::too_many_arguments)]
+fn requested_covered_lanczos_key(
+    source_id: FullscreenPaintSourceId,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
+    source_size: [u32; 2],
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    coverage: SourceCoverage,
+    post_filter: PostFilter,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
+    let (scale_branch, target_size, source_region) = covered_sampler_request(
+        source_size,
+        logical_scale,
+        pixels_per_point,
+        visible_region,
+        coverage,
+        post_filter,
+    )?;
+    finish_requested_lanczos_key(
+        source_id,
+        source_texture_id,
+        generation,
+        source_size,
+        scale_branch,
+        target_size,
+        source_region,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+fn covered_sampler_request(
+    source_size: [u32; 2],
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    coverage: SourceCoverage,
+    post_filter: PostFilter,
+) -> Option<(FullscreenPaintScaleBranch, [u32; 2], LanczosSourceRegionKey)> {
+    if !coverage.is_partial() {
+        let scale_branch =
+            fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
+        if !scale_branch.uses_resampler() {
+            return None;
+        }
+        let (target, region) = target_and_source_region_for_branch(
+            source_size,
+            physical_scale(logical_scale, pixels_per_point),
+            scale_branch,
+            visible_region,
+        )?;
+        return Some((scale_branch, target, region));
+    }
+    if source_size.contains(&0) || !logical_scale.is_finite() || logical_scale <= 0.0 {
+        return None;
+    }
+    let source_extent = egui::vec2(source_size[0] as f32, source_size[1] as f32);
+    let material_extent =
+        original_display_dimensions([source_size[0] as usize, source_size[1] as usize], coverage)
+            .as_vec2()
+            * coverage.source_uv_rect()?.size();
+    // Sampling density can differ on each axis after integer thumbnail resize.
+    // It affects output texels/filter choice, never fit, contain or page aspect.
+    let sampler_scale = material_extent / source_extent * logical_scale;
+    let branch_x = fullscreen_paint_scale_branch(sampler_scale.x, pixels_per_point, post_filter);
+    let branch_y = fullscreen_paint_scale_branch(sampler_scale.y, pixels_per_point, post_filter);
+    let scale_branch = if branch_x == FullscreenPaintScaleBranch::OriginalOneToOne
+        && branch_y == FullscreenPaintScaleBranch::OriginalOneToOne
+    {
+        FullscreenPaintScaleBranch::OriginalOneToOne
+    } else if physical_scale(sampler_scale.max_elem(), pixels_per_point) <= 1.0 + 1.0e-4 {
+        FullscreenPaintScaleBranch::DownscaleLanczos
+    } else {
+        fullscreen_paint_scale_branch(sampler_scale.max_elem(), pixels_per_point, post_filter)
+    };
+    if !scale_branch.uses_resampler() {
+        return None;
+    }
+    let (target_size, source_region) =
+        if scale_branch == FullscreenPaintScaleBranch::DownscaleLanczos {
+            let scale = physical_scale(logical_scale, pixels_per_point);
+            (
+                [
+                    physical_pixel_extent(material_extent.x, scale).min(source_size[0]),
+                    physical_pixel_extent(material_extent.y, scale).min(source_size[1]),
+                ],
+                LanczosSourceRegionKey::Full,
+            )
+        } else {
+            target_and_source_region_for_branch(
+                source_size,
+                1.0,
+                scale_branch,
+                sampler_visible_region(coverage, visible_region),
+            )?
+        };
+    Some((scale_branch, target_size, source_region))
+}
+
+fn anime_material_source_dimensions(
+    source_size: [usize; 2],
+    coverage: SourceCoverage,
+    geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+    pixels_per_point: f32,
+) -> Option<[u32; 2]> {
+    let source_size = [source_size[0] as u32, source_size[1] as u32];
+    let request = geometry
+        .visible_region_request_for_coverage(geometry.viewport_rect, coverage.source_uv_rect()?);
+    let (branch, _, region) = covered_sampler_request(
+        source_size,
+        geometry.total_scale,
+        pixels_per_point,
+        request,
+        coverage,
+        PostFilter::UpscaleAnime,
+    )?;
+    if branch != FullscreenPaintScaleBranch::UpscaleAnime {
+        return None;
+    }
+    anime_source_region_dimensions(source_size, region.visible_rect()?)
+}
+
+/// Full-source requests retain the established sampler sizing contract.
+fn requested_lanczos_key(
+    source_id: FullscreenPaintSourceId,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
+    source_size: [u32; 2],
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    post_filter: PostFilter,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
+    let scale_branch = fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
+    if !scale_branch.uses_resampler() {
+        return None;
+    }
+    let (target_size, source_region) = target_and_source_region_for_branch(
+        source_size,
+        physical_scale(logical_scale, pixels_per_point),
+        scale_branch,
+        visible_region,
+    )?;
+    finish_requested_lanczos_key(
+        source_id,
+        source_texture_id,
+        generation,
+        source_size,
+        scale_branch,
+        target_size,
+        source_region,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_requested_lanczos_key(
+    source_id: FullscreenPaintSourceId,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
+    source_size: [u32; 2],
+    scale_branch: FullscreenPaintScaleBranch,
+    target_size: [u32; 2],
+    source_region: LanczosSourceRegionKey,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
+    let scale_branch = scale_branch_with_anime_source_limit(
+        scale_branch,
+        source_size,
+        source_region,
+        anime_source_limit,
+    );
+    if source_region == LanczosSourceRegionKey::Full && target_size == source_size {
+        return None;
+    }
+    Some(LanczosCacheKey {
+        source_id,
+        source_texture_id,
+        generation,
+        target_size,
+        // The smoothing setting changes downscale support only.
+        smoothing_percent: if scale_branch == FullscreenPaintScaleBranch::DownscaleLanczos {
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent)
+        } else {
+            0
+        },
+        scale_branch,
+        source_region,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -571,9 +1859,230 @@ pub(crate) struct GpuLanczosCache {
     regeneration_count: u64,
     active_smoothing_percent: u32,
     limit_fallback_sources: HashSet<LanczosFallbackSourceKey>,
+    #[cfg(test)]
+    resolve_input_ids: Vec<egui::TextureId>,
 }
 
 impl GpuLanczosCache {
+    /// Preserve ordinary successful-reuse housekeeping without preparing or
+    /// retaining a newly published source, or advancing the cache-use clock.
+    pub(crate) fn reuse_presentation(
+        &mut self,
+        material: &FullscreenPresentationResource,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_region: Option<VisibleRegionRequest>,
+        post_filter: PostFilter,
+        smoothing_percent: u32,
+        anime_source_limit: AnimeUpscaleSourceLimit,
+    ) -> bool {
+        if !material.matches_prepare(
+            logical_scale,
+            pixels_per_point,
+            visible_region,
+            post_filter,
+            smoothing_percent,
+            anime_source_limit,
+        ) {
+            return false;
+        }
+        let output = material.lanczos_output().unwrap();
+        self.sync_smoothing_percent(crate::settings::sanitize_downscale_smoothing_percent(
+            smoothing_percent,
+        ));
+        self.limit_fallback_sources
+            .remove(&LanczosFallbackSourceKey {
+                source_id: output.key.source_id,
+                source_texture_id: output.key.source_texture_id,
+                generation: output.key.generation,
+                scale_branch: output.key.scale_branch,
+            });
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_test_resolve_input_ids(&mut self) -> Vec<egui::TextureId> {
+        std::mem::take(&mut self.resolve_input_ids)
+    }
+
+    /// Inspect the ordinary request/cache and renderer backing without changing
+    /// cache recency, allocating GPU resources, or claiming a frame slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn query_prewarm(
+        &self,
+        render_state: Option<&egui_wgpu::RenderState>,
+        resource: &FullscreenPaintResource,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_region: Option<VisibleRegionRequest>,
+        post_filter: PostFilter,
+        smoothing_percent: u32,
+        anime_source_limit: AnimeUpscaleSourceLimit,
+    ) -> NativePrewarmQuery {
+        let Some(key) = resource_lanczos_key(
+            resource,
+            logical_scale,
+            pixels_per_point,
+            visible_region,
+            post_filter,
+            smoothing_percent,
+            anime_source_limit,
+        ) else {
+            return NativePrewarmQuery::NotNeeded;
+        };
+        if lanczos_target_decision(key.scale_branch, key.target_size)
+            == LanczosTargetDecision::OriginalFallback
+        {
+            return NativePrewarmQuery::NotNeeded;
+        }
+        let smoothing_percent =
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        if (self.active_smoothing_percent == smoothing_percent && self.entries.contains_key(&key))
+            || resource
+                .lanczos_output()
+                .is_some_and(|output| output.key == key)
+        {
+            return NativePrewarmQuery::Hit(key);
+        }
+        let Ok(work) =
+            work_plan_for_key([resource.size()[0] as u32, resource.size()[1] as u32], key)
+        else {
+            return NativePrewarmQuery::Unavailable(NativePrewarmUnavailable::InvalidPlan);
+        };
+        let Some(render_state) = render_state else {
+            return NativePrewarmQuery::Unavailable(NativePrewarmUnavailable::NoRenderer);
+        };
+        if let Err(reason) =
+            prewarm_source_backing(render_state, key.source_texture_id, work.source_size())
+        {
+            return NativePrewarmQuery::Unavailable(reason);
+        }
+        NativePrewarmQuery::Miss(NativePrewarmPlan {
+            key,
+            work,
+            smoothing_percent,
+        })
+    }
+
+    /// The caller revalidates demand, live activity and global VRAM admission
+    /// before entering. `claim` only claims the app-wide frame slot: it runs
+    /// after backing validation, with no renderer lock, immediately before GPU
+    /// allocation. A cloned backing keeps that validated allocation alive.
+    pub(crate) fn execute_prewarm(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        resource: &FullscreenPaintResource,
+        plan: NativePrewarmPlan,
+        claim: impl FnOnce(NativeAllocationBytes) -> bool,
+    ) -> NativePrewarmExecution {
+        self.execute_prewarm_with_policy(
+            render_state,
+            resource,
+            plan,
+            NativePrewarmPolicy::Ordinary,
+            claim,
+        )
+    }
+
+    /// Pure metadata admission shared by the caller and the execution boundary.
+    /// Includes invalidation removals as well as post-insertion pruning.
+    pub(crate) fn prewarm_no_removal_admission(
+        &self,
+        plan: NativePrewarmPlan,
+    ) -> Result<(), NativePrewarmUnavailable> {
+        if self.active_smoothing_percent != plan.smoothing_percent && !self.entries.is_empty() {
+            return Err(NativePrewarmUnavailable::CacheSmoothingClear);
+        }
+        if self.entries.keys().any(|key| {
+            key.source_id == plan.key.source_id
+                && (key.source_texture_id != plan.key.source_texture_id
+                    || key.generation != plan.key.generation)
+        }) {
+            return Err(NativePrewarmUnavailable::CacheSourceReplacement);
+        }
+        let increment = usize::from(!self.entries.contains_key(&plan.key));
+        if self.entries.len() + increment > MAX_CACHE_ENTRIES
+            || self
+                .entries
+                .keys()
+                .filter(|key| same_source_target_family(**key, plan.key))
+                .count()
+                + increment
+                > MAX_TARGETS_PER_SOURCE
+            || self
+                .entries
+                .keys()
+                .copied()
+                .chain((increment != 0).then_some(plan.key))
+                .map(cached_upscale_pixels)
+                .fold(0_u64, u64::saturating_add)
+                > MAX_CACHED_UPSCALE_PIXELS
+        {
+            return Err(NativePrewarmUnavailable::CacheCapacity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute_prewarm_with_policy(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        resource: &FullscreenPaintResource,
+        plan: NativePrewarmPlan,
+        policy: NativePrewarmPolicy,
+        claim: impl FnOnce(NativeAllocationBytes) -> bool,
+    ) -> NativePrewarmExecution {
+        let Some((source_id, _, generation)) = resource.resampleable_parts() else {
+            return NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::SourceChanged);
+        };
+        if source_id != plan.key.source_id
+            || resource.source_texture_id() != plan.key.source_texture_id
+            || generation != plan.key.generation
+            || resource.size() != plan.work.source_size().map(|size| size as usize)
+        {
+            return NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::SourceChanged);
+        }
+        if (self.active_smoothing_percent == plan.smoothing_percent
+            && self.entries.contains_key(&plan.key))
+            || resource
+                .lanczos_output()
+                .is_some_and(|output| output.key == plan.key)
+        {
+            return NativePrewarmExecution::Hit;
+        }
+        if policy == NativePrewarmPolicy::NoRemoval
+            && let Err(reason) = self.prewarm_no_removal_admission(plan)
+        {
+            return NativePrewarmExecution::Unavailable(reason);
+        }
+        let source = match prewarm_source_backing(
+            render_state,
+            plan.key.source_texture_id,
+            plan.work.source_size(),
+        ) {
+            Ok(source) => source,
+            Err(reason) => return NativePrewarmExecution::Unavailable(reason),
+        };
+        if !claim(plan.allocation()) {
+            return NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::ClaimDenied);
+        }
+        self.sync_smoothing_percent(plan.smoothing_percent);
+        self.use_clock = self.use_clock.wrapping_add(1);
+        self.entries.retain(|candidate, _| {
+            candidate.source_id != plan.key.source_id
+                || (candidate.source_texture_id == plan.key.source_texture_id
+                    && candidate.generation == plan.key.generation)
+        });
+        let (output, event) =
+            self.generate_with_source(render_state, resource, plan.key, plan.work, &source);
+        match event {
+            Some(LanczosPerfEvent::Generated(stats)) => NativePrewarmExecution::Submitted {
+                output_texture_id: output.paint_texture_id(),
+                stats,
+            },
+            _ => NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::InvalidPlan),
+        }
+    }
+
     pub(crate) fn resolve(
         &mut self,
         render_state: Option<&egui_wgpu::RenderState>,
@@ -585,84 +2094,65 @@ impl GpuLanczosCache {
         smoothing_percent: u32,
         anime_source_limit: AnimeUpscaleSourceLimit,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
+        #[cfg(test)]
+        self.resolve_input_ids.push(resource.source_texture_id());
         let smoothing_percent =
             crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
         self.sync_smoothing_percent(smoothing_percent);
-        let mut scale_branch =
-            fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
-        if resource.resampleable_parts().is_none() || !scale_branch.uses_resampler() {
+        if resource.resampleable_parts().is_none() {
+            record_native_lookup(render_state, resource, None, "not_needed");
             return (resource.original_resampleable(), None);
         }
-        let Some(render_state) = render_state else {
-            return (resource.original_resampleable(), None);
-        };
         let (source_id, source, generation) = resource.resampleable_parts().unwrap();
         let source_size = [source.size()[0] as u32, source.size()[1] as u32];
-        let physical_scale = physical_scale(logical_scale, pixels_per_point);
-        let Some((target_size, source_region)) = target_and_source_region_for_branch(
-            source_size,
-            physical_scale,
-            scale_branch,
+        let Some(key) = resource_lanczos_key(
+            resource,
+            logical_scale,
+            pixels_per_point,
             visible_region,
+            post_filter,
+            smoothing_percent,
+            anime_source_limit,
         ) else {
+            record_native_lookup(render_state, resource, None, "not_needed");
             return (resource.original_resampleable(), None);
         };
-        scale_branch = scale_branch_with_anime_source_limit(
-            scale_branch,
-            source_size,
-            source_region,
-            anime_source_limit,
-        );
-        if source_region == LanczosSourceRegionKey::Full && target_size == source_size {
+        let Some(render_state) = render_state else {
+            record_native_lookup(None, resource, None, "no_renderer");
             return (resource.original_resampleable(), None);
-        }
+        };
         let fallback_source = LanczosFallbackSourceKey {
             source_id,
             source_texture_id: source.id(),
             generation,
-            scale_branch,
+            scale_branch: key.scale_branch,
         };
-        if lanczos_target_decision(scale_branch, target_size)
+        if lanczos_target_decision(key.scale_branch, key.target_size)
             == LanczosTargetDecision::OriginalFallback
         {
+            record_native_lookup(Some(render_state), resource, Some(key), "not_needed");
             let first_for_source = self.limit_fallback_sources.insert(fallback_source);
             let event = first_for_source.then_some(upscale_limit_fallback_event(
                 source_size,
-                target_size,
-                scale_branch,
+                key.target_size,
+                key.scale_branch,
             ));
             return (resource.original_resampleable(), event);
         }
         self.limit_fallback_sources.remove(&fallback_source);
-        // The user-facing smoothing control is specifically for downscaling. Keeping
-        // upscale at zero also leaves the Lanczos3 support radius at exactly 3.0.
-        let effective_smoothing_percent =
-            if scale_branch == FullscreenPaintScaleBranch::DownscaleLanczos {
-                smoothing_percent
-            } else {
-                0
-            };
         if let FullscreenPaintResource::Lanczos {
             output,
             smoothing_percent: resource_smoothing,
             ..
         } = resource
-            && output.size == target_size
-            && *resource_smoothing == effective_smoothing_percent
-            && output.scale_branch == scale_branch
-            && output.source_region == source_region
+            && output.key.target_size == key.target_size
+            && *resource_smoothing == key.smoothing_percent
+            && output.key.scale_branch == key.scale_branch
+            && output.key.source_region == key.source_region
         {
+            record_native_lookup(Some(render_state), resource, Some(key), "hit");
             return (resource.clone(), None);
         }
-        let key = LanczosCacheKey {
-            source_id,
-            source_texture_id: source.id(),
-            generation,
-            target_size,
-            smoothing_percent: effective_smoothing_percent,
-            scale_branch,
-            source_region,
-        };
         self.resolve_key(render_state, resource, key)
     }
 
@@ -674,12 +2164,14 @@ impl GpuLanczosCache {
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         self.use_clock = self.use_clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&key) {
+            record_native_lookup(Some(render_state), resource, Some(key), "hit");
             entry.last_used = self.use_clock;
             return (
                 resource.with_lanczos(entry.output.clone(), key.smoothing_percent),
                 None,
             );
         }
+        record_native_lookup(Some(render_state), resource, Some(key), "miss");
         self.entries.retain(|candidate, _| {
             candidate.source_id != key.source_id
                 || (candidate.source_texture_id == key.source_texture_id
@@ -701,14 +2193,28 @@ impl GpuLanczosCache {
         key: LanczosCacheKey,
         plan: LanczosWorkPlan,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
-        let started = Instant::now();
-        let mut renderer = render_state.renderer.write();
-        let Some(source_texture) = renderer
-            .texture(&resource.source_texture_id())
-            .and_then(|texture| texture.texture.as_ref())
-        else {
-            return (resource.original_resampleable(), None);
+        let source_texture = {
+            let renderer = render_state.renderer.read();
+            let Some(source_texture) = renderer
+                .texture(&resource.source_texture_id())
+                .and_then(|texture| texture.texture.as_ref())
+            else {
+                return (resource.original_resampleable(), None);
+            };
+            source_texture.clone()
         };
+        self.generate_with_source(render_state, resource, key, plan, &source_texture)
+    }
+
+    fn generate_with_source(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        resource: &FullscreenPaintResource,
+        key: LanczosCacheKey,
+        plan: LanczosWorkPlan,
+        source_texture: &wgpu::Texture,
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
+        let started = Instant::now();
         let job = match plan {
             LanczosWorkPlan::AnimeUpscale(plan) => self
                 .anime_resampler
@@ -742,12 +2248,11 @@ impl GpuLanczosCache {
             Ok(job) => job,
             Err(_) => return (resource.original_resampleable(), None),
         };
-        let texture_id = renderer.register_native_texture(
+        let texture_id = render_state.renderer.write().register_native_texture(
             &render_state.device,
             job.output_view(),
             wgpu::FilterMode::Linear,
         );
-        drop(renderer);
         self.submit_job(render_state, resource, key, plan, job, texture_id, started)
     }
 
@@ -810,11 +2315,9 @@ impl GpuLanczosCache {
         let output_texture = job.into_output_texture();
         let output = Arc::new(LanczosOutput::new(
             texture_id,
-            key.target_size,
+            key,
             output_texture,
             rs.clone(),
-            key.scale_branch,
-            key.source_region,
         ));
         self.finish_generation(resource, key, plan, output, started)
     }
@@ -943,34 +2446,17 @@ impl GpuLanczosCache {
         loop {
             let total = self
                 .entries
-                .iter()
-                .filter(|(key, _)| {
-                    matches!(
-                        key.scale_branch,
-                        FullscreenPaintScaleBranch::UpscaleLanczos
-                            | FullscreenPaintScaleBranch::UpscaleNis
-                            | FullscreenPaintScaleBranch::UpscaleAnime
-                            | FullscreenPaintScaleBranch::UpscalePixelArt
-                    )
-                })
-                .fold(0_u64, |pixels, (key, _)| {
-                    pixels.saturating_add(target_pixels(key.target_size))
-                });
+                .keys()
+                .copied()
+                .map(cached_upscale_pixels)
+                .fold(0_u64, u64::saturating_add);
             if total <= MAX_CACHED_UPSCALE_PIXELS {
                 break;
             }
             let Some(oldest) = self
                 .entries
                 .iter()
-                .filter(|(key, _)| {
-                    matches!(
-                        key.scale_branch,
-                        FullscreenPaintScaleBranch::UpscaleLanczos
-                            | FullscreenPaintScaleBranch::UpscaleNis
-                            | FullscreenPaintScaleBranch::UpscaleAnime
-                            | FullscreenPaintScaleBranch::UpscalePixelArt
-                    )
-                })
+                .filter(|(key, _)| cached_upscale_pixels(**key) != 0)
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key)
             else {
@@ -989,11 +2475,19 @@ fn same_source_target_family(left: LanczosCacheKey, right: LanczosCacheKey) -> b
         && left.scale_branch == right.scale_branch
 }
 
+fn cached_upscale_pixels(key: LanczosCacheKey) -> u64 {
+    match key.scale_branch {
+        FullscreenPaintScaleBranch::UpscaleLanczos
+        | FullscreenPaintScaleBranch::UpscaleNis
+        | FullscreenPaintScaleBranch::UpscaleAnime
+        | FullscreenPaintScaleBranch::UpscalePixelArt => target_pixels(key.target_size),
+        _ => 0,
+    }
+}
+
 pub(crate) struct LanczosOutput {
     texture_id_lease: NativeTextureIdLease,
-    size: [u32; 2],
-    scale_branch: FullscreenPaintScaleBranch,
-    source_region: LanczosSourceRegionKey,
+    key: LanczosCacheKey,
     #[cfg(not(test))]
     _texture: wgpu::Texture,
     #[cfg(test)]
@@ -1003,20 +2497,16 @@ pub(crate) struct LanczosOutput {
 impl LanczosOutput {
     fn new(
         texture_id: egui::TextureId,
-        size: [u32; 2],
+        key: LanczosCacheKey,
         texture: wgpu::Texture,
         render_state: egui_wgpu::RenderState,
-        scale_branch: FullscreenPaintScaleBranch,
-        source_region: LanczosSourceRegionKey,
     ) -> Self {
         Self {
             texture_id_lease: NativeTextureIdLease {
                 texture_id,
                 releaser: Arc::new(RendererTextureIdReleaser { render_state }),
             },
-            size,
-            scale_branch,
-            source_region,
+            key,
             #[cfg(not(test))]
             _texture: texture,
             #[cfg(test)]
@@ -1029,11 +2519,14 @@ impl LanczosOutput {
     }
 
     pub(crate) fn size(&self) -> [usize; 2] {
-        [self.size[0] as usize, self.size[1] as usize]
+        [
+            self.key.target_size[0] as usize,
+            self.key.target_size[1] as usize,
+        ]
     }
 
     pub(crate) fn visible_source_uv_rect(&self) -> Option<egui::Rect> {
-        self.source_region.visible_rect()
+        self.key.source_region.visible_rect()
     }
 }
 
@@ -1273,6 +2766,30 @@ fn work_plan_for_key(source_size: [u32; 2], key: LanczosCacheKey) -> Result<Lanc
 }
 
 impl LanczosWorkPlan {
+    fn allocation_bytes(self) -> NativeAllocationBytes {
+        let rgba16_bytes = |size: [u32; 2]| {
+            u64::from(size[0])
+                .saturating_mul(u64::from(size[1]))
+                .saturating_mul(8)
+        };
+        let temporary_bytes = match self {
+            Self::Full(plan) => rgba16_bytes([plan.source_size[0], plan.target_size[1]]),
+            Self::VisibleUpscale(plan) => {
+                rgba16_bytes([plan.intermediate_x_width, plan.target_size[1]])
+            }
+            Self::AnimeUpscale(plan) => rgba16_bytes(plan.process_size)
+                .saturating_mul(STILL_IMAGE_ANIME4K_VARIANT.intermediate_count() as u64),
+            Self::NisUpscale(_) | Self::PixelArtUpscale(_) => 0,
+        };
+        let target = self.target_size();
+        NativeAllocationBytes {
+            output_bytes: u64::from(target[0])
+                .saturating_mul(u64::from(target[1]))
+                .saturating_mul(4),
+            temporary_bytes,
+        }
+    }
+
     fn source_size(self) -> [u32; 2] {
         match self {
             Self::Full(plan) => plan.source_size,
@@ -1332,6 +2849,34 @@ impl LanczosWorkPlan {
             Self::AnimeUpscale(plan) => Some(plan.source_region_px),
         }
     }
+}
+
+fn backing_matches_plan(
+    actual_size: [u32; 2],
+    format: wgpu::TextureFormat,
+    source_size: [u32; 2],
+) -> bool {
+    actual_size == source_size && format == wgpu::TextureFormat::Rgba8Unorm
+}
+
+fn prewarm_source_backing(
+    render_state: &egui_wgpu::RenderState,
+    texture_id: egui::TextureId,
+    source_size: [u32; 2],
+) -> Result<wgpu::Texture, NativePrewarmUnavailable> {
+    let renderer = render_state.renderer.read();
+    let source = renderer
+        .texture(&texture_id)
+        .and_then(|texture| texture.texture.as_ref())
+        .ok_or(NativePrewarmUnavailable::MissingBacking)?;
+    if !backing_matches_plan(
+        [source.width(), source.height()],
+        source.format(),
+        source_size,
+    ) {
+        return Err(NativePrewarmUnavailable::BackingMismatch);
+    }
+    Ok(source.clone())
 }
 
 fn quantized_target_size(source_size: [u32; 2], scale: f32, quantum: u32) -> [u32; 2] {
@@ -1576,8 +3121,8 @@ impl Lanczos3Resampler {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -1885,6 +3430,7 @@ impl Lanczos3Resampler {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
@@ -2100,10 +3646,14 @@ fn create_pipeline(
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
+
+#[cfg(test)]
+#[path = "gpu_lanczos/prewarm_tests.rs"]
+mod prewarm_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2135,6 +3685,459 @@ mod tests {
             FullscreenPaintScaleBranch::OriginalOneToOne
         );
         assert!(physical_scale_is_near_integer(0.5, 2.0));
+    }
+
+    #[test]
+    fn display_basis_survives_native_capture_payload_and_original_reconstruction() {
+        use crate::{
+            fullscreen_specified_scale::FullscreenFitBasis,
+            material_display_basis::{MaterialDisplayView, MaterialLegacyBasis},
+        };
+
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "display-basis-resource",
+            egui::ColorImage::filled([60, 80], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let partial = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(15000, 20000),
+                (6143, 8192),
+                (1000, 500, 3000, 6000),
+            )
+            .unwrap(),
+        );
+        let whole_basis = MaterialDisplayBasis::new(
+            MaterialLegacyBasis::Raster {
+                layout_size: egui::vec2(60.0, 80.0),
+                original: DisplayOriginalDimensions::new(60, 80),
+            },
+            MaterialLegacyBasis::Raster {
+                layout_size: egui::vec2(6144.0, 8192.0),
+                original: DisplayOriginalDimensions::new(6144, 8192),
+            },
+            MaterialLegacyBasis::SourceLayout {
+                basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                    layout_size: egui::vec2(15000.0, 20000.0),
+                    reference_size: egui::vec2(15000.0, 20000.0),
+                },
+            },
+            Ok(
+                FullscreenFitBasis::new(egui::vec2(6144.0, 8192.0), egui::vec2(6144.0, 8192.0))
+                    .unwrap(),
+            ),
+        );
+        for (coverage, basis) in [
+            (SourceCoverage::FullSource, whole_basis),
+            (
+                partial,
+                MaterialDisplayBasis::from_sampler(texture.size(), partial),
+            ),
+        ] {
+            let direct = FullscreenPaintResource::direct(texture.clone())
+                .with_source_coverage(coverage)
+                .with_display_basis(basis);
+            let original = FullscreenPaintResource::resampleable(
+                2,
+                texture.clone(),
+                FullscreenPaintSourceGeneration { items: 4, input: 7 },
+            )
+            .with_source_coverage(coverage)
+            .with_display_basis(basis);
+            let native = test_native_resource(original.clone(), [30, 40]);
+            for resource in [
+                direct,
+                original,
+                native.clone(),
+                native.original_resampleable(),
+            ] {
+                assert_eq!(resource.display_basis(), basis);
+                let payload = FullscreenPaintPayload::NormalResource(resource.clone());
+                assert_eq!(payload.display_basis(), basis);
+                let captured = payload.capture_presentation(&ctx);
+                assert_eq!(captured.display_basis(), basis);
+                let held = FullscreenPaintPayload::PresentationMaterial(captured);
+                assert_eq!(held.display_basis(), basis);
+                assert_eq!(held.capture_presentation(&ctx).display_basis(), basis);
+                for view in [
+                    MaterialDisplayView::Single,
+                    MaterialDisplayView::Spread,
+                    MaterialDisplayView::Continuous,
+                ] {
+                    assert_eq!(held.display_basis().legacy(view), basis.legacy(view));
+                }
+                assert_eq!(held.display_basis().specified(), basis.specified());
+                assert_eq!(
+                    resource
+                        .with_source_coverage(SourceCoverage::Unknown)
+                        .display_basis(),
+                    basis,
+                    "coverage changes must never reinterpret an accepted fit descriptor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_coverage_survives_native_capture_payload_and_original_fallback() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "coverage-resource",
+            egui::ColorImage::filled([80, 60], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1200, 800),
+                (600, 400),
+                (100, 50, 400, 300),
+            )
+            .unwrap(),
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            2,
+            texture.clone(),
+            FullscreenPaintSourceGeneration { items: 4, input: 7 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(
+            resource.original_display_dimensions().as_tuple(),
+            (600, 400)
+        );
+        assert!((resource.full_source_size_vec2() - egui::vec2(600.0, 400.0)).length() < 0.001);
+        let native_roi = egui::Rect::from_min_max(egui::pos2(0.125, 0.25), egui::pos2(0.875, 0.75));
+        let native = test_native_resource_with_region(resource.clone(), [120, 60], native_roi);
+        for resource in [
+            resource,
+            native.clone(),
+            native.original_resampleable(),
+            FullscreenPaintResource::direct(texture).with_source_coverage(coverage),
+        ] {
+            assert_eq!(resource.source_coverage(), coverage);
+            let captured = resource.capture_presentation(&ctx);
+            assert_eq!(captured.source_coverage(), coverage);
+            assert_eq!(
+                captured.original_display_dimensions(),
+                resource.original_display_dimensions()
+            );
+            assert_eq!(
+                captured.full_source_size_vec2(),
+                resource.full_source_size_vec2()
+            );
+            let payload = FullscreenPaintPayload::PresentationMaterial(captured);
+            assert_eq!(payload.source_coverage(), coverage);
+            assert_eq!(
+                payload.original_display_dimensions(),
+                resource.original_display_dimensions()
+            );
+            assert_eq!(
+                payload.capture_presentation(&ctx).source_coverage(),
+                coverage
+            );
+        }
+        assert_eq!(
+            native.visible_source_uv_rect(),
+            Some(native_roi),
+            "native ROI remains sampler-local"
+        );
+    }
+
+    #[test]
+    fn source_coverage_native_request_uses_sampler_coordinates_and_physical_material_extent() {
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1200, 800),
+                (600, 400),
+                (150, 100, 300, 200),
+            )
+            .unwrap(),
+        );
+        let request = VisibleRegionRequest {
+            source_uv_rect: egui::Rect::from_min_max(egui::pos2(0.5, 0.25), egui::pos2(0.75, 0.75)),
+            target_size: [375, 500],
+        };
+        let sampler = sampler_visible_region(coverage, Some(request)).unwrap();
+        assert_eq!(
+            sampler.source_uv_rect,
+            egui::Rect::from_min_max(egui::pos2(0.5, 0.0), egui::pos2(1.0, 1.0))
+        );
+        assert_eq!(sampler.target_size, [375, 500]);
+        let outside = VisibleRegionRequest {
+            source_uv_rect: egui::Rect::from_min_max(egui::pos2(0.9, 0.0), egui::pos2(1.0, 1.0)),
+            target_size: [100, 100],
+        };
+        assert!(sampler_visible_region(coverage, Some(outside)).is_none());
+    }
+
+    #[test]
+    fn source_coverage_original_basis_uses_uncropped_gpu_raster_and_keeps_coordinate_units_separate()
+     {
+        let ctx = egui::Context::default();
+        let coordinate_dims = crate::page_dims::CanonicalPageDimensions::new(20000, 15000);
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                coordinate_dims,
+                (8192, 6144),
+                (3840, 0, 256, 6144),
+            )
+            .unwrap(),
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            metadata_only_texture(&ctx, [11, 256], egui::TextureOptions::LINEAR),
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(coverage.coordinate_dims(), Some(coordinate_dims));
+        assert_eq!(
+            resource.original_display_dimensions(),
+            DisplayOriginalDimensions::new(8192, 6144)
+        );
+        assert_eq!(resource.full_source_size_vec2(), egui::vec2(8192.0, 6144.0));
+        let raw = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [8192, 6144],
+            egui::TextureOptions::LINEAR,
+        ));
+        assert_eq!(
+            resource.original_display_dimensions(),
+            raw.original_display_dimensions()
+        );
+        // Native density must use the same uncropped raster basis: the source
+        // coordinate dimensions would incorrectly request an upscale here.
+        let key = resource_lanczos_key(
+            &resource,
+            0.032,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [10, 245]);
+        let native = test_native_resource(resource.clone(), [10, 245]);
+        assert_eq!(
+            native.original_resampleable().original_display_dimensions(),
+            resource.original_display_dimensions()
+        );
+        assert_eq!(
+            native
+                .capture_presentation(&ctx)
+                .original_display_dimensions(),
+            resource.original_display_dimensions()
+        );
+    }
+
+    #[test]
+    fn source_coverage_full_source_and_uncropped_known_keep_actual_texture_original_basis_after_ai()
+    {
+        let ctx = egui::Context::default();
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1000, 750),
+                (1000, 750),
+                (0, 0, 1000, 750),
+            )
+            .unwrap(),
+        );
+        let ordinary = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [128, 96],
+            egui::TextureOptions::LINEAR,
+        ))
+        .with_source_coverage(coverage);
+        assert_eq!(ordinary.original_display_dimensions().as_tuple(), (128, 96));
+        assert_eq!(ordinary.full_source_size_vec2(), egui::vec2(128.0, 96.0));
+        let after_ai = FullscreenPaintResource::direct(metadata_only_texture(
+            &ctx,
+            [4000, 3000],
+            egui::TextureOptions::LINEAR,
+        ));
+        assert_eq!(
+            after_ai.original_display_dimensions().as_tuple(),
+            (4000, 3000)
+        );
+        assert_eq!(
+            after_ai
+                .capture_presentation(&ctx)
+                .original_display_dimensions(),
+            after_ai.original_display_dimensions()
+        );
+    }
+
+    #[test]
+    fn source_coverage_thin_rounded_sampler_keeps_canonical_aspect_and_native_pixel_density_separate()
+     {
+        let ctx = egui::Context::default();
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(800, 600),
+                (800, 600),
+                (390, 0, 20, 600),
+            )
+            .unwrap(),
+        );
+        let source = ctx.load_texture(
+            "thin-rounded",
+            egui::ColorImage::filled([9, 256], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            source,
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(resource.full_source_size_vec2(), egui::vec2(800.0, 600.0));
+        assert_eq!(resource.size(), [9, 256]);
+        // At 0.4 physical px per canonical px the rounded 9x256 sampler
+        // downsamples to 8x240, even though scalar 0.4 is not its texel scale.
+        let key = resource_lanczos_key(
+            &resource,
+            0.32,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [8, 240]);
+        assert_eq!(key.source_region, LanczosSourceRegionKey::Full);
+        // At this boundary the height is 1:1 while the rounded narrow axis
+        // still shrinks. The maximum axis alone must not bypass resampling.
+        let key = resource_lanczos_key(
+            &resource,
+            (256.0 / 600.0) / 1.25,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [8, 256]);
+        // Height crosses into upscale first, while width remains below 1:1.
+        // Output dimensions remain the geometry-owned pair for both axes.
+        let mixed_request = VisibleRegionRequest {
+            source_uv_rect: coverage.source_uv_rect().unwrap(),
+            target_size: [9, 264],
+        };
+        let mixed = resource_lanczos_key(
+            &resource,
+            0.44 / 1.25,
+            1.25,
+            Some(mixed_request),
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.scale_branch,
+            FullscreenPaintScaleBranch::UpscaleLanczos
+        );
+        assert_eq!(mixed.target_size, [9, 264]);
+        assert!(work_plan_for_key([9, 256], mixed).is_ok());
+        for ppp in [1.25, 1.375, 1.5] {
+            let geometry = crate::displayed_image_transform::DisplayedImageGeometry::resolve(
+                crate::displayed_image_transform::DisplayedImageGeometryInput {
+                    viewport_rect: egui::Rect::from_min_size(
+                        egui::pos2(13.0, 17.0),
+                        egui::vec2(1003.0, 747.0),
+                    ),
+                    source_size: egui::vec2(800.0, 600.0),
+                    texture_size: resource.full_source_size_vec2(),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    pixels_per_point: ppp,
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                },
+            )
+            .unwrap();
+            let request = resource
+                .visible_region_request(&geometry, geometry.viewport_rect)
+                .unwrap();
+            assert_eq!(
+                resource.anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256]),
+                "Anime budget uses the actual sampler, not the 800x600 geometry basis"
+            );
+            let held = resource.capture_presentation(&ctx);
+            assert_eq!(
+                held.anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256])
+            );
+            assert_eq!(
+                FullscreenPaintPayload::PresentationMaterial(held)
+                    .anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256])
+            );
+            let key = resource_lanczos_key(
+                &resource,
+                geometry.total_scale,
+                ppp,
+                Some(request),
+                PostFilter::None,
+                25,
+                AnimeUpscaleSourceLimit::default(),
+            )
+            .unwrap();
+            assert_eq!(key.scale_branch, FullscreenPaintScaleBranch::UpscaleLanczos);
+            assert_eq!(
+                key.target_size, request.target_size,
+                "native output uses the geometry-owned physical span"
+            );
+            assert_eq!(
+                key.source_region.visible_rect().unwrap(),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+            );
+            let native = resource.with_lanczos(
+                Arc::new(LanczosOutput {
+                    texture_id_lease: NativeTextureIdLease {
+                        texture_id: egui::TextureId::User(900_000),
+                        releaser: Arc::new(CountingReleaser(AtomicUsize::new(0))),
+                    },
+                    key,
+                    _texture: None,
+                }),
+                key.smoothing_percent,
+            );
+            assert!(
+                native.capture_presentation(&ctx).matches_prepare(
+                    geometry.total_scale,
+                    ppp,
+                    Some(request),
+                    PostFilter::None,
+                    25,
+                    AnimeUpscaleSourceLimit::default()
+                ),
+                "native capture and normal preparation must use the same sampling density"
+            );
+        }
     }
 
     #[test]
@@ -2960,6 +4963,650 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct TestPrepareRequest {
+        scale: f32,
+        ppp: f32,
+        visible: Option<VisibleRegionRequest>,
+        filter: PostFilter,
+        smoothing: u32,
+        anime_limit: AnimeUpscaleSourceLimit,
+    }
+
+    impl TestPrepareRequest {
+        fn matches(self, material: &FullscreenPresentationResource) -> bool {
+            material.matches_prepare(
+                self.scale,
+                self.ppp,
+                self.visible,
+                self.filter,
+                self.smoothing,
+                self.anime_limit,
+            )
+        }
+
+        fn reuse(
+            self,
+            cache: &mut GpuLanczosCache,
+            material: &FullscreenPresentationResource,
+        ) -> bool {
+            cache.reuse_presentation(
+                material,
+                self.scale,
+                self.ppp,
+                self.visible,
+                self.filter,
+                self.smoothing,
+                self.anime_limit,
+            )
+        }
+
+        fn capture_native(
+            self,
+            ctx: &egui::Context,
+            source_size: [usize; 2],
+        ) -> FullscreenPresentationResource {
+            let source = FullscreenPaintResource::resampleable(
+                3,
+                metadata_only_texture(ctx, source_size, egui::TextureOptions::LINEAR),
+                FullscreenPaintSourceGeneration {
+                    items: 7,
+                    input: 11,
+                },
+            );
+            let key = requested_lanczos_key(
+                source.source_id().unwrap(),
+                source.source_texture_id(),
+                source.source_generation().unwrap(),
+                [source_size[0] as u32, source_size[1] as u32],
+                self.scale,
+                self.ppp,
+                self.visible,
+                self.filter,
+                self.smoothing,
+                self.anime_limit,
+            )
+            .unwrap();
+            source
+                .with_lanczos(
+                    Arc::new(LanczosOutput {
+                        texture_id_lease: NativeTextureIdLease {
+                            texture_id: egui::TextureId::User(9003),
+                            releaser: Arc::new(CountingReleaser(AtomicUsize::new(0))),
+                        },
+                        key,
+                        _texture: None,
+                    }),
+                    key.smoothing_percent,
+                )
+                .capture_presentation(ctx)
+        }
+    }
+
+    #[test]
+    fn held_native_prepare_identity_uses_held_source_and_actual_downscale_request() {
+        let ctx = egui::Context::default();
+        let request = TestPrepareRequest {
+            scale: 0.25,
+            ppp: 1.0,
+            visible: None,
+            filter: PostFilter::None,
+            smoothing: 20,
+            anime_limit: AnimeUpscaleSourceLimit::Px4096,
+        };
+        let held = request.capture_native(&ctx, [8000, 8192]);
+        assert!(
+            ctx.tex_manager()
+                .read()
+                .meta(held.source_texture_id())
+                .is_none()
+        );
+        // A publication may have a different resolution and generation. The
+        // held allocation's request identity remains based on its own source.
+        let new_source = FullscreenPaintResource::resampleable(
+            3,
+            metadata_only_texture(&ctx, [4000, 4096], egui::TextureOptions::LINEAR),
+            FullscreenPaintSourceGeneration {
+                items: 7,
+                input: 12,
+            },
+        );
+        assert_ne!(new_source.source_texture_id(), held.source_texture_id());
+        assert!(request.matches(&held));
+        for changed in [
+            TestPrepareRequest {
+                scale: 0.3,
+                ..request
+            },
+            TestPrepareRequest {
+                ppp: 2.0,
+                ..request
+            },
+            TestPrepareRequest {
+                scale: 1.0,
+                ..request
+            },
+            TestPrepareRequest {
+                smoothing: 30,
+                ..request
+            },
+        ] {
+            assert!(!changed.matches(&held));
+        }
+        // The ordinary downscale path ignores visible ROI, upscale filter and
+        // Anime limits; request identity must preserve that same equivalence.
+        assert!(
+            TestPrepareRequest {
+                visible: Some(region_request(
+                    egui::Rect::from_min_max(egui::pos2(0.2, 0.3), egui::pos2(0.5, 0.8)),
+                    [1, 1],
+                )),
+                filter: PostFilter::Nearest,
+                anime_limit: AnimeUpscaleSourceLimit::Px2048,
+                ..request
+            }
+            .matches(&held)
+        );
+        let managed = new_source.capture_presentation(&ctx);
+        assert!(!request.matches(&managed));
+    }
+
+    #[test]
+    fn held_native_prepare_identity_checks_upscale_region_target_filter_and_anime_limit() {
+        let ctx = egui::Context::default();
+        let roi = egui::Rect::from_min_max(egui::pos2(0.1, 0.2), egui::pos2(0.6, 0.7));
+        let request = TestPrepareRequest {
+            scale: 2.0,
+            ppp: 1.0,
+            visible: Some(region_request(roi, [1000, 1000])),
+            filter: PostFilter::None,
+            smoothing: 20,
+            anime_limit: AnimeUpscaleSourceLimit::Px4096,
+        };
+        let held = request.capture_native(&ctx, [5000, 4000]);
+        assert!(request.matches(&held));
+        for changed in [
+            TestPrepareRequest {
+                visible: None,
+                ..request
+            },
+            TestPrepareRequest {
+                visible: Some(region_request(roi, [1001, 1000])),
+                ..request
+            },
+            TestPrepareRequest {
+                visible: Some(region_request(
+                    egui::Rect::from_min_max(egui::pos2(0.11, 0.2), roi.max),
+                    [1000, 1000],
+                )),
+                ..request
+            },
+            TestPrepareRequest {
+                visible: Some(region_request(roi, [MAX_UPSCALE_TARGET_DIMENSION + 1, 8])),
+                ..request
+            },
+            TestPrepareRequest {
+                filter: PostFilter::Nearest,
+                ..request
+            },
+            TestPrepareRequest {
+                filter: PostFilter::UpscaleSharp,
+                ..request
+            },
+            TestPrepareRequest {
+                filter: PostFilter::UpscaleAnime,
+                ..request
+            },
+            TestPrepareRequest {
+                filter: PostFilter::UpscalePixelArt,
+                ..request
+            },
+        ] {
+            assert!(!changed.matches(&held));
+        }
+        assert!(
+            TestPrepareRequest {
+                smoothing: 100,
+                ..request
+            }
+            .matches(&held)
+        );
+        // Scale/ppp do not form extra GPU identity when the caller's explicit
+        // visible texel target and branch remain identical; layout is checked by its owner.
+        assert!(
+            TestPrepareRequest {
+                scale: 2.5,
+                ppp: 2.0,
+                ..request
+            }
+            .matches(&held)
+        );
+
+        let anime = TestPrepareRequest {
+            filter: PostFilter::UpscaleAnime,
+            visible: Some(VisibleRegionRequest::full([1000, 1000])),
+            ..request
+        };
+        let fallback = anime.capture_native(&ctx, [5000, 4000]);
+        assert!(anime.matches(&fallback));
+        assert!(
+            !TestPrepareRequest {
+                anime_limit: AnimeUpscaleSourceLimit::Unlimited,
+                ..anime
+            }
+            .matches(&fallback)
+        );
+        assert!(
+            TestPrepareRequest {
+                anime_limit: AnimeUpscaleSourceLimit::Px2048,
+                ..anime
+            }
+            .matches(&fallback)
+        );
+    }
+
+    #[test]
+    fn held_native_reuse_preserves_housekeeping_without_preparing_or_advancing_cache_clock() {
+        let ctx = egui::Context::default();
+        let request = TestPrepareRequest {
+            scale: 2.0,
+            ppp: 1.0,
+            visible: Some(VisibleRegionRequest::full([16, 24])),
+            filter: PostFilter::None,
+            smoothing: 20,
+            anime_limit: AnimeUpscaleSourceLimit::Px4096,
+        };
+        let held = request.capture_native(&ctx, [8, 12]);
+        let output = held.lanczos_output().unwrap();
+        let key = output.key;
+        let fallback = LanczosFallbackSourceKey {
+            source_id: key.source_id,
+            source_texture_id: key.source_texture_id,
+            generation: key.generation,
+            scale_branch: key.scale_branch,
+        };
+        let sibling = LanczosFallbackSourceKey {
+            source_id: FullscreenPaintSourceId::Page(4),
+            ..fallback
+        };
+        let mut cache = GpuLanczosCache {
+            active_smoothing_percent: 20,
+            use_clock: 23,
+            regeneration_count: 9,
+            ..Default::default()
+        };
+        cache.entries.insert(
+            key,
+            LanczosCacheEntry {
+                output: output.clone(),
+                last_used: 7,
+            },
+        );
+        cache.limit_fallback_sources.extend([fallback, sibling]);
+        assert!(request.reuse(&mut cache, &held));
+        assert!(!cache.limit_fallback_sources.contains(&fallback));
+        assert!(cache.limit_fallback_sources.contains(&sibling));
+        assert_eq!(cache.entries[&key].last_used, 7);
+        assert_eq!(cache.use_clock, 23);
+        assert_eq!(cache.regeneration_count, 9);
+        assert!(cache.take_test_resolve_input_ids().is_empty());
+
+        cache.limit_fallback_sources.insert(fallback);
+        assert!(
+            !TestPrepareRequest {
+                visible: None,
+                ..request
+            }
+            .reuse(&mut cache, &held)
+        );
+        assert!(cache.limit_fallback_sources.contains(&fallback));
+        assert_eq!(cache.entries[&key].last_used, 7);
+        // Upscale ignores support-percent for its output identity, but ordinary
+        // preparation still synchronizes the setting and clears obsolete cache entries.
+        assert!(
+            TestPrepareRequest {
+                smoothing: 200,
+                ..request
+            }
+            .reuse(&mut cache, &held)
+        );
+        assert_eq!(cache.active_smoothing_percent, 100);
+        assert!(cache.entries.is_empty());
+        assert!(!cache.limit_fallback_sources.contains(&fallback));
+        assert!(cache.limit_fallback_sources.contains(&sibling));
+        assert_eq!(cache.use_clock, 23);
+        assert_eq!(cache.regeneration_count, 9);
+        assert!(cache.take_test_resolve_input_ids().is_empty());
+        assert!(held.source_texture().is_none());
+    }
+
+    #[test]
+    fn presentation_native_releases_source_and_preserves_metadata_through_batch() {
+        let ctx = egui::Context::default();
+        let source = ctx.load_texture(
+            "presentation-native-input",
+            egui::ColorImage::filled([16, 8], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_texture_id = source.id();
+        let generation = FullscreenPaintSourceGeneration {
+            items: 17,
+            input: 9,
+        };
+        let proof = TestPaintProvenance {
+            context: crate::app::ViewerContextId::for_test(4),
+            items_generation: generation.items,
+            item: "presentation-native-input".to_owned(),
+            page: 3,
+        };
+        let releaser = Arc::new(CountingReleaser(AtomicUsize::new(0)));
+        let roi = egui::Rect::from_min_max(egui::pos2(0.25, 0.0), egui::pos2(0.75, 1.0));
+        let resource = FullscreenPaintResource::resampleable(3, source, generation)
+            .with_test_paint_provenance(proof.clone())
+            .with_lanczos(
+                Arc::new(LanczosOutput {
+                    texture_id_lease: NativeTextureIdLease {
+                        texture_id: egui::TextureId::User(9001),
+                        releaser: releaser.clone(),
+                    },
+                    key: LanczosCacheKey {
+                        source_id: FullscreenPaintSourceId::Page(3),
+                        source_texture_id,
+                        generation,
+                        target_size: [8, 4],
+                        smoothing_percent: 0,
+                        scale_branch: FullscreenPaintScaleBranch::UpscaleLanczos,
+                        source_region: LanczosSourceRegionKey::from_visible_rect(roi),
+                    },
+                    _texture: None,
+                }),
+                0,
+            );
+        let payload =
+            FullscreenPaintPayload::PresentationMaterial(resource.capture_presentation(&ctx));
+        drop(resource);
+        assert!(ctx.tex_manager().read().meta(source_texture_id).is_none());
+        assert!(payload.source_texture().is_none());
+        assert_eq!(payload.size(), [16, 8]);
+        assert_eq!(payload.size_vec2(), egui::vec2(16.0, 8.0));
+        assert_eq!(payload.source_texture_id(), source_texture_id);
+        assert_eq!(payload.source_id(), Some(FullscreenPaintSourceId::Page(3)));
+        assert_eq!(payload.page_idx(), Some(3));
+        assert_eq!(payload.source_generation(), Some(generation));
+        assert_eq!(payload.test_paint_provenance(), Some(&proof));
+        assert_eq!(payload.visible_source_uv_rect(), Some(roi));
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        payload.account_material(&mut accountant);
+        assert_eq!(accountant.finish().total_bytes(), 8 * 4 * 4);
+
+        let mut cache = GpuLanczosCache::default();
+        let (prepared, event) = payload.prepare(
+            &mut cache,
+            None,
+            1.0,
+            2.0,
+            None,
+            PostFilter::Nearest,
+            80,
+            AnimeUpscaleSourceLimit::default(),
+        );
+        assert!(event.is_none());
+        assert_eq!(prepared.id(), payload.id());
+        assert_eq!(prepared.visible_source_uv_rect(), Some(roi));
+        assert_eq!(cache.active_smoothing_percent, 0);
+        assert!(cache.entries.is_empty());
+        drop(prepared);
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(64.0, 64.0),
+        ));
+        let mut output = ctx.run_pass(raw, |ctx| {
+            let painter = ctx.debug_painter();
+            painter.image(
+                payload.id(),
+                egui::Rect::from_min_size(egui::pos2(2.0, 2.0), egui::vec2(16.0, 8.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            payload.retain_native_output_for_paint(&painter);
+        });
+        drop(payload);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
+        assert!(
+            primitives.iter().any(|primitive| matches!(
+                &primitive.primitive,
+                egui::epaint::Primitive::Callback(_)
+            ))
+        );
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
+        drop(primitives);
+        assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn presentation_managed_preserves_actual_sampler_and_mip_accounting() {
+        for options in [
+            egui::TextureOptions::NEAREST,
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+        ] {
+            let ctx = egui::Context::default();
+            let source = ctx.load_texture(
+                "presentation-managed-input",
+                egui::ColorImage::filled([7, 5], egui::Color32::WHITE),
+                options,
+            );
+            // Display sources are immutable allocations. epaint 0.33 metadata records
+            // initial options; changing a handle's sampler with set is not this contract.
+            let source_id = source.id();
+            let resource = FullscreenPaintResource::resampleable(
+                2,
+                source,
+                FullscreenPaintSourceGeneration { items: 6, input: 4 },
+            );
+            let presentation = resource.capture_presentation(&ctx);
+            drop(resource);
+            let PresentationMaterial::Managed { actual_options, .. } = &presentation.material
+            else {
+                panic!("ordinary source painting remains Managed");
+            };
+            assert_eq!(*actual_options, options);
+            assert_eq!(presentation.source_texture().unwrap().id(), source_id);
+            assert_eq!(presentation.id(), source_id);
+            assert_eq!(presentation.size(), [7, 5]);
+            let mut accountant = crate::vram_budget::VramAccountant::default();
+            presentation.account_material(&mut accountant);
+            assert_eq!(
+                accountant.finish().total_bytes(),
+                (crate::vram_budget::texture_size_texels([7, 5], options.mipmap_mode.is_some()) * 4)
+                    as u64,
+            );
+            assert!(ctx.tex_manager().read().meta(source_id).is_some());
+            drop(presentation);
+            assert!(ctx.tex_manager().read().meta(source_id).is_none());
+        }
+    }
+
+    fn metadata_only_texture(
+        ctx: &egui::Context,
+        size: [usize; 2],
+        options: egui::TextureOptions,
+    ) -> egui::TextureHandle {
+        let manager = ctx.tex_manager();
+        let id = manager.write().alloc(
+            "managed-prepare-metadata".to_owned(),
+            egui::ImageData::Color(Arc::new(egui::ColorImage {
+                size,
+                source_size: egui::vec2(size[0] as f32, size[1] as f32),
+                pixels: Vec::new(),
+            })),
+            options,
+        );
+        egui::TextureHandle::new(manager, id)
+    }
+
+    fn assert_managed_prepared_allocation(
+        ctx: &egui::Context,
+        prepared: &FullscreenPaintResource,
+        original: &FullscreenPaintResource,
+        options: egui::TextureOptions,
+    ) {
+        let captured = prepared.capture_presentation(ctx);
+        assert!(captured.lanczos_output().is_none());
+        assert!(captured.visible_source_uv_rect().is_none());
+        assert_eq!(captured.id(), original.source_texture_id());
+        assert_eq!(captured.size(), original.size());
+        assert_eq!(captured.source_id(), original.source_id());
+        assert_eq!(captured.source_generation(), original.source_generation());
+        assert_eq!(
+            captured.source_texture().unwrap().id(),
+            original.source_texture_id()
+        );
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        captured.account_material(&mut accountant);
+        assert_eq!(
+            accountant.finish().total_bytes(),
+            crate::vram_budget::texture_size_texels(original.size(), options.mipmap_mode.is_some())
+                as u64
+                * 4,
+        );
+    }
+
+    #[test]
+    fn ordinary_prepare_managed_matrix_keeps_allocation_geometry_and_accounting() {
+        let ctx = egui::Context::default();
+        let mip = egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
+        for (name, size, options, scale, filter, resampleable) in [
+            ("one-to-one", [8, 12], mip, 1.0, PostFilter::None, true),
+            (
+                "nearest-upscale",
+                [8, 12],
+                egui::TextureOptions::NEAREST,
+                2.0,
+                PostFilter::Nearest,
+                true,
+            ),
+            (
+                "large-direct",
+                [8000, 8192],
+                mip,
+                0.25,
+                PostFilter::None,
+                false,
+            ),
+            (
+                "catalog-thumbnail",
+                [7, 5],
+                egui::TextureOptions::LINEAR,
+                3.0,
+                PostFilter::None,
+                false,
+            ),
+        ] {
+            let source = metadata_only_texture(&ctx, size, options);
+            let original = if resampleable {
+                FullscreenPaintResource::resampleable(
+                    3,
+                    source,
+                    FullscreenPaintSourceGeneration {
+                        items: 7,
+                        input: 11,
+                    },
+                )
+            } else {
+                FullscreenPaintResource::direct(source)
+            };
+            let mut cache = GpuLanczosCache::default();
+            let (prepared, event) = cache.resolve(
+                None,
+                &original,
+                scale,
+                1.0,
+                None,
+                filter,
+                0,
+                AnimeUpscaleSourceLimit::default(),
+            );
+            assert!(event.is_none(), "{name}");
+            assert_managed_prepared_allocation(&ctx, &prepared, &original, options);
+            assert_eq!(cache.regeneration_count, 0, "{name}");
+            assert_eq!(cache.use_clock, 0, "{name}");
+            assert!(cache.entries.is_empty(), "{name}");
+            assert!(cache.resampler.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn ordinary_prepare_output_limit_fallback_captures_actual_managed_allocation() {
+        // A real headless state gets past the ordinary renderer-availability gate.
+        // No surface/window, texture upload, resampler or presentation is created.
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: None,
+            ..Default::default()
+        }))
+        .expect("output-limit prepare regression requires a headless wgpu adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("managed output-limit prepare regression"),
+            ..Default::default()
+        }))
+        .expect("headless output-limit device");
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let renderer = egui_wgpu::Renderer::new(&device, target_format, Default::default());
+        let render_state = egui_wgpu::RenderState {
+            instance,
+            adapter,
+            available_adapters: Vec::new(),
+            device,
+            queue,
+            target_format,
+            renderer: Arc::new(egui::epaint::mutex::RwLock::new(renderer)),
+        };
+        let ctx = egui::Context::default();
+        let options =
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
+        let original = FullscreenPaintResource::resampleable(
+            3,
+            metadata_only_texture(&ctx, [8, 12], options),
+            FullscreenPaintSourceGeneration {
+                items: 7,
+                input: 11,
+            },
+        );
+        let mut cache = GpuLanczosCache::default();
+        for first in [true, false] {
+            let (prepared, event) = cache.resolve(
+                Some(&render_state),
+                &original,
+                2.0,
+                1.0,
+                Some(VisibleRegionRequest::full([
+                    MAX_UPSCALE_TARGET_DIMENSION + 1,
+                    8,
+                ])),
+                PostFilter::None,
+                0,
+                AnimeUpscaleSourceLimit::default(),
+            );
+            assert_eq!(
+                matches!(event, Some(LanczosPerfEvent::UpscaleLimitFallback(_))),
+                first
+            );
+            assert_managed_prepared_allocation(&ctx, &prepared, &original, options);
+            assert_eq!(cache.regeneration_count, 0);
+            assert_eq!(cache.use_clock, 0);
+            assert!(cache.entries.is_empty());
+            assert!(cache.resampler.is_none());
+            assert_eq!(cache.limit_fallback_sources.len(), 1);
+        }
+    }
+
     #[cfg(all(windows, feature = "test-script"))]
     #[test]
     fn test_script_content_proof_survives_all_paint_resource_forms() {
@@ -2982,6 +5629,8 @@ mod tests {
         let direct = FullscreenPaintResource::direct(source.clone())
             .with_test_script_content_proof(proof.clone());
         assert_eq!(direct.test_script_content_proof(), Some(&proof));
+        let presentation = direct.capture_presentation(&context);
+        assert_eq!(presentation.test_script_content_proof(), Some(&proof));
 
         let generation = FullscreenPaintSourceGeneration {
             items: 34,
@@ -2997,13 +5646,23 @@ mod tests {
                 texture_id: egui::TextureId::User(8128),
                 releaser: releaser.clone(),
             },
-            size: [1, 1],
-            scale_branch: FullscreenPaintScaleBranch::DownscaleLanczos,
-            source_region: LanczosSourceRegionKey::Full,
+            key: LanczosCacheKey {
+                source_id: FullscreenPaintSourceId::Page(5),
+                source_texture_id: resampleable.source_texture_id(),
+                generation,
+                target_size: [1, 1],
+                smoothing_percent: 0,
+                scale_branch: FullscreenPaintScaleBranch::DownscaleLanczos,
+                source_region: LanczosSourceRegionKey::Full,
+            },
             _texture: None,
         });
         let lanczos = resampleable.with_lanczos(output, 0);
         assert_eq!(lanczos.test_script_content_proof(), Some(&proof));
+        let presentation = lanczos.capture_presentation(&context);
+        assert_eq!(presentation.test_script_content_proof(), Some(&proof));
+        let payload = FullscreenPaintPayload::PresentationMaterial(presentation);
+        assert_eq!(payload.test_script_content_proof(), Some(&proof));
 
         let restored = lanczos.original_resampleable();
         assert_eq!(restored.test_script_content_proof(), Some(&proof));
@@ -3042,7 +5701,7 @@ mod tests {
             egui::Pos2::ZERO,
             egui::vec2(64.0, 64.0),
         ));
-        let output = ctx.run(raw, |ctx| {
+        let output = ctx.run_pass(raw, |ctx| {
             let painter = ctx.debug_painter().with_clip_rect(clip_rect);
             painter.image(
                 texture_id,
@@ -3061,8 +5720,10 @@ mod tests {
         owner: Arc<NativeTextureIdLease>,
     ) -> Vec<egui::ClippedPrimitive> {
         let clip_rect = egui::Rect::from_min_max(egui::pos2(3.0, 5.0), egui::pos2(41.0, 43.0));
-        let (ctx, output) = native_texture_batch_output(texture_id, owner, clip_rect);
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let (ctx, mut output) = native_texture_batch_output(texture_id, owner, clip_rect);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
         assert!(primitives.iter().any(|primitive| {
             matches!(
                 &primitive.primitive,
@@ -3089,11 +5750,13 @@ mod tests {
             releaser: releaser.clone(),
         });
         let clip_rect = egui::Rect::from_min_max(egui::pos2(3.0, 5.0), egui::pos2(41.0, 43.0));
-        let (ctx, output) =
+        let (ctx, mut output) =
             native_texture_batch_output(lease.texture_id, Arc::clone(&lease), clip_rect);
         drop(lease);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
         drop(primitives);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
@@ -3113,7 +5776,7 @@ mod tests {
         );
         drop(lease);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
-        drop(output);
+        output.drop_without_applying_deltas();
         assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
     }
 
@@ -3125,11 +5788,13 @@ mod tests {
             releaser: releaser.clone(),
         });
         let empty_clip = egui::Rect::from_min_max(egui::pos2(7.0, 7.0), egui::pos2(7.0, 7.0));
-        let (ctx, output) =
+        let (ctx, mut output) =
             native_texture_batch_output(lease.texture_id, Arc::clone(&lease), empty_clip);
         drop(lease);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
         assert!(primitives.is_empty());
         assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
     }
@@ -3245,6 +5910,247 @@ mod tests {
         assert!(plan.intermediate_x_start + plan.intermediate_x_width >= 2003);
         assert!(plan.intermediate_x_width < 4000);
         assert!(plan.texture_fetches > 0);
+    }
+
+    fn back_fake_entry(cache: &mut GpuLanczosCache, key: LanczosCacheKey) {
+        cache.entries.insert(
+            key,
+            LanczosCacheEntry {
+                output: Arc::new(LanczosOutput {
+                    texture_id_lease: NativeTextureIdLease {
+                        texture_id: egui::TextureId::User(9900),
+                        releaser: Arc::new(CountingReleaser(AtomicUsize::new(0))),
+                    },
+                    key,
+                    _texture: None,
+                }),
+                last_used: 17,
+            },
+        );
+    }
+
+    fn back_plan(key: LanczosCacheKey, smoothing_percent: u32) -> NativePrewarmPlan {
+        NativePrewarmPlan {
+            key,
+            work: work_plan_for_key([16, 24], key).unwrap(),
+            smoothing_percent,
+        }
+    }
+
+    #[test]
+    fn back_native_no_removal_covers_all_invalidation_and_pruning_rules_purely() {
+        let base = LanczosCacheKey {
+            source_id: FullscreenPaintSourceId::Page(3),
+            source_texture_id: egui::TextureId::Managed(7),
+            generation: FullscreenPaintSourceGeneration { items: 4, input: 8 },
+            target_size: [32, 48],
+            smoothing_percent: 0,
+            scale_branch: FullscreenPaintScaleBranch::UpscaleLanczos,
+            source_region: LanczosSourceRegionKey::Full,
+        };
+        let plan = back_plan(base, 50);
+        let mut cache = GpuLanczosCache::default();
+        assert!(
+            cache.prewarm_no_removal_admission(plan).is_ok(),
+            "empty cache can synchronize smoothing"
+        );
+        back_fake_entry(
+            &mut cache,
+            LanczosCacheKey {
+                source_id: FullscreenPaintSourceId::Page(99),
+                ..base
+            },
+        );
+        cache.use_clock = 29;
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheSmoothingClear)
+        );
+        assert_eq!(
+            (
+                cache.entries.len(),
+                cache.active_smoothing_percent,
+                cache.use_clock
+            ),
+            (1, 0, 29)
+        );
+        cache.active_smoothing_percent = 50;
+        assert!(
+            cache.prewarm_no_removal_admission(plan).is_ok(),
+            "other sources do not trigger source replacement"
+        );
+        for old in [
+            LanczosCacheKey {
+                source_texture_id: egui::TextureId::Managed(8),
+                ..base
+            },
+            LanczosCacheKey {
+                generation: FullscreenPaintSourceGeneration { items: 4, input: 7 },
+                ..base
+            },
+        ] {
+            cache.entries.clear();
+            back_fake_entry(&mut cache, old);
+            assert_eq!(
+                cache.prewarm_no_removal_admission(plan),
+                Err(NativePrewarmUnavailable::CacheSourceReplacement)
+            );
+            assert_eq!(cache.entries.len(), 1);
+        }
+        cache.entries.clear();
+        for target_size in [[34, 50], [36, 52]] {
+            back_fake_entry(
+                &mut cache,
+                LanczosCacheKey {
+                    target_size,
+                    ..base
+                },
+            );
+        }
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheCapacity)
+        );
+        cache.entries.clear();
+        for idx in 0..MAX_CACHE_ENTRIES {
+            back_fake_entry(
+                &mut cache,
+                LanczosCacheKey {
+                    source_id: FullscreenPaintSourceId::Page(idx + 100),
+                    ..base
+                },
+            );
+        }
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheCapacity)
+        );
+        cache.entries.clear();
+        for idx in 0..2 {
+            back_fake_entry(
+                &mut cache,
+                LanczosCacheKey {
+                    source_id: FullscreenPaintSourceId::Page(idx + 100),
+                    target_size: [4096, 4096],
+                    ..base
+                },
+            );
+        }
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheCapacity)
+        );
+    }
+
+    #[test]
+    fn back_native_execution_rechecks_no_removal_before_backing_claim_or_mutation() {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let renderer = egui_wgpu::Renderer::new(&device, target_format, Default::default());
+        let rs = egui_wgpu::RenderState {
+            instance,
+            adapter,
+            available_adapters: Vec::new(),
+            device,
+            queue,
+            target_format,
+            renderer: Arc::new(egui::epaint::mutex::RwLock::new(renderer)),
+        };
+        let ctx = egui::Context::default();
+        let tex = metadata_only_texture(&ctx, [16, 24], egui::TextureOptions::LINEAR);
+        let resource = FullscreenPaintResource::resampleable(
+            3,
+            tex,
+            FullscreenPaintSourceGeneration { items: 4, input: 8 },
+        );
+        let key = resource_lanczos_key(
+            &resource,
+            0.5,
+            1.0,
+            None,
+            PostFilter::None,
+            0,
+            AnimeUpscaleSourceLimit::Px4096,
+        )
+        .unwrap();
+        let plan = back_plan(key, 0);
+        let mut cache = GpuLanczosCache::default();
+        assert!(cache.prewarm_no_removal_admission(plan).is_ok());
+        let old = LanczosCacheKey {
+            source_texture_id: egui::TextureId::Managed(9999),
+            ..key
+        };
+        back_fake_entry(&mut cache, old); // changes after caller's pure preflight
+        let claimed = std::cell::Cell::new(false);
+        assert!(matches!(
+            cache.execute_prewarm_with_policy(
+                &rs,
+                &resource,
+                plan,
+                NativePrewarmPolicy::NoRemoval,
+                |_| {
+                    claimed.set(true);
+                    true
+                }
+            ),
+            NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::CacheSourceReplacement)
+        ));
+        assert!(!claimed.get());
+        assert_eq!(cache.use_clock, 0);
+        assert_eq!(cache.entries.len(), 1);
+        cache.active_smoothing_percent = 50;
+        assert!(matches!(
+            cache.execute_prewarm_with_policy(
+                &rs,
+                &resource,
+                plan,
+                NativePrewarmPolicy::NoRemoval,
+                |_| {
+                    claimed.set(true);
+                    true
+                }
+            ),
+            NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::CacheSmoothingClear)
+        ));
+        assert!(!claimed.get());
+        assert_eq!(cache.active_smoothing_percent, 50);
+        assert_eq!(cache.use_clock, 0);
+        assert!(cache.entries.contains_key(&old));
+        cache.active_smoothing_percent = 0;
+        rs.renderer.write().update_texture(
+            &rs.device,
+            &rs.queue,
+            resource.source_texture_id(),
+            &egui::epaint::ImageDelta::full(
+                egui::ColorImage::filled([16, 24], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        assert!(matches!(
+            cache.execute_prewarm(&rs, &resource, plan, |_| true),
+            NativePrewarmExecution::Submitted { .. }
+        ));
+        assert!(!cache.entries.contains_key(&old));
+        assert!(cache.entries.contains_key(&key));
+        let mut empty = GpuLanczosCache::default();
+        empty.active_smoothing_percent = 50;
+        assert!(matches!(
+            empty.execute_prewarm_with_policy(
+                &rs,
+                &resource,
+                plan,
+                NativePrewarmPolicy::NoRemoval,
+                |_| true
+            ),
+            NativePrewarmExecution::Submitted { .. }
+        ));
+        assert_eq!(empty.active_smoothing_percent, 0);
+        assert!(empty.entries.contains_key(&key));
     }
 
     #[test]

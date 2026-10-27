@@ -232,6 +232,31 @@ impl App {
         }
     }
 
+    pub(super) fn capture_snapshot_viewing_state(&self) -> crate::snapshot::SnapshotViewingState {
+        crate::snapshot::SnapshotViewingState {
+            mode: self.spread_mode,
+            direction: self.reading_direction,
+            flow: self.reading_flow,
+            shift: self.spread_shift.fork_accepted(),
+            composition: self.book_composition.clone(),
+            final_cover: self.final_cover_spread_preference,
+            endpoints: self.singleton_spread_endpoint_preferences,
+            page_alone: self.page_alone_preferences,
+        }
+    }
+
+    fn restore_snapshot_viewing_state(&mut self, state: crate::snapshot::SnapshotViewingState) {
+        self.spread_mode = state.mode;
+        self.reading_direction = state.direction;
+        self.reading_flow = state.flow;
+        self.spread_shift = state.shift;
+        self.retire_book_presentation_permission();
+        self.book_composition = state.composition;
+        self.final_cover_spread_preference = state.final_cover;
+        self.singleton_spread_endpoint_preferences = state.endpoints;
+        self.page_alone_preferences = state.page_alone;
+    }
+
     fn finish_snapshot_viewer_index_swap(&mut self, swap: Option<SnapshotViewerIndexSwap>) {
         self.finish_viewer_index_swap(swap, ViewerIndexSwapPolicy::Snapshot);
     }
@@ -274,6 +299,7 @@ impl App {
             self.restore_fs_page_from_snapshot(swap.new_fullscreen_idx, transfer);
         }
         self.fullscreen_idx = Some(swap.new_fullscreen_idx);
+        self.align_page_edit_slots_with_exact_reader();
         self.video_audio_mode = self.video_audio_mode.and_then(&remap);
         self.video_audio_vst = self.video_audio_vst.take().and_then(|mut state| {
             remap(state.fs_idx).map(|new_idx| {
@@ -735,8 +761,8 @@ impl App {
         }
         // Ctrl+G dirty (= query が last_executed と異なる、入力中で結果未確定)
         if self.global_search.active
-            && !self.global_search.query.is_empty()
-            && self.global_search.query != self.global_search.last_executed
+            && !self.global_search.draft().is_empty()
+            && self.global_search.draft() != self.global_search.last_executed
         {
             return Some("検索結果の確定後にお試しください (Ctrl+G)");
         }
@@ -873,6 +899,7 @@ impl App {
         self.thumbnails.truncate(parent_len);
         self.image_metas.truncate(parent_len);
         self.page_identity_index = direct.saved_page_identity_index;
+        self.projection_recipe = direct.saved_projection_recipe;
         self.visible_indices.retain(|idx| *idx < parent_len);
         self.details_order.retain(|idx| *idx < parent_len);
         self.checked.retain(|idx| *idx < parent_len);
@@ -894,7 +921,7 @@ impl App {
                     .and_then(snapshot_key_from_grid_item)
                     .is_some()
         }) {
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.normalize_direct_media_basis_for_snapshot();
@@ -909,7 +936,7 @@ impl App {
             .collect();
         if captured_entries.is_empty() {
             // 0 件の snapshot は意味がない (= scope なし)。toast で警告して早期 return。
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.capture_main_list_restore_cursor();
@@ -992,11 +1019,19 @@ impl App {
             membership.insert(entry.key.clone(), idx);
         }
 
+        // Park the original presentation before the index-swap helper remaps live state.
+        // Its book anchor stays on saved_items, even when the subset drops preceding rows.
+        let mut saved_viewing_state = self.capture_snapshot_viewing_state();
+        saved_viewing_state.shift = std::mem::take(&mut self.spread_shift);
+        saved_viewing_state.composition = std::mem::take(&mut self.book_composition);
+        saved_viewing_state.shift.cancel_retained_readoption();
         // Preserve or close the open viewer while the old index space and player are alive.
         let viewer_index_swap = self.prepare_snapshot_viewer_index_swap("activate", &membership);
 
         // Step 2: close search (= mutual exclusion)
         let search_was_active = self.close_searches_for_snapshot();
+
+        self.save_departing_session_grid_positions();
 
         // Step 3: activate
         let generation_id = self.snapshot_next_generation_id;
@@ -1020,6 +1055,16 @@ impl App {
         let list_view_thumbnails = captured_thumbnails.clone();
         let list_view_image_metas = captured_image_metas.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
+        // Fixing this list is an explicit display request; late initial opens must retire.
+        if self.main_folder_history_available() {
+            self.cancel_unresolved_open_for_navigation(true);
+        }
+        let saved_projection_recipe = std::mem::replace(
+            &mut self.projection_recipe,
+            super::book_materialization::ProjectionRecipe::ExtractedResult(
+                super::book_materialization::ExtractedSurface::Snapshot,
+            ),
+        );
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
@@ -1065,6 +1110,8 @@ impl App {
             generation_id,
             saved_items,
             saved_page_identity_index,
+            saved_projection_recipe,
+            saved_viewing_state,
             saved_thumbnails,
             saved_image_metas,
             saved_visible_indices,
@@ -1072,12 +1119,13 @@ impl App {
             saved_selected,
             saved_zip_nav,
             list_view_items,
+            list_view_projection_recipe: self.projection_recipe.clone(),
             list_view_thumbnails,
             list_view_image_metas,
             list_view_page_identity_index: Default::default(),
             pre_snapshot_search_origin,
         });
-        // A fixed/synthetic list keeps today's live pairing but has no durable Book scope.
+        // The original shift owner is parked above; the extracted list has no Book scope.
         self.spread_shift.detach_book_scope_for_ordinary_list();
         let return_origin = top_level_return.map(|restore| {
             let route = self
@@ -1103,6 +1151,7 @@ impl App {
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
         self.invalidate_snapshot_details_index_state();
+        self.begin_extracted_result_view();
         self.finish_snapshot_viewer_index_swap(viewer_index_swap);
         self.page_identity_index = Default::default();
         self.prepare_snapshot_page_identity_index(accepted_policy);
@@ -1277,6 +1326,10 @@ impl App {
         let Some(snap) = self.snapshot.take() else {
             return;
         };
+        // Unfixing explicitly chooses the retained/current list, before any restore branch.
+        if self.main_folder_history_available() {
+            self.cancel_unresolved_open_for_navigation(true);
+        }
         let top_level_origin = self.top_level_grid_view.take_return_origin();
         let top_level_return = top_level_origin
             .as_ref()
@@ -1419,6 +1472,7 @@ impl App {
             }
             self.items = snap.saved_items;
             self.page_identity_index = snap.saved_page_identity_index;
+            self.projection_recipe = snap.saved_projection_recipe;
             self.thumbnails = merged_thumbnails;
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
@@ -1436,6 +1490,12 @@ impl App {
             self.move_grid_cursor(snap.saved_selected, crate::app::GridCursorIntent::Automatic);
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
+            // Complete this same retained-list adoption with the saved presentation. Its
+            // shift owner already belongs to saved_items and must not be subset-remapped.
+            // DirectMedia is an ordinary reader, so retain its existing return behavior.
+            if !matches!(snap.source_label, SnapshotSourceLabel::DirectMedia { .. }) {
+                self.restore_snapshot_viewing_state(snap.saved_viewing_state);
+            }
             self.clear_tags_cache();
             // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
             // し直す (= activate の subset hydrate と対称、Codex P1)。snapshot 中に編集した分は
@@ -1486,6 +1546,7 @@ impl App {
             list_thumbs,
             list_image_metas,
             list_identity_index,
+            list_recipe,
             exact_page_edits,
         ) = {
             let Some(snap) = self.snapshot.as_ref() else {
@@ -1497,6 +1558,7 @@ impl App {
                 snap.list_view_thumbnails.clone(),
                 snap.list_view_image_metas.clone(),
                 snap.list_view_page_identity_index.clone(),
+                snap.list_view_projection_recipe.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
                 snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
@@ -1528,8 +1590,8 @@ impl App {
         let n = list_items.len();
         // filter suppress 解除 (= snapshot list view は filter 通常適用)
         let _ = self.restore_rating_filter_suppression();
-        // fullscreen 中なら閉じる
-        if self.fullscreen_idx.is_some() {
+        // A pending reader also ends here; list-only preparation is not a reader.
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         // snapshot 内から ZipFile を開いていた場合、その子 ZIP の zip_nav が残っている。
@@ -1542,6 +1604,7 @@ impl App {
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.items = list_items;
         self.page_identity_index = list_identity_index;
+        self.projection_recipe = list_recipe;
         self.thumbnails = list_thumbs;
         self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
@@ -1584,7 +1647,7 @@ impl App {
         if self.show_search_bar {
             had_active = true;
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.cancel_search_pending();
         }
 
@@ -1592,7 +1655,7 @@ impl App {
         if self.favsearch.active {
             had_active = true;
             self.favsearch.active = false;
-            self.favsearch.query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Container);
             self.favsearch.last_executed.clear();
             // FavSearchPending は take すれば drop で rx 閉じる (= cancel field は private、
             // 既存パターンも take で済ませている)
@@ -1603,7 +1666,9 @@ impl App {
         if self.global_search.active {
             had_active = true;
             self.global_search.active = false;
-            self.global_search.query.clear();
+            self.global_search.last_change_at = None;
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Metadata);
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Everything);
             self.global_search.last_executed.clear();
             self.global_search.containers.clear();
             self.global_search.all_hits.clear();
@@ -1785,7 +1850,7 @@ impl App {
         // The classification worker has proved this is not a subsequent RAR volume.
         // This route remains cache-only: a miss never opens a conversion dialog.
         let Some(cached) = self.try_archive_cache_lookup(&path) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)".into(),
             );
             return;
@@ -1983,7 +2048,7 @@ impl App {
                 };
                 let _ = format; // 変換 dialog は snapshot scope 外、cache hit 時のみ自動 open
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                     return false;
@@ -2005,7 +2070,7 @@ impl App {
                 } else {
                     // cache 無し: snapshot 中は変換 dialog を出さず skip (= 次 entry に進む
                     // 想定だが、ユーザーの代表 use case ではないので MVP として false)
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)"
                             .into(),
                     );
@@ -2034,7 +2099,7 @@ impl App {
         let was_fs = self.fullscreen_idx.is_some();
         // 現在 fullscreen を閉じる (= items が入れ替わるので)
         if was_fs {
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         // guard bypass
         self.snapshot_internal_nav = true;
@@ -2174,6 +2239,10 @@ impl App {
     }
 
     pub(crate) fn finish_fullscreen_navigation_for_true_close(&mut self) {
+        // A live return can defer content teardown until the main UI dispatcher.
+        // Its accepted Close already ends this viewer's automatic navigation owner.
+        self.stop_projected_slideshow_playback();
+        self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
         self.cancel_inflight_order_dependent_folder_nav();
         if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {
@@ -2181,12 +2250,73 @@ impl App {
             self.zip_enumerate_pending = None;
             self.pdf_password_request = None;
             self.pdf_password_pending_save = None;
-            self.pdf_password_input.clear();
-            self.pdf_password_error = None;
-            self.pdf_password_save = false;
+            // The request is bundle-owned, but the dialog editor is App-global.
+            // A sibling's surviving prompt still owns its current input/error.
+            if self.pdf_password_dialog_path().is_none() {
+                self.pdf_password_input.clear();
+                self.pdf_password_error = None;
+                self.pdf_password_save = false;
+            }
             self.fs_nav_after_pdf_enumerate = None;
         }
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
+        self.retire_viewer_reopen_requests(self.projected_viewer_context_id());
+    }
+
+    /// Check the owner after list adoption, immediately before either completion reopens.
+    /// Adoption itself may retire a context; an earlier take/check is not sufficient.
+    pub(crate) fn resume_archive_convert_viewer_after_load(
+        &mut self,
+        ctx: &egui::Context,
+        deferred: crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen,
+    ) {
+        if !matches!(
+            self.viewer_context_residence(deferred.owner_context),
+            crate::app::ContextResidence::Mounted | crate::app::ContextResidence::AtRest
+        ) {
+            return;
+        }
+        let reason = self.reopen_fullscreen_after_folder_nav_load(
+            ctx,
+            deferred.restore_video_tile,
+            deferred.reopen.resume_slideshow,
+            deferred.reopen.history_trigger,
+        );
+        if reason == "enumerate_defer" {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Capture the requesting viewer here, inside App's context ownership boundary.
+    pub(crate) fn attach_archive_convert_deferred_fullscreen(
+        &mut self,
+        restore_video_tile: bool,
+        resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
+    ) -> bool {
+        let owner_context = self.projected_viewer_context_id();
+        let resume_to_last_page = self.settings.book_nav_resume.resumes();
+        let Some(state) = self.archive_convert.as_mut() else {
+            return false;
+        };
+        if !state.suppress_confirm && !state.allow_direct_read {
+            return false;
+        }
+        state.deferred_fullscreen = Some(
+            crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                owner_context,
+                restore_video_tile,
+                reopen: crate::app::DeferredFsReopen {
+                    history_trigger,
+                    resume_slideshow,
+                    target: crate::app::DeferredFsTarget::None,
+                    resume_to_last_page,
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                },
+            },
+        );
+        true
     }
 
     pub(super) fn prepare_required_fullscreen_navigation(
@@ -2226,17 +2356,14 @@ impl App {
             });
             return;
         }
-        let Some(idx) = self.resolve_required_snapshot_target_idx(&target) else {
-            self.finish_fs_navigation_sequence(
-                crate::app::FsNavigationSequenceFinish::RequestFailed,
-            );
-            self.show_feedback_toast("移動先の画像が見つかりません".to_string());
-            return;
-        };
-        self.open_fullscreen(idx, history_trigger);
-        self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
-        self.update_last_selected_image();
+        self.complete_deferred_book_composition_open(crate::app::DeferredFsReopen {
+            history_trigger,
+            resume_slideshow: false,
+            target: crate::app::DeferredFsTarget::Required(target),
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: true,
+        });
     }
 
     fn open_required_fullscreen_from_location_load(
@@ -2271,12 +2398,12 @@ impl App {
                 );
             self.snapshot_internal_nav = false;
             if !started {
-                self.show_feedback_toast("画像の場所を開けません".to_string());
+                self.show_feedback_warning("画像の場所を開けません".to_string());
             }
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2304,7 +2431,7 @@ impl App {
             // Transfer the scan's proof to the existing prepared Physical owner. Its adoption
             // validates the source BEFORE fullscreen preparation dismisses a snapshot.
             self.snapshot_internal_nav = true;
-            let started = self.start_physical_history_transition_classified(
+            let started = self.start_physical_history_transition_classified_at_stage(
                 super::PhysicalHistoryIntent::RequiredFullscreen {
                     target,
                     history_trigger,
@@ -2316,6 +2443,7 @@ impl App {
                 super::StartupListIntent::PageContinuation,
                 navigation,
                 Some(scan),
+                super::MainListRequestStage::Continuation,
             );
             if started {
                 self.poll_collection_history_transition(ctx);
@@ -2324,7 +2452,7 @@ impl App {
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2396,11 +2524,8 @@ impl App {
             if !direct && !converted_alias {
                 return None;
             }
-            let target = crate::book_bookmarks::resolve_archive_bookmark_target(
-                &nav.tree,
-                requested_entry,
-                &self.settings.grid_display_order,
-            )?;
+            let target =
+                crate::book_bookmarks::resolve_archive_bookmark_target(&nav.tree, requested_entry)?;
             (tree_path, target)
         };
         let already_materialized = self.zip_nav.as_ref().is_some_and(|nav| {
@@ -2669,7 +2794,7 @@ impl App {
                 SnapshotTarget::Fs(p) => p.clone(),
                 SnapshotTarget::ConvertibleArchive { path, .. } => {
                     if self.settings.archive_file_handling_ignores_convertible() {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                         );
                         return false;
@@ -2684,7 +2809,7 @@ impl App {
                     if let Some(cached) = self.try_archive_cache_lookup(path) {
                         cached
                     } else {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "変換対応アーカイブは★固定範囲内で開けません".into(),
                         );
                         return false;
@@ -2987,7 +3112,19 @@ mod tests {
         let (source, cached) = legacy_standalone_rar_cache_fixture(&app);
         app.current_folder = Some(app.tmp.path().to_path_buf());
         activate_single_archive_snapshot(&mut app, source.clone());
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         assert!(app.snapshot_navigate_grid(true));
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            drain_snapshot_archive_classification(&mut app);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            assert!(
+                matches!(app.top_level_grid_view.history_navigation_transition(),
+                Some(crate::app::HistoryNavigationTransition::Physical(request))
+                    if matches!(request.phase, crate::app::PhysicalHistoryPhase::ArchivePreflighting { .. }))
+            );
+        }
         drain_snapshot_archive_adoption(&mut app);
         assert_eq!(app.current_folder, Some(cached.clone()));
         assert_eq!(app.archive_source_override, Some(source));
@@ -2998,6 +3135,8 @@ mod tests {
                 if zip_path == &cached && entry_name == "page.png"
         ));
         assert!(app.archive_convert.is_none());
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -3271,6 +3410,8 @@ mod tests {
         app.fs_cache.insert(
             1,
             crate::app::FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: pixels.clone(),
                 source_dims: Some([2, 3]),
@@ -3594,6 +3735,213 @@ mod tests {
     }
 
     #[test]
+    fn g1_snapshot_a2_deactivation_preserves_source_book_presentation() {
+        use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app_for_test();
+        let book = app.tmp.path().join("g1-snapshot-source-book");
+        std::fs::create_dir(&book).unwrap();
+        for name in ["01.png", "02.png"] {
+            image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+        }
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.default_spread_mode = SpreadMode::LtrCover;
+        app.settings.default_reading_direction = ReadingDirection::Ltr;
+        app.settings.default_reading_flow = ReadingFlow::Horizontal;
+        let db_path = app.tmp.path().join("g1-snapshot-spread.db");
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set_presentation_state(
+                &book,
+                SpreadMode::RtlCover,
+                ReadingFlow::Vertical,
+                ReadingDirection::Rtl,
+                (
+                    SpreadMode::LtrCover,
+                    ReadingFlow::Horizontal,
+                    ReadingDirection::Ltr,
+                ),
+            )
+            .unwrap();
+        app.load_folder(book.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        let original_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(book));
+        assert_eq!(app.projection_recipe, original_recipe);
+        app.set_spread_shift_anchor_for_test(Some(1));
+        let source_items = app.items.clone();
+        let before = app.capture_snapshot_viewing_state();
+        let observer = rusqlite::Connection::open(&db_path).unwrap();
+        let version: i64 = observer
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        let recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot);
+        assert_eq!(app.projection_recipe, recipe);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        // HEAD^ activation swapped rows directly and retained the preceding flow.
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        assert_eq!(app.snapshot.as_ref().unwrap().saved_viewing_state, before);
+        let ctx = egui::Context::default();
+        for idx in [0, 1] {
+            assert!(app.snapshot_open_entry(idx, false, crate::app::HistoryTrigger::UserChosen));
+            assert_eq!(app.fullscreen_idx, Some(idx));
+            assert_eq!(app.projection_recipe, recipe);
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_direction, ReadingDirection::Ltr);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.apply_fullscreen_spread_mode(&ctx, idx, SpreadMode::RtlCover);
+            assert_eq!(app.spread_mode, SpreadMode::Ltr);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            if idx == 1 {
+                app.set_reading_flow_for_fullscreen(&ctx, idx, ReadingFlow::Horizontal);
+                assert_eq!(app.reading_flow, ReadingFlow::Horizontal);
+            }
+            app.close_fullscreen();
+        }
+        app.deactivate_snapshot();
+        assert_eq!(app.items, source_items);
+        assert_eq!(app.capture_snapshot_viewing_state(), before);
+        assert_eq!(app.projection_recipe, original_recipe);
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        assert_eq!(
+            observer
+                .pragma_query_value::<i64, _>(None, "data_version", |row| row.get(0))
+                .unwrap(),
+            version,
+            "snapshot opens and temporary modes/flow must not write spread.db"
+        );
+    }
+
+    #[test]
+    fn g1_snapshot_real_producer_classifies_cross_book_and_mixed_lists_as_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingFlow, SpreadMode};
+        for mixed in [false, true] {
+            let second = if mixed {
+                GridItem::Video(PathBuf::from(r"E:\book-b\clip.mp4"))
+            } else {
+                GridItem::Image(PathBuf::from(r"E:\book-b\page.png"))
+            };
+            let mut app = test_app_with_items(vec![
+                GridItem::Image(PathBuf::from(r"E:\book-a\page.png")),
+                second,
+            ]);
+            app.reading_flow = ReadingFlow::Vertical;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            drain_snapshot_identity_preparation(&mut app);
+            assert_eq!(
+                app.projection_recipe,
+                ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot)
+            );
+            assert_eq!(app.snapshot_count(), Some(2));
+            assert_eq!(
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Video(_))),
+                mixed
+            );
+            assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.close_fullscreen();
+            app.deactivate_snapshot();
+        }
+    }
+
+    #[test]
+    fn g1_snapshot_child_return_and_deactivation_restore_accepted_recipes() {
+        use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        let items = vec![GridItem::Image(PathBuf::from(r"E:\test\page.png"))];
+        let mut app = test_app_with_items(items.clone());
+        let original = ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
+        app.projection_recipe = original.clone();
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.set_spread_shift_anchor_for_test(Some(0));
+        let before = app.capture_snapshot_viewing_state();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        let fixed = ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot);
+        assert_eq!(app.projection_recipe, fixed);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        app.current_folder = Some(PathBuf::from(r"E:\test\child.pdf"));
+        app.projection_recipe =
+            ProjectionRecipe::Book(BookScope::Document(app.current_folder.clone().unwrap()));
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: app.current_folder.clone().unwrap(),
+            page_num: 8,
+            content_type: None,
+        }];
+        let ctx = egui::Context::default();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.handle_keyboard(ctx).is_none());
+                },
+            )
+            .drop_without_applying_deltas();
+        assert_eq!(app.projection_recipe, fixed);
+        assert_eq!(app.items, items);
+        app.deactivate_snapshot();
+        assert_eq!(app.projection_recipe, original);
+        assert_eq!(app.items, items);
+        assert_eq!(app.capture_snapshot_viewing_state(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn g1_f12_snapshot_fork_return_keeps_original_book_state_and_main_unchanged() {
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\01.png"))]);
+        app.projection_recipe =
+            ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.set_spread_shift_anchor_for_test(Some(0));
+        let book_state = app.capture_snapshot_viewing_state();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        app.apply_fullscreen_spread_mode(
+            &egui::Context::default(),
+            0,
+            crate::settings::SpreadMode::Ltr,
+        );
+        let main_state = app.capture_snapshot_viewing_state();
+        let main_generation = app.items_generation;
+        let mut fork = app.split_current_context_preserving_main_grid();
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(
+            app.snapshot.as_ref().unwrap().saved_viewing_state,
+            book_state
+        );
+        app.deactivate_snapshot();
+        assert_eq!(app.capture_snapshot_viewing_state(), book_state);
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(app.capture_snapshot_viewing_state(), main_state);
+        assert_eq!(app.items_generation, main_generation);
+        assert!(app.is_snapshot_active());
+        app.deactivate_snapshot();
+        assert_eq!(app.capture_snapshot_viewing_state(), book_state);
+    }
+
+    #[test]
     fn deactivate_restores_saved_state() {
         let original_items = vec![
             GridItem::Folder(PathBuf::from(r"E:\original")),
@@ -3623,7 +3971,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_remaps_book_pairing_from_list_and_reader_exactly_once() {
+    fn g1_snapshot_restores_book_pairing_and_remaps_reader_target_exactly_once() {
         use super::super::spread_shift_owner::ViewerShift;
         use crate::spread_shift::{
             ShiftPersistence, ShiftResolution, SpreadShiftPageRef, SpreadShiftState,
@@ -3632,6 +3980,11 @@ mod tests {
         for reader_open in [false, true] {
             let mut app = setup_app_for_test();
             app.current_folder = Some(PathBuf::from("c:/books/book"));
+            app.projection_recipe = super::super::book_materialization::ProjectionRecipe::Book(
+                super::super::book_materialization::BookScope::ImageFolder(
+                    app.current_folder.clone().unwrap(),
+                ),
+            );
             app.items = (0..6)
                 .map(|idx| GridItem::Image(PathBuf::from(format!("c:/books/book/{idx}.jpg"))))
                 .collect();
@@ -3651,14 +4004,26 @@ mod tests {
                 resolution: ShiftResolution::Resolved(3),
                 persistence: ShiftPersistence::SessionOnly,
             });
+            let original_shift = app.spread_shift.clone();
             app.fullscreen_idx = reader_open.then_some(3);
             app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert!(app.extracted_result_surface().is_some());
+            assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
             assert_eq!(app.spread_shift.scope, None);
-            assert_eq!(app.spread_shift.state, ViewerShift::Ordinary(1));
+            assert_eq!(app.spread_shift.state, ViewerShift::None);
+            assert_eq!(
+                app.snapshot.as_ref().unwrap().saved_viewing_state.shift,
+                original_shift,
+                "the book identity stays on the original row basis, outside A2",
+            );
             assert_eq!(app.fullscreen_idx, reader_open.then_some(1));
             drain_snapshot_identity_preparation(&mut app);
             app.deactivate_snapshot();
-            assert_eq!(app.spread_shift.state, ViewerShift::Ordinary(3));
+            assert_eq!(app.spread_shift, original_shift);
+            assert!(matches!(
+                app.projection_recipe,
+                super::super::book_materialization::ProjectionRecipe::Book(_)
+            ));
             assert_eq!(app.fullscreen_idx, reader_open.then_some(3));
         }
     }

@@ -843,6 +843,7 @@ impl App {
         full_rect: egui::Rect,
         image_rect: egui::Rect,
         pixels: Option<&egui::ColorImage>,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let mods = ctx.input(|i| i.modifiers);
         let is_drag_mod = mods.shift || mods.ctrl || mods.alt;
@@ -850,9 +851,12 @@ impl App {
         let zc = ZoomCtx::new(image_rect, iw, ih, self.analysis_zoom, self.analysis_pan);
 
         // ── 入力処理 ──
-        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
-        let primary_released = ctx.input(|i| i.pointer.primary_released());
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let primary_pressed = primary_allowed && ctx.input(|i| i.pointer.primary_pressed());
+        let primary_down = primary_allowed && ctx.input(|i| i.pointer.primary_down());
+        let primary_released = primary_allowed
+            && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+            && ctx.input(|i| i.pointer.primary_released());
 
         if primary_pressed && is_drag_mod {
             if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
@@ -892,7 +896,9 @@ impl App {
             self.analysis_pan_drag_start = None;
         }
 
-        if ctx.input(|i| i.pointer.secondary_pressed()) {
+        if !overflow_pointer_input.owns(egui::PointerButton::Secondary)
+            && ctx.input(|i| i.pointer.secondary_pressed())
+        {
             if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
                 if image_rect.contains(pos) {
                     let mag = if mods.ctrl && mods.alt {
@@ -1052,7 +1058,7 @@ impl App {
         );
         let close_resp = ui.interact(
             cb_rect,
-            egui::Id::new("analysis_close_btn"),
+            egui::Id::unique("analysis_close_btn"),
             egui::Sense::click(),
         );
         ui.painter().rect_filled(
@@ -1215,9 +1221,9 @@ impl App {
                 .map_or(false, |c| c.0 == zoom && c.1 == pan && c.2 == fs_idx);
             if !hist_valid {
                 let (h, s, v) = compute_hsv_histograms(pix, &zc, image_rect);
-                self.analysis_hist_cache = Some((zoom, pan, fs_idx, h, s, v));
+                self.analysis_hist_cache = Some(Box::new((zoom, pan, fs_idx, h, s, v)));
             }
-            let (_, _, _, h_hist, s_hist, v_hist) = self.analysis_hist_cache.as_ref().unwrap();
+            let (_, _, _, h_hist, s_hist, v_hist) = self.analysis_hist_cache.as_deref().unwrap();
 
             small_label(ui.painter(), egui::pos2(x0, y), "色相 (H)");
             y += 11.0;

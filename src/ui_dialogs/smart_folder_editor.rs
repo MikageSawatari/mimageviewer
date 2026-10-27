@@ -408,6 +408,7 @@ impl App {
             .iter()
             .any(|definition| definition.name.eq_ignore_ascii_case(&trimmed));
         egui::Window::new("新しいスマートフォルダ")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -472,6 +473,7 @@ impl App {
         let mut confirm = false;
         let mut cancel = false;
         egui::Window::new("現在のアイテム表示条件を追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -497,13 +499,14 @@ impl App {
                 );
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("名前に含む:");
+                    let field_label = ui.label("名前に含む:");
                     crate::ime_focus::add_singleline(
                         ui,
                         &mut draft.filter.name_contains,
                         None,
                         |edit| edit.desired_width(320.0),
-                    );
+                    )
+                    .labelled_by(field_label.id);
                     ui.label(egui::RichText::new("（任意）").weak());
                 });
                 ui.label(egui::RichText::new("保存する条件").strong());
@@ -616,7 +619,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(48.0, 32.0);
 
-        egui::Window::new("スマートフォルダ")
+        egui::Window::new("スマートフォルダ").drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -670,7 +673,7 @@ impl App {
                         });
                         ui.separator();
                         let list_height = ui.available_height().max(0.0);
-                        egui::ScrollArea::vertical()
+                        egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                             .id_salt("smart_folder_definition_list")
                             .auto_shrink([false, false])
                             .max_height(list_height)
@@ -706,13 +709,13 @@ impl App {
                         ui.set_max_size(right_size);
                         if let Some(definition) = draft.as_mut() {
                             ui.horizontal(|ui| {
-                                ui.label("名前:");
+                                let field_label = ui.label("名前:");
                                 if crate::ime_focus::add_singleline(
                                     ui,
                                     &mut definition.name,
                                     None,
                                     |edit| edit,
-                                )
+                                ).labelled_by(field_label.id)
                                 .lost_focus()
                                 {
                                     normalize_definition_text = true;
@@ -736,7 +739,7 @@ impl App {
                                 ui.colored_label(ui.visuals().error_fg_color, error);
                             }
                             ui.add_space(4.0);
-                            ui.label(egui::RichText::new("並び方").strong());
+                            let field_label = ui.label(egui::RichText::new("並び方").strong());
                             ui.horizontal_wrapped(|ui| {
                                 egui::ComboBox::from_id_salt("smart_folder_grouping")
                                     .selected_text(definition.grouping.label())
@@ -748,7 +751,7 @@ impl App {
                                                 grouping.label(),
                                             );
                                         }
-                                    });
+                                    }).response.labelled_by(field_label.id);
                                 ui.label(
                                     egui::RichText::new(
                                         "表示形式とソート順は現在の一覧設定を使います",
@@ -766,7 +769,7 @@ impl App {
                                 .weak(),
                             );
                             let rule_list_height = ui.available_height().max(0.0);
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                 .id_salt("smart_folder_rule_list")
                                 .auto_shrink([false, false])
                                 .max_height(rule_list_height)
@@ -806,13 +809,13 @@ impl App {
                                                 "サブフォルダを含む",
                                             );
                                             ui.horizontal(|ui| {
-                                                ui.label("名前に含む:");
+                                                let field_label = ui.label("名前に含む:");
                                                 if crate::ime_focus::add_singleline(
                                                     ui,
                                                     &mut rule.filter.name_contains,
                                                     None,
                                                     |edit| edit.desired_width(240.0),
-                                                )
+                                                ).labelled_by(field_label.id)
                                                     .lost_focus()
                                                 {
                                                     normalize_definition_text = true;
@@ -933,9 +936,8 @@ impl App {
             if let Some(name) = target {
                 let mut confirmed = false;
                 let mut cancel = false;
-                let response = egui::Modal::new(egui::Id::new("smart_folder_delete_confirm")).show(
-                    ctx,
-                    |ui| {
+                let response = egui::Modal::new(egui::Id::unique("smart_folder_delete_confirm"))
+                    .show(ctx, |ui| {
                         ui.heading("スマートフォルダを削除");
                         ui.label(format!(
                             "「{name}」を削除します。実ファイルは削除されません。"
@@ -948,8 +950,7 @@ impl App {
                                 cancel = true;
                             }
                         });
-                    },
-                );
+                    });
                 if confirmed {
                     if let Some(index) = self
                         .settings

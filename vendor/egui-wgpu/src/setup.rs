@@ -1,6 +1,45 @@
 use std::sync::Arc;
 
+/// A cloneable display handle for use with [`wgpu::InstanceDescriptor`].
+///
+/// [`wgpu::InstanceDescriptor`] stores its display handle as a non-cloneable
+/// `Box<dyn WgpuHasDisplayHandle>`. This trait wraps it so it can be cloned
+/// alongside the rest of the egui wgpu configuration.
+///
+/// Automatically implemented for all types that satisfy the bounds
+/// (including [`winit::event_loop::OwnedDisplayHandle`]).
+pub trait EguiDisplayHandle:
+    wgpu::rwh::HasDisplayHandle + core::fmt::Debug + Send + Sync + 'static
+{
+    /// Clone into a `Box<dyn WgpuHasDisplayHandle>` for [`wgpu::InstanceDescriptor::display`].
+    fn clone_for_wgpu(&self) -> Box<dyn wgpu::wgt::WgpuHasDisplayHandle>;
+
+    /// Clone into a new `Box<dyn EguiDisplayHandle>`.
+    fn clone_display_handle(&self) -> Box<dyn EguiDisplayHandle>;
+}
+
+impl Clone for Box<dyn EguiDisplayHandle> {
+    fn clone(&self) -> Self {
+        // We need to deref here, otherwise this causes infinite recursion stack overflow.
+        (**self).clone_display_handle()
+    }
+}
+
+impl<T> EguiDisplayHandle for T
+where
+    T: wgpu::rwh::HasDisplayHandle + Clone + core::fmt::Debug + Send + Sync + 'static,
+{
+    fn clone_for_wgpu(&self) -> Box<dyn wgpu::wgt::WgpuHasDisplayHandle> {
+        Box::new(self.clone())
+    }
+
+    fn clone_display_handle(&self) -> Box<dyn EguiDisplayHandle> {
+        Box::new(self.clone())
+    }
+}
+
 #[derive(Clone)]
+#[expect(clippy::large_enum_variant)]
 pub enum WgpuSetup {
     /// Construct a wgpu setup using some predefined settings & heuristics.
     /// This is the default option. You can customize most behaviours overriding the
@@ -22,14 +61,24 @@ pub enum WgpuSetup {
     Existing(WgpuSetupExisting),
 }
 
-impl Default for WgpuSetup {
-    fn default() -> Self {
-        Self::CreateNew(WgpuSetupCreateNew::default())
+impl WgpuSetup {
+    /// Creates a new [`WgpuSetup::CreateNew`] with the given display handle.
+    ///
+    /// See [`WgpuSetupCreateNew::from_display_handle`] for details.
+    pub fn from_display_handle(display_handle: impl EguiDisplayHandle) -> Self {
+        Self::CreateNew(WgpuSetupCreateNew::from_display_handle(display_handle))
+    }
+
+    /// Creates a new [`WgpuSetup::CreateNew`] without a display handle.
+    ///
+    /// See [`WgpuSetupCreateNew::without_display_handle`] for details.
+    pub fn without_display_handle() -> Self {
+        Self::CreateNew(WgpuSetupCreateNew::without_display_handle())
     }
 }
 
-impl std::fmt::Debug for WgpuSetup {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for WgpuSetup {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::CreateNew(create_new) => f
                 .debug_tuple("WgpuSetup::CreateNew")
@@ -48,11 +97,14 @@ impl WgpuSetup {
     pub async fn new_instance(&self) -> wgpu::Instance {
         match self {
             Self::CreateNew(create_new) => {
-                #[allow(unused_mut, clippy::allow_attributes)]
+                #[allow(clippy::allow_attributes, unused_mut)]
                 let mut backends = create_new.instance_descriptor.backends;
 
                 // Don't try WebGPU if we're not in a secure context.
-                #[cfg(target_arch = "wasm32")]
+                // Emscripten is excluded: wgpu gates both its `webgpu` backend and
+                // its `web_sys` re-export on `not(Emscripten)` (see the cfg aliases
+                // in `wgpu/build.rs`).
+                #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
                 if backends.contains(wgpu::Backends::BROWSER_WEBGPU) {
                     let is_secure_context =
                         wgpu::web_sys::window().is_some_and(|w| w.is_secure_context());
@@ -65,8 +117,18 @@ impl WgpuSetup {
                 }
 
                 log::debug!("Creating wgpu instance with backends {backends:?}");
-                wgpu::util::new_instance_with_webgpu_detection(&create_new.instance_descriptor)
-                    .await
+                let desc = &create_new.instance_descriptor;
+                let descriptor = wgpu::InstanceDescriptor {
+                    backends: desc.backends,
+                    flags: desc.flags,
+                    backend_options: desc.backend_options.clone(),
+                    memory_budget_thresholds: desc.memory_budget_thresholds,
+                    display: create_new
+                        .display_handle
+                        .as_ref()
+                        .map(|handle| handle.clone_for_wgpu()),
+                };
+                wgpu::util::new_instance_with_webgpu_detection(descriptor).await
             }
             Self::Existing(existing) => existing.instance.clone(),
         }
@@ -95,65 +157,107 @@ pub type NativeAdapterSelectorMethod = Arc<
         + Sync,
 >;
 
+/// Method for returning native adapters in device-request order.
+///
+/// Only a failed device request advances to the next candidate. The callback
+/// should exclude adapters incompatible with the supplied surface.
+pub type NativeAdapterCandidatesMethod = Arc<
+    dyn Fn(&[wgpu::Adapter], Option<&wgpu::Surface<'_>>) -> Result<Vec<wgpu::Adapter>, String>
+        + Send
+        + Sync,
+>;
+
 /// Configuration for creating a new wgpu setup.
 ///
 /// Used for [`WgpuSetup::CreateNew`].
+///
+/// Prefer [`Self::from_display_handle`] when you have a display handle available.
+/// Most platforms work without one, but some (e.g. Wayland with GLES, or WebGL)
+/// require it, so providing one ensures maximum compatibility.
+/// With winit, pass [`EventLoop::owned_display_handle`](winit::event_loop::EventLoop::owned_display_handle).
+///
+/// Note: The display handle is stored in [`Self::display_handle`] rather than in
+/// [`Self::instance_descriptor`] so the config can be cloned
+/// ([`wgpu::InstanceDescriptor`] is not `Clone`). It is injected at instance creation time.
 pub struct WgpuSetupCreateNew {
-    /// Instance descriptor for creating a wgpu instance.
+    /// Descriptor for the wgpu instance.
     ///
-    /// The most important field is [`wgpu::InstanceDescriptor::backends`], which
-    /// controls which backends are supported (wgpu will pick one of these).
-    /// If you only want to support WebGL (and not WebGPU),
-    /// you can set this to [`wgpu::Backends::GL`].
-    /// By default on web, WebGPU will be used if available.
-    /// WebGL will only be used as a fallback,
-    /// and only if you have enabled the `webgl` feature of crate `wgpu`.
+    /// Leave [`wgpu::InstanceDescriptor::display`] as `None` — use [`Self::display_handle`]
+    /// instead (injected at instance creation time).
+    ///
+    /// The most important field is [`wgpu::InstanceDescriptor::backends`], which controls
+    /// which backends are supported (wgpu will pick one of these). For example, set it to
+    /// [`wgpu::Backends::GL`] to use only WebGL. By default on web, WebGPU is preferred
+    /// with WebGL as a fallback (requires the `webgl` feature of crate `wgpu`).
     pub instance_descriptor: wgpu::InstanceDescriptor,
 
-    /// Power preference for the adapter if [`Self::native_adapter_selector`] is not set or targeting web.
+    /// Display handle passed to wgpu at instance creation time.
+    ///
+    /// Required on some platforms (e.g. Wayland with GLES, WebGL); optional elsewhere.
+    /// With winit, use [`winit::event_loop::OwnedDisplayHandle`].
+    ///
+    /// `eframe` 's winit & web integrations will attempt to fill the display handle automatically if it is left empty.
+    pub display_handle: Option<Box<dyn EguiDisplayHandle>>,
+
+    /// Power preference when neither native callback is set, or when targeting web.
     pub power_preference: wgpu::PowerPreference,
 
     /// Optional selector for native adapters.
     ///
     /// This field has no effect when targeting web!
-    /// Otherwise, if set [`Self::power_preference`] is ignored and the adapter is instead selected by this method.
+    /// Otherwise, if set and [`Self::native_adapter_candidates`] is absent,
+    /// [`Self::power_preference`] is ignored and this method selects the adapter.
     /// Note that [`Self::instance_descriptor`]'s [`wgpu::InstanceDescriptor::backends`]
     /// are still used to filter the adapter enumeration in the first place.
     ///
     /// Defaults to `None`.
     pub native_adapter_selector: Option<NativeAdapterSelectorMethod>,
 
+    /// Optional ordered candidates for native device creation.
+    ///
+    /// Takes precedence over [`Self::native_adapter_selector`] and
+    /// [`Self::power_preference`]. An empty list is an adapter-selection error.
+    /// Each candidate is tried once, stopping at the first successful device
+    /// request. Errors after device creation do not try another candidate.
+    /// Like the selector, this has no effect on web and defaults to `None`.
+    pub native_adapter_candidates: Option<NativeAdapterCandidatesMethod>,
+
     /// Configuration passed on device request, given an adapter
     pub device_descriptor:
         Arc<dyn Fn(&wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> + Send + Sync>,
 }
 
-impl Clone for WgpuSetupCreateNew {
-    fn clone(&self) -> Self {
+impl WgpuSetupCreateNew {
+    /// Creates a new configuration with the given display handle.
+    ///
+    /// This is the recommended constructor. Most platforms (Windows, macOS/iOS, Android, web)
+    /// work fine without a display handle, but some (e.g. Wayland on Linux with GLES) require
+    /// one. Providing it unconditionally ensures your app works everywhere.
+    ///
+    /// If you don't have a display handle available, use [`Self::without_display_handle`]
+    /// instead — it will still work on the majority of platforms.
+    ///
+    /// With winit, pass [`EventLoop::owned_display_handle`](winit::event_loop::EventLoop::owned_display_handle).
+    pub fn from_display_handle(display_handle: impl EguiDisplayHandle) -> Self {
         Self {
-            instance_descriptor: self.instance_descriptor.clone(),
-            power_preference: self.power_preference,
-            native_adapter_selector: self.native_adapter_selector.clone(),
-            device_descriptor: self.device_descriptor.clone(),
+            display_handle: Some(Box::new(display_handle)),
+            ..Self::without_display_handle()
         }
     }
-}
 
-impl std::fmt::Debug for WgpuSetupCreateNew {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WgpuSetupCreateNew")
-            .field("instance_descriptor", &self.instance_descriptor)
-            .field("power_preference", &self.power_preference)
-            .field(
-                "native_adapter_selector",
-                &self.native_adapter_selector.is_some(),
-            )
-            .finish()
-    }
-}
-
-impl Default for WgpuSetupCreateNew {
-    fn default() -> Self {
+    /// Creates a new configuration without a display handle.
+    ///
+    /// A display handle is not required for headless operation (offscreen rendering, tests,
+    /// compute-only workloads). It also isn't needed on most platforms even when presenting
+    /// to a window — only some configurations (e.g. Wayland on Linux with GLES) require one.
+    ///
+    /// If you do have a display handle available, prefer [`Self::from_display_handle`] for
+    /// maximum compatibility.
+    ///
+    /// With winit you can obtain one via [`EventLoop::owned_display_handle`](winit::event_loop::EventLoop::owned_display_handle).
+    ///
+    /// `eframe` 's winit & web integrations will attempt to fill the display handle automatically if it is left empty.
+    pub fn without_display_handle() -> Self {
         Self {
             instance_descriptor: wgpu::InstanceDescriptor {
                 // Add GL backend, primarily because WebGPU is not stable enough yet.
@@ -163,12 +267,17 @@ impl Default for WgpuSetupCreateNew {
                 flags: wgpu::InstanceFlags::from_build_config().with_env(),
                 backend_options: wgpu::BackendOptions::from_env_or_default(),
                 memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: None,
             },
+
+            display_handle: None,
 
             power_preference: wgpu::PowerPreference::from_env()
                 .unwrap_or(wgpu::PowerPreference::HighPerformance),
 
             native_adapter_selector: None,
+
+            native_adapter_candidates: None,
 
             device_descriptor: Arc::new(|adapter| {
                 let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
@@ -189,6 +298,52 @@ impl Default for WgpuSetupCreateNew {
                 }
             }),
         }
+    }
+}
+
+impl Clone for WgpuSetupCreateNew {
+    fn clone(&self) -> Self {
+        let desc = &self.instance_descriptor;
+        Self {
+            instance_descriptor: wgpu::InstanceDescriptor {
+                backends: desc.backends,
+                flags: desc.flags,
+                backend_options: desc.backend_options.clone(),
+                memory_budget_thresholds: desc.memory_budget_thresholds,
+                display: None,
+            },
+            display_handle: self.display_handle.clone(),
+            power_preference: self.power_preference,
+            native_adapter_selector: self.native_adapter_selector.clone(),
+            native_adapter_candidates: self.native_adapter_candidates.clone(),
+            device_descriptor: Arc::clone(&self.device_descriptor),
+        }
+    }
+}
+
+impl core::fmt::Debug for WgpuSetupCreateNew {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Self {
+            instance_descriptor,
+            display_handle,
+            power_preference,
+            native_adapter_selector,
+            native_adapter_candidates,
+            device_descriptor: _,
+        } = self;
+        f.debug_struct("WgpuSetupCreateNew")
+            .field("instance_descriptor", instance_descriptor)
+            .field("display_handle", display_handle)
+            .field("power_preference", power_preference)
+            .field(
+                "native_adapter_selector",
+                &native_adapter_selector.is_some(),
+            )
+            .field(
+                "native_adapter_candidates",
+                &native_adapter_candidates.is_some(),
+            )
+            .finish_non_exhaustive()
     }
 }
 

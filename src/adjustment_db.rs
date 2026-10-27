@@ -18,6 +18,40 @@ pub struct AdjustmentDb {
 }
 
 impl AdjustmentDb {
+    pub(crate) fn favorite_view_for_copy(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FavoriteViewState>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT state_json FROM favorite_view_states WHERE favorite_id=?1",
+                [id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
+            .transpose()
+    }
+    pub(crate) fn copy_favorite_view_for_zip(
+        &self,
+        old: Uuid,
+        new: Uuid,
+        phase: crate::image_folder_zip_metadata::CopyPhase,
+    ) -> crate::image_folder_zip_metadata::CopyReply {
+        self.favorite_view_for_copy(old)?;
+        self.favorite_view_for_copy(new)?;
+        crate::image_folder_zip_metadata::copy_rows_on(
+            &self.conn,
+            "favorite_view_states",
+            "favorite_id",
+            &old.to_string(),
+            &new.to_string(),
+            phase,
+            |_, _| Ok(()),
+        )
+    }
     /// DB を開く (なければ作成)。旧スキーマが残っていれば破棄して作り直す。
     pub fn open() -> Result<Self, rusqlite::Error> {
         Self::open_at(&Self::db_path())
@@ -200,10 +234,37 @@ impl AdjustmentDb {
         self.remove_page_params(from_key)
     }
 
+    /// 書き込みと削除を同じトランザクションで確定し、対象キーだけを失効させる。
+    pub fn apply_page_param_writes(
+        &mut self,
+        writes: &[(String, Option<AdjustParams>)],
+    ) -> Result<(), rusqlite::Error> {
+        let keys: Vec<_> = writes.iter().map(|(key, _)| key.clone()).collect();
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_keys(&keys);
+        let tx = self.conn.transaction()?;
+        {
+            let mut set = tx.prepare(
+                "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
+                 ON CONFLICT(page_path) DO UPDATE SET params_json = ?2",
+            )?;
+            let mut remove = tx.prepare("DELETE FROM page_params WHERE page_path = ?1")?;
+            for (key, params) in writes {
+                match params {
+                    Some(params) => {
+                        let json = serde_json::to_string(params).unwrap_or_default();
+                        set.execute(rusqlite::params![key, json])?;
+                    }
+                    None => {
+                        remove.execute([key])?;
+                    }
+                }
+            }
+        }
+        tx.commit()
+    }
+
     /// 複数ページに同じパラメータを一括書込する (「全画像に適用」ボタン用)。
-    ///
-    /// 削除判定 (= グローバルと等価かどうか) は呼び出し側の責務。
-    /// グローバルと等価な params を渡したい場合は `remove_page_params_bulk` を使う。
+    /// 削除判定は呼び出し側の責務。
     pub fn set_page_params_bulk(
         &mut self,
         page_keys: &[String],
@@ -582,15 +643,9 @@ mod tests {
 
     #[test]
     fn db_page_params_roundtrip() {
-        // 2026-05-17: 旧版は `AdjustmentDb::open()` を使っていたが、これは内部で
-        // `data_dir::get()` 経由で APPDATA に DB を作るため、`cfg(test)` の
-        // `data_dir::default()` panic ガードに当たる。`open_at` で temp path に
-        // 明示開きに変更 (= 同 module の `db_favorite_params_roundtrip_and_prune` と同方式)。
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer_page_params_test_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        // プロセス共有の既定 sandbox に依存せず、テストが所有する DB を明示的に開く。
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("test.db");
         let db = AdjustmentDb::open_at(&tmp).unwrap();
         let page = "c:/test/folder/page001.jpg";
         // クリーンな状態を保証
@@ -612,17 +667,12 @@ mod tests {
         // 明示削除すれば消える
         db.remove_page_params(page).unwrap();
         assert!(db.get_page_params(page).is_none());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn db_load_page_param_keys_returns_all_page_params() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer_page_param_keys_test_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("test.db");
         let db = AdjustmentDb::open_at(&tmp).unwrap();
 
         let plain = "c:/test/plain.jpg";
@@ -636,8 +686,6 @@ mod tests {
         let keys = db.load_page_param_keys();
         assert!(keys.contains(ai));
         assert!(keys.contains(plain));
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -656,11 +704,8 @@ mod tests {
 
     #[test]
     fn db_favorite_params_roundtrip_and_prune() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer_fav_params_test_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("test.db");
         let db = AdjustmentDb::open_at(&tmp).unwrap();
 
         let a = Uuid::new_v4();
@@ -690,8 +735,6 @@ mod tests {
         // 明示削除
         db.remove_favorite_params(b).unwrap();
         assert!(db.load_all_favorite_params().is_empty());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub(crate) struct NewFolderCreated {
 impl App {
     pub(crate) fn request_new_folder_dialog(&mut self, parent: PathBuf) {
         if self.new_folder_pending.is_some() {
-            self.show_feedback_toast("フォルダ作成が完了するまでお待ちください".to_owned());
+            self.show_feedback_warning("フォルダ作成が完了するまでお待ちください".to_owned());
             return;
         }
         self.new_folder_parent = Some(parent);
@@ -61,13 +61,16 @@ impl App {
                 }
                 NamePromptOutcome::Failed => {
                     self.clear_new_folder_dialog_state();
-                    self.show_feedback_toast("フォルダ作成画面を開けませんでした".to_owned());
+                    self.show_feedback_warning("フォルダ作成画面を開けませんでした".to_owned());
                     return;
                 }
             };
             match validate_new_folder_name(&entered) {
                 Ok(name) => {
                     self.clear_new_folder_dialog_state();
+                    if !self.admit_book_append_followup_mutation() {
+                        return;
+                    }
                     self.new_folder_pending = Some(spawn_new_folder(parent, name));
                     ctx.request_repaint();
                     return;
@@ -104,8 +107,12 @@ impl App {
                     self.pending_reload = true;
                 }
                 self.show_feedback_toast(format!(
-                    "フォルダを作成しました: {}",
-                    created.path.display()
+                    "フォルダを作成: {}",
+                    created
+                        .path
+                        .file_name()
+                        .unwrap_or(created.path.as_os_str())
+                        .to_string_lossy()
                 ));
             }
             Ok(Err(message)) => {

@@ -101,7 +101,7 @@ impl App {
         self.reload_open_metadata_views_after_cleanup();
     }
 
-    fn metadata_cleanup_can_start(&self) -> bool {
+    fn metadata_cleanup_can_start(&mut self) -> bool {
         self.metadata_cleanup_pending.is_none()
             && self.delete_pending.is_none()
             && self.delete_purge_retry_pending.is_none()
@@ -114,7 +114,7 @@ impl App {
 
     fn start_metadata_cleanup_scan(&mut self) {
         if !self.metadata_cleanup_can_start() {
-            self.show_feedback_toast("ファイル操作の完了後にもう一度実行してください".into());
+            self.show_feedback_warning("ファイル操作の完了後にもう一度実行してください".into());
             return;
         }
         self.metadata_cleanup_scan = None;
@@ -127,7 +127,9 @@ impl App {
 
     fn start_metadata_cleanup_delete(&mut self) {
         if !self.metadata_cleanup_can_start() {
-            self.show_feedback_toast("メタデータ書き込みの完了後にもう一度実行してください".into());
+            self.show_feedback_warning(
+                "メタデータ書き込みの完了後にもう一度実行してください".into(),
+            );
             return;
         }
         let Some(scan) = self.metadata_cleanup_scan.clone() else {
@@ -136,6 +138,11 @@ impl App {
         if scan.orphan_total() == 0 {
             return;
         }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
+        let keys = scan.candidate_keys().collect::<HashSet<_>>();
+        self.invalidate_xmp_rating_reads(|key| keys.contains(key));
         self.metadata_cleanup_result = None;
         self.metadata_cleanup_pending = Some(crate::metadata_cleanup::spawn_delete(
             crate::data_dir::get(),
@@ -155,6 +162,7 @@ impl App {
         let mut cancel = false;
         let mut close = false;
         egui::Window::new("メタデータを整理")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
             .default_width(520.0)

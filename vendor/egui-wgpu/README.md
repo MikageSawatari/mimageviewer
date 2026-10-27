@@ -5,19 +5,6 @@
 ![MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Apache](https://img.shields.io/badge/license-Apache-blue.svg)
 
-This crate provides bindings between [`egui`](https://github.com/emilk/egui) and [wgpu](https://crates.io/crates/wgpu).
+This crates provides bindings between [`egui`](https://github.com/emilk/egui) and [wgpu](https://crates.io/crates/wgpu).
 
 This was originally hosted at https://github.com/hasenbanck/egui_wgpu_backend
-
-## mImageViewer patch
-
-This directory is based on `egui-wgpu` 0.33.3. The local patch adds opt-in mipmap allocation,
-GPU mip-chain generation, and mipmap sampler filtering for managed textures whose
-`TextureOptions::mipmap_mode` is set. The generator is also shared by the application's
-wipe/diff comparison and 360-degree panorama paths. Ordinary still-image downscaling uses the
-application's separate display-sized Lanczos3 path; this renderer has no application-specific
-LOD bias or level-0 sampling switch. See `docs/dot-by-dot-and-downscale-plan.md` in the
-application repository for the current behavior and maintenance notes.
-
-The upstream 0.33.3 license texts and copyright notice are preserved in
-[`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).

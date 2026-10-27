@@ -198,7 +198,7 @@ fn show_delete_confirm_modal(
     let dialog_width = (content_rect.width() - 32.0).clamp(240.0, 520.0);
     let target_list_height = (content_rect.height() - 180.0).clamp(100.0, 320.0);
     let has_target_list = label.contains("\n\n対象:");
-    egui::Modal::new(egui::Id::new("delete_confirm_modal")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("delete_confirm_modal")).show(ctx, |ui| {
         ui.set_min_width(dialog_width.min(320.0));
         ui.set_max_width(dialog_width);
         ui.heading("削除の確認");
@@ -208,6 +208,10 @@ fn show_delete_confirm_modal(
                 ui.spacing_mut().scroll =
                     super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("delete_confirm_targets")
                     .max_height(target_list_height)
                     .auto_shrink([false, true])
@@ -248,6 +252,8 @@ fn resolve_delete_confirm_action(
     enter_pressed: bool,
     ime_active: bool,
 ) -> DeleteConfirmAction {
+    // Y/N are dialog shortcuts too: suppress them only while composing.
+    // Process presses never arrive here; ordinary presses after Commit act immediately.
     if ime_active {
         DeleteConfirmAction::None
     } else if n_pressed || escape_pressed {
@@ -828,7 +834,8 @@ impl crate::app::App {
         let checked_count = self.checked.len();
         let pos = self.context_menu_pos;
         egui::Window::new("bookmark-grid-context")
-            .id(egui::Id::new("bookmark_grid_context_menu"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("bookmark_grid_context_menu"))
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
@@ -994,7 +1001,8 @@ impl crate::app::App {
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("context_menu")
-            .id(egui::Id::new("grid_ctx_menu"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("grid_ctx_menu"))
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -1212,7 +1220,9 @@ impl crate::app::App {
                 self.settings.show_windows_context_menu_inline,
             ),
         };
-        let native_result = crate::native_context_menu::show_native_context_menu(request);
+        let native_result = crate::native_context_menu::show_native_context_menu(request, || {
+            self.admit_book_append_followup_mutation()
+        });
         Self::resync_egui_modifiers_from_os(ctx);
         #[cfg(windows)]
         if matches!(&native_result, NativeContextMenuResult::Canceled)
@@ -1450,7 +1460,30 @@ impl crate::app::App {
             },
             layout: self.settings.context_menu_layout.clone(),
         };
-        crate::context_menu_model::build_context_menu(&input)
+        let mut nodes = crate::context_menu_model::build_context_menu(&input);
+        // Native and fallback menus share this current-book operation. Checked
+        // rows and page count do not determine whether an empty book can edit.
+        if target.surface == ContextMenuSurface::Grid
+            && (target.is_folder_context
+                || matches!(
+                    &target.item,
+                    GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+                ))
+        {
+            let enabled = self.composition_editor_available();
+            nodes.insert(0, MenuNode::Separator);
+            nodes.insert(
+                0,
+                MenuNode::Item {
+                    command: MenuCommand::EditBookComposition,
+                    label: "本の構成を編集".to_owned(),
+                    enabled,
+                    disabled_reason: (!enabled)
+                        .then(|| "現在開いている書庫・PDF・EPUB の本で使えます".to_owned()),
+                },
+            );
+        }
+        nodes
     }
 
     fn context_menu_associated_apps(&mut self, item: &GridItem) -> Vec<AssociatedAppMenuEntry> {
@@ -1576,11 +1609,16 @@ impl crate::app::App {
             crate::native_context_menu::ShellClipboardVerb,
         ),
     {
+        if self.image_folder_zip_operation.is_some() {
+            return None;
+        }
         if !self.grid_item_input_allowed()
             && !(target.is_folder_context
                 && matches!(
                     &command,
                     MenuCommand::NewFolder
+                        | MenuCommand::EditBookComposition
+                        | MenuCommand::ConvertImageFolderToZip
                         | MenuCommand::Paste
                         | MenuCommand::OpenFolderInExplorer
                         | MenuCommand::OpenExternalToolSettings
@@ -1589,6 +1627,18 @@ impl crate::app::App {
             return None;
         }
         match command {
+            MenuCommand::ConvertImageFolderToZip => {
+                if let GridItem::Folder(path) = &target.item {
+                    self.start_image_folder_zip(ctx, path.clone(), false);
+                }
+                None
+            }
+            MenuCommand::EditBookComposition => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.start_local_composition_editor(ctx);
+                }
+                None
+            }
             MenuCommand::ConvertEpubToPdf => {
                 self.start_batch_convert_to_pdf_at(target.item_index);
                 None
@@ -1606,6 +1656,9 @@ impl crate::app::App {
                     && let (Some(hwnd), Some(folder)) =
                         (self.main_hwnd, target.folder_command_target.clone())
                 {
+                    if !self.admit_book_append_followup_mutation() {
+                        return None;
+                    }
                     // Ctrl+V と同じ約束。Shell が何を作るかは分からないので、呼ぶ前の
                     // 一覧を控えて差分で拾う ([`crate::post_operation_selection`])。
                     self.request_post_operation_selection_for_added_items(folder.clone());
@@ -1648,14 +1701,16 @@ impl crate::app::App {
                 if let Some(paths) = target.shell_paths.as_deref() {
                     invoke_shell_clipboard(self, ctx, paths, verb);
                 } else if target.has_checked {
-                    self.show_feedback_toast(checked_virtual_selection_message("コピー / カット"));
+                    self.show_feedback_warning(checked_virtual_selection_message(
+                        "コピー / カット",
+                    ));
                 } else {
                     let message = target
                         .item
                         .file_operation_refusal()
                         .unwrap_or(crate::grid_item::FileOperationRefusal::VirtualPage)
                         .message("コピー / カット");
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                 }
                 None
             }
@@ -1664,7 +1719,7 @@ impl crate::app::App {
                     && target.checked_file_operation_selection
                         != CheckedFileOperationSelection::RealOnly
                 {
-                    self.show_feedback_toast(checked_virtual_selection_message(
+                    self.show_feedback_warning(checked_virtual_selection_message(
                         "ファイルのパスとしてコピー",
                     ));
                     return None;
@@ -1804,7 +1859,10 @@ impl crate::app::App {
                     .find(|tool| tool.id == id)
                     .cloned()
                 else {
-                    self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
+                    self.show_feedback_warning(format!(
+                        "外部ツールが見つかりません (ID: {})",
+                        id.0
+                    ));
                     return None;
                 };
                 self.queue_external_tool_launch_from_context_menu(
@@ -1830,7 +1888,7 @@ impl crate::app::App {
                         crate::external_tool::ExternalToolLaunch::Association { handler_id },
                         file.to_path_buf(),
                     ),
-                    Err(reason) => self.show_feedback_toast(reason),
+                    Err(reason) => self.show_feedback_warning(reason),
                 }
                 None
             }
@@ -1845,7 +1903,7 @@ impl crate::app::App {
                     && target.checked_file_operation_selection
                         != CheckedFileOperationSelection::RealOnly
                 {
-                    self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                    self.show_feedback_warning(checked_virtual_selection_message("削除"));
                     return None;
                 }
                 if !target.delete_targets.is_empty() {
@@ -1883,11 +1941,11 @@ impl crate::app::App {
                     Some(ContextMenuAction::JumpToFolder(request))
                 }
                 CollectionJumpRequestResolution::NoParent => {
-                    self.show_feedback_toast(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned());
+                    self.show_feedback_warning(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned());
                     None
                 }
                 CollectionJumpRequestResolution::Unavailable(reason) => {
-                    self.show_feedback_toast(reason);
+                    self.show_feedback_warning(reason);
                     None
                 }
             };
@@ -2002,6 +2060,10 @@ impl crate::app::App {
     /// 移動なし右クリックでトリガーされる。
     /// アプリケーション起動によりフルスクリーンを閉じるべき場合は true を返す。
     pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> bool {
+        if !self.fs_context_menu_presented() {
+            self.fs_context_menu_idx = None;
+            return false;
+        }
         let idx = match self.fs_context_menu_idx {
             Some(i) => i,
             None => return false,
@@ -2053,7 +2115,8 @@ impl crate::app::App {
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("fs_context_menu")
-            .id(egui::Id::new("fs_ctx_menu"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("fs_ctx_menu"))
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -2064,7 +2127,12 @@ impl crate::app::App {
                 ui.set_min_width(200.0);
                 selected_command = render_egui_menu_nodes(ui, &nodes);
 
-                if ui.input(|i| i.pointer.primary_clicked()) && !ui.ui_contains_pointer() {
+                if crate::ui_fullscreen::fs_menu_outside_press(
+                    ctx,
+                    ui.min_rect(),
+                    egui::Rect::NOTHING,
+                    &[],
+                ) {
                     close = true;
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -2137,7 +2205,7 @@ impl crate::app::App {
             }
             ctx.data_mut(|data| {
                 data.insert_temp(
-                    egui::Id::new(DELETE_CONFIRM_SELECTION_ID),
+                    egui::Id::unique(DELETE_CONFIRM_SELECTION_ID),
                     content.kind.initial_selection(),
                 );
             });
@@ -2145,7 +2213,7 @@ impl crate::app::App {
         }
         let label = self.delete_confirm_label.clone().unwrap_or_default();
         let selection = ctx
-            .data(|data| data.get_temp(egui::Id::new(DELETE_CONFIRM_SELECTION_ID)))
+            .data(|data| data.get_temp(egui::Id::unique(DELETE_CONFIRM_SELECTION_ID)))
             .unwrap_or(DeleteConfirmSelection::Cancel);
 
         // CLAUDE.md の IME 定型どおり Modal closure の前で capture する。
@@ -2161,7 +2229,7 @@ impl crate::app::App {
         );
         ctx.data_mut(|data| {
             data.insert_temp(
-                egui::Id::new(DELETE_CONFIRM_SELECTION_ID),
+                egui::Id::unique(DELETE_CONFIRM_SELECTION_ID),
                 key_response.selection,
             );
         });
@@ -2209,7 +2277,7 @@ impl crate::app::App {
         let canceling = pending.cancel.load(std::sync::atomic::Ordering::Relaxed);
 
         let mut cancel_requested = false;
-        egui::Modal::new(egui::Id::new("delete_progress_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("delete_progress_modal")).show(ctx, |ui| {
             ui.set_min_width(280.0);
             ui.heading("削除中");
             ui.add_space(4.0);
@@ -2273,7 +2341,7 @@ impl crate::app::App {
                 return;
             }
             crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(reason) => {
-                self.show_feedback_toast(reason.to_string());
+                self.show_feedback_warning(reason.to_string());
                 return;
             }
             crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot => {}
@@ -2285,7 +2353,7 @@ impl crate::app::App {
             if classify_checked_file_operation_selection(self.checked.len(), targets.len())
                 != CheckedFileOperationSelection::RealOnly
             {
-                self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                self.show_feedback_warning(checked_virtual_selection_message("削除"));
                 return;
             }
             self.request_delete_confirm(targets);
@@ -2298,7 +2366,7 @@ impl crate::app::App {
             };
             let Some(path) = item.drag_source_path().map(|p| p.to_path_buf()) else {
                 if let Some(reason) = item.file_operation_refusal() {
-                    self.show_feedback_toast(reason.message("削除"));
+                    self.show_feedback_warning(reason.message("削除"));
                 }
                 return;
             };
@@ -2382,32 +2450,16 @@ fn copy_image_to_clipboard(
                     }
                 }
             } else {
-                match image::open(&path) {
-                    Ok(i) => i,
-                    Err(_) => {
-                        #[cfg(windows)]
-                        {
-                            match crate::wic_decoder::decode_to_dynamic_image(&path).or_else(|| {
-                                crate::susie_loader::decode_file(&path, true, None).ok()
-                            }) {
-                                Some(i) => i,
-                                None => return,
-                            }
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            match crate::susie_loader::decode_file(&path, true, None) {
-                                Ok(i) => i,
-                                Err(_) => return,
-                            }
-                        }
-                    }
+                let source = crate::image_decode::Source::Path(&path);
+                match crate::image_decode::decode(
+                    source,
+                    crate::avif_decoder::Workload::Display,
+                    true,
+                    None,
+                ) {
+                    Ok(decoded) => decoded.oriented(source),
+                    Err(_) => return,
                 }
-            };
-            let img = if crate::raw_format::is_raw_path(&path) {
-                img
-            } else {
-                crate::thumb_loader::apply_exif_orientation(img, &path)
             };
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // ここの pre-check は DIB 構築を省くだけの best-effort 短絡。
@@ -2457,24 +2509,19 @@ fn copy_zip_image_to_clipboard(
                     }
                 }
             } else {
-                let Some(img) = image::load_from_memory(&bytes)
-                    .ok()
-                    .or_else(|| {
-                        crate::wic_decoder::decode_to_dynamic_image_from_bytes(
-                            &bytes,
-                            std::path::Path::new(&entry_name)
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .unwrap_or(""),
-                        )
-                    })
-                    .or_else(|| {
-                        crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
-                    })
-                else {
-                    return;
+                let source = crate::image_decode::Source::Bytes {
+                    bytes: &bytes,
+                    hint: &entry_name,
                 };
-                crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes)
+                match crate::image_decode::decode(
+                    source,
+                    crate::avif_decoder::Workload::Display,
+                    true,
+                    None,
+                ) {
+                    Ok(decoded) => decoded.oriented(source),
+                    Err(_) => return,
+                }
             };
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // pre-check は best-effort 短絡 (DIB 構築省略)。正式な stale 判定は
@@ -3197,7 +3244,16 @@ mod delete_confirm_tests {
         let message = checked_virtual_selection_message("削除");
         let chars = message.chars().count();
         assert!(chars >= 50, "文言が想定より短い: {chars} 文字");
-        let secs = crate::ui_fullscreen::feedback_toast_duration(&message);
+        let secs = crate::feedback::feedback_toast_duration(&message);
+        assert_eq!(
+            crate::feedback::resolve_duration(
+                crate::settings::NotificationDuration::Short,
+                crate::feedback::FeedbackKind::Warning,
+                &message,
+                crate::feedback::FeedbackTiming::Text
+            ),
+            secs
+        );
         // 日本語の読字速度 (毎秒 8 文字程度) で読み切れること。
         assert!(
             secs >= 5.0,
@@ -3253,6 +3309,31 @@ mod delete_confirm_tests {
     }
 
     #[test]
+    fn image_folder_zip_context_entry_uses_modal_and_blocks_stale_background_commands() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("photos");
+        std::fs::create_dir(&source).unwrap();
+        let item = GridItem::Folder(source.clone());
+        assert!(
+            menu_commands(&mut app, item.clone(), ContextMenuSurface::Grid)
+                .contains(&MenuCommand::ConvertImageFolderToZip)
+        );
+        let mut target = target(&app, item, ContextMenuSurface::Grid);
+        let ctx = egui::Context::default();
+        app.dispatch_native_grid_context_command(
+            &ctx,
+            MenuCommand::ConvertImageFolderToZip,
+            &target,
+        );
+        assert!(app.image_folder_zip_operation.is_some());
+        assert!(app.common_modal_dialog_open());
+        target.is_folder_context = true;
+        app.dispatch_native_grid_context_command(&ctx, MenuCommand::NewFolder, &target);
+        assert!(!app.show_new_folder_dialog);
+        app.image_folder_zip_operation = None;
+    }
+
+    #[test]
     fn epub_grid_context_routes_pdf_conversion_but_plain_pdf_does_not() {
         let mut app = crate::app::setup_app_for_test();
         assert!(
@@ -3270,6 +3351,42 @@ mod delete_confirm_tests {
                 ContextMenuSurface::Grid,
             )
             .contains(&MenuCommand::ConvertEpubToPdf)
+        );
+    }
+
+    #[test]
+    fn composition_editor_context_entry_survives_empty_current_book_and_explains_unavailable() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items.clear();
+        app.current_folder = Some(PathBuf::from("C:/books/empty.pdf"));
+        let mut background = target(
+            &app,
+            GridItem::Folder(app.current_folder.clone().unwrap()),
+            ContextMenuSurface::Grid,
+        );
+        background.is_folder_context = true;
+        background.item_index = None;
+        let nodes = app.context_menu_nodes(&background, false);
+        assert!(matches!(
+            nodes.first(),
+            Some(MenuNode::Item {
+                command: MenuCommand::EditBookComposition,
+                enabled: false,
+                disabled_reason: Some(_),
+                ..
+            })
+        ));
+        background.surface = ContextMenuSurface::Fullscreen;
+        assert!(
+            !app.context_menu_nodes(&background, false)
+                .iter()
+                .any(|node| matches!(
+                    node,
+                    MenuNode::Item {
+                        command: MenuCommand::EditBookComposition,
+                        ..
+                    }
+                ))
         );
     }
 
@@ -4480,24 +4597,27 @@ mod delete_confirm_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    if ui.button("Background action").clicked() {
-                        clicked_in_ui.store(true, Ordering::Relaxed);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
                     }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        if ui.button("Background action").clicked() {
+                            clicked_in_ui.store(true, Ordering::Relaxed);
+                        }
+                    });
+                    let _ = show_delete_confirm_modal(
+                        ctx,
+                        "sample.jpg をゴミ箱に移動しますか？",
+                        DeleteConfirmSelection::Delete,
+                    );
                 });
-                let _ = show_delete_confirm_modal(
-                    ctx,
-                    "sample.jpg をゴミ箱に移動しますか？",
-                    DeleteConfirmSelection::Delete,
-                );
             });
 
         harness.get_by_label("Background action").click();
@@ -4561,7 +4681,7 @@ mod delete_confirm_tests {
             !keymap.consume_action(&ctx, crate::keymap::KeyAction::GridPin),
             "削除確認で消費した Y は同 frame の背面 KeyAction に届かない"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -4573,7 +4693,81 @@ mod delete_confirm_tests {
             consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Delete, true, false, false);
         assert_eq!(response.action, DeleteConfirmAction::None);
         assert!(!keymap.consume_action(&ctx, crate::keymap::KeyAction::GridPin));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
+    fn delete_confirm_y_n_enter_act_immediately_after_ime_commit() {
+        for same_pass in [true, false] {
+            for (key, expected) in [
+                (egui::Key::Y, DeleteConfirmAction::Delete),
+                (egui::Key::N, DeleteConfirmAction::Cancel),
+                (egui::Key::Enter, DeleteConfirmAction::Delete),
+            ] {
+                let ctx = egui::Context::default();
+                crate::ime_focus::install_ime_input_policy(&ctx);
+                let mut app = crate::app::setup_app_for_test();
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                                text: "preedit".into(),
+                                active_range_chars: None,
+                            })],
+                            ..Default::default()
+                        },
+                        |ctx| app.update_ime_state(ctx),
+                    )
+                    .drop_without_applying_deltas();
+                let press = egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                let mut events = vec![
+                    egui::Event::Ime(egui::ImeEvent::Commit("committed".into())),
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                ];
+                if !same_pass {
+                    let _ = ctx
+                        .run_pass(
+                            egui::RawInput {
+                                events: std::mem::take(&mut events),
+                                ..Default::default()
+                            },
+                            |ctx| app.update_ime_state(ctx),
+                        )
+                        .drop_without_applying_deltas();
+                }
+                events.push(press);
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.update_ime_state(ctx);
+                            let response = consume_delete_confirm_action(
+                                ctx,
+                                DeleteConfirmSelection::Delete,
+                                app.ime_input_active(ctx),
+                                app.dialog_escape_pressed(ctx),
+                                app.dialog_enter_pressed(ctx),
+                            );
+                            assert_eq!(response.action, expected, "{key:?}, same_pass={same_pass}");
+                            assert!(!ctx.input(|input| input.key_pressed(key)));
+                        },
+                    )
+                    .drop_without_applying_deltas();
+            }
+        }
     }
 
     #[test]
@@ -4584,7 +4778,7 @@ mod delete_confirm_tests {
             consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Delete, false, true, false);
         assert_eq!(response.action, DeleteConfirmAction::Cancel);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -4595,7 +4789,7 @@ mod delete_confirm_tests {
             consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Cancel, false, false, true);
         assert_eq!(response.action, DeleteConfirmAction::Cancel);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -4618,7 +4812,7 @@ mod delete_confirm_tests {
             assert_eq!(response.selection, expected, "{key:?}");
             assert_eq!(response.action, DeleteConfirmAction::None);
             assert!(ctx.input(|input| input.events.is_empty()));
-            let _ = ctx.end_pass();
+            let _ = ctx.end_pass().drop_without_applying_deltas();
         }
     }
 

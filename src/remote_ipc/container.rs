@@ -50,6 +50,20 @@ const PAGE_JPEG_QUALITY: i32 = 85;
 /// Bump only when the native remote AI pipeline changes pixel semantics.
 const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
 
+#[cfg(test)]
+#[derive(Default)]
+struct RemoteEnumerationAudit {
+    budget: Option<usize>,
+    dimension_inputs: Vec<String>,
+    zip_probes: Vec<String>,
+    pdf_size_calls: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static REMOTE_ENUMERATION_AUDIT: std::cell::RefCell<Option<RemoteEnumerationAudit>> = const { std::cell::RefCell::new(None) };
+}
+
 struct ContainerEntryBudget {
     estimated_bytes: usize,
     maximum_bytes: usize,
@@ -57,6 +71,10 @@ struct ContainerEntryBudget {
 
 impl ContainerEntryBudget {
     fn new(maximum_bytes: usize) -> Self {
+        #[cfg(test)]
+        let maximum_bytes = REMOTE_ENUMERATION_AUDIT
+            .with(|audit| audit.borrow().as_ref().and_then(|a| a.budget))
+            .unwrap_or(maximum_bytes);
         // Brackets for both the `entries` and `page_groups` JSON arrays.
         Self {
             estimated_bytes: 4,
@@ -2220,7 +2238,20 @@ struct RemotePartnerAutoTrimRequest {
     resolved: ResolvedPath,
 }
 
+/// Directory eligibility is supplied only by successful folder enumeration, never path sniffing.
+enum SpreadDefaultSource {
+    Legacy {
+        use_book_defaults: bool,
+    },
+    Directory {
+        book_locked: bool,
+        canonical_image_book: bool,
+    },
+}
+
 struct SpreadPayload {
+    composition_managed: bool,
+    composition_revision: Option<u64>,
     configured: RemoteSpreadMode,
     effective: RemoteSpreadMode,
     reading_direction: RemoteReadingDirection,
@@ -2250,6 +2281,13 @@ struct ValidatedPageContext {
     record_history: bool,
     record_resume: bool,
     bookmark_supported: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PageContextOrder {
+    /// Read-only bookmark lists validate their anchor without consuming composition.
+    Canonical,
+    VisibleReading,
 }
 
 struct PreparedZipBookmarkList {
@@ -2427,6 +2465,12 @@ fn collect_zip_entry_dims(
     let mut unresolved = 0usize;
     let mut undecodable = 0usize;
     for entry_name in missing {
+        #[cfg(test)]
+        REMOTE_ENUMERATION_AUDIT.with(|audit| {
+            if let Some(audit) = audit.borrow_mut().as_mut() {
+                audit.zip_probes.push(entry_name.clone());
+            }
+        });
         if crate::raw_format::is_raw_path(Path::new(&entry_name)) {
             match crate::zip_loader::read_entry_bytes(container_path, &entry_name)
                 .ok()
@@ -2435,6 +2479,31 @@ fn collect_zip_entry_dims(
                 }) {
                 Some(info) => {
                     dims.insert(entry_name, (info.developed_dims[0], info.developed_dims[1]));
+                }
+                None => undecodable += 1,
+            }
+            continue;
+        }
+        // libavif needs the container, not a truncated image header. Other
+        // formats retain the prefix probe and its bounded archive I/O.
+        if Path::new(&entry_name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("avif"))
+        {
+            match crate::zip_loader::read_entry_bytes(container_path, &entry_name)
+                .ok()
+                .and_then(|bytes| {
+                    crate::image_decode::avif_dimensions(
+                        crate::image_decode::Source::Bytes {
+                            bytes: &bytes,
+                            hint: &entry_name,
+                        },
+                        crate::avif_decoder::Workload::Background,
+                    )?
+                    .ok()
+                }) {
+                Some(size) => {
+                    dims.insert(entry_name, size);
                 }
                 None => undecodable += 1,
             }
@@ -2479,6 +2548,12 @@ fn file_image_dims(path: &Path) -> Option<(u32, u32)> {
             .ok()?
             .developed_dims;
         return Some((dims[0], dims[1]));
+    }
+    if let Some(result) = crate::image_decode::avif_dimensions(
+        crate::image_decode::Source::Path(path),
+        crate::avif_decoder::Workload::Background,
+    ) {
+        return result.ok();
     }
     image::ImageReader::open(path)
         .ok()?
@@ -3131,6 +3206,188 @@ impl ContainerEngine {
         self.validate_write_request_admitted(request, current_catalog_admission())
     }
 
+    pub(super) fn composition_write_admission(
+        &self,
+        request: &RemoteWriteRequest,
+    ) -> Result<crate::book_composition::CompositionWriteAdmission, RemoteWriteError> {
+        use crate::book_composition::{
+            CandidatePermissionError, CompositionTarget, CompositionWriteAdmission,
+            ScopePermissionToken,
+        };
+        let mut admission = CompositionWriteAdmission::default();
+        let service = self
+            .session
+            .as_ref()
+            .and_then(|session| session.book_composition_service());
+        if service.is_none() {
+            return Ok(admission);
+        }
+        let binding = matches!(
+            request,
+            RemoteWriteRequest::SetSpread { .. }
+                | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
+                | RemoteWriteRequest::SetPageAlonePreference { .. }
+        );
+        if let RemoteWriteRequest::SetSpread { spread_mode, .. } = request {
+            admission.binding_kind =
+                crate::book_composition::CompositionBindingWriteKind::LegacySpread(
+                    core_spread_mode(*spread_mode),
+                );
+        } else if binding {
+            admission.binding_kind =
+                crate::book_composition::CompositionBindingWriteKind::AutomaticRule;
+        }
+        if let Some(address) = request.address() {
+            let resolved = self
+                .resolve(address)
+                .map_err(remote_write_error_from_media)?;
+            if binding && is_composition_container(&resolved) {
+                let prefix = match &address.subresource {
+                    RemoteSubresource::ZipDirectory { prefix } => prefix.trim_end_matches('/'),
+                    _ => "",
+                };
+                let scope = crate::book_scope::BookScopeKey::new(&resolved.logical, prefix)
+                    .map_err(|error| {
+                        RemoteWriteError::new(RemoteWriteErrorCode::Unsupported, error)
+                    })?;
+                // Eligibility above comes from the physical file. Future folder
+                // values at the same key are not an active file composition.
+                if service
+                    .as_ref()
+                    .unwrap()
+                    .snapshot()
+                    .rows
+                    .get(&scope.storage_key())
+                    .is_some_and(|row| {
+                        row.domain == crate::book_composition::PageDomain::ImageFolder
+                    })
+                {
+                    return Ok(admission);
+                }
+                if service
+                    .as_ref()
+                    .unwrap()
+                    .snapshot()
+                    .rows
+                    .contains_key(&scope.storage_key())
+                    && is_archive_container(&resolved)
+                {
+                    match crate::book_composition::validate_archive_scope_source(
+                        &scope,
+                        resolved.readable_logical(),
+                    ) {
+                        Ok(()) => {}
+                        Err(CandidatePermissionError::UnsupportedSource(error)) => {
+                            crate::logger::log(format!(
+                                "book_composition: unsupported remote binding source: {error}"
+                            ));
+                            admission.unsupported_scopes.push(ScopePermissionToken {
+                                token: service.as_ref().unwrap().snapshot().token_for(&scope),
+                                scope: scope.clone(),
+                            });
+                        }
+                        Err(error) => {
+                            return Err(RemoteWriteError::new(
+                                RemoteWriteErrorCode::PersistenceFailed,
+                                error.to_string(),
+                            ));
+                        }
+                    }
+                }
+                admission.binding_scope = Some(scope);
+            } else if !matches!(
+                request,
+                RemoteWriteRequest::SetViewMode { .. }
+                    | RemoteWriteRequest::SetSortOrder { .. }
+                    | RemoteWriteRequest::RecordVideoProgress { .. }
+            ) {
+                if let Some(candidate) = self.composition_page_candidate(address, &resolved) {
+                    match crate::book_composition::resolve_candidate_scope(&candidate) {
+                        Ok((scope, _, page)) => {
+                            admission.targets.push(CompositionTarget { scope, page })
+                        }
+                        Err(CandidatePermissionError::UnsupportedSource(error)) => {
+                            crate::logger::log(format!(
+                                "book_composition: unsupported remote write source: {error}"
+                            ));
+                            admission.unsupported_pages.push(candidate.identity);
+                        }
+                        Err(error) => {
+                            return Err(RemoteWriteError::new(
+                                RemoteWriteErrorCode::PersistenceFailed,
+                                error.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        admission
+            .validate(&service.unwrap().snapshot())
+            .map_err(|error| RemoteWriteError::new(RemoteWriteErrorCode::Unsupported, error))?;
+        Ok(admission)
+    }
+
+    fn composition_page_candidate(
+        &self,
+        address: &RemoteAddress,
+        resolved: &ResolvedPath,
+    ) -> Option<crate::book_composition::CandidatePage> {
+        use crate::book_resume_db::PageIdentity;
+        let identity = match &address.subresource {
+            RemoteSubresource::ZipEntry { entry_name } => PageIdentity::Archive {
+                container: crate::path_key::normalize_keep_drive(&resolved.logical),
+                entry_name: entry_name.clone(),
+            },
+            RemoteSubresource::PdfPage { page_number } => PageIdentity::Document {
+                container: crate::path_key::normalize_keep_drive(&resolved.logical),
+                page_num: *page_number as usize,
+            },
+            _ => return None,
+        };
+        Some(crate::book_composition::CandidatePage {
+            identity,
+            physical_archive: matches!(address.subresource, RemoteSubresource::ZipEntry { .. })
+                .then(|| resolved.readable_logical().to_owned()),
+            raw_tree: None,
+        })
+    }
+    fn validate_composition_page(
+        &self,
+        address: &RemoteAddress,
+        resolved: &ResolvedPath,
+    ) -> Result<(), MediaError> {
+        let Some(service) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.book_composition_service())
+        else {
+            return Ok(());
+        };
+        let Some(candidate) = self.composition_page_candidate(address, resolved) else {
+            return Ok(());
+        };
+        match crate::book_composition::candidate_permission(&service.snapshot(), &candidate) {
+            Ok(crate::book_composition::CandidatePermission::Hidden(_)) => Err(media_error(
+                MediaErrorCode::Unsupported,
+                "本の構成で非表示に設定されています",
+            )),
+            Ok(_) => Ok(()),
+            Err(crate::book_composition::CandidatePermissionError::UnsupportedSource(error)) => {
+                crate::logger::log(format!(
+                    "book_composition: remote source unsupported: {error}"
+                ));
+                Ok(())
+            }
+            Err(error) => Err(media_error(
+                MediaErrorCode::RenderFailed,
+                format!("本の構成を確認できませんでした: {error:?}"),
+            )),
+        }
+    }
+
     fn validate_write_request_admitted(
         &self,
         request: &mut RemoteWriteRequest,
@@ -3147,7 +3404,8 @@ impl ContainerEngine {
             self.canonicalize_write_address(context_address)?;
         }
         match request {
-            RemoteWriteRequest::SetSpread { address, .. }
+            RemoteWriteRequest::SetViewMode { address, .. }
+            | RemoteWriteRequest::SetSpread { address, .. }
             | RemoteWriteRequest::SetFinalCoverSpreadPreference { address, .. }
             | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { address, .. }
             | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { address, .. }
@@ -3160,12 +3418,7 @@ impl ContainerEngine {
                 let is_directory = metadata.as_ref().is_some_and(|value| value.is_dir());
                 let supported = match address.subresource {
                     RemoteSubresource::File => {
-                        is_directory
-                            || is_file
-                                && (is_archive_container(&resolved)
-                                    || crate::folder_tree::is_paged_document_path(
-                                        &resolved.logical,
-                                    ))
+                        is_directory || is_supported_reading_file(&resolved, is_file)
                     }
                     RemoteSubresource::ZipDirectory { .. } => {
                         is_file && is_archive_container(&resolved)
@@ -3286,7 +3539,7 @@ impl ContainerEngine {
                         "このページは本のブックマーク対象ではありません",
                     ));
                 }
-                *page_index = validated.page_index;
+                *page_index = validated.page_number.saturating_sub(1);
                 Ok(())
             }
             RemoteWriteRequest::GetItemState {
@@ -3298,7 +3551,7 @@ impl ContainerEngine {
                 self.validate_rating_page(address, catalog_admission)?;
                 let validated =
                     self.validate_page_context(address, context_address, catalog_admission)?;
-                *page_index = validated.page_index;
+                *page_index = validated.page_number.saturating_sub(1);
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
             }
@@ -3308,9 +3561,13 @@ impl ContainerEngine {
                 page_index,
                 bookmark_supported,
             } => {
-                let validated =
-                    self.validate_page_context(address, context_address, catalog_admission)?;
-                *page_index = validated.page_index;
+                let validated = self.validate_page_context_with_order(
+                    address,
+                    context_address,
+                    catalog_admission,
+                    PageContextOrder::Canonical,
+                )?;
+                *page_index = validated.page_number.saturating_sub(1);
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
             }
@@ -3535,11 +3792,11 @@ impl ContainerEngine {
                     let target = match &bookmark.page_identity {
                         crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) => {
                             crate::book_bookmarks::resolve_archive_bookmark_target(
-                                &tree,
+                                tree,
                                 entry_name,
-                                &self.settings.grid_display_order,
                             )
                             .and_then(|target| {
+                                let item_index = crate::app::book_materialization::resolve_archive_target_index(tree, &target, &self.settings.grid_display_order)?;
                                 let address =
                                     zip_entry_address(&container_address, &target.entry_name);
                                 address.validate_syntax().ok()?;
@@ -3556,7 +3813,7 @@ impl ContainerEngine {
                                 Some(RemoteBookBookmarkTarget {
                                     address,
                                     context_address,
-                                    item_index: u32::try_from(target.item_index).ok()?,
+                                    item_index: u32::try_from(item_index).ok()?,
                                 })
                             })
                         }
@@ -3663,8 +3920,13 @@ impl ContainerEngine {
         let validation_tree =
             crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries.clone())
                 .project(&policy);
-        let validated =
-            self.validate_zip_page_in_tree(&validation_tree, &requested_prefix, entry_name)?;
+        let validated = self.validate_zip_page_in_tree(
+            &resolved,
+            &validation_tree,
+            &requested_prefix,
+            entry_name,
+            PageContextOrder::Canonical,
+        )?;
         *page_index = validated.page_index;
         *bookmark_supported = validated.bookmark_supported;
 
@@ -3754,14 +4016,33 @@ impl ContainerEngine {
         context_address: &RemoteAddress,
         catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
+        self.validate_page_context_with_order(
+            address,
+            context_address,
+            catalog_admission,
+            PageContextOrder::VisibleReading,
+        )
+    }
+
+    fn validate_page_context_with_order(
+        &self,
+        address: &RemoteAddress,
+        context_address: &RemoteAddress,
+        catalog_admission: crate::catalog::CatalogAdmission,
+        order: PageContextOrder,
+    ) -> Result<ValidatedPageContext, RemoteWriteError> {
         match &address.subresource {
             RemoteSubresource::File => self.validate_folder_page(address, context_address),
             RemoteSubresource::ZipEntry { entry_name } => {
-                self.validate_zip_page(address, context_address, entry_name)
+                self.validate_zip_page(address, context_address, entry_name, order)
             }
-            RemoteSubresource::PdfPage { page_number } => {
-                self.validate_pdf_page(address, context_address, *page_number, catalog_admission)
-            }
+            RemoteSubresource::PdfPage { page_number } => self.validate_pdf_page(
+                address,
+                context_address,
+                *page_number,
+                catalog_admission,
+                order,
+            ),
             RemoteSubresource::ZipDirectory { .. } => Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::Unsupported,
                 "コンテナ自体はページではありません",
@@ -3815,11 +4096,11 @@ impl ContainerEngine {
                     "画像フォルダ内のページが見つかりません",
                 )
             })?;
-        let page_number = items[..=index]
-            .iter()
-            .filter(|item| item.has_page_data())
-            .count();
-        let page_count = items.iter().filter(|item| item.has_page_data()).count();
+        let reader_order = (0..items.len()).collect::<Vec<_>>();
+        let image_indices = crate::ui_helpers::still_image_display_indices(&items, &reader_order);
+        let page_number = crate::ui_helpers::image_reading_position(&image_indices, index)
+            .expect("validated image is in the reading order");
+        let page_count = image_indices.len();
         validated_context(
             index,
             page_count,
@@ -3954,13 +4235,14 @@ impl ContainerEngine {
         address: &RemoteAddress,
         context_address: &RemoteAddress,
         entry_name: &str,
+        order: PageContextOrder,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
         let (resolved, requested_prefix, enumeration) =
             self.enumerate_zip_page_context(address, context_address)?;
         let policy = self.settings_for_listing()?.file_type_visibility;
-        let tree =
-            crate::zip_tree::ZipTree::build(resolved.logical, enumeration.entries).project(&policy);
-        self.validate_zip_page_in_tree(&tree, &requested_prefix, entry_name)
+        let tree = crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries)
+            .project(&policy);
+        self.validate_zip_page_in_tree(&resolved, &tree, &requested_prefix, entry_name, order)
     }
 
     fn enumerate_zip_page_context(
@@ -4009,9 +4291,11 @@ impl ContainerEngine {
 
     fn validate_zip_page_in_tree(
         &self,
+        resolved: &ResolvedPath,
         tree: &crate::zip_tree::ZipTree,
         requested_prefix: &str,
         entry_name: &str,
+        order: PageContextOrder,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
         let requested_segments = zip_prefix_segments(&requested_prefix);
         if tree.node_at(&requested_segments).is_none() {
@@ -4022,13 +4306,11 @@ impl ContainerEngine {
         }
         let effective_segments = tree.collapse_redundant(&requested_segments);
         let root_segments = tree.collapse_redundant(&[]);
-        let (mut items, mut metas) =
-            tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut metas,
-            &self.settings.grid_display_order,
-            Some(crate::app::BOOK_READING_PAGE_ORDER),
+        let (items, _) = crate::app::book_materialization::materialize_archive_level(
+            tree,
+            &effective_segments,
+            crate::app::BOOK_READING_PAGE_ORDER,
+            Some(&self.settings.grid_display_order),
         );
         let index = items
             .iter()
@@ -4047,12 +4329,58 @@ impl ContainerEngine {
                     "ZIP 内のページが見つかりません",
                 )
             })?;
-        let image_position = items[..=index]
-            .iter()
-            .filter(|item| item.has_page_data())
-            .count()
-            .saturating_sub(1);
-        let image_count = items.iter().filter(|item| item.has_page_data()).count();
+        let projection = if matches!(order, PageContextOrder::Canonical) {
+            None
+        } else {
+            let scope =
+                crate::book_scope::BookScopeKey::archive(&resolved.logical, &effective_segments)
+                    .map_err(|error| {
+                        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, error)
+                    })?;
+            self.remote_book_projection(
+                resolved,
+                scope.clone(),
+                crate::book_composition::PageDomain::ArchiveLevel {
+                    prefix: scope.level_prefix.clone(),
+                },
+                || {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(raw_index, item)| match item {
+                            crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
+                                Some(crate::book_composition::CanonicalRawPage {
+                                    page:
+                                        crate::book_composition::CompositionPageRef::ArchiveEntry {
+                                            entry_name: entry_name.clone(),
+                                        },
+                                    raw_index,
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                },
+                items.len(),
+                Some(tree.raw_source()),
+            )
+            .map_err(remote_write_error_from_media)?
+        };
+        // Keep the canonical row index for resume, but count bookmark/history
+        // positions in the same visible composition order as Remote enumeration.
+        let reader_order = projection.map_or_else(
+            || (0..items.len()).collect::<Vec<_>>(),
+            |projection| projection.output_to_input,
+        );
+        let image_indices = crate::ui_helpers::still_image_display_indices(&items, &reader_order);
+        let image_position =
+            crate::ui_helpers::image_reading_position(&image_indices, index).ok_or_else(|| {
+                RemoteWriteError::new(
+                    RemoteWriteErrorCode::Unsupported,
+                    "本の構成で非表示に設定されています",
+                )
+            })? - 1;
+        let image_count = image_indices.len();
         validated_context(
             index,
             image_count,
@@ -4073,6 +4401,7 @@ impl ContainerEngine {
         context_address: &RemoteAddress,
         page_number: u32,
         catalog_admission: crate::catalog::CatalogAdmission,
+        order: PageContextOrder,
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
         if !matches!(context_address.subresource, RemoteSubresource::File) {
             return Err(RemoteWriteError::new(
@@ -4099,7 +4428,52 @@ impl ContainerEngine {
             .pdf_page_count(&resolved, &metadata, catalog_admission)
             .map_err(remote_write_error_from_media)?;
         validate_page_number(page_number, page_count).map_err(remote_write_error_from_media)?;
-        validated_context(page_number as usize, page_count as usize, true, true, true)
+        if matches!(order, PageContextOrder::Canonical) {
+            return validated_context(page_number as usize, page_count as usize, true, true, true);
+        }
+        let scope = crate::book_scope::BookScopeKey::document(&resolved.logical)
+            .map_err(|error| RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, error))?;
+        let projection = self
+            .remote_book_projection(
+                &resolved,
+                scope,
+                crate::book_composition::PageDomain::Document,
+                || {
+                    (0..page_count)
+                        .map(|page_num| crate::book_composition::CanonicalRawPage {
+                            page: crate::book_composition::CompositionPageRef::PdfPage { page_num },
+                            raw_index: page_num as usize,
+                        })
+                        .collect()
+                },
+                page_count as usize,
+                None,
+            )
+            .map_err(remote_write_error_from_media)?;
+        let Some(projection) = projection else {
+            return validated_context(page_number as usize, page_count as usize, true, true, true);
+        };
+        let reading_position = crate::ui_helpers::image_reading_position(
+            &projection.output_to_input,
+            page_number as usize,
+        )
+        .ok_or_else(|| {
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::Unsupported,
+                "本の構成で非表示に設定されています",
+            )
+        })?;
+        validated_context(
+            page_number as usize,
+            projection.output_to_input.len(),
+            true,
+            true,
+            true,
+        )
+        .map(|mut context| {
+            context.page_number = u32::try_from(reading_position).unwrap_or(u32::MAX);
+            context
+        })
     }
 
     #[cfg(test)]
@@ -4270,6 +4644,9 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
         };
+        if let Err(error) = self.validate_composition_page(&request.address, &resolved) {
+            return PageResponse::Error(error);
+        }
         let rotation =
             context.rotation_for_remote_page(&resolved.logical, &request.address.subresource);
         let view_trim_plan = match self.remote_view_trim_plan_timed(
@@ -4955,6 +5332,7 @@ impl ContainerEngine {
                 )),
             );
             let resolved = self.resolve(&page.address).map_err(remote_ai_media_error)?;
+            self.validate_composition_page(&page.address, &resolved).map_err(remote_ai_media_error)?;
             let metadata = std::fs::metadata(&resolved.canonical)
                 .map_err(|error| RemoteAiRunError::Failed(format!("source metadata: {error}")))?;
             if !metadata.is_file() {
@@ -5489,6 +5867,7 @@ impl ContainerEngine {
         items: &[crate::grid_item::GridItem],
         resume_supported: bool,
         policy: &crate::file_type_visibility::FileTypeVisibility,
+        canonical_slots: Option<&[usize]>,
     ) -> ResumePageResolution {
         if !resume_supported {
             return ResumePageResolution::Unavailable;
@@ -5508,8 +5887,21 @@ impl ContainerEngine {
         let Some(saved) = saved else {
             return ResumePageResolution::Unavailable;
         };
-        let resolved =
-            resolve_saved_resume_for_items(container, container_path, items, &saved, policy);
+        let resolved = if let Some(slots) =
+            canonical_slots.filter(|_| saved.identity.is_none() && policy.is_all_visible())
+        {
+            slots
+                .iter()
+                .position(|&slot| slot == saved.page)
+                .and_then(|index| items.get(index))
+                .and_then(|item| grid_item_address(container, item))
+                .map(ResumePageResolution::Page)
+                .unwrap_or(ResumePageResolution::VisibilityRefused(
+                    ContainerResumeRefusal::SavedPageUnavailable,
+                ))
+        } else {
+            resolve_saved_resume_for_items(container, container_path, items, &saved, policy)
+        };
         if !matches!(resolved, ResumePageResolution::Page(_)) {
             crate::logger::log(format!(
                 "remote_ipc: saved book resume is outside the current readable pages saved_index={} item_count={}",
@@ -5573,6 +5965,7 @@ impl ContainerEngine {
             &listing.items,
             true,
             &listing.file_type_visibility,
+            None,
         );
         let source_items = listing.items;
         let total = source_items
@@ -5623,11 +6016,15 @@ impl ContainerEngine {
             &items,
             Some(&source_items),
             None,
-            canonical_image_book,
+            SpreadDefaultSource::Directory {
+                book_locked: listing.sort_locked,
+                canonical_image_book,
+            },
             complete_book_eligible,
             None,
             None,
             shift_scope,
+            None,
         )?;
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
@@ -5652,6 +6049,8 @@ impl ContainerEngine {
             resume_page,
             resume_refusal,
             open_mode,
+            composition_managed: spread.composition_managed,
+            composition_revision: spread.composition_revision,
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -5675,6 +6074,91 @@ impl ContainerEngine {
             entry_limit,
             truncated,
         })
+    }
+
+    /// Resolve identities and order only. Response limits are applied by the caller before
+    /// dimension discovery and spread grouping, just as for an automatic book.
+    fn remote_book_projection(
+        &self,
+        resolved: &ResolvedPath,
+        scope: crate::book_scope::BookScopeKey,
+        domain: crate::book_composition::PageDomain,
+        raw_pages: impl FnOnce() -> Vec<crate::book_composition::CanonicalRawPage>,
+        row_count: usize,
+        source: Option<&crate::zip_tree::ZipTree>,
+    ) -> Result<Option<crate::book_composition::PreparedCompositionProjection>, MediaError> {
+        use crate::book_composition::*;
+        if !is_composition_container(resolved) {
+            return Ok(None);
+        }
+        let Some(service) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.book_composition_service())
+        else {
+            return Ok(None);
+        };
+        let snapshot = service.snapshot();
+        snapshot.status.as_ref().map_err(|error| {
+            crate::logger::log(format!(
+                "book_composition: remote read unavailable: {error}"
+            ));
+            media_error(MediaErrorCode::RenderFailed, "本の構成を読み取れません")
+        })?;
+        let Some(row) = snapshot.rows.get(&scope.storage_key()) else {
+            return Ok(None);
+        };
+        if row.domain == PageDomain::ImageFolder {
+            return Ok(None);
+        }
+        if source.is_some_and(|tree| validate_archive_scope_in_tree(&scope, tree).is_err()) {
+            crate::logger::log(UNSUPPORTED_COMPOSITION_NOTICE.to_owned());
+            return Ok(None);
+        }
+        let raw_pages = raw_pages();
+        let manifest = raw_pages
+            .iter()
+            .map(|raw| ManifestPage {
+                page: raw.page.clone(),
+                availability: ManifestAvailability::Present {
+                    item_index: raw.raw_index,
+                },
+            })
+            .collect::<Vec<_>>();
+        let projection = project_composition(
+            scope.clone(),
+            &domain,
+            snapshot.token_for(&scope),
+            Some(&row.composition),
+            &raw_pages,
+            &manifest,
+            row_count,
+        )
+        .map_err(|error| {
+            crate::logger::log(format!(
+                "book_composition: remote projection failed: {error}"
+            ));
+            media_error(MediaErrorCode::RenderFailed, "本の構成を読み取れません")
+        })?;
+        match &projection.outcome {
+            CompositionProjectionOutcome::Composed(_) => Ok(Some(projection)),
+            CompositionProjectionOutcome::Unsupported { reason } => {
+                crate::logger::log(format!(
+                    "book_composition: remote source unsupported: {reason}"
+                ));
+                Ok(None)
+            }
+            CompositionProjectionOutcome::Unreadable { reason } => {
+                crate::logger::log(format!(
+                    "book_composition: remote record unreadable: {reason}"
+                ));
+                Err(media_error(
+                    MediaErrorCode::RenderFailed,
+                    "本の構成を読み取れません",
+                ))
+            }
+            CompositionProjectionOutcome::Automatic => Ok(None),
+        }
     }
 
     fn enumerate_zip(
@@ -5705,6 +6189,8 @@ impl ContainerEngine {
             enumeration_started.elapsed().as_secs_f64() * 1000.0,
             enumeration.entries.len()
         ));
+        let composition_source =
+            crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries.clone());
         let safe_entries = enumeration
             .entries
             .into_iter()
@@ -5737,6 +6223,55 @@ impl ContainerEngine {
         let effective_prefix = zip_prefix(&effective_segments);
         let (items, _) =
             tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
+        let scope =
+            crate::book_scope::BookScopeKey::archive(&resolved.logical, &effective_segments)
+                .map_err(|_| media_error(MediaErrorCode::BadRequest, "本の場所が不正です"))?;
+        let raw_pages = || {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(raw_index, item)| {
+                    if let crate::grid_item::GridItem::ZipImage { entry_name, .. } = item {
+                        Some(crate::book_composition::CanonicalRawPage {
+                            page: crate::book_composition::CompositionPageRef::ArchiveEntry {
+                                entry_name: entry_name.clone(),
+                            },
+                            raw_index,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let projection = self.remote_book_projection(
+            resolved,
+            scope.clone(),
+            crate::book_composition::PageDomain::ArchiveLevel {
+                prefix: scope.level_prefix.clone(),
+            },
+            raw_pages,
+            items.len(),
+            Some(&composition_source),
+        )?;
+        let items = if let Some(projection) = projection.as_ref() {
+            projection
+                .output_to_input
+                .iter()
+                .map(|&index| items[index].clone())
+                .collect()
+        } else {
+            items
+        };
+        let composition = projection.as_ref().and_then(|projection| {
+            if let crate::book_composition::CompositionProjectionOutcome::Composed(accepted) =
+                &projection.outcome
+            {
+                Some(&accepted.resolved)
+            } else {
+                None
+            }
+        });
         let total = items.len();
         let canonical_image_book = !items.is_empty()
             && items
@@ -5749,6 +6284,9 @@ impl ContainerEngine {
             &items,
             at_resume_root,
             &policy,
+            projection
+                .as_ref()
+                .map(|projection| projection.output_to_input.as_slice()),
         );
         let (resume_page, resume_refusal, open_mode) = self.container_resume_fields(
             at_resume_root && self.settings.effective_auto_fullscreen_zip_pdf(),
@@ -5797,11 +6335,14 @@ impl ContainerEngine {
             &items,
             Some(&source_items),
             Some((&effective_segments, &resolved.logical)),
-            true,
+            SpreadDefaultSource::Legacy {
+                use_book_defaults: true,
+            },
             complete_book_eligible,
             None,
             None,
-            crate::book_scope::BookScopeKey::archive(&resolved.logical, &effective_segments).ok(),
+            Some(scope),
+            composition,
         )?;
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
@@ -5835,6 +6376,8 @@ impl ContainerEngine {
             resume_page,
             resume_refusal,
             open_mode,
+            composition_managed: spread.composition_managed,
+            composition_revision: spread.composition_revision,
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -5884,16 +6427,54 @@ impl ContainerEngine {
             None,
             catalog_admission,
         )?;
+        let scope = crate::book_scope::BookScopeKey::document(&resolved.logical)
+            .map_err(|_| media_error(MediaErrorCode::BadRequest, "本の場所が不正です"))?;
+        let projection = self.remote_book_projection(
+            resolved,
+            scope.clone(),
+            crate::book_composition::PageDomain::Document,
+            || {
+                (0..page_count)
+                    .map(|page_num| crate::book_composition::CanonicalRawPage {
+                        page: crate::book_composition::CompositionPageRef::PdfPage { page_num },
+                        raw_index: page_num as usize,
+                    })
+                    .collect()
+            },
+            page_count as usize,
+            None,
+        )?;
+        let page_order = projection.as_ref().map_or_else(
+            || (0..(page_count as usize).min(CONTAINER_ENTRY_LIMIT)).collect::<Vec<_>>(),
+            |projection| projection.output_to_input.clone(),
+        );
+        let composition = projection.as_ref().and_then(|projection| {
+            if let crate::book_composition::CompositionProjectionOutcome::Composed(accepted) =
+                &projection.outcome
+            {
+                Some(&accepted.resolved)
+            } else {
+                None
+            }
+        });
+        let visible_page_count = projection
+            .as_ref()
+            .map_or(page_count as usize, |projection| {
+                projection.output_to_input.len()
+            });
         let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut items = Vec::new();
         let mut entries = Vec::new();
         let mut byte_truncated = false;
-        for page_number in (0..page_count).take(CONTAINER_ENTRY_LIMIT) {
-            let item = crate::grid_item::GridItem::PdfPage {
-                pdf_path: resolved.logical.clone(),
-                page_num: page_number,
-                content_type: None,
-            };
+        for page_number in page_order
+            .iter()
+            .take(CONTAINER_ENTRY_LIMIT)
+            .map(|&p| p as u32)
+        {
+            let item = crate::app::book_materialization::document_page_item(
+                &resolved.logical,
+                page_number,
+            );
             let entry = ContainerEntry {
                 address: RemoteAddress {
                     path: address.path.clone(),
@@ -5913,24 +6494,34 @@ impl ContainerEngine {
         let policy = self
             .current_file_type_visibility()
             .map_err(|error| media_error(MediaErrorCode::RenderFailed, &error.to_string()))?;
-        let resume = self.resume_page_for_items(&address, &resolved.logical, &items, true, &policy);
+        let resume = self.resume_page_for_items(
+            &address,
+            &resolved.logical,
+            &items,
+            true,
+            &policy,
+            projection.as_ref().map(|_| page_order.as_slice()),
+        );
         let (resume_page, resume_refusal, open_mode) =
             self.container_resume_fields(self.settings.effective_auto_fullscreen_zip_pdf(), resume);
-        let complete_book_eligible = entries.len() == page_count as usize && !byte_truncated;
+        let complete_book_eligible = entries.len() == visible_page_count && !byte_truncated;
         let spread = self.spread_payload_with_read(
             request,
             resolved,
             &items,
             None,
             None,
-            true,
+            SpreadDefaultSource::Legacy {
+                use_book_defaults: true,
+            },
             complete_book_eligible,
             Some(&read),
             Some(page_count),
-            crate::book_scope::BookScopeKey::document(&resolved.logical).ok(),
+            Some(scope),
+            composition,
         )?;
         let (entry_limit, truncated) =
-            container_limit_metadata(page_count as usize, entries.len(), byte_truncated);
+            container_limit_metadata(visible_page_count, entries.len(), byte_truncated);
         Ok(ContainerPayload {
             thumbnail_presentation: super::thumbnail_presentation(
                 &self
@@ -5952,6 +6543,8 @@ impl ContainerEngine {
             resume_page,
             resume_refusal,
             open_mode,
+            composition_managed: spread.composition_managed,
+            composition_revision: spread.composition_revision,
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -6011,11 +6604,12 @@ impl ContainerEngine {
             items,
             source_items,
             zip_context,
-            use_book_defaults,
+            SpreadDefaultSource::Legacy { use_book_defaults },
             complete_book_eligible,
             None,
             None,
             shift_scope,
+            None,
         )
     }
 
@@ -6027,30 +6621,51 @@ impl ContainerEngine {
         items: &[crate::grid_item::GridItem],
         source_items: Option<&[crate::grid_item::GridItem]>,
         zip_context: Option<(&[String], &Path)>,
-        use_book_defaults: bool,
+        default_source: SpreadDefaultSource,
         complete_book_eligible: bool,
         read: Option<&crate::pdf_loader::ReadTarget>,
         document_page_count: Option<u32>,
         shift_scope: Option<crate::book_scope::BookScopeKey>,
+        composition: Option<&crate::book_composition::ResolvedComposition>,
     ) -> Result<SpreadPayload, MediaError> {
         let reading_settings = self
             .reading_settings
             .load(&self.settings)
             .map_err(remote_reading_settings_error)?;
+        let composition_managed = composition.is_some();
         let key = if let Some((segments, root)) = zip_context {
             crate::spread_db::container_key_with_fallback(root, segments)
         } else {
             crate::spread_db::container_key_with_fallback(&resolved.logical, &[])
         };
-        let (
-            stored_mode,
-            stored_direction,
-            final_cover_preference,
-            singleton_placement_preference,
-            page_alone_preference,
-        ) = self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
+        let (stored, final_cover_preference, singleton_placement_preference, page_alone_preference) =
+            self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
         let source_items = source_items.unwrap_or(items);
-        let (mut default_mode, mut default_direction) = if use_book_defaults {
+        let use_book_defaults = match default_source {
+            SpreadDefaultSource::Legacy { use_book_defaults } => use_book_defaults,
+            SpreadDefaultSource::Directory {
+                canonical_image_book,
+                ..
+            } => canonical_image_book,
+        };
+        let (default_mode, default_direction) = if let SpreadDefaultSource::Directory {
+            book_locked: false,
+            canonical_image_book: true,
+        } = default_source
+            && reading_settings.apply_default_spread_to_plain_folders
+        {
+            // Folder responses omit non-images, so they cannot preserve mixed-media
+            // pairing boundaries. Only an all-image source may opt into this default.
+            let defaults = crate::app::SpreadRestoreDefaults::for_physical_folder(
+                false,
+                true,
+                reading_settings.apply_default_spread_to_plain_folders,
+                reading_settings.default_spread_mode,
+                reading_settings.default_reading_flow,
+                reading_settings.default_reading_direction,
+            );
+            (defaults.spread_mode(), defaults.reading_direction())
+        } else if use_book_defaults {
             (
                 reading_settings.default_spread_mode,
                 reading_settings.default_reading_direction,
@@ -6061,17 +6676,12 @@ impl ContainerEngine {
                 crate::settings::ReadingDirection::Ltr,
             )
         };
-        // A saved direction without a saved mode rotates the default mode, as on PC.
-        if let (None, Some(direction)) = (stored_mode, stored_direction) {
-            default_mode = default_mode.with_reading_direction(direction);
-        }
         // The open operation owns the target used for count, direction and dimensions.
-        // Only an enabled D10 without a saved book value reads a plain PDF's direction.
-        if reading_settings.follow_document_reading_direction
-            && stored_mode.is_none()
-            && stored_direction.is_none()
+        // A viewing classification does not override an inherited document direction.
+        let document_direction = if composition.is_none()
+            && stored.needs_document_direction(reading_settings.follow_document_reading_direction)
         {
-            let document_direction = if is_epub_path(&resolved.logical) {
+            if is_epub_path(&resolved.logical) {
                 read.and_then(|target| target.epub_direction)
             } else if is_pdf_path(&resolved.logical) {
                 read.map(|target| {
@@ -6091,28 +6701,55 @@ impl ContainerEngine {
                 .flatten()
             } else {
                 None
-            };
-            if let Some(direction) = document_direction {
-                default_direction = match direction {
-                    crate::pdf_loader::PdfReadingDirection::L2R => {
-                        crate::settings::ReadingDirection::Ltr
-                    }
-                    crate::pdf_loader::PdfReadingDirection::R2L => {
-                        crate::settings::ReadingDirection::Rtl
-                    }
-                };
-                default_mode = default_mode.with_reading_direction(default_direction);
             }
-        }
-        let (configured, effective, reading_direction) = resolve_spread_state(
-            request.spread_mode,
-            request.reading_direction,
-            stored_mode,
-            stored_direction,
+        } else {
+            None
+        };
+        let reading = stored.resolve_reading(
             default_mode,
             default_direction,
+            reading_settings.follow_document_reading_direction,
+            document_direction,
+        );
+        let (mut configured, mut effective, mut reading_direction) = resolve_spread_state(
+            request.spread_mode,
+            request.reading_direction,
+            None,
+            None,
+            reading.mode,
+            reading.direction,
             request.force_single_page,
         );
+        if let Some(composition) = composition {
+            let rtl = composition.direction == crate::book_composition::ReadingDirection::Rtl;
+            reading_direction = if rtl {
+                RemoteReadingDirection::Rtl
+            } else {
+                RemoteReadingDirection::Ltr
+            };
+            // Requests may change display classification, never the record's binding.
+            configured = match configured {
+                RemoteSpreadMode::Single => RemoteSpreadMode::Single,
+                RemoteSpreadMode::SplitLtr | RemoteSpreadMode::SplitRtl => {
+                    if rtl {
+                        RemoteSpreadMode::SplitRtl
+                    } else {
+                        RemoteSpreadMode::SplitLtr
+                    }
+                }
+                _ => match (rtl, composition.cover_enabled) {
+                    (false, false) => RemoteSpreadMode::Ltr,
+                    (false, true) => RemoteSpreadMode::LtrCover,
+                    (true, false) => RemoteSpreadMode::Rtl,
+                    (true, true) => RemoteSpreadMode::RtlCover,
+                },
+            };
+            effective = if request.force_single_page && !configured.is_split() {
+                RemoteSpreadMode::Single
+            } else {
+                configured
+            };
+        }
         // ZIP has always reported media counts for the bounded response. Its
         // complete manifest is retained only for stable saved-shift identity;
         // folders retain their existing full-list media counts.
@@ -6143,16 +6780,27 @@ impl ContainerEngine {
                 after_cover: reading_settings.page_after_cover_alone_enabled,
                 last: reading_settings.last_page_alone_enabled,
             });
-        let shift_anchor = if reading_settings.remember_spread_shift_per_book {
-            shift_scope
-                .as_ref()
-                .map(|scope| self.saved_shift_anchor(scope, source_items, document_page_count))
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_shift(
+        let shift_anchor =
+            if !composition_managed && reading_settings.remember_spread_shift_per_book {
+                shift_scope
+                    .as_ref()
+                    .map(|scope| self.saved_shift_anchor(scope, source_items, document_page_count))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+        let overrides = composition
+            .map(|composition| {
+                composition
+                    .page_overrides
+                    .iter()
+                    .filter(|(index, _)| **index < items.len())
+                    .map(|(&index, &directive)| (index, directive))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_overrides(
             items,
             core_spread_mode(effective),
             &landscape,
@@ -6161,6 +6809,7 @@ impl ContainerEngine {
             page_alone_enabled,
             complete_book_eligible,
             shift_anchor,
+            &overrides,
         );
         let container_address = page_identity_from_resolved(resolved, &request.address.subresource);
         let groups = index_groups
@@ -6176,6 +6825,25 @@ impl ContainerEngine {
                 } else {
                     pages.first().cloned()
                 }?;
+                let explicit_blank_slot = if !matches!(effective, RemoteSpreadMode::Single)
+                    && !effective.is_split()
+                    && group.indices.len() == 1
+                    && matches!(
+                        overrides.get(&group.indices[0]),
+                        Some(crate::book_composition::PageOverride::BlankOpposite { .. })
+                    ) {
+                    match group.singleton_placement {
+                        crate::displayed_image_transform::SingletonSpreadPlacement::LeftWhite => {
+                            Some(RemotePageDisplaySlot::SpreadLeft)
+                        }
+                        crate::displayed_image_transform::SingletonSpreadPlacement::RightWhite => {
+                            Some(RemotePageDisplaySlot::SpreadRight)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let presentation = match group.presentation {
                     Some(occurrences) => Some(
                         occurrences
@@ -6187,11 +6855,18 @@ impl ContainerEngine {
                                         items.get(occurrence.idx)?,
                                     )?,
                                     role: remote_page_presentation_role(occurrence.role),
+                                    display_slot: None,
                                 })
                             })
                             .collect::<Option<Vec<_>>>()?,
                     ),
-                    None => None,
+                    None => explicit_blank_slot.map(|display_slot| {
+                        vec![RemotePagePresentationSlot {
+                            address: anchor.clone(),
+                            role: RemotePagePresentationRole::Navigation,
+                            display_slot: Some(display_slot),
+                        }]
+                    }),
                 };
                 Some(PageGroup {
                     anchor,
@@ -6205,6 +6880,8 @@ impl ContainerEngine {
             })
             .collect::<Vec<_>>();
         Ok(SpreadPayload {
+            composition_managed,
+            composition_revision: composition.map(|composition| composition.revision),
             configured,
             effective,
             reading_direction,
@@ -6316,8 +6993,7 @@ impl ContainerEngine {
         fallback: Option<&Path>,
     ) -> Result<
         (
-            Option<crate::settings::SpreadMode>,
-            Option<crate::settings::ReadingDirection>,
+            crate::spread_db::StoredSpreadState,
             crate::settings::FinalCoverSpreadPreference,
             crate::settings::SingletonSpreadEndpointPreferences,
             crate::settings::PageAlonePreferences,
@@ -6367,8 +7043,7 @@ impl ContainerEngine {
             })?
             .unwrap_or_default();
         Ok((
-            stored.mode,
-            stored.direction,
+            stored,
             final_cover_preference,
             singleton_placement_preference,
             page_alone_preference,
@@ -6782,6 +7457,12 @@ impl ContainerEngine {
         let recover_empty_dims =
             read.is_some_and(|target| target.stamp.generation_catalog_pair().is_some());
         if pdf_page_sizes_needed(items, cached, recover_empty_dims) {
+            #[cfg(test)]
+            REMOTE_ENUMERATION_AUDIT.with(|audit| {
+                if let Some(audit) = audit.borrow_mut().as_mut() {
+                    audit.pdf_size_calls += 1;
+                }
+            });
             let password = self.real_pdf_password(container_path);
             let page_sizes = if let Some(read) = read {
                 crate::pdf_loader::get_page_sizes_with_read_target(
@@ -6834,6 +7515,14 @@ impl ContainerEngine {
         items: &[crate::grid_item::GridItem],
         read: Option<&crate::pdf_loader::ReadTarget>,
     ) -> Vec<bool> {
+        #[cfg(test)]
+        REMOTE_ENUMERATION_AUDIT.with(|audit| {
+            if let Some(audit) = audit.borrow_mut().as_mut() {
+                audit
+                    .dimension_inputs
+                    .extend(items.iter().map(|item| item.name().into_owned()));
+            }
+        });
         // 寸法列だけを引く。`load_all` は thumbnail の blob も運ぶので、横長かどうかを
         // 知るためだけに 5 万枚で 1.7 GB を確保して即捨てることになる。
         let catalog = crate::catalog::CatalogDb::open_existing_read_only(
@@ -7302,13 +7991,12 @@ impl ContainerEngine {
                     None
                 }
                 Err(error) => {
+                    // The catalog only accelerates decoding and stores generated thumbnails.
+                    // CacheOnly still cannot generate source pixels when the cache is absent.
                     crate::logger::log(format!(
                         "remote_ipc: container catalog open failed: {error}"
                     ));
-                    return Err(media_error(
-                        MediaErrorCode::Internal,
-                        "サムネイルカタログを開けませんでした",
-                    ));
+                    None
                 }
             }
         };
@@ -7317,8 +8005,8 @@ impl ContainerEngine {
             crate::thumb_loader::LoadSourcePolicy::CacheOnly
         ) && catalog.is_none()
         {
-            // Maintenance may retain this RAW row. Accept only one read-only
-            // continuation after the boundary, without permitting generation/writes.
+            // CacheOnly needs no writable catalog. Use the existing read-only path once
+            // after either maintenance retirement or an ordinary writable-open failure.
             let cache_dir = crate::catalog::default_cache_dir();
             let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
             let read_admission = access.wait_read_admission(&cancel).ok_or_else(|| {
@@ -8238,6 +8926,7 @@ fn decode_remote_ai_canonical(
     let decoded = crate::canonical_image_loader::decode_canonical_image(
         source,
         crate::canonical_image_loader::CanonicalDecodeOptions {
+            avif_workload: crate::avif_decoder::Workload::Display,
             susie_priority: true,
             susie_cancel: Some(cancel),
             cancel: Some(cancel),
@@ -8621,6 +9310,34 @@ fn remote_reading_direction_name(direction: RemoteReadingDirection) -> &'static 
     }
 }
 
+/// Result lists use a session direction, with no cover or per-book state.
+pub(super) fn resolve_extracted_spread_state(
+    requested: Option<RemoteSpreadMode>,
+    session_direction: Option<RemoteReadingDirection>,
+    default_direction: crate::settings::ReadingDirection,
+    force_single_page: bool,
+) -> (RemoteSpreadMode, RemoteSpreadMode, RemoteReadingDirection) {
+    let direction =
+        session_direction.unwrap_or_else(|| remote_reading_direction(default_direction));
+    let core_direction = match direction {
+        RemoteReadingDirection::Ltr => crate::settings::ReadingDirection::Ltr,
+        RemoteReadingDirection::Rtl => crate::settings::ReadingDirection::Rtl,
+    };
+    let configured = remote_spread_mode(crate::app::book_materialization::extracted_view_mode(
+        core_spread_mode(requested.unwrap_or(RemoteSpreadMode::Single)),
+        core_direction,
+    ));
+    resolve_spread_state(
+        Some(configured),
+        Some(direction),
+        None,
+        None,
+        crate::settings::SpreadMode::Single,
+        core_direction,
+        force_single_page,
+    )
+}
+
 pub(super) fn resolve_spread_state(
     requested: Option<RemoteSpreadMode>,
     requested_direction: Option<RemoteReadingDirection>,
@@ -8687,6 +9404,21 @@ fn is_zip_path(path: &Path) -> bool {
 
 fn is_archive_container(resolved: &ResolvedPath) -> bool {
     resolved.has_archive_backing() || is_zip_path(&resolved.logical)
+}
+
+/// Only worker-side callers may classify the physical source. A directory can
+/// retain a document/archive suffix and an older composition row at its key.
+fn is_composition_container(resolved: &ResolvedPath) -> bool {
+    is_supported_reading_file(
+        resolved,
+        std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_file()),
+    )
+}
+
+fn is_supported_reading_file(resolved: &ResolvedPath, is_file: bool) -> bool {
+    is_file
+        && (is_archive_container(resolved)
+            || crate::folder_tree::is_paged_document_path(&resolved.logical))
 }
 
 fn remote_address_may_contain_raw(address: &RemoteAddress, resolved: &ResolvedPath) -> bool {
@@ -9106,8 +9838,1325 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    fn audit_enumeration<T>(
+        budget: Option<usize>,
+        run: impl FnOnce() -> T,
+    ) -> (T, RemoteEnumerationAudit) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REMOTE_ENUMERATION_AUDIT.with(|audit| {
+                    audit.borrow_mut().take();
+                });
+            }
+        }
+        REMOTE_ENUMERATION_AUDIT.with(|audit| {
+            assert!(audit.borrow().is_none());
+            *audit.borrow_mut() = Some(RemoteEnumerationAudit {
+                budget,
+                ..Default::default()
+            });
+        });
+        let reset = Reset;
+        let result = run();
+        let audit = REMOTE_ENUMERATION_AUDIT.with(|audit| audit.borrow_mut().take().unwrap());
+        drop(reset);
+        (result, audit)
+    }
+
+    #[test]
+    fn remote_composition_projects_before_limits_and_preserves_bounded_directives() {
+        use crate::book_composition::*;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("composed.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        for index in 0..6 {
+            zip.start_file(
+                format!("{index}.png"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"no decode needed for single projection")
+                .unwrap();
+        }
+        zip.finish().unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap();
+        let domain = PageDomain::ArchiveLevel {
+            prefix: String::new(),
+        };
+        let page = |index| CompositionPageRef::ArchiveEntry {
+            entry_name: format!("{index}.png"),
+        };
+        let mut record =
+            BookComposition::new(ReadingDirection::Rtl, [3, 0, 1, 2, 4].map(page).to_vec());
+        record.cover_enabled = true;
+        record.hidden_pages.push(page(1));
+        record.page_overrides = vec![
+            PageOverrideEntry {
+                page: page(0),
+                directive: PageOverride::Alone,
+            },
+            PageOverrideEntry {
+                page: page(4),
+                directive: PageOverride::BlankOpposite {
+                    page_side: PageSide::Trailing,
+                },
+            },
+        ];
+        let (service, owner) =
+            BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+        service
+            .save(scope.clone(), domain.clone(), record)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let session = super::super::session::SessionHandle::new();
+        session.install_book_composition_service(Some(service.clone()));
+        let mut engine = ContainerEngine::new(Default::default());
+        engine.session = Some(session);
+        *engine.spread_db.lock().unwrap() = Ok(None);
+        let address = RemoteAddress::file(root.to_string_lossy().into_owned());
+        let resolved = engine.resolve(&address).unwrap();
+        let projection = engine
+            .remote_book_projection(
+                &resolved,
+                scope.clone(),
+                domain,
+                || {
+                    (0..6)
+                        .map(|raw_index| CanonicalRawPage {
+                            page: page(raw_index),
+                            raw_index,
+                        })
+                        .collect()
+                },
+                6,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.output_to_input, vec![3, 0, 2, 4, 5]);
+        let CompositionProjectionOutcome::Composed(accepted) = &projection.outcome else {
+            panic!("expected composition")
+        };
+        // Mimic the existing count/byte budget: only the returned prefix reaches dimensions/grouping.
+        let items = projection
+            .output_to_input
+            .iter()
+            .take(4)
+            .map(|&index| crate::grid_item::GridItem::ZipImage {
+                zip_path: root.clone(),
+                entry_name: format!("{index}.png"),
+            })
+            .collect::<Vec<_>>();
+        engine.resume_reader = Some(ResumeReader::Saved(
+            crate::book_resume_db::ReadingPosition {
+                page: 0,
+                identity: None,
+            },
+        ));
+        let policy = crate::file_type_visibility::FileTypeVisibility::default();
+        assert_eq!(
+            engine.resume_page_for_items(
+                &address,
+                &root,
+                &items,
+                true,
+                &policy,
+                Some(&projection.output_to_input),
+            ),
+            ResumePageResolution::Page(zip_entry_address(&address, "0.png"))
+        );
+        engine.resume_reader = Some(ResumeReader::Saved(
+            crate::book_resume_db::ReadingPosition {
+                page: 1,
+                identity: None,
+            },
+        ));
+        assert_eq!(
+            engine.resume_page_for_items(
+                &address,
+                &root,
+                &items,
+                true,
+                &policy,
+                Some(&projection.output_to_input),
+            ),
+            ResumePageResolution::VisibilityRefused(ContainerResumeRefusal::SavedPageUnavailable)
+        );
+        let request = ContainerRequest {
+            address: address.clone(),
+            spread_mode: Some(RemoteSpreadMode::Single),
+            reading_direction: Some(RemoteReadingDirection::Ltr),
+            force_single_page: false,
+        };
+        let single = engine
+            .spread_payload_with_read(
+                &request,
+                &resolved,
+                &items,
+                None,
+                Some((&[], &root)),
+                SpreadDefaultSource::Legacy {
+                    use_book_defaults: true,
+                },
+                false,
+                None,
+                None,
+                Some(scope.clone()),
+                Some(&accepted.resolved),
+            )
+            .unwrap();
+        assert!(single.composition_managed);
+        assert_eq!(single.composition_revision, Some(1));
+        assert_eq!(single.reading_direction, RemoteReadingDirection::Rtl);
+        assert_eq!(single.groups.len(), 4);
+        let groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_overrides(
+            &items,
+            crate::settings::SpreadMode::RtlCover,
+            &[false; 4],
+            true,
+            crate::settings::SingletonSpreadEndpointSettings {
+                first: true,
+                last: true,
+            },
+            crate::settings::PageAloneSettings {
+                after_cover: true,
+                last: true,
+            },
+            false,
+            None,
+            &accepted.resolved.page_overrides,
+        );
+        assert_eq!(groups.iter().flat_map(|g| g.indices.iter()).count(), 4);
+        assert!(groups.iter().all(|g| g.presentation.is_none()));
+        assert!(groups.iter().any(|g| g.indices == [1]));
+        assert!(groups.iter().any(|g| g.indices == [3]
+            && g.singleton_placement
+                != crate::displayed_image_transform::SingletonSpreadPlacement::Center));
+        // The actual response also keeps original addresses and fills the hidden slot with new-tail pages.
+        let payload = engine.enumerate_zip(&request, &resolved).unwrap();
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["3.png", "0.png", "2.png", "4.png", "5.png"]
+        );
+        assert!(!payload.truncated);
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Rtl);
+        let mut budget = ContainerEntryBudget::new(usize::MAX);
+        for entry in &payload.entries[..4] {
+            assert!(budget.try_include(entry));
+        }
+        let response_budget = budget.estimated_bytes;
+        let (bounded_single, audit) = audit_enumeration(Some(response_budget), || {
+            engine.enumerate_zip(&request, &resolved).unwrap()
+        });
+        assert!(bounded_single.truncated);
+        assert_eq!(bounded_single.entries.len(), 4);
+        assert!(audit.dimension_inputs.is_empty());
+        assert!(audit.zip_probes.is_empty());
+        assert_eq!(audit.pdf_size_calls, 0);
+        let spread_request = ContainerRequest {
+            spread_mode: Some(RemoteSpreadMode::RtlCover),
+            ..request.clone()
+        };
+        let (bounded_spread, audit) = audit_enumeration(Some(response_budget), || {
+            engine.enumerate_zip(&spread_request, &resolved).unwrap()
+        });
+        assert!(bounded_spread.truncated);
+        assert_eq!(
+            bounded_spread
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["3.png", "0.png", "2.png", "4.png"]
+        );
+        assert_eq!(audit.dimension_inputs, ["3.png", "0.png", "2.png", "4.png"]);
+        assert_eq!(audit.zip_probes, audit.dimension_inputs);
+        let last = bounded_spread.page_groups.last().unwrap();
+        assert_eq!(last.pages, vec![zip_entry_address(&address, "4.png")]);
+        assert_eq!(
+            last.presentation.as_ref().unwrap()[0].display_slot,
+            Some(RemotePageDisplaySlot::SpreadLeft)
+        );
+        assert!(
+            bounded_spread
+                .page_groups
+                .iter()
+                .flat_map(|group| group.presentation.iter().flatten())
+                .all(|slot| slot.role != RemotePagePresentationRole::FrontCoverSupplement)
+        );
+        for automatic in [
+            RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address: address.clone(),
+                preference: Default::default(),
+            },
+            RemoteWriteRequest::SetSingletonSpreadEndpointPreference {
+                address: address.clone(),
+                endpoint: mimageviewer_ipc::RemoteSingletonSpreadEndpoint::Last,
+                preference: Default::default(),
+            },
+            RemoteWriteRequest::SetPageAlonePreference {
+                address: address.clone(),
+                endpoint: mimageviewer_ipc::RemotePageAloneEndpoint::Last,
+                preference: Default::default(),
+            },
+        ] {
+            let admission = engine.composition_write_admission(&automatic).unwrap();
+            assert_eq!(admission.binding_scope.as_ref(), Some(&scope));
+            assert_eq!(
+                admission.binding_kind,
+                CompositionBindingWriteKind::AutomaticRule
+            );
+            admission.validate(&service.snapshot()).unwrap();
+        }
+        assert!(
+            engine
+                .composition_write_admission(&RemoteWriteRequest::SetSpread {
+                    address: address.clone(),
+                    spread_mode: RemoteSpreadMode::Single,
+                    reading_direction: RemoteReadingDirection::Rtl,
+                })
+                .is_err()
+        );
+        let mut empty = BookComposition::new(ReadingDirection::Rtl, (0..6).map(page).collect());
+        empty.hidden_pages = empty.page_order.clone();
+        service
+            .save(
+                scope,
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+                empty,
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let (empty, audit) = audit_enumeration(None, || {
+            engine.enumerate_zip(&spread_request, &resolved).unwrap()
+        });
+        assert!(empty.entries.is_empty());
+        assert!(empty.page_groups.is_empty());
+        assert!(!empty.truncated);
+        assert!(audit.dimension_inputs.is_empty());
+        assert!(audit.zip_probes.is_empty());
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn remote_explicit_blank_trim_uses_accepted_side_only_in_spread() {
+        use crate::book_composition::*;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("trim.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"portrait dimensions are unnecessary for this explicit blank")
+            .unwrap();
+        zip.finish().unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap();
+        let domain = PageDomain::ArchiveLevel {
+            prefix: String::new(),
+        };
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: "page.png".into(),
+        };
+        let (service, owner) =
+            BookCompositionService::spawn_at(temp.path().join("composition"), None).unwrap();
+        let session = super::super::session::SessionHandle::new();
+        session.install_book_composition_service(Some(service.clone()));
+        let mut engine = ContainerEngine::new(Default::default());
+        engine.session = Some(session);
+        *engine.spread_db.lock().unwrap() = Ok(None);
+        let db_path = temp.path().join("view_trim.db");
+        let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
+        db.set_book_state(
+            &root,
+            crate::view_trim::ViewTrimBookState {
+                apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+                book_settings: crate::view_trim::ViewTrimBookSettings {
+                    enabled: true,
+                    spread_separate: true,
+                    single: crate::view_trim::ViewTrimMargins {
+                        left: 0.1,
+                        ..Default::default()
+                    },
+                    spread_left: crate::view_trim::ViewTrimMargins {
+                        left: 0.2,
+                        ..Default::default()
+                    },
+                    spread_right: crate::view_trim::ViewTrimMargins {
+                        left: 0.15,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        *engine.view_trim_db.lock().unwrap() =
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+        let address = RemoteAddress::file(root.to_string_lossy().into_owned());
+        let resolved = engine.resolve(&address).unwrap();
+        let page_address = zip_entry_address(&address, "page.png");
+        let page_resolved = engine.resolve(&page_address).unwrap();
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            for page_side in [PageSide::Leading, PageSide::Trailing] {
+                let mut record = BookComposition::new(direction, vec![page.clone()]);
+                record.cover_enabled = true;
+                record.page_overrides.push(PageOverrideEntry {
+                    page: page.clone(),
+                    directive: PageOverride::BlankOpposite { page_side },
+                });
+                service
+                    .save(scope.clone(), domain.clone(), record)
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+                for (mode, force_single) in [
+                    (RemoteSpreadMode::LtrCover, false),
+                    (RemoteSpreadMode::LtrCover, true),
+                    (RemoteSpreadMode::Single, false),
+                    (RemoteSpreadMode::SplitLtr, false),
+                    (RemoteSpreadMode::SplitRtl, false),
+                ] {
+                    let payload = engine
+                        .enumerate_zip(
+                            &ContainerRequest {
+                                address: address.clone(),
+                                spread_mode: Some(mode),
+                                reading_direction: None,
+                                force_single_page: force_single,
+                            },
+                            &resolved,
+                        )
+                        .unwrap();
+                    let explicit_slot = payload.page_groups[0]
+                        .presentation
+                        .as_ref()
+                        .and_then(|p| p[0].display_slot);
+                    let slot = if mode == RemoteSpreadMode::LtrCover && !force_single {
+                        let left = (direction == ReadingDirection::Ltr)
+                            == (page_side == PageSide::Leading);
+                        let expected = if left {
+                            RemotePageDisplaySlot::SpreadLeft
+                        } else {
+                            RemotePageDisplaySlot::SpreadRight
+                        };
+                        assert_eq!(explicit_slot, Some(expected));
+                        expected
+                    } else {
+                        assert_eq!(explicit_slot, None);
+                        RemotePageDisplaySlot::Single
+                    };
+                    let context = RemotePageRenderContext {
+                        context_address: address.clone(),
+                        display_slot: slot,
+                        spread_partner: None,
+                    };
+                    let RemoteViewTrimPlan::Stored(Some(bbox)) = engine
+                        .remote_view_trim_plan(
+                            &page_address,
+                            &page_resolved,
+                            Some(&context),
+                            crate::rotation_db::Rotation::None,
+                        )
+                        .unwrap()
+                    else {
+                        panic!("expected book margin")
+                    };
+                    let expected = match slot {
+                        RemotePageDisplaySlot::Single => 0.1,
+                        RemotePageDisplaySlot::SpreadLeft => 0.2,
+                        RemotePageDisplaySlot::SpreadRight => 0.15,
+                    };
+                    let actual = crate::view_trim::ViewTrimMargins::from_bbox(bbox).left;
+                    assert!(
+                        (actual - expected).abs() < 1e-6,
+                        "direction={direction:?} side={page_side:?} mode={mode:?} force_single={force_single} effective={:?} slot={slot:?} actual={actual} expected={expected}",
+                        payload.effective_spread_mode,
+                    );
+                    assert!(
+                        payload
+                            .page_groups
+                            .iter()
+                            .flat_map(|g| g.presentation.iter().flatten())
+                            .all(|p| p.role == RemotePagePresentationRole::Navigation)
+                    );
+                }
+            }
+        }
+        db.set_book_state(
+            &root,
+            crate::view_trim::ViewTrimBookState {
+                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for display_slot in [
+            RemotePageDisplaySlot::SpreadLeft,
+            RemotePageDisplaySlot::SpreadRight,
+        ] {
+            let context = RemotePageRenderContext {
+                context_address: address.clone(),
+                display_slot,
+                spread_partner: None,
+            };
+            assert!(matches!(
+                engine
+                    .remote_view_trim_plan(
+                        &page_address,
+                        &page_resolved,
+                        Some(&context),
+                        crate::rotation_db::Rotation::None
+                    )
+                    .unwrap(),
+                RemoteViewTrimPlan::AutoSingle
+            ));
+        }
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn remote_document_composition_budget_keeps_physical_pages_and_existing_size_calls() {
+        use crate::book_composition::*;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = minimal_remote_pdf_pages(72, 144, 6);
+        for extension in ["pdf", "epub"] {
+            let root = temp.path().join(format!("book.{extension}"));
+            let generated = if extension == "epub" {
+                root.with_extension("generated.pdf")
+            } else {
+                root.clone()
+            };
+            std::fs::write(&generated, &pdf).unwrap();
+            if extension == "epub" {
+                std::fs::write(&root, b"logical EPUB source").unwrap();
+            }
+            let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&generated);
+            let _pin = (extension == "epub").then(|| {
+                open_parent_catalog(&root)
+                    .unwrap()
+                    .set_pdf_meta_safe("book.epub", 321, pdf.len() as i64, 6)
+                    .unwrap();
+                crate::pdf_loader::pin_epub_for_test(&root, 321, pdf.len() as u64)
+            });
+            let scope = crate::book_scope::BookScopeKey::document(&root).unwrap();
+            let page = |page_num| CompositionPageRef::PdfPage { page_num };
+            let mut record =
+                BookComposition::new(ReadingDirection::Rtl, [3, 0, 1, 2, 4].map(page).to_vec());
+            record.cover_enabled = true;
+            record.hidden_pages.push(page(1));
+            record.page_overrides = vec![
+                PageOverrideEntry {
+                    page: page(0),
+                    directive: PageOverride::Alone,
+                },
+                PageOverrideEntry {
+                    page: page(4),
+                    directive: PageOverride::BlankOpposite {
+                        page_side: PageSide::Trailing,
+                    },
+                },
+            ];
+            let (service, owner) = BookCompositionService::spawn_at(
+                temp.path().join(format!("data-{extension}")),
+                None,
+            )
+            .unwrap();
+            service
+                .save(scope.clone(), PageDomain::Document, record)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let session = super::super::session::SessionHandle::new();
+            session.install_book_composition_service(Some(service.clone()));
+            let mut engine = ContainerEngine::new(crate::settings::Settings {
+                final_cover_spread_enabled: true,
+                ..Default::default()
+            });
+            engine.session = Some(session);
+            *engine.spread_db.lock().unwrap() = Ok(None);
+            let request = ContainerRequest {
+                address: RemoteAddress::file(root.to_string_lossy().into_owned()),
+                spread_mode: Some(RemoteSpreadMode::Single),
+                reading_direction: None,
+                force_single_page: false,
+            };
+            let enumerate = |request: &ContainerRequest| {
+                let ContainerResponse::Success(payload) = engine.container(request.clone()) else {
+                    panic!("document enumeration failed: {extension}")
+                };
+                payload
+            };
+            let (complete_single, audit) = audit_enumeration(None, || enumerate(&request));
+            assert_eq!(
+                complete_single
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["Page 4", "Page 1", "Page 3", "Page 5", "Page 6"]
+            );
+            assert_eq!(
+                complete_single
+                    .entries
+                    .iter()
+                    .map(|entry| match entry.address.subresource {
+                        RemoteSubresource::PdfPage { page_number } => page_number,
+                        _ => panic!("physical page missing"),
+                    })
+                    .collect::<Vec<_>>(),
+                [3, 0, 2, 4, 5]
+            );
+            assert!(!complete_single.truncated);
+            assert!(audit.dimension_inputs.is_empty());
+            assert_eq!(audit.pdf_size_calls, 0);
+            let mut budget = ContainerEntryBudget::new(usize::MAX);
+            for entry in &complete_single.entries[..4] {
+                assert!(budget.try_include(entry));
+            }
+            let (bounded_single, audit) =
+                audit_enumeration(Some(budget.estimated_bytes), || enumerate(&request));
+            assert_eq!(bounded_single.entries.len(), 4);
+            assert!(bounded_single.truncated);
+            assert!(audit.dimension_inputs.is_empty());
+            assert_eq!(audit.pdf_size_calls, 0);
+            let spread = ContainerRequest {
+                spread_mode: Some(RemoteSpreadMode::RtlCover),
+                ..request.clone()
+            };
+            let (bounded_spread, audit) =
+                audit_enumeration(Some(budget.estimated_bytes), || enumerate(&spread));
+            assert!(bounded_spread.truncated);
+            assert_eq!(
+                audit.dimension_inputs,
+                ["Page 4", "Page 1", "Page 3", "Page 5"]
+            );
+            assert_eq!(
+                audit.pdf_size_calls, 1,
+                "retain the existing batched PDF/EPUB size API"
+            );
+            assert!(audit.zip_probes.is_empty());
+            assert_eq!(
+                bounded_spread
+                    .page_groups
+                    .last()
+                    .unwrap()
+                    .presentation
+                    .as_ref()
+                    .unwrap()[0]
+                    .display_slot,
+                Some(RemotePageDisplaySlot::SpreadLeft)
+            );
+            assert!(
+                bounded_spread
+                    .page_groups
+                    .iter()
+                    .flat_map(|g| g.presentation.iter().flatten())
+                    .all(|p| p.role != RemotePagePresentationRole::FrontCoverSupplement)
+            );
+            let (complete_spread, _) = audit_enumeration(None, || enumerate(&spread));
+            assert!(!complete_spread.truncated);
+            assert!(
+                complete_spread
+                    .page_groups
+                    .last()
+                    .unwrap()
+                    .presentation
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(
+                        |p| p.role == RemotePagePresentationRole::FrontCoverSupplement
+                            && p.address == complete_spread.entries[0].address
+                    )
+            );
+            let mut empty = BookComposition::new(ReadingDirection::Rtl, (0..6).map(page).collect());
+            empty.hidden_pages = empty.page_order.clone();
+            service
+                .save(scope, PageDomain::Document, empty)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let (empty, audit) = audit_enumeration(None, || enumerate(&spread));
+            assert!(empty.entries.is_empty());
+            assert!(empty.page_groups.is_empty());
+            assert!(!empty.truncated);
+            assert!(audit.dimension_inputs.is_empty());
+            assert_eq!(audit.pdf_size_calls, 0);
+            owner.shutdown_and_join();
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn detached_folder_composition_is_inert_for_remote_reads_writes_and_saved_shift() {
+        use crate::book_composition::*;
+        use crate::grid_item::GridItem;
+        use crate::spread_shift::{ShiftOperation, SpreadShiftPageRef, SpreadShiftService};
+        for name in ["image-book", "directory.pdf", "directory.zip"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            let items = (0..4)
+                .map(|index| {
+                    let path = root.join(format!("{index:03}.png"));
+                    image::RgbaImage::from_pixel(2, 4, image::Rgba([20, 40, 60, 255]))
+                        .save(&path)
+                        .unwrap();
+                    GridItem::Image(path)
+                })
+                .collect::<Vec<_>>();
+            let scope = crate::book_scope::BookScopeKey::folder(&root).unwrap();
+            let hidden = CompositionPageRef::RelativePath {
+                path: "000.png".into(),
+            };
+            let mut composition = BookComposition::new(ReadingDirection::Rtl, vec![hidden.clone()]);
+            composition.hidden_pages.push(hidden);
+            let (service, owner) =
+                BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+            service
+                .save(scope.clone(), PageDomain::ImageFolder, composition)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let before = service.snapshot();
+            let (shifts, shift_owner) =
+                SpreadShiftService::spawn_at(temp.path().join("shifts"), None).unwrap();
+            let anchor = SpreadShiftPageRef::RelativePath("001.png".into());
+            let cutoff = shifts
+                .set_shift(
+                    scope.clone(),
+                    anchor.clone(),
+                    ShiftOperation {
+                        context_id: crate::app::ViewerContextId::for_test(903),
+                        items_generation: 1,
+                        operation_sequence: 1,
+                    },
+                )
+                .unwrap();
+            let session = super::super::session::SessionHandle::new();
+            session.install_book_composition_service(Some(service.clone()));
+            session.install_spread_shift_service(Some(shifts.clone()));
+            let mut engine = ContainerEngine::new(crate::settings::Settings {
+                remember_spread_shift_per_book: true,
+                final_cover_spread_enabled: false,
+                ..Default::default()
+            });
+            *engine.spread_db.lock().unwrap() = Ok(None);
+            engine.session = Some(session);
+            let page = RemoteAddress::file(root.join("000.png").to_string_lossy().into_owned());
+            let resolved_page = engine.resolve(&page).unwrap();
+            assert!(
+                engine
+                    .composition_page_candidate(&page, &resolved_page)
+                    .is_none()
+            );
+            engine
+                .validate_composition_page(&page, &resolved_page)
+                .unwrap();
+            for request in [
+                RemoteWriteRequest::SetRating {
+                    address: page.clone(),
+                    stars: 2,
+                },
+                RemoteWriteRequest::SetAdjustment {
+                    address: page.clone(),
+                    scope: mimageviewer_ipc::RemoteAdjustmentScope::Page,
+                    values: super::super::remote_adjustment_values(
+                        &crate::adjustment::AdjustParams::default(),
+                    ),
+                },
+                RemoteWriteRequest::SetViewTrim {
+                    address: page.clone(),
+                    context_address: RemoteAddress::file(root.to_string_lossy().into_owned()),
+                    state: serde_json::to_value(crate::view_trim::ViewTrimBookState::default())
+                        .unwrap(),
+                },
+                RemoteWriteRequest::SetSpread {
+                    address: RemoteAddress::file(root.to_string_lossy().into_owned()),
+                    spread_mode: RemoteSpreadMode::Ltr,
+                    reading_direction: RemoteReadingDirection::Ltr,
+                },
+            ] {
+                let admission = engine.composition_write_admission(&request).unwrap();
+                assert!(admission.targets.is_empty() && admission.binding_scope.is_none());
+                admission.validate(&service.snapshot()).unwrap();
+            }
+            let request = ContainerRequest {
+                address: RemoteAddress::file(root.to_string_lossy().into_owned()),
+                spread_mode: Some(RemoteSpreadMode::Ltr),
+                reading_direction: Some(RemoteReadingDirection::Ltr),
+                force_single_page: false,
+            };
+            let resolved = resolve_existing(root.to_string_lossy().as_ref()).unwrap();
+            let payload = engine
+                .spread_payload_with_read(
+                    &request,
+                    &resolved,
+                    &items,
+                    Some(&items),
+                    None,
+                    SpreadDefaultSource::Legacy {
+                        use_book_defaults: true,
+                    },
+                    true,
+                    None,
+                    None,
+                    Some(scope.clone()),
+                    None,
+                )
+                .unwrap();
+            assert!(!payload.composition_managed);
+            assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+            let expected = [vec![0], vec![1, 2], vec![3]]
+                .into_iter()
+                .map(|indices| {
+                    indices
+                        .into_iter()
+                        .map(|index| grid_item_address(&request.address, &items[index]).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                payload
+                    .groups
+                    .iter()
+                    .map(|group| group.pages.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let read = shifts.read_after(scope.clone(), cutoff).recv().unwrap();
+            read.status.unwrap();
+            assert_eq!(read.row, Some(anchor));
+            assert_eq!(service.snapshot().rows, before.rows);
+            assert_eq!(
+                service.snapshot().token_for(&scope),
+                before.token_for(&scope)
+            );
+            owner.shutdown_and_join();
+            shift_owner.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn replaced_document_archive_directory_ignores_retained_composition_for_remote_binding_and_display()
+     {
+        use crate::book_composition::*;
+        use std::io::Write;
+        for (name, domain) in [
+            ("replaced.pdf", PageDomain::Document),
+            ("replaced.epub", PageDomain::Document),
+            (
+                "replaced.zip",
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(name);
+            if matches!(domain, PageDomain::ArchiveLevel { .. }) {
+                let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+                zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"original page").unwrap();
+                zip.finish().unwrap();
+            } else {
+                std::fs::write(&root, b"original document").unwrap();
+            }
+            let page = match domain {
+                PageDomain::Document => CompositionPageRef::PdfPage { page_num: 0 },
+                PageDomain::ArchiveLevel { .. } => CompositionPageRef::ArchiveEntry {
+                    entry_name: "page.png".into(),
+                },
+                _ => unreachable!(),
+            };
+            let scope = crate::book_scope::BookScopeKey::new(&root, "").unwrap();
+            let (service, owner) =
+                BookCompositionService::spawn_at(temp.path().join("composition"), None).unwrap();
+            service
+                .save(
+                    scope.clone(),
+                    domain,
+                    BookComposition::new(ReadingDirection::Ltr, vec![page]),
+                )
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let before = service.snapshot();
+            let session = super::super::session::SessionHandle::new();
+            session.install_book_composition_service(Some(service.clone()));
+            let (shifts, shift_owner) =
+                crate::spread_shift::SpreadShiftService::spawn_at(temp.path().join("shifts"), None)
+                    .unwrap();
+            session.install_spread_shift_service(Some(shifts));
+            let mut engine = ContainerEngine::new(Default::default());
+            engine.session = Some(session);
+            *engine.spread_db.lock().unwrap() = Ok(None);
+            let address = RemoteAddress::file(root.to_string_lossy().into_owned());
+            let binding = RemoteWriteRequest::SetSpread {
+                address: address.clone(),
+                spread_mode: RemoteSpreadMode::RtlCover,
+                reading_direction: RemoteReadingDirection::Rtl,
+            };
+            assert!(
+                engine.composition_write_admission(&binding).is_err(),
+                "actual composed file must remain protected"
+            );
+            std::fs::remove_file(&root).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            for index in 0..4 {
+                image::RgbaImage::from_pixel(2, 4, image::Rgba([20, 40, 60, 255]))
+                    .save(root.join(format!("{index}.png")))
+                    .unwrap();
+            }
+            for mut request in [
+                binding,
+                RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                    address: address.clone(),
+                    preference: Default::default(),
+                },
+                RemoteWriteRequest::SetSingletonSpreadPlacementPreference {
+                    address: address.clone(),
+                    preference: Default::default(),
+                },
+                RemoteWriteRequest::SetSingletonSpreadEndpointPreference {
+                    address: address.clone(),
+                    endpoint: Default::default(),
+                    preference: Default::default(),
+                },
+                RemoteWriteRequest::SetPageAlonePreference {
+                    address: address.clone(),
+                    endpoint: Default::default(),
+                    preference: Default::default(),
+                },
+            ] {
+                engine.validate_write_request(&mut request).unwrap();
+                let admission = engine.composition_write_admission(&request).unwrap();
+                assert!(admission.targets.is_empty());
+                assert!(admission.binding_scope.is_none());
+                assert!(admission.unsupported_scopes.is_empty());
+                assert!(admission.unsupported_pages.is_empty());
+            }
+            let request = ContainerRequest {
+                address: address.clone(),
+                spread_mode: Some(RemoteSpreadMode::RtlCover),
+                reading_direction: Some(RemoteReadingDirection::Rtl),
+                force_single_page: false,
+            };
+            let resolved = engine.resolve(&address).unwrap();
+            assert!(!is_composition_container(&resolved));
+            let payload = engine
+                .enumerate(&request, &resolved, current_catalog_admission())
+                .unwrap();
+            assert_eq!(payload.kind, ContainerKind::Folder);
+            assert_eq!(payload.entries.len(), 4);
+            assert!(!payload.composition_managed);
+            // Exercise the display classifier even if the folder listing is not book-locked.
+            let items = (0..4)
+                .map(|index| crate::grid_item::GridItem::Image(root.join(format!("{index}.png"))))
+                .collect::<Vec<_>>();
+            assert!(
+                !engine
+                    .spread_payload_with_read(
+                        &request,
+                        &resolved,
+                        &items,
+                        Some(&items),
+                        None,
+                        SpreadDefaultSource::Legacy {
+                            use_book_defaults: true
+                        },
+                        true,
+                        None,
+                        None,
+                        Some(scope.clone()),
+                        None
+                    )
+                    .unwrap()
+                    .composition_managed
+            );
+            assert_eq!(service.snapshot().rows, before.rows);
+            assert_eq!(
+                service.snapshot().token_for(&scope),
+                before.token_for(&scope)
+            );
+            owner.shutdown_and_join();
+            shift_owner.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn detached_folder_remote_admission_ignores_unavailable_store_but_documents_fail_closed() {
+        use crate::book_composition::*;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("book_composition.db"), b"invalid database").unwrap();
+        let root = temp.path().join("image-book");
+        std::fs::create_dir(&root).unwrap();
+        let image = root.join("page.png");
+        std::fs::write(&image, b"read gate must not decode").unwrap();
+        let document = temp.path().join("book.pdf");
+        std::fs::write(&document, b"no document decode").unwrap();
+        let (service, owner) = BookCompositionService::spawn_at(data, None).unwrap();
+        assert!(
+            service
+                .prepare(
+                    crate::book_scope::BookScopeKey::document(&document).unwrap(),
+                    PageDomain::Document
+                )
+                .recv()
+                .unwrap()
+                .status
+                .is_err()
+        );
+        let session = super::super::session::SessionHandle::new();
+        session.install_book_composition_service(Some(service));
+        let mut engine = ContainerEngine::new(Default::default());
+        engine.session = Some(session);
+        let page = RemoteAddress::file(image.to_string_lossy().into_owned());
+        engine
+            .validate_composition_page(&page, &engine.resolve(&page).unwrap())
+            .unwrap();
+        for address in [
+            page,
+            RemoteAddress::file(root.to_string_lossy().into_owned()),
+        ] {
+            engine
+                .composition_write_admission(&RemoteWriteRequest::SetSpread {
+                    address,
+                    spread_mode: RemoteSpreadMode::Rtl,
+                    reading_direction: RemoteReadingDirection::Rtl,
+                })
+                .unwrap();
+        }
+        assert!(
+            engine
+                .composition_write_admission(&RemoteWriteRequest::SetSpread {
+                    address: RemoteAddress::file(document.to_string_lossy().into_owned()),
+                    spread_mode: RemoteSpreadMode::Rtl,
+                    reading_direction: RemoteReadingDirection::Rtl
+                })
+                .is_err()
+        );
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn composition_legacy_spread_admission_retains_matching_intent_for_effective_zip_scope() {
+        use crate::book_composition::*;
+        use std::io::Write;
+        // new_with_session resolves source visibility through the live settings DB.
+        // Isolate its process-global data-dir/DB alongside the other settings tests.
+        let temp = crate::settings_db::DataDirOverrideGuard::new();
+        let root = temp.path().join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        zip.start_file("chapter/a.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"qualification fixture without decoding")
+            .unwrap();
+        zip.finish().unwrap();
+        let scope = crate::book_scope::BookScopeKey::new(&root, "chapter").unwrap();
+        let domain = PageDomain::ArchiveLevel {
+            prefix: "chapter".into(),
+        };
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: "chapter/a.png".into(),
+        };
+        let (service, owner) =
+            BookCompositionService::spawn_at(temp.path().join("composition"), None).unwrap();
+        let session = super::super::session::SessionHandle::new();
+        session.install_book_composition_service(Some(service.clone()));
+        let engine = ContainerEngine::new_with_session(Default::default(), session);
+        let address = RemoteAddress {
+            path: root.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: "chapter/".into(),
+            },
+        };
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            for cover in [false, true] {
+                let mut book = BookComposition::new(direction, vec![page.clone()]);
+                book.cover_enabled = cover;
+                service
+                    .save(scope.clone(), domain.clone(), book)
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+                let expected = composition_spread_mode(direction, cover);
+                for mode in [
+                    RemoteSpreadMode::Ltr,
+                    RemoteSpreadMode::LtrCover,
+                    RemoteSpreadMode::Rtl,
+                    RemoteSpreadMode::RtlCover,
+                ] {
+                    let request = RemoteWriteRequest::SetSpread {
+                        address: address.clone(),
+                        spread_mode: mode,
+                        reading_direction: RemoteReadingDirection::Ltr,
+                    };
+                    let admission = engine.composition_write_admission(&request);
+                    if core_spread_mode(mode) == expected {
+                        let admission = admission.unwrap();
+                        assert_eq!(admission.binding_scope.as_ref(), Some(&scope));
+                        assert_eq!(
+                            admission.binding_kind,
+                            CompositionBindingWriteKind::LegacySpread(expected)
+                        );
+                        assert_eq!(
+                            admission
+                                .legacy_spread_view_mode(&service.snapshot())
+                                .unwrap(),
+                            Some(expected)
+                        );
+                    } else {
+                        let error = admission.unwrap_err();
+                        assert_eq!(error.code, RemoteWriteErrorCode::Unsupported, "{error:?}");
+                    }
+                }
+            }
+        }
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn composition_hidden_page_gate_preserves_listing_resolution_and_rechecks_mutation() {
+        use crate::book_composition::*;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        zip.start_file("chapter/a.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"no image decoding is permitted by this fixture")
+            .unwrap();
+        zip.finish().unwrap();
+        let (service, owner) =
+            BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&root, &["chapter".into()]).unwrap();
+        let domain = PageDomain::ArchiveLevel {
+            prefix: "chapter".into(),
+        };
+        service
+            .prepare(scope.clone(), domain.clone())
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let session = super::super::session::SessionHandle::new();
+        session.install_book_composition_service(Some(service.clone()));
+        let mut engine = ContainerEngine::new(crate::settings::Settings::default());
+        engine.session = Some(session);
+        let address = RemoteAddress {
+            path: root.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "chapter/a.jpg".into(),
+            },
+        };
+        let resolved = engine.resolve(&address).unwrap();
+        assert!(
+            engine
+                .validate_composition_page(&address, &resolved)
+                .is_ok()
+        );
+        let admission = engine
+            .composition_write_admission(&RemoteWriteRequest::SetRating {
+                address: address.clone(),
+                stars: 2,
+            })
+            .unwrap();
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: "chapter/a.jpg".into(),
+        };
+        let mut composition = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+        composition.hidden_pages.push(page);
+        service
+            .save(scope, domain, composition)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(
+            engine.resolve(&address).is_ok(),
+            "thumbnail/listing resolution retains the raw result row"
+        );
+        assert_eq!(
+            engine
+                .validate_composition_page(&address, &resolved)
+                .unwrap_err()
+                .code,
+            MediaErrorCode::Unsupported
+        );
+        assert!(
+            admission.validate(&service.snapshot()).is_err(),
+            "UI mutation rechecks a newly hidden target"
+        );
+        let binding = RemoteWriteRequest::SetSpread {
+            address: RemoteAddress {
+                path: address.path,
+                subresource: RemoteSubresource::ZipDirectory {
+                    prefix: "chapter/".into(),
+                },
+            },
+            spread_mode: RemoteSpreadMode::RtlCover,
+            reading_direction: RemoteReadingDirection::Rtl,
+        };
+        assert!(engine.composition_write_admission(&binding).is_err());
+        let mode = RemoteWriteRequest::SetViewMode {
+            address: binding.address().unwrap().clone(),
+            mode: mimageviewer_ipc::RemoteViewMode::Spread,
+        };
+        assert!(engine.composition_write_admission(&mode).is_ok());
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn unsupported_archive_source_keeps_legacy_read_write_and_binding_admission() {
+        use crate::book_composition::*;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ambiguous.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        for name in ["B.jpg", "b.jpg", "c.jpg"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"unchanged source").unwrap();
+        }
+        zip.finish().unwrap();
+        let before_source = std::fs::read(&root).unwrap();
+        let (service, owner) =
+            BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap();
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: "c.jpg".into(),
+        };
+        let mut composition = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+        composition.hidden_pages.push(page);
+        service
+            .save(
+                scope.clone(),
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+                composition,
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let before = service.snapshot();
+        let session = super::super::session::SessionHandle::new();
+        session.install_book_composition_service(Some(service.clone()));
+        // Refused composition falls back to the released automatic book path,
+        // whose shift reader is installed alongside composition at runtime.
+        let (shift_service, shift_owner) =
+            crate::spread_shift::SpreadShiftService::spawn_at(temp.path().join("shift-data"), None)
+                .unwrap();
+        session.install_spread_shift_service(Some(shift_service));
+        let mut engine = ContainerEngine::new(crate::settings::Settings::default());
+        *engine.spread_db.lock().unwrap() = Ok(None);
+        engine.session = Some(session);
+        let address = RemoteAddress {
+            path: root.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "c.jpg".into(),
+            },
+        };
+        let resolved = engine.resolve(&address).unwrap();
+        assert!(
+            engine
+                .validate_composition_page(&address, &resolved)
+                .is_ok()
+        );
+        let writes = engine
+            .composition_write_admission(&RemoteWriteRequest::SetRating {
+                address: address.clone(),
+                stars: 2,
+            })
+            .unwrap();
+        assert_eq!(writes.unsupported_pages.len(), 1);
+        assert!(writes.targets.is_empty());
+        let binding = RemoteWriteRequest::SetSpread {
+            address: RemoteAddress::file(address.path.clone()),
+            spread_mode: RemoteSpreadMode::RtlCover,
+            reading_direction: RemoteReadingDirection::Rtl,
+        };
+        let admission = engine.composition_write_admission(&binding).unwrap();
+        assert_eq!(admission.unsupported_scopes.len(), 1);
+        assert!(admission.validate(&service.snapshot()).is_ok());
+        let tree = crate::zip_tree::ZipTree::build(
+            root.clone(),
+            crate::zip_loader::enumerate_image_entries(&root).unwrap(),
+        );
+        assert!(
+            engine
+                .remote_book_projection(
+                    &resolved,
+                    scope.clone(),
+                    PageDomain::ArchiveLevel {
+                        prefix: String::new()
+                    },
+                    Vec::new,
+                    0,
+                    Some(&tree),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let request = ContainerRequest {
+            address: binding.address().unwrap().clone(),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        };
+        let payload = engine
+            .spread_payload_with_read(
+                &request,
+                &resolved,
+                &[],
+                Some(&[]),
+                Some((&[], &root)),
+                SpreadDefaultSource::Legacy {
+                    use_book_defaults: true,
+                },
+                true,
+                None,
+                None,
+                Some(scope.clone()),
+                None,
+            )
+            .unwrap();
+        assert!(!payload.composition_managed);
+        assert_eq!(std::fs::read(&root).unwrap(), before_source);
+        assert_eq!(service.snapshot().rows, before.rows);
+        assert_eq!(
+            service.snapshot().token_for(&scope),
+            before.token_for(&scope)
+        );
+        owner.shutdown_and_join();
+        shift_owner.shutdown_and_join();
+    }
 
     include!("spread_shift_container_tests.rs");
 
@@ -9118,6 +11167,52 @@ mod tests {
         drop(crate::conceal_db::ConcealDb::open().unwrap());
         drop(crate::comic_db::ComicDb::open().unwrap());
         drop(crate::export_crop::CropDb::open().unwrap());
+    }
+
+    #[test]
+    fn g1_extracted_remote_view_request_uses_session_direction_without_cover_or_store() {
+        use crate::settings::ReadingDirection;
+        assert_eq!(
+            resolve_extracted_spread_state(None, None, ReadingDirection::Rtl, false),
+            (
+                RemoteSpreadMode::Single,
+                RemoteSpreadMode::Single,
+                RemoteReadingDirection::Rtl
+            )
+        );
+        for requested in [
+            RemoteSpreadMode::Ltr,
+            RemoteSpreadMode::LtrCover,
+            RemoteSpreadMode::Rtl,
+            RemoteSpreadMode::RtlCover,
+        ] {
+            assert_eq!(
+                resolve_extracted_spread_state(
+                    Some(requested),
+                    Some(RemoteReadingDirection::Rtl),
+                    ReadingDirection::Ltr,
+                    false
+                ),
+                (
+                    RemoteSpreadMode::Rtl,
+                    RemoteSpreadMode::Rtl,
+                    RemoteReadingDirection::Rtl
+                )
+            );
+        }
+        assert_eq!(
+            resolve_extracted_spread_state(
+                Some(RemoteSpreadMode::SplitLtr),
+                Some(RemoteReadingDirection::Rtl),
+                ReadingDirection::Ltr,
+                true
+            ),
+            (
+                RemoteSpreadMode::SplitRtl,
+                RemoteSpreadMode::SplitRtl,
+                RemoteReadingDirection::Rtl
+            )
+        );
     }
 
     #[test]
@@ -10450,6 +12545,36 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn avif_remote_file_and_zip_dimension_probes_use_display_dimensions() {
+        use std::io::Write;
+        let bytes = crate::avif_decoder::tests::with_clap_and_mirror(true);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("page.avif");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(file_image_dims(&path), Some((64, 32)));
+        let zip_path = temp.path().join("avif.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.avif", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let items = [crate::grid_item::GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "page.avif".into(),
+        }];
+        let mut output = std::collections::HashMap::new();
+        collect_zip_entry_dims(
+            &zip_path,
+            &items,
+            &std::collections::HashMap::new(),
+            &mut output,
+        );
+        assert_eq!(output.get("page.avif"), Some(&(64, 32)));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn raw_remote_file_and_zip_probes_use_libraw_dimensions() {
         use std::io::Write;
         let source = Path::new("vendor/raw-samples/1018.cr2");
@@ -10600,11 +12725,23 @@ mod tests {
     }
 
     fn minimal_remote_pdf(width: u32, height: u32) -> Vec<u8> {
-        let objects = [
+        minimal_remote_pdf_pages(width, height, 1)
+    }
+
+    fn minimal_remote_pdf_pages(width: u32, height: u32, count: usize) -> Vec<u8> {
+        let kids = (3..3 + count)
+            .map(|index| format!("{index} 0 R"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut objects = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
-            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] >>"),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {count} >>"),
         ];
+        objects.extend(
+            (0..count).map(|_| {
+                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] >>")
+            }),
+        );
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -10612,12 +12749,16 @@ mod tests {
             bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
         }
         let xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", count + 3).as_bytes());
         for offset in offsets {
             bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
         bytes.extend_from_slice(
-            format!("trailer\n<< /Root 1 0 R /Size 4 >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            format!(
+                "trailer\n<< /Root 1 0 R /Size {} >>\nstartxref\n{xref}\n%%EOF\n",
+                count + 3
+            )
+            .as_bytes(),
         );
         bytes
     }
@@ -10904,6 +13045,80 @@ mod tests {
         };
         assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Ltr);
         assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+    }
+
+    #[test]
+    fn remote_epub_mode_only_without_binding_keeps_document_direction() {
+        use crate::settings::{ReadingDirection, SpreadMode};
+        use crate::spread_db::StoredViewMode;
+
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("rtl-mode-only.epub");
+        std::fs::write(&epub, b"epub").unwrap();
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe("rtl-mode-only.epub", 707, 400, 1)
+            .unwrap();
+        let _pin = crate::pdf_loader::pin_epub_with_direction_for_test(
+            &epub,
+            707,
+            400,
+            crate::pdf_loader::PdfReadingDirection::R2L,
+        );
+        let db = crate::spread_db::SpreadDb::open().unwrap();
+        for (saved_mode, view_mode, rtl_mode, ltr_mode) in [
+            (
+                SpreadMode::Single,
+                StoredViewMode::Single,
+                RemoteSpreadMode::Single,
+                RemoteSpreadMode::Single,
+            ),
+            (
+                SpreadMode::Ltr,
+                StoredViewMode::Spread,
+                RemoteSpreadMode::RtlCover,
+                RemoteSpreadMode::LtrCover,
+            ),
+            (
+                SpreadMode::SplitLtr,
+                StoredViewMode::LandscapeSplit,
+                RemoteSpreadMode::SplitRtl,
+                RemoteSpreadMode::SplitLtr,
+            ),
+        ] {
+            db.set_mode_only(&epub, saved_mode).unwrap();
+            let stored = db.get_state_with_fallback(&epub, None);
+            assert_eq!((stored.mode, stored.direction), (None, None));
+            assert_eq!(stored.view_mode, Some(view_mode));
+            for (follow, expected_mode, expected_direction) in [
+                (true, rtl_mode, RemoteReadingDirection::Rtl),
+                (false, ltr_mode, RemoteReadingDirection::Ltr),
+            ] {
+                let engine = ContainerEngine::new(crate::settings::Settings {
+                    default_spread_mode: SpreadMode::LtrCover,
+                    default_reading_direction: ReadingDirection::Ltr,
+                    follow_document_reading_direction: follow,
+                    ..Default::default()
+                });
+                let ContainerResponse::Success(payload) =
+                    engine.container(remote_epub_request(&epub))
+                else {
+                    panic!("mode-only EPUB open failed: {view_mode:?}, follow={follow}");
+                };
+                assert_eq!(
+                    (
+                        payload.configured_spread_mode,
+                        payload.effective_spread_mode,
+                        payload.reading_direction,
+                    ),
+                    (expected_mode, expected_mode, expected_direction),
+                    "{view_mode:?}, follow={follow}",
+                );
+                assert!(!payload.composition_managed);
+                assert_eq!(db.get_state_with_fallback(&epub, None), stored);
+            }
+        }
     }
 
     #[test]
@@ -11754,6 +13969,8 @@ mod tests {
             resume_page: None,
             resume_refusal: None,
             open_mode: ContainerOpenMode::Grid,
+            composition_managed: false,
+            composition_revision: None,
             configured_spread_mode: RemoteSpreadMode::Single,
             effective_spread_mode: RemoteSpreadMode::Single,
             reading_direction: RemoteReadingDirection::Ltr,
@@ -11792,10 +14009,12 @@ mod tests {
             RemotePagePresentationSlot {
                 address: last,
                 role: RemotePagePresentationRole::Navigation,
+                display_slot: None,
             },
             RemotePagePresentationSlot {
                 address: first,
                 role: RemotePagePresentationRole::FrontCoverSupplement,
+                display_slot: None,
             },
         ]);
 
@@ -12619,7 +14838,7 @@ mod tests {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let zip_path = data_dir.path().join("book.zip");
 
-        let mut png = |width: u32, height: u32| {
+        let png = |width: u32, height: u32| {
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
                 .write_to(
@@ -12665,6 +14884,186 @@ mod tests {
             engine.cached_landscape_flags(&zip_path, &items),
             [true, false]
         );
+    }
+
+    #[test]
+    fn remote_pages_survive_catalog_open_failure() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let zip_path = data_dir.path().join("book.zip");
+        write_remote_ai_test_zip(&zip_path, &[("page.png", &remote_ai_test_png(13, 7))]);
+        let pdf_path = data_dir.path().join("book.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let context = WorkerContext::open();
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let cache_dir = crate::catalog::default_cache_dir();
+        std::fs::write(&cache_dir, b"cache directory blocked by a file").unwrap();
+        assert!(crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).is_err());
+        for (path, subresource) in [
+            (
+                &zip_path,
+                RemoteSubresource::ZipEntry {
+                    entry_name: "page.png".into(),
+                },
+            ),
+            (&pdf_path, RemoteSubresource::PdfPage { page_number: 0 }),
+        ] {
+            let address = RemoteAddress {
+                path: path.to_string_lossy().into_owned(),
+                subresource,
+            };
+            let response = engine.page_with_job_cancel(
+                PageRequest {
+                    job_id: "catalog-open-failure".into(),
+                    display_request_id: None,
+                    address: address.clone(),
+                    target_px: 64,
+                    priority: PagePriority::Foreground,
+                    render_context: None,
+                    adjustment_preview: None,
+                },
+                &context,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let PageResponse::Success(page) = response else {
+                panic!("page failed without catalog: {response:?}");
+            };
+            assert_eq!(page.identity, address);
+            assert!(page.width > 0 && page.height > 0);
+            let pixels = image::load_from_memory(&page.bytes).unwrap();
+            assert_eq!((pixels.width(), pixels.height()), (page.width, page.height));
+        }
+        assert_eq!(
+            std::fs::read(&cache_dir).unwrap(),
+            b"cache directory blocked by a file"
+        );
+    }
+
+    #[test]
+    fn remote_container_thumbnails_survive_catalog_open_failure() {
+        // Isolate the logger OnceLocks, as in logger's facade regression tests.
+        const CHILD: &str = "MIV_TEST_REMOTE_CATALOG_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "remote_ipc::container::tests::remote_container_thumbnails_survive_catalog_open_failure", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let writer = crate::log_writer::test_support::writer(data_dir.path(), 128, 65536);
+        crate::log_writer::test_support::install_global(&writer);
+        let zip_path = data_dir.path().join("book.zip");
+        write_remote_ai_test_zip(&zip_path, &[("page.png", &remote_ai_test_png(13, 7))]);
+        let pdf_path = data_dir.path().join("book.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let cache_dir = crate::catalog::default_cache_dir();
+        std::fs::write(&cache_dir, b"cache directory blocked by a file").unwrap();
+        assert!(crate::catalog::CatalogDb::open(&cache_dir, &zip_path).is_err());
+        for (path, subresource) in [
+            (
+                &zip_path,
+                RemoteSubresource::ZipEntry {
+                    entry_name: "page.png".into(),
+                },
+            ),
+            (&pdf_path, RemoteSubresource::PdfPage { page_number: 0 }),
+            (&zip_path, RemoteSubresource::File),
+            (&pdf_path, RemoteSubresource::File),
+        ] {
+            let response = engine.thumbnail(
+                &mimageviewer_ipc::ThumbnailRequest {
+                    address: RemoteAddress {
+                        path: path.to_string_lossy().into_owned(),
+                        subresource,
+                    },
+                    source_address: None,
+                    target_px: 64,
+                },
+                &WorkerContext::without_databases(),
+            );
+            let ThumbnailResponse::Success { webp_bytes } = response else {
+                panic!("thumbnail failed without catalog: {response:?}");
+            };
+            let pixels = image::load_from_memory(&webp_bytes).unwrap();
+            assert!(pixels.width() > 0 && pixels.height() > 0);
+        }
+        assert!(writer.shutdown());
+        let log = std::fs::read_to_string(data_dir.path().join("mimageviewer.log")).unwrap();
+        assert!(
+            log.contains("remote_ipc: container catalog open failed:"),
+            "{log}"
+        );
+        assert_eq!(
+            std::fs::read(&cache_dir).unwrap(),
+            b"cache directory blocked by a file"
+        );
+    }
+
+    // Keep a readable RAW row, but fail writable open during schema migration.
+    // The read-only continuation must return this row without generation or writes.
+    pub(in crate::remote_ipc) fn catalog_with_failing_writer(raw_path: &Path) {
+        let cache_dir = crate::catalog::default_cache_dir();
+        let folder = raw_path.parent().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, folder).unwrap();
+        let webp = crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(8, 8), 8, 80.0)
+            .unwrap()
+            .0;
+        let metadata = std::fs::metadata(raw_path).unwrap();
+        let key = raw_path.file_name().unwrap().to_str().unwrap();
+        catalog
+            .save(
+                key,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                8,
+                8,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        drop(catalog);
+        let connection =
+            rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, folder)).unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_test_migration BEFORE DELETE ON thumbnails BEGIN SELECT RAISE(ABORT, 'test catalog open failure'); END; UPDATE meta SET value='test-old-version' WHERE key='version';").unwrap();
+        drop(connection);
+        assert!(crate::catalog::CatalogDb::open(&cache_dir, folder).is_err());
+        let readable = crate::catalog::CatalogDb::open_existing_read_only(&cache_dir, folder)
+            .unwrap()
+            .unwrap();
+        assert!(readable.load_one(key).unwrap().is_some());
+    }
+
+    #[test]
+    fn remote_cache_only_catalog_open_failure_reads_existing_thumbnail() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let path = data_dir.path().join("page.cr2");
+        std::fs::write(&path, b"invalid raw with no preview").unwrap();
+        catalog_with_failing_writer(&path);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let response = engine.thumbnail(
+            &mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+                source_address: None,
+                target_px: 64,
+            },
+            &WorkerContext::without_databases(),
+        );
+        let ThumbnailResponse::Success { webp_bytes } = response else {
+            panic!("read-only RAW thumbnail failed: {response:?}");
+        };
+        let pixels = image::load_from_memory(&webp_bytes).unwrap();
+        assert_eq!((pixels.width(), pixels.height()), (8, 8));
     }
 
     #[test]
@@ -14980,6 +17379,358 @@ mod tests {
     }
 
     #[test]
+    fn zip_bookmark_hint_uses_verified_image_reading_order_with_subfolders() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("book.zip");
+        write_remote_ai_test_zip(
+            &zip,
+            &[
+                ("d1/a.jpg", b"a"),
+                ("d2/b.jpg", b"b"),
+                ("p1.jpg", b"1"),
+                ("p2.jpg", b"2"),
+                ("p3.jpg", b"3"),
+            ],
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let context = RemoteAddress::file(zip.to_string_lossy().into_owned());
+        let page = zip_entry_address(&context, "p1.jpg");
+        let mut request = RemoteWriteRequest::SetBookmark {
+            address: page,
+            context_address: context,
+            page_index: 999,
+            bookmarked: true,
+        };
+        engine.validate_write_request(&mut request).unwrap();
+        assert!(matches!(
+            request,
+            RemoteWriteRequest::SetBookmark { page_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn remote_zip_and_pdf_bookmark_saves_use_composed_visible_order_and_keep_raw_resume() {
+        use super::super::session::{SessionHandle, UiWriteOutcome};
+        use crate::book_bookmarks::PageIdentity;
+        use crate::book_composition::*;
+
+        for archive in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app
+                .tmp
+                .path()
+                .join(if archive { "hint.zip" } else { "hint.pdf" });
+            if archive {
+                write_remote_ai_test_zip(
+                    &root,
+                    &[
+                        ("d1/a.jpg", b"a"),
+                        ("d2/b.jpg", b"b"),
+                        ("p0.jpg", b"0"),
+                        ("p1.jpg", b"1"),
+                        ("p2.jpg", b"2"),
+                        ("p3.jpg", b"3"),
+                    ],
+                );
+            } else {
+                std::fs::write(&root, minimal_remote_pdf_pages(72, 144, 4)).unwrap();
+            }
+            let _backend =
+                (!archive).then(|| crate::pdf_loader::RemotePdfTestBackend::for_path(&root));
+            let scope = if archive {
+                crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap()
+            } else {
+                crate::book_scope::BookScopeKey::document(&root).unwrap()
+            };
+            let domain = if archive {
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                }
+            } else {
+                PageDomain::Document
+            };
+            let page_ref = |page_num| {
+                if archive {
+                    CompositionPageRef::ArchiveEntry {
+                        entry_name: format!("p{page_num}.jpg"),
+                    }
+                } else {
+                    CompositionPageRef::PdfPage { page_num }
+                }
+            };
+            let mut record =
+                BookComposition::new(ReadingDirection::Rtl, [2, 1, 3, 0].map(page_ref).to_vec());
+            record.hidden_pages.push(page_ref(1));
+            let (service, owner) = BookCompositionService::spawn_at(
+                app.tmp.path().join(if archive {
+                    "zip-composition"
+                } else {
+                    "pdf-composition"
+                }),
+                None,
+            )
+            .unwrap();
+            service
+                .save(scope, domain, record)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            app.install_book_composition_runtime(service);
+            let session = SessionHandle::new();
+            app.set_remote_session_handle(session.clone());
+            let acquired = session.acquire(mimageviewer_ipc::SessionAcquireRequest {
+                client_id: "bookmark-hint-test".into(),
+                peer: mimageviewer_ipc::SessionPeerInfo {
+                    connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                    device_name: None,
+                },
+            });
+            assert_eq!(acquired.status, mimageviewer_ipc::SessionStatus::Active);
+            assert!(session.finish_acquire(session.snapshot().generation));
+            let remote_owner = session.owner_for_test("bookmark-hint-test");
+            let mut engine = ContainerEngine::new(app.settings.clone());
+            engine.session = Some(session.clone());
+            let context = RemoteAddress::file(root.to_string_lossy().into_owned());
+            let address_for = |page_number| {
+                if archive {
+                    zip_entry_address(&context, &format!("p{page_number}.jpg"))
+                } else {
+                    RemoteAddress {
+                        path: context.path.clone(),
+                        subresource: RemoteSubresource::PdfPage { page_number },
+                    }
+                }
+            };
+            for (hint, physical_page) in [2, 3, 0].into_iter().enumerate() {
+                let address = address_for(physical_page);
+                let mut progress = RemoteWriteRequest::RecordReadingProgress {
+                    address: address.clone(),
+                    context_address: context.clone(),
+                    page_index: 999,
+                    page_number: 999,
+                    page_count: 999,
+                    record_resume: false,
+                    record_history: false,
+                };
+                engine.validate_write_request(&mut progress).unwrap();
+                assert!(
+                    matches!(progress, RemoteWriteRequest::RecordReadingProgress {
+                    page_index,
+                    page_number,
+                    page_count: 3,
+                    record_resume: true,
+                    ..
+                } if page_index == physical_page + if archive { 2 } else { 0 }
+                    && page_number == hint as u32 + 1)
+                );
+
+                let mut request = RemoteWriteRequest::SetBookmark {
+                    address,
+                    context_address: context.clone(),
+                    page_index: 999,
+                    bookmarked: true,
+                };
+                engine.validate_write_request(&mut request).unwrap();
+                assert!(
+                    matches!(request, RemoteWriteRequest::SetBookmark { page_index, .. }
+                    if page_index == hint as u32)
+                );
+                let admission = engine.composition_write_admission(&request).unwrap();
+                let operation = session
+                    .begin_operation(&remote_owner, "bookmark-hint".into())
+                    .unwrap();
+                let producer = session.clone();
+                let worker = std::thread::spawn(move || {
+                    producer.submit_write_with_composition(request, operation, admission)
+                });
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !worker.is_finished() {
+                    app.service_remote_session(&egui::Context::default());
+                    app.poll_book_bookmarks();
+                    assert!(Instant::now() < deadline, "bookmark save did not finish");
+                    std::thread::yield_now();
+                }
+                assert!(matches!(
+                    worker.join().unwrap(),
+                    UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                ));
+            }
+            let rows = crate::book_bookmarks::load_for_container_from_disk_readonly(&root).unwrap();
+            assert_eq!(rows.len(), 3);
+            for (hint, physical_page) in [2, 3, 0].into_iter().enumerate() {
+                let identity = if archive {
+                    PageIdentity::ArchiveEntry(format!("p{physical_page}.jpg"))
+                } else {
+                    PageIdentity::PdfPage(physical_page)
+                };
+                let saved = rows
+                    .iter()
+                    .find(|row| row.page_identity == identity)
+                    .unwrap();
+                assert_eq!(saved.page_index_hint, hint);
+            }
+            let mut hidden = RemoteWriteRequest::SetBookmark {
+                address: address_for(1),
+                context_address: context,
+                page_index: 999,
+                bookmarked: true,
+            };
+            assert_eq!(
+                engine.validate_write_request(&mut hidden).unwrap_err().code,
+                RemoteWriteErrorCode::Unsupported
+            );
+            owner.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn remote_bookmark_lists_preserve_hidden_anchor_and_ignore_composition_read_errors() {
+        use crate::book_bookmarks::{
+            BookBookmarkEvent, BookBookmarkService, BookContainerKind, NewBookBookmark,
+            PageIdentity,
+        };
+        use crate::book_composition::*;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        for archive in [true, false] {
+            let root = temp
+                .path()
+                .join(if archive { "list.zip" } else { "list.pdf" });
+            if archive {
+                write_remote_ai_test_zip(&root, &[("p0.jpg", b"0"), ("p1.jpg", b"1")]);
+            } else {
+                std::fs::write(&root, minimal_remote_pdf_pages(72, 144, 2)).unwrap();
+            }
+            let _backend =
+                (!archive).then(|| crate::pdf_loader::RemotePdfTestBackend::for_path(&root));
+            let scope = if archive {
+                crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap()
+            } else {
+                crate::book_scope::BookScopeKey::document(&root).unwrap()
+            };
+            let domain = if archive {
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                }
+            } else {
+                PageDomain::Document
+            };
+            let page_ref = |page_num| {
+                if archive {
+                    CompositionPageRef::ArchiveEntry {
+                        entry_name: format!("p{page_num}.jpg"),
+                    }
+                } else {
+                    CompositionPageRef::PdfPage { page_num }
+                }
+            };
+            let identity = if archive {
+                PageIdentity::ArchiveEntry("p1.jpg".into())
+            } else {
+                PageIdentity::PdfPage(1)
+            };
+            let bookmarks = BookBookmarkService::spawn().unwrap();
+            bookmarks.add(
+                1,
+                NewBookBookmark {
+                    container_path: root.clone(),
+                    container_kind: if archive {
+                        BookContainerKind::Zip
+                    } else {
+                        BookContainerKind::Pdf
+                    },
+                    page_identity: identity,
+                    page_index_hint: 99,
+                },
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match bookmarks.try_recv() {
+                    Ok(BookBookmarkEvent::Added { result: Ok(_), .. }) => break,
+                    Ok(event) => panic!("unexpected bookmark event: {event:?}"),
+                    Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                        std::thread::yield_now()
+                    }
+                    Err(error) => panic!("bookmark fixture was not saved: {error}"),
+                }
+            }
+            let context = RemoteAddress::file(root.to_string_lossy().into_owned());
+            let hidden_anchor = if archive {
+                zip_entry_address(&context, "p1.jpg")
+            } else {
+                RemoteAddress {
+                    path: context.path.clone(),
+                    subresource: RemoteSubresource::PdfPage { page_number: 1 },
+                }
+            };
+            for unreadable in [false, true] {
+                let data = temp
+                    .path()
+                    .join(format!("composition-{archive}-{unreadable}"));
+                std::fs::create_dir(&data).unwrap();
+                if unreadable {
+                    std::fs::write(data.join("book_composition.db"), b"invalid database").unwrap();
+                }
+                let (service, owner) = BookCompositionService::spawn_at(data, None).unwrap();
+                if unreadable {
+                    assert!(
+                        service
+                            .prepare(scope.clone(), domain.clone())
+                            .recv()
+                            .unwrap()
+                            .status
+                            .is_err()
+                    );
+                    assert!(service.snapshot().status.is_err());
+                } else {
+                    let mut record =
+                        BookComposition::new(ReadingDirection::Ltr, [1, 0].map(page_ref).to_vec());
+                    record.hidden_pages.push(page_ref(1));
+                    service
+                        .save(scope.clone(), domain.clone(), record)
+                        .recv()
+                        .unwrap()
+                        .status
+                        .unwrap();
+                }
+                let session = super::super::session::SessionHandle::new();
+                session.install_book_composition_service(Some(service));
+                let mut engine = ContainerEngine::new(Default::default());
+                engine.session = Some(session);
+                let mut request = RemoteWriteRequest::ListBookBookmarks {
+                    address: hidden_anchor.clone(),
+                    context_address: context.clone(),
+                    page_index: 999,
+                    bookmark_supported: false,
+                };
+                let RemoteWriteResponse::Success(result) = engine.book_bookmarks(&mut request)
+                else {
+                    panic!(
+                        "read-only list consumed composition: archive={archive} unreadable={unreadable}"
+                    );
+                };
+                let list = result.book_bookmarks.unwrap();
+                assert!(list.supported);
+                assert_eq!(list.rows.len(), 1);
+                assert_eq!(list.rows[0].page_index_hint, 99);
+                let target = list.rows[0].target.as_ref().unwrap();
+                assert_eq!(target.address, hidden_anchor);
+                assert_eq!(target.item_index, 1);
+                assert!(matches!(
+                    request,
+                    RemoteWriteRequest::ListBookBookmarks {
+                        page_index: 1,
+                        bookmark_supported: true,
+                        ..
+                    }
+                ));
+                owner.shutdown_and_join();
+            }
+        }
+    }
+
+    #[test]
     fn zip_materialization_uses_book_filename_order() {
         let tree = crate::zip_tree::ZipTree::build(
             "book.zip".into(),
@@ -15539,7 +18290,8 @@ mod tests {
         let settings = crate::settings::Settings {
             favorites: vec![favorite.clone()],
             skip_duplicate_images: true,
-            skip_zip_if_folder_exists: true,
+            same_name_folder_book:
+                crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder,
             skip_image_if_video_exists: true,
             video_thumb_use_sidecar_image: true,
             auto_fullscreen_zip_pdf: true,
@@ -15800,6 +18552,86 @@ mod tests {
     }
 
     #[test]
+    fn g1_remote_book_return_after_a2_uses_unchanged_book_state() {
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let _ratings =
+            crate::rating_db::RatingDb::open_at(&crate::rating_db::RatingDb::db_path()).unwrap();
+        let root = data.path().join("favorite");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("01.jpg"), b"page").unwrap();
+        let favorite = FavoriteEntry::new("test".into(), root);
+        let settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            default_reading_direction: ReadingDirection::Ltr,
+            ..Default::default()
+        };
+        let engine = ContainerEngine::new(settings.clone());
+        let db_path = data.path().join("return-spread.db");
+        let db = crate::spread_db::SpreadDb::open_at(&db_path).unwrap();
+        db.set(
+            &book,
+            SpreadMode::RtlCover,
+            SpreadMode::Single,
+            ReadingFlow::Paged,
+            ReadingDirection::Rtl,
+        )
+        .unwrap();
+        *engine.spread_db.lock().unwrap() = Ok(Some(db));
+        let open_book = || {
+            let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                address: favorite_address(&favorite, "book"),
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: false,
+            }) else {
+                panic!("book return failed")
+            };
+            (
+                payload.configured_spread_mode,
+                payload.reading_direction,
+                payload.page_groups,
+            )
+        };
+        let before = open_book();
+        assert_eq!(before.0, RemoteSpreadMode::RtlCover);
+        let collections = super::super::collections::CollectionEngine::new(settings);
+        for requested in [None, Some(RemoteSpreadMode::RtlCover)] {
+            let response = collections.collection(mimageviewer_ipc::CollectionRequest {
+                kind: mimageviewer_ipc::CollectionKind::Rating { stars: 4 },
+                spread_mode: requested,
+                reading_direction: None,
+                force_single_page: false,
+            });
+            let mimageviewer_ipc::CollectionResponse::Success(payload) = response else {
+                panic!("A2 failed")
+            };
+            assert_eq!(
+                payload.configured_spread_mode,
+                if requested.is_some() {
+                    RemoteSpreadMode::Ltr
+                } else {
+                    RemoteSpreadMode::Single
+                }
+            );
+        }
+        assert_eq!(open_book(), before);
+        assert_eq!(
+            engine
+                .spread_db
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get(&book),
+            Some(SpreadMode::RtlCover)
+        );
+    }
+
+    #[test]
     fn folder_container_uses_page_groups_and_accepts_spread_writes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
@@ -15845,6 +18677,145 @@ mod tests {
             reading_direction: RemoteReadingDirection::Rtl,
         };
         engine.validate_write_request(&mut write).unwrap();
+    }
+
+    #[test]
+    fn plain_folder_spread_payload_uses_live_defaults_and_accepted_book_classification() {
+        use crate::settings::{ReadingDirection as Direction, SpreadMode as Mode};
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("favorite");
+        let plain = root.join("plain");
+        let mixed = root.join("mixed");
+        for folder in [&plain, &mixed] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("001.jpg"), b"one").unwrap();
+            std::fs::write(folder.join("002.jpg"), b"two").unwrap();
+        }
+        std::fs::write(mixed.join("clip.mp4"), b"video").unwrap();
+        for book in [false, true] {
+            for mode in [
+                Mode::Single,
+                Mode::LtrCover,
+                Mode::RtlCover,
+                Mode::SplitRtl,
+                Mode::Vertical,
+            ] {
+                let favorite = FavoriteEntry::new("test".to_owned(), root.clone());
+                let mut engine = ContainerEngine::new(crate::settings::Settings {
+                    favorites: vec![favorite.clone()],
+                    auto_fullscreen_zip_pdf: true,
+                    auto_fullscreen_image_folders: book,
+                    // Startup values deliberately differ from the live reading snapshot.
+                    default_spread_mode: Mode::Ltr,
+                    ..Default::default()
+                });
+                engine.reading_settings = RemoteReadingSettingsSource::Snapshot(
+                    crate::settings_db::RemoteReadingSettings::from_settings(
+                        &crate::settings::Settings {
+                            apply_default_spread_to_plain_folders: true,
+                            default_spread_mode: mode,
+                            default_reading_direction: Direction::Rtl,
+                            ..Default::default()
+                        },
+                    ),
+                );
+                *engine.spread_db.lock().unwrap() = Ok(None);
+                for relative in ["plain", "mixed"] {
+                    let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                        address: favorite_address(&favorite, relative),
+                        spread_mode: None,
+                        reading_direction: None,
+                        force_single_page: false,
+                    }) else {
+                        panic!("folder enumeration failed");
+                    };
+                    let locked = book && relative == "plain";
+                    let expected_mode = if relative == "mixed" || mode == Mode::Vertical {
+                        Mode::Single
+                    } else {
+                        mode
+                    };
+                    assert_eq!(
+                        payload.configured_spread_mode,
+                        remote_spread_mode(expected_mode)
+                    );
+                    assert_eq!(
+                        payload.reading_direction,
+                        remote_reading_direction(if relative == "mixed" {
+                            Direction::Ltr
+                        } else {
+                            mode.reading_direction().unwrap_or(if locked {
+                                Direction::Rtl
+                            } else {
+                                Direction::Ltr
+                            })
+                        })
+                    );
+                    if relative == "mixed" {
+                        assert_eq!(payload.video_count, 1);
+                        assert!(payload.page_groups.iter().all(|group| {
+                            group
+                                .pages
+                                .iter()
+                                .all(|page| !page.path.ends_with("clip.mp4"))
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_folder_spread_remote_mixed_portrait_video_portrait_starts_single() {
+        use crate::settings::{ReadingFlow, SortOrder, SpreadMode};
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("mixed");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["001.png", "003.png"] {
+            image::RgbImage::new(8, 12).save(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("002.mp4"), b"video").unwrap();
+        let favorite = FavoriteEntry::new("mixed".to_owned(), root.clone());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            apply_default_spread_to_plain_folders: true,
+            auto_fullscreen_image_folders: false,
+            default_spread_mode: SpreadMode::Ltr,
+            default_reading_flow: ReadingFlow::Paged,
+            sort_order: SortOrder::FileName,
+            ..Default::default()
+        });
+        *engine.spread_db.lock().unwrap() = Ok(None);
+        let listing = engine.recompute_folder_listing(&root).unwrap();
+        assert!(!listing.sort_locked);
+        assert_eq!(
+            listing
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["001.png", "002.mp4", "003.png"]
+        );
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            address: favorite_address(&favorite, ""),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        }) else {
+            panic!("mixed folder enumeration failed");
+        };
+        assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Single);
+        assert_eq!(payload.image_count, 2);
+        assert_eq!(payload.video_count, 1);
+        assert_eq!(payload.page_groups.len(), 2);
+        assert!(
+            payload
+                .page_groups
+                .iter()
+                .all(|group| group.pages.len() == 1)
+        );
     }
 
     #[test]

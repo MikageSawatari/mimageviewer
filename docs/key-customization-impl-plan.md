@@ -1,5 +1,38 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+2026-10-26 §1.444: `FsListOrderPrev` / `FsListOrderNext` は `FsCommon` / Press、
+既定 `Ctrl+Shift+Up` / `Ctrl+Shift+Down`。説明は「一覧の表示順で前 / 次の本を開く」。
+`EachPhysicalPress` で物理押下を数えるが、移動の準備中は既存 gate で拒否し累積しない。
+egui の repeat-only フレームは既存 Ctrl+↑↓ と同じく最大 1 回へまとめ、native は既存 Ctrl+↑↓ と同じく repeat を無視する。
+egui と native 動画の resolver / dispatcher、双方の動画ヘルプへ登録する。
+通常フォルダ一覧から最後に本を開く操作を受け付けた時点の列を使い、DFS / 兄弟移動は維持する。
+詳細は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) を参照。
+
+2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、
+ドラッグが無ければ従来どおりモードを終了する。消しゴム / 補正レイヤーと同じモード内の取消優先であり、
+キー割当や新しい KeyAction は追加しない。通常 release（窓外で離した OS level の確認を含む）の確定と
+取消の二終端を既存 editor 所有者で扱う。詳細は `preset-and-adjustment.md` の crop 節。
+
+2026-10-17 §1.394: `ClearVideoMediaMemory` / `ClearBookResumePositions` を Global / Press、
+既定キーなしで追加。既存の常に最前面と同じ各入力受付から、保存済み位置の管理処理へ渡す。
+環境設定と消去対象を共通化し、動画は live のみ変更、本は既存 writer の非同期 clear を使う。
+完了・空・失敗は既存トーストへ出す。保存・Remote・入力所有の契約は
+[keymap-spec.md](keymap-spec.md#保存済み位置の全件クリア1394) を参照。
+
+2026-10-11 §1.242 G3: `FsViewSpread` / `FsViewLandscapeSplit`を通常のfullscreen Action登録へ追加。
+既定キーなし、保存済みbindingの移行なし。構成本/A2では閲覧mode-only、通常本では既存表示ownerへ渡す。
+
+2026-10-14 §1.242 Q31: 構成本の既存見開きActionは、構成の方向×表紙に一致すればmode-onlyとして受け付ける。
+既定2=`FsSpreadLtr`（左→右・表紙なし）、3=`FsSpreadLtrCover`（左→右・表紙あり）、
+4=`FsSpreadRtl`（右→左・表紙なし）、5=`FsSpreadRtlCover`（右→左・表紙あり）、NumPadも同じ。
+既存Action・既定割当を変更せず、現在のkeymapを使って一致Actionのキーを拒否通知とHUDに表示する。
+一致Actionが未割当なら`FsViewSpread`の割当、それも未割当ならHUDの「見開き」を案内し、方向/表紙変更はPCの構成編集へ案内する。
+HUDの横長分割は`FsViewLandscapeSplit`のカスタム割当だけを表示し、拒否対象の旧8/9を表示しない。
+固定Pad Selectは構成本の単ページと一致見開きを循環し、picker/キー/リングは共通setterへ通す。
+Remoteの旧`SetSpread`は型付き受付で最新構成との一致を検証し、既存mode-only保存へ通す。
+不一致はWeb固定キーの一致見開きとPC編集を案内する。IPC形状は変更せず、構成/方向/表紙/休眠shiftには書き込まない。
+構成なし本と抽出一覧の既存操作は変更しない。正本は本構成計画§9.2と`keymap-spec.md`冒頭。
+
 > ステータス: **実装済み / 保守メモ**。v1.1.0+。
 > 設計の経緯・調査・代替案は [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) に残す。
 > 簡易版の実装判断は本書を優先し、差異が出たら本書へ集約する。
@@ -396,9 +429,15 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     Win32 クリップボード paste、ファイル D&D は keyboard keymap の範囲外。対象にするなら
     Grid の別フェーズで明示的に設計する。
 11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear/StepUp/StepDown` と
-   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。StepUp/StepDown は既定キーなし。グリッド / 画像フルスクリーン / native 動画の
+   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。§1.417で `RatingBookPreferred1..5/Clear/StepUp/StepDown` を追加し、8操作とも既定キーなしとする。既存2系統のStepUp/StepDownも既定キーなし。グリッド / 画像フルスクリーン / native 動画の
    入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
    `set_rating` / `set_current_folder_rating` 経路を共有する。
+   入力の対象系統は `RatingTargetFamily::{Item, Container, BookPreferred}` で表し、
+   `consume_rating_action(ctx, family)` と `RatingKey.family` に渡す。nativeの照合順は
+   Container → Item → BookPreferredとし、既存2系統の優先を保つ。表示用の
+   `rating_key_action` / `first_rating_chord_label` / `rating_chord_summary_label` は既存のbool引数のまま、
+   アイテム / コンテナ用だけを扱う。本を優先する入力は一覧ではアイテム用へ、閲覧中は採用済みrecipeに
+   基づく単一resolverへ渡す。対象解決・保存の詳細は [§1.417 の設計](book-preferred-rating-plan.md) を参照。
 12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104 など) は特殊。
     元画像表示は `FsOriginalPreviewHold` へ昇格し、Windows では割り当てた修飾キーの OS 状態を読む。
     旧 F11 window mode 経路は `FsToggleWindowMode` へ昇格済みで、native 動画 presenter も
@@ -536,7 +575,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
 - RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`。
-  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`
+  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`。
+  RatingBookPreferred1..5/Clear/StepUp/StepDownも全操作 `none`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridCopyFiles / GridCutFiles は Shell clipboard 実行経路を保ったまま keymap 化済み。
   Paste `Ctrl+V`、D&D、右クリック操作そのものは OS/clipboard/マウス経路を含むため固定。
@@ -546,9 +586,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsClose `Enter` (画像のみ P) / FsBackToList `Backspace` (P) / `Esc` (固定)
 - FsJumpFirst/Last `Home/End` (P)
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
+- FsListOrderPrev/Next `Ctrl+Shift+↑/↓` (P): 最後に通常フォルダ一覧から本を開いたときの一覧順。準備中は受付拒否、累積なし
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
-- レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
+- レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` / `RatingBookPreferred*` を共有する。
 - BrowserBack/Forward、マウス戻る/進むは
   `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で
   コンテキスト別に個別割り当て。動画・音声の修飾なしホイールは前後ファイル移動（既定）/
@@ -565,8 +606,16 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   `None` へ戻す。Tab traversal はアプリ全体で無効だが event は後段の Keymap まで残すため、
   Tab chord は引き続き任意の KeyAction へ割り当て可能。KeySlot と egui event queue の同一押下は
   Keymap ownership 境界で一緒に consume する。no-repeat の Tab repeat も発火させず除去する。
-  TextEdit / IME の keyboard owner gate は先に維持し、IME 中の field-level focus lock / 復帰と
+  TextEdit / IME の keyboard owner gate は先に維持し、矢印の field-level focus lock / 復帰と
   直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
+  Windows の allow_ime が true の場合、egui-winit は IME 処理済み Process press を遮断する。
+  本家 0.34.0 #7967 の HashSet を物理キーごとの Hidden / Forwarded に置換し、配送済みは Process repeat でも維持する。
+  release は allow_ime にかかわらず状態を除去して Hidden のみ遮断し、focus 喪失で全状態を消す。
+  helper の IME 専用 Tab lock は置かない。
+  本体 Win32 queue / native 生キーも 0xE5 の press / repeat を公開せず release を維持する。
+  IME gate は今 pass 反映後の composing のみで、Commit 後の通常キーは直ちに通す。
+  focus 復帰は所有 claim と分離し、pointer 無し・他 widget focus 無し・composing または Enter / Escape 無しを
+  条件とする。helper retry は次 pass 限りで同条件に従い、呼び出し側の初回 focus latch には書かない。
   Hover side panel 内の helper field が実 focus を持つ間は panel lifetime も維持し、widget を描かなかった
   ことによる egui end-pass の dead-man focus clear を起こさない。これは非 IME の focus recovery ではなく、
   focus が別 widget へ移れば解除される。`[text-input-key]` の通常ログには helper field の id 継続、focus 前後、
@@ -588,6 +637,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
 - FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)
 - FsNavigatorToggle `Alt+N` (P) / FsNavigatorHold `Alt` (MH。修飾↔修飾のみ)
+- FsPageTurnAnimationToggle 既定なし (P、2026-10-11 §1.341追補)。その他の機能のON/OFF行と同じKeyAction経由。環境設定と共通の全体設定を通常/F12で切り替える。表示項目カスタマイズやリングActionは追加しない。
 - FsLoupeLockToggle `M` (P) ★ / FsLoupeHold `Shift` (MH, Ph6。修飾↔修飾のみ)
 - FsOriginalPreviewHold `RightCtrl` (MH。Windows は右側限定、egui fallback は Ctrl に縮退)
 - FsEraseMode `E` ★ / FsLocalAdjustMode `Ctrl+G` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
@@ -600,7 +650,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsAdjustSlot1..10 `Ctrl+1`..`Ctrl+0` (P) ★ / FsClearAdjust `Ctrl+Backspace` ★
 - FsPin `P` ★ / FsApplyErase1/2 `F7/F8` / FsApplyConceal1/2 `F9/F10`
   (family・予約候補)
-- FsMetaUndo/Redo (handle_meta_undo_keys、family・実コード確認) /
+- `UndoLastAction` (Global / Press、既定 `Ctrl+Z`) はグリッド・画像ビューア共通の本追加一回取消 / メタデータUndo入口。
+  有効な追加receiptを先に扱い、処理中・失効検出を含め同じ入力で古いメタUndoへ続けない。
+  編集専用UndoとTextEdit / IME / dialogの所有を優先する。追加自体のRedoはない。
+  メタRedo (`Ctrl+Y` / `Ctrl+Shift+Z`) は従来の固定入力を維持 /
   FsPipelineDebug `Ctrl+Alt+Shift+D` (固定)
 
 ### FsVideo (Ph5、VK 経路)

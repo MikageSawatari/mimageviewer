@@ -89,7 +89,7 @@ WndProc はサイズ／request ID を確認し、上限内の payload を owned 
 
 提案上限は reply 16 MiB、query 32,768 UTF-16 code units（終端を含む）。割当前の byte／count 検査、checked add/mul、header／item table／offset／UTF-16 length と NUL の境界検査を行う。count が request 上限を越える、必須 full-path flag がない、offset が 0 でない等は malformed として log＋通知し、部分結果を公開しない。query の埋込み NUL は送信前に拒否する。
 
-実ファイル結果だけを採る。folder／drive／root flag は除外。relative path、URL、device namespace、制御文字／仮想 entry separator を含む値は physical-file identity にしない。drive absolute／UNC／通常の verbatim file path は既存 `path_key` の規則に沿って I/O なしで正規化・重複除去する。UNC を勝手に除外しない。存在・権限を IPC の主張だけで保証せず、読出し／open は既存 worker の検証を使う。欠落観測から metadata DB の purge を呼ばない。
+実ファイル・実フォルダの結果を採る。drive／root flag は除外し、未知の flag は従来どおり packet 不正とする。relative path、URL、device namespace、制御文字／仮想 entry separator を含む値は physical identity にしない。drive absolute／UNC／通常の verbatim path は既存 `path_key` の規則に沿って I/O なしで正規化・重複除去する。UNC を勝手に除外しない。bare drive／UNC share root は `C:\x\..` など正規化後に root になる表記も拒否する。存在・権限を IPC の主張だけで保証せず、読出し／open は既存 worker の検証を使う。欠落観測から metadata DB の purge を呼ばない。
 
 ## 5. query、形式、件数、paging
 
@@ -112,17 +112,18 @@ worker にファイル種類設定、EPUB／変換書庫設定、thumbnail sourc
 | ZIP／CBZ | `ZipFile` |
 | PDF／許可された EPUB | `PdfFile`（元 EPUB identity を保持） |
 | 許可された RAR／CBR／7z／CB7／LZH／LHA 等 | `ConvertibleArchive`（probe／変換は通常 open へ） |
-| folder、未対応形式、非表示種類 | 除外 |
+| 実フォルダ（拡張子らしい名前・画像なしも含む） | `Folder` |
+| drive／UNC share root、未対応形式、非表示種類、安全でないパス | 除外 |
 
 Everything は archive 内 entry／PDF page を列挙しない。検索結果の本タイルを開いた後は、その本の通常の全ページを閲覧する。選択した archive の内容だけ query で再フィルタしない。
 
 名前ヒットをそのまま示すため、親フォルダの代表への集約、別ファイル名の同 stem collapse、動画 sidecar 画像の自動省略は Everything 結果では行わない。query にヒットした画像は独立した結果である。動画／音声の補助画像選定は既存 source discovery worker を使い、画像の表示可否を補助画像の採否へ誤流用しない。
 
-**初版は対応形式へ絞った候補だけを、共通 Search prepare worker で一度 stat する。** IPC の全 raw 行に stat するのではなく、folder／非対応／非表示形式を先に除外する。これは thumbnail の既存契約を満たすための準備であり、新しい存在確認 worker ではない。metadata 成功から file 種別、mtime、size を確定し、`image_metas=Some((mtime,size))` と `ListingSortMetadata::new(mtime,Some(size))` を同じ prepared row に保持する。実 0-byte と取得失敗を同一視しない。分類・sort・source-discovery・stamp は採用前に worker で揃える。再 sort は採用済み stamp を再利用する。
+**初版は対応形式へ絞った候補だけを、共通 Search prepare worker で一度 stat する。** IPC の全 raw 行に stat するのではなく、root／非対応／非表示形式を先に除外する。フォルダは拡張子によらず分類し、作業用 suffix (`has_work_dir_suffix`) と内部 bundle 名 (`is_internal_app_entry_name`) だけを先に除外する。Everything の明示的な名前ヒットはファイル・フォルダとも hidden/system 設定で隠さない。これは thumbnail の既存契約を満たすための準備であり、新しい存在確認 worker ではない。metadata 成功から file 種別、mtime、size を確定し、`image_metas=Some((mtime,size))` と `ListingSortMetadata::new(mtime,Some(size))` を同じ prepared row に保持する。フォルダは `metadata.is_dir()` を必須とし、`image_metas=Some((mtime,0))`、`ListingSortMetadata::new(mtime,None)` を使う。再帰走査・画像有無の判定・総容量計算はしない。IPC の file/folder と現在の実体が異なる場合は再分類せず読取不能に数える。実 0-byte と取得失敗を同一視しない。分類・sort・source-discovery・stamp は採用前に worker で揃える。再 sort は採用済み stamp を再利用する。
 
 根拠: 現行 thumbnail enqueue は画像／ZIP／PDF の `image_metas=None` を skip し (`app.rs:52088` 付近)、convertible の None は Unavailable になる (`:40649` 付近)。`Some((0,0))` を捏造すると `thumb_loader.rs` の cache freshness 比較へそのまま入る。DetailsLazyMeta は日時／size を後から埋める一般 owner ではない。このため「full-path-only をそのまま採用し、既存 lazy thumbnail が stat してくれる」前提を却下した。unknown stamp を許す共通 thumbnail request の構造変更は初版に追加しない。
 
-stat に失敗した、または現在は file でない候補は今回の新しい結果から除外し、件数を集計して「読めなかった項目 N 件」を案内する。これを mIV DB の不在証明にせず、user data／metadata row を削除しない。採用後に消えた path は thumbnail／open の既存 failed 表示と通知で扱う。再検索は利用者の明示送信だけ。
+stat に失敗した、または現在の実体が IPC の file/folder と異なる候補は今回の新しい結果から除外し、件数を集計して「読めなかった項目 N 件」を案内する。これを mIV DB の不在証明にせず、user data／metadata row を削除しない。採用後に消えた path は thumbnail／open の既存 failed 表示と通知で扱う。再検索は利用者の明示送信だけ。
 
 decode・archive inspection／展開・全件 EXIF 読取は検索完了条件にしない。共有 I/O permit と各候補の cancel checkpoint を使い、UI は stat 終了を待たない。UNC 等の OS I/O 自体は強制中断できないため、cancel の UI 解除と旧完了の棄却を別に保証する。検索結果は stat 時点の snapshot であり、採用までの外部変更を完全同期するものではない。
 
@@ -132,7 +133,7 @@ decode・archive inspection／展開・全件 EXIF 読取は検索完了条件�
 
 1 query／1 reply、raw 上限 10,000、後段の表示行も最大 10,000。raw limit は Everything の並び順で切り、mIV のソートは **取得した部分集合内** で行う。Everything の `totitems` は全構文ヒット数であり、mIV 対応形式の総数ではない。
 
-表示例: `Everything: 52,340 件中、先頭 10,000 件を取得 / mIV 表示対象 1,246 件`。種類・★／tag facet でさらに隠れる件数と stat で読めなかった件数も取得件数とは別。上限で打ち切り、後段で 0 行になっても「対象がありません。取得上限に達したため検索条件を絞ってください」と案内し、「全体で 0 件」と表示しない。16 MiB を超える reply は一覧を採用せず条件を絞る案内とする。
+表示例: `Everything: 52,340 件中、先頭 10,000 件を取得 / mIV 表示対象 1,246 件`。取得件数／表示対象（★・tag facet 前の採用行数）／対象外（unsupported + excluded）／読めなかった件数を分けて表示する。対象外には root・安全でないパス・未対応／非表示形式・作業用／内部フォルダを含む。正規化キーの重複は別集計し、対象外には含めず、status の tooltip に件数を示す。種類・★／tag facet でさらに隠れる件数と stat で読めなかった件数も取得件数とは別。上限で打ち切り、後段で 0 行になっても「対象がありません。取得上限に達したため検索条件を絞ってください」と案内し、「全体で 0 件」と表示しない。16 MiB を超える reply は一覧を採用せず条件を絞る案内とする。
 
 offset paging は wire 上できるが、QUERY2 に同一結果 snapshot を保持する token の保証を今回の資料で確認できない。別 query で offset を進めると Everything の更新で行が飛ぶ／重なる可能性があり、local dedup は欠落を直せない。後続取得中の行再配置・編集・open/back の組合せも増える。初版は cap＋明示絞り込みで取り除く。将来 paging を入れるなら snapshot 契約と上限の意味を別設計で決める。
 
@@ -165,6 +166,16 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 
 ### 6.3 簡素化と UI 入力
 
+§1.409: 入力は `metadata_draft / everything_draft` に分離し、固定ONの終了・source切替では
+各draftを保持する。固定Everything入力の編集/focusだけではsessionを開始せず、通常Enter/検索
+だけが既存入口→送信を通る。固定中は一時バーの入力を省き、状態と帰路の操作を残す。
+Escは全検索共通routerへ移し、IME/modalと描画前input ownerを優先して一度だけ消費する。
+Everything実行中のEscは取消のみで、次のEscが未送信/取消後/PhysicalChildのsessionを閉じる。
+×はaccepted結果ownerと編集ownerを区別し、別sourceの保持結果をその欄から解除できる。
+Metadata acceptedにも成立した検索の適用条件をOptionで保持し、未送信Everything draftで表示結果の説明を上書きしない。
+未検証/拒否は適用条件を持たず、正常0件と区別する。一時バーのEscは従来の×と同じく共通sessionを終了する。
+
+
 全 interleaving の rollback／部分採用／resume を作る案を比較し、明示送信＋準備中の target-context modal を推奨した。変更するのは新機能の待機中だけで、Ctrl+G の streaming／debounce／集約を遅らせない。
 
 バーは existing global-search top panel を source 別に描画する。TextEdit は `ime_focus::show_singleline` helper、Enter／Esc は `dialog_enter_pressed`／`dialog_escape_pressed`、context menu は既存 singleline helper。未確定文字の確定 Enter で検索を送信しない。Esc は実行中なら取消、Editing／Ready なら検索を閉じる。query draft の変更は表示済み結果を再実行せず、「検索」を押すまで保持する。
@@ -173,7 +184,7 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 
 主一覧の open／navigation／history／F12 switch／Remote acquire はこの modal admission を共有する。取消・Window ×・shutdown は常に受理。既存 detached の独立閲覧は停止しない。UI frame は bounded `try_recv` と小さい状態遷移だけを行い、worker wake は ROOT を明示。idle で毎 frame repaint しない。待機 backstop が必要なら既存の再武装規約を使い、競合解消の grace／sleep を足さない。
 
-古い Ready は `{source, run_sequence, context, source/items generation, adopted surface authority, policy snapshot}` を既存採用証明へ照合して捨てる。取消・切替後は query text が偶然同じでも受理しない。Everything の submitted query/options は Running／Ready の immutable run payload が所有する。バーの `query` は draft として別の意味を持ち、draft を変えただけで採用済み rows の sort／facet prepare を失効させない。現行 Metadata の `wish.query == self.global_search.query` 検査を Everything にそのまま適用せず、submitted spec 同士で比較する。公開前に失効した map は現行一覧へ先行書込みしない。
+古い Ready は `{source, run_sequence, context, source/items generation, adopted surface authority, policy snapshot}` を既存採用証明へ照合して捨てる。取消・切替後は query text が偶然同じでも受理しない。Everything の submitted query/options は Running／Ready の immutable run payload が所有する。バーの `query` は draft として別の意味を持ち、draft を変えただけで採用済み rows の sort／facet prepare を失効させない。現行 Metadata の `wish.query == self.global_search.metadata_draft` 検査を Everything にそのまま適用せず、submitted spec 同士で比較する。公開前に失効した map は現行一覧へ先行書込みしない。
 
 送信／source 切替／結果ソートなどで index 空間を替える前に、既存の編集終了・page-boundary 処理で保存先を旧 identity のまま確定し、idx-only Undo と editor draft を新一覧へ持ち越さない。Everything の一覧再投影では閲覧を閉じる必要がある場合もこの既存境界へまとめる。共通 editor を新規 owner 化したり、Ctrl+G の released 動作を変更して §1.372 を同時修正しない。既存境界だけで Everything の通常操作を安全にできないことが実装前検証で判明したら、追加設計の範囲・費用を報告して止める。
 
@@ -185,11 +196,11 @@ media は一覧の exact physical identity から通常の fullscreen／native p
 
 現在の Ctrl+G は `SearchContainer` の hit-only drill と physical 本 open の双方がある。Flat から本を開く帰路も `commit_staged_search_navigation_effects` → `advance_drilled_current_path` (`global_search_ui.rs:3503` 付近) が一段の `DrillState` を作ることで成立している。`app.rs:53067` の BS は active search かつ drill=None で no-op になる。したがって Everything の本 open は、型付きの位置を持つ構造的変更が必要であり、現行 return を無変更で使えるとは判断しない。
 
-共通 session の source payload を `Metadata(existing drill/view)` と `Everything { submitted/accepted result, position }` に分け、後者の position は `Root | PhysicalChild { logical_source, return_anchor, route }` とする。logical_source は検索行の元 ZIP/PDF/EPUB/変換書庫であり、cache ZIP/PDF ではない。archive 内の現在 prefix は既存 `zip_nav`、本の現在ページは既存 reader が所有し、position に複製しない。origin の「検索前の場所」と、この position の「採用済み結果内の子」は異なる役割である。同じ戻り先の第二 owner は作らない。
+共通 session の source payload を `Metadata(existing drill/view)` と `Everything { submitted/accepted result, position }` に分け、後者の position は `Root | PhysicalChild { logical_source, return_anchor, route }` とする。logical_source は検索行の実フォルダまたは元 ZIP/PDF/EPUB/変換書庫であり、cache ZIP/PDF ではない。archive 内の現在 prefix は既存 `zip_nav`、本の現在ページは既存 reader が所有し、position に複製しない。origin の「検索前の場所」と、この position の「採用済み結果内の子」は異なる役割である。同じ戻り先の第二 owner は作らない。
 
-本 open の typed request は現在の search run/source と選択した logical identity を捕捉する。**実際の physical open の accepted closure**（ZIP/PDF の install、または変換後 alias を採用する境界）だけが Root→PhysicalChild を公開する。open の受付・変換開始・password 表示だけでは position を替えず、cancel/error/stale は Root のまま。common result dataset/query/stats は session に保持し、child の `App.items` へ検索 rows を同時に表示・再採用しない。
+本 open の typed request は現在の search run/source と選択した logical identity を捕捉する。実フォルダ・main で開く画像フォルダ本は既存 `install_prepared_scanned_folder_listing` → `commit_staged_search_navigation_effects` → `advance_drilled_current_path` の成功採用境界を共有する。独立 viewer へ開く場合はその viewer にだけ install し、main は Root に残す。context menu の「フォルダに移動」は従来の検索終了契約を維持する。**実際の physical open の accepted closure**（ZIP/PDF の install、または変換後 alias を採用する境界）だけが Root→PhysicalChild を公開する。open の受付・変換開始・password 表示だけでは position を替えず、cancel/error/stale は Root のまま。common result dataset/query/stats は session に保持し、child の `App.items` へ検索 rows を同時に表示・再採用しない。
 
-BS／親移動は Everything position を経由し、book 内の既存 prefix parent がある間は通常の内部移動へ渡す。book root からは保持済み result dataset を共通 Search prepare→accepted install で Root へ戻す。再 IPC は行わない。復帰成功時だけ position を Root にし、return_anchor の full path で選択・ensure-visible を行う。cancel/failed return は子の accepted view を保持する。Esc は fullscreen の通常終了を先に行い、grid の本階層では既存の検索終了 semantics を維持する（元結果への階層復帰は BS／親操作）。
+戻る操作値 `EverythingReturn::{Parent, Results}` を共通 router へ渡し、永続 state は増やさない。Parent（BS・grid 親操作・gamepad Back）は ZIP 内部階層なら既存 zip nav を一段戻す。それ以外は `effective_folder()` が logical_source の厳密な物理子孫かを `path_key` の component 境界・正規化 helper で判定し、子孫なら `resolve_grid_parent_nav()` → 通常 navigation dispatcher へ渡す（検索 gate に再入せず、子選択予約を維持）。起点なら保持済み result dataset を共通 Search prepare→accepted install で Root へ戻す。Results（「← 結果へ戻る」）は ZIP・物理階層の途中でも直接 Root へ再投影する。再 IPC は行わない。復帰成功時だけ position を Root にし、return_anchor の full path で選択・ensure-visible を行う。cancel/failed return は子の accepted view を保持する。Esc は fullscreen の通常終了を先に行い、grid の本階層では既存の検索終了 semantics を維持する（元結果への階層復帰は BS／親操作）。
 
 `commit_staged_search_navigation_effects`、`advance_drilled_current_path`、grid／fullscreen の parent・Ctrl+上下、converted alias、F12 direct-media／container open を source-aware routing の対象として列挙する。Everything Root では filesystem の sibling navigation をしない。PhysicalChild 内では本の通常 navigation を使い、外側 container を越える操作は検索結果集合の契約へ戻す。Metadata の hit-only drill はそのまま維持し、Everything 用に container hit count や偽の DrillState を作らない。
 
@@ -248,7 +259,8 @@ BS／親移動は Everything position を経由し、book 内の既存 prefix pa
 | Lite／IPC 無効／QUERY2 拒否／古い版 | 「この Everything では IPC 検索を利用できません。通常版の 1.4.1 以降と IPC 設定を確認してください」。lite 検出を version だけで断定しない |
 | DB 未ロード／再構築中 | 成功の 0 件を採用しない。「Everything の索引を準備中です。準備後にもう一度検索してください」。自動 wait/retry はしない |
 | DB loaded だが folder index が更新途中 | 得られた時点の snapshot を表示。全ドライブ／全 folder の完走や最新性を保証しない。loaded は全索引更新完了の証明ではない |
-| 応答 deadline／hung | log＋「Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください」。未起動案内にまとめない |
+| 送信失敗時に Windows が対象 HWND を応答なしと判定 | `NotResponding`。log＋「Everything が応答していません。起動直後の索引の読み込みや更新などの処理が終わるまで待ってから、もう一度検索してください」。検索条件の絞り込みを勧めない |
+| 応答 deadline／送信timeout（応答なしと判定されない） | `Busy`／`Timeout`。log＋「Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください」。未起動案内にまとめない |
 | 終了／UIPI 拒否等 | log＋「Everything から結果を取得できませんでした。起動状態・権限を確認して再検索してください」。mIV を勝手に elevate しない |
 | malformed／byte limit／互換 wire 不一致 | その reply を全体で拒否。log＋通知／条件を絞る案内。QUERY1／SDK／FS 全走査への silent fallback なし |
 | worker spawn／prepare／DB read のまれな失敗 | log＋通知。未採用一覧を公開せず、元の accepted view を保持。新 recovery state／retry loop／DB 再作成を設計しない |
@@ -587,7 +599,7 @@ callerにもstatus4回＋query60秒＋cleanupを含む65秒の上限を置く。
 run/channel/eventは作成した検索だけが持ち、一覧、App/bundle field、Remote API、PDF epoch ownerは増やさない。
 元のrun/context/generationによる旧完了棄却とcontext退役の契約を保持する。
 
-timeout/ERROR_TIMEOUTと実hungは`Busy`/`Timeout`として同じ「処理が遅いか、混雑しています」案内へ接続。
+当時はtimeout/ERROR_TIMEOUTと実hungを`Busy`/`Timeout`として同じ「処理が遅いか、混雑しています」案内へ接続した。2026-10-14の分類分離は§19参照。
 HWND不在のclient起動案内、索引未ロード、拒否/権限等の案内とは区別する。
 失敗logはmessage/status/errorにbudget/elapsedだけを追加し、queryやpathを出さない。
 まれなspawn/event/native失敗はlog＋既存通知。partial結果/回復owner/retry loopを追加しない。
@@ -639,3 +651,353 @@ master `71e6b4c83` のincoming 17ファイルを共通ancestorから衝突なく
 `test-full.ps1` を1回実行し、workspaceとvendor 3 crateがPASS（本体lib 12,214 passed / 0 failed / 57 ignored）。
 最後に `build-dev.ps1 -PreserveRuntime` を完了し、normal featureのcore/Remote/EPUB workerを構築。
 未コミットで引き渡す。agentによるmIVのUI起動は行っていない。
+
+## 19. Everything側の応答なしと遅い検索の案内分離（2026-10-14）
+
+利用者の操作と設計担当の読み取り専用process観測による追加確認:
+
+- Everything 1.4.1.1032の約2,800万件・約1 GBの索引環境で、起動・スキャン後に
+  約6分間Responding=Falseとなり、CPU 1コアを使用し続けた。
+- この間のmIV検索はWM_USER（0x400）のABORTIFHUNG付き版照会が約0.03 msで失敗するか、
+  queryのWM_COPYDATAが60秒でerror1460となり、従来はいずれもBusyの案内だった。
+  読取ログの出どころは`G:\miv-iso\view\data\logs\mimageviewer.log`のeverything行。
+  今回の実装agentは実Everythingへの追加probeや当該process/logの追加観測を行っていない。
+- Everythingが落ち着いた後は`mist`・`妹`とも検索成功した（利用者の観測）。
+  内部の処理内容をIPCで特定したという意味ではない。
+
+利用者決定に従い、送信失敗直後の対象HWNDに対して既存Windows API
+[IsHungAppWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-ishungappwindow)
+を一度呼び、trueなら型付き`EverythingError::NotResponding`を返す。
+Win32 errorはAPI呼出し前に保存し、error0の状態照会即時失敗とerror1460のquery timeoutを
+同じ失敗境界で分類する。falseのerror1460は従来どおりBusy、返信待ちdeadlineはTimeoutのまま。
+Windowsの応答なし判定を通知するもので、Everything内部の停止理由を断定しない。
+
+送信失敗logへ分類名を加え、query/pathは記録しない。新たなretry・待機・pollingは追加しない。
+status失敗時はquery/取消を送らず、query失敗時は既存の一回・100 msのbest-effort取消と
+correlation失効・RAII破棄を維持する。検索owner・一覧・旧結果保持・main modalは変更しない。
+既存のmodalと有限deadlineで組合せを抑える設計を維持し、新たな回復状態は不要。
+
+fake endpointはerror0/1460とWindows判定の組合せを注入し、分類から案内への伝播、
+応答なし・遅いだけ・未起動の文言分離、status失敗の未送信、query失敗の取消一回を検査する。
+応答なし案内の狭幅dark検索bar PNGを1枚追加し、生成後に目視確認する。
+マニュアルのEverything節へ、多数のファイルがある環境の起動直後／索引更新中の応答停止、
+画面の「応答なし」の確認と処理完了後の再検索、頻繁に更新されるフォルダーの除外が
+処理負荷を軽くする場合があることを追記する。
+
+### 19.1 検証記録
+
+master `f5bdab499` 上の今回の未コミット差分で、以下はすべてexit 0。
+
+- `cargo fmt --all -- --check`、通常／`--features portable`のcore check、
+  `python scripts/check_ui_glyphs.py`（危険文字0）、`git diff --check`が成功。
+- `cargo test -p mimageviewer --lib everything`: **68 passed / 0 failed / 1 ignored**
+  （実Everything probeは実行しない）。新しい分類／案内のfake回帰を含む。
+- `cargo test -p mimageviewer --lib global_search_ui`: **85 passed / 0 failed**。
+  新PNGは更新指定で1 passed、その後の上記2 filterでは更新指定なしで比較成功。
+  狭幅darkの案内全体と検索／閉じるボタンのviewport内配置を検査し、PNGを目視確認済み。
+  追加1枚は38,209 bytes。既存`--test ui_snapshot everything`も**5 passed / 0 failed**。
+- `scripts/build-dev.ps1 -PreserveRuntime`が成功。通常featureのdev-runtime core／Remote service／
+  EPUB PDF workerをbuild/stageし、VCRT gateはruntime=4 / pe=3で成功。
+  アプリは起動していない。コミットしていない。
+
+各検証の記録は`target/EV-1374-hung-{fmt,glyph,check-normal,check-portable,everything-tests,search-tests,ui-tests,snapshot-update}.log`。
+build完了と成果物の記録は`target/EV-1374-hung-build-dev.log`（JSON）。
+変更はprivate transportの失敗分類と案内に限定し、今回はfull gateを実行していない。
+実Everythingが応答しない間の新案内と、応答回復後の再検索は利用者確認待ち。
+
+## 20. §1.386 利用できない理由の表示（2026-10-19、段2）
+
+正本は `next-release-backlog.md` §1.386 と2026-10-19の利用者決定。
+段1の条件拡大案は独立設計レビューの条件付き合意を受け、**今回は理由表示だけ**に縮小した。
+Ctrl+R の可否条件、Ctrl+G の入口／メニュー／結果採用、detached の所有移管・表示切替は変更しない。
+以下のコード参照は HEAD `be318299f` の調査時点（実装で行番号が動く）。
+
+### 20.1 原因と現行条件の保持
+
+利用者観測は「連動動画窓の表示中、メニューが灰色で hover/キーとも理由がない」。
+`everything_search_entry_allowed` (`src/global_search_ui/everything.rs:178`) は bool だけを返し、
+`ui_main.rs:7577,7658` の両メニューは `add_enabled` だけ、
+`everything/shortcut.rs:7` はキー判定より前に拒否していたため、理由が生成されなかった。
+
+都度算出する `EverythingSearchEntryAvailability` を導入し、`reason_text()` が None のときだけ
+`is_allowed()` を true にする。App の field や別の理由キャッシュは追加しない。
+既存 bool helper はこの enum から導く。元の次の conjunction と可否を一致させる。
+
+修正箇所は可否を作る境界とその表示consumerである。別の理由bool、通知用の保持状態、detachedの
+追加guardを設けず、メニュー・起動／送信の可否・拒否通知を同じ判定から導くため、理由と可否の
+不一致を構造で防ぐ。BA-7の状態重複とBA-5の入口差を増やさず、凍結中の所有移管経路には触れない。
+
+| 旧成分／境界 | enum と理由 |
+| --- | --- |
+| `!main_folder_history_available()` | `ViewerContext`: メインウィンドウの一覧から検索してください |
+| `fullscreen_idx.is_some()`、linked detached/switching | `LinkedViewer`: 連動した別ウィンドウで閲覧している間は使えません。表示を閉じてから検索してください |
+| 同じ idx 判定、main の fullscreen/ウィンドウ内表示 | `MainViewer`: メインウィンドウで画像・動画などを表示している間は使えません。表示を閉じてから検索してください |
+| Windows の native main backdrop | `MainViewer`。旧 native 判定も保持する（現状この述語自身が fullscreen idx を要するため、先の idx 判定に包含される） |
+| `remote_session_blocks_local_control()` | `RemoteControl`: mIV Remote で操作中のため検索できません |
+| その他の `common_modal_dialog_open()` | `OtherOperation`: 別の操作や準備が終わってから検索してください |
+| いずれにも該当しない | `Available`、理由なし |
+
+判定は main context → idx → native → Remote → common modal の順。Remote は common modal にも
+含まれるため、その前で理由だけを区別する。VST3 manager は `any_dialog_open` にだけ含まれ、
+元の Everything 可否には含まれなかったので、今回もメニューの可否を変更しない。
+catch-all は準備待ちも含むため、必ず「ダイアログを閉じて」とは案内しない。
+
+`main_folder_history_available` (`app.rs:23682`) は projected registry main と suppression depth=0 を要求する。
+main の Back/Forward/facet は bundle 外の App 所有なので、viewer 投影処理から触らせないための条件である。
+`with_detached_viewer_main_history_suppressed` (`app.rs:22947`) は実行スコープの depth で、
+**連動窓が存在する間ずっと立つフラグではない**。linked 中の拒否は raw `fullscreen_idx` にも由来する。
+この履歴述語・全 caller と `viewer_session_blocks_main_window` は変更しない。
+
+Everything の未導入／未起動は入口では判明しない。バー表示では IPC を送らず、送信 worker が
+接続／版／DB loaded を確認して既存 `EverythingError::user_message()` を表示する（§9/§19）。
+UI 同期 probe、最終エラーを使った入口の無効化、未確認の NotRunning variant は追加しない。
+
+### 20.2 メニューと ROOT の拒否通知
+
+両メニューは同じ `everything_search_menu_button` に enum を渡し、既存
+`HoverTipExt::hover_tip_disabled` (`ui_helpers.rs:1076`) で disabled の理由を描く。
+既存例は sort lock の `reason.tooltip()` (`ui_main.rs:8351`) と
+`OpenAdmissionRefusal::message` → `show_open_admission_refusal` (`app.rs:1490,28423`)。
+
+拒否通知専用の `notify_everything_search_shortcut_refusal` を ROOT の `input_begin_key_frame` に接続する。
+この phase は既存 keyboard owner の確定とWin32 native frameの確立後、embedded/native fullscreen の描画 early return より前に通る。
+通知入口は検索を開かず、IPC／context 移管も行わない。
+
+- ROOT、検索の main context 資格、ROOT/Main に一致する application shortcut permit を要求する。
+  `Modal` / TextInput / IME / pending focus / focus recovery / FocusedUi / 他 viewport では通知も消費もしない。
+  新しい dialog が同 pass で開いた場合も `any_dialog_open()` でそのキーを任せる。
+- 拒否の非 repeat press だけを既存 `keymap.consume_action_no_repeat(GlobalEverythingSearch)` で処理する。
+  実効割当／none／exact modifiers／Win32 viewport ごとの edge 所有をそのまま使う。
+  通知はnative frame確立直後の1か所だけで処理し、後段dispatchでは通知しない。
+  同じ押下のWin32/egui両キューを既存helperで同時に消費し、repeat は通知を重ねない。
+  固定 Ctrl+R、OS current level、Modal 越えの diagnostic peek は使わない。
+- 本文に「Everything ファイル名検索: 」を付け、既存の本文長に応じた時間を使って
+  `show_feedback_toast_on_with_duration(..., ActionSurface::MainWindow, ...)` へ出す。
+  面未指定の helper は native sibling にも送るため使わない。通知 queue/新 latch は追加しない。
+- 許可時の dispatch は従来の ROOT/Main permit → consume → `open_everything_search`。
+  source 切替、前 query の全選択、IME、明示検索、Ctrl+G toggle は変更しない。
+
+**入力／表示の到達限界:** fullscreen child/native presenter がキーを所有する場合、ROOT への新しい転送は
+追加しないので通知しない。embedded fullscreen のように ROOT で受けても `ShortcutSurface::Fullscreen` が
+所有するキーは消費せず通知もしない。Grid の Everything 再割当を Ctrl+G 等にすると、拒否通知の先行consumeが
+既存fullscreen編集Actionを奪うためである。通知の入力所有は通常の検索起動と同じ Main permit に限定する。
+linked viewer 中の main ROOT は Main owner なので、今回の利用者報告の操作面では理由を通知できる。
+MainWindow 面の通知は viewer/native overlay へ複製しない。
+Remote は `modal_dialog_block_reason` (`app.rs:22728`) に含まれるため、**実際の owner は Modal**となり、
+現行の実経路ではキー通知を出さずメニューホバーで Remote 理由を示す。
+これは「Modal のキーはその所有者へ任せる」という今回の優先方針による。
+fullscreen/Remote の非到達・非視認については、ホバーと manual の利用条件で足りるかを検収時の判断材料にする。
+
+### 20.3 今回やらないこと／後続 §1.406 への申し送り
+
+条件拡大と Ctrl+G の欠陥は [backlog §1.406](next-release-backlog.md) へ分離する。
+以下はコード上の欠陥経路・設計上の論点であり、今回の実機再現／修正済みを意味しない。
+
+- **Everything の入口だけを広げられない:** source 切替・send・child return・採用前が
+  `finish_everything_edit_boundary` (`everything.rs:199,265,499`, `global_search_ui.rs:3190`) を通り、
+  同 helper (`app.rs:22708`) は fullscreen idx があれば viewer を閉じる。
+- **Ctrl+G の既存欠陥:** 連動 detached 中も `update_phases.rs:1010` の Ctrl+G gate は通る。
+  初回の結果は `adopt_prepared_search_view` → `replace_search_view_items_with_ratings`
+  (`global_search_ui.rs:3697,2176`) に入り、`invalidate_idx_state_and_queues`
+  (`app.rs:44289`) が `fs_cache.clear()` を行って、main の旧列を読む linked VideoPlayer を Drop し得る。
+  main adoption は履歴/facet の採用であり、通常の `start_loading_items` の viewer 移管を代替しない。
+- **source 交換と同一結果の再投影を分ける:** source 交換は main を保つ既存 live-park fork
+  (`app.rs:65705` → `viewer_context_registry.rs:5577`) を候補にする。
+  `split_current_context_preserving_main_grid` の `keep_in_main!(global_search, ...)` (`:4344`) を使えば
+  検索要求を複製せず main に残せる。一方 streaming/sort/rating 等の同一結果集合では既存の
+  `capture_rating_membership` / `prepare_rating_membership_items_swap` / `finish_rating_membership_viewer_swap`
+  (`global_search_ui.rs:3240–3310`) の identity remap を保ち、一律 fork しない。
+- **表示切替と採用を直列化する:** live-park snapshot は `viewer_session_is_detached()` を要求するが
+  main 操作 gate は detached への切替途中も許可する。detached へ／からの未完了 effect と採用を
+  同じ presentation/session owner で順序付ける。raw idx guard、検索の機能制限、時間待ちで回避しない。
+- **rating publication の再入を防ぐ:** `fork_mounted_context` と registry の rating publication 境界
+  (`viewer_context_registry.rs:5477` 付近、fork_outgoing/fork_incoming) が採用中の状態へ再入し得る。
+  prepare/stamp/currentness の確定と fork/publication/install の順序を独立設計で定める。
+- **promote をそのまま検索採用へ足さない:** `stash_mounted_and_start_fresh` (`:5697`) は bundle 全体を
+  退避し fresh main を作るため、Search producer/prepare/return origin と採用 context がずれる。
+  通常 folder/book open と検索 close の既存 promote は維持し、C1 後の reader に二度目の promote を作らない。
+- C1 は独立化／promote **後**の受動 watch/rescan/restart を停止する（`detached-snapshot-reader-plan.md` §4/§9）。
+  linked 中と最初の移管は残る。既存 `section1375_c1_search_close_promotes_once_and_remount_never_observes`
+  (`src/app/section375_c1_tests.rs:117`) は Ctrl+G/R × 動画/音声の close/promote/remount を検査するが、
+  新入口・初回採用の安全性までは証明しない。
+
+後続は BA-7（状態／所有）を主に、BA-5（複数入力／描画入口）の構造設計として双方レビューする。
+今回の理由表示は detached の所有移管・viewport 経路を変えないため、リワーク計画 §11 の記録対象を増やさない。
+まれな失敗は既定の割り切り（ログ + 通知 [+ 既存の単純な復帰入口]）。回復 owner は追加しない。
+
+### 20.4 回帰・文書・検証台帳
+
+- enum: 旧 conjunction との一致、許可、main fullscreen/ウィンドウ内表示、linked、別 context、
+  通常 modal、Remote、VST3 manager の従来可否を検査する。
+- 入力: 非 Modal 拒否一回／MainWindow 面、同 pass 再 dispatch、repeat、再割当/none、Modal/key-capture、
+  TextInput/IME/focus recovery/pending focus、foreign scope、許可時の既存 open を検査する。
+  Fullscreen owner の ROOT 入力も保持し、Grid の Ctrl+G 再割当が fullscreen の同キー編集を奪わないことを検査する。
+- 両 menu は同じ pure 描画 helper。disabled button を実際に hover して理由本文を検査し、
+  Light/Dark の代表 PNG を追加する。実 App の起動はしない。
+- manual/search.html の既存の fullscreen/linked 中の利用不可説明を残し、hover による理由確認を追記する。
+  新 action／設定／DB schema／Remote API は追加しない。
+- 独立完成レビューは別担当。main lib 全件は ClaudeCode が最後に実施する。
+  対象テスト、glyph lint、fmt、check、確認用 build の実施結果は以下へ記録する。
+
+以下は初回実装（`3306bf124` としてcommit済み）の検証記録であり、レビュー修正後の結果は§20.5に記録する。
+当時の検証対象は HEAD `be318299f` 上の未コミット差分。Rust 差分
+（`git diff --binary -- src tests/ui_snapshot.rs`）の SHA-256 は
+`3185f5ebca6da9c24be05198e1a471e4c9e9cce62535a50aaf4ecd8341252a9f`。
+
+| 実施 | 結果 |
+| --- | --- |
+| 通常 core `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0（先行ソース、5m07s）。最終ソースは通常featureの下記buildで確認 |
+| 同 `--features portable` | exit 0（最終ソース、13.98s、`target/search6-check-portable-final.log`） |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/everything/) \| test(/phase_c_key_tests/) \| test(/global_search_ui/)' --test-threads 4` | **174 passed / 0 failed**（最終ソース、18.461s、`target/search6-tests-owner-final.log`）。先行72件／173件の成功と件数を合算しない |
+| `cargo test -p mimageviewer --test ui_snapshot everything`（更新指定なし） | **7 passed / 0 failed**（最終ソース、1.43s、`target/search6-ui-owner-final.log`）。既存5枚と新規2枚の比較成功 |
+| 新規 hover PNG | `tests/snapshots/everything_search_disabled_menu_hover_{light,dark}.png`、640×180、19,847 / 19,833 bytes、計39,680 bytes。本文・折返し・Light/Darkを目視確認 |
+| `cargo fmt`（引数なし）／`cargo fmt --check`／glyph lint／`git diff --check` | exit 0、危険グリフ0 |
+| `scripts/vst3-host-identity.ps1 -ValidateRepo` | 現ソース一致を確認、hostの起動・変更なし |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | **exit 0**（2026-10-20）。通常featureのcore／Remote service／EPUB PDF worker、DLL配置、EffeTune bundle、VCRT検査（runtime=4 / pe=3）成功。`target/search6-build-dev-final.log` |
+
+UI検査の最初の480pt fixtureは本文が右へ16ptはみ出して失敗した。その際「640ptが実際の最小幅」と誤認して
+fixtureを広げたが、これははみ出しを隠しただけだった。`MIN_INNER_SIZE` はUI倍率で割ってviewportへ渡し、
+小さい作業領域では最小寸法自体も縮むため、論理幅640ptは保証されない。§20.5で共通tooltipの幅を修正し、
+480pt・200%で320pt・小さい作業領域の200%で240ptを追加検査する。640×180の2枚は代表画像としてのみ保持する。
+
+前提復元: このworktreeで不足していた `vendor/libraw` を既存treeから実体コピーした。
+TurboJPEGの並列native buildは終了コード1となり、`MSBUILDDISABLENODEREUSE=1` とworkspace内TEMP、
+`CARGO_BUILD_JOBS=1`（必要なCMake段もparallel 1）で成功した。最初のnextestはnative buildで止まり、
+テスト本体未実行である。上表はその後の成功結果。まれな製品エラーやテストの失敗とは分類しない。
+既存の非推奨／dead code等の警告は残るが、新規テストの旧ID API警告は現行APIへ揃えて解消した。
+
+通常profileの確認用buildは上表のコマンドで完了した。core 19m05s、Remote service 4m48s、EPUB PDF worker 3m24s。
+`target/dev-runtime/mimageviewer-core.exe` は334,415,360 bytes、更新日時2026-10-20 00:17:11。
+先行buildはFullscreen所有キーの非消費を補うため、自分のbuildプロセスだけを中断した。
+これは製品／コンパイル失敗ではなく、上記の最終ソース検証後に同コマンドで作り直した。
+portable featureは付けず、製品アプリ・実Everythingへの照会は実行していない。git commit は行わない。
+本体lib全件と独立完成レビュー、実機でのlinked窓／native／実IMEの最終確認は未実施。
+
+利用者による確認は、インストール版／トレイ常駐版を終了してから
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常の `%APPDATA%\mimageviewer` を使用し、実設定／データを更新し得る（single-instance mutexも共有）。
+連動した別ウィンドウを開いてmainへ戻り、両メニューのhoverとCtrl+R一回の理由通知、
+操作カスタマイズの「押して入力」等でキーが奪われないこと、通常一覧では従来どおり開けることを確認する。
+
+### 20.5 独立コードレビューのP2対応（2026-10-20）
+
+独立レビューの2件をコードで確認して修正する。可否enum・文言・入力所有gateは維持する。
+
+- **入力frameの境界:** `input_update_begin` はWin32の `begin_frame_for_context_with_tracking` より前だった。
+  未取込pendingはkeymapの両キュー消費から漏れるため、eguiで通知した後に同じ押下を再取込できた。
+  前frameの未消費edgeを次frameのMain所有と読み替える経路もあった。
+  既存のnative begin位置を `input_begin_key_frame` として抽出し、その直後だけで通知する。
+  後段の実行dispatchから通知を外す。frame確立そのものの位置、入力所有、検索の受付条件は動かさず、
+  新しいlatch／guard／queueを増やさない。実phase順の回帰でegui+Win32 pendingの同時押下と
+  TextInputからMainへ移った時の旧edge失効を確認する。
+- **tooltipの表示可能幅:** 共通 `show_offset_tooltip_with_observer` がviewportを無視して
+  `tooltip_width` を再設定していた。popup枠の寸法を差し引いた現在の `content_rect().width()` と
+  tooltip幅の小さい方で折り返す。UI倍率・小さい作業領域・表示後resizeにも同じ計算を使う。
+  enabled／disabled／暗色固定のhoverは同じhelperを通るため、既存のtooltip回帰とUI snapshot全件を確認する。
+  文言を省略せず、既存の遅延変換・AccessKit名・配色・pointer回避を維持する。
+- main grid限定、Modal非消費、Fullscreen所有入力の非消費、Ctrl+Gおよびdetached経路は変更しない。
+
+検証対象は `3306bf124` 上の未コミット差分。初回実装の結果と今回の件数は合算しない。
+Rust差分（`git diff --binary -- src tests/ui_snapshot.rs`）のSHA-256:
+`2681f842f477ac1cad15cd3f06624832a3675e819ff1129251d4771de18bc2ab`。
+
+| 実施 | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/everything/) \| test(/phase_c_key_tests/) \| test(/global_search_ui/) \| test(/ui_helpers::accessibility_names_tests/)' --test-threads 4` | **182 passed / 0 failed**、21.275s。`target/search6-review-tests.log` |
+| `cargo test -p mimageviewer --test ui_snapshot -- --test-threads 4` | **189 passed / 0 failed**、94.95s。`target/search6-review-ui.log` |
+| UI差分 | 既存PNG全件の比較成功。代表のhover PNG2枚も変更不要。新規PNGなし |
+| 通常 core `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、34.72s。`target/search6-review-check.log` |
+| 同 `--features portable` | exit 0、53.48s。`target/search6-review-check-portable.log` |
+| `cargo fmt`（引数なし）／`cargo fmt --check`／glyph lint／`git diff --check` | exit 0、危険グリフ0 |
+
+最初のlib test compileは追加fixtureの `RawInput.modifiers` がegui 0.37に存在せず失敗した。
+既存と同じ `Event::ModifiersChanged` に直して再実行し、上表の成功を確認した。
+実行環境はworkspace内TEMP/TMP/MSBUILDDEBUGPATHと `MSBUILDDISABLENODEREUSE=1` を使用。
+tests/checkは `CARGO_BUILD_JOBS=1`、native依存が構築済みの確認用buildは4。
+`scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` もexit 0。
+core 5m47s、Remote service 0.54s、EPUB PDF worker 0.47s、VCRT検査runtime=4 / pe=3で成功した。
+ログは `target/search6-review-build-dev.log`。通常featureの `target/dev-runtime/mimageviewer-core.exe` は
+334,356,480 bytes、更新日時2026-10-20 00:59:04。製品の起動はしていない。
+利用者確認は前節の通常profile起動手順に従い、連動窓中のCtrl+R一回の通知、ダイアログの非消費、
+UI倍率200%／狭い窓でのホバー理由全文を確認する。
+製品アプリは起動せず、commitは行わない。本体lib全件・独立再レビュー・実機での確認は別途。
+
+### 20.6 ホバーsnapshotのOSカーソル依存を除去（2026-10-20）
+
+`389371880` 時点の代表2枚がsearch6単独／master統合後とも縦1～2px揺れる利用者報告。
+コード確認でも、fixtureが製品の `anchor_for` → `cursor_anchor_rect` → `GetCursorInfo` / `GetIconInfo` を
+通り、headlessの擬似ポインタとは別にデスクトップの現在のカーソル画像を計測していた。
+
+公開fixtureへ上下の物理px寸法を引数で渡し、2 PNGと倍率geometryは `(0, 34)` で固定する。
+メニューbutton／可否／理由と、tooltipの遅延変換・AccessKit名・幅制限・配色・gapは製品と共有する。
+寸法からアンカーへの変換をpure helperに分け、製品は従来のOS計測値（取得不可時は既存の論理34pt fallback）、
+fixtureは明示寸法を渡す。製品のOS計測gateや実カーソル回避を変更せず、テスト判定用の環境変数・状態を追加しない。
+
+他のhover撮影も確認した。Ctrl+G拒否バッジ、EffeTune、動画タグはegui標準 `on_hover_text` /
+`on_disabled_hover_text` でOS計測へ入らない。詳細アイコンはhover色だけ、整理先／見開き調整／toolbar等は
+撮影前にpointerを外している。libのstill seek hover撮影は独自previewで、lock button外を指す。
+確認範囲で同じ実カーソル依存の修正対象はEverythingの2枚のみ。
+
+物理寸法の100%／200%変換と、OS計測不可時の既存fallbackをlib回帰で検査する。
+検証対象は `389371880` 上の未コミット差分。Rust差分
+（`git diff --binary -- src tests/ui_snapshot.rs`）のSHA-256は
+`40b5ab7c5b01731d8ad9da7443bba9d6ba13ccab9b2edb431e8ea72b87bc93d7`。
+
+| 実施 | 結果 |
+| --- | --- |
+| `UPDATE_SNAPSHOTS=1` でEverything hover明暗2件をnextest実行 | 2 passed。`target/search6-cursor-update.log` |
+| PNG目視／比較 | 明暗とも640×180、理由全文・disabled状態・枠・位置を目視確認。固定寸法で再生成した2枚はHEADとbyte単位で一致（19,847 / 19,833 bytes）、PNG差分なし |
+| `cargo nextest run -p mimageviewer --test ui_snapshot --test-threads 4`（更新指定なし） | **191 passed / 0 failed / 0 skipped**、64.816s。`target/search6-cursor-ui.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ui_helpers::accessibility_names_tests/) \| test(/everything/)' --test-threads 4` | **82 passed / 0 failed**、7.440s。`target/search6-cursor-lib.log` |
+| 全体 `cargo fmt`／`cargo fmt --check`／glyph lint／`git diff --check` | 成功、危険グリフ0 |
+
+workspace内TEMP/TMP/MSBUILDDEBUGPATH、`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`を使用。
+fixtureの再現性だけの変更なので確認用製品buildは行わず、製品起動・commitも行わない。
+
+
+## 21. §1.410 実フォルダ行（2026-10-25、実装済み・実機未検証）
+
+採用済み dataset／source／return owner を維持し、候補 kind と戻りの操作値だけを拡張する。
+新たな結果一覧・永続 state・IPC 経路は作らない。既存の取消可能な prepare modal で
+結果再投影との組合せを減らし、物理階層の親移動は通常 navigation を使う。
+まれな失敗は既定のログ＋通知で扱う。
+
+main の成功 install 後に呼ぶ既存 acceptance を維持する。採用行との照合には dataset の
+`physical_key` を使う。従来の `file_operation_path()` はチェック可能な実ファイル専用で
+Folder を返さないため、フォルダを含む検索行 identity の照合には使わない。
+
+Folder の代表サムネイルは既存 full-path cache key を使う。共通 Search prepare は
+直接 Video の WebP に加え、既存 `prepare_video_folder_pin_seeds` で Folder→Video／
+Folder→Folder→Video を解決し、捕捉した既存 thumbnail owner の catalog／cache map へ
+worker 上で seed する。UI から同期 seed は呼ばない。物理 child で thumbnail owner が
+替わるため、再投影ごとに `MetadataResources` を worker へ渡し、採用時もその identity を照合する。
+採用待ちにピン更新が cache map を置き換えた場合も、既存 prepare の再試行送信で現在の
+resources を取り直す。古い owner を参照したまま Ready の棄却を繰り返さない。
+兄弟 context の rows／世代／queue／cancel へは変更を発行しない。
+
+検証対象は `8b9205743`（§1.425）からの未コミット差分、branch は
+`claude/requests-425-410-409-4844f7`。新規12テストで、混在／フォルダのみ／画像なし／
+拡張子付き名／UNC、正規化後root拒否、hidden/system保持、実体種別不一致、内部名除外、
+取消／上限／重複、Folderのsize unknown・★・種類facet・タグ情報、main open／画像フォルダ本、
+Parent連鎖／gamepad Back、深いZIPからResults直帰、検索close／再検索、独立viewerのmain Root維持、
+動画pinのcold cache／cascade／結果復帰、Ready待ち中のthumbnail owner交換を検査する。
+既存ファイル形式、IPCの未知flag拒否、通常のCtrl+F／ドライブrootの親操作も対象に含めた。
+
+| 実行コマンド | 最終差分の結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib --test ui_snapshot -E 'test(/everything_results\|everything_ipc\|global_search_ui::everything\|^everything_search_\|ctrl_f_filter_.*backspace\|gamepad_back_(at_drive_root\|respects_ctrl_f)\|backspace_at_drive_root/)'` | **86 passed / 0 failed**、実行3.470s。更新指定なし。`target/1410-final-tests.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **成功**、17.55s。`target/1410-check.log`。既存warningあり |
+| `cargo fmt`、`cargo fmt --check` | **成功** |
+| `python scripts/check_ui_glyphs.py` | **成功**、危険グリフ0 |
+| `python scripts/check_site_cards.py` | **成功**、49 cards / 上限超過0 |
+| `git diff --check` | **成功** |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | **成功**、core 1m38s、remote 0.38s、EPUB worker 0.34s。normal feature set／dev-runtime、portableなし。PE検査runtime=4／pe=3成功。tool出力記録 `target/1410-build-dev-final.txt`。起動なし |
+
+検索バーのLight／Dark／狭幅Darkと応答なし狭幅Darkの4枚を更新し、文字・折り返し・
+件数の収まりを目視確認した（計226,931 bytes）。更新は
+`UPDATE_SNAPSHOTS=1 cargo nextest run -p mimageviewer --lib -E 'test(/everything_results|everything_ipc|global_search_ui::everything/)'`
+（72 passed）と、`UPDATE_SNAPSHOTS=1 cargo nextest run -p mimageviewer --test ui_snapshot -E 'test(/^everything_search_bar_(light|dark|narrow_dark)$/)'`
+（3 passed）。その後の所有者再取得修正を含む最終86件は、更新指定なしで同じPNGと比較して成功した。
+
+**未実施:** 実Everything／製品起動・実機操作、独立コードレビュー、full gate（今回の指示により実行しない）。
+backlog本文・バージョン・永続schema・検索受付条件は変更していない。コミットは実施しない。

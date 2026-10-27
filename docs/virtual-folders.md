@@ -1,15 +1,102 @@
-# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+﻿# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+§1.353 の全再読込は [承認設計](section353-zip-refresh-location-plan.md) に従い、
+`RefreshList` に現在の論理 source・実効 ZIP prefix・カーソルを固定する。
+新ツリーで同階層を復元し、階層が消失した場合だけ直近の存在する祖先へ戻る。
+collapse で実効階層／親 stack が変わっても、存在する階層の active facet を保持し、
+Backspace の帰路だけ新ツリーへ合わせる。Collection／Smart／検索等の物理子は
+親の root へ配送せず、その子を既存 owner で更新する。変換済み書庫は論理 source と
+mounted backing を保持する。PDF の page cursor と履歴再入場の root 規則は維持する。
+検索 hit drill は途中 batch のヒット不足では戻さず、完全な結果の確定後だけ祖先／一覧へ戻す。
+facet の手動復元は有効な帰路 frame 一件だけを消費し、新しい実効親の無条件 frame は残す。
+階層消失と wrapper collapse が重なる場合、実際の祖先 scope に保存した条件を復元し、
+route の位置番号によって外側の条件まで復元しない。
+
+## 画像folder→Stored ZIP（§1.242 G、実装中・検証待ち）
+
+`image_folder_zip`が直下全画像のmanifestとentry対応、Stored/ZIP64出力とno-clobber公開を担当する。
+表示種類・hidden・facet・同名画像省略はmanifestへ適用せず、元bytesをそのまま格納する。
+子folder・動画・音声・本を含むfolderは対象外。画像以外の許可された補助fileは元に残す。
+`app/image_folder_zip_operation`のprocess modalは二つの製品入口、保存完了待ち、worker、
+取消・成功・失敗の採用を一つの操作寿命で所有する。別のfolder構成adapterを復活させない。
+
+画像タグとfolder自身のタグは和集合をZIP本体へ複製し、ZIPページ別タグを作らない。
+★・編集・しおり等のidentityはmanifestでZIP側へ対応付け、元データも保持する。
+Collectionは登録・順序・revisionを変えず元参照を保持し、source削除時は既存missing表示を使う。
+DAT補充と先行保存の採用はsourceの該当keyを持つ各contextへ限定し、関係のない兄弟をresetしない。
+F12起点は元viewerを保つ。mainの一覧復帰だけが起点の親folderを読み直し、可視ならZIPのpathを選択する。
+不可視ZIPのために同名3択・種類・facet設定を変更しない。詳細・受入条件は
+[画像folder→ZIP計画](image-folder-to-zip-plan.md)と[リワーク外記録](detached-rework-plan.md#11-リワーク外からの変更記録)。
+
+## G3 mode-onlyと文書方向（2026-10-11）
+
+表示分類だけの保存は本別binding/方向の指定とは扱わない。文書方向追従ONで両方未設定なら、
+既存のPDF/EPUB open workerが方向を取得し、共通resolverがその既定を解決してからSingle/Spread/Splitを適用する。
+PDFのwarm placeholder/collection/smart-folder preflightも同じ取得要否を使う。構成解除は元EPUB世代を保持し、
+必要なPDF方向列挙を投影workerへ載せる。追従OFFと保存済みbinding/方向の優先は維持する。
+公開v4.5.0ではこのbinding未設定mode-only保存形式は存在しない（調査記録はbook-composition-plan G3）。
+
+## 本の列生成と抽出一覧（§1.242 G1）
+
+`app/book_materialization` が、安全性・種類policy・同名除去後の本の行を生成する。
+ZIPのroot、enter/back、DFS、評価履歴、しおりとRemoteは同じ直下ページ投影を使う。
+子folder/nested archiveのカテゴリ位置は各surfaceの従来規則を保持する。
+PDF/EPUBのcached countと完了manifestは同じ論理source/page_numから行を作り、cached
+adoptionを完了待ちへ変えない。folder走査・metadata/rating sort・製本のnumeric順も従来どおり。
+しおりのmember検索はscopeとidentityだけを返し、表示indexは生成済み順へ解決する。
+
+採用済み`ProjectionRecipe::Book | OrdinaryList | ExtractedResult`はitemsと同じcontextで保持する。
+検索・評価・Smart root・Collection root・固定snapshot・サブ展開の直接閲覧は、一冊分の結果でも
+ExtractedResult。本を列挙し直して入った子階層はBook、通常のmixed/本扱いOFF/スタックはOrdinaryList。
+固定snapshotのmembership、★一致による直接open、帰路は維持し、保存列復帰ではrecipeも復元する。
+抽出一覧は新規fullscreen openでSingle、全体の読む方向をsessionへsnapshotする。一時見開きは
+全結果順で隣接ページを組み、cover/shift/末尾補助/端配置/強制単独を使わず、spread keyを作らない。
+F12の表示中forkだけはcapture-time modeを保持できる。
+B2の`book_composition`は方向・表紙・順序・hidden・ページ指定を保存し、pure resolverが可視実列を作る。
+組は通常builderで自動生成し、構成非表示は詰めて組み直す。metadata v11はschema 2のrecordを運び、
+旧unitsの移行・読み替えを持たない。Missingとhiddenの参照は転送でも保持する。
+PageRefは書庫の完全entry名、PDF/EPUBの物理0-based番号、画像folderの直下file名を区別し、
+bookmarkのcase/slash照合を共有する。EPUBのedit-key adapterは既存`edit_source::page_key_for_pdf`
+を使い、元EPUB+番号の同値をpure testで検査する。変換cache世代・内容reflowの対応表は作らない。
+G2 part Bの保存は`book_composition.db`一つ、共有`book_scope::BookScopeKey`のKeepDriveキー。
+Appは単一worker handleだけを持ち、SQLite/FS処理・maintenance待機はworkerで行う。
+保存成功時のEdit観測は捕捉済みlogical outer rootへ送る。閲覧/履歴なしのPDF/EPUB/ZIP/変換元書庫も内容ID復元へ参加し、Folder ledgerは増やさない。
+個別ページ削除では構成をpurgeせず、再解決時にMissingを保つ。本/root削除はfamilyをpurgeする。
+製本/一括出力の実Source受付はworkerで最新構成を照合し、結果列のhiddenを除外・通知する。
+全選択のSource順は構成後items順。白紙・添付表紙は実Sourceへ増やさず、結果列は選択順を保つ。
+F12/固定snapshotはimmutableなaccepted recordを各context内へ運ぶ。RemoteのSessionHandleへ同じread serviceを登録し、構成write入口は作らない。
+G3の共通projectionはraw sourceを保持し、直下の実ページblockだけを構成順へ投影する。
+子containerの位置と、構成なしの従来表示prefixは維持する。resume/しおりhintはraw番号、履歴表示は実Navigationのordinal。
+構成で非表示のしおりは記録を残し、しおり欄にも「本の構成で非表示になっています」と表示する。
+その行への移動は提示直前に拒否し、raw番号を新しい表示列の別ページへ流用しない。
+元行を置き換えるworkerは未保存trimを既存page keyで保存してから個別編集を投影し、UI同期I/Oを追加しない。
+unsafe/case衝突を含む階層は構成だけ拒否し、書庫と保存構成は変更せず従来表示を使う。
+通知は「この本のページ名では本の構成を使えません。構成を使わずに開きます。」。
+画像folder sidecarのwriter/schemaはG4Fまで変更しない。
+metadata v11の`composition_family { coverage, scopes }`はlogical folder/書庫/document entryが所有する。
+既存のcache DriveStripped spread/trim familyと別にsource KeepDrive構成を運ぶ。
+旧v7–v10/字段なしは保持、新版空はcoverage内だけ解除、非空はscope単位の置換。skip/coverage外は保持する。
+追加/置換/解除のpreviewは既存の確認一回へ載せ、実適用数はbatch/SAVEPOINT後のcommit結果から表示する。
+2026-10-12の利用者決定でG4Fを切り離し、画像だけのfolderは構成対象外とする。
+共通型/store/明示転送のfolder値は将来用として保持するが、物理画像の提示・類似preview・Remoteは消費しない。
+既存folder閲覧・編集・sidecar v1・Eの見開き調整は維持し、保存行をpurgeするmigrationは追加しない。
+連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
+元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
+一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
+検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
+Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+§1.364統合後は、固定一覧の元列と一緒にshift ownerのscope・identity・保存状態を退避する。
+保存完了・記憶policy・ページ改名は同contextの退避ownerにも届け、一覧のmode変更で元本をClearしない。
+F12の複製はaccepted sessionだけを受け取り、保存要求・復元receiverを共有しない。
 ## Everything 検索からの本open/back（§1.374、実装中・検証待ち）
 
-Everythingは外側の実ファイルだけを検索し、ZIP内部entry/PDFページを列挙しない。
+Everythingは外側の実ファイル・実フォルダを検索し、ZIP内部entry/PDFページを列挙しない。
 対応・表示設定に合うZIP/CBZ、PDF/EPUB、変換対象書庫をworkerで分類・statしてSearchのflat行へ採用する。
 元EPUB/変換書庫のidentityを維持し、検索時に変換や内部probeを先行実行しない。
 本openは既存通常open/enumerate/password/convert経路へ渡す。取消/失敗はaccepted位置を変更せず、
 物理表示の成功adoptionだけが `EverythingPosition::PhysicalChild` にlogical source/return anchor/routeを記録する。
 
-ZIP内部の親移動は通常zip navを使い、本の外側では保持したimmutable検索datasetを
-既存Search prepareで再投影してRootへ戻る。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
+ParentはZIP内部なら通常zip navを使い、それ以外でeffective_folderがlogical_sourceの厳密な物理子孫なら通常の物理親へ戻る。起点からは保持したimmutable検索datasetを既存Search prepareで再投影してRootへ戻る。Resultsボタンは階層を飛ばしてRootへ直帰する。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
 同contextのitems/metasとthumbnail requestsは共通adoptionに従い、同pathを読むdetached兄弟の
 PDF ticket/queue/cacheを失効しない。先行PDF ownership改修 `4510346f5` / master `c1e66f589` を前提とする。
 F12は既存open/fork/park/promoteを維持し、Everything datasetを兄弟viewerの一覧ownerにしない。
@@ -75,6 +162,12 @@ ZIPの全再読込で準備済みprefixが変わる場合はSameLocationでもro
 同階層の再読込は手動復元済みの値を維持し、外側の履歴cursorはどちらも進めない。
 場所条件は移動時にactive/frame双方から除く。folder/PDF/ZIPのinstall後は履歴とfacetを確定してから
 sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuationが担当する。
+DFS の fullscreen 継続と RequiredFullscreen の after-hydration 再オープン予約は、その sidecar
+continuation が所有する。待機述語も同じ live な context／世代／source／items数と取消状態から答え、
+viewport と旧ページの holdover を hydration 中も維持する。true close はこの予約を消費し、
+hydration 完了で勝手に再オープンしない。ZIP と EPUB／RAR 等の変換 cache にも同じ規則を適用する。
+`56c11e621`（v4.5.0）の採用後 hydration への移行で待機判定が追従せず、v4.7.0 で PDF 間
+Ctrl+↑↓ のちらつきが報告された。再オープンを採用直後へ戻さず、予約所有者からの判定で修正する。
 failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。
 この段階では設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外を対象外とした。
 後続の§1.345は `FileTypeVisibility` を共通の一覧投影 owner とし、実 entry のネスト書庫来歴と
@@ -607,6 +700,19 @@ Auto比率の★一覧では、同じ保存helperが `TopLevelGridView` の★�
 純ロジックなので受信後に UI スレッドで行う。内側 ZIP バイト列は zip_loader 内の LRU
 キャッシュに保持され、後続の read_entry_bytes / 深い階層のサムネ読み込みで再展開せず参照される。
 
+内側 ZIP bytes のキーは、ローカルの内部名と Remote の物理 index chain のどちらも、
+外側 ZIP の `ArchiveCacheKey` (path + 精密な mtime + len) を必ず含む。同じ path の外側 ZIP が
+更新された場合は古い identity にヒットしない。列挙・先頭画像名・先頭画像 bytes・個別ページ取得・
+Remote 候補の探索/解決/取得は、`open_archive_with_key` で外側の request reader と、その reader が
+使う目次 template の slot key を一緒に取得する。その key を全階層の内側 bytes の lookup / insert と、
+外側の CP932 復号名 index に使い、別途 path を stat して世代を取り直さない。stat / open に失敗した
+場合は従来のエラー処理に任せる。mtime と長さが両方同じ差し替えは目次キャッシュと同様に検出できない。
+目次 cache 内部の stat と file open の間の競合は既存の限界とし、再試行や二重 stat の照合は追加しない。
+個別ページ取得は内側 bytes のヒット時も先に外側 template を取得する。warm 時は metadata / slot の照合と
+reader clone だけで目次を再解析しないが、内側 bytes が残っていても目次が8書庫 LRU から退避していれば
+外側目次を一度再解析する。先頭画像名取得も共有 template 経由とし、既存の毎回の目次解析を再利用可能にする。
+ナビゲーション時の `clear_nested_cache()` はメモリ解放のために残し、更新検証の根拠にはしない。
+
 ### 2.2 PDF を開く (`App::load_pdf_as_folder`)
 
 PDF は **非同期**で開く:
@@ -643,6 +749,12 @@ mtime / size を含むキーのいずれかが変わった差し替えやパス�
 context epoch による解放は行わない。
 
 ### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
+
+「通常フォルダにも既定のページ構成を使う」(`apply_default_spread_to_plain_folders`、既定 OFF) は
+この直接表示・本扱い設定と独立する。ON でも `ProjectionRecipe`、ページ順固定、自動 fullscreen、
+一覧/ツリー/アドレス指定・F12/複数窓の開き方と帰路は変えない。走査済みの実フォルダに保存された
+ページ構成がないときだけ実効 `default_spread_mode` を使い、非本の flow は Paged のまま。
+保存値を優先し、既定を DB に書き込まない。抽出一覧・ZIP/PDF/EPUB の規則は維持する。
 
 環境設定のフル機能ウィンドウで「本をページ表示で開く」が ON、または複数ウィンドウモードが
 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く、または
@@ -957,7 +1069,7 @@ fullscreen viewport、detached window、in-window がそれぞれの実 inner si
 - ZIP 内 WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
 
 WIC デコードは `wic_decoder::decode_to_dynamic_image_from_bytes` でバイト列から
-直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF も開ける
+直接デコードできるため、ZIP 内の HEIC/JXL/TIFF も開ける（AVIF は内蔵を先に試す）
 (対応コーデックがインストールされていれば)。サムネイル・フルスクリーン両方の
 非 RAW ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
 ZIP 内 RAW は拡張子で先に LibRaw へ分岐し、entry bytes から preview または現像結果と
@@ -1065,3 +1177,10 @@ ZIP/PDF 用の相対キーは **ZIP/PDF ファイルの親フォルダ** に置�
 bufferは初回small readでのみ確保し、miss時は領域を再利用する。request/templateのcloneは空のbufferで開始し、可変bufferや取消tokenを兄弟request間で共有しない。cache hit前にも取消を確認し、大きなreadは直接読み、EOF/short read/seekの位置契約を維持する。書庫のfreshness判定、entry列挙、CP932/UTF-8正規化、legacy rename、入れ子ZIP、復号や失敗の扱いを省略しない。
 
 局所比較と検証結果は [類似索引の増分照合と収束](similar-index-incremental-reconcile-plan.md) の起動Full短縮節に記録する。small readのOS呼出しは減るがread-aheadによる読み取りbytesは増え得るため、局所fixtureの速度を実機全体の起動時間に読み替えない。
+
+### ZIP 内 AVIF（§1.407）
+
+entry bytes は通常ファイルと同じ `image_decode` 境界を通し、内蔵 libavif → WIC → Susie。
+canonical・thumbnail・本への追加・clipboard・類似検索・Remote で共有する。
+内蔵 AVIF の clap/irot/imir 適用済み情報は `Orientation::Applied` で運び、ZIP の
+EXIF bytes 補正を重ねない。native source_dims も表示変換後の寸法とする。

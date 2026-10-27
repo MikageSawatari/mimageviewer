@@ -30,6 +30,7 @@ impl Drop for StillSeekRotationsPending {
 #[derive(Default)]
 pub(crate) struct RotationCache {
     values: HashMap<usize, Rotation>,
+    invalidation_revision: u64,
     pending: Option<StillSeekRotationsPending>,
     /// A memo of a completely hydrated immutable nav list, not a request state.
     /// It avoids walking the whole book in every otherwise idle overlay frame.
@@ -48,6 +49,7 @@ impl From<HashMap<usize, Rotation>> for RotationCache {
     fn from(values: HashMap<usize, Rotation>) -> Self {
         Self {
             values,
+            invalidation_revision: 0,
             pending: None,
             verified_nav: None,
         }
@@ -64,6 +66,9 @@ impl std::ops::Deref for RotationCache {
 }
 
 impl RotationCache {
+    pub(crate) fn invalidation_revision(&self) -> u64 {
+        self.invalidation_revision
+    }
     pub(crate) fn has_rotations_for_nav(&mut self, nav: &Arc<Vec<usize>>) -> bool {
         if self
             .verified_nav
@@ -99,13 +104,27 @@ impl RotationCache {
         self.values.insert(idx, rotation)
     }
 
+    pub(crate) fn replace_values(&mut self, values: HashMap<usize, Rotation>) {
+        self.clear();
+        self.values = values;
+    }
+
+    pub(crate) fn take_values(&mut self) -> HashMap<usize, Rotation> {
+        self.invalidation_revision = self.invalidation_revision.wrapping_add(1);
+        self.cancel_still_seek_rotations();
+        self.verified_nav = None;
+        std::mem::take(&mut self.values)
+    }
+
     pub(crate) fn clear(&mut self) {
+        self.invalidation_revision = self.invalidation_revision.wrapping_add(1);
         self.cancel_still_seek_rotations();
         self.verified_nav = None;
         self.values.clear();
     }
 
     pub(crate) fn remove(&mut self, idx: &usize) -> Option<Rotation> {
+        self.invalidation_revision = self.invalidation_revision.wrapping_add(1);
         self.verified_nav = None;
         if self
             .pending

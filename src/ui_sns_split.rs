@@ -1,6 +1,7 @@
 use crate::app::{App, SnsSplitDrag};
 use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::export_crop::{CropHandle, CropRect};
+use crate::gpu_lanczos::FullscreenPaintPayload;
 use crate::keymap::KeyAction;
 use crate::sns_split::{
     MAX_COUNT, MAX_SEAM_PERMILLE, MIN_COUNT, SnsFrameRatio, SnsSplitLayout, SnsTarget,
@@ -460,7 +461,7 @@ fn draw_sns_split_preview(
     ui: &mut egui::Ui,
     layout: SnsSplitLayout,
     image_size: [usize; 2],
-    texture: Option<&egui::TextureHandle>,
+    texture: Option<&FullscreenPaintPayload>,
 ) {
     let frames = layout.frames();
     let (bounds, _) = ui.allocate_exact_size(
@@ -478,7 +479,7 @@ fn draw_sns_split_preview(
 
     for (paint_rect, uv_rect) in paint_rects.into_iter().zip(uv_rects) {
         if let Some(texture) = texture {
-            painter.image(texture.id(), paint_rect, uv_rect, egui::Color32::WHITE);
+            paint_sns_split_preview_frame(&painter, texture, paint_rect, uv_rect);
         } else {
             painter.rect_filled(
                 paint_rect,
@@ -493,6 +494,31 @@ fn draw_sns_split_preview(
             );
         }
     }
+}
+
+fn paint_sns_split_preview_frame(
+    painter: &egui::Painter,
+    material: &FullscreenPaintPayload,
+    paint_rect: egui::Rect,
+    source_uv_rect: egui::Rect,
+) {
+    // Each preview frame is a window into the same full source. Reconstruct
+    // that frame before mapping the material's coverage; fitting the cropped
+    // sampler to this rectangle would move/stretch the available pixels.
+    let full_size = paint_rect.size() / source_uv_rect.size();
+    let full_rect = egui::Rect::from_min_size(
+        paint_rect.min - source_uv_rect.min.to_vec2() * full_size,
+        full_size,
+    );
+    material.paint_source_region(
+        painter,
+        full_rect,
+        crate::rotation_db::Rotation::None,
+        0.0,
+        source_uv_rect,
+        egui::Color32::WHITE,
+    );
+    material.retain_native_output_for_paint(painter);
 }
 
 fn sns_split_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
@@ -656,6 +682,47 @@ fn paint_seams(
 }
 
 impl App {
+    pub(crate) fn finish_sns_split_drag(&mut self, end: crate::ui_crop::OverlayDragEnd) -> bool {
+        let Some(drag) = self.sns_split_drag.as_ref() else {
+            return false;
+        };
+        if !self.page_edit_owner_is_current(&drag.owner) {
+            return false;
+        }
+        let drag = self.sns_split_drag.take().unwrap();
+        if end.finish() == crate::ui_crop::OverlayDragFinish::Cancel
+            && drag.owner.items_generation == self.items_generation
+        {
+            self.sns_split = Some(drag.base);
+        }
+        true
+    }
+
+    fn service_sns_split_drag(
+        &mut self,
+        ctx: &egui::Context,
+        front: &crate::ui_fullscreen::FsFrontPointerFrameInput,
+    ) {
+        // The structural owner cancels all owning contexts before its worker can proceed.
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        if let Some(drag) = self.sns_split_drag.as_ref() {
+            let end = if self
+                .fullscreen_idx
+                .is_none_or(|idx| !drag.owner.slots.contains(&idx))
+                || drag.owner.items_generation != self.items_generation
+            {
+                Some(crate::ui_crop::OverlayDragEnd::OwnerChanged)
+            } else {
+                crate::ui_crop::overlay_drag_end(ctx, front, drag.press_frame)
+            };
+            if let Some(end) = end {
+                self.finish_sns_split_drag(end);
+            }
+        }
+    }
+
     pub(crate) fn sns_split_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
         let pos = egui::pos2(full_rect.left() + PANEL_MARGIN, full_rect.top() + PANEL_TOP);
         let height = sns_split_panel_outer_height(full_rect, pos);
@@ -686,6 +753,7 @@ impl App {
         let Some(source_size) = self.fs_page_coordinate_source_size(target_idx) else {
             return Err(SnsSplitEntryError::ImageLoading);
         };
+        self.cancel_original_material_entry_intents(None);
         let image_size = [
             source_size.x.round().max(1.0) as usize,
             source_size.y.round().max(1.0) as usize,
@@ -706,14 +774,23 @@ impl App {
             self.sns_split_spread_ctx = Some(pivot);
             self.enter_page_edit_single_view(target_idx);
         }
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.sns_split = Some(layout);
-        self.sns_split_drag = None;
         Ok(())
     }
 
     pub(crate) fn reset_sns_split_mode(&mut self) {
+        self.leave_sns_split_mode(crate::ui_crop::OverlayDragEnd::ModeExit);
+    }
+
+    pub(crate) fn complete_sns_split_mode(&mut self) {
+        self.leave_sns_split_mode(crate::ui_crop::OverlayDragEnd::Execute);
+    }
+
+    fn leave_sns_split_mode(&mut self, end: crate::ui_crop::OverlayDragEnd) {
+        self.finish_sns_split_drag(end);
+        self.cancel_original_material_entry_intents(None);
         self.sns_split = None;
-        self.sns_split_drag = None;
         let pivot = self.sns_split_spread_ctx.take();
         self.leave_page_edit_single_view(pivot);
     }
@@ -723,12 +800,16 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = crate::ui_fullscreen::FsKeyAction {
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
@@ -736,7 +817,7 @@ impl App {
         };
         if let Some(error) = self.sns_split_rotation_error(fs_idx) {
             self.reset_sns_split_mode();
-            self.show_feedback_toast(error.message().to_string());
+            self.show_feedback_error(error.message().to_string());
             return action;
         }
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
@@ -744,9 +825,12 @@ impl App {
             return action;
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.reset_sns_split_mode();
+            if !self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Escape) {
+                self.reset_sns_split_mode();
+            }
             return action;
         }
+        self.service_sns_split_drag(ctx, &Default::default());
         if self.keymap.consume_action(ctx, KeyAction::SnsSplitExecute) {
             self.execute_sns_split_export(ctx, fs_idx);
         } else if self.keymap.consume_action(ctx, KeyAction::FsExport) {
@@ -759,18 +843,22 @@ impl App {
     }
 
     fn execute_sns_split_export(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        if self.book_structural_op.is_some() {
+            return false;
+        }
+        self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Execute);
         let Some(layout) = self.sns_split else {
             return false;
         };
         if let Some(error) = self.sns_split_rotation_error(fs_idx) {
             self.reset_sns_split_mode();
-            self.show_feedback_toast(error.message().to_string());
+            self.show_feedback_error(error.message().to_string());
             return false;
         }
         let Some(source_size) = self.fs_page_coordinate_source_size(fs_idx) else {
             // キー入力に対して何も起きないと、利用者は原因を知る手段が無い。
             // open_export_dialog 側の失敗経路と同じく理由を出す。
-            self.show_feedback_toast("ページの寸法をまだ取得できていません".to_string());
+            self.show_feedback_warning("ページの寸法をまだ取得できていません".to_string());
             return false;
         };
         let image_size = [
@@ -779,7 +867,7 @@ impl App {
         ];
         if let Some(reason) = sns_split_export_disabled_reason(layout, image_size) {
             // パネルにも理由は出ているが、キーを押して無反応にはしない。
-            self.show_feedback_toast(reason.to_string());
+            self.show_feedback_warning(reason.to_string());
             return false;
         }
 
@@ -793,7 +881,7 @@ impl App {
         fs_idx: usize,
         full_rect: egui::Rect,
         image_size: Option<[usize; 2]>,
-        preview_texture: Option<&egui::TextureHandle>,
+        preview_texture: Option<&FullscreenPaintPayload>,
     ) {
         if self.sns_split.is_none() {
             return;
@@ -804,16 +892,19 @@ impl App {
         let mut close = false;
         let mut export_requested = false;
 
-        egui::Area::new(egui::Id::new("sns_split_panel"))
+        egui::Area::new(egui::Id::unique("sns_split_panel"))
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() {
+                    ui.disable();
+                }
                 ui.interact(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
                         egui::vec2(PANEL_W + 12.0, panel_height + 12.0),
                     ),
-                    egui::Id::new("sns_split_panel_click_sink"),
+                    egui::Id::unique("sns_split_panel_click_sink"),
                     egui::Sense::click(),
                 );
                 egui::Frame::popup(ui.style())
@@ -870,6 +961,10 @@ impl App {
                                 ui.set_max_width(PANEL_W);
                                 ui.set_min_height(body_height);
                                 egui::ScrollArea::vertical()
+                                    .scroll_source(egui::scroll_area::ScrollSource {
+                                        drag: egui::scroll_area::DragScroll::Always,
+                                        ..Default::default()
+                                    })
                                     .id_salt("sns_split_panel_body")
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
@@ -919,12 +1014,15 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         image_size: [usize; 2],
-        preview_texture: Option<&egui::TextureHandle>,
+        preview_texture: Option<&FullscreenPaintPayload>,
     ) -> bool {
         let Some(mut layout) = self.sns_split else {
             return false;
         };
-        let previous_layout = layout;
+        let previous_layout = self
+            .sns_split_drag
+            .as_ref()
+            .map_or(layout, |drag| drag.base);
         let mut frame_ratio =
             sns_frame_ratio_from_key(self.settings.sns_split_frame_ratio.as_deref());
 
@@ -967,7 +1065,7 @@ impl App {
         };
 
         ui.add_space(6.0);
-        ui.label("継ぎ目");
+        let seam_label = ui.label("継ぎ目");
         ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(seam_choice == SnsSplitSeamChoice::None, "なし")
@@ -999,13 +1097,15 @@ impl App {
         });
         if seam_choice == SnsSplitSeamChoice::Custom {
             let mut seam_percent = f64::from(seam_permille) / 10.0;
-            let response = ui.add(
-                egui::DragValue::new(&mut seam_percent)
-                    .range(0.0..=10.0)
-                    .speed(0.1)
-                    .fixed_decimals(1)
-                    .suffix("%"),
-            );
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut seam_percent)
+                        .range(0.0..=10.0)
+                        .speed(0.1)
+                        .fixed_decimals(1)
+                        .suffix("%"),
+                )
+                .labelled_by(seam_label.id);
             if response.changed() {
                 seam_permille = (seam_percent * 10.0)
                     .round()
@@ -1031,6 +1131,9 @@ impl App {
         let seam_changed = seam_permille != layout.seam_permille;
         let topology_changed =
             target_changed || count_changed || seam_changed || frame_ratio_changed;
+        if topology_changed {
+            layout = previous_layout;
+        }
         if target_changed {
             layout = layout.with_target(target, image_size);
         }
@@ -1066,8 +1169,8 @@ impl App {
             self.settings.sns_split_count = layout.count;
             self.settings.sns_split_seam_permille = layout.seam_permille;
             self.settings.sns_split_frame_ratio = Some(frame_ratio.stable_key().to_string());
+            self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::SettingsChanged);
             self.sns_split = Some(layout);
-            self.sns_split_drag = None;
         }
         if persist_settings {
             self.settings.save();
@@ -1110,7 +1213,9 @@ impl App {
         transform: &DisplayedImageTransform,
         image_size: [usize; 2],
         pointer_allowed: bool,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
+        self.service_sns_split_drag(ui.ctx(), &overflow_pointer_input);
         let Some(layout) = self.sns_split else {
             return false;
         };
@@ -1165,12 +1270,21 @@ impl App {
             );
         }
 
-        if !pointer_allowed {
-            self.sns_split_drag = None;
+        if overflow_pointer_input.owns(egui::PointerButton::Primary) {
+            return false;
+        }
+        if !pointer_allowed && self.sns_split_drag.is_none() {
             return false;
         }
 
-        self.handle_sns_split_pointer(ui, transform, image_size, layout, handles)
+        self.handle_sns_split_pointer(
+            ui,
+            transform,
+            image_size,
+            layout,
+            handles,
+            overflow_pointer_input,
+        )
     }
 
     fn handle_sns_split_pointer(
@@ -1180,14 +1294,20 @@ impl App {
         image_size: [usize; 2],
         layout: SnsSplitLayout,
         handles: [(CropHandle, egui::Pos2); 8],
+        front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
+        if self.book_structural_op.is_some() {
+            return false;
+        }
+        self.service_sns_split_drag(ui.ctx(), &front);
         let frame_ratio = sns_frame_ratio_from_key(self.settings.sns_split_frame_ratio.as_deref());
         let (primary_pressed, primary_down, primary_released, press_origin, hover_pos, total_delta) =
             ui.input(|input| {
                 (
                     input.pointer.primary_pressed(),
                     input.pointer.primary_down(),
-                    input.pointer.primary_released(),
+                    !front.owns_release(egui::PointerButton::Primary)
+                        && input.pointer.primary_released(),
                     input.pointer.press_origin(),
                     input.pointer.hover_pos(),
                     input.pointer.total_drag_delta().unwrap_or(egui::Vec2::ZERO),
@@ -1213,39 +1333,50 @@ impl App {
             }
         };
 
-        if primary_pressed {
+        if primary_pressed && self.sns_split_drag.is_none() {
             self.sns_split_drag = press_origin.and_then(|origin| {
-                target_at(origin).map(|handle| SnsSplitDrag {
-                    handle,
-                    base: layout,
-                })
+                target_at(origin)
+                    .zip(
+                        self.fullscreen_idx
+                            .and_then(|idx| self.capture_page_edit_owner(idx)),
+                    )
+                    .map(|(handle, owner)| SnsSplitDrag {
+                        handle,
+                        base: layout,
+                        owner,
+                        press_frame: ui.ctx().cumulative_frame_nr(),
+                    })
             });
         }
 
         let mut used = false;
-        if primary_down && let Some(drag) = self.sns_split_drag {
+        if primary_down
+            && let Some((base, handle)) = self
+                .sns_split_drag
+                .as_ref()
+                .map(|drag| (drag.base, drag.handle))
+        {
             let origin = press_origin.unwrap_or_else(|| transform.viewport_rect.center());
             let start = screen_to_image(transform, image_size, origin);
             let end = screen_to_image(transform, image_size, origin + total_delta);
             self.sns_split = Some(drag_sns_split_layout(
-                drag.base,
-                drag.handle,
+                base,
+                handle,
                 end[0] - start[0],
                 end[1] - start[1],
                 image_size,
                 frame_ratio,
             ));
-            ui.ctx()
-                .set_cursor_icon(if drag.handle == CropHandle::Body {
-                    egui::CursorIcon::Grabbing
-                } else {
-                    handle_cursor(drag.handle)
-                });
+            ui.ctx().set_cursor_icon(if handle == CropHandle::Body {
+                egui::CursorIcon::Grabbing
+            } else {
+                handle_cursor(handle)
+            });
             used = true;
         }
 
         if primary_released {
-            self.sns_split_drag = None;
+            self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Released);
         }
 
         if !used
@@ -1263,6 +1394,427 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sns_split_drag_terminal_routes_restore_or_commit_the_whole_layout() {
+        let _key_input_guard = crate::key_input::lock_test_input();
+        for route in [
+            "release",
+            "missing_release",
+            "escape",
+            "focus",
+            "right",
+            "panel",
+            "reset",
+            "execute_shortcut",
+            "execute_button",
+            "execute_unready",
+            "book_structure",
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let path = app.tmp.path().join("sns-drag.jpg");
+            std::fs::write(&path, b"test").unwrap();
+            app.items.push(crate::grid_item::GridItem::Image(path));
+            app.fullscreen_idx = Some(0);
+            app.settings.sns_split_frame_ratio = Some("free".into());
+            let size = [1000, 800];
+            let base = SnsSplitLayout {
+                target: SnsTarget::X,
+                count: 2,
+                seam_permille: 17,
+                group: CropRect {
+                    min_x: 100.0,
+                    min_y: 200.0,
+                    max_x: 500.0,
+                    max_y: 400.0,
+                },
+            };
+            app.sns_split = Some(base);
+            let ctx = egui::Context::default();
+            app.keymap = crate::keymap::Keymap::from_ini_str("[SnsSplit]\nSnsSplitExecute = F13\n");
+            let image = egui::ColorImage::filled(size, egui::Color32::WHITE);
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Static {
+                    pdf_metadata: None,
+                    pdf_rerender_failures: Vec::new(),
+                    tex: ctx.load_texture("sns-execute", image.clone(), Default::default()),
+                    pixels: std::sync::Arc::new(image),
+                    source_dims: Some(size),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+            let transform = DisplayedImageTransform::resolve(
+                crate::displayed_image_transform::DisplayedImageTransformInput {
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                    page_idx: 0,
+                    viewport_rect: viewport,
+                    source_size: egui::vec2(1000.0, 800.0),
+                    texture_size: egui::vec2(1000.0, 800.0),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
+                    fit_scale_limits: Default::default(),
+                    pixels_per_point: 1.0,
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                },
+            )
+            .unwrap();
+            let start = transform.source_normalized_to_screen(egui::pos2(0.3, 0.375));
+            let end = start + egui::vec2(60.0, 40.0);
+            let button = |button, pressed| egui::Event::PointerButton {
+                pos: end,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let frame = |app: &mut App, events, allowed| {
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|root| {
+                                egui::CentralPanel::default().show(root, |ui| {
+                                    app.draw_sns_split_overlay(
+                                        ui,
+                                        &transform,
+                                        size,
+                                        allowed,
+                                        Default::default(),
+                                    );
+                                });
+                            });
+                        },
+                    )
+                    .drop_without_applying_deltas();
+            };
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                true,
+            );
+            frame(
+                &mut app,
+                vec![egui::Event::PointerMoved(end)],
+                route != "panel",
+            );
+            let draft = app.sns_split.unwrap();
+            assert_ne!(
+                draft, base,
+                "the production pointer handler must update the layout"
+            );
+            match route {
+                "release" | "panel" => frame(
+                    &mut app,
+                    vec![button(egui::PointerButton::Primary, false)],
+                    route != "panel",
+                ),
+                "missing_release" => {
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::unique("overlay_test_primary_level"), false)
+                    });
+                    frame(&mut app, vec![], true);
+                }
+                "focus" => frame(&mut app, vec![egui::Event::WindowFocused(false)], true),
+                "right" => frame(
+                    &mut app,
+                    vec![button(egui::PointerButton::Secondary, true)],
+                    true,
+                ),
+                "escape" => {
+                    let _ = ctx
+                        .run_pass(
+                            egui::RawInput {
+                                events: vec![egui::Event::Key {
+                                    key: egui::Key::Escape,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: egui::Modifiers::NONE,
+                                }],
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                app.handle_sns_split_keys(ctx, 0);
+                            },
+                        )
+                        .drop_without_applying_deltas();
+                }
+                "reset" => app.reset_sns_split_mode(),
+                "execute_shortcut" => {
+                    ctx.begin_pass(egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key: egui::Key::F13,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    });
+                    assert!(ctx.input(|input| input.pointer.primary_down()));
+                    app.keyboard_owner_for_pass(&ctx);
+                    app.handle_sns_split_keys(&ctx, 0);
+                    let _ = ctx.end_pass().drop_without_applying_deltas();
+                }
+                "execute_button" => {
+                    assert!(ctx.input(|input| input.pointer.primary_down()));
+                    assert!(app.execute_sns_split_export(&ctx, 0));
+                }
+                "execute_unready" => {
+                    app.fs_early_dims.insert(0, size);
+                    app.fs_cache.clear();
+                    assert!(!app.execute_sns_split_export(&ctx, 0));
+                    assert!(app.export_dialog.is_none());
+                }
+                "book_structure" => {
+                    let key = app.page_path_key(0).unwrap();
+                    let crop_before = app.export_crop_db.as_ref().unwrap().get(&key);
+                    let worker = app.hold_book_structure_for_test();
+                    frame(
+                        &mut app,
+                        vec![button(egui::PointerButton::Primary, false)],
+                        true,
+                    );
+                    assert!(!app.execute_sns_split_export(&ctx, 0));
+                    app.poll_book_structural_op(&ctx);
+                    assert_eq!(
+                        app.sns_split,
+                        Some(base),
+                        "structural poll must cancel SNS draft"
+                    );
+                    assert!(app.sns_split_drag.is_none());
+                    frame(
+                        &mut app,
+                        vec![button(egui::PointerButton::Primary, false)],
+                        true,
+                    );
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            egui::Event::PointerButton {
+                                pos: start,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        true,
+                    );
+                    frame(&mut app, vec![egui::Event::PointerMoved(end)], true);
+                    assert_eq!(app.sns_split, Some(base));
+                    assert!(
+                        app.sns_split_drag.is_none(),
+                        "new SNS input must stay blocked"
+                    );
+                    ctx.begin_pass(egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key: egui::Key::F13,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    });
+                    app.keyboard_owner_for_pass(&ctx);
+                    app.handle_sns_split_keys(&ctx, 0);
+                    let _ = ctx.end_pass().drop_without_applying_deltas();
+                    assert!(app.export_dialog.is_none());
+                    let _ = ctx
+                        .run_pass(
+                            egui::RawInput {
+                                screen_rect: Some(viewport),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                app.draw_sns_split_panel(ctx, 0, viewport, Some(size), None);
+                            },
+                        )
+                        .drop_without_applying_deltas();
+                    assert_eq!(app.sns_split, Some(base));
+                    worker
+                        .send(Err("synthetic structural completion".into()))
+                        .unwrap();
+                    app.poll_book_structural_op(&ctx);
+                    assert!(app.book_structural_op.is_none());
+                    frame(&mut app, vec![egui::Event::PointerMoved(end)], true);
+                    frame(
+                        &mut app,
+                        vec![button(egui::PointerButton::Primary, false)],
+                        true,
+                    );
+                    assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), crop_before);
+                }
+                _ => unreachable!(),
+            }
+            if matches!(route, "execute_shortcut" | "execute_button") {
+                let dialog = app.export_dialog.as_ref().expect("export dialog must open");
+                assert_eq!(dialog.sns_split_frames, draft.frames(), "route={route}");
+                assert_eq!(dialog.sns_split_source_size, Some(size));
+            }
+            let expected = match route {
+                "release" | "missing_release" | "panel" | "execute_unready" => Some(draft),
+                "reset" | "execute_shortcut" | "execute_button" => None,
+                _ => Some(base),
+            };
+            assert_eq!(app.sns_split, expected, "route={route}");
+            assert!(app.sns_split_drag.is_none(), "route={route}");
+        }
+    }
+
+    #[test]
+    fn crop_coverage_sns_preview_samples_partial_and_native_material_at_the_original_frame_position()
+     {
+        use crate::gpu_lanczos::{FullscreenPaintResource, FullscreenPaintSourceGeneration};
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "sns-coverage",
+            egui::ColorImage::filled([5, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let coverage = crate::source_coverage::SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(1000, 800),
+                (1000, 800),
+                (250, 200, 500, 400),
+            )
+            .unwrap(),
+        );
+        let crop = FullscreenPaintResource::resampleable(
+            0,
+            texture.clone(),
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        let native = crate::gpu_lanczos::test_native_resource_with_region(
+            crop.clone(),
+            [10, 8],
+            egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75)),
+        );
+        let frame = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(200.0, 160.0));
+        let request = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(0.5, 1.0));
+        for (resource, expected, expected_uv) in [
+            (FullscreenPaintResource::direct(texture), frame, request),
+            (
+                crop,
+                egui::Rect::from_min_max(egui::pos2(120.0, 70.0), egui::pos2(220.0, 150.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(0.5, 1.0)),
+            ),
+            (
+                native,
+                egui::Rect::from_min_max(egui::pos2(170.0, 90.0), egui::pos2(220.0, 130.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(0.5, 1.0)),
+            ),
+        ] {
+            for material in [
+                FullscreenPaintPayload::from(resource.clone()),
+                FullscreenPaintPayload::PresentationMaterial(resource.capture_presentation(&ctx)),
+            ] {
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                    egui::RawInput::default(),
+                    |ctx| {
+                        paint_sns_split_preview_frame(
+                            &ctx.debug_painter(),
+                            &material,
+                            frame,
+                            request,
+                        );
+                    },
+                ));
+                let mesh = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Mesh(mesh)
+                            if mesh.texture_id == material.paint_texture_id() =>
+                        {
+                            Some(mesh)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let corners = |rect: egui::Rect| {
+                    [
+                        rect.left_top(),
+                        rect.right_top(),
+                        rect.right_bottom(),
+                        rect.left_bottom(),
+                    ]
+                };
+                assert_eq!(mesh.vertices.len(), 4);
+                for ((vertex, position), uv) in mesh
+                    .vertices
+                    .iter()
+                    .zip(corners(expected))
+                    .zip(corners(expected_uv))
+                {
+                    assert!(
+                        (vertex.pos - position).length() < 0.001,
+                        "crop pixels must keep their full-source position"
+                    );
+                    assert!(
+                        (vertex.uv - uv).length() < 0.00001,
+                        "UV is relative to the actual crop/native sampler"
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn crop_coverage_sns_preview_empty_frame_draws_no_material() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "sns-empty-coverage",
+            egui::ColorImage::filled([5, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let material: FullscreenPaintPayload =
+            crate::gpu_lanczos::FullscreenPaintResource::direct(texture)
+                .with_source_coverage(crate::source_coverage::SourceCoverage::Known(
+                    crate::source_coverage::EditPreviewGeometry::new(
+                        crate::page_dims::CanonicalPageDimensions::new(1000, 800),
+                        (1000, 800),
+                        (250, 200, 500, 400),
+                    )
+                    .unwrap(),
+                ))
+                .into();
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                paint_sns_split_preview_frame(
+                    &ctx.debug_painter(),
+                    &material,
+                    egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(200.0, 160.0)),
+                    egui::Rect::from_min_max(egui::pos2(0.8, 0.0), egui::pos2(1.0, 1.0)),
+                );
+            }));
+        assert!(output.shapes.iter().all(|shape| !matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == material.paint_texture_id())));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn the_panel_reaches_the_bottom_of_every_window_it_is_given() {
@@ -1449,14 +2001,15 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(360.0, 700.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.set_max_width(320.0);
                     let _ = app_for_ui
                         .borrow_mut()
@@ -2077,14 +2630,15 @@ mod tests {
         let ctx = egui::Context::default();
         let modifiers = egui::Modifiers::CTRL;
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key: egui::Key::E,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key: egui::Key::E,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         app.keyboard_owner_for_pass(&ctx);
@@ -2093,7 +2647,7 @@ mod tests {
             !app.keymap.consume_action(&ctx, KeyAction::FsExport),
             "通常の Ctrl+E は SNS handler が export guard へ渡す"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(app.sns_split, Some(layout));
         assert!(app.export_dialog.is_none());
@@ -2185,6 +2739,8 @@ mod tests {
             app.fs_cache.insert(
                 idx,
                 crate::fs_animation::FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex: texture,
                     pixels: std::sync::Arc::new(image),
                     source_dims: Some(image_size),
@@ -2209,14 +2765,15 @@ mod tests {
 
         let modifiers = egui::Modifiers::NONE;
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key: egui::Key::F13,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key: egui::Key::F13,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         app.keyboard_owner_for_pass(&ctx);
@@ -2225,7 +2782,7 @@ mod tests {
             !app.keymap.consume_action(&ctx, KeyAction::SnsSplitExecute),
             "利用者が割り当てた SNS 分割実行キーは handler が消費する"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.sns_split.is_none());
         assert!(app.sns_split_spread_ctx.is_none());

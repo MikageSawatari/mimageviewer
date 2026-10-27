@@ -49,6 +49,98 @@ fn requested(app: &App) -> bool {
 }
 
 #[test]
+fn effetune_auto_open_same_source_eof_loop_does_not_reconsider_armed_session() {
+    let mut app = setup_app_for_test();
+    let gate = prepare(&mut app);
+    app.settings.effetune_auto_open_on_video = false;
+    app.publish_effetune_auto_setting();
+    let path = app.tmp.path().join("continuous-single.mp4");
+    successful_player(&mut app, path);
+    app.poll_video(&egui::Context::default());
+    assert!(!requested(&app));
+    app.settings.effetune_auto_open_on_video = true;
+    app.publish_effetune_auto_setting();
+    assert!(gate.auto_snapshot().allowed);
+    app.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
+    let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+        panic!()
+    };
+    player.set_loop_enabled(false);
+    player.mark_eof_for_test(30.0);
+    let serial = player.current_seek_serial();
+    app.video_continuous_last_eof = Some((0, serial));
+    app.apply_video_continuous_eof_target(
+        &egui::Context::default(),
+        0,
+        serial,
+        Some(0),
+        HistoryTrigger::AutoAdvance,
+    );
+    let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+        panic!()
+    };
+    player.complete_seek_for_test(0.0);
+    assert!(player.pending_playback_success_for_test().is_none());
+    app.poll_video(&egui::Context::default());
+    assert!(!requested(&app));
+    // Armed was not consumed: the next explicit user start can still open the GUI.
+    let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+        panic!()
+    };
+    player.mark_eof_for_test(30.0);
+    player.seek(0.0, crate::video::SeekOrigin::User);
+    player.complete_seek_for_test(0.0);
+    app.poll_video(&egui::Context::default());
+    assert!(requested(&app));
+}
+
+#[test]
+fn effetune_auto_open_internal_pause_user_seek_or_play_keeps_armed() {
+    for route in ["w", "bar", "space"] {
+        let mut app = setup_app_for_test();
+        prepare(&mut app);
+        app.settings.effetune_auto_open_on_video = false;
+        app.publish_effetune_auto_setting();
+        let path = app.tmp.path().join("internal-pause.mp4");
+        successful_player(&mut app, path);
+        let ctx = egui::Context::default();
+        app.poll_video(&ctx);
+        assert!(!requested(&app));
+        app.settings.effetune_auto_open_on_video = true;
+        app.publish_effetune_auto_setting();
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) {
+            player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
+        }
+        match route {
+            "w" => app.handle_native_video_seek_to_start_command(&ctx, 0),
+            "bar" => app.handle_native_video_seek_command(&ctx, 0, 5.0),
+            "space" => app.handle_native_video_toggle_play_command(&ctx, 0),
+            _ => unreachable!(),
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) {
+            player.complete_seek_for_test(5.0);
+            player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
+            assert!(
+                player.pending_playback_success_for_test().is_none(),
+                "{route}"
+            );
+        }
+        app.poll_video(&ctx);
+        assert!(!requested(&app), "{route}");
+        // A genuine user pause discards the old start; the next user start can still open.
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) {
+            player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::UserPlay);
+        }
+        app.poll_video(&ctx);
+        assert!(
+            requested(&app),
+            "internal continuation must leave Armed: {route}"
+        );
+    }
+}
+
+#[test]
 fn effetune_auto_open_poll_accepts_adopted_success_once() {
     let mut app = setup_app_for_test();
     let gate = prepare(&mut app);
@@ -344,4 +436,78 @@ fn effetune_auto_open_delivery_manual_control_activates_and_publishes_visible() 
     assert_eq!(shown.auto_revision, None);
     app.poll_effetune(&ctx);
     assert!(host.bridge.slots()[0].gui_visible);
+}
+
+#[test]
+fn effetune_taskbar_close_and_all_save_callers_install_normal_screen_payload() {
+    use crate::effetune::delivery_tests::{DeliveryStage, FakeHost};
+    use crate::video::dsp::bridge::{Event, NormalScreenRect};
+    let mut app = setup_app_for_test();
+    prepare(&mut app);
+    let host = FakeHost::new(&app.effetune, DeliveryStage::Loading);
+    let ctx = egui::Context::default();
+    app.effetune.click_idle(None, None);
+    app.effetune
+        .set_test_load_bridge_completion(Arc::clone(&host.bridge));
+    app.poll_effetune(&ctx);
+    assert!(host.fence(&app.effetune).visible);
+    host.bridge.mark_enabled_without_bridge_for_test();
+    let rect = NormalScreenRect {
+        x: -1400,
+        y: 90,
+        outer_width: 760,
+        outer_height: 570,
+    };
+    host.publish_event(
+        &app.effetune,
+        Event::GuiNormalRect {
+            slot_id: 0,
+            container_hwnd: 1,
+            normal_rect: rect,
+        },
+    );
+    // Button and runtime exit call this same helper. No HWND exists to query.
+    app.save_effetune_gui_rect();
+    assert_eq!(app.settings.effetune_gui_pos, Some((-1400, 90)));
+    assert_eq!(app.settings.effetune_gui_size, Some((760, 570)));
+    let close = NormalScreenRect {
+        x: -1350,
+        y: 130,
+        outer_width: 780,
+        outer_height: 590,
+    };
+    host.publish_event(
+        &app.effetune,
+        Event::GuiUserHidden {
+            slot_id: 0,
+            container_hwnd: 1,
+            normal_rect: Some(close),
+        },
+    );
+    // Delay adoption until after a new style target: immutable screen pixels stay unchanged.
+    app.effetune.set_show_in_taskbar(false);
+    host.fence(&app.effetune);
+    app.poll_effetune(&ctx);
+    assert_eq!(app.settings.effetune_gui_pos, Some((-1350, 130)));
+    assert_eq!(app.settings.effetune_gui_size, Some((780, 590)));
+    assert!(!host.bridge.slots()[0].gui_visible);
+    app.settings.save();
+    let saved = crate::settings::Settings::load();
+    assert_eq!(saved.effetune_gui_pos, Some((-1350, 130)));
+    assert_eq!(saved.effetune_gui_size, Some((780, 590)));
+    // Stale frame cannot overwrite the persisted normal geometry during a later save.
+    host.publish_event(
+        &app.effetune,
+        Event::GuiUserHidden {
+            slot_id: 0,
+            container_hwnd: 999,
+            normal_rect: Some(rect),
+        },
+    );
+    app.save_effetune_gui_rect();
+    assert_eq!(app.settings.effetune_gui_pos, saved.effetune_gui_pos);
+    app.effetune.request_show_gui();
+    assert!(host.fence(&app.effetune).visible);
+    app.save_effetune_gui_rect();
+    assert_eq!(app.settings.effetune_gui_size, saved.effetune_gui_size);
 }

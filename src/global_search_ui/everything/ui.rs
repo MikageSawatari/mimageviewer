@@ -1,5 +1,49 @@
 //! Shared Everything controls and progress drawing. Request ownership stays in App.
 
+pub(crate) fn everything_search_menu_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    entry: super::EverythingSearchEntryAvailability,
+) -> egui::Response {
+    use crate::ui_helpers::HoverTipExt;
+    everything_search_menu_button_with_hover(ui, label, entry, |response, reason| {
+        response.hover_tip_disabled(reason)
+    })
+}
+
+fn everything_search_menu_button_with_hover(
+    ui: &mut egui::Ui,
+    label: &str,
+    entry: super::EverythingSearchEntryAvailability,
+    hover: impl FnOnce(egui::Response, &'static str) -> egui::Response,
+) -> egui::Response {
+    let response = ui.add_enabled(entry.is_allowed(), egui::Button::new(label));
+    match entry.reason_text() {
+        Some(reason) => hover(response, reason),
+        None => response,
+    }
+}
+
+#[doc(hidden)]
+/// `cursor_extent_physical` is the cursor's physical-pixel extent above/below its hotspot.
+pub fn draw_everything_search_disabled_menu_snapshot_fixture(
+    ui: &mut egui::Ui,
+    cursor_extent_physical: (f32, f32),
+) {
+    everything_search_menu_button_with_hover(
+        ui,
+        "Everything ファイル名検索…  Ctrl+R",
+        super::EverythingSearchEntryAvailability::LinkedViewer,
+        |response, reason| {
+            crate::ui_helpers::hover_tip_disabled_with_cursor_extent(
+                response,
+                reason,
+                cursor_extent_physical,
+            )
+        },
+    );
+}
+
 #[derive(Default)]
 pub(super) struct EverythingControls {
     pub(super) send: bool,
@@ -30,12 +74,13 @@ pub(super) fn draw_everything_controls(
         };
         let reserved = button_width("検索") + button_width("×") + ui.spacing().item_spacing.x * 3.0;
         let width = (ui.available_width() - reserved).clamp(80.0, 420.0);
-        // The same latch is also used by the IME helper for focus recovery.
-        // Select on opening, but preserve an active composition's selection.
+        // The caller latch requests opening focus; recovery retries belong to
+        // the helper. Explicit requests preserve an active preedit selection.
         let select_query = *focus_request && !crate::ime_focus::ime_input_active(ui.ctx());
         let mut output =
             crate::ime_focus::show_singleline(ui, query, Some(focus_request), |edit| {
-                edit.hint_text("ファイル名・Everything 構文 (ext:jpg;png など)")
+                edit.id(crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id())
+                    .hint_text("ファイル名・Everything 構文 (ext:jpg;png など)")
                     .desired_width(width)
             });
         if select_query {
@@ -54,20 +99,26 @@ pub(super) fn draw_everything_controls(
         controls.send = ui.button("検索").clicked();
         controls.close = ui.small_button("×").on_hover_text("検索を閉じる").clicked();
     });
+    draw_everything_hint(ui);
+    controls
+}
+
+pub(super) fn draw_everything_hint(ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new(
-            "Everything クライアントの起動が必要です。先頭10,000件を取得し、対応形式だけ表示します。",
+            "Everything クライアントの起動が必要です。先頭10,000件を取得し、フォルダと対応ファイルを表示します。",
         )
         .small()
         .color(ui.visuals().weak_text_color()),
     );
-    controls
 }
 
 pub(super) struct EverythingStatus<'a> {
     pub(super) total: u32,
     pub(super) raw_returned: usize,
     pub(super) displayed: usize,
+    pub(super) outside: usize,
+    pub(super) duplicates: usize,
     pub(super) unreadable: usize,
     pub(super) limit_reached: bool,
     pub(super) query_changed: bool,
@@ -75,18 +126,22 @@ pub(super) struct EverythingStatus<'a> {
 }
 
 pub(super) fn draw_everything_status(ui: &mut egui::Ui, status: EverythingStatus<'_>) {
+    use crate::ui_helpers::HoverTipExt;
     if let Some(error) = status.error {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
     ui.label(format!(
-        "{} 件中 {} 件取得 / mIV 表示対象 {} 件 / 読めなかった項目 {} 件",
-        status.total, status.raw_returned, status.displayed, status.unreadable
+        "全 {} 件 / 取得件数 {} 件 / 表示対象 {} 件 / 対象外 {} 件 / 読めなかった {} 件",
+        status.total, status.raw_returned, status.displayed, status.outside, status.unreadable
+    )).hover_tip(format!(
+        "対象外は非対応・非表示の種類、安全でないパス、作業用・内部フォルダです。重複 {} 件は対象外に含めません。表示対象は★・タグなどで絞り込む前の件数です。",
+        status.duplicates
     ));
     if status.displayed == 0 {
         if status.raw_returned == 0 {
-            ui.label("検索条件に一致するファイルがありません。");
+            ui.label("検索条件に一致する項目がありません。");
         } else {
-            ui.label("取得した結果に表示できるファイルがありません。ファイル種類の設定や検索条件を確認してください。");
+            ui.label("取得した結果に表示できる項目がありません。ファイル種類の設定や検索条件を確認してください。");
             if status.limit_reached {
                 ui.label("フォルダや非対応ファイルも取得上限に含まれます。ext:jpg;png などで条件を絞って再検索してください。");
             }
@@ -106,7 +161,8 @@ pub(super) fn draw_everything_progress(ctx: &egui::Context) -> bool {
     let mut cancel = false;
     let viewport = ctx.content_rect();
     egui::Window::new("Everything ファイル名検索")
-        .id(egui::Id::new("everything_search_progress"))
+        .drag_area(egui::WindowDrag::Anywhere)
+        .id(egui::Id::unique("everything_search_progress"))
         .default_pos(viewport.min + egui::vec2(60.0, 40.0))
         .default_width(340.0_f32.min((viewport.width() - 80.0).max(160.0)))
         .max_width((viewport.width() - 32.0).max(160.0))
@@ -116,6 +172,10 @@ pub(super) fn draw_everything_progress(ctx: &egui::Context) -> bool {
         .show(ctx, |ui| {
             let action_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .auto_shrink([false, true])
                 .max_height((ui.available_height() - action_height).max(20.0))
                 .show(ui, |ui| {
@@ -141,6 +201,8 @@ pub fn draw_everything_search_snapshot_fixture(ui: &mut egui::Ui) {
             total: 32_145,
             raw_returned: 10_000,
             displayed: 6_789,
+            outside: 3_195,
+            duplicates: 4,
             unreadable: 12,
             limit_reached: true,
             query_changed: true,
@@ -152,4 +214,83 @@ pub fn draw_everything_search_snapshot_fixture(ui: &mut egui::Ui) {
 #[doc(hidden)]
 pub fn draw_everything_progress_snapshot_fixture(ctx: &egui::Context) {
     draw_everything_progress(ctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn everything_status_reports_outside_separately_from_duplicates_and_uses_items() {
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(900.0, 400.0))
+            .build_ui(move |ui| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts_ready = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                super::draw_everything_status(
+                    ui,
+                    super::EverythingStatus {
+                        total: 30,
+                        raw_returned: 20,
+                        displayed: 0,
+                        outside: 14,
+                        duplicates: 2,
+                        unreadable: 4,
+                        limit_reached: false,
+                        query_changed: false,
+                        error: None,
+                    },
+                );
+            });
+        harness.run();
+        harness.get_by_label(
+            "全 30 件 / 取得件数 20 件 / 表示対象 0 件 / 対象外 14 件 / 読めなかった 4 件",
+        );
+        harness.get_by_label("取得した結果に表示できる項目がありません。ファイル種類の設定や検索条件を確認してください。");
+    }
+
+    #[test]
+    fn everything_search_bar_not_responding_narrow_dark() {
+        let mut fonts_ready = false;
+        let size = egui::vec2(320.0, 400.0);
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
+                        let mut focus = false;
+                        super::draw_everything_controls(ui, &mut query, &mut focus);
+                        // Production renders a failed search via the same error label.
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            crate::everything_ipc::EverythingError::NotResponding.user_message(),
+                        );
+                    });
+                });
+            });
+        harness.run();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for label in [
+            "検索",
+            "×",
+            crate::everything_ipc::EverythingError::NotResponding.user_message(),
+        ] {
+            assert!(viewport.contains_rect(harness.get_by_label(label).rect()));
+        }
+        harness.snapshot("everything_search_bar_not_responding_narrow_dark");
+    }
 }

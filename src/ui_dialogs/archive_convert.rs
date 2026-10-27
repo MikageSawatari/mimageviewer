@@ -112,6 +112,18 @@ impl ArchiveConvertCompletionPolicy {
         }
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    fn starts_new_folder_load_owner(&self) -> bool {
+        match self {
+            Self::StagedHistory(_) | Self::SiblingZip => false,
+            Self::MainGridArchive(intent) => !matches!(
+                intent.smart_folder_owner,
+                crate::app::SmartGridArchiveOwner::Transition(_)
+            ),
+            Self::Navigation | Self::Bookmark(_) | Self::DetachedGridArchive(_) => true,
+        }
+    }
+
     fn open_owner(&self) -> Option<crate::app::OpenRequestOwner> {
         match self {
             Self::Navigation => Some(crate::app::OpenRequestOwner::Navigation),
@@ -168,6 +180,8 @@ pub(crate) enum ArchivePasswordResume {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ArchiveConvertDeferredFullscreen {
+    /// Conversion is App-global; only this viewer's close retires its reopen intent.
+    pub owner_context: crate::app::ViewerContextId,
     pub reopen: crate::app::DeferredFsReopen,
     pub restore_video_tile: bool,
 }
@@ -582,11 +596,13 @@ impl App {
         auto_fullscreen: bool,
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
-        self.request_archive_convert_owned(
+        // The only caller offers conversion after a ZIP owner has already loaded its list.
+        // This scan continues that owner, unlike request_archive_convert_owned below.
+        self.request_archive_open_with_completion(
             src,
             format,
             auto_fullscreen,
-            crate::app::OpenRequestOwner::Navigation,
+            ArchiveConvertCompletionPolicy::Navigation,
             restore_intent,
         )
     }
@@ -597,6 +613,65 @@ impl App {
         format: ArchiveFormat,
         auto_fullscreen: bool,
         owner: crate::app::OpenRequestOwner,
+        restore_intent: crate::app::StartupListIntent,
+    ) -> bool {
+        if self.settings.archive_file_handling_ignores_convertible() {
+            return false;
+        }
+        if self.archive_convert.is_some() || self.batch_convert.is_some() {
+            return false;
+        }
+        let completion = match owner {
+            crate::app::OpenRequestOwner::Navigation => ArchiveConvertCompletionPolicy::Navigation,
+            crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
+                debug_assert!(
+                    false,
+                    "convertible collection items use MainGridArchive owner"
+                );
+                ArchiveConvertCompletionPolicy::Navigation
+            }
+            crate::app::OpenRequestOwner::RatingPhysical(_) => {
+                debug_assert!(false, "convertible Rating items use MainGridArchive owner");
+                ArchiveConvertCompletionPolicy::Navigation
+            }
+            crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
+                debug_assert!(false, "quick-folder switch preflights convertible archives");
+                ArchiveConvertCompletionPolicy::Navigation
+            }
+            crate::app::OpenRequestOwner::MainGridArchive(intent) => {
+                ArchiveConvertCompletionPolicy::MainGridArchive(intent)
+            }
+            crate::app::OpenRequestOwner::Bookmark(owner) => {
+                ArchiveConvertCompletionPolicy::Bookmark(owner)
+            }
+            crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
+                ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
+            }
+        };
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_intent = completion
+            .starts_new_folder_load_owner()
+            .then(|| restore_intent.clone());
+        let started = self.request_archive_open_with_completion(
+            src,
+            format,
+            auto_fullscreen,
+            completion,
+            restore_intent,
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        if started && let Some(intent) = count_intent {
+            self.test_script_record_folder_load_owner(&intent);
+        }
+        started
+    }
+
+    pub(crate) fn request_archive_open_with_completion(
+        &mut self,
+        src: PathBuf,
+        format: ArchiveFormat,
+        auto_fullscreen: bool,
+        completion: ArchiveConvertCompletionPolicy,
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible() {
@@ -617,7 +692,7 @@ impl App {
             Arc::clone(&cancel),
         );
         let suppress_confirm = self.settings.archive_convert_suppresses_confirm();
-        self.archive_convert = Some(ArchiveConvertState {
+        self.archive_convert = Some(Box::new(ArchiveConvertState {
             src_path: src,
             input_seq: self.input_seq,
             format,
@@ -629,42 +704,14 @@ impl App {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: format == ArchiveFormat::Rar,
-            completion: match owner {
-                crate::app::OpenRequestOwner::Navigation => {
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
-                    debug_assert!(
-                        false,
-                        "convertible collection items use MainGridArchive owner"
-                    );
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::RatingPhysical(_) => {
-                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
-                    debug_assert!(false, "quick-folder switch preflights convertible archives");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::MainGridArchive(intent) => {
-                    ArchiveConvertCompletionPolicy::MainGridArchive(intent)
-                }
-                crate::app::OpenRequestOwner::Bookmark(owner) => {
-                    ArchiveConvertCompletionPolicy::Bookmark(owner)
-                }
-                crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
-                    ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
-                }
-            },
+            completion,
             pending_sibling_output: None,
             restore_intent,
             auto_fullscreen,
             deferred_fullscreen: None,
             suppress_confirm,
             suppress_confirm_next_time: false,
-        });
+        }));
         true
     }
 
@@ -677,72 +724,13 @@ impl App {
         owner: crate::app::OpenRequestOwner,
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
-        if self.settings.archive_file_handling_ignores_convertible()
-            || self.archive_convert.is_some()
-            || self.batch_convert.is_some()
-        {
-            return false;
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        let rx = spawn_archive_scan(
-            src.clone(),
+        self.request_archive_convert_owned(
+            src,
             ArchiveFormat::Rar,
-            None,
-            ArchiveScanPurpose::Open {
-                cache_db: self.archive_cache_db.clone(),
-            },
-            self.input_seq,
-            Arc::clone(&cancel),
-        );
-        self.archive_convert = Some(ArchiveConvertState {
-            src_path: src,
-            input_seq: self.input_seq,
-            format: ArchiveFormat::Rar,
-            password: None,
-            password_input: String::new(),
-            phase: ArchiveConvertPhase::Scanning,
-            cancel,
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: true,
-            completion: match owner {
-                crate::app::OpenRequestOwner::Navigation => {
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
-                    debug_assert!(
-                        false,
-                        "convertible collection items use MainGridArchive owner"
-                    );
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::RatingPhysical(_) => {
-                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
-                    debug_assert!(false, "quick-folder switch preflights convertible archives");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::MainGridArchive(intent) => {
-                    ArchiveConvertCompletionPolicy::MainGridArchive(intent)
-                }
-                crate::app::OpenRequestOwner::Bookmark(owner) => {
-                    ArchiveConvertCompletionPolicy::Bookmark(owner)
-                }
-                crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
-                    ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
-                }
-            },
-            pending_sibling_output: None,
-            restore_intent,
             auto_fullscreen,
-            deferred_fullscreen: None,
-            suppress_confirm: self.settings.archive_convert_suppresses_confirm(),
-            suppress_confirm_next_time: false,
-        });
-        true
+            owner,
+            restore_intent,
+        )
     }
 
     pub(crate) fn request_explicit_zip_convert(
@@ -762,7 +750,7 @@ impl App {
             self.input_seq,
             Arc::clone(&cancel),
         );
-        self.archive_convert = Some(ArchiveConvertState {
+        self.archive_convert = Some(Box::new(ArchiveConvertState {
             src_path: src,
             input_seq: self.input_seq,
             format,
@@ -781,15 +769,8 @@ impl App {
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
-        });
+        }));
         true
-    }
-
-    pub(crate) fn archive_convert_deferred_fullscreen_active(&self) -> bool {
-        self.archive_convert
-            .as_ref()
-            .and_then(|state| state.deferred_fullscreen.as_ref())
-            .is_some()
     }
 
     /// 背面入力を止める実ダイアログが現在表示されるか。
@@ -804,33 +785,6 @@ impl App {
                 state.allow_direct_read,
             )
         })
-    }
-
-    pub(crate) fn attach_archive_convert_deferred_fullscreen(
-        &mut self,
-        restore_video_tile: bool,
-        resume_slideshow: bool,
-        history_trigger: crate::app::HistoryTrigger,
-    ) -> bool {
-        let resume_to_last_page = self.settings.book_nav_resume.resumes();
-        let Some(state) = self.archive_convert.as_mut() else {
-            return false;
-        };
-        if !state.suppress_confirm && !state.allow_direct_read {
-            return false;
-        }
-        state.deferred_fullscreen = Some(ArchiveConvertDeferredFullscreen {
-            restore_video_tile,
-            reopen: crate::app::DeferredFsReopen {
-                history_trigger,
-                resume_slideshow,
-                target: crate::app::DeferredFsTarget::None,
-                resume_to_last_page,
-                from_explicit_open: false,
-                preserve_after_password_prompt: false,
-            },
-        });
-        true
     }
 
     pub(crate) fn clear_archive_convert_deferred_fullscreen(&mut self) {
@@ -1106,7 +1060,7 @@ impl App {
                             owner.request_id,
                             "archive_detached_direct_open_failed",
                         );
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
                         );
                     }
@@ -1194,15 +1148,7 @@ impl App {
                 self.finish_converted_archive_list_open(&src, restore_intent);
             }
             if let Some(deferred) = deferred {
-                let reason = self.reopen_fullscreen_after_folder_nav_load(
-                    ctx,
-                    deferred.restore_video_tile,
-                    deferred.reopen.resume_slideshow,
-                    deferred.reopen.history_trigger,
-                );
-                if reason == "enumerate_defer" {
-                    ctx.request_repaint();
-                }
+                self.resume_archive_convert_viewer_after_load(ctx, deferred);
             }
             return;
         }
@@ -1219,7 +1165,7 @@ impl App {
                 .and_then(|name| name.to_str())
                 .unwrap_or("ZIP")
                 .to_string();
-            self.show_feedback_toast(format!("ZIP ファイルを作成しました: {output_name}"));
+            self.show_feedback_toast(format!("ZIP を作成: {output_name}"));
             let parent = output.parent().map(std::path::Path::to_path_buf);
             if let Some(parent) = parent
                 && self
@@ -1351,7 +1297,7 @@ impl App {
                                 owner.request_id,
                                 "archive_detached_converted_open_failed",
                             );
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
                             );
                         }
@@ -1461,15 +1407,7 @@ impl App {
                     self.update_favsearch_address();
                 }
                 if let Some(deferred) = deferred_fullscreen {
-                    let reason = self.reopen_fullscreen_after_folder_nav_load(
-                        ctx,
-                        deferred.restore_video_tile,
-                        deferred.reopen.resume_slideshow,
-                        deferred.reopen.history_trigger,
-                    );
-                    if reason == "enumerate_defer" {
-                        ctx.request_repaint();
-                    }
+                    self.resume_archive_convert_viewer_after_load(ctx, deferred);
                 }
                 return;
             }
@@ -1528,7 +1466,8 @@ impl App {
         let password_required =
             matches!(&state.phase, ArchiveConvertPhase::PasswordRequired { .. });
         let window = egui::Window::new(title)
-            .id(egui::Id::new("archive_convert_dialog"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("archive_convert_dialog"))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -2565,8 +2504,8 @@ pub(super) fn draw_archive_startup_snapshot_fixture(ctx: &egui::Context, kind: &
         | "archive_no_images_error" => "変換エラー",
         _ => "7z を ZIP に変換",
     };
-    egui::Window::new(title)
-        .id(egui::Id::new("archive_convert_dialog"))
+    egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
+        .id(egui::Id::unique("archive_convert_dialog"))
         .open(&mut true)
         .resizable(false)
         .collapsible(false)

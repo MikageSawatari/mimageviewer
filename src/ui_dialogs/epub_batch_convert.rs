@@ -223,7 +223,7 @@ impl App {
         }
         let mut cancel = false;
         let mut close = false;
-        egui::Modal::new(egui::Id::new("epub_batch_convert")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("epub_batch_convert")).show(ctx, |ui| {
             ui.set_min_width(360.0);
             ui.heading("PDF ファイルに変換");
             ui.label(format!("{} / {}", pending.results.len(), pending.total));
@@ -231,6 +231,10 @@ impl App {
                 ui.label(&pending.current_name);
             }
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(240.0)
                 .show(ui, |ui| {
                     for (source, result) in &pending.results {

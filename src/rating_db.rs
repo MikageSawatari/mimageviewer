@@ -5,11 +5,30 @@
 //! 0 (未評価) 〜 5 の星数を記録する。キーは `App::rating_path_key` が返す
 //! 正規化キーを使う (`adjustment_db::normalize_path` と同じ規則で統一)。
 
+#[cfg(test)]
+thread_local! {
+    static READ_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static POINT_READ_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn point_read_operations_for_test() -> usize {
+    POINT_READ_OPERATIONS.with(std::cell::Cell::get)
+}
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
+
+#[cfg(test)]
+pub(crate) fn read_operations_for_test() -> usize {
+    READ_OPERATIONS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+fn count_reads_for_test(count: usize) {
+    READ_OPERATIONS.with(|calls| calls.set(calls.get() + count));
+}
 
 /// ratings.kind に保存する GridItem 種別。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +235,60 @@ impl RatingDb {
         crate::data_dir::get().join("rating.db")
     }
 
+    /// The already-open connection's filename; this does not access the filesystem.
+    pub(crate) fn connection_path(&self) -> Option<PathBuf> {
+        self.conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// Acquire SQLite's writer reservation before checking the request ticket.
+    /// A user write invalidates its ticket before entering SQLite, so a clear
+    /// cannot be resurrected by an import that was waiting for that write.
+    pub(crate) fn import_xmp_rating_if_unrated(
+        &self,
+        key: &str,
+        stars: u8,
+        source_path: &Path,
+        is_current: impl FnOnce() -> bool,
+    ) -> Result<bool, rusqlite::Error> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !is_current() || stars == 0 {
+            return Ok(false);
+        }
+        let rated: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ratings WHERE path = ?1 AND stars <> 0)",
+            [key],
+            |row| row.get(0),
+        )?;
+        if rated {
+            return Ok(false);
+        }
+        let _rating_write = RATING_WRITES.begin();
+        let changed = transaction.execute(
+            "INSERT INTO ratings (path, stars, rated_at_ms, source_path, kind)
+             VALUES (?1, ?2, NULL, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+                 stars = excluded.stars, rated_at_ms = NULL,
+                 source_path = excluded.source_path, kind = excluded.kind,
+                 entry_name = NULL, page_num = NULL, dir_prefix = NULL,
+                 archive_format = NULL, zipdir_is_archive = NULL, zipdir_representative = NULL
+             WHERE ratings.stars = 0",
+            rusqlite::params![
+                key,
+                stars.min(5) as i64,
+                source_path.to_string_lossy(),
+                RatingItemKind::Image.to_db(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(changed > 0)
+    }
+
     fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS ratings (
@@ -257,6 +330,10 @@ impl RatingDb {
 
     /// 指定キーのレーティングを取得。未登録なら 0。
     pub fn get(&self, key: &str) -> u8 {
+        #[cfg(test)]
+        count_reads_for_test(1);
+        #[cfg(test)]
+        POINT_READ_OPERATIONS.with(|calls| calls.set(calls.get() + 1));
         let mut stmt = match self
             .conn
             .prepare_cached("SELECT stars FROM ratings WHERE path = ?1")
@@ -274,6 +351,8 @@ impl RatingDb {
     /// 複数キーをまとめて取得する。フォルダ読み込み直後のキャッシュプリウォーム用。
     /// 結果に含まれないキーは未登録 (=0) を意味する。
     pub fn get_many(&self, keys: &[String]) -> std::collections::HashMap<String, u8> {
+        #[cfg(test)]
+        count_reads_for_test(keys.len().div_ceil(500));
         let mut out = std::collections::HashMap::new();
         if keys.is_empty() {
             return out;
@@ -316,6 +395,8 @@ impl RatingDb {
         keys: &[String],
         write_generation: u64,
     ) -> Result<CompleteRatingFacts, rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(keys.len().div_ceil(500));
         #[cfg(test)]
         {
             self.read_complete_chunks(keys, write_generation, None, None)
@@ -564,6 +645,8 @@ impl RatingDb {
 
     /// 指定★の行を一覧用に取得する。
     pub fn list_by_stars(&self, stars: u8) -> Result<Vec<RatingRow>, rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(1);
         let stars = stars.clamp(1, 5);
         let mut stmt = self.conn.prepare(
             "SELECT path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
@@ -578,6 +661,8 @@ impl RatingDb {
 
     /// ★0〜★5 の件数。index 0 は未評価ではなく常に 0 (DB 行が無いため)。
     pub fn count_by_stars(&self) -> Result<[usize; 6], rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(1);
         let mut out = [0usize; 6];
         let mut stmt = self
             .conn
@@ -598,6 +683,8 @@ impl RatingDb {
 
     /// 指定キーの 1 行を一覧復元用に取得する。
     pub fn row_for_key(&self, key: &str) -> Result<Option<RatingRow>, rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(1);
         self.conn
             .query_row(
                 "SELECT path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
@@ -618,6 +705,8 @@ impl RatingDb {
 
     /// 登録件数。
     pub fn count(&self) -> usize {
+        #[cfg(test)]
+        count_reads_for_test(1);
         self.conn
             .query_row("SELECT COUNT(*) FROM ratings", [], |row| row.get(0))
             .unwrap_or(0)

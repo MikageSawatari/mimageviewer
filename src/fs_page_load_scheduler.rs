@@ -297,6 +297,16 @@ impl FsPageLoadTicket {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
+
+    /// Intercepted tests have no worker to acquire/drop a permit. Give their
+    /// pending owner the same terminal cleanup without consuming execution capacity.
+    #[cfg(test)]
+    pub(crate) fn completion_without_worker_for_test(&self) -> FsPageLoadPermit {
+        FsPageLoadPermit {
+            inner: Arc::clone(&self.inner),
+            request_id: self.request_id,
+        }
+    }
 }
 
 impl Drop for FsPageLoadTicket {

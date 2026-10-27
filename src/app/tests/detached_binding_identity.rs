@@ -219,24 +219,25 @@ fn install_detached_item(app: &mut App, ctx: &egui::Context, media: bool) -> u64
     } else {
         GridItem::Image(PathBuf::from("binding-page.jpg"))
     }];
-    app.thumbnails = vec![ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    app.thumbnails = vec![ThumbnailState::loaded_raster(
+        ctx.load_texture(
             "binding-page",
             egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         ),
-        origin: if media {
+        if media {
             crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic
         } else {
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 2,
             }
         },
-        from_edit_preview: false,
-        rendered_at_px: 2,
-        source_dims: Some((2, 2)),
-        layout_dims: None,
-    }];
+        false,
+        2,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((2, 2)),
+        None,
+    )];
     app.image_metas = vec![None];
     app.visible_indices = vec![0];
     app.fullscreen_idx = Some(0);

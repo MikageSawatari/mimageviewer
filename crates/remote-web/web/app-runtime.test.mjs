@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import {
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   ViewerGroupLoadOutcome,
+  CommandName,
+  commandFromKey,
+  inputAdvancesRightToLeft,
+  viewerPageButtonState,
+  viewerTapCommand,
   remoteAddressIdentity,
 } from "./command-core.mjs";
 
@@ -181,6 +186,7 @@ const {
   loadFolder,
   renderFolder,
   setViewerRating,
+  requestSpreadMode,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
@@ -5775,3 +5781,172 @@ test("current audio decode failure remains terminal for its listing", async () =
     globalThis.fetch = oldFetch;
   }
 });
+
+
+test("G1 extracted view keys select only a session view kind", async () => {
+  const { extractedResultViewMode } = await import("./app.js");
+  for (const direction of ["ltr", "rtl"]) {
+    for (const requested of ["ltr", "ltr_cover", "rtl", "rtl_cover"]) {
+      assert.equal(extractedResultViewMode(requested, direction), direction);
+    }
+    assert.equal(extractedResultViewMode("single", direction), "single");
+    assert.equal(extractedResultViewMode("split_ltr", direction), `split_${direction}`);
+    assert.equal(extractedResultViewMode("split_rtl", direction), `split_${direction}`);
+  }
+});
+
+test("G1 extracted menu exposes the three temporary display choices", () => {
+  const menu = viewerMenuDefinitions({ hasContainer: true, barsVisible: true, extractedResult: true,
+    supportsFinalCoverSetting: true, supportsSingletonPlacementSetting: true, supportsPageAloneSetting: true });
+  assert.equal(menu.spread.actions.length, 4);
+  assert.deepEqual(menu.spread.actions.slice(1).map(([,label])=>label), ["1ページ表示","見開き","横長分割"]);
+  assert.match(menu.spread.title, /記憶しません/);
+});
+
+test("composed books offer mode-only choices and retain automatic preference controls", () => {
+  const menu = viewerMenuDefinitions({ hasContainer: true, barsVisible: true, compositionManaged: true,
+    supportsFinalCoverSetting: true, supportsSingletonPlacementSetting: true, supportsPageAloneSetting: true });
+  const choices = menu.spread.actions.filter(([name]) => name.startsWith("spread_"));
+  assert.deepEqual(choices.map(([, label]) => label), ["1ページ表示", "見開き", "横長分割"]);
+  assert.equal(choices[1][3].modeOnly, true);
+  assert.equal(choices[2][3].modeOnly, true);
+  assert.match(menu.spread.title, /方向・表紙はPCで編集/);
+  for (const page of ["final_cover", "singleton_placement", "singleton_placement_last", "page_alone"]) {
+    assert.ok(menu.spread.actions.some((action) => action[3]?.menuPage === page));
+  }
+  assert.equal(menu.final_cover.actions.length, 4);
+});
+
+test("explicit blank presentation carries its core trim side without a partner", () => {
+  const fileAddress = (path) => ({ path, subresource: { kind: "file" } });
+  const entry = { name: "page.jpg", address: fileAddress("book/page.jpg") };
+  const contextAddress = fileAddress("book");
+  const byAddress = new Map([[remoteAddressIdentity(entry.address), entry]]);
+  for (const [direction, pageSide, displaySlot] of [
+    ["ltr", "leading", "spread_left"], ["ltr", "trailing", "spread_right"],
+    ["rtl", "leading", "spread_right"], ["rtl", "trailing", "spread_left"],
+  ]) {
+    const presentationSlots = normalizePagePresentationSlots([
+      { address: entry.address, role: "navigation", display_slot: displaySlot },
+    ], [entry], byAddress, entry);
+    const group = { navigationEntries: [entry], presentationSlots, slice: "full" };
+    assert.deepEqual(pageRenderContextForSlot(group, 0, contextAddress), {
+      context_address: contextAddress, display_slot: displaySlot, spread_partner: null,
+    }, `${direction}/${pageSide}`);
+    assert.notEqual(pageGroupPresentationIdentity(group), pageGroupPresentationIdentity({ ...group,
+      presentationSlots: [{ entry, role: "navigation" }],
+    }));
+  }
+  for (const mode of ["single", "force_single", "split_ltr", "split_rtl", "ordinary_singleton"]) {
+    const group = { navigationEntries: [entry], presentationSlots: [{ entry, role: "navigation" }], slice: "full" };
+    assert.deepEqual(pageRenderContextForSlot(group, 0, contextAddress), {
+      context_address: contextAddress, display_slot: "single", spread_partner: null,
+    }, mode);
+  }
+  assert.equal(normalizePagePresentationSlots([
+    { address: entry.address, role: "navigation", display_slot: "bad" },
+  ], [entry], byAddress, entry), null);
+});
+
+
+test("G1 Remote return adoption restores the book response after temporary A2 spread", () => {
+  const address = {path:testPath("Book"),subresource:{kind:"file"}};
+  const entries = [1,2,3].map((i)=>({kind:"image",name:`${i}.jpg`,path:testPath(`Book/${i}.jpg`)}));
+  const book = {entries,configured_spread_mode:"rtl_cover",effective_spread_mode:"rtl_cover",
+    reading_direction:"rtl",page_groups:[[0],[1,2]]};
+  applyContainerData(address,book,false);
+  const before = containerRuntimeStateForTest();
+  const route = {collectionKind:"rating",value:4};
+  for (const mode of ["single","ltr"]) {
+    applyCollectionData(route,{entries,configured_spread_mode:mode,effective_spread_mode:mode,
+      reading_direction:"ltr",page_groups:mode === "single" ? [[0],[1],[2]] : [[0,1],[2]]},false);
+    assert.equal(containerRuntimeStateForTest().container,null);
+  }
+  applyContainerData(address,book,false);
+  const after = containerRuntimeStateForTest();
+  assert.deepEqual(after.container,before.container);
+  assert.deepEqual(after.pageGroups,before.pageGroups);
+});
+
+test("horizontal button labels follow configured mode across container and collection updates", () => {
+  const originalHistory = globalThis.history;
+  globalThis.history = { state: {}, replaceState() {} };
+  const address = { path: testPath("horizontal-input"), subresource: { kind: "file" } };
+  const entries = [1, 2].map((index) => ({ kind: "image", name: `${index}.jpg`,
+    address: { path: testPath(`horizontal-input/${index}.jpg`), subresource: { kind: "file" } } }));
+  const labels = {};
+  const viewer = {
+    destroy() {},
+    syncPagePositionFeedback() { ImageViewer.prototype.syncPagePositionFeedback.call(this); },
+    previous: { setAttribute: (name, value) => { labels.left = [name, value]; } },
+    next: { setAttribute: (name, value) => { labels.right = [name, value]; } },
+  };
+  try {
+    for (const kind of ["container", "collection"]) {
+      for (const [configuredMode, expectedRtl] of [["rtl", true], ["single", false], ["rtl_cover", true]]) {
+        const data = {
+          entries, image_count: entries.length,
+          configured_spread_mode: configuredMode, effective_spread_mode: "single", reading_direction: "rtl",
+          page_groups: entries.map((entry) => ({ anchor: entry.address, pages: [entry.address], slice: "full" })),
+        };
+        if (kind === "container") applyContainerData(address, data, true);
+        else applyCollectionData({ collectionKind: "rating", value: "4" }, data, true);
+        assert.equal(openViewerPagePositionForTest(viewer, 0), true);
+        viewer.syncPagePositionFeedback();
+        assert.deepEqual(labels.left, ["aria-label", expectedRtl ? "次の画像" : "前の画像"], kind);
+        assert.deepEqual(labels.right, ["aria-label", expectedRtl ? "前の画像" : "次の画像"], kind);
+        assert.equal(viewerPagePresentationForTest().seekState.direction, "rtl", kind);
+      }
+    }
+  } finally {
+    cleanupVideoViewerForTest(viewer);
+    globalThis.history = originalHistory;
+  }
+});
+
+for (const [selectedMode, expectedMode] of [["ltr", "rtl"], ["split_ltr", "split_rtl"]]) {
+  test(`mode-only ${selectedMode} keeps RTL input and labels before the response`, async () => {
+    const originalHistory = globalThis.history;
+    const originalFetch = globalThis.fetch;
+    const responseGate = deferred();
+    globalThis.history = { state: {}, replaceState() {} };
+    globalThis.fetch = async () => {
+      await responseGate.promise;
+      return new Response("{}", { status: 200 });
+    };
+    const address = { path: testPath("mode-only-input"), subresource: { kind: "file" } };
+    const entry = { kind: "image", name: "1.jpg",
+      address: { path: testPath("mode-only-input/1.jpg"), subresource: { kind: "file" } } };
+    const labels = {};
+    const viewer = {
+      destroy() {},
+      syncPagePositionFeedback() { ImageViewer.prototype.syncPagePositionFeedback.call(this); },
+      previous: { setAttribute: (_name, value) => { labels.left = value; } },
+      next: { setAttribute: (_name, value) => { labels.right = value; } },
+    };
+    try {
+      applyContainerData(address, {
+        entries: [entry], image_count: 1, composition_managed: true,
+        configured_spread_mode: "single", effective_spread_mode: "single", reading_direction: "rtl",
+        page_groups: [{ anchor: entry.address, pages: [entry.address], slice: "full" }],
+      }, false);
+      assert.equal(openViewerPagePositionForTest(viewer, 0), true);
+      assert.equal(requestSpreadMode(selectedMode, true), true);
+      // No response can have arrived: the write is still behind responseGate.
+      const snapshot = containerRuntimeStateForTest();
+      const rtl = inputAdvancesRightToLeft(snapshot.spreadMode);
+      assert.equal(commandFromKey({ key: "ArrowRight", rtl }, "viewer").name, CommandName.PREV_PAGE);
+      assert.equal(viewerTapCommand(290, 300, rtl).name, CommandName.PREV_PAGE);
+      assert.equal(viewerPageButtonState("right", rtl).commandName, CommandName.PREV_PAGE);
+      assert.deepEqual(labels, { left: "次の画像", right: "前の画像" });
+      assert.equal(snapshot.spreadMode, expectedMode);
+      assert.equal(snapshot.readingDirection, "rtl");
+    } finally {
+      cleanupVideoViewerForTest(viewer);
+      responseGate.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      globalThis.fetch = originalFetch;
+      globalThis.history = originalHistory;
+    }
+  });
+}

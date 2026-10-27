@@ -500,9 +500,22 @@ function Finalize-UiSmokeButtonHelper {
                 $script:buttonHelperStatus.ReleaseState,
                 $script:buttonHelperStatus.Joined,
                 $script:buttonHelperStatus.SafeToTerminateApp)
+        if (-not $script:buttonHelperStatus.Succeeded) {
+            # The App only sees the wire reply (kind/phase/detail numbers); the reason the
+            # helper refused lives here. Without it a pre-down failure has no cause in the evidence.
+            Write-UiSmokeEvent (
+                'button helper failure phase={0} primary="{1}" detail="{2}" cleanup_attempts={3}' -f
+                    $script:buttonHelperStatus.OwnerPhase,
+                    $script:buttonHelperStatus.PrimaryFailure,
+                    $script:buttonHelperStatus.Detail,
+                    $script:buttonHelperStatus.CleanupAttempts)
+        }
     }
     elseif ($script:buttonHelperStarted) {
         Write-UiSmokeEvent 'button helper terminal unavailable; exact App termination remains blocked'
+    }
+    if ($Scenario -eq 'NativeTopPanoramaClick' -and $null -ne $script:buttonHelperHandle) {
+        Write-UiSmokeEvent ('button helper input trace: ' + $script:buttonHelperHandle.InputTrace())
     }
 }
 
@@ -1141,6 +1154,9 @@ if ($script:archiveErrors.Count -gt 0) {
             sort_order = 'RatingDesc'
             rating_sort_unrated_position = 'BetweenThreeAndTwo'
             auto_fullscreen_image_folders = $false
+            # The script clicks the toolbar refresh button. New defaults hide the
+            # toolbar sort since 1.292, so show it explicitly.
+            show_toolbar_sort = $true
             smart_folders = @([ordered]@{
                 id = 'b3ff891f-5b83-4bf4-9554-148e363a439b'
                 name = 'RatingSortSmoke'

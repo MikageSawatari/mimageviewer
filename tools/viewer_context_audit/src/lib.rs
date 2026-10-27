@@ -15,15 +15,89 @@ use syn::{
 };
 
 const REGISTRY_PATH: &str = "src/app/viewer_context_registry.rs";
-const APP_TESTS_PATH: &str = "src/app/tests.rs";
 
-/// A6 asks whether a `*_for_test` call sits under `cfg(test)`, but it reads one file at a
-/// time, so a module whose `#[cfg(test)]` attribute lives in the parent file looks like
-/// production code. Name those files here: `src/app/tests.rs`, and anything a `tests`
-/// directory under `src` holds.
-fn is_cfg_test_module_file(relative: &str) -> bool {
-    relative == APP_TESTS_PATH || relative.split('/').any(|segment| segment == "tests")
+// Both module reachability and A6 must carry exactly the same lexical test gates.
+macro_rules! visit_test_scopes {
+    () => {
+        fn visit_item(&mut self, node: &'ast Item) {
+            let is_test = (item_attributes(node))
+                .iter()
+                .any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_item(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast ImplItem) {
+            let is_test = (impl_item_attributes(node))
+                .iter()
+                .any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_impl_item(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_trait_item(&mut self, node: &'ast TraitItem) {
+            let is_test = (trait_item_attributes(node))
+                .iter()
+                .any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_trait_item(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_foreign_item(&mut self, node: &'ast ForeignItem) {
+            let is_test = (foreign_item_attributes(node))
+                .iter()
+                .any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_foreign_item(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_expr(&mut self, node: &'ast Expr) {
+            let is_test = (expression_attributes(node))
+                .iter()
+                .any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_expr(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            let is_test = (&node.attrs).iter().any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_local(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_arm(&mut self, node: &'ast syn::Arm) {
+            let is_test = (&node.attrs).iter().any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_arm(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+            let is_test = (&node.attrs).iter().any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_stmt_macro(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+
+        fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+            let is_test = (&node.attrs).iter().any(cfg_implies_test_attribute);
+            self.cfg_test_depth += usize::from(is_test);
+            visit::visit_field_value(self, node);
+            self.cfg_test_depth -= usize::from(is_test);
+        }
+    };
 }
+
+/// A6 resolves modules and literal includes from the crate roots, carrying enclosing
+/// cfg(test) gates across files. Only files reached exclusively through test gates
+/// are test-only; mixed and unreachable files remain subject to production checks.
+mod module_tree;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Rule {
@@ -101,6 +175,12 @@ struct KnownFindingEntry {
 
 const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     AllowlistEntry {
+        file: "src/app/book_composition_runtime.rs",
+        function: "adopt_book_projection",
+        rule: Rule::A2b,
+        reason: "G3 remaps pending trim and the local-adjustment layer/selection maps by stable page identity while replacing rows in the same mounted context. Every taken value is reinstalled there after install_prepared_aggregate_items; no viewer/window or sibling owns this temporary edit payload. Source/token/items generation and edit-write stamp are qualified before adoption, and pending saves remain on the existing FIFO.",
+    },
+    AllowlistEntry {
         file: "src/app/smart_folder.rs",
         function: "take_visible_smart_folder_grid",
         rule: Rule::A2b,
@@ -142,12 +222,51 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     // 1.340 R5: immutable overview metadata/cursor projection only; no mount or mutation.
     // Accepted owner-scoped design and independent non-PDF implementation review (2026-10-12).
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn page_overview_view (self ,) -> Option < crate :: page_overview :: PageOverviewView >",
+    // egui 0.37 stage 1b (9481bc344): state-only mounts use the existing table,
+    // restore the original owner even on unwind, and leave publication in the UI
+    // wrapper. Window access resolves an existing binding without changing it.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context_state < R > (& mut self , id : ViewerContextId , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn with_viewer_context_state < R > (& mut self , id : ViewerContextId , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn with_window_viewer_context_state < R > (& mut self , window_id : u64 , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
+    // Same stage: exact context/scope/request owner validation grants access only
+    // to that mounted/at-rest editor; stale tickets cannot update a new session.
+    "inherent fn # [cfg (windows)]   App ::  pub (super) fn with_composition_editor_owner_state < R > (& mut self , owner : & super :: book_composition_editor :: CompositionEditorOwner , f : impl FnOnce (& mut super :: book_composition_editor :: CompositionEditorState) -> R ,) -> Option < R >",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (super) fn with_composition_editor_owner_state < R > (& mut self , owner : & super :: book_composition_editor :: CompositionEditorOwner , f : impl FnOnce (& mut super :: book_composition_editor :: CompositionEditorState) -> R ,) -> Option < R >",
+    // 1.232 (48e2ddff4): terminal close/retire clears only the named owner's
+    // reopen requests, including the App-global archive request after ID matching.
+    "inherent fn    App ::  pub (super) fn retire_viewer_reopen_requests (& mut self , id : ViewerContextId)",
+    // 1.272/1.245 (a6a0b3a49): read-only mounted/at-rest/retiring busy inspection,
+    // including buffered results; no mount, receiver drain or sibling mutation.
+    "inherent fn    App ::  pub (super) fn has_tag_prewarm_work (& self) -> bool",
+    // 1.372/1.376 already-reviewed master page-edit ownership APIs. History/Exit
+    // take owner commits; producers validate context/target/document, and accepted
+    // publication/eviction touches matching page keys in each owning bundle only.
+    // Keep exact fingerprints so A4 still rejects any unreviewed API expansion.
+    "inherent fn    App ::  pub (super) fn take_parked_page_edit_commits (& mut self) -> Vec < page_edit_owner :: PageEditCommit >",
+    "inherent fn    App ::  pub (super) fn take_parked_page_edit_exit_commits (& mut self ,) -> Vec < page_edit_owner :: PageEditCommit >",
+    "inherent fn    App ::  pub (crate) fn has_page_edit_producers (& self) -> bool",
+    "inherent fn    App ::  pub (crate) fn poll_all_page_edit_producers (& mut self , ctx : & egui :: Context)",
+    "inherent fn    App ::  pub (super) fn cancel_superseded_page_edit_producers (& mut self , key : & str , layers : & local_adjust_core :: LocalAdjustmentLayers , accepted : bool ,)",
+    "inherent fn    App ::  pub (crate) fn publish_accepted_adjustment_page_edits (& mut self , documents : & HashMap < String , Option < crate :: adjustment :: AdjustParams > > ,)",
+    "inherent fn    App ::  pub (crate) fn invalidate_thumb_adjust_for_page_key (& mut self , key : & str)",
+    "inherent fn    App ::  pub (super) fn evict_pinned_adjustment_materializations (& mut self , keys : & std :: collections :: HashSet < String > ,)",
+    "inherent fn    App ::  pub (super) fn publish_finished_adjustment_page_edit (& mut self , owner : & PageEditOwner , params : & Option < crate :: adjustment :: AdjustParams > ,)",
+    "inherent fn    App ::  pub (super) fn publish_accepted_local_page_edits (& mut self , documents : & HashMap < String , local_adjust_core :: LocalAdjustmentLayers > ,)",
+    "inherent fn    App ::  pub (super) fn refresh_pending_page_edit_projections (& mut self)",
+    // 1.341 reads mounted/at-rest readiness and addresses the existing owning
+    // context/viewport. Only explicit settings/tray operations visit all owners;
+    // normal mount/deposit never invalidates a sibling's presentation.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pending_fs_page_turn_ready (self ,) -> Option < & 'a crate :: ui_fullscreen :: PendingFsPageTurnReady >",
+    "inherent fn    crate :: app :: App ::  pub (crate) fn page_turn_destination (& self) -> crate :: ui_fullscreen :: PresentationDestination",
+    "inherent fn    App ::  pub (crate) fn page_turn_operation_tracking_needed (& self) -> bool",
+    "inherent fn    App ::  pub (crate) fn deactivate_all_page_turn_presentations (& mut self , reason : & 'static str)",
+    "inherent fn    App ::  pub (crate) fn cancel_all_page_turn_effects_for_settings (& mut self)",
+    // 1.242 G2B polls only pending or changed-scope retained owners; no sibling mutation.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn book_composition_contexts_to_poll (& self , changed : & [String] ,) -> Vec < ViewerContextId >",
     // 1.364 D2 routes write replies by context ID and validates the owning command/scope.
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn deliver_spread_shift_reply_at_rest (& mut self , reply : & crate :: spread_shift :: ShiftWriteReply ,) -> Option < bool >",
     // 1.364 D2 applies the memory setting to retained owners without navigation or saving.
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn make_at_rest_spread_shifts_session_only (& mut self)",
-    // 1.364 D2c migrates page refs only; root rename preserves accepted contexts at the old source.
-    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn migrate_at_rest_spread_shifts (& mut self , mappings : & [crate :: books :: BookPathMapping] , root_move : Option < (& std :: path :: Path , & std :: path :: Path) > ,)",
     // 1.345 keeps bookmark projection, pending request and title draft in the owning bundle.
     // ContextRef only reads mounted/at-rest owners; it cannot mutate or replace sibling state.
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmarks_request (self) -> Option < & 'a CurrentBookBookmarksRequest >",
@@ -176,13 +295,17 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "item enum # [cfg (windows)] pub (in crate :: app) enum BuildOutcome { Commit , Abort (& 'static str) , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum RetireContextError { Mount (MountError) , Retire (RetireError) , }",
     // 1.364 D2 keeps the accepted spread-shift owner in the bundle across mount/swap/fork.
-    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift }",
+    // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
+    // 1.444 freezes the main listing order in this bundle; forks leave it with the parent.
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (in crate :: app) list_order : Option < Arc < super :: ListOrderSnapshot > > , pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
     "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn at_rest (bundle : & 'a ViewerContextBundle) -> Self",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fullscreen_idx (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn items (self) -> & 'a [GridItem]",
+    // D2 resident accounting borrows the same normal GPU stores in mounted/at-rest contexts.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn texture_caches (self) -> super :: vram_accounting :: ViewerTextureCaches < 'a >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_cache (self) -> & 'a ItemsGenerationMap < FsCacheEntry >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn viewer_session_last_sync_stamp (self) -> Option < & 'a ViewerSyncStamp >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pdf_password_request (self) -> Option < & 'a PdfPasswordRequest >",
@@ -225,10 +348,17 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
     // 1.364 D2 adds context-owned retained readoption with mounted poll and park cancellation.
-    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { RetainedSpreadShift , PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , RawPages , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
+    // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
+    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { FolderObservation , BookCompositionRead , RetainedSpreadShift , PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , RawPages , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncServicePhase { Background , Dialog , }",
-    // 1.364 D2 adds RetainedSpreadShift first; freeze the exact ordered 20-owner inventory.
-    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 20] = [Self :: RetainedSpreadShift , Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: RawPages , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
+    // 1.242 G2B adds BookCompositionRead before the E owner; freeze all owners in order.
+    // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
+    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 22] = [Self :: FolderObservation , Self :: BookCompositionRead , Self :: RetainedSpreadShift , Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: RawPages , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
+    // 1.375 observation is owned by its viewer bundle; 1.373 forwards append
+    // observations only to the matching at-rest folder. These exact APIs and
+    // the 22-owner enum/order match the reviewed master merge input.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn enqueue_at_rest_book_append_observation (& mut self , context : ViewerContextId , folder : & Path , cause : book_append_refresh :: FolderRefreshCause ,)",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn cancel_at_rest_book_append_observations (& mut self , folder : & Path)",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn is_pending (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn needs_mounted_service (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn service (self , app : & mut App , ctx : & egui :: Context , phase : ContextAsyncServicePhase ,)",
@@ -353,25 +483,79 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
         .map_err(|error| format!("cannot read {REGISTRY_PATH}: {error}"))?;
     let bundle_fields = extract_bundle_fields(&registry_source)?;
 
-    let mut files = Vec::new();
-    collect_rust_files(&root.join("src"), &mut files)?;
-    files.sort();
+    let mut inventory = Vec::new();
+    for entry in
+        fs::read_dir(root).map_err(|error| format!("cannot inspect repository: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("cannot inspect repository entry: {error}"))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let source_directory = ["src", "examples", "tests", "benches"]
+            .iter()
+            .find(|directory| name.to_uppercase() == directory.to_uppercase());
+        if let Some(directory) = source_directory {
+            reject_source_link(&entry, &kind)?;
+            if name != *directory {
+                return Err(format!(
+                    "module path case differs from file on disk: {directory} (actual: {name})"
+                ));
+            }
+            if !kind.is_dir() {
+                return Err(format!("unsupported target source directory: {name}"));
+            }
+            collect_rust_files(&entry.path(), &mut inventory)?;
+        } else if is_rust_source_path(&entry.path())? {
+            reject_source_link(&entry, &kind)?;
+            if !kind.is_file() {
+                return Err(format!("unsupported linked/non-file target source: {name}"));
+            }
+            inventory.push(entry.path());
+        }
+    }
+    inventory.sort();
+
+    let mut sources = BTreeMap::new();
+    for path in &inventory {
+        let relative = relative_path(root, path)?;
+        let source =
+            fs::read_to_string(path).map_err(|error| format!("cannot read {relative}: {error}"))?;
+        sources.insert(relative, source);
+    }
+    let manifest = fs::read_to_string(root.join("Cargo.toml"))
+        .map_err(|error| format!("cannot read Cargo.toml: {error}"))?;
+    let roots = module_tree::crate_roots(&manifest, &sources)?;
+    let module_tree = resolve_module_sources(&mut sources, &roots, |relative| {
+        // src/**/*.rs was fully inventoried above. External support modules need
+        // disk discovery, including both candidates for an ordinary mod declaration.
+        if relative.starts_with("src/") {
+            Ok(None)
+        } else {
+            read_module_source(root, relative)
+        }
+    })?;
 
     let mut violations = audit_public_api(&registry_source, PUBLIC_API_ALLOWLIST)?;
-    for path in files {
+    // Root discovery also inventories examples/tests/benches/build scripts; the
+    // audit's file scope itself remains src/**/*.rs (including unreachable files).
+    for path in inventory {
         let relative = relative_path(root, &path)?;
-        let source = fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {relative}: {error}"))?;
+        if !relative.starts_with("src/") {
+            continue;
+        }
+        let source = &sources[&relative];
         violations.extend(analyze_source(
             &relative,
-            &source,
+            source,
             &bundle_fields,
             relative == REGISTRY_PATH,
         )?);
         violations.extend(analyze_test_api(
             &relative,
-            &source,
-            is_cfg_test_module_file(&relative),
+            source,
+            module_tree.test_only.contains(&relative),
         )?);
     }
     violations.sort_by(|left, right| {
@@ -383,6 +567,127 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
         ))
     });
     classify_findings(violations, ALLOWLIST_ENTRIES, KNOWN_FINDINGS, use_allowlist)
+}
+
+/// The loader is injectable so candidate discovery and insertion are exercised by
+/// in-memory fixtures using the same loop as the disk adapter.
+fn resolve_module_sources(
+    sources: &mut BTreeMap<String, String>,
+    roots: &[String],
+    mut load: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<module_tree::ModuleTree, String> {
+    loop {
+        let tree = module_tree::resolve(sources, roots)?;
+        let before = sources.len();
+        for path in tree.missing.union(&tree.module_candidates) {
+            module_tree::check_path_case(sources, path)?;
+            if !sources.contains_key(path)
+                && let Some(source) = load(path)?
+            {
+                // The disk adapter checks actual directory-entry spelling too.
+                module_tree::check_path_case(sources, path)?;
+                sources.insert(path.clone(), source);
+            }
+        }
+        if sources.len() == before {
+            if let Some(path) = tree.missing.first() {
+                return Err(format!("cannot find module source: {path}"));
+            }
+            return Ok(tree);
+        }
+    }
+}
+
+fn read_module_source(root: &Path, relative: &str) -> Result<Option<String>, String> {
+    if relative.starts_with("../")
+        || relative.starts_with('/')
+        || relative.as_bytes().get(1) == Some(&b':')
+        || Path::new(relative).is_absolute()
+    {
+        return Err(format!("module path escapes repository: {relative}"));
+    }
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect module directory {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let mut exact = None;
+        let mut case_variant = None;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("cannot inspect module {relative}: {error}"))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == component {
+                let kind = entry
+                    .file_type()
+                    .map_err(|error| format!("cannot inspect module {relative}: {error}"))?;
+                reject_source_link(&entry, &kind)?;
+                exact = Some(entry.path());
+            } else if name.to_uppercase() == component.to_uppercase() {
+                case_variant = Some(entry.path());
+            }
+        }
+        if let Some(actual) = case_variant {
+            return Err(format!(
+                "module path case differs from file on disk: {relative} (actual: {})",
+                actual.display()
+            ));
+        } else if let Some(exact) = exact {
+            path = exact;
+        } else {
+            return Ok(None);
+        }
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|error| format!("cannot read module {relative}: {error}"))
+}
+
+fn is_rust_source_path(path: &Path) -> Result<bool, String> {
+    match path.extension().and_then(OsStr::to_str) {
+        Some("rs") => Ok(true),
+        Some(extension) if extension.to_uppercase() == "RS" => Err(format!(
+            "module path case differs from file on disk: expected .rs extension: {}",
+            path.display()
+        )),
+        _ => Ok(false),
+    }
+}
+
+fn reject_source_link(entry: &fs::DirEntry, kind: &fs::FileType) -> Result<(), String> {
+    #[cfg(windows)]
+    let reparse = {
+        use std::os::windows::fs::MetadataExt as _;
+        fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("cannot inspect source {}: {error}", entry.path().display()))?
+            .file_attributes()
+            & 0x400
+            != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = false;
+    if kind.is_symlink() || reparse {
+        return Err(format!(
+            "unsupported linked/reparse source inventory entry: {}",
+            entry.path().display()
+        ));
+    }
+    Ok(())
 }
 
 fn collect_rust_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -398,9 +703,10 @@ fn collect_rust_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(),
         let file_type = entry
             .file_type()
             .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+        reject_source_link(&entry, &file_type)?;
         if file_type.is_dir() {
             collect_rust_files(&entry.path(), output)?;
-        } else if file_type.is_file() && entry.path().extension().is_some_and(|ext| ext == "rs") {
+        } else if file_type.is_file() && is_rust_source_path(&entry.path())? {
             output.push(entry.path());
         }
     }
@@ -1249,39 +1555,7 @@ impl TestApiVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for TestApiVisitor<'_> {
-    fn visit_item(&mut self, node: &'ast Item) {
-        let is_test = item_attributes(node).iter().any(cfg_implies_test_attribute);
-        self.cfg_test_depth += usize::from(is_test);
-        visit::visit_item(self, node);
-        self.cfg_test_depth -= usize::from(is_test);
-    }
-
-    fn visit_impl_item(&mut self, node: &'ast ImplItem) {
-        let is_test = impl_item_attributes(node)
-            .iter()
-            .any(cfg_implies_test_attribute);
-        self.cfg_test_depth += usize::from(is_test);
-        visit::visit_impl_item(self, node);
-        self.cfg_test_depth -= usize::from(is_test);
-    }
-
-    fn visit_trait_item(&mut self, node: &'ast TraitItem) {
-        let is_test = trait_item_attributes(node)
-            .iter()
-            .any(cfg_implies_test_attribute);
-        self.cfg_test_depth += usize::from(is_test);
-        visit::visit_trait_item(self, node);
-        self.cfg_test_depth -= usize::from(is_test);
-    }
-
-    fn visit_foreign_item(&mut self, node: &'ast ForeignItem) {
-        let is_test = foreign_item_attributes(node)
-            .iter()
-            .any(cfg_implies_test_attribute);
-        self.cfg_test_depth += usize::from(is_test);
-        visit::visit_foreign_item(self, node);
-        self.cfg_test_depth -= usize::from(is_test);
-    }
+    visit_test_scopes!();
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.check_definition(&node.sig);
@@ -1310,9 +1584,7 @@ impl<'ast> Visit<'ast> for TestApiVisitor<'_> {
     }
 
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
-        let call_is_test = node.attrs.iter().any(cfg_implies_test_attribute);
         if self.cfg_test_depth == 0
-            && !call_is_test
             && call_path(node)
                 .and_then(|path| path.segments.last())
                 .is_some_and(|segment| segment.ident.to_string().ends_with("_for_test"))
@@ -1326,31 +1598,13 @@ impl<'ast> Visit<'ast> for TestApiVisitor<'_> {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
-        let call_is_test = node.attrs.iter().any(cfg_implies_test_attribute);
-        if self.cfg_test_depth == 0
-            && !call_is_test
-            && node.method.to_string().ends_with("_for_test")
-        {
+        if self.cfg_test_depth == 0 && node.method.to_string().ends_with("_for_test") {
             self.record(
                 node.method.span(),
                 "test-only method call appears outside cfg(test)",
             );
         }
         visit::visit_expr_method_call(self, node);
-    }
-
-    fn visit_expr_block(&mut self, node: &'ast syn::ExprBlock) {
-        let is_test = node.attrs.iter().any(cfg_implies_test_attribute);
-        self.cfg_test_depth += usize::from(is_test);
-        visit::visit_expr_block(self, node);
-        self.cfg_test_depth -= usize::from(is_test);
-    }
-
-    fn visit_local(&mut self, node: &'ast syn::Local) {
-        let is_test = node.attrs.iter().any(cfg_implies_test_attribute);
-        self.cfg_test_depth += usize::from(is_test);
-        visit::visit_local(self, node);
-        self.cfg_test_depth -= usize::from(is_test);
     }
 }
 
@@ -1891,6 +2145,52 @@ fn parse_nested_meta(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
         .map(|nested| nested.into_iter().collect())
 }
 
+fn expression_attributes(expression: &Expr) -> &[Attribute] {
+    match expression {
+        Expr::Array(node) => &node.attrs,
+        Expr::Assign(node) => &node.attrs,
+        Expr::Async(node) => &node.attrs,
+        Expr::Await(node) => &node.attrs,
+        Expr::Binary(node) => &node.attrs,
+        Expr::Block(node) => &node.attrs,
+        Expr::Break(node) => &node.attrs,
+        Expr::Call(node) => &node.attrs,
+        Expr::Cast(node) => &node.attrs,
+        Expr::Closure(node) => &node.attrs,
+        Expr::Const(node) => &node.attrs,
+        Expr::Continue(node) => &node.attrs,
+        Expr::Field(node) => &node.attrs,
+        Expr::ForLoop(node) => &node.attrs,
+        Expr::Group(node) => &node.attrs,
+        Expr::If(node) => &node.attrs,
+        Expr::Index(node) => &node.attrs,
+        Expr::Infer(node) => &node.attrs,
+        Expr::Let(node) => &node.attrs,
+        Expr::Lit(node) => &node.attrs,
+        Expr::Loop(node) => &node.attrs,
+        Expr::Macro(node) => &node.attrs,
+        Expr::Match(node) => &node.attrs,
+        Expr::MethodCall(node) => &node.attrs,
+        Expr::Paren(node) => &node.attrs,
+        Expr::Path(node) => &node.attrs,
+        Expr::Range(node) => &node.attrs,
+        Expr::RawAddr(node) => &node.attrs,
+        Expr::Reference(node) => &node.attrs,
+        Expr::Repeat(node) => &node.attrs,
+        Expr::Return(node) => &node.attrs,
+        Expr::Struct(node) => &node.attrs,
+        Expr::Try(node) => &node.attrs,
+        Expr::TryBlock(node) => &node.attrs,
+        Expr::Tuple(node) => &node.attrs,
+        Expr::Unary(node) => &node.attrs,
+        Expr::Unsafe(node) => &node.attrs,
+        Expr::While(node) => &node.attrs,
+        Expr::Yield(node) => &node.attrs,
+        Expr::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
 fn item_attributes(item: &Item) -> &[Attribute] {
     match item {
         Item::Const(item) => &item.attrs,
@@ -2189,36 +2489,858 @@ mod tests {
         assert!(has_rule(&violations, Rule::A6), "{violations:#?}");
     }
 
-    #[test]
-    fn a6_treats_a_tests_directory_module_as_cfg_test() {
-        // `src/ui_fullscreen/tests/*.rs` carries its `#[cfg(test)]` in the parent file, so
-        // reading the module alone must not report its test-only calls as production ones.
-        assert!(is_cfg_test_module_file(APP_TESTS_PATH));
-        assert!(is_cfg_test_module_file(
-            "src/ui_fullscreen/tests/still_seek_rotation.rs"
-        ));
-        assert!(!is_cfg_test_module_file("src/ui_fullscreen.rs"));
-        assert!(!is_cfg_test_module_file("src/tests_helper.rs"));
-
-        let source = r#"
-            fn reads_the_owner(app: &mut App) {
-                app.helper_for_test();
-            }
-        "#;
-        assert!(has_rule(
-            &analyze_test_api("src/fixture.rs", source, false).unwrap(),
-            Rule::A6,
-        ));
-        assert!(!has_rule(
-            &analyze_test_api(
-                "src/ui_fullscreen/tests/still_seek_rotation.rs",
-                source,
-                true,
-            )
-            .unwrap(),
-            Rule::A6,
-        ));
+    fn manifest_roots(manifest: &str, has_default_lib: bool) -> Result<Vec<String>, String> {
+        let sources = if has_default_lib {
+            BTreeMap::from([("src/lib.rs".into(), String::new())])
+        } else {
+            BTreeMap::new()
+        };
+        module_tree::crate_roots(manifest, &sources)
     }
+
+    fn module_fixture(
+        entries: &[(&str, &str)],
+        roots: &[&str],
+    ) -> (BTreeSet<String>, Vec<Violation>) {
+        let sources = entries
+            .iter()
+            .map(|(path, source)| (path.to_string(), source.to_string()))
+            .collect();
+        let roots = roots
+            .iter()
+            .map(|root| root.to_string())
+            .collect::<Vec<_>>();
+        let tree = module_tree::resolve(&sources, &roots).unwrap();
+        assert!(tree.missing.is_empty(), "missing: {:?}", tree.missing);
+        let mut violations = Vec::new();
+        for (path, source) in &sources {
+            violations
+                .extend(analyze_test_api(path, source, tree.test_only.contains(path)).unwrap());
+        }
+        (tree.test_only, violations)
+    }
+
+    const TEST_API_CALL: &str = "fn exercise() { helper_for_test(); }";
+
+    #[test]
+    fn a6_resolves_parent_test_gates_without_filename_heuristics() {
+        for gate in ["test", "all(test, windows)"] {
+            let root = format!("#[cfg({gate})] mod arbitrary; mod tests;");
+            let (test_files, violations) = module_fixture(
+                &[
+                    ("src/lib.rs", &root),
+                    ("src/arbitrary.rs", TEST_API_CALL),
+                    ("src/tests/mod.rs", TEST_API_CALL),
+                    ("src/app/tests.rs", TEST_API_CALL),
+                ],
+                &["src/lib.rs"],
+            );
+            assert_eq!(test_files, BTreeSet::from(["src/arbitrary.rs".into()]));
+            assert_eq!(violations.len(), 2, "{violations:#?}");
+            assert!(violations.iter().all(|v| v.file.contains("tests")));
+        }
+    }
+
+    #[test]
+    fn a6_resolves_test_path_modules_and_their_children() {
+        let (test_files, violations) = module_fixture(
+            &[
+                (
+                    "src/lib.rs",
+                    "#[cfg(test)] #[path = \"custom/named.rs\"] mod x;",
+                ),
+                ("src/custom/named.rs", "mod child;"),
+                ("src/custom/child.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs"],
+        );
+        assert_eq!(test_files.len(), 2);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn a6_resolves_non_mod_rs_and_mod_rs_children() {
+        for (a, b) in [
+            ("src/a.rs", "src/a/b.rs"),
+            ("src/a/mod.rs", "src/a/b/mod.rs"),
+        ] {
+            let (test_files, violations) = module_fixture(
+                &[
+                    ("src/lib.rs", "#[cfg(test)] mod a;"),
+                    (a, "mod b;"),
+                    (b, TEST_API_CALL),
+                ],
+                &["src/lib.rs"],
+            );
+            assert!(test_files.contains(b));
+            assert!(violations.is_empty(), "{violations:#?}");
+        }
+    }
+
+    #[test]
+    fn a6_resolves_inline_modules_and_nested_path_attributes() {
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/lib.rs", "mod a;"),
+                (
+                    "src/a.rs",
+                    r#"
+                #[cfg(test)] mod t { mod u; #[path = "named.rs"] mod v; }
+                #[cfg(test)] #[path = "custom"] mod other { mod w; }
+            "#,
+                ),
+                ("src/a/t/u.rs", TEST_API_CALL),
+                ("src/a/t/named.rs", TEST_API_CALL),
+                ("src/custom/w.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs"],
+        );
+        assert_eq!(test_files.len(), 3);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn a6_mixed_test_and_production_routes_remain_production() {
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/lib.rs", "#[cfg(test)] #[path = \"shared.rs\"] mod t;"),
+                ("src/main.rs", "#[path = \"shared.rs\"] mod p;"),
+                ("src/shared.rs", "mod child;"),
+                ("src/child.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs", "src/main.rs"],
+        );
+        assert!(test_files.is_empty());
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+    }
+
+    #[test]
+    fn a6_merges_windows_path_aliases_with_the_same_source() {
+        let (test_files, violations) = module_fixture(
+            &[
+                (
+                    "src/lib.rs",
+                    r#"#[cfg(test)] #[path = "shared.rs"] mod t;
+                    #[path = r".\shared.rs"] mod p;"#,
+                ),
+                ("src/shared.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs"],
+        );
+        assert!(test_files.is_empty());
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn a6_resolves_literal_includes_relative_to_the_source_file() {
+        let (test_files, violations) = module_fixture(
+            &[
+                (
+                    "src/lib.rs",
+                    r#"#[cfg(test)] mod t { include!("sub/x.rs"); }
+                include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+                ),
+                ("src/sub/x.rs", "mod child;"),
+                ("src/sub/child.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs"],
+        );
+        assert_eq!(test_files.len(), 2);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn a6_merges_qualified_production_includes_with_test_module_routes() {
+        for include in ["include", "std::include", "core::include"] {
+            let root = format!(
+                r#"#[cfg(test)] #[path = "shared.rs"] mod t;
+                {include}!("shared.rs");"#
+            );
+            let (test_files, violations) = module_fixture(
+                &[("src/lib.rs", &root), ("src/shared.rs", TEST_API_CALL)],
+                &["src/lib.rs"],
+            );
+            assert!(test_files.is_empty());
+            assert_eq!(violations.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a6_file_level_gate_flows_to_child_modules() {
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/lib.rs", "mod a;"),
+                ("src/a.rs", "#![cfg(test)] mod b;"),
+                ("src/a/b.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs"],
+        );
+        assert_eq!(test_files.len(), 2);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn a6_keeps_ordinary_modules_under_production_checks() {
+        let (test_files, violations) = module_fixture(
+            &[("src/lib.rs", "mod x;"), ("src/x.rs", TEST_API_CALL)],
+            &["src/lib.rs"],
+        );
+        assert!(test_files.is_empty());
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn a6_reads_declared_bin_roots_as_independent_production_paths() {
+        let roots = manifest_roots(
+            r#"
+            [package]
+            name = "fixture"
+            autobins = false
+            [[ bin ]] # production root
+            name = "probe"
+            path = "src/bin/probe.rs"
+            required-features = ["tools"]
+            [target.'cfg(windows)'.dependencies]
+            example = "1"
+        "#,
+            true,
+        )
+        .unwrap();
+        let roots = roots.iter().map(String::as_str).collect::<Vec<_>>();
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                ("src/bin/probe.rs", "#[path = \"../shared.rs\"] mod shared;"),
+                ("src/shared.rs", TEST_API_CALL),
+            ],
+            &roots,
+        );
+        assert!(test_files.is_empty());
+        assert_eq!(violations.len(), 1);
+        assert!(
+            manifest_roots(
+                "[package]\nautobins = false\n[[bin]]\nname = \"implicit\"",
+                true
+            )
+            .unwrap_err()
+            .contains("requires an explicit string path")
+        );
+    }
+
+    #[test]
+    fn a6_honors_an_explicit_library_root_instead_of_the_default() {
+        let roots = manifest_roots(
+            r#"
+            [package]
+            autobins = false
+            [lib]
+            path = "src/custom_lib.rs"
+            [[bin]]
+            path = "src/main.rs"
+        "#,
+            true,
+        )
+        .unwrap();
+        assert!(!roots.iter().any(|path| path == "src/lib.rs"));
+        let roots = roots.iter().map(String::as_str).collect::<Vec<_>>();
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/custom_lib.rs", "mod shared;"),
+                ("src/main.rs", "#[cfg(test)] mod shared;"),
+                ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                ("src/shared.rs", TEST_API_CALL),
+            ],
+            &roots,
+        );
+        assert!(test_files.is_empty());
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn a6_auto_discovery_flags_accept_booleans_and_reject_unknown_shapes() {
+        for key in [
+            "autolib",
+            "autobins",
+            "autoexamples",
+            "autotests",
+            "autobenches",
+        ] {
+            for value in ["true", "false"] {
+                let manifest = format!("[package]\n{key} = {value}");
+                assert!(manifest_roots(&manifest, true).is_ok(), "{manifest}");
+            }
+            for value in ["\"false\"", "{}", "0"] {
+                let manifest = format!("[package]\n{key} = {value}");
+                assert!(
+                    manifest_roots(&manifest, true)
+                        .unwrap_err()
+                        .contains("auto-discovery")
+                );
+            }
+        }
+        assert!(manifest_roots("[package]", true).is_ok());
+        assert!(
+            manifest_roots("[package]\nautofuture = false", true)
+                .unwrap_err()
+                .contains("unsupported auto-discovery")
+        );
+        assert!(
+            manifest_roots("[package]\nautolib = false", true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            manifest_roots("[package]\nautolib = false\n[lib]", true).unwrap(),
+            vec!["src/lib.rs"]
+        );
+    }
+
+    fn target_fixture(
+        manifest: &str,
+        entries: &[(&str, &str)],
+    ) -> (Vec<String>, BTreeSet<String>, Vec<Violation>) {
+        let sources = entries
+            .iter()
+            .map(|(path, source)| (path.to_string(), source.to_string()))
+            .collect();
+        let roots = module_tree::crate_roots(manifest, &sources).unwrap();
+        let root_refs = roots.iter().map(String::as_str).collect::<Vec<_>>();
+        let (test_only, violations) = module_fixture(entries, &root_refs);
+        (roots, test_only, violations)
+    }
+
+    #[test]
+    fn a6_every_explicit_target_kind_is_a_production_root() {
+        for kind in ["lib", "bin", "example", "test", "bench"] {
+            let header = if kind == "lib" {
+                "[lib]".to_owned()
+            } else {
+                format!("[[{kind}]]")
+            };
+            let manifest = format!(
+                "[package]\nauto{plural} = false\n{header}\npath = 'targets/entry.rs'\ntest = false\nbench = false\nharness = false\nrequired-features = ['unselected']",
+                plural = match kind {
+                    "lib" => "lib",
+                    "bin" => "bins",
+                    "example" => "examples",
+                    "test" => "tests",
+                    _ => "benches",
+                }
+            );
+            let (roots, test_only, violations) = target_fixture(
+                &manifest,
+                &[
+                    ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                    ("src/shared.rs", TEST_API_CALL),
+                    (
+                        "targets/entry.rs",
+                        r#"#[path = "../src/shared.rs"] mod shared;"#,
+                    ),
+                ],
+            );
+            assert!(
+                roots.iter().any(|root| root == "targets/entry.rs"),
+                "{kind}"
+            );
+            assert!(!test_only.contains("src/shared.rs"), "{kind}");
+            assert_eq!(violations.len(), 1, "{kind}: {violations:#?}");
+            assert_eq!(violations[0].file, "src/shared.rs");
+        }
+    }
+
+    #[test]
+    fn a6_auto_discovered_targets_are_production_unless_their_auto_flag_is_false() {
+        for (auto, entry) in [
+            ("autobins", "src/main.rs"),
+            ("autobins", "src/bin/probe.rs"),
+            ("autobins", "src/bin/multi/main.rs"),
+            ("autoexamples", "examples/probe.rs"),
+            ("autoexamples", "examples/multi/main.rs"),
+            ("autotests", "tests/probe.rs"),
+            ("autotests", "tests/multi/main.rs"),
+            ("autobenches", "benches/probe.rs"),
+            ("autobenches", "benches/multi/main.rs"),
+        ] {
+            let relative = format!("{}src/shared.rs", "../".repeat(entry.matches('/').count()));
+            let body = format!("#[path = {relative:?}] mod shared;");
+            let entries = [
+                ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                ("src/shared.rs", TEST_API_CALL),
+                (entry, body.as_str()),
+            ];
+            for setting in ["", "true", "false"] {
+                let manifest = if setting.is_empty() {
+                    "[package]".to_owned()
+                } else {
+                    format!("[package]\n{auto} = {setting}")
+                };
+                let (roots, test_only, violations) = target_fixture(&manifest, &entries);
+                let enabled = setting != "false";
+                assert_eq!(
+                    roots.iter().any(|root| root == entry),
+                    enabled,
+                    "{entry}: {setting}"
+                );
+                assert_eq!(
+                    test_only.contains("src/shared.rs"),
+                    !enabled,
+                    "{entry}: {setting}"
+                );
+                assert_eq!(
+                    violations.len(),
+                    usize::from(enabled),
+                    "{entry}: {setting}: {violations:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a6_build_script_default_and_explicit_path_routes_are_production() {
+        for setting in ["", "build = true", "build = 'build.rs'", "build = false"] {
+            let (roots, test_only, violations) = target_fixture(
+                &format!("[package]\n{setting}"),
+                &[
+                    ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                    ("src/shared.rs", TEST_API_CALL),
+                    ("build.rs", r#"#[path = "src/shared.rs"] mod shared;"#),
+                ],
+            );
+            let enabled = setting != "build = false";
+            assert_eq!(roots.iter().any(|root| root == "build.rs"), enabled);
+            assert_eq!(test_only.contains("src/shared.rs"), !enabled);
+            assert_eq!(violations.len(), usize::from(enabled));
+        }
+        let (roots, test_only, violations) = target_fixture(
+            "[package]\nbuild = 'scripts/custom.rs'",
+            &[
+                ("src/lib.rs", "#[cfg(test)] mod shared;"),
+                ("src/shared.rs", TEST_API_CALL),
+                (
+                    "scripts/custom.rs",
+                    r#"#[path = "../src/shared.rs"] mod shared;"#,
+                ),
+                ("build.rs", ""),
+            ],
+        );
+        assert!(roots.iter().any(|root| root == "scripts/custom.rs"));
+        assert!(!roots.iter().any(|root| root == "build.rs"));
+        assert!(!test_only.contains("src/shared.rs"));
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn a6_auto_discovery_ignores_support_files_below_the_target_root_level() {
+        let (roots, _, _) = target_fixture(
+            "[package]\nautolib = false",
+            &[
+                ("examples/support/helper.rs", ""),
+                ("tests/common/mod.rs", ""),
+                ("benches/deep/nested/main.rs", ""),
+                ("src/bin/common/helper.rs", ""),
+            ],
+        );
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn a6_rejects_case_variants_of_auto_discovered_paths() {
+        for entry in [
+            "Examples/probe.rs",
+            "src/Bin/probe.rs",
+            "benches/probe/Main.rs",
+            "Build.rs",
+            "Build.RS",
+            "src/Lib.RS",
+            "tests/probe/main.RS",
+            "examples/probe.RS",
+            "examples/probe.rſ",
+            "tests/probe/main.rſ",
+        ] {
+            let sources = BTreeMap::from([(entry.to_owned(), String::new())]);
+            let error = module_tree::crate_roots("[package]", &sources).unwrap_err();
+            assert!(
+                error.contains("module path case differs from file on disk"),
+                "{entry}: {error}"
+            );
+        }
+        for path in [
+            "Build.RS",
+            "src/lib.RS",
+            "tests/probe/main.RS",
+            "examples/probe.rS",
+            "examples/probe.rſ",
+        ] {
+            assert!(
+                is_rust_source_path(Path::new(path))
+                    .unwrap_err()
+                    .contains("module path case differs")
+            );
+        }
+        assert!(is_rust_source_path(Path::new("examples/probe.rs")).unwrap());
+    }
+
+    #[test]
+    fn a6_rejects_unsupported_target_fields_for_every_kind() {
+        for kind in ["lib", "bin", "example", "test", "bench"] {
+            let header = if kind == "lib" {
+                "[lib]".to_owned()
+            } else {
+                format!("[[{kind}]]")
+            };
+            for field in [
+                "unknown_target_setting = true",
+                "test = 'false'",
+                "required-features = [false]",
+                "path = false",
+            ] {
+                let manifest = format!("[package]\n{header}\n{field}");
+                assert!(manifest_roots(&manifest, true).is_err(), "{manifest}");
+            }
+        }
+        for value in ["0", "{}", "[]", "''"] {
+            assert!(
+                manifest_roots(&format!("[package]\nbuild = {value}"), true)
+                    .unwrap_err()
+                    .contains("package.build")
+            );
+        }
+    }
+
+    #[test]
+    fn a6_honors_inline_dotted_and_quoted_root_declarations() {
+        for (root, expected) in [
+            (
+                r#"lib = { path = "src/custom_lib.rs" }"#,
+                vec!["src/custom_lib.rs"],
+            ),
+            (
+                r#"bin = [{ path = "src/probe.rs" }]"#,
+                vec!["src/lib.rs", "src/probe.rs"],
+            ),
+            (
+                r#"lib.path = "src/custom_lib.rs""#,
+                vec!["src/custom_lib.rs"],
+            ),
+            (
+                r#""lib" = { path = "src/custom_lib.rs" }"#,
+                vec!["src/custom_lib.rs"],
+            ),
+            (
+                "[package]\nautobins = false\n[[\"bin\"]]\npath = \"src/probe.rs\"",
+                vec!["src/lib.rs", "src/probe.rs"],
+            ),
+        ] {
+            let manifest = if root.starts_with("[package]") {
+                root.to_owned()
+            } else {
+                format!("{root}\n[package]\nautobins = false")
+            };
+            assert_eq!(manifest_roots(&manifest, true).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn a6_rejects_invalid_target_value_shapes() {
+        for target in [
+            "lib = false",
+            "lib = { path = false }",
+            "lib = { path = { value = 'src/p.rs' } }",
+            "bin = {}",
+            "bin = [false]",
+            "bin = [{ name = 'implicit' }]",
+            "bin = [{ path = false }]",
+        ] {
+            let manifest = format!("{target}\n[package]\nautobins = false");
+            assert!(manifest_roots(&manifest, true).is_err(), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn a6_ignores_fake_library_tables_inside_multiline_manifest_strings() {
+        let manifest = r#"
+            [package]
+            autobins = false
+            description = """"
+            [lib]
+            path = "src/test_entry.rs"
+            """"
+        "#;
+        let roots = manifest_roots(manifest, true).unwrap();
+        assert_eq!(roots, vec!["src/lib.rs"]);
+        let roots = roots.iter().map(String::as_str).collect::<Vec<_>>();
+        let (test_files, violations) = module_fixture(
+            &[
+                ("src/lib.rs", "mod shared; #[cfg(test)] mod test_entry;"),
+                (
+                    "src/test_entry.rs",
+                    r#"#[cfg(test)] #[path = "shared.rs"] mod shared;"#,
+                ),
+                ("src/shared.rs", TEST_API_CALL),
+            ],
+            &roots,
+        );
+        assert!(test_files.contains("src/test_entry.rs"));
+        assert!(!test_files.contains("src/shared.rs"));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].file, "src/shared.rs");
+        assert_eq!(violations[0].rule, Rule::A6);
+    }
+
+    #[test]
+    fn a6_rejects_a_case_variant_automatic_library_before_omitting_the_root() {
+        let sources = BTreeMap::from([("src/Lib.rs".into(), TEST_API_CALL.into())]);
+        let error = module_tree::crate_roots("[package]\nautobins = false", &sources).unwrap_err();
+        assert!(
+            error.contains("module path case differs from file on disk"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a6_parses_root_paths_with_comments_and_escaped_quotes() {
+        let roots = manifest_roots(
+            r##"
+            [package] # comment
+            autobins = false # explicitly disabled
+            [lib]
+            path = "library/#part.rs" # comment after library path
+            [[bin]]
+            path = "src/main.rs" # ordinary comment
+            [[bin]]
+            path = "src/bin/escaped\"#part.rs" # escaped quote, then literal hash
+            [target.'cfg(feature = "#hash")'.dependencies]
+            example = "1"
+        "##,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                "library/#part.rs",
+                "src/bin/escaped\"#part.rs",
+                "src/main.rs"
+            ]
+        );
+        assert!(
+            manifest_roots("[package]\nautobins = false\n[lib]\npath = \"\"\"", true)
+                .unwrap_err()
+                .contains("cannot parse Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn a6_rejects_case_variant_module_and_include_routes() {
+        for production in [
+            r#"#[path = "Shared.rs"] mod p;"#,
+            r#"include!("Shared.rs");"#,
+            "mod Shared;",
+        ] {
+            let root = format!(r#"#[cfg(test)] #[path = "shared.rs"] mod t; {production}"#);
+            let sources = BTreeMap::from([
+                ("src/lib.rs".into(), root),
+                ("src/shared.rs".into(), TEST_API_CALL.into()),
+            ]);
+            let error = module_tree::resolve(&sources, &["src/lib.rs".into()])
+                .err()
+                .unwrap();
+            assert!(
+                error.contains("module path case differs from file on disk"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a6_rejects_exact_keys_that_collide_on_windows() {
+        let sources = BTreeMap::from([
+            (
+                "src/lib.rs".into(),
+                r#"#[cfg(test)] #[path = "shared.rs"] mod t;
+                #[path = "Shared.rs"] mod p;"#
+                    .into(),
+            ),
+            ("src/shared.rs".into(), TEST_API_CALL.into()),
+            ("src/Shared.rs".into(), String::new()),
+        ]);
+        let error = module_tree::resolve(&sources, &["src/lib.rs".into()])
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("module path case differs from file on disk"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a6_loader_rejects_a_case_variant_before_inserting_or_reading_it() {
+        let mut sources = BTreeMap::from([
+            (
+                "src/lib.rs".into(),
+                r#"#[path = "../outside/Shared.rs"] mod p;"#.into(),
+            ),
+            ("outside/shared.rs".into(), TEST_API_CALL.into()),
+        ]);
+        let error = resolve_module_sources(&mut sources, &["src/lib.rs".into()], |_| {
+            panic!("a known case variant must never reach the disk loader");
+        })
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("module path case differs from file on disk"),
+            "{error}"
+        );
+        assert!(!sources.contains_key("outside/Shared.rs"));
+    }
+
+    #[test]
+    fn a6_external_modules_probe_both_file_candidates() {
+        for child in ["outside/x/child.rs", "outside/x/child/mod.rs"] {
+            let mut sources = BTreeMap::from([(
+                "src/lib.rs".into(),
+                r#"#[cfg(test)] #[path = "../outside/parent.rs"] mod parent;"#.into(),
+            )]);
+            let disk = BTreeMap::from([
+                ("outside/x.rs".to_owned(), "mod child;".to_owned()),
+                (child.to_owned(), TEST_API_CALL.to_owned()),
+            ]);
+            // #[path] owns its physical directory, so use an ordinary nested mod
+            // to exercise non-mod-rs children outside the initial src inventory.
+            let disk = disk
+                .into_iter()
+                .chain([("outside/parent.rs".into(), "mod x;".into())])
+                .collect::<BTreeMap<_, _>>();
+            let mut probes = BTreeSet::new();
+            let tree = resolve_module_sources(&mut sources, &["src/lib.rs".into()], |path| {
+                probes.insert(path.to_owned());
+                module_tree::check_path_case(&disk, path)?;
+                Ok(disk.get(path).cloned())
+            })
+            .unwrap();
+            assert!(tree.test_only.contains(child));
+            assert!(probes.contains("outside/x/child.rs"));
+            assert!(probes.contains("outside/x/child/mod.rs"));
+        }
+    }
+
+    #[test]
+    fn a6_external_modules_reject_ambiguous_candidates_even_if_one_was_loaded() {
+        let mut sources = BTreeMap::from([
+            (
+                "src/lib.rs".into(),
+                r#"#[path = "../outside/parent.rs"] mod parent;"#.into(),
+            ),
+            ("outside/parent.rs".into(), "mod x;".into()),
+            ("outside/x.rs".into(), TEST_API_CALL.into()),
+        ]);
+        let error = resolve_module_sources(&mut sources, &["src/lib.rs".into()], |path| {
+            Ok((path == "outside/x/mod.rs").then(|| TEST_API_CALL.to_owned()))
+        })
+        .err()
+        .unwrap();
+        assert!(error.contains("ambiguous module x"), "{error}");
+    }
+
+    #[test]
+    fn a6_resolves_includes_below_enclosing_items_and_expressions() {
+        let (test_files, violations) = module_fixture(
+            &[
+                (
+                    "src/lib.rs",
+                    r#"
+                #[cfg(test)] fn t() { include!("a.rs"); }
+                fn p() { #[cfg(test)] if true { include!("b.rs"); } }
+            "#,
+                ),
+                ("src/a.rs", TEST_API_CALL),
+                ("src/b.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs"],
+        );
+        assert_eq!(test_files.len(), 2);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn a6_rejects_unsupported_routes_instead_of_assuming_test_only() {
+        for root in [
+            r#"#[cfg_attr(feature = "prod", path = "shared.rs")] mod p;"#,
+            r#"include!("rust_source.txt");"#,
+        ] {
+            let sources = BTreeMap::from([("src/lib.rs".into(), root.into())]);
+            assert!(module_tree::resolve(&sources, &["src/lib.rs".into()]).is_err());
+        }
+        let tree = module_tree::resolve(&BTreeMap::new(), &["tools/probe.rs".into()]).unwrap();
+        assert_eq!(tree.missing, BTreeSet::from(["tools/probe.rs".into()]));
+    }
+
+    #[test]
+    fn a6_carries_statement_macro_and_expression_macro_gates_into_includes() {
+        let (test_files, violations) = module_fixture(
+            &[
+                (
+                    "src/lib.rs",
+                    r#"
+                fn p() {
+                    #[cfg(test)] include!("statement.rs",);
+                    let x = #[cfg(test)] include!("expression.rs");
+                }
+            "#,
+                ),
+                ("src/statement.rs", TEST_API_CALL),
+                ("src/expression.rs", TEST_API_CALL),
+            ],
+            &["src/lib.rs"],
+        );
+        assert_eq!(test_files.len(), 2);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn a6_honors_if_match_and_arm_gates_without_masking_siblings() {
+        for gated in [
+            "#[cfg(test)] if helper_for_test() { helper_for_test(); }",
+            "#[cfg(test)] match helper_for_test() { _ => helper_for_test() }",
+            "match value { #[cfg(all(test, windows))] _ if helper_for_test() => helper_for_test(), _ => () }",
+        ] {
+            let source = format!(
+                "fn p() {{
+{gated};
+unexpected_for_test();
+}}"
+            );
+            let violations = analyze_test_api("src/lib.rs", &source, false).unwrap();
+            assert_eq!(violations.len(), 1, "{gated}: {violations:#?}");
+            assert_eq!(violations[0].line, 3);
+            assert!(violations[0].message.contains("function call"));
+        }
+    }
+
+    #[test]
+    fn a6_honors_other_expression_gates_and_field_values() {
+        for gated in [
+            "#[cfg(test)] loop { helper_for_test(); break; }",
+            "#[cfg(test)] while helper_for_test() {}",
+            "#[cfg(test)] for x in helper_for_test() {}",
+            "#[cfg(test)] unsafe { helper_for_test(); }",
+            "#[cfg(test)] || helper_for_test()",
+            "#[cfg(test)] async { helper_for_test(); }",
+            "#[cfg(test)] free_for_test(helper_for_test())",
+            "#[cfg(test)] app.method_for_test(helper_for_test())",
+            "S { #[cfg(test)] field: helper_for_test() }",
+        ] {
+            let source = format!(
+                "fn p() {{
+{gated};
+unexpected_for_test();
+}}"
+            );
+            let violations = analyze_test_api("src/lib.rs", &source, false).unwrap();
+            assert_eq!(violations.len(), 1, "{gated}: {violations:#?}");
+        }
+    }
+
     #[test]
     fn a2a_flags_bundle_field_swap_but_not_an_unrelated_field() {
         assert_flagged_and_clear(

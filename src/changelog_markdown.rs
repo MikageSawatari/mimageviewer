@@ -243,8 +243,10 @@ mod tests {
             .take_while(|l| !l.starts_with("### v"))
             .filter(|l| !l.trim().is_empty())
             .collect();
+        // 項目が 1〜2 個だけの不具合修正版もあるので、読めたかどうかだけを見る
+        // (v4.8.1 は 2 項目)。
         assert!(
-            section.len() >= 3,
+            !section.is_empty(),
             "最新の更新履歴が読めていない ({} 行)",
             section.len()
         );

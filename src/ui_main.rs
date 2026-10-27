@@ -25,6 +25,41 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
+use crate::wheel_input::consume_wheel_input;
+
+#[cfg(windows)]
+fn effetune_toolbar_button(
+    ui: &mut egui::Ui,
+    active: bool,
+    available: bool,
+    drag_enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled(
+        available,
+        egui::Button::new("音響調整")
+            .selected(active)
+            .sense(if drag_enabled {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::click()
+            }),
+    )
+    .on_hover_text(tooltip)
+    .on_disabled_hover_text(tooltip)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn draw_effetune_show_only_snapshot_fixture(ui: &mut egui::Ui, active: bool) {
+    let effective = if active {
+        crate::effetune::EffectiveState::Effective
+    } else {
+        crate::effetune::EffectiveState::Inert
+    };
+    let tooltip = crate::effetune::running_gui_tooltip(Some(effective));
+    let _ = effetune_toolbar_button(ui, active, true, false, &tooltip);
+}
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -98,7 +133,6 @@ pub(crate) fn saved_group_slot_number(index: usize) -> Option<usize> {
 }
 // 詳細ヘッダ + 詳細行 + パネル内の最小余白。下部情報バーはこの 2 行に加えて
 // solid 横スクロールバー専用レーンを CentralPanel より先に予約する。
-const SELECTION_INFO_BAR_CONTENT_HEIGHT: f32 = 58.0;
 // 列境界のダブルクリックは UI thread 上で egui の font atlas を使って文字幅を測る。
 // 全行の exact max を維持したまま 1 frame の仕事量を一定にするため、分割 job で測る。
 const DETAILS_BEST_FIT_ROWS_PER_FRAME: usize = 192;
@@ -240,7 +274,7 @@ pub(crate) enum AddressBarNav {
         restore_intent: crate::app::StartupListIntent,
     },
     DriveList(Option<PathBuf>),
-    ReadingHistory,
+    ReadingHistory(crate::app::ReadingHistoryEntrance),
     Bookmarks,
     RatingViewBack,
     BooksRoot,
@@ -345,13 +379,17 @@ fn checked_selection_overlay_top(available_rect: egui::Rect) -> f32 {
 }
 
 /// チェック件数をメイン一覧の右上へ表示する。「選択解除」が押されたら true を返す。
-fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> bool {
+fn show_checked_selection_overlay(
+    ctx: &egui::Context,
+    available_rect: egui::Rect,
+    checked_count: usize,
+) -> bool {
     let Some(count_label) = checked_selection_overlay_label(checked_count) else {
         return false;
     };
-    let top_offset = checked_selection_overlay_top(ctx.available_rect());
+    let top_offset = checked_selection_overlay_top(available_rect);
     let mut clear_clicked = false;
-    egui::Area::new(egui::Id::new(CHECKED_SELECTION_OVERLAY_ID))
+    egui::Area::new(egui::Id::unique(CHECKED_SELECTION_OVERLAY_ID))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top_offset))
         .show(ctx, |ui| {
@@ -729,7 +767,7 @@ pub(crate) fn extend_grid_end_for_touch_fraction(
 }
 
 fn grid_touch_scroll_state_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new(("miv_grid_touch_scroll_fraction", ctx.viewport_id()))
+    egui::Id::unique(("miv_grid_touch_scroll_fraction", ctx.viewport_id()))
 }
 
 fn grid_touch_scroll_state(
@@ -748,7 +786,7 @@ fn grid_touch_scroll_state_for_viewport(
     row_h: f32,
     items_generation: u64,
 ) -> GridTouchScrollState {
-    let id = egui::Id::new(("miv_grid_touch_scroll_fraction", viewport));
+    let id = egui::Id::unique(("miv_grid_touch_scroll_fraction", viewport));
     ctx.data(|data| data.get_temp::<GridTouchScrollState>(id))
         .filter(|state| {
             state.items_generation == items_generation
@@ -897,7 +935,7 @@ fn accumulate_grid_pinch_column_factor(
 }
 
 fn grid_pinch_column_state_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new(("miv_grid_pinch_columns", ctx.viewport_id()))
+    egui::Id::unique(("miv_grid_pinch_columns", ctx.viewport_id()))
 }
 
 fn apply_grid_pinch_column_factor(
@@ -1193,21 +1231,24 @@ fn draw_facet_calendar_date_row(
     ui.horizontal(|ui| {
         ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(
+            let year = ui.add(
                 egui::DragValue::new(&mut value.year)
                     .range(1970..=9999)
                     .suffix("年"),
             );
-            ui.add(
+            crate::ui_helpers::set_accessibility_label_with(&year, || format!("{label} 年"));
+            let month = ui.add(
                 egui::DragValue::new(&mut value.month)
                     .range(1..=12)
                     .suffix("月"),
             );
-            ui.add(
+            crate::ui_helpers::set_accessibility_label_with(&month, || format!("{label} 月"));
+            let day = ui.add(
                 egui::DragValue::new(&mut value.day)
                     .range(1..=31)
                     .suffix("日"),
             );
+            crate::ui_helpers::set_accessibility_label_with(&day, || format!("{label} 日"));
         });
     });
     value.sanitize();
@@ -1232,20 +1273,24 @@ pub(crate) fn draw_facet_size_value_row(
     let mut enabled = value.is_some();
     let mut current = value.unwrap_or(default);
     ui.horizontal(|ui| {
-        ui.checkbox(&mut enabled, label);
+        let label_response = ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
             ui.add(
                 egui::DragValue::new(&mut current.value)
                     .range(0..=u32::MAX)
                     .speed(1),
-            );
-            egui::ComboBox::from_id_salt(("facet_size_unit", id))
+            )
+            .labelled_by(label_response.id);
+            let unit = egui::ComboBox::from_id_salt(("facet_size_unit", id))
                 .selected_text(current.unit.label())
                 .show_ui(ui, |ui| {
                     for unit in FacetSizeUnit::ALL {
                         ui.selectable_value(&mut current.unit, unit, unit.label());
                     }
                 });
+            crate::ui_helpers::set_accessibility_label_with(&unit.response, || {
+                format!("{label} サイズ単位")
+            });
             ui.label(relation);
         });
     });
@@ -1300,6 +1345,10 @@ fn show_ai_facet_choices<R>(
             ui.set_min_height(body_height);
             ui.set_width(AI_FACET_MENU_WIDTH);
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show(ui, add_contents)
@@ -1340,6 +1389,10 @@ fn show_scrollable_facet_choices<R>(
             ui.set_min_height(body_height);
             ui.set_width(width);
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show(ui, add_contents)
@@ -1366,7 +1419,8 @@ fn show_virtualized_facet_choice_rows(
     }
 
     let spacing = ui.spacing();
-    let row_h = spacing.interact_size.y.max(22.0) + spacing.item_spacing.y;
+    // show_rows adds item_spacing itself; the drawing allocates only row_h.
+    let row_h = spacing.interact_size.y.max(22.0);
     let body_height = facet_choice_body_height(ui, choice_count);
     ui.allocate_ui_with_layout(
         egui::vec2(width, body_height),
@@ -1374,7 +1428,11 @@ fn show_virtualized_facet_choice_rows(
         |ui| {
             ui.set_min_height(body_height);
             ui.set_width(width);
-            egui::ScrollArea::vertical()
+            let output = egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, choice_count, |ui, row_range| {
@@ -1383,6 +1441,19 @@ fn show_virtualized_facet_choice_rows(
                         add_row(ui, idx);
                     }
                 });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::unique("facet_choice_scroll_layout"),
+                    (
+                        output.inner_rect,
+                        output.content_size,
+                        output.state.clamped_offset(),
+                    ),
+                )
+            });
+            #[cfg(not(test))]
+            let _ = output;
         },
     );
 }
@@ -1440,15 +1511,6 @@ fn draw_facet_checkbox_choice(
         .inner;
     response.on_hover_text(hover_text);
     changed
-}
-
-fn consume_wheel_input(ctx: &egui::Context) {
-    ctx.input_mut(|i| {
-        i.raw_scroll_delta = egui::Vec2::ZERO;
-        i.smooth_scroll_delta = egui::Vec2::ZERO;
-        i.events
-            .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-    });
 }
 
 fn suppress_menu_button_wheel_passthrough(ctx: &egui::Context, response: &egui::Response) {
@@ -1514,9 +1576,11 @@ mod sticky_settings_menu_header_tests {
         let measured_width = Arc::new(Mutex::new(None));
         let measured_width_in_ui = measured_width.clone();
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(800.0, 180.0))
-            .build(move |ctx| {
-                let area = egui::Area::new(egui::Id::new("sticky_settings_menu_header_test"))
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                let area = egui::Area::new(egui::Id::unique("sticky_settings_menu_header_test"))
                     .fixed_pos(egui::pos2(0.0, 0.0))
                     .movable(false)
                     .show(ctx, |ui| {
@@ -1544,9 +1608,10 @@ mod sticky_settings_menu_header_tests {
         let dedicated = Arc::new(Mutex::new(false));
         let dedicated_in_ui = Arc::clone(&dedicated);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(640.0, 360.0))
-            .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui(move |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.horizontal(|ui| {
                         let response = ui.button("列メニュー");
                         ui.add_space(360.0);
@@ -1795,7 +1860,7 @@ fn toolbar_combo_width(ui: &egui::Ui, inner_width: f32, selected_text: &str) -> 
     actual + 2.0 * padding
 }
 
-fn apply_toolbar_style(ui: &mut egui::Ui) {
+pub(crate) fn apply_toolbar_style(ui: &mut egui::Ui) {
     let toolbar_family = egui::FontFamily::Name(std::sync::Arc::<str>::from(
         crate::ui_fonts::TOOLBAR_TEXT_FAMILY_NAME,
     ));
@@ -1822,12 +1887,14 @@ fn grid_sort_combo<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
     toolbar_combo_slot(ui, enabled, 100.0, text, |ui, text| {
-        egui::ComboBox::from_id_salt(id_salt)
+        let combo = egui::ComboBox::from_id_salt(id_salt)
             .width(100.0)
             .height(height)
             .popup_style(sort_combo_popup_style())
             .selected_text(text)
-            .show_ui(ui, add)
+            .show_ui(ui, add);
+        crate::ui_helpers::set_accessibility_label(&combo.response, "ソート:");
+        combo
     })
 }
 
@@ -1869,10 +1936,9 @@ fn facet_sort_slot<R>(
 
 /// ツールバーの ComboBox を、**実測幅の場所を親に取ってから**描く。
 ///
-/// **`ComboBox` は単体では折り返さない。** egui の `button_frame` は
-/// `ui.advance_cursor_after_rect` でカーソルを進めるだけで、**折り返し判定
-/// (`Layout::next_frame`) を一度も通らない**。残り幅にそのまま置かれ、入らなければ
-/// 右端からはみ出したまま描かれる。
+/// 0.37 の単体 ComboBox は WidgetAtom が折り返す。ただし、先に
+/// `add_enabled_ui` の子 Ui を作ると行頭が現在のカーソル位置になり、親の
+/// 行頭へ折り返せない。0.33 では単体 ComboBox も折り返さなかった。
 ///
 /// そこで、先に `allocate_ui_with_layout` で実測幅の矩形を取る。この確保は
 /// `Layout::next_frame` を通るので、**入らなければ egui が自分で次の行へ送る**。
@@ -2010,6 +2076,7 @@ fn draw_collection_toolbar_controls(
                 }
             })
     });
+    crate::ui_helpers::set_accessibility_label(&combo.response, "コレクション");
     result.popup_open = egui::ComboBox::is_open(ctx, combo.response.id);
 
     let target_name = target_id.and_then(|target| {
@@ -3357,15 +3424,36 @@ fn details_layout_right_guard(pixels_per_point: f32) -> f32 {
     (1.0 / normalized_pixels_per_point(pixels_per_point)).max(0.5)
 }
 
-fn selection_info_bar_height() -> f32 {
-    SELECTION_INFO_BAR_CONTENT_HEIGHT + details_scroll_style().allocated_width()
+fn selection_info_bar_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::side_top_panel(style)
+}
+
+// Match Panel::resolve_frame: a persistent separator reserves its rounded stroke
+// in the frame's outer margin on the edge facing the remaining viewport.
+fn panel_separator_outer_margin(style: &egui::Style, outer_margin: i8) -> i8 {
+    let separator_width = style.visuals.widgets.noninteractive.bg_stroke.width.round() as i8;
+    outer_margin.saturating_add(separator_width)
+}
+
+fn selection_info_bar_height(style: &egui::Style) -> f32 {
+    let mut frame = selection_info_bar_frame(style);
+    // Panel::exact_size includes the frame and the separator's outer margin.
+    // Reserve both before allocating the two fixed rows and the horizontal bar;
+    // otherwise the overflowing content grows past the bottom edge before Panel
+    // clamps its response, leaving the grid with an incorrect height reservation.
+    frame.outer_margin.top = panel_separator_outer_margin(style, frame.outer_margin.top);
+    App::DETAILS_HEADER_H
+        + App::DETAILS_ROW_H
+        + frame.total_margin().sum().y
+        + details_scroll_style().allocated_width()
 }
 
 fn details_grid_available_height_after_selection_bar(
     available_before: egui::Rect,
     style: &egui::Style,
 ) -> f32 {
-    let remaining_outer_height = (available_before.height() - selection_info_bar_height()).max(0.0);
+    let remaining_outer_height =
+        (available_before.height() - selection_info_bar_height(style)).max(0.0);
     let central_margin_y = egui::Frame::central_panel(style).inner_margin.sum().y;
     (remaining_outer_height - central_margin_y).max(0.0)
 }
@@ -3486,6 +3574,10 @@ fn configured_details_horizontal_scroll_area(
     use egui::containers::scroll_area::{ScrollBarVisibility, ScrollSource};
 
     let area = egui::ScrollArea::horizontal()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .auto_shrink([false, false])
         .scroll_bar_visibility(if policy.overflow {
             ScrollBarVisibility::AlwaysVisible
@@ -4029,6 +4121,10 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
         TS::SmartFolders => "スマートフォルダ",
         TS::Tags => "タグ",
         TS::Folder => "フォルダバー",
+        TS::SearchEverything => "Everything 検索欄",
+        TS::SearchMetadata => "アイテム検索欄",
+        TS::SearchLocal => "現在地の絞り込み欄",
+        TS::SearchContainer => "コンテナ検索欄",
         TS::Unknown => "",
     }
 }
@@ -4136,7 +4232,7 @@ fn draw_toolbar_drop_indicator(
     // パネルより前面に描く (セパレータやボタンに隠れないように)。
     let painter = ui.ctx().layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
-        egui::Id::new("toolbar_drop_indicator"),
+        egui::Id::unique("toolbar_drop_indicator"),
     ));
     painter.line_segment([egui::pos2(x, top), egui::pos2(x, bottom)], stroke);
     // I 字の上下キャップ。
@@ -4169,6 +4265,10 @@ fn set_toolbar_section_visible(
         TS::SmartFolders => settings.show_toolbar_smart_folders = visible,
         TS::Tags => settings.show_toolbar_tags = visible,
         TS::Folder => settings.show_toolbar_folder = visible,
+        TS::SearchEverything => settings.show_toolbar_search_everything = visible,
+        TS::SearchMetadata => settings.show_toolbar_search_metadata = visible,
+        TS::SearchLocal => settings.show_toolbar_search_local = visible,
+        TS::SearchContainer => settings.show_toolbar_search_container = visible,
         TS::Unknown => {}
     }
 }
@@ -4281,6 +4381,20 @@ fn adjusted_book_reorder_group_insert_index(
         .filter(|idx| **idx < insert_index)
         .count();
     insert_index.saturating_sub(removed_before)
+}
+
+fn book_reorder_group_move_changes_order(
+    state: &crate::app::BookReorderState,
+    insert_index: usize,
+) -> bool {
+    let indices = selected_book_reorder_indices(&state.entries, &state.selected_keys);
+    let Some(&first) = indices.first() else {
+        return false;
+    };
+    let contiguous = indices.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    !contiguous
+        || adjusted_book_reorder_group_insert_index(&indices, insert_index, state.entries.len())
+            != first
 }
 
 fn move_selected_book_reorder_group(
@@ -4650,7 +4764,7 @@ mod details_text_clip_tests {
         assert_eq!(details_item_content_opacity(false, false), 1.0);
 
         let ctx = egui::Context::default();
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -4659,26 +4773,28 @@ mod details_text_clip_tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let mut painter = ui.painter().clone();
-                        painter.multiply_opacity(details_item_content_opacity(false, true));
-                        draw_details_text_with_painter(
-                            ui,
-                            &painter,
-                            egui::Rect::from_min_size(
-                                egui::pos2(10.0, 10.0),
-                                egui::vec2(200.0, 36.0),
-                            ),
-                            "cut.jpg",
-                            egui::Align2::LEFT_CENTER,
-                            egui::Color32::WHITE,
-                            false,
-                        );
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let mut painter = ui.painter().clone();
+                            painter.multiply_opacity(details_item_content_opacity(false, true));
+                            draw_details_text_with_painter(
+                                ui,
+                                &painter,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(10.0, 10.0),
+                                    egui::vec2(200.0, 36.0),
+                                ),
+                                "cut.jpg",
+                                egui::Align2::LEFT_CENTER,
+                                egui::Color32::WHITE,
+                                false,
+                            );
+                        })
+                });
             },
-        );
+        ));
         let mut alpha = Vec::new();
         for clipped in &output.shapes {
             collect_text_alpha(&clipped.shape, &mut alpha);
@@ -4687,12 +4803,14 @@ mod details_text_clip_tests {
             alpha.iter().any(|alpha| (127..=128).contains(alpha)),
             "details content text must be painted at 0.5 opacity: {alpha:?}"
         );
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
     fn details_name_cut_paint_is_opaque_while_other_columns_remain_dimmed() {
         let ctx = egui::Context::default();
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -4701,44 +4819,46 @@ mod details_text_clip_tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let painter = ui.painter().clone();
-                        let mut content = painter.clone();
-                        content.multiply_opacity(details_item_content_opacity(false, true));
-                        draw_details_name_text(
-                            ui,
-                            &painter,
-                            egui::Rect::from_min_size(
-                                egui::pos2(10.0, 10.0),
-                                egui::vec2(300.0, 32.0),
-                            ),
-                            "cut.jpg",
-                            Some(crate::details_name_colors::DetailsNameCategory::Image),
-                            &crate::details_name_colors::DetailsNameColors::default(),
-                            DetailsRowVisualState {
-                                selected: false,
-                                checked: false,
-                                hovered: false,
-                            },
-                            false,
-                        );
-                        draw_details_text_with_painter(
-                            ui,
-                            &content,
-                            egui::Rect::from_min_size(
-                                egui::pos2(10.0, 45.0),
-                                egui::vec2(300.0, 32.0),
-                            ),
-                            "JPEG",
-                            egui::Align2::LEFT_CENTER,
-                            ui.visuals().text_color(),
-                            false,
-                        );
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let painter = ui.painter().clone();
+                            let mut content = painter.clone();
+                            content.multiply_opacity(details_item_content_opacity(false, true));
+                            draw_details_name_text(
+                                ui,
+                                &painter,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(10.0, 10.0),
+                                    egui::vec2(300.0, 32.0),
+                                ),
+                                "cut.jpg",
+                                Some(crate::details_name_colors::DetailsNameCategory::Image),
+                                &crate::details_name_colors::DetailsNameColors::default(),
+                                DetailsRowVisualState {
+                                    selected: false,
+                                    checked: false,
+                                    hovered: false,
+                                },
+                                false,
+                            );
+                            draw_details_text_with_painter(
+                                ui,
+                                &content,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(10.0, 45.0),
+                                    egui::vec2(300.0, 32.0),
+                                ),
+                                "JPEG",
+                                egui::Align2::LEFT_CENTER,
+                                ui.visuals().text_color(),
+                                false,
+                            );
+                        })
+                });
             },
-        );
+        ));
         let mut alpha = Vec::new();
         for clipped in &output.shapes {
             collect_text_alpha(&clipped.shape, &mut alpha);
@@ -4748,6 +4868,8 @@ mod details_text_clip_tests {
             alpha.iter().any(|a| (127..=128).contains(a)),
             "other columns retain cut opacity: {alpha:?}"
         );
+
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -4773,18 +4895,20 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 pixels.push(color);
             }
         }
-        ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        ThumbnailState::loaded_raster(
+            crate::ui_helpers::load_snapshot_texture(
+                ctx,
                 "cut-item-appearance-snapshot",
                 egui::ColorImage::new(size, pixels),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 160,
-            source_dims: Some((1920, 1200)),
-            layout_dims: None,
-        }
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            160,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1920, 1200)),
+            None,
+        )
     }
 
     fn draw_thumbnail_sample(
@@ -6217,6 +6341,10 @@ fn draw_details_column_menu_layout(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .max_height(body_height)
                     .auto_shrink([true, false])
                     .show(ui, |ui| {
@@ -6279,7 +6407,7 @@ fn draw_details_column_menu_layout(
         #[cfg(test)]
         content_size: output.content_size,
         #[cfg(test)]
-        scroll_offset: output.state.offset,
+        scroll_offset: output.state.clamped_offset(),
     }
 }
 
@@ -6366,10 +6494,12 @@ mod details_column_context_menu_layout_tests {
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_pixels_per_point(1.25)
             .with_size(egui::vec2(900.0, 900.0))
-            .build(move |ctx| {
-                let area = egui::Area::new(egui::Id::new(0xD37A_11_u64))
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                let area = egui::Area::new(egui::Id::unique(0xD37A_11_u64))
                     .fixed_pos(egui::pos2(0.0, 0.3))
                     .movable(false)
                     .default_size(egui::vec2(500.0, 120.0))
@@ -6414,9 +6544,11 @@ mod details_column_context_menu_layout_tests {
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(900.0, 200.0))
-            .build(move |ctx| {
-                let area = egui::Area::new(egui::Id::new(0xD37A_12_u64))
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                let area = egui::Area::new(egui::Id::unique(0xD37A_12_u64))
                     .fixed_pos(egui::pos2(0.0, 0.0))
                     .movable(false)
                     .default_size(egui::vec2(500.0, 500.0))
@@ -6453,9 +6585,11 @@ mod details_column_context_menu_layout_tests {
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1200.0, 700.0))
-            .build(move |ctx| {
-                let area = egui::Area::new(egui::Id::new("details_column_menu_layout_test"))
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                let area = egui::Area::new(egui::Id::unique("details_column_menu_layout_test"))
                     .fixed_pos(egui::pos2(0.0, 0.0))
                     .movable(false)
                     .default_size(egui::vec2(1200.0, 650.0))
@@ -6707,9 +6841,10 @@ mod collection_order_mode_menu_tests {
         let app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(520.0, 240.0))
-            .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui(move |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let root = render_app
                         .borrow()
                         .collection_grid_root_order()
@@ -6838,6 +6973,8 @@ mod fixed_sort_control_tests {
                 ToolbarSectionDisplay::Buttons
             };
             app.load_folder_with_scan(folder, None);
+            // Production sanitizes pointer input during hydration; this harness must settle it first.
+            app.finish_page_identity_preparation_for_test();
             assert!(app.grid_sort_lock_reason().is_none());
             let app = Rc::new(RefCell::new(app));
             let render_app = Rc::clone(&app);
@@ -6845,15 +6982,19 @@ mod fixed_sort_control_tests {
             SORT_CONTROL_TEST_RELOADS.with(|count| count.set(0));
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1700.0, 500.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_set.replace(true) {
                         crate::ui_fonts::configure_fonts(ctx);
                         ctx.request_repaint();
                         return;
                     }
-                    render_app.borrow_mut().render_menubar(ctx);
-                    render_app.borrow_mut().render_toolbar(ctx);
-                    render_app.borrow_mut().render_facet_filter_bar(ctx);
+                    render_app
+                        .borrow_mut()
+                        .note_main_chrome_pointer_block_transition(ctx);
+                    render_app.borrow_mut().render_menubar(root_ui);
+                    render_app.borrow_mut().render_toolbar(root_ui);
+                    render_app.borrow_mut().render_facet_filter_bar(root_ui);
                 });
             harness.run();
             harness.run();
@@ -6867,12 +7008,13 @@ mod fixed_sort_control_tests {
                         .expect("rating sort combo")
                         .click();
                     harness.run();
+                    assert!(!app.borrow().main_chrome_pointer_blocked());
                     harness.get_all_by_label("評価↓").last().unwrap().click();
                 }
                 "menu" => {
                     harness.get_all_by_label("設定").next().unwrap().click();
                     harness.run();
-                    harness.get_by_label("ソート順 ⏵").click();
+                    harness.get_by_label("ソート順").click();
                     harness.run();
                     harness.get_by_label("✓ 評価（高い順）").click();
                 }
@@ -6941,14 +7083,15 @@ mod fixed_sort_control_tests {
         let fonts_set = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1280.0, 800.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_set.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
                     return;
                 }
-                render_app.borrow_mut().render_menubar(ctx);
-                render_app.borrow_mut().render_toolbar(ctx);
+                render_app.borrow_mut().render_menubar(root_ui);
+                render_app.borrow_mut().render_toolbar(root_ui);
             });
         harness.run();
         harness.run();
@@ -7027,7 +7170,7 @@ mod fixed_sort_control_tests {
             .expect("Settings menu")
             .click();
         harness.run();
-        harness.get_by_label("ソート順 ⏵").click();
+        harness.get_by_label("ソート順").click();
         harness.run();
         for label in ["  評価（低い順）", "  評価（高い順）"] {
             let row = harness.get_by_label(label);
@@ -7055,9 +7198,9 @@ mod fixed_sort_control_tests {
             .expect("Collections menu")
             .click();
         harness.run();
-        harness.get_by_label("現在のコレクションの並び順 ⏵").click();
+        harness.get_by_label("現在のコレクションの並び順").click();
         harness.run();
-        harness.get_by_label("通常ソート ⏵").click();
+        harness.get_by_label("通常ソート").click();
         harness.run();
         for label in ["  評価（低い順）", "  評価（高い順）"] {
             let row = harness.get_by_label(label);
@@ -7108,13 +7251,14 @@ mod fixed_sort_control_tests {
         let fonts_set = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1700.0, 500.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_set.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
                     return;
                 }
-                render_app.borrow_mut().render_toolbar(ctx);
+                render_app.borrow_mut().render_toolbar(root_ui);
             });
         harness.run();
         harness.run();
@@ -7151,14 +7295,15 @@ mod fixed_sort_control_tests {
         SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().clear());
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1500.0, 500.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_set.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
                     return;
                 }
-                render_app.borrow_mut().render_menubar(ctx);
-                render_app.borrow_mut().render_toolbar(ctx);
+                render_app.borrow_mut().render_menubar(root_ui);
+                render_app.borrow_mut().render_toolbar(root_ui);
             });
         harness.run();
         harness.run();
@@ -7200,7 +7345,8 @@ impl App {
     }
 
     /// メニューバーを描画し、ナビゲーション先とソート変更の有無を返す。
-    pub(crate) fn render_menubar(&mut self, ctx: &egui::Context) -> (Option<PathBuf>, bool) {
+    pub(crate) fn render_menubar(&mut self, root_ui: &mut egui::Ui) -> (Option<PathBuf>, bool) {
+        let ctx = &root_ui.ctx().clone();
         let mut fav_nav: Option<PathBuf> = None;
         let mut smart_folder_open: Option<uuid::Uuid> = None;
         let mut settings_changed = false;
@@ -7366,7 +7512,8 @@ impl App {
             .menu_command_label(MenuCommandId::HelpShowWhatsNew);
         let help_about_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpAbout);
 
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+        egui::Panel::top("menubar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             egui::MenuBar::new().ui(ui, |ui| {
                 let mut top_menu_responses = Vec::with_capacity(9);
 
@@ -7471,7 +7618,7 @@ impl App {
                                         }
                                         MenuCommandId::GlobalEverythingSearch => {
                                             let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
-                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                            if crate::global_search_ui::everything_search_menu_button(ui, &label, self.everything_search_entry_availability()).clicked() {
                                                 self.open_everything_search();
                                                 ui.close();
                                             }
@@ -7552,7 +7699,7 @@ impl App {
                                         }
                                         MenuCommandId::GlobalEverythingSearch => {
                                             let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
-                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                            if crate::global_search_ui::everything_search_menu_button(ui, &label, self.everything_search_entry_availability()).clicked() {
                                                 self.open_everything_search();
                                                 ui.close();
                                             }
@@ -7667,6 +7814,17 @@ impl App {
                             let response = ui.menu_button(TopMenuId::Books.label(), |ui| {
                                 let active_name = self.active_book_name();
                                 ui.label(format!("追加先の本: {active_name}"));
+                                // Current reader scope, independent of selection and page
+                                // count: an empty/all-hidden book still has this entrance.
+                                let can_edit_composition = self.composition_editor_available();
+                                if ui.add_enabled(can_edit_composition, egui::Button::new("本の構成を編集"))
+                                    .on_disabled_hover_text("現在開いている書庫・PDF・EPUB の本で使えます")
+                                    .clicked()
+                                {
+                                    self.start_local_composition_editor(ctx);
+                                    ui.close();
+                                }
+                                ui.separator();
                                 let has_selection = self.grid_item_input_allowed()
                                     && (self.selected.is_some() || !self.checked.is_empty());
                                 for &command in books_menu_commands {
@@ -7733,7 +7891,7 @@ impl App {
                                     }
                                 }
                                 ui.separator();
-                                if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+                                if self.book_list_cache.is_none() && self.book_op_pending.is_none() && self.book_structural_op.is_none() {
                                     self.request_book_list_refresh();
                                 }
                                 let rows = self.book_list_cache.clone();
@@ -7751,9 +7909,7 @@ impl App {
                                                     format!("{} ({}p)", row.name, row.page_count)
                                                 };
                                                 if ui.button(label).clicked() {
-                                                    self.settings.active_book_name = row.name.clone();
-                                                    self.settings.save();
-                                                    self.book_manager_rename_name = row.name;
+                                                    self.select_book_append_target(row.name);
                                                     ui.close();
                                                 }
                                             }
@@ -8522,30 +8678,7 @@ impl App {
                                                 )
                                                 .clicked()
                                             {
-                                                // 現行版のエントリ。無ければ現行版以下の最新エントリに
-                                                // フォールバック (次版エントリを先に埋め込んでも未来の
-                                                // 変更点を表示しない)。
-                                                let mut entries =
-                                                    crate::version_highlights::for_version(
-                                                        env!("CARGO_PKG_VERSION"),
-                                                        crate::version_highlights::table(),
-                                                    );
-                                                if entries.is_empty() {
-                                                    if let Some(latest) =
-                                                        crate::version_highlights::latest_not_newer_than(
-                                                            env!("CARGO_PKG_VERSION"),
-                                                            crate::version_highlights::table(),
-                                                        )
-                                                    {
-                                                        entries = vec![latest];
-                                                    }
-                                                }
-                                                // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
-                                                // ショートカットを塞がないよう、開かない (Codex P3)。
-                                                if !entries.is_empty() {
-                                                    self.whats_new_entries = entries;
-                                                    self.show_whats_new = true;
-                                                }
+                                                self.request_whats_new_from_help();
                                                 ui.close();
                                             }
                                         }
@@ -8631,13 +8764,34 @@ impl App {
         (fav_nav, sort_changed)
     }
 
+    /// Accepted target changes share a boundary across menu, manager, and
+    /// toolbar. Reselecting the same effective folder is a read-only no-op.
+    pub(crate) fn select_book_append_target(&mut self, name: String) -> bool {
+        let name = crate::books::normalize_book_name(&name);
+        if name.is_empty()
+            || crate::folder_tree::path_eq(
+                &crate::books::book_folder(&self.book_root_path(), &name),
+                &self.active_book_folder_path(),
+            )
+        {
+            return false;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
+        self.settings.active_book_name = name.clone();
+        self.settings.save();
+        self.book_manager_rename_name = name;
+        true
+    }
+
     pub(crate) fn open_book_reorder_from_current(&mut self) {
         let Some(folder) = self.current_folder.clone() else {
-            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            self.show_feedback_warning("本フォルダを開いてから並べ替えてください".to_string());
             return;
         };
         if !crate::books::is_direct_book_folder(&self.book_root_path(), &folder) {
-            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            self.show_feedback_warning("本フォルダを開いてから並べ替えてください".to_string());
             return;
         }
         let entries: Vec<crate::books::BookPageEntry> = self
@@ -8663,7 +8817,7 @@ impl App {
             })
             .collect();
         if entries.is_empty() {
-            self.show_feedback_toast("並べ替えできるページがありません".to_string());
+            self.show_feedback_warning("並べ替えできるページがありません".to_string());
             return;
         }
         let mut selected_keys = HashSet::new();
@@ -8688,9 +8842,7 @@ impl App {
             dirty: false,
             drag_insert_index: None,
             thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
-            flush_pending: None,
             transfer_target_book: String::new(),
-            transfer_pending: None,
             error: None,
         });
         self.book_list_cache = None;
@@ -8701,7 +8853,10 @@ impl App {
         if !self.show_book_manager {
             return;
         }
-        if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+        if self.book_list_cache.is_none()
+            && self.book_op_pending.is_none()
+            && self.book_structural_op.is_none()
+        {
             self.request_book_list_refresh();
         }
         let mut open = true;
@@ -8712,7 +8867,7 @@ impl App {
         let mut delete_request: Option<String> = None;
         let mut refresh_request = false;
         let default_pos = ctx.content_rect().center() - egui::vec2(250.0, 220.0);
-        egui::Window::new("製本の管理")
+        egui::Window::new("製本の管理").drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(true)
             .default_pos(default_pos)
@@ -8733,15 +8888,16 @@ impl App {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("新しい本");
+                    let name_label = ui.label("新しい本");
                     crate::ime_focus::add_singleline(
                         ui,
                         &mut self.book_manager_new_name,
                         None,
                         |edit| edit,
-                    );
+                    )
+                    .labelled_by(name_label.id);
                     let name = crate::books::normalize_book_name(&self.book_manager_new_name);
-                    let can_create = !name.trim().is_empty() && self.book_op_pending.is_none();
+                    let can_create = !name.trim().is_empty() && self.book_op_pending.is_none() && self.book_structural_op.is_none();
                     if ui
                         .add_enabled(can_create, egui::Button::new("作成"))
                         .clicked()
@@ -8758,12 +8914,12 @@ impl App {
                             "操作カスタマイズの「本1〜20を開く」で使う番号です。\n名前順のため、追加・名前変更・削除で番号が変わります。",
                         );
                     if ui
-                        .add_enabled(self.book_op_pending.is_none(), egui::Button::new("更新"))
+                        .add_enabled(self.book_op_pending.is_none() && self.book_structural_op.is_none(), egui::Button::new("更新"))
                         .clicked()
                     {
                         refresh_request = true;
                     }
-                    if self.book_op_pending.is_some() {
+                    if self.book_op_pending.is_some() || self.book_structural_op.is_some() {
                         ui.label(egui::RichText::new("処理中…").weak());
                     }
                 });
@@ -8777,7 +8933,7 @@ impl App {
                             rows.iter().map(|row| row.name.clone()).collect();
                         self.book_manager_rename_inputs
                             .retain(|name, _| row_names.contains(name));
-                        egui::ScrollArea::vertical()
+                        egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                             .max_height(360.0)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
@@ -8817,7 +8973,7 @@ impl App {
                                             .book_manager_rename_inputs
                                             .entry(row.name.clone())
                                             .or_insert_with(|| row.name.clone());
-                                        crate::ime_focus::add_singleline(
+                                        let name_response = crate::ime_focus::add_singleline(
                                             ui,
                                             input,
                                             None,
@@ -8826,7 +8982,7 @@ impl App {
                                         let new_name = crate::books::normalize_book_name(input);
                                         let can_rename = !new_name.is_empty()
                                             && new_name != row.name
-                                            && self.book_op_pending.is_none();
+                                            && self.book_op_pending.is_none() && self.book_structural_op.is_none();
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
@@ -8835,7 +8991,7 @@ impl App {
                                                 }
                                                 if ui
                                                     .add_enabled(
-                                                        self.book_op_pending.is_none(),
+                                                        self.book_op_pending.is_none() && self.book_structural_op.is_none(),
                                                         egui::Button::new("削除"),
                                                     )
                                                     .clicked()
@@ -8845,20 +9001,20 @@ impl App {
                                                 }
                                                 if ui
                                                     .add_enabled(
-                                                        !active && self.book_op_pending.is_none(),
+                                                        !active && self.book_op_pending.is_none() && self.book_structural_op.is_none(),
                                                         egui::Button::new("追加先の本にする"),
                                                     )
                                                     .clicked()
                                                 {
                                                     set_active_request = Some(row.name.clone());
                                                 }
-                                                if ui
+                                                let rename_response = ui
                                                     .add_enabled(
                                                         can_rename,
                                                         egui::Button::new("名前変更"),
-                                                    )
-                                                    .clicked()
-                                                {
+                                                    );
+                                                name_response.clone().labelled_by(rename_response.id);
+                                                if rename_response.clicked() {
                                                     rename_request =
                                                         Some((row.name.clone(), new_name.clone()));
                                                 }
@@ -8890,7 +9046,7 @@ impl App {
         if let Some(name) = self.book_manager_delete_confirm.clone() {
             let mut close_confirm = false;
             let mut confirmed = false;
-            let response = egui::Modal::new(egui::Id::new("book_manager_delete_confirm_modal"))
+            let response = egui::Modal::new(egui::Id::unique("book_manager_delete_confirm_modal"))
                 .show(ctx, |ui| {
                     ui.set_min_width(420.0);
                     ui.heading("本を削除");
@@ -8905,7 +9061,10 @@ impl App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(self.book_op_pending.is_none(), egui::Button::new("削除"))
+                            .add_enabled(
+                                self.book_op_pending.is_none() && self.book_structural_op.is_none(),
+                                egui::Button::new("削除"),
+                            )
                             .clicked()
                         {
                             confirmed = true;
@@ -8936,9 +9095,7 @@ impl App {
             }
         }
         if let Some(name) = set_active_request {
-            self.settings.active_book_name = name.clone();
-            self.settings.save();
-            self.book_manager_rename_name = name;
+            self.select_book_append_target(name);
         }
         if let Some(name) = pin_toggle_request {
             if let Some(pos) = self.settings.pinned_books.iter().position(|b| b == &name) {
@@ -8962,176 +9119,9 @@ impl App {
     }
 
     pub(crate) fn draw_book_reorder(&mut self, ctx: &egui::Context) {
-        enum CompletedBookReorderOp {
-            Flush(Result<crate::books::BookOpResult, String>),
-            Transfer(Result<crate::books::BookOpResult, String>),
-        }
-
-        let mut completed: Option<CompletedBookReorderOp> = None;
-        if let Some(state) = self.book_reorder.as_mut() {
-            if let Some(pending) = state.flush_pending.as_ref() {
-                match pending.rx.try_recv() {
-                    Ok(result) => completed = Some(CompletedBookReorderOp::Flush(result)),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        completed = Some(CompletedBookReorderOp::Flush(Err(
-                            "並べ替え保存が中断されました".to_string(),
-                        )));
-                    }
-                }
-            }
-            if completed.is_none()
-                && let Some(pending) = state.transfer_pending.as_ref()
-            {
-                match pending.rx.try_recv() {
-                    Ok(result) => completed = Some(CompletedBookReorderOp::Transfer(result)),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        completed = Some(CompletedBookReorderOp::Transfer(Err(
-                            "ページ転送が中断されました".to_string(),
-                        )));
-                    }
-                }
-            }
-        } else {
+        if self.book_reorder.is_none() {
             return;
         }
-        if let Some(result) = completed {
-            match result {
-                CompletedBookReorderOp::Flush(result) => {
-                    if let Some(state) = self.book_reorder.as_mut() {
-                        state.flush_pending = None;
-                    }
-                    match result {
-                        Ok(crate::books::BookOpResult::Reordered {
-                            folder,
-                            count,
-                            edit_moves,
-                            bookmark_migration_journal_id,
-                        }) => {
-                            self.apply_book_page_edit_moves_with_journal(
-                                &edit_moves,
-                                bookmark_migration_journal_id.as_deref(),
-                                None,
-                            );
-                            self.book_reorder = None;
-                            if self.current_folder.as_ref().is_some_and(|current| {
-                                crate::folder_tree::path_eq(current, &folder)
-                            }) {
-                                self.pending_reload = true;
-                            }
-                            self.show_feedback_toast(format!(
-                                "ページ順を保存しました: {count} ページ"
-                            ));
-                            return;
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            if let Some(state) = self.book_reorder.as_ref() {
-                                crate::logger::log(format!(
-                                    "book reorder flush failed for {}: {err}",
-                                    state.folder.display()
-                                ));
-                            }
-                            if let Some(state) = self.book_reorder.as_mut() {
-                                state.error = Some(err.clone());
-                            }
-                            self.show_feedback_toast(format!(
-                                "ページ順の保存に失敗しました: {err}"
-                            ));
-                            ctx.request_repaint();
-                            return;
-                        }
-                    }
-                }
-                CompletedBookReorderOp::Transfer(result) => {
-                    if let Some(state) = self.book_reorder.as_mut() {
-                        state.transfer_pending = None;
-                    }
-                    match result {
-                        Ok(crate::books::BookOpResult::Transfer(summary)) => {
-                            self.apply_book_page_edit_moves_with_journal(
-                                &summary.edit_moves,
-                                summary.bookmark_migration_journal_id.as_deref(),
-                                None,
-                            );
-                            self.apply_book_page_edit_copies(&summary.edit_copies);
-                            self.book_list_cache = None;
-                            if self.current_folder.as_ref().is_some_and(|current| {
-                                crate::folder_tree::path_eq(current, &summary.source_folder)
-                                    || crate::folder_tree::path_eq(current, &summary.target_folder)
-                            }) {
-                                self.pending_reload = true;
-                            }
-                            let verb = match summary.kind {
-                                crate::books::BookTransferKind::Copy => "コピー",
-                                crate::books::BookTransferKind::Move => "移動",
-                            };
-                            let toast = format!(
-                                "「{}」へ {} ページ{}しました",
-                                summary.target_book_name, summary.pages, verb
-                            );
-                            let mut close_empty_reorder = false;
-                            if let Some(state) = self.book_reorder.as_mut() {
-                                state.entries = summary.source_entries;
-                                state.dirty = false;
-                                state.dragging = None;
-                                state.drag_auto_scroll_enabled = false;
-                                state.drag_insert_index = None;
-                                state.thumb_textures.clear();
-                                state.thumb_failed.clear();
-                                state.thumb_pending_keys.clear();
-                                state.thumb_upload_backlog.clear();
-                                state.thumb_tx = None;
-                                state.thumb_rx = None;
-                                state.selected_keys.clear();
-                                if state.entries.is_empty() {
-                                    close_empty_reorder = true;
-                                } else {
-                                    let index = state
-                                        .selected
-                                        .unwrap_or(0)
-                                        .min(state.entries.len().saturating_sub(1));
-                                    book_reorder_select_single(state, index);
-                                }
-                            }
-                            if close_empty_reorder {
-                                self.book_reorder = None;
-                            }
-                            self.show_feedback_toast(toast);
-                            ctx.request_repaint();
-                            return;
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            let mut reload_current = false;
-                            if let Some(state) = self.book_reorder.as_ref() {
-                                reload_current =
-                                    self.current_folder.as_ref().is_some_and(|current| {
-                                        crate::folder_tree::path_eq(current, &state.folder)
-                                    });
-                                crate::logger::log(format!(
-                                    "book page transfer failed for {}: {err}",
-                                    state.folder.display()
-                                ));
-                            }
-                            self.book_reorder = None;
-                            if reload_current {
-                                self.pending_reload = true;
-                            }
-                            self.show_feedback_toast(format!("ページ転送に失敗しました: {err}"));
-                            ctx.request_repaint();
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
         let mut thumb_results = Vec::new();
         let mut thumb_disconnected = false;
         if let Some(state) = self.book_reorder.as_ref()
@@ -9199,7 +9189,10 @@ impl App {
             ctx.request_repaint();
         }
 
-        if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+        if self.book_list_cache.is_none()
+            && self.book_op_pending.is_none()
+            && self.book_structural_op.is_none()
+        {
             self.request_book_list_refresh();
         }
         let book_rows = self.book_list_cache.clone().unwrap_or_default();
@@ -9245,8 +9238,15 @@ impl App {
             })
             .unwrap_or_else(|| "ページ並べ替え".to_string());
         let mut window_open = true;
+        // The window borrows its document locally so successful draft changes
+        // can use App admission before mutation. Admission only checks the
+        // existing book intent and expires the receipt; it cannot re-enter UI.
+        let Some(mut reorder_state) = self.book_reorder.take() else {
+            return;
+        };
         egui::Window::new(title)
-            .id(egui::Id::new("book_reorder_window"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("book_reorder_window"))
             .open(&mut window_open)
             .collapsible(false)
             .resizable(true)
@@ -9259,10 +9259,8 @@ impl App {
                 BOOK_REORDER_MIN_WINDOW_H,
             ))
             .show(ctx, |ui| {
-                let Some(state) = self.book_reorder.as_mut() else {
-                    return;
-                };
-                let busy = state.flush_pending.is_some() || state.transfer_pending.is_some();
+                let state = &mut reorder_state;
+                let busy = self.book_structural_op.is_some();
                 ensure_book_reorder_selection(state);
                 if let Some(err) = &state.error {
                     ui.colored_label(egui::Color32::from_rgb(210, 80, 80), err);
@@ -9287,7 +9285,9 @@ impl App {
                         .on_hover_text("左へ移動")
                         .clicked()
                     {
-                        if move_selected_book_reorder_by(state, -1) {
+                        if self.admit_book_append_followup_mutation()
+                            && move_selected_book_reorder_by(state, -1)
+                        {
                             state.dirty = true;
                         }
                     }
@@ -9296,7 +9296,9 @@ impl App {
                         .on_hover_text("右へ移動")
                         .clicked()
                     {
-                        if move_selected_book_reorder_by(state, 1) {
+                        if self.admit_book_append_followup_mutation()
+                            && move_selected_book_reorder_by(state, 1)
+                        {
                             state.dirty = true;
                         }
                     }
@@ -9363,6 +9365,7 @@ impl App {
                                 );
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&combo.response, "移動先の本");
                     if egui::ComboBox::is_open(ctx, combo.response.id) {
                         transfer_combo_open = true;
                         consume_wheel_input(ctx);
@@ -9428,7 +9431,7 @@ impl App {
                         }
                     }
                     if busy {
-                        let label = if state.transfer_pending.is_some() {
+                        let label = if self.book_structural_op.is_some() {
                             "転送中…"
                         } else {
                             "保存中…"
@@ -9484,12 +9487,20 @@ impl App {
                     |ui| {
                         ui.set_min_width(scroll_width);
                         ui.set_min_height(scroll_height);
-                        let scroll_output = egui::ScrollArea::vertical()
-                            .id_salt("book_reorder_thumb_scroll")
-                            .vertical_scroll_offset(state.scroll_offset_y)
-                            .max_height(scroll_height)
-                            .auto_shrink([false, false])
-                            .show_rows(ui, row_height, rows.max(1), |ui, row_range| {
+                        let scroll_output = crate::ui_helpers::show_fixed_slot_rows(
+                            ui,
+                            egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
+                                .id_salt("book_reorder_thumb_scroll")
+                                .vertical_scroll_offset(state.scroll_offset_y)
+                                .max_height(scroll_height)
+                                .auto_shrink([false, false]),
+                            row_height,
+                            rows.max(1),
+                            |ui, row_range| {
                                 egui::Grid::new("book_reorder_thumb_grid")
                                     .num_columns(cols)
                                     .spacing(egui::vec2(gap, gap))
@@ -9705,8 +9716,9 @@ impl App {
                                             ui.end_row();
                                         }
                                     });
-                            });
-                        state.scroll_offset_y = scroll_output.state.offset.y;
+                            },
+                        );
+                        state.scroll_offset_y = scroll_output.state.clamped_offset().y;
                         if !busy
                             && !pointer_released
                             && state.dragging.is_some()
@@ -9732,7 +9744,10 @@ impl App {
                 if let Some((src, insert_index)) = move_request {
                     let len = state.entries.len();
                     if src < len {
-                        if move_selected_book_reorder_group(state, insert_index) {
+                        if book_reorder_group_move_changes_order(state, insert_index)
+                            && self.admit_book_append_followup_mutation()
+                            && move_selected_book_reorder_group(state, insert_index)
+                        {
                             state.dirty = true;
                         }
                     }
@@ -9745,12 +9760,13 @@ impl App {
                     state.drag_insert_index = None;
                 }
             });
+        self.book_reorder = Some(reorder_state);
         if !window_open
             && save_request.is_none()
             && !close
             && let Some(state) = self.book_reorder.as_ref()
         {
-            let busy = state.flush_pending.is_some() || state.transfer_pending.is_some();
+            let busy = self.book_structural_op.is_some();
             if !busy {
                 if state.dirty {
                     let paths = state.entries.iter().map(|e| e.path.clone()).collect();
@@ -9835,7 +9851,7 @@ impl App {
             }
         }
         if let Some((folder, current_order, selected_paths, target_book, kind)) = transfer_request {
-            if let Some(pending) = self.start_book_transfer(
+            if self.start_book_transfer(
                 ctx,
                 folder,
                 current_order,
@@ -9844,15 +9860,13 @@ impl App {
                 kind,
             ) {
                 if let Some(state) = self.book_reorder.as_mut() {
-                    state.transfer_pending = Some(pending);
                     state.error = None;
                 }
             }
         }
         if let Some((folder, paths)) = save_request {
-            if let Some(pending) = self.start_book_reorder_flush(ctx, folder, paths) {
+            if self.start_book_reorder_flush(ctx, folder, paths) {
                 if let Some(state) = self.book_reorder.as_mut() {
-                    state.flush_pending = Some(pending);
                     state.error = None;
                 }
             }
@@ -9865,7 +9879,8 @@ impl App {
     // ── 選択件数 ─────────────────────────────────────────────────────
 
     /// チェック済みがある間だけ、メイン一覧の右上に件数と解除操作を表示する。
-    pub(crate) fn render_checked_selection_overlay(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_checked_selection_overlay(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         let checked_count = self.checked.len();
         if checked_count == 0 {
             return;
@@ -9873,7 +9888,9 @@ impl App {
         if self.viewer_session_blocks_main_window() || self.any_dialog_open() {
             return;
         }
-        if show_checked_selection_overlay(ctx, checked_count) && self.grid_item_input_allowed() {
+        if show_checked_selection_overlay(ctx, root_ui.available_rect_before_wrap(), checked_count)
+            && self.grid_item_input_allowed()
+        {
             self.checked.clear();
         }
     }
@@ -9888,7 +9905,7 @@ impl App {
             return;
         }
 
-        egui::Area::new("progress_overlay".into())
+        egui::Area::new(egui::Id::unique("progress_overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
@@ -9985,7 +10002,7 @@ impl App {
             -8.0
         };
 
-        egui::Area::new("container_enumerate_overlay".into())
+        egui::Area::new(egui::Id::unique("container_enumerate_overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, y_offset))
@@ -10026,7 +10043,7 @@ impl App {
         let Some(message) = self.collection_grid_stale_error_message() else {
             return;
         };
-        egui::Area::new("collection_grid_error_overlay".into())
+        egui::Area::new(egui::Id::unique("collection_grid_error_overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
@@ -10048,7 +10065,7 @@ impl App {
         if !self.location_navigation_pending() {
             return;
         }
-        egui::Area::new("location_navigation_wait_overlay".into())
+        egui::Area::new(egui::Id::unique("location_navigation_wait_overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -10088,8 +10105,10 @@ impl App {
     /// ソート変更があった場合はフォルダの再ロードも行う。
     pub(crate) fn render_toolbar(
         &mut self,
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
     ) -> (Option<PathBuf>, Option<AddressBarNav>) {
+        let ctx = &root_ui.ctx().clone();
+        self.prepare_pinned_search_frame(ctx);
         if !self.settings.show_toolbar_folder {
             self.address_has_focus = false;
         }
@@ -10133,7 +10152,11 @@ impl App {
             .collect::<Vec<_>>();
         let sort_lock = self.grid_sort_lock_reason();
         let root_order = self.collection_grid_root_order().and_then(Result::ok);
-        if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+        if show_bookshelf
+            && self.book_list_cache.is_none()
+            && self.book_op_pending.is_none()
+            && self.book_structural_op.is_none()
+        {
             self.request_book_list_refresh();
         }
         let active_book_name = self.active_book_name();
@@ -10160,6 +10183,10 @@ impl App {
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
                         TS::Folder => show_folder,
+                        TS::SearchContainer => self.settings.show_toolbar_search_container,
+                        TS::SearchLocal => self.settings.show_toolbar_search_local,
+                        TS::SearchMetadata => self.settings.show_toolbar_search_metadata,
+                        TS::SearchEverything => self.settings.show_toolbar_search_everything,
                         TS::Unknown => false,
                     }
                 })
@@ -10179,12 +10206,16 @@ impl App {
             || show_smart_folders
             || show_rating
             || show_tags
-            || self.settings.show_toolbar_folder;
+            || self.settings.show_toolbar_folder
+            || crate::ui_pinned_search::PinnedSearchKind::ALL
+                .into_iter()
+                .any(|kind| kind.pinned(&self.settings));
 
         if !any_toolbar_section {
             return (None, None);
         }
 
+        let mut pinned_actions = Vec::new();
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_address_nav = None;
         let mut toolbar_smart_folder_open: Option<uuid::Uuid> = None;
@@ -10211,7 +10242,8 @@ impl App {
         let mut current_section_anchors: Vec<(crate::settings::ToolbarSectionId, egui::Rect)> =
             Vec::new();
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             if toolbar_section_order.first() != Some(&crate::settings::ToolbarSectionId::Folder) {
                 ui.add_space(2.0);
             }
@@ -10255,7 +10287,7 @@ impl App {
                 let row_h = (ui.spacing().interact_size.y + 6.0).min(r.height());
                 let capped =
                     egui::Rect::from_min_size(r.min, egui::vec2(r.width(), row_h.max(1.0)));
-                ui.interact(capped, ui.id().with("toolbar_bg_menu"), egui::Sense::click())
+                ui.interact(capped, ui.scope_id().with("toolbar_bg_menu"), egui::Sense::click())
             });
 
             let folder_style = ui.style().clone();
@@ -10303,7 +10335,7 @@ impl App {
                     } else {
                         egui::Sense::click()
                     };
-                    ui.interact(rect, ui.id().with((text, "toolbar_section_label")), sense)
+                    ui.interact(rect, ui.scope_id().with((text, "toolbar_section_label")), sense)
                 }
 
                 ui.horizontal_wrapped(|ui| {
@@ -10341,6 +10373,10 @@ impl App {
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
                         TS::Folder => self.settings.show_toolbar_folder,
+                        TS::SearchContainer => self.settings.show_toolbar_search_container,
+                        TS::SearchLocal => self.settings.show_toolbar_search_local,
+                        TS::SearchMetadata => self.settings.show_toolbar_search_metadata,
+                        TS::SearchEverything => self.settings.show_toolbar_search_everything,
                         TS::Unknown => false,
                     };
                     if !visible {
@@ -10390,29 +10426,12 @@ impl App {
                 TS::EffeTune => {
                     #[cfg(windows)]
                     {
-                        let active = matches!(
-                            self.effetune.runtime,
-                            crate::effetune::EffetuneRuntime::Running { .. }
-                        ) && matches!(
-                            self.effetune.effective_state(),
-                            Some(crate::effetune::EffectiveState::Effective)
-                        );
+                        let active = self.effetune_toolbar_active();
                         let available = self.effetune_toolbar_available();
-                        let resp = ui
-                            .add_enabled(
-                                available,
-                                egui::Button::selectable(active, "音響調整").sense(
-                                    if drag_enabled {
-                                        egui::Sense::click_and_drag()
-                                    } else {
-                                        egui::Sense::click()
-                                    },
-                                ),
-                            )
-                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()))
-                            .on_disabled_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
+                        let tooltip = format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip());
+                        let resp = effetune_toolbar_button(ui, active, available, drag_enabled, &tooltip);
                         if resp.clicked() {
-                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary));
+                            self.effetune_toolbar_click();
                         }
                         self.finish_toolbar_section_lead(
                             ui,
@@ -10459,6 +10478,7 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                             }
                         })
 });
+                    crate::ui_helpers::set_accessibility_label(&combo.response, "本棚:");
                     toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                     let add_resp = ui
                         .add_enabled(has_book_add_target, egui::Button::new("追加"))
@@ -10620,6 +10640,7 @@ egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                     }
                                 })
 });
+                            crate::ui_helpers::set_accessibility_label(&combo.response, "列:");
                             toolbar_combo_popup_open |=
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
@@ -10723,6 +10744,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     }
                                 })
 });
+                            crate::ui_helpers::set_accessibility_label(&combo.response, "比率:");
                             toolbar_combo_popup_open |=
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
@@ -10897,6 +10919,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
                             })
 });
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "ソート:");
                         toolbar_combo_popup_open |=
                             egui::ComboBox::is_open(ctx, combo.response.id);
                     }
@@ -10907,7 +10930,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     if self.grid_sort_refresh_available() {
                         let refresh = ui.button("⟳").on_hover_text("最新の情報に更新");
                         refresh.widget_info(|| egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button, true, "最新の情報に更新"));
+                            egui::Role::Button, true, "最新の情報に更新"));
                         #[cfg(all(windows, feature = "test-script"))]
                         crate::test_script::register_clickable_widget("最新の情報に更新", &refresh);
                         if refresh.clicked() {
@@ -11093,6 +11116,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 },
                             )
                             .inner;
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "お気に入り:");
                         toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                     } else if show_inline {
                         for fav in &self.settings.favorites {
@@ -11169,6 +11193,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 },
                             )
                             .inner;
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "スマートフォルダ:");
                         toolbar_combo_popup_open |=
                             egui::ComboBox::is_open(ctx, combo.response.id);
                     } else if show_inline {
@@ -11264,6 +11289,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     },
                                 )
                                 .inner;
+                            crate::ui_helpers::set_accessibility_label(&combo.response, "タグ:");
                             toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                             if let Some(p) = new_pick {
                                 self.toolbar_tag_dropdown_pick = Some(p);
@@ -11306,6 +11332,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             }
                         }
                     }
+                }
+                TS::SearchContainer | TS::SearchLocal | TS::SearchMetadata | TS::SearchEverything => {
+                    let kind = crate::ui_pinned_search::PinnedSearchKind::from_section(section).unwrap();
+                    let response = self.draw_pinned_search_section(ui, kind);
+                    self.finish_toolbar_section_lead(ui, response.inner.label, section, &mut current_section_anchors, &last_section_anchors);
+                    if let Some(anchor) = current_section_anchors.last_mut() { anchor.1 = response.response.rect; }
+                    pinned_actions.extend(response.inner.actions);
                 }
                 TS::Folder => {
                     // A scope would start a fresh placer at the remaining rect and
@@ -11357,15 +11390,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         // 次フレームのドラッグ並べ替え drop 計算用に、今フレームの可視セクション矩形を格納。
         self.toolbar_section_anchors = current_section_anchors;
+        self.handle_pinned_search_actions(ctx, pinned_actions);
 
         if toolbar_combo_popup_open {
             consume_wheel_input(ctx);
         }
 
         if let Some(name) = toolbar_book_target_name {
-            self.settings.active_book_name = name.clone();
-            self.settings.save();
-            self.book_manager_rename_name = name;
+            self.select_book_append_target(name);
         }
         if toolbar_book_add && self.grid_item_input_allowed() {
             self.add_grid_selection_to_active_book(ctx);
@@ -11427,7 +11459,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 Ok(false) => {
                     // 合成ビュー等で実コンテナが無い場合。常に何らかのフィードバックを返す
                     // (グリッドからのコンテナ付与で無反応に見えないように)。
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "この画面ではこの場所に評価を付けられません".to_string(),
                     );
                 }
@@ -11560,6 +11592,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .on_hover_text("詳細設定はフォルダバー左端の「フォルダ:」を右クリック")
             .changed();
 
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_container, "コンテナ検索欄")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_local, "現在地の絞り込み欄")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_metadata, "アイテム検索欄")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_search_everything, "Everything 検索欄")
+            .changed();
+
         ui.separator();
         // ドラッグ並べ替えの許可 (既定 OFF。OFF のときはカーソルも変わらない)。
         if ui
@@ -11607,7 +11652,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        egui::Window::new("ツールバーを既定に戻す")
+        egui::Window::new("ツールバーを既定に戻す").drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -11656,6 +11701,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_toolbar_facet_filter = true;
         // フォルダバー (アドレス行) もセクション扱いなので一緒に既定へ戻す (Codex P3)。
         s.show_toolbar_folder = true;
+        s.show_toolbar_search_everything = false;
+        s.show_toolbar_search_metadata = false;
+        s.show_toolbar_search_local = false;
+        s.show_toolbar_search_container = false;
         s.show_address_bar_history_nav = true;
         s.show_address_bar_quick_folders = true;
         s.show_toolbar_parent_button = true;
@@ -11734,10 +11783,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let has_section_specific_settings = !matches!(
             section,
-            TS::FolderTree | TS::EffeTune | TS::Rating | TS::Unknown
+            TS::FolderTree
+                | TS::EffeTune
+                | TS::Rating
+                | TS::SearchContainer
+                | TS::SearchLocal
+                | TS::SearchMetadata
+                | TS::SearchEverything
+                | TS::Unknown
         );
         match section {
-            TS::FolderTree | TS::EffeTune | TS::Rating | TS::Folder => {
+            TS::FolderTree
+            | TS::EffeTune
+            | TS::Rating
+            | TS::Folder
+            | TS::SearchContainer
+            | TS::SearchLocal
+            | TS::SearchMetadata
+            | TS::SearchEverything => {
                 // 表示形式・出す項目を持たない。非表示 / 既定化のみ (下の共通部)。
             }
             TS::Bookshelf => {
@@ -12163,7 +12226,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if !self.settings.toolbar_section_drag_enabled {
             return;
         }
-        let drag_id = egui::Id::new("toolbar_section_drag_state");
+        let drag_id = egui::Id::unique("toolbar_section_drag_state");
         if resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             // ドロップ先に I 字マーカーを表示してどこへ入るか分かるようにする。
@@ -12507,7 +12570,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         (sort_changed, reload_requested, popup_open)
     }
 
-    pub(crate) fn render_facet_filter_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_facet_filter_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         self.facet_name_has_focus = false;
         self.color_filter.input_has_focus = false;
         if !self.settings.show_toolbar_facet_filter {
@@ -12528,7 +12592,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut sort_changed = false;
         let mut sort_reload_requested = false;
         let mut sort_popup_open = false;
-        egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
+        egui::Panel::top("facet_filter_bar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
                 let filter_label = egui::Label::new(egui::RichText::new("絞り込み:").small())
@@ -12539,7 +12604,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.draw_facet_filter_bar_settings_menu(ui);
                 });
                 if self.items_are_reading_history_view {
-                    egui::ComboBox::from_id_salt("reading_history_grid_media_filter")
+                    let named_combo = egui::ComboBox::from_id_salt("reading_history_grid_media_filter")
                         .selected_text(format!(
                             "閲覧履歴種別: {}",
                             self.reading_history_media_filter.label()
@@ -12555,12 +12620,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .changed();
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "閲覧履歴種別");
                     if matches!(
                         self.reading_history_media_filter,
                         crate::bookmark_browser::MediaFilter::All
                             | crate::bookmark_browser::MediaFilter::Book
                     ) {
-                        egui::ComboBox::from_id_salt("reading_history_grid_book_kind_filter")
+                        let named_combo = egui::ComboBox::from_id_salt("reading_history_grid_book_kind_filter")
                             .selected_text(format!(
                                 "本: {}",
                                 self.reading_history_book_kind_filter.label()
@@ -12576,11 +12642,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         .changed();
                                 }
                             });
+                        crate::ui_helpers::set_accessibility_label(&named_combo.response, "本");
                     }
                     ui.separator();
                 }
                 if self.items_are_bookmark_view {
-                    egui::ComboBox::from_id_salt("bookmark_grid_media_filter")
+                    let named_combo = egui::ComboBox::from_id_salt("bookmark_grid_media_filter")
                         .selected_text(format!(
                             "ブックマーク種別: {}",
                             self.bookmark_media_filter.label()
@@ -12596,12 +12663,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .changed();
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "ブックマーク種別");
                     if matches!(
                         self.bookmark_media_filter,
                         crate::bookmark_browser::MediaFilter::All
                             | crate::bookmark_browser::MediaFilter::Book
                     ) {
-                        egui::ComboBox::from_id_salt("bookmark_grid_book_kind_filter")
+                        let named_combo = egui::ComboBox::from_id_salt("bookmark_grid_book_kind_filter")
                             .selected_text(format!(
                                 "本: {}",
                                 self.bookmark_book_kind_filter.label()
@@ -12617,6 +12685,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         .changed();
                                 }
                             });
+                        crate::ui_helpers::set_accessibility_label(&named_combo.response, "本");
                     }
                     ui.separator();
                 }
@@ -12716,7 +12785,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     &mut self.facet_name_input,
                                 );
                             let response = output
-                                .response
+                                .response.response
                                 .clone()
                                 .on_hover_text("表示中の一覧をファイル名で絞り込みます");
                             self.facet_name_has_focus |= response.has_focus();
@@ -12889,7 +12958,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
     }
 
-    pub(crate) fn render_details_lazy_status_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_details_lazy_status_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         if self.settings.grid_view_mode != GridViewMode::Details
             || !(self.settings.details_show_page_count
                 || self.settings.details_show_created
@@ -12916,9 +12986,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         // Keep the list origin fixed while metadata loads. A top panel made the
         // entire list jump by one row when it disappeared at completion.
-        egui::TopBottomPanel::bottom("details_lazy_status_bar")
-            .exact_height(25.0)
-            .show(ctx, |ui| {
+        egui::Panel::bottom("details_lazy_status_bar")
+            .exact_size(25.0)
+            .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     match self.details_image_dims_state {
@@ -13540,7 +13611,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             self.settings.facet_filter.date_preset,
                             Some(FacetDatePreset::CustomDays(_))
                         );
-                        if ui.selectable_label(selected, "日数を指定").clicked() {
+                        let days_label = ui.selectable_label(selected, "日数を指定");
+                        if days_label.clicked() {
                             self.active_facet_filter_mut().date_preset =
                                 Some(FacetDatePreset::CustomDays(custom_days));
                             changed = true;
@@ -13551,6 +13623,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .range(1..=36_500)
                                     .suffix(" 日以内"),
                             )
+                            .labelled_by(days_label.id)
                             .changed()
                         {
                             self.active_facet_filter_mut().date_preset =
@@ -13974,14 +14047,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.horizontal(|ui| {
                     let r_response =
                         ui.add(egui::DragValue::new(&mut r).range(0..=255).prefix("R "));
+                    crate::ui_helpers::set_accessibility_label(&r_response, "RGB R");
                     self.color_filter.input_has_focus |= r_response.has_focus();
                     input_changed |= r_response.changed();
                     let g_response =
                         ui.add(egui::DragValue::new(&mut g).range(0..=255).prefix("G "));
+                    crate::ui_helpers::set_accessibility_label(&g_response, "RGB G");
                     self.color_filter.input_has_focus |= g_response.has_focus();
                     input_changed |= g_response.changed();
                     let b_response =
                         ui.add(egui::DragValue::new(&mut b).range(0..=255).prefix("B "));
+                    crate::ui_helpers::set_accessibility_label(&b_response, "RGB B");
                     self.color_filter.input_has_focus |= b_response.has_focus();
                     input_changed |= b_response.changed();
                 });
@@ -13998,14 +14074,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.horizontal(|ui| {
                     let h_response =
                         ui.add(egui::DragValue::new(&mut h).range(0..=360).prefix("H "));
+                    crate::ui_helpers::set_accessibility_label(&h_response, "HSL H");
                     self.color_filter.input_has_focus |= h_response.has_focus();
                     input_changed |= h_response.changed();
                     let s_response =
                         ui.add(egui::DragValue::new(&mut s).range(0..=100).prefix("S "));
+                    crate::ui_helpers::set_accessibility_label(&s_response, "HSL S");
                     self.color_filter.input_has_focus |= s_response.has_focus();
                     input_changed |= s_response.changed();
                     let l_response =
                         ui.add(egui::DragValue::new(&mut l).range(0..=100).prefix("L "));
+                    crate::ui_helpers::set_accessibility_label(&l_response, "HSL L");
                     self.color_filter.input_has_focus |= l_response.has_focus();
                     input_changed |= l_response.changed();
                 });
@@ -14575,13 +14654,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             input_widths.label(ui, suffix);
         }
         let minimum_width = (widths.width() + right_widths.width()).ceil();
-        // Preserve the interior margins of the former two panels and the toolbar's
-        // trailing padding when the folder bar is explicitly on a separate row.
+        // The former top toolbar panel reserved its separator in the bottom outer
+        // margin. Keep the same resolved frame for the integrated row's spacing,
+        // border and background boundary; the following folder panel starts after
+        // that reservation, not at the preceding frame's outline.
+        let mut former_toolbar_frame = egui::Frame::side_top_panel(ui.style());
+        former_toolbar_frame.outer_margin.bottom =
+            panel_separator_outer_margin(ui.style(), former_toolbar_frame.outer_margin.bottom);
         let separate_row_padding =
             if new_row && ui.available_rect_before_wrap().width() < ui.max_rect().width() - 0.5 {
-                f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.top)
-                    + f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.bottom)
-                    + 2.0
+                former_toolbar_frame.total_margin().sum().y + 2.0
             } else {
                 0.0
             };
@@ -14598,11 +14680,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             let former_toolbar_bottom = (ui.min_rect().bottom()
                 + ui.spacing().item_spacing.y
                 + 2.0
-                + f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.bottom))
+                + f32::from(former_toolbar_frame.inner_margin.bottom)
+                + former_toolbar_frame.stroke.width
+                + f32::from(former_toolbar_frame.outer_margin.bottom))
             .round_ui();
+            // Panel paints the separator just outside the outline, inside its
+            // reserved outer margin. Use its actual stroke even when fractional
+            // stroke widths reserve a different rounded number of points.
+            let outline_bottom =
+                former_toolbar_bottom - f32::from(former_toolbar_frame.outer_margin.bottom);
             ui.painter().hline(
                 ui.clip_rect().x_range(),
-                former_toolbar_bottom - stroke.width * 0.5,
+                outline_bottom + stroke.width * 0.5,
                 stroke,
             );
             // In the two-panel layout the folder panel's background was painted
@@ -14614,7 +14703,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ui.clip_rect().max,
                 ),
                 0.0,
-                egui::Frame::side_top_panel(ui.style()).fill,
+                former_toolbar_frame.fill,
             );
         }
         let result = crate::ui_toolbar_layout::flexible_section(
@@ -14777,7 +14866,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         {
                                             self.start_quick_folder_slot_switch(slot, resolved);
                                         } else {
-                                            self.show_feedback_toast(format!(
+                                            self.show_feedback_warning(format!(
                                                 "{label} の最後の場所が見つかりません。ドライブ一覧へ切り替えます: {}",
                                                 raw_target.to_string_lossy()
                                             ));
@@ -14838,7 +14927,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(AddressBarNav::DriveList(None)) => {
                                         "ドライブ一覧へ [BS]".to_string()
                                     }
-                                    Some(AddressBarNav::ReadingHistory) => {
+                                    Some(AddressBarNav::ReadingHistory(_)) => {
                                         "閲覧履歴へ戻る [BS]".to_string()
                                     }
                                     Some(AddressBarNav::Bookmarks) => {
@@ -14975,7 +15064,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                     crate::known_folders::LocationMenuEntry::ReadingHistory => {
                                         if ui.button("閲覧履歴").clicked() {
-                                            result = Some(AddressBarNav::ReadingHistory);
+                                            result = Some(AddressBarNav::ReadingHistory(crate::app::ReadingHistoryEntrance::Menu));
                                             ui.close();
                                         }
                                     }
@@ -14986,7 +15075,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         }
                                     }
                                     crate::known_folders::LocationMenuEntry::Rating { stars } => {
-                                        let rating_menu = ui.menu_button("レーティング", |ui| {
+                                        let _rating_menu = ui.menu_button("レーティング", |ui| {
                                             for stars in stars {
                                                 let rating_response = ui.button(rating_view_menu_label(
                                                         stars,
@@ -15003,7 +15092,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             }
                                         });
                                         #[cfg(feature = "test-script")]
-                                        crate::test_script::register_clickable_widget("rating-menu", &rating_menu.response);
+                                        crate::test_script::register_clickable_widget("rating-menu", &_rating_menu.response);
                                     }
                                     crate::known_folders::LocationMenuEntry::Bookshelf => {
                                         if ui
@@ -15023,7 +15112,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         let response = ui.menu_button("整理先", |ui| {
                                             // Reserve a separate gutter so the last names remain readable.
                                             ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-                                            egui::ScrollArea::vertical()
+                                            egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                                 .id_salt("organize_destinations_menu")
                                                 .max_height((ui.ctx().content_rect().height() - 48.0).clamp(48.0, 400.0))
                                                 .show(ui, |ui| {
@@ -15334,7 +15423,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             ui.add_enabled(
                                                 false,
                                                 egui::TextEdit::singleline(&mut self.address)
-                                                    .id(egui::Id::new("folder_address_input"))
+                                                    .id(egui::Id::unique("folder_address_input"))
                                                     .desired_width(f32::INFINITY),
                                             )
                                         } else {
@@ -15343,8 +15432,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                 &mut self.address,
                                                 None,
                                                 |edit| {
-                                                    edit.id(egui::Id::new("folder_address_input"))
-                                                        .desired_width(f32::INFINITY)
+                                                    edit.id(egui::Id::unique(
+                                                        "folder_address_input",
+                                                    ))
+                                                    .desired_width(f32::INFINITY)
                                                 },
                                             );
                                             crate::ui_helpers::singleline_text_edit_context_menu(
@@ -15352,8 +15443,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                 &mut output,
                                                 &mut self.address,
                                             );
-                                            output.response
+                                            output.response.response
                                         };
+                                        crate::ui_helpers::set_accessibility_label(
+                                            &resp,
+                                            "フォルダ:",
+                                        );
                                         self.address_has_focus = resp.has_focus();
                                         if !is_snap_active && resp.lost_focus() && enter_pressed {
                                             let address_text = self.address.trim();
@@ -15465,7 +15560,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     // ── 検索バー ─────────────────────────────────────────────────────
 
     /// メタデータ検索バーを描画する。
-    pub(crate) fn render_search_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_search_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         if !self.show_search_bar {
             return;
         }
@@ -15474,7 +15570,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // 開いた場合はここで閉じる (ショートカット側は app.rs で抑止済み)。
         if self.grid_is_pdf_pages() {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -15491,13 +15587,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         // IME 変換確定の Enter は送信に使わず、確定後の通常 Enter だけを検索実行に使う。
         let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
         let local_search_label = self
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
-        egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+        egui::Panel::top("search_bar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
+                if !crate::ui_pinned_search::PinnedSearchKind::Local.pinned(&self.settings) {
                 ui.label("検索:").on_hover_text(format!(
                     "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
@@ -15507,7 +15604,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &mut self.search_query,
                     Some(&mut self.search_focus_request),
                     |edit| {
-                        edit.hint_text(
+                        edit.id(crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id()).hint_text(
                             r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#,
                         )
                         .desired_width(320.0)
@@ -15534,38 +15631,30 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 // × ボタン
                 if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
-                    self.cancel_pending_folder_nav();
-                    self.show_search_bar = false;
-                    self.search_query.clear();
-                    self.search_filter = None;
-                    self.search_filter_origin_folder = None;
-                    self.search_has_focus = false;
-                    self.search_tag_bridge.clear();
-                    self.move_grid_cursor(
-                        self.selected,
-                        crate::app::GridCursorIntent::ExplicitKeep,
-                    );
-                    self.cancel_search_pending();
-                    self.rebuild_visible_indices();
-                    self.refresh_color_filter_for_scope_change(ctx);
+                    self.close_local_search(ctx);
                 }
 
+                }
                 // ── 検索対象ドロップダウン (§19.7) ──
                 if zip_view {
                     // §4.1.2: ZIP 内はファイル名フィルタ固定。ドロップダウンは無効化
                     // して「ファイル名」を表示する (メタ系を選んでも無反応な
                     // 分かりにくさを防ぐ)。
                     ui.add_enabled_ui(false, |ui| {
-                        egui::ComboBox::from_id_salt("ctrl_f_search_target")
+                        let named_combo = egui::ComboBox::from_id_salt("ctrl_f_search_target")
                             .selected_text("ファイル名")
                             .width(160.0)
                             .show_ui(ui, |_ui| {});
+                        crate::ui_helpers::set_accessibility_label(
+                            &named_combo.response,
+                            "検索対象",
+                        );
                     });
                 } else {
                     let current =
                         crate::global_search_ui::TargetChoice::from_target(&self.search_target);
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("ctrl_f_search_target")
+                    let named_combo = egui::ComboBox::from_id_salt("ctrl_f_search_target")
                         .selected_text(current.label())
                         .width(160.0)
                         .show_ui(ui, |ui| {
@@ -15573,6 +15662,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, choice, choice.label());
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "検索対象");
                     if next != current {
                         self.search_target = next.to_target();
                         // クエリが空でなければ即再検索
@@ -15586,24 +15676,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     && !self.search_query.trim().is_empty()
                 {
                     self.execute_search(ctx);
-                }
-
-                // Esc で検索解除（ダイアログが開いていない場合のみ。IME 変換中もスキップ）
-                if !self.any_dialog_open() && escape_pressed {
-                    self.cancel_pending_folder_nav();
-                    self.show_search_bar = false;
-                    self.search_query.clear();
-                    self.search_filter = None;
-                    self.search_filter_origin_folder = None;
-                    self.search_has_focus = false;
-                    self.search_tag_bridge.clear();
-                    self.move_grid_cursor(
-                        self.selected,
-                        crate::app::GridCursorIntent::ExplicitKeep,
-                    );
-                    self.cancel_search_pending();
-                    self.rebuild_visible_indices();
-                    self.refresh_color_filter_for_scope_change(ctx);
                 }
 
                 // 検索中インジケータ or マッチ件数 (separator の後に表示)
@@ -15675,54 +15747,59 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     /// お気に入り検索バー (ツールバー直下の 2 行目) を描画する。
     /// `favsearch.active` が true のときだけ表示される。
-    pub(crate) fn render_favsearch_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_favsearch_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         if !self.favsearch.active {
             return;
         }
         let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
         let mut query_changed = false;
 
-        egui::TopBottomPanel::top("favsearch_bar").show(ctx, |ui| {
+        egui::Panel::top("favsearch_bar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("コンテナ検索:");
-                let mut output = crate::ime_focus::show_singleline(
-                    ui,
-                    &mut self.favsearch.query,
-                    Some(&mut self.favsearch.focus_request),
-                    |edit| {
-                        edit.hint_text(
-                            r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#,
-                        )
-                        .desired_width(320.0)
-                        .min_size(egui::vec2(320.0, 20.0))
-                    },
-                );
-                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
-                    ui,
-                    &mut output,
-                    &mut self.favsearch.query,
-                );
-                let response = output.response;
+                if !crate::ui_pinned_search::PinnedSearchKind::Container.pinned(&self.settings) {
+                    ui.label("コンテナ検索:");
+                    let mut output = crate::ime_focus::show_singleline(
+                        ui,
+                        &mut self.favsearch.query,
+                        Some(&mut self.favsearch.focus_request),
+                        |edit| {
+                            edit.id(
+                                crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id()
+                            )
+                            .hint_text(
+                                r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#,
+                            )
+                            .desired_width(320.0)
+                            .min_size(egui::vec2(320.0, 20.0))
+                        },
+                    );
+                    let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                        ui,
+                        &mut output,
+                        &mut self.favsearch.query,
+                    );
+                    let response = output.response;
 
-                self.favsearch.has_focus = response.has_focus();
+                    self.favsearch.has_focus = response.has_focus();
 
-                // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
-                if response.changed() || menu_changed {
-                    query_changed = true;
+                    // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
+                    if response.changed() || menu_changed {
+                        query_changed = true;
+                    }
+                    // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
+                    if response.lost_focus() && enter_pressed {
+                        query_changed = true;
+                    }
+
+                    if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
+                        close_requested = true;
+                    }
                 }
-                // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
-                if response.lost_focus() && enter_pressed {
-                    query_changed = true;
-                }
-
-                if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
-                    close_requested = true;
-                }
-
                 // ── お気に入り絞り込みドロップダウン (§19.7) ──
                 // `auto_index_structure=true` のお気に入りのみ候補に出す (名前索引の対象と一致)。
                 {
@@ -15738,7 +15815,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("favsearch_fav")
+                    let named_combo = egui::ComboBox::from_id_salt("favsearch_fav")
                         .selected_text(label_for(current))
                         .width(140.0)
                         .show_ui(ui, |ui| {
@@ -15750,6 +15827,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, Some(fav.id), &fav.name);
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "お気に入り");
                     if next != current {
                         self.favsearch.favorite_filter = next;
                         // ドロップダウン変更は即再実行。クエリが空なら execute_favsearch が早期 return する。
@@ -15774,7 +15852,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("favsearch_kind")
+                    let named_combo = egui::ComboBox::from_id_salt("favsearch_kind")
                         .selected_text(label_for(current))
                         .width(110.0)
                         .show_ui(ui, |ui| {
@@ -15787,6 +15865,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, choice, label_for(choice));
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "種別");
                     if next != current {
                         self.favsearch.kind_filter = next;
                         query_changed = true;
@@ -15818,13 +15897,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ui.add_space(2.0);
         });
 
-        // Esc で閉じる (IME 変換中はスキップ、他のダイアログが開いていないときのみ)。
-        // テキストボックスが Esc で focus を失ってから本チェックに達するため、
-        // has_focus は要求せず active のみで判定する (Ctrl+F の検索バーと同じ挙動)。
-        if !self.any_dialog_open() && escape_pressed {
-            close_requested = true;
-        }
-
         if close_requested {
             self.close_favsearch();
             return;
@@ -15835,7 +15907,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     }
 
     /// タグビュー (Ctrl+T) の検索バーを描画する。
-    pub(crate) fn render_tag_view_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_tag_view_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         if !self.tag_view.active {
             self.tag_view.has_focus = false;
             return;
@@ -15848,7 +15921,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut filter_changed = false;
         let mut clicked_tag: Option<String> = None;
 
-        egui::TopBottomPanel::top("tag_view_bar").show(ctx, |ui| {
+        egui::Panel::top("tag_view_bar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");
@@ -15897,7 +15971,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 {
                     let current = self.tag_view.kind_filter;
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("tag_view_kind")
+                    let named_combo = egui::ComboBox::from_id_salt("tag_view_kind")
                         .selected_text(current.label())
                         .width(140.0)
                         .show_ui(ui, |ui| {
@@ -15905,6 +15979,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, choice, choice.label());
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "種類");
                     if next != current {
                         self.tag_view.kind_filter = next;
                         self.tag_view.last_executed.clear();
@@ -16218,7 +16293,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             let frame = ctx.cumulative_frame_nr();
             ctx.data_mut(|data| {
                 data.insert_temp(
-                    egui::Id::new("grid_background_primary_frame"),
+                    egui::Id::unique("grid_background_primary_frame"),
                     GridPrimaryInputFrame::Blocked(frame),
                 )
             });
@@ -16233,7 +16308,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         self.grid_click_pairing.begin_primary_click_frame(
             primary_clicked
                 && ctx.data(|data| {
-                    data.get_temp::<GridPrimaryInputFrame>(egui::Id::new(
+                    data.get_temp::<GridPrimaryInputFrame>(egui::Id::unique(
                         "grid_background_primary_frame",
                     ))
                     .map(GridPrimaryInputFrame::frame)
@@ -16280,7 +16355,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     ) -> Option<AddressBarNav> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
-        let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
+        let response = ui.interact(
+            cell_rect,
+            ui.scope_id().with(idx),
+            egui::Sense::click_and_drag(),
+        );
         if !self.grid_item_input_allowed() {
             return None;
         }
@@ -16740,6 +16819,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         return nav;
                     }
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
+                    self.capture_main_folder_list_order(idx);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let staged = self.will_stage_archive_navigation(&pf, &owner);
                     let open_outcome = self
@@ -16793,7 +16873,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // しないので網羅性のため no-op。
                 Some(GridItem::Stack { .. }) => {}
                 Some(GridItem::CollectionPlaceholder { .. }) => {
-                    self.show_feedback_toast("この参照は現在見つからないため開けません".into());
+                    self.show_feedback_warning("この参照は現在見つからないため開けません".into());
                 }
                 None => {}
             }
@@ -16831,7 +16911,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         post_drag_toast,
                     });
                 }
-                DragDecision::ImmediateToast(msg) => self.show_feedback_toast(msg),
+                DragDecision::ImmediateToast(msg) => self.show_feedback_warning(msg),
                 DragDecision::None => {}
             }
         }
@@ -16909,6 +16989,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         previous.validate_background(context(GridClickSource::Mouse), frame);
         self.grid_click_pairing
             .validate_background(context(GridClickSource::Mouse), frame);
+        let wheel_options = ctx.options(|o| o.input_options);
         let (clicked, released, down, pos, press_pos, scroll) = ctx.input(|input| {
             (
                 input.pointer.primary_clicked(),
@@ -16919,10 +17000,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     .interact_pos()
                     .or_else(|| input.pointer.latest_pos()),
                 grid_primary_press_pos(input),
-                !input.raw_scroll_delta.eq(&egui::Vec2::ZERO),
+                !crate::wheel_input::remaining_wheel_delta(input, wheel_options)
+                    .eq(&egui::Vec2::ZERO),
             )
         });
-        let id = egui::Id::new("grid_background_primary_frame");
+        let id = egui::Id::unique("grid_background_primary_frame");
         let frame_owner = ctx.data(|data| data.get_temp::<GridPrimaryInputFrame>(id));
         let blocked = matches!(frame_owner, Some(GridPrimaryInputFrame::Blocked(owner_frame)) if owner_frame == frame)
             || !self.grid_item_input_allowed()
@@ -17249,6 +17331,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 let old_scroll_style = ui.spacing().scroll;
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 let scroll_output = egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("details_list_vertical")
                     .auto_shrink([false, false])
                     .vertical_scroll_offset(self.scroll_offset_y)
@@ -17336,7 +17422,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     });
                 ui.spacing_mut().scroll = old_scroll_style;
                 body_inner_rect = scroll_output.inner_rect;
-                egui_offset_y = scroll_output.state.offset.y;
+                egui_offset_y = scroll_output.state.clamped_offset().y;
                 vertical_scroll_debug = Some(DetailsVerticalScrollDebug {
                     inner_rect: scroll_output.inner_rect,
                     content_size: scroll_output.content_size,
@@ -17507,15 +17593,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .with_max_inner_size(viewport_size)
             .with_visible(true);
 
-        ctx.show_viewport_immediate(viewport_id, builder, move |vp_ctx, _class| {
+        ctx.show_viewport_immediate(viewport_id, builder, move |vp_ctx_ui, _class| {
+            let vp_ctx = &vp_ctx_ui.ctx().clone();
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::new()
-                        .fill(vp_ctx.style().visuals.extreme_bg_color)
+                        .fill(vp_ctx.global_style().visuals.extreme_bg_color)
                         .stroke(egui::Stroke::new(
                             1.0,
                             vp_ctx
-                                .style()
+                                .global_style()
                                 .visuals
                                 .widgets
                                 .noninteractive
@@ -17524,7 +17611,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         ))
                         .inner_margin(egui::Margin::same(padding as i8)),
                 )
-                .show(vp_ctx, |ui| {
+                .show(vp_ctx_ui, |ui| {
                     let rect = ui.max_rect().shrink(padding);
                     if let Some(tex) = texture.as_ref() {
                         let img_rect = egui::Rect::from_center_size(rect.center(), image_size);
@@ -17687,7 +17774,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         let response = ui.interact(
             rect,
-            ui.id().with(("reading_history_item_tooltip", idx)),
+            ui.scope_id().with(("reading_history_item_tooltip", idx)),
             egui::Sense::hover(),
         );
         response.on_hover_ui_at_pointer(|ui| {
@@ -17776,7 +17863,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         );
         let response = ui.interact(
             rect,
-            ui.id().with(("bookmark_view_tooltip", idx)),
+            ui.scope_id().with(("bookmark_view_tooltip", idx)),
             egui::Sense::hover(),
         );
         response.on_hover_ui_at_pointer(|ui| {
@@ -17865,10 +17952,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         let response = ui.interact(
             header_hit,
-            ui.id().with(("details_header", column_set, column)),
+            ui.scope_id().with(("details_header", column_set, column)),
             egui::Sense::click_and_drag(),
         );
-        let drag_state_id = ui.id().with(("details_header_drag_state", column_set));
+        let drag_state_id = ui
+            .scope_id()
+            .with(("details_header_drag_state", column_set));
         if response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
@@ -18005,11 +18094,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     }
 
     fn details_best_fit_job_id() -> egui::Id {
-        egui::Id::new("details_best_fit_job")
+        egui::Id::unique("details_best_fit_job")
     }
 
     fn details_best_fit_frame_budget_id() -> egui::Id {
-        egui::Id::new("details_best_fit_frame_budget")
+        egui::Id::unique("details_best_fit_frame_budget")
     }
 
     fn claim_details_best_fit_frame_budget(ctx: &egui::Context) -> bool {
@@ -18357,7 +18446,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let resize_response = ui
             .interact(
                 resize_rect,
-                ui.id().with(("details_header_resize", column_set, column)),
+                ui.scope_id()
+                    .with(("details_header_resize", column_set, column)),
                 egui::Sense::click_and_drag(),
             )
             .on_hover_text("ドラッグで幅変更 / ダブルクリックで内容に合わせる");
@@ -18495,7 +18585,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     }
 
     fn details_column_context_menu_tracker_id() -> egui::Id {
-        egui::Id::new("details_column_context_menu_tracker")
+        egui::Id::unique("details_column_context_menu_tracker")
     }
 
     pub(crate) fn details_column_context_menu_is_open(ctx: &egui::Context) -> bool {
@@ -18849,7 +18939,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 DetailsColumn::Preview => {
                     let response = ui.interact(
                         col_rect,
-                        ui.id().with(("details_preview_icon", idx)),
+                        ui.scope_id().with(("details_preview_icon", idx)),
                         egui::Sense::hover(),
                     );
                     #[cfg(feature = "test-script")]
@@ -19072,7 +19162,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     // ── サムネイルグリッド ───────────────────────────────────────────
 
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
-    pub(crate) fn render_grid(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+    pub(crate) fn render_grid(&mut self, root_ui: &mut egui::Ui) -> Option<AddressBarNav> {
+        let ctx = &root_ui.ctx().clone();
         self.begin_grid_click_input_frame(ctx);
         let scroll_to = self.scroll_to_selected;
         self.scroll_to_selected = false;
@@ -19089,7 +19180,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
 
         let nav = egui::CentralPanel::default()
-            .show(ctx, |ui| -> Option<AddressBarNav> {
+            .show(root_ui, |ui| -> Option<AddressBarNav> {
                 if !self.grid_item_input_allowed() {
                     ui.disable();
                 }
@@ -19651,12 +19742,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // egui にスクロールを管理させず、自前の offset を毎フレーム注入する。
                 // ただしスクロールバードラッグ時は egui 側のオフセットを読み戻す。
                 let egui_before = (self.items_are_rating_view && scroll_to).then(||
-                    egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("scroll_area"))));
+                    egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::IdSalt::new("scroll_area"))));
+                let wheel_options = ctx.options(|o| o.input_options);
                 let input_before = (self.items_are_rating_view && scroll_to).then(|| ctx.input(|input| (
-                    input.raw_scroll_delta, input.smooth_scroll_delta,
+                    crate::wheel_input::remaining_wheel_delta(input, wheel_options), input.smooth_scroll_delta,
                     input.pointer.latest_pos(), input.pointer.primary_down(),
                     input.pointer.delta(), input.pointer.velocity())));
-                let scroll_output = egui::ScrollArea::vertical()
+                let scroll_output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .auto_shrink([false, false])
                     .vertical_scroll_offset(display_scroll_offset_y)
                     .show_viewport(ui, |ui, viewport| {
@@ -19989,7 +20081,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。
                                 if let Some((_total, per_star)) = filter_match {
-                                    let hover_id = egui::Id::new(("folder_rating_badge", idx));
+                                    let hover_id = egui::Id::unique(("folder_rating_badge", idx));
                                     let resp = ui.interact(cell_rect, hover_id, egui::Sense::hover());
                                     if resp.hovered() {
                                         resp.on_hover_ui_at_pointer(|ui| {
@@ -20035,15 +20127,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // egui が内部で管理するオフセットと自前オフセットを同期させる。
                 // ただし行スナップによる端数差分で毎フレーム振動するのを防ぐため、
                 // 1 行分 (cell_h) 以上ずれた場合のみ同期する。
-                let egui_offset = scroll_output.state.offset.y;
+                let egui_offset = scroll_output.state.clamped_offset().y;
                 if self.items_are_rating_view && scroll_to
                 {
+                    let wheel_options = ctx.options(|o| o.input_options);
                     crate::logger::log(format!(
                         "[grid-scroll] source=egui-state gen={} injected={display_scroll_offset_y:.1} \
                          returned={egui_offset:.1} content={:?} inner={:?} wheel={:?} \
                          input_before={input_before:?} prior_state={egui_before:?} state={:?}",
                         self.items_generation, scroll_output.content_size, scroll_output.inner_rect,
-                        ctx.input(|input| (input.raw_scroll_delta, input.smooth_scroll_delta)),
+                        ctx.input(|input| (crate::wheel_input::remaining_wheel_delta(input, wheel_options), input.smooth_scroll_delta)),
                         scroll_output.state));
                 }
                 if should_sync_grid_scrollbar(
@@ -20341,9 +20434,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     }
 
     /// 選択情報の固定 1 行バーを、グリッド用 CentralPanel より先に確保する。
-    /// TopBottomPanel が `ctx.available_rect()` を縮めるため、render_grid が読む
+    /// TopBottomPanel が `ctx.root_ui(|ui| ui.available_rect_before_wrap())` を縮めるため、render_grid が読む
     /// `ui.available_height()` と仮想スクロールの viewport 高さには予約分が反映される。
-    pub(crate) fn render_selection_info_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_selection_info_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         self.selection_info_bar_rect = None;
         if self.viewer_session_blocks_main_window()
             || !self.settings.selection_info_display_mode.shows_bottom_bar()
@@ -20355,17 +20449,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let column_set = selection_info_bottom_bar_column_set(&self.settings);
         let selected_idx = self.selected.filter(|&idx| self.items.get(idx).is_some());
-        let available_before = ctx.available_rect();
+        let available_before = root_ui.available_rect_before_wrap();
         let future_details_avail_h = details_grid_available_height_after_selection_bar(
             available_before,
-            ctx.style().as_ref(),
+            root_ui.style().as_ref(),
         );
         let details_natural_h = self.visible_indices.len() as f32 * Self::DETAILS_ROW_H;
         let scroll_style = details_scroll_style();
-        let panel = egui::TopBottomPanel::bottom("selection_info_bottom_bar")
-            .exact_height(selection_info_bar_height())
+        let panel = egui::Panel::bottom("selection_info_bottom_bar")
+            .frame(selection_info_bar_frame(root_ui.style()))
+            .exact_size(selection_info_bar_height(root_ui.style()))
             .show_separator_line(true)
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 let source_rect = ui.available_rect_before_wrap();
                 let avail_w = source_rect.width().max(1.0);
                 let pixels_per_point = ui.ctx().pixels_per_point();
@@ -20472,12 +20568,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 );
             });
         self.selection_info_bar_rect = Some(panel.response.rect);
-        let available_after = ctx.available_rect();
+        let available_after = root_ui.available_rect_before_wrap();
         debug_assert!(
             available_before.height() <= 0.0
                 || available_before.height() - available_after.height() + 0.5
                     >= panel.response.rect.height().min(available_before.height()),
-            "selection-info bar must reserve height before the grid viewport"
+            "selection-info bar must reserve height before the grid viewport: before={available_before:?}, after={available_after:?}, panel={:?}",
+            panel.response.rect
         );
     }
 
@@ -20519,7 +20616,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         };
         let text = content.tooltip_text();
 
-        let style = ctx.style();
+        let style = ctx.global_style();
         let dark = style.visuals.dark_mode;
         let (fill, text_color, stroke, shadow) = if dark {
             (
@@ -20590,7 +20687,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let y = selection_info_popup_y(cell_rect, viewport, measured_h);
         let area_pos = egui::pos2(x, y);
 
-        egui::Area::new("selection_info".into())
+        egui::Area::new(egui::Id::unique("selection_info"))
             .order(egui::Order::Middle)
             .interactable(false)
             .fixed_pos(area_pos)
@@ -20607,6 +20704,81 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 #[cfg(test)]
 mod facet_filter_bar_tests {
     use super::*;
+
+    #[test]
+    fn calculated_facet_choice_height_uses_each_gap_once() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 900.0));
+        let draw = |events| {
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    show_virtualized_facet_choice_rows(ui, 360.0, 26, |ui, idx| {
+                                        draw_facet_checkbox_choice(
+                                            ui,
+                                            &mut false,
+                                            format!("選択肢 {idx}"),
+                                            "",
+                                        );
+                                    });
+                                },
+                            )
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
+            let (inner, content, offset) = ctx.data(|data| {
+                data.get_temp(egui::Id::unique("facet_choice_scroll_layout"))
+                    .unwrap()
+            });
+            ScrollLayout {
+                inner,
+                content,
+                offset,
+            }
+        };
+        let mut before = draw(vec![]);
+        for _ in 0..3 {
+            before = draw(vec![]);
+        }
+        let spacing = ctx.global_style().spacing.clone();
+        let row_height = spacing.interact_size.y.max(22.0);
+        assert_eq!(
+            before.content.y,
+            26.0 * row_height + 25.0 * spacing.item_spacing.y
+        );
+        // This menu intentionally caps its viewport at 24 of the 26 choices.
+        before.assert_height(HeightExpectation::Scrolls, viewport, ctx.pixels_per_point());
+        let mut after = before;
+        for frame in 0..40 {
+            after = draw(if frame == 0 {
+                vec![
+                    egui::Event::PointerMoved(before.inner.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -4000.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                    },
+                ]
+            } else {
+                vec![]
+            });
+        }
+        after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+    }
     use crate::app::setup_app_for_test;
 
     #[test]
@@ -20692,9 +20864,10 @@ mod facet_filter_bar_tests {
             system: 0,
         };
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(640.0, 240.0))
-            .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui(move |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let _ = draw_omitted_entries_chip(ui, counts);
                 });
             });
@@ -20729,9 +20902,10 @@ mod facet_filter_bar_tests {
             system: 0,
         };
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(640.0, 240.0))
-            .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui(move |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let _ = draw_omitted_entries_chip(ui, unsupported_only);
                 });
             });
@@ -20759,9 +20933,10 @@ mod facet_filter_bar_tests {
         let opened_for_ui = Arc::clone(&opened);
         let chip_label = omitted_entries_chip_label(counts).expect("chip label");
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(640.0, 240.0))
-            .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui(move |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     if let Some(request) = draw_omitted_entries_chip(ui, counts) {
                         *opened_for_ui.lock().unwrap() = Some(request);
                     }
@@ -20857,7 +21032,7 @@ mod facet_filter_bar_tests {
         app.items_are_bookmark_view = !reading_history;
 
         let ctx = egui::Context::default();
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -20865,12 +21040,13 @@ mod facet_filter_bar_tests {
                 )),
                 ..Default::default()
             },
-            |ctx| app.render_facet_filter_bar(ctx),
-        );
+            |ctx| ctx.root_ui(|root_ui| app.render_facet_filter_bar(root_ui)),
+        ));
         let mut text = String::new();
         for clipped in &output.shapes {
             collect_shape_text(&clipped.shape, &mut text);
         }
+        output.drop_without_applying_deltas();
         text
     }
 
@@ -20907,7 +21083,7 @@ mod facet_filter_bar_tests {
         app.visible_indices = vec![0];
 
         let ctx = egui::Context::default();
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -20915,8 +21091,8 @@ mod facet_filter_bar_tests {
                 )),
                 ..Default::default()
             },
-            |ctx| app.render_facet_filter_bar(ctx),
-        );
+            |ctx| ctx.root_ui(|root_ui| app.render_facet_filter_bar(root_ui)),
+        ));
         let mut text = String::new();
         for clipped in &output.shapes {
             collect_shape_text(&clipped.shape, &mut text);
@@ -20925,6 +21101,8 @@ mod facet_filter_bar_tests {
         assert!(!text.contains("ファイル名"), "{text}");
         assert!(app.facet_name_input.is_empty());
         assert!(app.settings.facet_filter.name_query.is_empty());
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -20941,7 +21119,7 @@ mod facet_filter_bar_tests {
         app.visible_indices = vec![0];
 
         let ctx = egui::Context::default();
-        let output = ctx.run(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -20949,8 +21127,8 @@ mod facet_filter_bar_tests {
                 )),
                 ..Default::default()
             },
-            |ctx| app.render_facet_filter_bar(ctx),
-        );
+            |ctx| ctx.root_ui(|root_ui| app.render_facet_filter_bar(root_ui)),
+        ));
         let mut text = String::new();
         for clipped in &output.shapes {
             collect_shape_text(&clipped.shape, &mut text);
@@ -20958,6 +21136,8 @@ mod facet_filter_bar_tests {
 
         assert!(text.contains("needle"), "{text}");
         assert!(!text.contains("ファイル名:needle"), "{text}");
+
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -21125,16 +21305,17 @@ mod selection_info_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        ThumbnailState::Loaded {
+        ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 128,
             },
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_dims: Some(dims),
-            layout_dims: None,
-        }
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some(dims),
+            None,
+        )
     }
 
     #[test]
@@ -21527,18 +21708,22 @@ mod selection_info_tests {
         ));
         let mut measured = None;
 
-        let _ = ctx.run(raw_input, |ctx| {
-            let before = ctx.available_rect().height();
-            app.render_selection_info_bar(ctx);
-            let after = ctx.available_rect().height();
-            let central = egui::CentralPanel::default()
-                .show(ctx, |ui| ui.available_height())
-                .inner;
-            measured = Some((before, after, central));
-        });
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                let before = ctx.root_ui(|ui| ui.available_rect_before_wrap()).height();
+                ctx.root_ui(|root_ui| app.render_selection_info_bar(root_ui));
+                let after = ctx.root_ui(|ui| ui.available_rect_before_wrap()).height();
+                let central = ctx
+                    .root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| ui.available_height())
+                    })
+                    .inner;
+                measured = Some((before, after, central));
+            })
+            .drop_without_applying_deltas();
 
         let (before, after, central) = measured.unwrap();
-        assert!(before - after >= selection_info_bar_height() - 0.5);
+        assert!(before - after >= selection_info_bar_height(ctx.global_style().as_ref()) - 0.5);
         assert!(central <= after + 0.5);
     }
 
@@ -21557,17 +21742,21 @@ mod selection_info_tests {
             ));
             let mut measured = None;
 
-            let _ = ctx.run(raw_input, |ctx| {
-                let predicted = details_grid_available_height_after_selection_bar(
-                    ctx.available_rect(),
-                    ctx.style().as_ref(),
-                );
-                app.render_selection_info_bar(ctx);
-                let actual = egui::CentralPanel::default()
-                    .show(ctx, |ui| ui.available_height())
-                    .inner;
-                measured = Some((predicted, actual));
-            });
+            let _ = ctx
+                .run_pass(raw_input, |ctx| {
+                    let predicted = details_grid_available_height_after_selection_bar(
+                        ctx.root_ui(|ui| ui.available_rect_before_wrap()),
+                        ctx.global_style().as_ref(),
+                    );
+                    ctx.root_ui(|root_ui| app.render_selection_info_bar(root_ui));
+                    let actual = ctx
+                        .root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| ui.available_height())
+                        })
+                        .inner;
+                    measured = Some((predicted, actual));
+                })
+                .drop_without_applying_deltas();
 
             let (predicted, actual) = measured.unwrap();
             assert!(
@@ -21582,9 +21771,15 @@ mod selection_info_tests {
         let scroll = details_scroll_style();
         assert!(!scroll.floating);
         assert!(scroll.allocated_width() > 0.0);
+        let style = egui::Style::default();
+        let frame = selection_info_bar_frame(&style);
         assert_eq!(
-            selection_info_bar_height(),
-            SELECTION_INFO_BAR_CONTENT_HEIGHT + scroll.allocated_width()
+            selection_info_bar_height(&style),
+            App::DETAILS_HEADER_H
+                + App::DETAILS_ROW_H
+                + frame.total_margin().sum().y
+                + style.visuals.widgets.noninteractive.bg_stroke.width.round()
+                + scroll.allocated_width()
         );
     }
 
@@ -21609,12 +21804,14 @@ mod selection_info_tests {
         ));
         let mut measured = None;
 
-        let _ = ctx.run(raw_input, |ctx| {
-            let before = ctx.available_rect();
-            app.render_details_lazy_status_bar(ctx);
-            let after = ctx.available_rect();
-            measured = Some((before, after));
-        });
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                let before = ctx.root_ui(|ui| ui.available_rect_before_wrap());
+                ctx.root_ui(|root_ui| app.render_details_lazy_status_bar(root_ui));
+                let after = ctx.root_ui(|ui| ui.available_rect_before_wrap());
+                measured = Some((before, after));
+            })
+            .drop_without_applying_deltas();
 
         let (before, after) = measured.unwrap();
         assert!((after.top() - before.top()).abs() < 0.01);
@@ -21641,12 +21838,14 @@ mod selection_info_tests {
         ));
         let mut measured = None;
 
-        let _ = ctx.run(raw_input, |ctx| {
-            let before = ctx.available_rect();
-            app.render_details_lazy_status_bar(ctx);
-            let after = ctx.available_rect();
-            measured = Some((before, after));
-        });
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                let before = ctx.root_ui(|ui| ui.available_rect_before_wrap());
+                ctx.root_ui(|root_ui| app.render_details_lazy_status_bar(root_ui));
+                let after = ctx.root_ui(|ui| ui.available_rect_before_wrap());
+                measured = Some((before, after));
+            })
+            .drop_without_applying_deltas();
 
         let (before, after) = measured.unwrap();
         assert!((after.top() - before.top()).abs() < 0.01);
@@ -21669,11 +21868,14 @@ mod selection_info_tests {
         ));
         let mut bottom_delta = 0.0;
 
-        let _ = ctx.run(raw_input, |ctx| {
-            let before = ctx.available_rect();
-            app.render_details_lazy_status_bar(ctx);
-            bottom_delta = before.bottom() - ctx.available_rect().bottom();
-        });
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                let before = ctx.root_ui(|ui| ui.available_rect_before_wrap());
+                ctx.root_ui(|root_ui| app.render_details_lazy_status_bar(root_ui));
+                bottom_delta =
+                    before.bottom() - ctx.root_ui(|ui| ui.available_rect_before_wrap()).bottom();
+            })
+            .drop_without_applying_deltas();
 
         assert!(bottom_delta >= 24.5);
     }
@@ -21692,11 +21894,14 @@ mod selection_info_tests {
             egui::vec2(640.0, 480.0),
         ));
         let mut bottom_delta = 0.0;
-        let _ = ctx.run(raw_input, |ctx| {
-            let before = ctx.available_rect();
-            app.render_details_lazy_status_bar(ctx);
-            bottom_delta = before.bottom() - ctx.available_rect().bottom();
-        });
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                let before = ctx.root_ui(|ui| ui.available_rect_before_wrap());
+                ctx.root_ui(|root_ui| app.render_details_lazy_status_bar(root_ui));
+                bottom_delta =
+                    before.bottom() - ctx.root_ui(|ui| ui.available_rect_before_wrap()).bottom();
+            })
+            .drop_without_applying_deltas();
         assert!(bottom_delta.abs() < 0.01);
     }
 
@@ -21970,6 +22175,73 @@ mod rating_filter_op_tests {
 }
 
 #[cfg(test)]
+mod book_append_target_tests {
+    use super::*;
+
+    fn install_receipt(app: &mut crate::app::AppTestEnvForTest) {
+        let root = app.tmp.path().join("target-select-books");
+        let folder = root.join("Current");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "Current".into())
+                .unwrap();
+        let page = folder.join("0001_page.jpg");
+        std::fs::write(&page, b"generated page").unwrap();
+        builder.record(&page).unwrap();
+        app.settings.book_root = Some(root);
+        app.settings.active_book_name = "Current".into();
+        app.book_append_undo_receipt = Some(crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 1,
+            source_context: app.virtual_list_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        });
+    }
+
+    #[test]
+    fn section1373_reselecting_the_same_book_target_preserves_receipt_and_revision() {
+        let mut app = crate::app::setup_app_for_test();
+        install_receipt(&mut app);
+        let revision = app.book_append_undo_revision;
+        assert!(!app.select_book_append_target("Current".into()));
+        assert_eq!(app.settings.active_book_name, "Current");
+        assert_eq!(app.book_append_undo_revision, revision);
+        assert!(app.book_append_undo_receipt.is_some());
+    }
+
+    #[test]
+    fn section1373_target_change_rejects_only_undo_append_before_setting_write() {
+        for undo_pending in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            install_receipt(&mut app);
+            let receipt = app.book_append_undo_receipt.as_ref().unwrap().clone();
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx,
+                intent: if undo_pending {
+                    crate::books::BookOpIntent::UndoAppend { receipt }
+                } else {
+                    crate::books::BookOpIntent::SourceMutation
+                },
+            });
+            let revision = app.book_append_undo_revision;
+            assert!(!app.select_book_append_target("Current".into()));
+            assert_eq!(app.book_append_undo_revision, revision);
+            assert_eq!(app.select_book_append_target("Next".into()), !undo_pending);
+            if undo_pending {
+                assert_eq!(app.settings.active_book_name, "Current");
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.book_append_undo_receipt.is_some());
+            } else {
+                assert_eq!(app.settings.active_book_name, "Next");
+                assert_eq!(app.book_append_undo_revision, revision + 1);
+                assert!(app.book_append_undo_receipt.is_none());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod book_reorder_drag_tests {
     use super::*;
 
@@ -22016,9 +22288,7 @@ mod book_reorder_drag_tests {
             dirty: false,
             drag_insert_index: None,
             thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
-            flush_pending: None,
             transfer_target_book: String::new(),
-            transfer_pending: None,
             error: None,
         }
     }
@@ -22196,6 +22466,26 @@ mod book_reorder_drag_tests {
     }
 
     #[test]
+    fn group_move_admission_ignores_same_order_and_empty_selection() {
+        for (selected, insertion, changed) in [
+            (vec!["b", "c"], 1, false),
+            (vec!["b", "c"], 2, false),
+            (vec!["b", "c"], 3, false),
+            (vec!["b", "c"], 4, true),
+            (vec!["a", "c"], 1, true),
+        ] {
+            let state = reorder_state(&["a", "b", "c", "d"], &selected);
+            assert_eq!(
+                book_reorder_group_move_changes_order(&state, insertion),
+                changed
+            );
+        }
+        let mut state = reorder_state(&["a", "b", "c", "d"], &[]);
+        state.selected_keys.clear();
+        assert!(!book_reorder_group_move_changes_order(&state, 4));
+    }
+
+    #[test]
     fn moving_selected_group_preserves_internal_order() {
         let mut state = reorder_state(&["a", "b", "c", "d", "e"], &["b", "c"]);
 
@@ -22233,19 +22523,23 @@ mod compute_cell_size_tests {
             ..Default::default()
         };
 
-        let _ = ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                // Narrower than `✓ 100%`: the button must grow horizontally, not vertically.
-                ui.set_max_width(36.0);
-                let expected_row_height = ui.spacing().interact_size.y;
-                let response = ui_scale_menu_button(ui, true, 100);
-                measured = Some((
-                    response.rect.width(),
-                    response.rect.height(),
-                    expected_row_height,
-                ));
-            });
-        });
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        // Narrower than `✓ 100%`: the button must grow horizontally, not vertically.
+                        ui.set_max_width(36.0);
+                        let expected_row_height = ui.spacing().interact_size.y;
+                        let response = ui_scale_menu_button(ui, true, 100);
+                        measured = Some((
+                            response.rect.width(),
+                            response.rect.height(),
+                            expected_row_height,
+                        ));
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         let (width, height, expected_row_height) = measured.expect("button measurement");
         assert!(width > 36.0, "the popup row should extend horizontally");
@@ -22875,48 +23169,52 @@ mod compute_cell_size_tests {
             root_viewport.outer_rect = Some(viewport_rect);
             let mut measured = None;
 
-            let _ = ctx.run(raw_input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let viewport = ui.available_rect_before_wrap();
-                    let effective_ppp = ui.ctx().pixels_per_point();
-                    let layout_avail_w =
-                        details_horizontal_viewport_capacity(viewport, effective_ppp)
-                            .min(viewport.width());
-                    let layout = details_layout(
-                        layout_avail_w,
-                        10.0,
-                        effective_ppp,
-                        &settings,
-                        DetailsColumnSet::Details,
-                        false,
-                    );
-                    let policy = details_horizontal_scroll_policy(
-                        viewport,
-                        layout.extent,
-                        layout.columns_w,
-                        effective_ppp,
-                    );
-                    let output = configured_details_horizontal_scroll_area(policy)
-                        .id_salt(("fractional_baseline", pixels_per_point.to_bits()))
-                        .show(ui, |ui| {
-                            // egui の入れ子 ScrollArea が作った「実描画ではない 1pt 超過」を
-                            // 明示的に再現する。policy は列が収まると判定済みなので、この
-                            // synthetic content_size がバー表示や offset を発生させてはならない。
-                            ui.set_min_width(viewport.width() + 1.0);
-                            ui.allocate_exact_size(
-                                egui::vec2(layout.pane_w, 80.0),
-                                egui::Sense::hover(),
+            let _ = ctx
+                .run_pass(raw_input, |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let viewport = ui.available_rect_before_wrap();
+                            let effective_ppp = ui.ctx().pixels_per_point();
+                            let layout_avail_w =
+                                details_horizontal_viewport_capacity(viewport, effective_ppp)
+                                    .min(viewport.width());
+                            let layout = details_layout(
+                                layout_avail_w,
+                                10.0,
+                                effective_ppp,
+                                &settings,
+                                DetailsColumnSet::Details,
+                                false,
                             );
-                        });
-                    measured = Some((
-                        policy,
-                        output.state.offset,
-                        output.content_size,
-                        output.inner_rect,
-                        viewport,
-                    ));
-                });
-            });
+                            let policy = details_horizontal_scroll_policy(
+                                viewport,
+                                layout.extent,
+                                layout.columns_w,
+                                effective_ppp,
+                            );
+                            let output = configured_details_horizontal_scroll_area(policy)
+                                .id_salt(("fractional_baseline", pixels_per_point.to_bits()))
+                                .show(ui, |ui| {
+                                    // egui の入れ子 ScrollArea が作った「実描画ではない 1pt 超過」を
+                                    // 明示的に再現する。policy は列が収まると判定済みなので、この
+                                    // synthetic content_size がバー表示や offset を発生させてはならない。
+                                    ui.set_min_width(viewport.width() + 1.0);
+                                    ui.allocate_exact_size(
+                                        egui::vec2(layout.pane_w, 80.0),
+                                        egui::Sense::hover(),
+                                    );
+                                });
+                            measured = Some((
+                                policy,
+                                output.state.clamped_offset(),
+                                output.content_size,
+                                output.inner_rect,
+                                viewport,
+                            ));
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
 
             let (policy, offset, content_size, inner_rect, viewport) =
                 measured.expect("scroll area rendered");
@@ -22939,22 +23237,26 @@ mod compute_cell_size_tests {
         app.settings.details_selection_bar_column_widths.clear();
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.apply_details_best_fit_width(
-                    ui,
-                    DetailsColumnSet::DedicatedBar,
-                    DetailsColumn::Name,
-                    260.0,
-                );
-                app.apply_details_best_fit_width(
-                    ui,
-                    DetailsColumnSet::SharedBar,
-                    DetailsColumn::Tags,
-                    180.0,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.apply_details_best_fit_width(
+                            ui,
+                            DetailsColumnSet::DedicatedBar,
+                            DetailsColumn::Name,
+                            260.0,
+                        );
+                        app.apply_details_best_fit_width(
+                            ui,
+                            DetailsColumnSet::SharedBar,
+                            DetailsColumn::Tags,
+                            180.0,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(app.settings.details_name_width_auto);
         assert!(!app.settings.details_selection_bar_name_width_auto);
@@ -22980,16 +23282,20 @@ mod compute_cell_size_tests {
         app.visible_indices = (0..row_count).collect();
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::Name,
-                    DetailsColumnSet::SharedBar,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::Name,
+                            DetailsColumnSet::SharedBar,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         let started_next_row = ctx
             .data(|data| {
                 data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
@@ -22998,15 +23304,19 @@ mod compute_cell_size_tests {
             .expect("multi-frame job remains after the first batch")
             .next_row;
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(800.0, App::DETAILS_HEADER_H),
-                    egui::Sense::hover(),
-                );
-                app.draw_details_header_static(ui, rect, DetailsColumnSet::SharedBar);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(800.0, App::DETAILS_HEADER_H),
+                            egui::Sense::hover(),
+                        );
+                        app.draw_details_header_static(ui, rect, DetailsColumnSet::SharedBar);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         let advanced_next_row = ctx
             .data(|data| {
                 data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
@@ -23036,16 +23346,20 @@ mod compute_cell_size_tests {
             egui::Pos2::ZERO,
             egui::vec2(900.0, 200.0),
         ));
-        let _ = ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::Name,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::Name,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         let width = app.settings.details_name_width;
         assert!(!app.settings.details_name_width_auto);
@@ -23075,34 +23389,42 @@ mod compute_cell_size_tests {
         app.details_order_revision = 1;
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::Name,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::Name,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(
             app.settings.details_name_width_auto,
             "最初の 192 行だけでは未標本の最長行を見ず、確定幅を適用しない"
         );
 
         let mut expected = 0.0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                expected = (App::details_best_fit_measure(
-                    ui,
-                    longest_name.clone(),
-                    egui::TextStyle::Body.resolve(ui.style()),
-                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
-                    .ceil()
-                    .clamp(DetailsColumn::Name.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        expected = (App::details_best_fit_measure(
+                            ui,
+                            longest_name.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                        ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                            .ceil()
+                            .clamp(DetailsColumn::Name.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(!app.settings.details_name_width_auto);
         assert!(
@@ -23134,29 +23456,37 @@ mod compute_cell_size_tests {
         app.details_order_revision = 9;
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::Name,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::Name,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         let mut expected = 0.0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                expected = (App::details_best_fit_measure(
-                    ui,
-                    filtered_longest.clone(),
-                    egui::TextStyle::Body.resolve(ui.style()),
-                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
-                    .ceil()
-                    .clamp(DetailsColumn::Name.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        expected = (App::details_best_fit_measure(
+                            ui,
+                            filtered_longest.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                        ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                            .ceil()
+                            .clamp(DetailsColumn::Name.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!((app.settings.details_name_width - expected).abs() < 0.01);
         assert!(
@@ -23179,22 +23509,30 @@ mod compute_cell_size_tests {
         app.details_order_revision = 3;
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::Name,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::Name,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         app.items_generation = app.items_generation.wrapping_add(1);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(app.settings.details_name_width_auto);
         assert!(
@@ -23214,64 +23552,68 @@ mod compute_cell_size_tests {
         let ctx = egui::Context::default();
         let mut checked = false;
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let rating_key = app.details_best_fit_job_key(
-                    ui,
-                    DetailsColumn::Rating,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-                let (rating_width, rating_dynamic) =
-                    app.details_best_fit_seed_width(ui, &rating_key);
-                let five_stars = App::details_best_fit_measure(
-                    ui,
-                    "★★★★★".to_owned(),
-                    rating_key.body_font.clone(),
-                );
-                assert!(!rating_dynamic);
-                assert!(rating_width >= five_stars);
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let rating_key = app.details_best_fit_job_key(
+                            ui,
+                            DetailsColumn::Rating,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                        let (rating_width, rating_dynamic) =
+                            app.details_best_fit_seed_width(ui, &rating_key);
+                        let five_stars = App::details_best_fit_measure(
+                            ui,
+                            "★★★★★".to_owned(),
+                            rating_key.body_font.clone(),
+                        );
+                        assert!(!rating_dynamic);
+                        assert!(rating_width >= five_stars);
 
-                let tags_key = app.details_best_fit_job_key(
-                    ui,
-                    DetailsColumn::Tags,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-                let (_, tags_dynamic) = app.details_best_fit_seed_width(ui, &tags_key);
-                assert!(tags_dynamic, "タグは現在一覧の動的値を全行測る");
+                        let tags_key = app.details_best_fit_job_key(
+                            ui,
+                            DetailsColumn::Tags,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                        let (_, tags_dynamic) = app.details_best_fit_seed_width(ui, &tags_key);
+                        assert!(tags_dynamic, "タグは現在一覧の動的値を全行測る");
 
-                app.items_are_bookmark_view = true;
-                let bookmark_state_key = app.details_best_fit_job_key(
-                    ui,
-                    DetailsColumn::State,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-                let (_, bookmark_state_dynamic) =
-                    app.details_best_fit_seed_width(ui, &bookmark_state_key);
-                assert!(
-                    bookmark_state_dynamic,
-                    "ブックマークの位置は固定語彙でないため全行測る"
-                );
+                        app.items_are_bookmark_view = true;
+                        let bookmark_state_key = app.details_best_fit_job_key(
+                            ui,
+                            DetailsColumn::State,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                        let (_, bookmark_state_dynamic) =
+                            app.details_best_fit_seed_width(ui, &bookmark_state_key);
+                        assert!(
+                            bookmark_state_dynamic,
+                            "ブックマークの位置は固定語彙でないため全行測る"
+                        );
 
-                app.items_are_bookmark_view = false;
-                app.items_are_reading_history_view = true;
-                let history_state_key = app.details_best_fit_job_key(
-                    ui,
-                    DetailsColumn::State,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-                let (_, history_state_dynamic) =
-                    app.details_best_fit_seed_width(ui, &history_state_key);
-                assert!(
-                    history_state_dynamic,
-                    "閲覧履歴の閲覧位置は固定語彙でないため全行測る"
-                );
-                checked = true;
-            });
-        });
+                        app.items_are_bookmark_view = false;
+                        app.items_are_reading_history_view = true;
+                        let history_state_key = app.details_best_fit_job_key(
+                            ui,
+                            DetailsColumn::State,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                        let (_, history_state_dynamic) =
+                            app.details_best_fit_seed_width(ui, &history_state_key);
+                        assert!(
+                            history_state_dynamic,
+                            "閲覧履歴の閲覧位置は固定語彙でないため全行測る"
+                        );
+                        checked = true;
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(checked);
     }
 
@@ -23291,26 +23633,34 @@ mod compute_cell_size_tests {
         app.details_order_revision = 1;
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::Tags,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::Tags,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         let long_tag = "first-batch-row-received-a-long-tag-after-measurement".to_string();
         let key = crate::tags_db::item_key_for_path(&first_path);
         app.set_tags_cache_entry(key, vec![long_tag.clone()]);
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         let restarted = ctx
             .data(|data| {
                 data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
@@ -23323,24 +23673,32 @@ mod compute_cell_size_tests {
             app.details_cell_content_revisions.tags
         );
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         let mut expected = 0.0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                expected = (App::details_best_fit_measure(
-                    ui,
-                    long_tag.clone(),
-                    egui::TextStyle::Body.resolve(ui.style()),
-                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
-                    .ceil()
-                    .clamp(DetailsColumn::Tags.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        expected = (App::details_best_fit_measure(
+                            ui,
+                            long_tag.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                        ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                            .ceil()
+                            .clamp(DetailsColumn::Tags.min_width(), DETAILS_BEST_FIT_MAX_WIDTH);
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(
             (details_column_width(
@@ -23369,16 +23727,20 @@ mod compute_cell_size_tests {
         app.details_order_revision = 1;
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::VideoCodec,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::VideoCodec,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         let codec = "AV1 / unusually-long-worker-result-codec-profile".to_string();
         let key = app.metadata_cache_key(0).unwrap();
@@ -23401,28 +23763,36 @@ mod compute_cell_size_tests {
             .wrapping_add(1);
 
         for _ in 0..2 {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.advance_details_best_fit_job(ui, false);
-                });
-            });
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            app.advance_details_best_fit_job(ui, false);
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
         }
         let mut expected = 0.0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                expected = (App::details_best_fit_measure(
-                    ui,
-                    codec.clone(),
-                    egui::TextStyle::Body.resolve(ui.style()),
-                ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
-                    .ceil()
-                    .clamp(
-                        DetailsColumn::VideoCodec.min_width(),
-                        DETAILS_BEST_FIT_MAX_WIDTH,
-                    );
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        expected = (App::details_best_fit_measure(
+                            ui,
+                            codec.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                        ) + DETAILS_BEST_FIT_HORIZONTAL_PADDING)
+                            .ceil()
+                            .clamp(
+                                DetailsColumn::VideoCodec.min_width(),
+                                DETAILS_BEST_FIT_MAX_WIDTH,
+                            );
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(
             (details_column_width(
@@ -23451,25 +23821,33 @@ mod compute_cell_size_tests {
         app.details_order_revision = 1;
         let ctx = egui::Context::default();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::Tags,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::Tags,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         app.details_cell_content_revisions.video_meta = app
             .details_cell_content_revisions
             .video_meta
             .wrapping_add(1);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.advance_details_best_fit_job(ui, false);
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.advance_details_best_fit_job(ui, false);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(ctx.data(|data| {
             data.get_temp::<Option<DetailsBestFitJob>>(App::details_best_fit_job_id())
@@ -23516,21 +23894,25 @@ mod compute_cell_size_tests {
         let ctx = egui::Context::default();
         let mut measured = 0.0;
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                measured = App::details_best_fit_measure(
-                    ui,
-                    state.clone(),
-                    egui::TextStyle::Body.resolve(ui.style()),
-                );
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::State,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        measured = App::details_best_fit_measure(
+                            ui,
+                            state.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                        );
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::State,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(state.contains("12345 ページ"));
         assert!(state.ends_with("見つかりません"));
@@ -23568,21 +23950,25 @@ mod compute_cell_size_tests {
         let state = "12345 / 123456".to_string();
         let mut measured = 0.0;
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                measured = App::details_best_fit_measure(
-                    ui,
-                    state.clone(),
-                    egui::TextStyle::Body.resolve(ui.style()),
-                );
-                app.start_details_best_fit_job(
-                    ui,
-                    DetailsColumn::State,
-                    DetailsColumnSet::Details,
-                    false,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        measured = App::details_best_fit_measure(
+                            ui,
+                            state.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                        );
+                        app.start_details_best_fit_job(
+                            ui,
+                            DetailsColumn::State,
+                            DetailsColumnSet::Details,
+                            false,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(app.details_state_text(0), state);
         assert!(
@@ -25289,9 +25675,10 @@ mod effetune_toolbar_flavor_tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1200.0, 300.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if fonts_ready {
-                        app.render_toolbar(ctx);
+                        app.render_toolbar(root_ui);
                     } else {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -25326,13 +25713,15 @@ mod effetune_toolbar_flavor_tests {
         crate::ui_fonts::configure_fonts(&ctx);
         // Panels settle their height and newly installed fonts over the initial frames.
         for _ in 0..2 {
-            let _ = ctx.run(input(), |ctx| {
-                app.render_toolbar(ctx);
-            });
+            let _ = ctx
+                .run_pass(input(), |ctx| {
+                    ctx.root_ui(|root_ui| app.render_toolbar(root_ui));
+                })
+                .drop_without_applying_deltas();
         }
-        let output = ctx.run(input(), |ctx| {
-            app.render_toolbar(ctx);
-        });
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(input(), |ctx| {
+            ctx.root_ui(|root_ui| app.render_toolbar(root_ui));
+        }));
         let mut text = String::new();
         for shape in &output.shapes {
             collect_text(&shape.shape, &mut text);
@@ -25355,23 +25744,29 @@ mod effetune_toolbar_flavor_tests {
             let with_hidden_row = app.toolbar_section_anchors.clone();
             let with_hidden_row_rect = app.toolbar_content_rect;
             app.settings.toolbar_section_new_row.clear();
-            let _ = ctx.run(input(), |ctx| {
-                app.render_toolbar(ctx);
-            });
+            let _ = ctx
+                .run_pass(input(), |ctx| {
+                    ctx.root_ui(|root_ui| app.render_toolbar(root_ui));
+                })
+                .drop_without_applying_deltas();
             assert_eq!(app.toolbar_section_anchors, with_hidden_row);
             assert_eq!(app.toolbar_content_rect, with_hidden_row_rect);
         }
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
     fn effetune_customization_candidate_follows_build_flavor() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
-        let output = ctx.run(input(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.draw_toolbar_visibility_menu(ui, false, false);
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(input(), |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    app.draw_toolbar_visibility_menu(ui, false, false);
+                })
             });
-        });
+        }));
         let mut text = String::new();
         for shape in &output.shapes {
             collect_text(&shape.shape, &mut text);
@@ -25379,6 +25774,8 @@ mod effetune_toolbar_flavor_tests {
         assert_eq!(text.contains("音響調整"), !cfg!(feature = "portable"));
         assert!(text.contains("ツリー"));
         assert!(app.settings.show_toolbar_effetune);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -25388,9 +25785,11 @@ mod effetune_toolbar_flavor_tests {
         only_effetune(&mut app.settings);
         app.settings.toolbar_section_order = vec![TS::EffeTune];
         let ctx = egui::Context::default();
-        let _ = ctx.run(input(), |ctx| {
-            app.render_toolbar(ctx);
-        });
+        let _ = ctx
+            .run_pass(input(), |ctx| {
+                ctx.root_ui(|root_ui| app.render_toolbar(root_ui));
+            })
+            .drop_without_applying_deltas();
         assert!(app.toolbar_section_anchors.is_empty());
         assert!(app.toolbar_content_rect.is_none());
     }
@@ -25525,10 +25924,12 @@ mod collection_toolbar_interaction_tests {
     ) -> Harness<'static, ToolbarState> {
         let second = crate::collection_store::CollectionId::new();
         crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(900.0, 240.0))
-            .build_state(
-                |ctx, state| {
-                    egui::TopBottomPanel::top("collection-toolbar-test").show(ctx, |ui| {
+            .build_ui_state(
+                |root_ui, state| {
+                    let ctx = &root_ui.ctx().clone();
+                    egui::Panel::top("collection-toolbar-test").show(root_ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             let drawn = draw_collection_toolbar_controls(
                                 ui,
@@ -25590,6 +25991,8 @@ mod collection_toolbar_interaction_tests {
             });
             harness.step();
         }
+        // A newly shown popup has a sizing pass before its accessible rows exist.
+        harness.run();
     }
 
     #[test]
@@ -26000,13 +26403,17 @@ mod checked_selection_overlay_tests {
         let available_top = Arc::new(std::sync::Mutex::new(None));
         let available_top_in_ui = Arc::clone(&available_top);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(640.0, 420.0))
-            .build(move |ctx| {
-                egui::TopBottomPanel::top("checked-overlay-test-toolbar")
-                    .exact_height(48.0)
-                    .show(ctx, |_| {});
-                *available_top_in_ui.lock().unwrap() = Some(ctx.available_rect().top());
-                let _ = show_checked_selection_overlay(ctx, 3);
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                egui::Panel::top("checked-overlay-test-toolbar")
+                    .exact_size(48.0)
+                    .show(root_ui, |_| {});
+                *available_top_in_ui.lock().unwrap() =
+                    Some(root_ui.available_rect_before_wrap().top());
+                let _ =
+                    show_checked_selection_overlay(ctx, root_ui.available_rect_before_wrap(), 3);
             });
 
         harness.run();
@@ -26022,8 +26429,10 @@ mod checked_selection_overlay_tests {
     fn checked_selection_overlay_is_absent_when_no_items_are_checked() {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
-            .build(|ctx| {
-                let _ = show_checked_selection_overlay(ctx, 0);
+            .build_ui(|root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                let _ =
+                    show_checked_selection_overlay(ctx, root_ui.available_rect_before_wrap(), 0);
             });
 
         harness.run();
@@ -26034,9 +26443,12 @@ mod checked_selection_overlay_tests {
     #[test]
     fn checked_selection_overlay_shows_the_exact_checked_count() {
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(480.0, 300.0))
-            .build(|ctx| {
-                let _ = show_checked_selection_overlay(ctx, 1);
+            .build_ui(|root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                let _ =
+                    show_checked_selection_overlay(ctx, root_ui.available_rect_before_wrap(), 1);
             });
 
         harness.run();
@@ -26049,9 +26461,11 @@ mod checked_selection_overlay_tests {
         let clicked = Arc::new(AtomicBool::new(false));
         let clicked_in_ui = Arc::clone(&clicked);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(480.0, 300.0))
-            .build(move |ctx| {
-                if show_checked_selection_overlay(ctx, 2) {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                if show_checked_selection_overlay(ctx, root_ui.available_rect_before_wrap(), 2) {
                     clicked_in_ui.store(true, Ordering::Relaxed);
                 }
             });
@@ -26067,9 +26481,11 @@ mod checked_selection_overlay_tests {
         let clicked = Arc::new(AtomicBool::new(false));
         let clicked_in_ui = Arc::clone(&clicked);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(480.0, 300.0))
-            .build(move |ctx| {
-                if show_checked_selection_overlay(ctx, 2) {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                if show_checked_selection_overlay(ctx, root_ui.available_rect_before_wrap(), 2) {
                     clicked_in_ui.store(true, Ordering::Relaxed);
                 }
             });
@@ -26387,18 +26803,21 @@ mod saved_group_number_ui_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 600.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("画像一覧");
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("画像一覧");
+                    });
+                    ui_app.borrow_mut().draw_book_manager(ctx);
                 });
-                ui_app.borrow_mut().draw_book_manager(ctx);
             });
         harness.run();
         harness.snapshot("book_manager_numbered_dark");
@@ -26467,10 +26886,11 @@ mod grid_reclick_open_tests {
         crate::test_ui::builder()
             .with_size(egui::vec2(460.0, 200.0))
             .with_step_dt(0.01)
-            .build_state(
-                |ctx, state| {
+            .build_ui_state(
+                |root_ui, state| {
+                    let ctx = &root_ui.ctx().clone();
                     state.app.begin_grid_click_input_frame(ctx);
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         let suppress_primary_pointer =
                             state.app.begin_grid_right_drag_primary_frame(ctx);
                         let previous_grid_click_pairing = state.app.begin_grid_primary_click_frame(
@@ -26578,6 +26998,89 @@ mod grid_reclick_open_tests {
         harness.run();
     }
 
+    #[test]
+    fn list_order_double_click_captures_folder_zip_pdf_and_conversion_before_open() {
+        use crate::app::ListOrderEntryKind;
+        use crate::app::top_level_grid_view::TopLevelGridSurface;
+        for activated in 0..4 {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            let app = &mut harness.state_mut().app;
+            let folder = app.tmp.path().join("list-order-pointer-source");
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut rows = vec![
+                GridItem::Folder(folder.join("folder-book")),
+                GridItem::ZipFile(folder.join("zip-book.zip")),
+                GridItem::PdfFile(folder.join("pdf-book.pdf")),
+                GridItem::ConvertibleArchive {
+                    path: folder.join("convert-book.7z"),
+                    format: crate::archive_converter::ArchiveFormat::SevenZ,
+                },
+            ];
+            // Keep the clicked cell at the same on-screen position in every case.
+            rows.swap(0, activated);
+            let expected = rows
+                .iter()
+                .rev()
+                .map(|item| item.container_path().unwrap().to_path_buf())
+                .collect::<Vec<_>>();
+            std::fs::write(folder.join("convert-book.7z"), b"test archive").unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = rows;
+            app.thumbnails = vec![ThumbnailState::Pending; 4];
+            app.image_metas = vec![None; 4];
+            app.visible_indices = vec![3, 2, 1, 0];
+            app.settings.grid_view_mode = GridViewMode::Thumbnail;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            // Conversion stops at its ordinary confirmation; no external tool runs.
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            assert!(app.list_order.is_none());
+            harness.run();
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            assert!(
+                harness.state().app.list_order.is_none(),
+                "selection alone cannot capture"
+            );
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            let app = &harness.state().app;
+            let captured = app
+                .list_order
+                .as_ref()
+                .expect("double-click captures before opening");
+            assert_eq!(captured.owner, app.virtual_list_context_id());
+            assert_eq!(
+                captured
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut expected_kinds = vec![
+                ListOrderEntryKind::Folder,
+                ListOrderEntryKind::Zip,
+                ListOrderEntryKind::Pdf,
+                ListOrderEntryKind::ConvertibleArchive,
+            ];
+            expected_kinds.swap(0, activated);
+            expected_kinds.reverse();
+            assert_eq!(
+                captured
+                    .entries
+                    .iter()
+                    .map(|entry| entry.kind)
+                    .collect::<Vec<_>>(),
+                expected_kinds
+            );
+            // Returned folder/container navigation has not been adopted, and conversion
+            // has only reached confirmation. The captured rows are the outgoing list.
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        }
+    }
+
     fn rating_selection_harness(
         view: crate::settings::GridViewMode,
     ) -> Harness<'static, HandlerState> {
@@ -26626,19 +27129,20 @@ mod grid_reclick_open_tests {
     fn ctrl_z_rating_origin(app: &mut AppTestEnvForTest) {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers: egui::Modifiers::CTRL,
-            events: vec![egui::Event::Key {
-                key: egui::Key::Z,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::CTRL,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+                .chain(vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }])
+                .collect(),
             ..Default::default()
         });
         app.keyboard_owner_for_pass(&ctx);
         app.handle_meta_undo_keys(&ctx);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -27214,7 +27718,7 @@ mod grid_reclick_open_tests {
                     harness.state_mut().app.show_cache_manager = false;
                 }
                 3 => {
-                    egui::Popup::open_id(&harness.ctx, egui::Id::new("test_background_popup"));
+                    egui::Popup::open_id(&harness.ctx, egui::Id::unique("test_background_popup"));
                     harness.step();
                     egui::Popup::close_all(&harness.ctx);
                 }
@@ -27230,6 +27734,8 @@ mod grid_reclick_open_tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, 10.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     });
                     for _ in 0..100 {
                         harness.step();
@@ -27452,14 +27958,15 @@ mod grid_reclick_open_tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(640.0, 480.0))
                 .with_step_dt(0.01)
-                .build_state(
-                    move |ctx, state: &mut (AppTestEnvForTest, Vec<AddressBarNav>)| {
+                .build_ui_state(
+                    move |root_ui, state: &mut (AppTestEnvForTest, Vec<AddressBarNav>)| {
+                        let ctx = &root_ui.ctx().clone();
                         if !fonts_set.replace(true) {
                             crate::ui_fonts::configure_fonts(ctx);
                             ctx.request_repaint();
                             return;
                         }
-                        if let Some(nav) = state.0.render_grid(ctx) {
+                        if let Some(nav) = state.0.render_grid(root_ui) {
                             state.1.push(nav);
                         }
                     },
@@ -27519,23 +28026,25 @@ mod grid_reclick_open_tests {
                 ],
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                let previous = app.begin_grid_primary_click_frame(
-                    ctx,
-                    ctx.input(|input| input.pointer.primary_clicked()),
-                );
-                if let Some(nav) = app.handle_grid_background_primary_click(
-                    ctx,
-                    rect,
-                    false,
-                    false,
-                    false,
-                    previous,
-                    &crate::touch_correlation::TouchFrame::default(),
-                ) {
-                    navs.push(nav);
-                }
-            });
+            let _ = ctx
+                .run_pass(input, |ctx| {
+                    let previous = app.begin_grid_primary_click_frame(
+                        ctx,
+                        ctx.input(|input| input.pointer.primary_clicked()),
+                    );
+                    if let Some(nav) = app.handle_grid_background_primary_click(
+                        ctx,
+                        rect,
+                        false,
+                        false,
+                        false,
+                        previous,
+                        &crate::touch_correlation::TouchFrame::default(),
+                    ) {
+                        navs.push(nav);
+                    }
+                })
+                .drop_without_applying_deltas();
         }
         assert!(navs.is_empty());
     }
@@ -27543,7 +28052,7 @@ mod grid_reclick_open_tests {
     #[test]
     fn background_excluded_press_popup_dismissal_never_pairs() {
         let mut harness = background_harness(GridClickSelectionMode::Explorer);
-        egui::Popup::open_id(&harness.ctx, egui::Id::new("background_dismissal_popup"));
+        egui::Popup::open_id(&harness.ctx, egui::Id::unique("background_dismissal_popup"));
         harness.state_mut().close_popup_before_background = true;
         click_at(&mut harness, egui::pos2(30.0, 170.0));
         harness.state_mut().close_popup_before_background = false;
@@ -27590,60 +28099,64 @@ mod grid_reclick_open_tests {
         let draw = |app: &mut AppTestEnvForTest, time, events| {
             let mut navs = Vec::new();
             let mut background_calls = 0;
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(460.0, 200.0),
-                    )),
-                    focused: true,
-                    time: Some(time),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    // Same start/extraction/cell/background order as ROOT render_grid.
-                    app.begin_grid_click_input_frame(ctx);
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let previous = app.begin_grid_primary_click_frame(
-                            ctx,
-                            ctx.input(|input| input.pointer.primary_clicked()),
-                        );
-                        let cell_nav = app.handle_cell_interaction(
-                            ui,
-                            ctx,
-                            cell_rect(0),
-                            0,
-                            &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
-                            false,
-                            false,
-                            previous,
-                            None,
-                        );
-                        let mut background = || {
-                            background_calls += 1;
-                            app.handle_grid_background_primary_click(
-                                ctx,
-                                ui.max_rect(),
-                                true,
-                                true,
-                                false,
-                                previous,
-                                &crate::touch_correlation::TouchFrame::default(),
-                            )
-                        };
-                        let nav = if skip_background_on_navigation {
-                            cell_nav.or_else(background)
-                        } else {
-                            let background_nav = background();
-                            cell_nav.or(background_nav)
-                        };
-                        if let Some(nav) = nav {
-                            navs.push(nav);
-                        }
-                    });
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(460.0, 200.0),
+                        )),
+                        focused: true,
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        // Same start/extraction/cell/background order as ROOT render_grid.
+                        app.begin_grid_click_input_frame(ctx);
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                let previous = app.begin_grid_primary_click_frame(
+                                    ctx,
+                                    ctx.input(|input| input.pointer.primary_clicked()),
+                                );
+                                let cell_nav = app.handle_cell_interaction(
+                                    ui,
+                                    ctx,
+                                    cell_rect(0),
+                                    0,
+                                    &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
+                                    false,
+                                    false,
+                                    previous,
+                                    None,
+                                );
+                                let mut background = || {
+                                    background_calls += 1;
+                                    app.handle_grid_background_primary_click(
+                                        ctx,
+                                        ui.max_rect(),
+                                        true,
+                                        true,
+                                        false,
+                                        previous,
+                                        &crate::touch_correlation::TouchFrame::default(),
+                                    )
+                                };
+                                let nav = if skip_background_on_navigation {
+                                    cell_nav.or_else(background)
+                                } else {
+                                    let background_nav = background();
+                                    cell_nav.or(background_nav)
+                                };
+                                if let Some(nav) = nav {
+                                    navs.push(nav);
+                                }
+                            })
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
             (navs, background_calls)
         };
         // Establish the interactive rectangle before supplying pointer edges.
@@ -27720,37 +28233,39 @@ mod grid_reclick_open_tests {
                 }
                 let accepted = app.grid_click_pairing;
                 assert_ne!(accepted, GridClickPairingState::default());
-                let _ = ctx.run(
-                    egui::RawInput {
-                        focused: false,
-                        time: Some(1.1),
-                        events: if focus_lost {
-                            vec![egui::Event::WindowFocused(false)]
-                        } else {
-                            Vec::new()
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            focused: false,
+                            time: Some(1.1),
+                            events: if focus_lost {
+                                vec![egui::Event::WindowFocused(false)]
+                            } else {
+                                Vec::new()
+                            },
+                            ..Default::default()
                         },
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        app.begin_grid_click_input_frame(ctx);
-                        let previous = app.grid_click_pairing;
-                        assert!(
-                            app.handle_grid_background_primary_click(
-                                ctx,
-                                egui::Rect::from_min_size(
-                                    egui::Pos2::ZERO,
-                                    egui::vec2(400.0, 200.0)
-                                ),
-                                false,
-                                false,
-                                false,
-                                previous,
-                                &crate::touch_correlation::TouchFrame::default(),
-                            )
-                            .is_none()
-                        );
-                    },
-                );
+                        |ctx| {
+                            app.begin_grid_click_input_frame(ctx);
+                            let previous = app.grid_click_pairing;
+                            assert!(
+                                app.handle_grid_background_primary_click(
+                                    ctx,
+                                    egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(400.0, 200.0)
+                                    ),
+                                    false,
+                                    false,
+                                    false,
+                                    previous,
+                                    &crate::touch_correlation::TouchFrame::default(),
+                                )
+                                .is_none()
+                            );
+                        },
+                    )
+                    .drop_without_applying_deltas();
                 assert_eq!(
                     app.grid_click_pairing,
                     if cell && !focus_lost {
@@ -27794,25 +28309,27 @@ mod grid_reclick_open_tests {
                 ],
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                for _ in 0..2 {
-                    let previous = app.begin_grid_primary_click_frame(
-                        ctx,
-                        ctx.input(|input| input.pointer.primary_clicked()),
-                    );
-                    if let Some(nav) = app.handle_grid_background_primary_click(
-                        ctx,
-                        rect,
-                        false,
-                        false,
-                        false,
-                        previous,
-                        &crate::touch_correlation::TouchFrame::default(),
-                    ) {
-                        navs.push(nav);
+            let _ = ctx
+                .run_pass(input, |ctx| {
+                    for _ in 0..2 {
+                        let previous = app.begin_grid_primary_click_frame(
+                            ctx,
+                            ctx.input(|input| input.pointer.primary_clicked()),
+                        );
+                        if let Some(nav) = app.handle_grid_background_primary_click(
+                            ctx,
+                            rect,
+                            false,
+                            false,
+                            false,
+                            previous,
+                            &crate::touch_correlation::TouchFrame::default(),
+                        ) {
+                            navs.push(nav);
+                        }
                     }
-                }
-            });
+                })
+                .drop_without_applying_deltas();
         }
         assert_eq!(navs.len(), 1);
     }
@@ -28463,6 +28980,67 @@ mod decide_drag_payload_tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[test]
+    fn retained_material_entry_native_drag_keeps_virtual_refusal_and_physical_paths() {
+        use crate::app::composite_pixels_revision_tests::{evict_pair_cpu, warm_final_pair};
+        use crate::page_dims::{CanonicalPageDimensions, PagePixelDimensions};
+
+        let ctx = egui::Context::default();
+        let (mut app, keys) = warm_final_pair(&ctx);
+        app.final_composite_cache
+            .get_mut(&keys[1])
+            .unwrap()
+            .canonical_dims = Some(CanonicalPageDimensions::new(1200, 1800));
+        app.page_dims_cache.clear();
+        let generation = app.items_generation;
+        app.page_dims_cache
+            .record(generation, 0, PagePixelDimensions::Thumbnail((160, 240)));
+        evict_pair_cpu(&mut app);
+        app.fullscreen_idx = Some(0);
+        let checked = HashSet::new();
+        match decide_drag_payload(&app.items, &checked, 0) {
+            DragDecision::ImmediateToast(message) => {
+                assert!(message.contains("ページ") && message.contains("ドラッグできません"));
+            }
+            _ => panic!("a displayed PDF composite must not become a native file-drag payload"),
+        }
+        let file = app.tmp.path().join("drag-original.png");
+        let file_idx = app.items.len();
+        app.items.push(GridItem::Image(file.clone()));
+        match decide_drag_payload(&app.items, &checked, file_idx) {
+            DragDecision::Start {
+                paths,
+                post_drag_toast,
+            } => {
+                assert_eq!(paths, vec![file.clone()]);
+                assert!(post_drag_toast.is_none());
+            }
+            _ => panic!("ordinary files retain their existing path-drag behavior"),
+        }
+        let checked = [0, file_idx].into_iter().collect();
+        match decide_drag_payload(&app.items, &checked, 0) {
+            DragDecision::Start {
+                paths,
+                post_drag_toast,
+            } => {
+                assert_eq!(paths, vec![file]);
+                assert!(post_drag_toast.is_some());
+            }
+            _ => panic!("mixed drag must exclude the virtual page and keep the real file"),
+        }
+        assert!(!app.fs_cache.contains_key(&0));
+        assert!(!app.fs_pending.contains_key(&0));
+        assert!(!app.fs_upload_backlog_contains(0));
+        assert!(
+            app.pending_native_drag.is_none(),
+            "this test must not queue an OS drag"
+        );
+        assert_eq!(
+            app.final_composite_cache.get(&keys[1]).unwrap().pixels.size,
+            [8, 12]
+        );
+    }
+
     fn img(p: &str) -> GridItem {
         GridItem::Image(PathBuf::from(p))
     }
@@ -28635,9 +29213,10 @@ mod toolbar_wrap_tests {
             let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_rows = row_geometry.clone();
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(screen_size)
-                .build(move |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                .build_ui(move |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         ui.spacing_mut().interact_size.y = 22.0;
                         ui.spacing_mut().button_padding.y = 1.0;
                         ui.style_mut().text_styles.insert(
@@ -28667,6 +29246,7 @@ mod toolbar_wrap_tests {
                                         .push((row.rect, ui.clip_rect()));
                                 }
                             });
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "ソート");
                         *observed_id.lock().unwrap() = Some(combo.response.id);
                     });
                 });
@@ -28733,9 +29313,10 @@ mod toolbar_wrap_tests {
             let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_rows = row_geometry.clone();
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(screen_size)
-                .build(move |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                .build_ui(move |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         ui.spacing_mut().interact_size.y = 22.0;
                         ui.spacing_mut().button_padding.y = 1.0;
                         ui.style_mut().text_styles.insert(
@@ -28777,6 +29358,7 @@ mod toolbar_wrap_tests {
                                         .push((row.rect, ui.clip_rect()));
                                 }
                             });
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "ソート");
                         *observed_id.lock().unwrap() = Some(combo.response.id);
                     });
                 });
@@ -28835,13 +29417,14 @@ mod toolbar_wrap_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(853.0, 533.0))
             .with_pixels_per_point(1.5)
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_set.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
                     return;
                 }
-                egui::TopBottomPanel::top("probe").show(ctx, |ui| {
+                egui::Panel::top("probe").show(root_ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.add_space(700.0);
                         let h = sort_combo_popup_height(ui, 10, true, false, false, 0, 0);
@@ -28887,6 +29470,7 @@ mod toolbar_wrap_tests {
                                     ));
                                 }
                             });
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "ソート:");
                         *observed_id.lock().unwrap() = Some(combo.response.id);
                     });
                 });
@@ -28948,7 +29532,7 @@ mod toolbar_wrap_tests {
     #[test]
     fn sort_popup_reserves_floating_scrollbar_width_before_its_contents() {
         let ctx = egui::Context::default();
-        ctx.style_mut(|style| {
+        ctx.global_style_mut(|style| {
             style.spacing.scroll = egui::style::ScrollStyle::floating();
             style.spacing.scroll.floating_allocated_width = 0.0;
         });
@@ -28960,26 +29544,32 @@ mod toolbar_wrap_tests {
         let mut combo_id = None;
         let mut observed_popup_style = None;
         for frame in 0..4 {
-            let _ = ctx.run(input.clone(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let combo = egui::ComboBox::from_id_salt("sort-popup-test")
-                        .width(100.0)
-                        .height(80.0)
-                        .popup_style(sort_combo_popup_style())
-                        .selected_text("シャッフル")
-                        .show_ui(ui, |ui| {
-                            observed_popup_style = Some((
-                                ui.spacing().scroll.allocated_width(),
-                                ui.spacing().button_padding.x,
-                            ));
-                            for row in 0..20 {
-                                let _ =
-                                    ui.selectable_label(row == 0, "シャッフル（再選択で並べ直す）");
-                            }
-                        });
-                    combo_id = Some(combo.response.id);
-                });
-            });
+            let _ = ctx
+                .run_pass(input.clone(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let combo = egui::ComboBox::from_id_salt("sort-popup-test")
+                                .width(100.0)
+                                .height(80.0)
+                                .popup_style(sort_combo_popup_style())
+                                .selected_text("シャッフル")
+                                .show_ui(ui, |ui| {
+                                    observed_popup_style = Some((
+                                        ui.spacing().scroll.allocated_width(),
+                                        ui.spacing().button_padding.x,
+                                    ));
+                                    for row in 0..20 {
+                                        let _ = ui.selectable_label(
+                                            row == 0,
+                                            "シャッフル（再選択で並べ直す）",
+                                        );
+                                    }
+                                });
+                            combo_id = Some(combo.response.id);
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
             if frame == 0 {
                 egui::Popup::open_id(&ctx, combo_id.unwrap().with("popup"));
             }
@@ -28993,7 +29583,10 @@ mod toolbar_wrap_tests {
             menu_padding, 2.0,
             "ComboBox menu appearance must remain intact"
         );
-        assert_eq!(ctx.style().spacing.scroll.floating_allocated_width, 0.0);
+        assert_eq!(
+            ctx.global_style().spacing.scroll.floating_allocated_width,
+            0.0
+        );
     }
 
     /// パネル幅 `panel_w` で折り返し行を 1 回描き、`build` が集めた値を返す。
@@ -29015,15 +29608,17 @@ mod toolbar_wrap_tests {
         for _ in 0..2 {
             sink.lock().unwrap().clear();
             let out = sink.clone();
-            ctx.run(input.clone(), |ctx| {
-                egui::TopBottomPanel::top("t").show(ctx, |ui| {
-                    let right = ui.max_rect().right();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        build(ui, right, out.as_ref());
-                    });
+            crate::test_ui::headless_paint_output(ctx.run_pass(input.clone(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::Panel::top("t").show(root_ui, |ui| {
+                        let right = ui.max_rect().right();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                            build(ui, right, out.as_ref());
+                        });
+                    })
                 });
-            });
+            }));
         }
         let v = sink.lock().unwrap().clone();
         v
@@ -29056,29 +29651,41 @@ mod toolbar_wrap_tests {
         }
     }
 
-    /// **ComboBox は折り返し判定を通らない** ので、`toolbar_combo_slot` で場所を
-    /// 取らないとパネル右端からはみ出す。取れば出ない。
+    /// 0.37 の WidgetAtom は単体の ComboBox を自動で折り返す。一方、予約前に
+    /// add_enabled_ui を作ると子 Ui の左端は行頭ではなく現在位置になる。
+    /// その実際の失敗経路を negative control にし、親での slot 予約を検査する。
     #[test]
     fn a_combo_stays_inside_the_panel_only_when_we_reserve_its_place() {
         let mut without = 0usize;
         let mut with = 0usize;
-        for w in 500..1200 {
+        for w in 500..600 {
             let panel = w as f32;
             let a = run(panel, |ui, right, out| {
-                for &text in SELECTED_TEXTS {
-                    let combo = egui::ComboBox::from_id_salt(text)
-                        .width(120.0)
-                        .selected_text(text)
-                        .show_ui(ui, |_| {});
-                    if combo.response.rect.right() > right + 0.5 {
-                        out.lock()
-                            .unwrap()
-                            .push(combo.response.rect.right() - right);
-                    }
+                let text = SELECTED_TEXTS[0];
+                let predicted = toolbar_combo_width(ui, 120.0, text);
+                // 全幅なら収まるが、今の行には半分しか残らない配置を作る。
+                let prefix = ui.available_width() - predicted * 0.5 - ui.spacing().item_spacing.x;
+                ui.allocate_exact_size(egui::vec2(prefix, 22.0), egui::Sense::hover());
+                let combo = ui
+                    .add_enabled_ui(true, |ui| {
+                        egui::ComboBox::from_id_salt("unreserved-child")
+                            .width(120.0)
+                            .selected_text(text)
+                            .show_ui(ui, |_| {})
+                    })
+                    .inner;
+                if combo.response.rect.right() > right + 0.5 {
+                    out.lock()
+                        .unwrap()
+                        .push(combo.response.rect.right() - right);
                 }
             });
             let b = run(panel, |ui, right, out| {
-                for &text in SELECTED_TEXTS {
+                for &text in &SELECTED_TEXTS[..1] {
+                    let predicted = toolbar_combo_width(ui, 120.0, text);
+                    let prefix =
+                        ui.available_width() - predicted * 0.5 - ui.spacing().item_spacing.x;
+                    ui.allocate_exact_size(egui::vec2(prefix, 22.0), egui::Sense::hover());
                     let combo = toolbar_combo_slot(ui, true, 120.0, text.to_string(), |ui, t| {
                         egui::ComboBox::from_id_salt(text)
                             .width(120.0)
@@ -29095,9 +29702,9 @@ mod toolbar_wrap_tests {
             without += usize::from(!a.is_empty());
             with += usize::from(!b.is_empty());
         }
-        assert!(
-            without > 100,
-            "この前提が崩れたらテストの意味がない (折り返さない ComboBox は溢れるはず): {without}"
+        assert_eq!(
+            without, 100,
+            "親で予約しない子 Ui は全条件ではみ出す必要がある"
         );
         assert_eq!(with, 0, "折り返しを入れてもはみ出した幅が {with} 件ある");
     }
@@ -29168,6 +29775,7 @@ mod details_header_right_click_tests {
 
     struct HeaderState {
         app: AppTestEnvForTest,
+        header_rect: Option<egui::Rect>,
     }
 
     /// 詳細一覧をそのまま描く harness。ヘッダも背景右クリックも右ドラッグ短押しも
@@ -29192,11 +29800,15 @@ mod details_header_right_click_tests {
             );
         }
         crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(640.0, 400.0))
             .with_step_dt(0.01)
-            .build_state(
-                |ctx, state| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui_state(
+                |root_ui, state| {
+                    let ctx = &root_ui.ctx().clone();
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let list_origin = ui.available_rect_before_wrap().min;
+                        let header_fill = ui.visuals().extreme_bg_color;
                         let _ = state.app.render_details_list(
                             ui,
                             ctx,
@@ -29206,9 +29818,28 @@ mod details_header_right_click_tests {
                             GridClickPairingState::default(),
                             &crate::touch_correlation::TouchFrame::default(),
                         );
+                        state.header_rect = ctx.graphics(|graphics| {
+                            graphics.get(ui.layer_id()).and_then(|paint| {
+                                paint
+                                    .all_entries()
+                                    .find_map(|clipped| match &clipped.shape {
+                                        egui::Shape::Rect(shape)
+                                            if shape.fill == header_fill
+                                                && shape.rect.top() == list_origin.y
+                                                && shape.rect.height() == App::DETAILS_HEADER_H =>
+                                        {
+                                            Some(shape.rect.intersect(clipped.clip_rect))
+                                        }
+                                        _ => None,
+                                    })
+                            })
+                        });
                     });
                 },
-                HeaderState { app },
+                HeaderState {
+                    app,
+                    header_rect: None,
+                },
             )
     }
 
@@ -29237,7 +29868,18 @@ mod details_header_right_click_tests {
         for gesture in [false, true] {
             let mut harness = details_harness(gesture);
             harness.step();
-            let header_pos = egui::pos2(120.0, App::DETAILS_HEADER_H * 0.5);
+            let header = harness.state().header_rect.expect("painted details header");
+            let header_pos = header.center();
+            assert!(header.is_positive() && header.contains(header_pos));
+            assert!(
+                !harness
+                    .state()
+                    .app
+                    .selected_cell_rect
+                    .unwrap()
+                    .contains(header_pos),
+                "the negative case must target the painted header, above the item rows"
+            );
             secondary_click(&mut harness, header_pos);
             assert_eq!(
                 harness.state().app.context_menu_idx,
@@ -29253,7 +29895,7 @@ mod details_header_right_click_tests {
         for gesture in [false, true] {
             let mut harness = details_harness(gesture);
             harness.step();
-            let row_pos = egui::pos2(120.0, App::DETAILS_HEADER_H + App::DETAILS_ROW_H * 0.5);
+            let row_pos = harness.state().app.selected_cell_rect.unwrap().center();
             secondary_click(&mut harness, row_pos);
             assert!(
                 harness.state().app.context_menu_idx.is_some(),
@@ -29313,21 +29955,24 @@ mod section207_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 480.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts.replace(true) {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    ctx.request_repaint();
-                    return;
-                }
-                if let Some(value) = render.borrow_mut().render_toolbar(ctx).1 {
-                    nav_render.borrow_mut().push(value);
-                }
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if let Some(value) = render.borrow_mut().render_toolbar(root_ui).1 {
+                        nav_render.borrow_mut().push(value);
+                    }
+                });
             });
         harness.run();
         click_location_menu(&mut harness, "場所▼");
         harness.run();
-        click_location_menu(&mut harness, "整理先 ⏵");
+        click_location_menu(&mut harness, "整理先");
         harness.run();
         harness.snapshot("folder_bar_organize_destinations");
         click_location_menu(&mut harness, "保管");
@@ -29345,7 +29990,7 @@ mod section207_tests {
             .show_location_file_organize_destinations = false;
         click_location_menu(&mut harness, "場所▼");
         harness.run();
-        assert!(harness.query_by_label("整理先 ⏵").is_none());
+        assert!(harness.query_by_label("整理先").is_none());
     }
 
     fn click_location_menu(harness: &mut Harness<'_, ()>, label: &str) {
@@ -29392,30 +30037,37 @@ mod section207_tests {
         let wheel_after = Rc::new(Cell::new(false));
         let observed = Rc::clone(&wheel_after);
         let fonts = Cell::new(false);
+        // Popup tooltips can take eight 0.25s steps to settle in egui 0.37.
         let mut harness = crate::test_ui::builder()
+            .with_max_steps(8)
             .with_size(egui::vec2(1100.0, 480.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts.replace(true) {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    ctx.request_repaint();
-                    return;
-                }
-                if let Some(value) = render.borrow_mut().render_toolbar(ctx).1 {
-                    nav_render.borrow_mut().push(value);
-                }
-                observed.set(ctx.input(|i| {
-                    i.raw_scroll_delta != egui::Vec2::ZERO
-                        || i.smooth_scroll_delta != egui::Vec2::ZERO
-                        || i.events
-                            .iter()
-                            .any(|e| matches!(e, egui::Event::MouseWheel { .. }))
-                }));
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if let Some(value) = render.borrow_mut().render_toolbar(root_ui).1 {
+                        nav_render.borrow_mut().push(value);
+                    }
+                    let wheel_options = ctx.options(|o| o.input_options);
+                    observed.set(ctx.input(|i| {
+                        crate::wheel_input::remaining_wheel_delta(i, wheel_options)
+                            != egui::Vec2::ZERO
+                            || i.smooth_scroll_delta != egui::Vec2::ZERO
+                            || i.events
+                                .iter()
+                                .any(|e| matches!(e, egui::Event::MouseWheel { .. }))
+                    }));
+                });
             });
         harness.run();
         click_location_menu(&mut harness, "場所▼");
         harness.run();
-        click_location_menu(&mut harness, "整理先 ⏵");
+        click_location_menu(&mut harness, "整理先");
         harness.run();
         let first = harness.get_by_label("整理先 000").rect();
         assert!(
@@ -29428,12 +30080,24 @@ mod section207_tests {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -10000.0),
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         });
         harness.step();
         assert!(!wheel_after.get(), "popup wheel must not reach the grid");
         harness.run();
+        // Capture the scrolled menu, not a transient full-path tooltip that
+        // contains this test's random temporary directory. Pointer departure
+        // keeps the open menu and the subsequent real destination click.
+        harness.event(egui::Event::PointerGone);
+        harness.run();
         let last = harness.get_by_label("整理先 099").rect();
         assert!(last.top() >= 0.0 && last.bottom() <= 480.0);
+        assert!(
+            harness
+                .query_by_role(egui::accesskit::Role::Tooltip)
+                .is_none()
+        );
         harness.snapshot("folder_bar_organize_destinations_scrolled");
         click_location_menu(&mut harness, "整理先 099");
         harness.run();
@@ -29451,15 +30115,18 @@ mod section207_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 700.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts.replace(true) {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    render.borrow_mut().draw_folder_bar_settings_menu(ui);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        render.borrow_mut().draw_folder_bar_settings_menu(ui);
+                    });
                 });
             });
         harness.run();
@@ -29509,14 +30176,23 @@ mod section207_tests {
                         let fonts = Cell::new(false);
                         let mut harness = crate::test_ui::builder()
                             .with_size(egui::vec2(width * zoom, 400.0 * zoom))
-                            .build(move |ctx| {
+                            .build_ui(move |root_ui| {
+                                let ctx = &root_ui.ctx().clone();
                                 ctx.set_zoom_factor(zoom);
                                 if !fonts.replace(true) {
                                     crate::ui_fonts::configure_fonts(ctx);
                                     ctx.request_repaint();
                                     return;
                                 }
-                                render.borrow_mut().render_toolbar(ctx);
+                                // Production receives the full viewport root Ui. kittest's
+                                // build_ui adds an outer 8pt frame around this closure.
+                                root_ui.scope_builder(
+                                    egui::UiBuilder::new().max_rect(ctx.content_rect()),
+                                    |viewport_ui| {
+                                        assert_eq!(viewport_ui.max_rect(), ctx.content_rect());
+                                        render.borrow_mut().render_toolbar(viewport_ui);
+                                    },
+                                );
                             });
                         harness.run();
                         let field = harness.get_by_role(egui::accesskit::Role::TextInput);
@@ -29529,7 +30205,7 @@ mod section207_tests {
                         let left = harness.get_by_label("場所▼").rect();
                         let right = harness.get_by_label("履歴▼").rect();
                         let panel = state.borrow().toolbar_content_rect.unwrap();
-                        let panel = egui::Rect::from_min_max(panel.min * zoom, panel.max * zoom);
+                        let viewport = harness.ctx.content_rect();
                         let case =
                             format!("width={width} zoom={zoom} row={new_row} changed={changed}");
                         if width == 360.0 && zoom == 1.0 && new_row {
@@ -29545,7 +30221,10 @@ mod section207_tests {
                                 }))
                                 .unwrap();
                         }
-                        assert!(input.width() >= 160.0 * zoom, "{case}: {input:?}");
+                        assert!(
+                            input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH,
+                            "{case}: {input:?}"
+                        );
                         let precedes = |a: egui::Rect, b: egui::Rect| {
                             a.bottom() <= b.top() + 0.5
                                 || (a.right() <= b.left() + 0.5
@@ -29572,10 +30251,7 @@ mod section207_tests {
                                 panel.expand(0.5).contains_rect(rect),
                                 "{case}: {panel:?} {rect:?}"
                             );
-                            assert!(
-                                rect.left() >= 0.0 && rect.right() <= width * zoom,
-                                "{case}: {rect:?}"
-                            );
+                            assert!(viewport.contains_rect(rect), "{case}: {rect:?}");
                         }
                     }
                 }
@@ -29628,16 +30304,34 @@ mod section207_tests {
                 let fonts = Cell::new(false);
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(width, 400.0 * zoom))
-                    .build(move |ctx| {
+                    .build_ui(move |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
                         ctx.set_zoom_factor(zoom);
                         if !fonts.replace(true) {
                             crate::ui_fonts::configure_fonts(ctx);
                             ctx.request_repaint();
                             return;
                         }
-                        render.borrow_mut().render_toolbar(ctx);
+                        // Production receives the full viewport root Ui. kittest's
+                        // build_ui adds an outer 8pt frame around this closure.
+                        root_ui.scope_builder(
+                            egui::UiBuilder::new().max_rect(ctx.content_rect()),
+                            |viewport_ui| {
+                                assert_eq!(viewport_ui.max_rect(), ctx.content_rect());
+                                render.borrow_mut().render_toolbar(viewport_ui);
+                            },
+                        );
                     });
                 harness.run();
+                let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+                std::fs::create_dir_all(dir).unwrap();
+                harness
+                    .render()
+                    .unwrap()
+                    .save(dir.join(format!(
+                        "folder-reported-{width}-zoom{zoom}-row{new_row}.png"
+                    )))
+                    .unwrap();
                 let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
                 let left = harness.get_by_label("場所▼").rect();
                 let precedes = |a: egui::Rect, b: egui::Rect| {
@@ -29647,25 +30341,18 @@ mod section207_tests {
                             && b.top() < a.bottom())
                 };
                 let favorite = harness.get_by_label("♡").rect();
-                if width / zoom >= 950.0 {
+                // 0.37 の字幅では旧 950pt 境界を越えても折り返す。十分な幅の
+                // Fits と狭幅の分離を残し、中間幅は全操作の到達性で検査する。
+                if width / zoom >= 1200.0 {
                     assert!(
                         left.top() < input.bottom() && input.top() < left.bottom(),
-                        "all controls fit on one row"
+                        "all controls fit on one row: width={width} zoom={zoom} row={new_row} left={left:?} input={input:?} favorite={favorite:?}"
                     );
                     assert!(
                         favorite.top() < input.bottom() && input.top() < favorite.bottom(),
                         "right controls fit too"
                     );
-                } else if width / zoom >= 700.0 {
-                    assert!(
-                        left.bottom() <= input.top(),
-                        "left controls need a separate row"
-                    );
-                    assert!(
-                        favorite.top() < input.bottom() && input.top() < favorite.bottom(),
-                        "input and right controls fit together"
-                    );
-                } else {
+                } else if width / zoom <= 400.0 {
                     assert!(left.bottom() <= input.top());
                     assert!(
                         input.bottom() <= favorite.top(),
@@ -29676,7 +30363,12 @@ mod section207_tests {
                     left.height() <= input.height() + 0.5,
                     "place caption must not wrap internally: {left:?}"
                 );
-                assert!(left.left() >= 0.0 && left.right() <= width);
+                let viewport = harness.ctx.content_rect();
+                assert!(viewport.contains_rect(left));
+                assert!(
+                    viewport.contains_rect(input),
+                    "input escaped viewport: {input:?}"
+                );
                 assert!(precedes(left, input), "left/input: {left:?} {input:?}");
                 for label in [
                     "♡",
@@ -29693,7 +30385,7 @@ mod section207_tests {
                         "right caption must not wrap internally: {label} {right:?}"
                     );
                     assert!(
-                        right.left() >= 0.0 && right.right() <= width,
+                        viewport.contains_rect(right),
                         "right control escaped the panel: {label} {right:?}"
                     );
                     assert!(
@@ -29701,7 +30393,34 @@ mod section207_tests {
                         "width={width} zoom={zoom} row={new_row} input/right={label}: {input:?} {right:?}"
                     );
                 }
-                assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH * zoom);
+                assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH);
+                // 矩形が存在するだけでなく、折り返した各行の固定操作に実際に
+                // pointer が届くことを確認する。popup を開かず hover hit test を使う。
+                for label in [
+                    "場所▼",
+                    "♡",
+                    "履歴▼",
+                    "📌",
+                    "サブ展開",
+                    "スタック",
+                    "非表示 321 件",
+                ] {
+                    let node = harness.get_by_label(label);
+                    let id = unsafe {
+                        egui::Id::from_high_entropy_bits(
+                            (u128::from(node.accesskit_node().id()) >> 64) as u64,
+                        )
+                    };
+                    let rect = node.rect();
+                    harness.hover_at(rect.center());
+                    harness.run_steps(1);
+                    let response = harness.ctx.read_response(id).unwrap();
+                    assert!(response.contains_pointer(), "{label}: {rect:?}");
+                    assert!(
+                        response.interact_rect.contains_rect(rect),
+                        "{label}: clipped {rect:?}"
+                    );
+                }
                 if new_row {
                     let evidence = std::path::Path::new("target/section207-wrap-rendering");
                     std::fs::create_dir_all(evidence).unwrap();
@@ -29755,13 +30474,14 @@ mod section207_tests {
                         let fonts = Cell::new(false);
                         let mut harness = crate::test_ui::builder()
                             .with_size(egui::vec2(width, 360.0))
-                            .build(move |ctx| {
+                            .build_ui(move |root_ui| {
+                                let ctx = &root_ui.ctx().clone();
                                 if !fonts.replace(true) {
                                     crate::ui_fonts::configure_fonts(ctx);
                                     ctx.request_repaint();
                                     return;
                                 }
-                                render.borrow_mut().render_toolbar(ctx);
+                                render.borrow_mut().render_toolbar(root_ui);
                             });
                         harness.run();
                         let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
@@ -29818,14 +30538,15 @@ mod section207_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
                     return;
                 }
                 let mut app = render.borrow_mut();
-                match app.render_toolbar(ctx).1 {
+                match app.render_toolbar(root_ui).1 {
                     Some(AddressBarNav::HistoryBack) => {
                         app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back)
                     }
@@ -29929,7 +30650,8 @@ mod section207_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::ime_focus::install_ime_input_policy(ctx);
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -29938,7 +30660,7 @@ mod section207_tests {
                 }
                 let mut app = render.borrow_mut();
                 app.update_ime_state(ctx);
-                if let Some(value) = app.render_toolbar(ctx).1 {
+                if let Some(value) = app.render_toolbar(root_ui).1 {
                     nav_render.borrow_mut().push(value);
                 }
             });
@@ -29995,6 +30717,10 @@ mod section207_tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn section207_address_ime_enter_and_escape_belong_to_composition() {
         let mut env = crate::app::setup_app_for_test();
         only_folder_and_tree(&mut env);
@@ -30005,7 +30731,8 @@ mod section207_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 360.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::ime_focus::install_ime_input_policy(ctx);
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -30014,7 +30741,7 @@ mod section207_tests {
                 }
                 let mut app = render.borrow_mut();
                 app.update_ime_state(ctx);
-                nav_render.set(nav_render.get() || app.render_toolbar(ctx).1.is_some());
+                nav_render.set(nav_render.get() || app.render_toolbar(root_ui).1.is_some());
             });
         harness.run();
         harness
@@ -30022,7 +30749,10 @@ mod section207_tests {
             .click();
         harness.run();
         harness.event(egui::Event::Ime(egui::ImeEvent::Enabled));
-        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit("にほんご".into())));
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "にほんご".into(),
+            active_range_chars: None,
+        }));
         harness.step();
         harness.key_press(egui::Key::Enter);
         harness.step();
@@ -30037,6 +30767,175 @@ mod section207_tests {
         harness.event(egui::Event::Ime(egui::ImeEvent::Disabled));
         harness.step();
         assert!(app.borrow().address_has_focus);
+    }
+
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
+    fn run_ime_committed_bar_enter(address: bool, same_pass: bool, recover_focus: bool) {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        let target = env.tmp.path().join("committed-target");
+        std::fs::create_dir_all(&target).unwrap();
+        if address {
+            env.address.clear();
+        } else {
+            env.show_search_bar = true;
+            env.search_query.clear();
+            env.search_focus_request = true;
+        }
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(RefCell::new(Vec::new()));
+        let nav_render = Rc::clone(&nav);
+        let force_focus_loss = Rc::new(Cell::new(false));
+        let force_focus_loss_render = Rc::clone(&force_focus_loss);
+        let fonts = Cell::new(false);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                if force_focus_loss_render.replace(false) {
+                    ctx.memory_mut(|memory| {
+                        if let Some(id) = memory.focused() {
+                            memory.surrender_focus(id);
+                        }
+                    });
+                }
+                if address {
+                    if let Some(value) = app.render_toolbar(root_ui).1 {
+                        nav_render.borrow_mut().push(value);
+                    }
+                } else {
+                    app.render_search_bar(root_ui);
+                }
+            });
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        let edit_id = harness.ctx.memory(|memory| memory.focused()).unwrap();
+        // input_mut feeds the whole event sequence to ONE egui pass; Harness::event
+        // would run separate passes for each event and miss the same-pass regression.
+        harness.input_mut().events = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "preedit".into(),
+                active_range_chars: None,
+            }),
+        ];
+        harness.step();
+        assert!(app.borrow().ime_input_active(&harness.ctx));
+        assert!(nav.borrow().is_empty());
+        assert!(app.borrow().search_pending.is_none());
+        let committed = if address {
+            target.to_string_lossy().to_string()
+        } else {
+            "committed-search".to_owned()
+        };
+        let mut events = vec![
+            egui::Event::Ime(egui::ImeEvent::Commit(committed.clone())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ];
+        if !same_pass {
+            harness.input_mut().events = std::mem::take(&mut events);
+            harness.step();
+            assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+            assert!(nav.borrow().is_empty());
+            assert!(app.borrow().search_pending.is_none());
+            if recover_focus {
+                force_focus_loss.set(true);
+                harness.input_mut().events = vec![
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                    egui::Event::Key {
+                        key: egui::Key::J,
+                        physical_key: Some(egui::Key::J),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::ALT,
+                    },
+                ];
+                harness.step();
+                assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+                assert!(!app.borrow().search_focus_request);
+                assert!(nav.borrow().is_empty());
+                assert!(app.borrow().search_pending.is_none());
+            }
+        }
+        events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.input_mut().events = events;
+        harness.step();
+        assert!(!app.borrow().ime_input_active(&harness.ctx));
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+        if address {
+            assert!(
+                matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, _)] if path == &target)
+            );
+            assert!(!app.borrow().address_has_focus);
+        } else {
+            assert_eq!(app.borrow().search_query, committed);
+            assert!(
+                app.borrow().search_pending.is_some(),
+                "the real search handler submits the committed query"
+            );
+            assert!(!app.borrow().search_has_focus);
+            assert!(!app.borrow().search_focus_request);
+        }
+        harness.input_mut().events = vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        harness.step();
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+    }
+
+    #[test]
+    fn address_ime_commit_and_immediate_enter_same_pass_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, true, false);
+    }
+
+    #[test]
+    fn address_ime_commit_and_immediate_enter_next_pass_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, false, false);
+    }
+
+    #[test]
+    fn search_ime_commit_and_immediate_enter_same_pass_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, true, false);
+    }
+
+    #[test]
+    fn search_ime_commit_and_immediate_enter_next_pass_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, false, false);
+    }
+
+    #[test]
+    fn address_bar_focus_recovery_then_enter_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, false, true);
+    }
+
+    #[test]
+    fn search_bar_focus_recovery_then_enter_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, false, true);
     }
 
     #[test]
@@ -30057,6 +30956,20 @@ mod section207_tests {
 
     #[test]
     fn section207_default_folder_geometry_matches_the_separate_panels() {
+        assert_section207_folder_geometry_matches_the_separate_panels(None);
+    }
+
+    #[test]
+    fn section207_folder_separator_reservation_matches_the_separate_panels() {
+        // Zero catches an unconditional +1; fractional/wider strokes catch a
+        // hard-coded default reservation and an incorrect half-stroke inset.
+        // Each case retains the real two-panel oracle at 100%/150%, Light/Dark.
+        for width in [0.0, 1.5, 2.0] {
+            assert_section207_folder_geometry_matches_the_separate_panels(Some(width));
+        }
+    }
+
+    fn assert_section207_folder_geometry_matches_the_separate_panels(separator_width: Option<f32>) {
         let mut env = crate::app::setup_app_for_test();
         only_folder_and_tree(&mut env);
         let app = Rc::new(RefCell::new(env));
@@ -30066,7 +30979,8 @@ mod section207_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
@@ -30075,19 +30989,22 @@ mod section207_tests {
                 let mut app = render.borrow_mut();
                 if legacy_render.get() {
                     app.settings.show_toolbar_folder = false;
-                    app.render_toolbar(ctx);
+                    app.render_toolbar(root_ui);
                     app.settings.show_toolbar_folder = true;
-                    egui::TopBottomPanel::top("legacy_address_bar").show(ctx, |ui| {
+                    egui::Panel::top("legacy_address_bar").show(root_ui, |ui| {
                         app.render_address_bar(ui, false, &[]);
                     });
                 } else {
-                    app.render_toolbar(ctx);
+                    app.render_toolbar(root_ui);
                 }
             });
-        for (theme, visuals) in [
+        for (theme, mut visuals) in [
             ("dark", egui::Visuals::dark()),
             ("light", egui::Visuals::light()),
         ] {
+            if let Some(width) = separator_width {
+                visuals.widgets.noninteractive.bg_stroke.width = width;
+            }
             harness.ctx.set_visuals(visuals);
             for zoom in [1.0, 1.5] {
                 harness.ctx.set_zoom_factor(zoom);
@@ -30113,8 +31030,15 @@ mod section207_tests {
                         new, old,
                         "default geometry must survive tree_visible={tree_visible}"
                     );
-                    let evidence = std::path::Path::new("target/section207-review-rendering/final");
-                    std::fs::create_dir_all(evidence).unwrap();
+                    let evidence = separator_width.map_or_else(
+                        || std::path::PathBuf::from("target/section207-review-rendering/final"),
+                        |width| {
+                            std::path::PathBuf::from(format!(
+                                "target/section207-review-rendering/separator_{width}"
+                            ))
+                        },
+                    );
+                    std::fs::create_dir_all(&evidence).unwrap();
                     old_image
                         .save(evidence.join(format!(
                             "legacy_{theme}_zoom_{zoom}_tree_{tree_visible}.png"
@@ -30159,6 +31083,8 @@ mod section292_tests {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
         app.load_folder_with_scan(folder, None);
+        // Production sanitizes pointer input during hydration; this harness must settle it first.
+        app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = true;
         app.settings.show_facet_sort = true;
         app.settings.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
@@ -30171,17 +31097,20 @@ mod section292_tests {
         let observed = Rc::clone(&wheel_after);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1400.0, 600.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
                     return;
                 }
                 let mut app = render.borrow_mut();
-                app.render_toolbar(ctx);
-                app.render_facet_filter_bar(ctx);
+                app.note_main_chrome_pointer_block_transition(ctx);
+                app.render_toolbar(root_ui);
+                app.render_facet_filter_bar(root_ui);
+                let wheel_options = ctx.options(|o| o.input_options);
                 observed.set(ctx.input(|i| {
-                    i.raw_scroll_delta != egui::Vec2::ZERO
+                    crate::wheel_input::remaining_wheel_delta(i, wheel_options) != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO
                         || i.events
                             .iter()
@@ -30204,11 +31133,17 @@ mod section292_tests {
             assert_eq!(combos.len(), 2);
             combos[index].click();
             harness.run();
+            assert!(
+                !app.borrow().main_chrome_pointer_blocked(),
+                "sort dropdowns are menus, not common modals"
+            );
             if index == 1 {
                 harness.input_mut().events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -20.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 });
                 harness.run();
                 assert!(
@@ -30223,6 +31158,9 @@ mod section292_tests {
                 .click();
             harness.run();
             assert_eq!(app.borrow().settings.sort_order, choice);
+            app.borrow_mut().finish_page_identity_preparation_for_test();
+            assert!(!app.borrow().main_chrome_pointer_blocked());
+            harness.run();
             let matching = harness
                 .get_all_by_role(egui::accesskit::Role::ComboBox)
                 .into_iter()
@@ -30291,15 +31229,16 @@ mod section292_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1400.0, 600.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
                     ctx.request_repaint();
                     return;
                 }
                 let mut app = render.borrow_mut();
-                app.render_toolbar(ctx);
-                app.render_facet_filter_bar(ctx);
+                app.render_toolbar(root_ui);
+                app.render_facet_filter_bar(root_ui);
             });
         harness.run();
         let combos: Vec<_> = harness
@@ -30325,6 +31264,26 @@ mod section292_tests {
         refresh.click();
         harness.run();
         SORT_CONTROL_TEST_RELOADS.with(|count| assert_eq!(count.get(), 1));
+        {
+            let mut app = app.borrow_mut();
+            let ctx = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+                || app.sidecar_restore_active()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "refresh did not settle"
+                );
+                app.settle_open_path_classification_for_test();
+                app.poll_sidecar_restore(&ctx);
+                app.poll_history_navigation_transition_for_test(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         app.borrow_mut().finish_page_identity_preparation_for_test();
         assert!(
             app.borrow()
@@ -30404,52 +31363,55 @@ mod section292_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(width, 240.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts.replace(true) {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("絞り込み:");
-                        let mut last = egui::Rect::NOTHING;
-                        for label in [
-                            "ファイル名: sample",
-                            "種類: 画像",
-                            "拡張子: JPG",
-                            "★3 以上",
-                            "タグ: 旅行",
-                            "日付: 今月",
-                            "色: 肌色",
-                            "表示 25 件 / 全体 120 件",
-                        ] {
-                            last = ui.button(label).rect;
-                        }
-                        let outer_right = ui.max_rect().right();
-                        let slot = facet_sort_slot(ui, "名前↓", |ui| {
-                            let label = ui.label("ソート:");
-                            let combo = grid_sort_combo(
-                                ui,
-                                true,
-                                "名前↓".to_owned(),
-                                "snapshot_facet_sort",
-                                300.0,
-                                |ui| ui.selectable_label(true, "名前↓"),
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("絞り込み:");
+                            let mut last = egui::Rect::NOTHING;
+                            for label in [
+                                "ファイル名: sample",
+                                "種類: 画像",
+                                "拡張子: JPG",
+                                "★3 以上",
+                                "タグ: 旅行",
+                                "日付: 今月",
+                                "色: 肌色",
+                                "表示 25 件 / 全体 120 件",
+                            ] {
+                                last = ui.button(label).rect;
+                            }
+                            let outer_right = ui.max_rect().right();
+                            let slot = facet_sort_slot(ui, "名前↓", |ui| {
+                                let label = ui.label("ソート:");
+                                let combo = grid_sort_combo(
+                                    ui,
+                                    true,
+                                    "名前↓".to_owned(),
+                                    "snapshot_facet_sort",
+                                    300.0,
+                                    |ui| ui.selectable_label(true, "名前↓"),
+                                );
+                                label.rect.union(combo.response.rect)
+                            });
+                            assert!(slot.left() >= ui.max_rect().left() - 0.5);
+                            assert!(
+                                (slot.right() - outer_right).abs() < 1.0,
+                                "sort must align to the right: {slot:?}, right {outer_right}"
                             );
-                            label.rect.union(combo.response.rect)
+                            assert!(
+                                !slot.intersects(last),
+                                "sort must not overlap the last facet"
+                            );
+                            assert!(slot.right() <= ui.clip_rect().right() + 0.5);
                         });
-                        assert!(slot.left() >= ui.max_rect().left() - 0.5);
-                        assert!(
-                            (slot.right() - outer_right).abs() < 1.0,
-                            "sort must align to the right: {slot:?}, right {outer_right}"
-                        );
-                        assert!(
-                            !slot.intersects(last),
-                            "sort must not overlap the last facet"
-                        );
-                        assert!(slot.right() <= ui.clip_rect().right() + 0.5);
                     });
                 });
             });
@@ -30465,5 +31427,76 @@ mod section292_tests {
     #[test]
     fn section292_facet_sort_snapshot_narrow_dark() {
         facet_sort_snapshot("facet_sort_narrow_dark", 320.0);
+    }
+}
+
+#[cfg(test)]
+mod pinned_search_review_tests {
+    use super::*;
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+    use egui_kittest::kittest::Queryable;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    #[test]
+    fn section1409_search_label_secondary_click_opens_settings_with_drag_disabled() {
+        for kind in Kind::ALL {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.toolbar_section_drag_enabled = false;
+            set_toolbar_section_visible(&mut app.settings, kind.section(), true);
+            let app = Rc::new(RefCell::new(app));
+            let render = app.clone();
+            let label_rect = Rc::new(Cell::new(egui::Rect::NOTHING));
+            let rect = label_rect.clone();
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(640.0, 260.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let mut app = render.borrow_mut();
+                            let response = app.draw_pinned_search_section(ui, kind);
+                            rect.set(response.inner.label.rect);
+                            app.finish_toolbar_section_lead(
+                                ui,
+                                response.inner.label,
+                                kind.section(),
+                                &mut Vec::new(),
+                                &[],
+                            );
+                        });
+                    });
+                });
+            harness.run();
+            let pos = label_rect.get().center();
+            harness.hover_at(pos);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.run();
+            harness.get_by_label("行頭に表示").click();
+            harness.run();
+            assert!(
+                app.borrow()
+                    .settings
+                    .toolbar_section_new_row
+                    .contains(&kind.section()),
+                "{kind:?}"
+            );
+            assert!(!app.borrow().settings.toolbar_section_drag_enabled);
+        }
     }
 }

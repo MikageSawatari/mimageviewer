@@ -27,7 +27,19 @@ impl ImageProbe {
     }
 }
 
+fn is_avif_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("avif"))
+}
+
 pub fn decode_oriented(path: &Path) -> Option<DynamicImage> {
+    if is_avif_path(path) {
+        let bytes = std::fs::read(path).ok()?;
+        match libavif_sys::decode(&bytes, libavif_sys::Limits::default(), 4) {
+            Ok(image) => return Some(DynamicImage::ImageRgba8(image)),
+            Err(error) => eprintln!("remote image libavif: {error}"),
+        }
+    }
     let image = image::open(path)
         .ok()
         .or_else(|| wic_decode_to_dynamic_image(path))?;
@@ -35,6 +47,19 @@ pub fn decode_oriented(path: &Path) -> Option<DynamicImage> {
 }
 
 pub fn probe_image(path: &Path) -> Option<ImageProbe> {
+    if is_avif_path(path) {
+        let bytes = std::fs::read(path).ok()?;
+        match libavif_sys::dimensions(&bytes, libavif_sys::Limits::default(), 4) {
+            Ok((raw_width, raw_height)) => {
+                return Some(ImageProbe {
+                    raw_width,
+                    raw_height,
+                    orientation: 1,
+                });
+            }
+            Err(error) => eprintln!("remote image-info libavif: {error}"),
+        }
+    }
     let (raw_width, raw_height) = image::image_dimensions(path)
         .ok()
         .or_else(|| wic_image_dimensions(path))?;
@@ -350,6 +375,23 @@ impl Drop for ComScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn avif_native_decode_retains_alpha_and_applied_orientation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/avif");
+        let image = decode_oriented(&root.join("quadrant_alpha_444.avif"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(image.get_pixel(16, 16)[3], 0);
+        assert_eq!(image.get_pixel(48, 16)[3], 255);
+        let probe = probe_image(&root.join("quadrant_irot90cw.avif")).unwrap();
+        assert_eq!(probe.orientation, 1);
+        let image = decode_oriented(&root.join("quadrant_irot90cw.avif"))
+            .unwrap()
+            .to_rgba8();
+        assert!(image.get_pixel(16, 16)[2] > 230);
+    }
 
     #[test]
     fn legacy_decode_extensions_are_disjoint_from_addressed_raw_extensions() {

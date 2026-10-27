@@ -41,9 +41,15 @@ fn run() -> Result<(), String> {
     println!("input size: {size}x{size}");
 
     // --- テスト画像読み込み + 前処理 (1024² resize, ImageNet 正規化, NCHW) ---
-    let img = image::open(&image_path)
-        .map_err(|e| format!("open image: {e}"))?
-        .to_rgb8();
+    let img = mimageviewer::image_decode::decode(
+        mimageviewer::image_decode::Source::Path(&image_path),
+        mimageviewer::avif_decoder::Workload::Background,
+        false,
+        None,
+    )
+    .map(|decoded| decoded.image)
+    .map_err(|e| format!("open image: {e}"))?
+    .to_rgb8();
     let (iw, ih) = img.dimensions();
     println!("source image: {iw}x{ih}");
     let resized = image::imageops::resize(

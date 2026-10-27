@@ -657,6 +657,7 @@ mod diagnostic_projection_tests {
                 },
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some((1, 1)),
                 layout_dims: None,
             }),

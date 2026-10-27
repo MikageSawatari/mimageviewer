@@ -4,32 +4,20 @@
 //! ドラッグ＆ドロップでコピーするための Windows シェル連携。設計の全体像は
 //! `docs/file-drag-drop-design.md` を参照。
 //!
-//! 方針: 自前で `IDataObject` を実装せず、シェルが用意済みのものを借りる。
-//! パス → PIDL → `IShellItemArray` → `BindToHandler(BHID_DataObject)` で
-//! 完成済み `IDataObject` を得て `SHDoDragDrop` に渡す。`SHDoDragDrop` は
-//! 既定の `IDropSource` とドラッグ画像も自動で提供する。
+//! パス → PIDL → `IShellItemArray` → `BindToHandler(BHID_DataObject)` で Shell の
+//! `IDataObject` を得る。送出だけを STA-bound な委譲ラッパーで包み、
+//! `IDataObjectAsyncCapability` を提供する (§12)。共有の Shell 生成経路は変更しない。
 //!
-//! `start_file_drag` は `SHDoDragDrop` が戻る (ドロップ完了 or キャンセル) まで
-//! ブロックする。UI スレッドから、かつマウスボタン押下中に呼ぶこと。
-//!
-//! **モーダルブロックの不可避性 (review #8 メモ)**: `SHDoDragDrop` は OLE2 の
-//! STA (Single-Threaded Apartment) モデルに従って HWND 所有スレッド上で独自の
-//! メッセージループを回す。`IDataObject` は呼び出しスレッドのアパートに bound
-//! されるため、別スレッドへ移して実行することは仕様上できない (= drag は UI
-//! スレッドをブロックする以外の選択肢が無い)。
-//!
-//! ユーザー影響の軽減策:
-//!   - **presenter / 音声 / decoder スレッドは独立**して動き続けるので、ドラッグ
-//!     中も動画は再生され続け、音飛びも起きない。`App::update` 側の poll が止まる
-//!     だけで、worker 自体は backlog を貯めながら作業を継続している。
-//!   - SHDoDragDrop 復帰直後に `ctx.request_repaint()` を呼ぶ (呼び出し側で実施) と、
-//!     次フレームで `poll_pdf_render` / `poll_file_drop_pending` /
-//!     `poll_global_search_events` などが backlog をまとめて処理する。
-//!   - 将来的な改善案: カスタム `IDropSource` を実装して `GiveFeedback` callback
-//!     から mIV の worker poll を周期駆動する。ただし `IDropSource` 内から `App`
-//!     (= `&mut self`) を参照する経路を作る必要があり、現時点では未実装。
+//! UI スレッド・マウス押下中に `SHDoDragDrop` を呼ぶ。ドラッグ操作の OLE モーダル
+//! 区間は残る。非同期を選択して Drop から早期復帰する target では、その後の転送完了を
+//! 待たない。非対応 target の同期処理と開始前の Shell 解決コストは残る。
+//! 復帰後の GetData / SetData / EndOperation は通常の winit message loop が UI STA へ配送する。
+//! 1ドラッグ1 owner とし App を参照せず、終了時に転送完了を待つ機構も追加しない。
 
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+mod async_data_object;
 
 /// `start_file_drag` の結果。呼び出し側はこれを見て、ポインタリセットの要否・
 /// 失敗トーストの要否を判断する (`docs/file-drag-drop-design.md` §5.1)。
@@ -44,7 +32,8 @@ pub struct DragOutcome {
     pub failed_paths: usize,
     /// COM 各ステップで失敗した場合のエラー。正常時は `None`。
     pub error: Option<FileDragError>,
-    /// ドロップが実際に成立したか (`SHDoDragDrop` の effect が NONE 以外)。
+    /// ドロップが受理されたか (`SHDoDragDrop` の effect が NONE 以外)。
+    /// 非同期転送の完了・成功を示すものではない。
     /// キャンセル (Esc / 無効ターゲット上で離す) のときは false。呼び出し側が
     /// 「mIV 自身のウィンドウへ落ちた」判定をするのに使う。
     pub dropped: bool,
@@ -93,6 +82,8 @@ pub enum FileDragError {
     ShellArrayCreate(i32),
     /// `IShellItemArray::BindToHandler(BHID_DataObject)` が失敗した。
     BindToHandler(i32),
+    /// 送出専用 async capability の設定 / 復帰時の寿命処理が失敗した。
+    AsyncCapability(i32),
     /// `SHDoDragDrop` 自体が HRESULT エラーを返した (モーダルループには入っている)。
     DoDragDrop(i32),
 }
@@ -211,7 +202,7 @@ pub(crate) fn shell_item_array_for_paths(
 
 /// 指定パス群の OLE ドラッグ＆ドロップ (コピー) を開始する。
 ///
-/// `SHDoDragDrop` が戻る (ドロップ完了 or キャンセル) までブロックする。
+/// OLE モーダル区間はブロックする。非同期 target の転送完了は待たない。
 /// UI スレッドから、かつマウスボタンが押下中に呼ぶこと。
 #[cfg(windows)]
 pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
@@ -235,23 +226,60 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
             return DragOutcome::failed_before_start(failed_paths, error);
         }
     };
+    let drag = match async_data_object::DragDataObject::new(data) {
+        Ok(drag) => drag,
+        Err(error) => {
+            crate::logger::log(format!("file_drag: async setup failed: {error}"));
+            return DragOutcome::failed_before_start(
+                failed_paths,
+                FileDragError::AsyncCapability(error.code().0),
+            );
+        }
+    };
 
     // SHDoDragDrop (モーダルブロック)。pdsrc は None でシェル既定の
     //    IDropSource が使われる (docs/file-drag-drop-design.md §4.3)。
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
     crate::logger::log(format!(
-        "file_drag: SHDoDragDrop start ({} item(s))",
-        paths.len()
+        "file_drag: SHDoDragDrop start ({} item(s)) drag_id={}",
+        paths.len(),
+        drag.id,
     ));
-    match unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY) } {
+    let started_at = std::time::Instant::now();
+    let result = unsafe {
+        SHDoDragDrop(
+            Some(hwnd),
+            &drag.data,
+            None::<&IDropSource>,
+            DROPEFFECT_COPY,
+        )
+    };
+    let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    // The target's Start/End state owns lifetime even when the modal result is NONE/error.
+    let in_operation = drag.finish_modal();
+    let async_error = in_operation.as_ref().err().map(|error| {
+        crate::logger::log(format!(
+            "file_drag: async cleanup failed drag_id={}: {error}",
+            drag.id
+        ));
+        FileDragError::AsyncCapability(error.code().0)
+    });
+    let in_operation = in_operation.ok();
+    match result {
         Ok(effect) => {
-            crate::logger::log(format!("file_drag: SHDoDragDrop done effect={}", effect.0));
+            crate::logger::log(format!(
+                "file_drag: SHDoDragDrop done effect={} drag_id={} elapsed_ms={elapsed_ms:.3} in_operation={in_operation:?}",
+                effect.0, drag.id,
+            ));
             // effect が NONE (0) 以外ならドロップ成立。Esc キャンセルや無効ターゲット上で
             // 離した場合は NONE。
-            DragOutcome::after_modal(failed_paths, None, effect.0 != 0)
+            DragOutcome::after_modal(failed_paths, async_error, effect.0 != 0)
         }
         Err(e) => {
-            crate::logger::log(format!("file_drag: SHDoDragDrop failed: {e}"));
+            crate::logger::log(format!(
+                "file_drag: SHDoDragDrop failed: {e} drag_id={} elapsed_ms={elapsed_ms:.3} in_operation={in_operation:?}",
+                drag.id,
+            ));
             DragOutcome::after_modal(
                 failed_paths,
                 Some(FileDragError::DoDragDrop(e.code().0)),

@@ -1902,6 +1902,52 @@ impl SimilarDb {
         Ok(batch)
     }
 
+    /// The array owner must never combine identity and changes from different read snapshots.
+    pub(crate) fn load_array_changes(
+        &self,
+        after_seq: u64,
+    ) -> rusqlite::Result<(StoreWatermark, ItemChangeBatch)> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let watermark = StoreWatermark {
+            store_id: search_store_id(&transaction)?,
+            through_change_seq: latest_change_seq(&transaction)?,
+        };
+        let batch = load_item_changes_after_connection(
+            &transaction,
+            after_seq,
+            watermark.through_change_seq,
+            None,
+        )?;
+        transaction.commit()?;
+        Ok((watermark, batch))
+    }
+
+    /// Reserve the writer before checking identity: a DEFERRED read-to-write upgrade can fail
+    /// with BUSY_SNAPSHOT during an ordinary concurrent scan commit.
+    pub(crate) fn prune_array_history(&self, cutoff: StoreWatermark) -> rusqlite::Result<bool> {
+        self.prune_array_history_checked(cutoff, || {})
+    }
+
+    fn prune_array_history_checked(
+        &self,
+        cutoff: StoreWatermark,
+        after_identity: impl FnOnce(),
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = write_transaction(&mut conn)?;
+        if search_store_id(&transaction)? != cutoff.store_id {
+            return Ok(false);
+        }
+        after_identity();
+        let through = i64::try_from(cutoff.through_change_seq).map_err(|_| {
+            rusqlite::Error::ToSqlConversionFailure("change seq exceeds SQLite INTEGER".into())
+        })?;
+        transaction.execute("DELETE FROM item_change WHERE seq <= ?1", [through])?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn prune_item_changes_through(&self, through_seq: u64) -> rusqlite::Result<usize> {
         let through = i64::try_from(through_seq).map_err(|_| {
             rusqlite::Error::ToSqlConversionFailure("change seq exceeds SQLite INTEGER".into())
@@ -5085,6 +5131,76 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
     use rusqlite::StatementStatus;
+
+    #[test]
+    fn array_prune_reserves_writer_before_identity_and_preserves_later_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        db.upsert_loose_item(&item("c:/old.jpg", None, None, 1))
+            .unwrap();
+        let cutoff = db.change_watermark().unwrap();
+        let scan = SimilarDb::open_at(&path).unwrap();
+        scan.conn
+            .lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        // This callback is after SELECT identity, before DELETE, within the real prune TX.
+        // With DEFERRED the second connection could commit here and the prune upgrade would
+        // fail with BUSY_SNAPSHOT. IMMEDIATE has already reserved the writer.
+        assert!(
+            db.prune_array_history_checked(cutoff, || {
+                std::thread::scope(|scope| {
+                    let write =
+                        scope.spawn(|| scan.upsert_loose_item(&item("c:/new.jpg", None, None, 2)));
+                    let error = write.join().unwrap().unwrap_err();
+                    assert_eq!(
+                        error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::DatabaseBusy)
+                    );
+                });
+            })
+            .unwrap()
+        );
+        scan.upsert_loose_item(&item("c:/new.jpg", None, None, 2))
+            .unwrap();
+        assert!(db.prune_array_history(cutoff).unwrap());
+        let (observed, changes) = db.load_array_changes(cutoff.through_change_seq).unwrap();
+        assert_eq!(observed.store_id, cutoff.store_id);
+        assert_eq!(changes.changes.len(), 1);
+        assert!(changes.changes[0].seq > cutoff.through_change_seq);
+        let wrong = StoreWatermark {
+            store_id: [0; 16],
+            through_change_seq: observed.through_change_seq,
+        };
+        assert!(!db.prune_array_history(wrong).unwrap());
+        assert_eq!(db.load_item_changes_after(0).unwrap().changes.len(), 1);
+    }
+
+    #[test]
+    fn array_prune_waits_for_a_separate_scan_writer_then_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        db.upsert_loose_item(&item("c:/old.jpg", None, None, 1))
+            .unwrap();
+        let cutoff = db.change_watermark().unwrap();
+        let mut scan = Connection::open(&path).unwrap();
+        let tx = write_transaction(&mut scan).unwrap();
+        tx.execute("UPDATE item SET mtime = mtime + 1", []).unwrap();
+        let (started, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let prune = scope.spawn(|| {
+                started.send(()).unwrap();
+                db.prune_array_history(cutoff)
+            });
+            receiver.recv().unwrap();
+            tx.commit().unwrap();
+            assert!(prune.join().unwrap().unwrap());
+        });
+        assert!(db.load_item_changes_after(0).unwrap().changes.is_empty());
+    }
 
     fn item(key: &str, container: Option<&str>, page: Option<u32>, marker: u8) -> StoredItem {
         StoredItem {

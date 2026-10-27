@@ -11,8 +11,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Mutex, Once};
 
 #[cfg(test)]
 use rusqlite::OptionalExtension;
@@ -112,8 +112,34 @@ const UPSERT_CHILDREN_DELETE_SQL: &str = "DELETE FROM entries \
 // SearchIndexDb
 // -----------------------------------------------------------------------
 
+pub(crate) const NAME_UPDATE_FAILURE_NOTICE: &str =
+    "名前索引の更新に失敗しました。mIV を再起動すると名前索引を作り直します。";
+pub(crate) const NAME_REBUILD_REQUEST_FAILURE_NOTICE: &str =
+    "名前索引の更新に失敗しました。再構築を予約できませんでした。ログを確認してください。";
+pub(crate) const NAME_SCAN_MARKER_FAILURE_NOTICE: &str =
+    "名前索引の完走記録を保存できませんでした。ログを確認してください。";
+
+/// Admission is once per DB lifetime, including after the UI drains a notice.
+/// These gates own no recovery work; a failed reservation is never retried.
+struct FailureNotices {
+    update: Once,
+    scan_marker: Once,
+    pending: Mutex<Vec<&'static str>>,
+}
+
+impl Default for FailureNotices {
+    fn default() -> Self {
+        Self {
+            update: Once::new(),
+            scan_marker: Once::new(),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 pub struct SearchIndexDb {
     conn: Mutex<Connection>,
+    failure_notices: FailureNotices,
     #[cfg(test)]
     full_scan_write_gate: Mutex<
         Option<(
@@ -124,6 +150,61 @@ pub struct SearchIndexDb {
 }
 
 impl SearchIndexDb {
+    /// Worker-only terminal error boundary. The failing DB API has released its
+    /// connection lock before this call. Every error is logged, but reservation
+    /// and notification are admitted only once for this DB, across all roots.
+    pub(crate) fn report_write_failure(&self, origin: &str, path: &Path, error: &rusqlite::Error) {
+        crate::logger::log(format!(
+            "name-index: {origin} failed for {}: {error}; detail={error:?}",
+            path.display()
+        ));
+        self.failure_notices.update.call_once(|| {
+            let notice = match self.request_rebuild_on_next_start() {
+                Ok(()) => NAME_UPDATE_FAILURE_NOTICE,
+                Err(marker_error) => {
+                    crate::logger::log(format!(
+                        "name-index: rebuild reservation failed: {marker_error}; detail={marker_error:?}"
+                    ));
+                    NAME_REBUILD_REQUEST_FAILURE_NOTICE
+                }
+            };
+            self.failure_notices.pending.lock().unwrap().push(notice);
+        });
+    }
+
+    /// A completed scan's marker is bookkeeping, not damaged index rows.
+    pub(crate) fn report_scan_marker_failure(&self, root: &Path, error: &rusqlite::Error) {
+        crate::logger::log(format!(
+            "name-index: scan marker write failed for {}: {error}; detail={error:?}",
+            root.display()
+        ));
+        self.failure_notices.scan_marker.call_once(|| {
+            self.failure_notices
+                .pending
+                .lock()
+                .unwrap()
+                .push(NAME_SCAN_MARKER_FAILURE_NOTICE);
+        });
+    }
+
+    /// UI projection only: never waits for SQLite or a reservation in flight.
+    pub(crate) fn take_failure_notifications(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.failure_notices.pending.lock().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn name_rebuild_pending_for_test(&self) -> bool {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM name_index_rebuild_state WHERE pending <> 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     /// Full が別の構成で行を変更する前に、旧構成の完走印を失効させる。
     /// commit が失敗した場合は呼び出し側も走査を開始しない。同じ構成の印は
     /// 通常の途中終了でも維持するため、指紋が違う行だけを削除する。
@@ -205,6 +286,7 @@ impl SearchIndexDb {
         rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            failure_notices: FailureNotices::default(),
             #[cfg(test)]
             full_scan_write_gate: Mutex::new(None),
         })
@@ -217,6 +299,7 @@ impl SearchIndexDb {
         rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            failure_notices: FailureNotices::default(),
             #[cfg(test)]
             full_scan_write_gate: Mutex::new(None),
         })
@@ -233,6 +316,7 @@ impl SearchIndexDb {
         rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            failure_notices: FailureNotices::default(),
             #[cfg(test)]
             full_scan_write_gate: Mutex::new(None),
         })
@@ -253,6 +337,7 @@ impl SearchIndexDb {
         conn.busy_timeout(std::time::Duration::from_millis(750))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            failure_notices: FailureNotices::default(),
             #[cfg(test)]
             full_scan_write_gate: Mutex::new(None),
         })
@@ -1050,11 +1135,169 @@ mod tests {
     use super::*;
     use rusqlite::StatementStatus;
 
+    #[test]
+    fn write_failure_reservation_and_notice_are_once_across_roots_and_drains() {
+        let db = std::sync::Arc::new(open_mem());
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE reservation_audit (attempt INTEGER);
+             CREATE TRIGGER audit_reservation BEFORE INSERT ON name_index_rebuild_state
+             BEGIN INSERT INTO reservation_audit VALUES (1); END;
+             CREATE TRIGGER deny_entries BEFORE INSERT ON entries
+             BEGIN SELECT RAISE(FAIL, 'write refused'); END;",
+            )
+            .unwrap();
+        for i in 0..128 {
+            let root = if i % 2 == 0 {
+                Path::new("C:/a")
+            } else {
+                Path::new("C:/b")
+            };
+            let error = db
+                .upsert_children(root, root, &[entry("C:/a/x", "x", IndexKind::Folder)])
+                .unwrap_err();
+            db.report_write_failure("test upsert", root, &error);
+            assert_eq!(
+                db.take_failure_notifications(),
+                if i == 0 {
+                    vec![NAME_UPDATE_FAILURE_NOTICE]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    db.report_write_failure(
+                        "parallel root",
+                        Path::new("C:/b"),
+                        &rusqlite::Error::InvalidQuery,
+                    )
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(db.take_failure_notifications().is_empty());
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM reservation_audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn failed_reservation_is_not_retried_after_drain_or_a_later_failure() {
+        let db = open_mem();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER deny_reservation BEFORE INSERT ON name_index_rebuild_state
+             BEGIN SELECT RAISE(FAIL, 'reservation refused'); END;",
+            )
+            .unwrap();
+        db.report_write_failure("first", Path::new("C:/a"), &rusqlite::Error::InvalidQuery);
+        assert_eq!(
+            db.take_failure_notifications(),
+            vec![NAME_REBUILD_REQUEST_FAILURE_NOTICE]
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER deny_reservation")
+            .unwrap();
+        db.report_write_failure("later", Path::new("C:/b"), &rusqlite::Error::InvalidQuery);
+        assert!(db.take_failure_notifications().is_empty());
+        let pending: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM name_index_rebuild_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0, "a later failure must not retry the reservation");
+    }
+
+    #[test]
+    fn marker_notice_is_once_and_db_owners_and_update_notices_are_independent() {
+        let db = open_mem();
+        let sibling = open_mem();
+        for i in 0..3 {
+            db.report_scan_marker_failure(Path::new("C:/a"), &rusqlite::Error::InvalidQuery);
+            assert_eq!(
+                db.take_failure_notifications(),
+                if i == 0 {
+                    vec![NAME_SCAN_MARKER_FAILURE_NOTICE]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        assert!(
+            db.can_reuse_initial_scan(Path::new("C:/a"), "missing")
+                .is_ok()
+        );
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM name_index_rebuild_state", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        db.report_write_failure("update", Path::new("C:/a"), &rusqlite::Error::InvalidQuery);
+        assert_eq!(
+            db.take_failure_notifications(),
+            vec![NAME_UPDATE_FAILURE_NOTICE]
+        );
+        assert!(sibling.take_failure_notifications().is_empty());
+        assert_eq!(
+            sibling
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM name_index_rebuild_state", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn notice_drain_does_not_wait_for_sqlite_connection() {
+        let db = std::sync::Arc::new(open_mem());
+        db.report_write_failure("update", Path::new("C:/a"), &rusqlite::Error::InvalidQuery);
+        let connection = db.conn.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = db.clone();
+        let worker =
+            std::thread::spawn(move || tx.send(reader.take_failure_notifications()).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(connection);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), vec![NAME_UPDATE_FAILURE_NOTICE]);
+    }
+
     fn open_mem() -> SearchIndexDb {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         SearchIndexDb {
             conn: Mutex::new(conn),
+            failure_notices: FailureNotices::default(),
             full_scan_write_gate: Mutex::new(None),
         }
     }

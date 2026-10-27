@@ -711,11 +711,11 @@ impl App {
     ) {
         let origin_context = origin.stamp.context_id;
         if self.collection_grid_context_id() == origin_context {
-            self.show_feedback_toast(message);
+            self.show_feedback_warning(message);
             return;
         }
         if self
-            .with_viewer_context(origin_context, |app| app.show_feedback_toast(message))
+            .with_viewer_context(origin_context, |app| app.show_feedback_warning(message))
             .is_err()
         {
             crate::logger::log(format!(
@@ -1353,11 +1353,12 @@ impl App {
     }
 
     pub(crate) fn grid_physical_navigation(
-        &self,
+        &mut self,
         index: usize,
         path: std::path::PathBuf,
         auto_fullscreen: bool,
     ) -> crate::ui_main::AddressBarNav {
+        self.capture_main_folder_list_order(index);
         let virtual_container = self.items.get(index).is_some_and(|item| match item {
             GridItem::ZipFile(item_path) | GridItem::PdfFile(item_path) => {
                 crate::folder_tree::path_eq(item_path, &path)
@@ -1793,7 +1794,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -1888,7 +1889,7 @@ impl App {
         restore: Option<CollectionGridRestore>,
         return_to: Option<TopLevelGridRestore>,
     ) {
-        self.save_leaving_rating_grid_position();
+        self.note_session_grid_positions();
         let perf_start = crate::perf::is_enabled().then(Instant::now);
         let restoring = restore.is_some();
         let retaining_binding = self.collection_root_installed_binding_matches(collection_id);
@@ -2267,7 +2268,7 @@ impl App {
         self.adopt_main_list_navigation(adoption, |app| {
             // The read-only admission above makes this native transfer non-rejecting.
             let _ = app.prepare_collection_main_context_change(identity.collection_id);
-            app.save_leaving_rating_grid_position();
+            app.save_departing_session_grid_positions();
             if !retaining_binding {
                 app.top_level_grid_view
                     .begin_with_origin(TopLevelGridSurface::Collection(identity), return_to);
@@ -2551,12 +2552,15 @@ impl App {
             }),
             prefix.as_deref(),
         );
-        let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
+        let Some(mut adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             return false;
         };
+        if let super::PreparedPhysicalListing::Zip { prepared, .. } = &listing {
+            self.reconcile_zip_refresh_adoption(&mut adoption, prepared);
+        }
         self.adopt_main_list_navigation(adoption, |app| {
             let _ = app.prepare_collection_main_context_change(session.identity.collection_id);
-            app.save_leaving_rating_grid_position();
+            app.save_departing_session_grid_positions();
             app.install_collection_history_child_session(session);
             app.pending_auto_fs_open = false;
             app.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
@@ -3649,7 +3653,14 @@ impl App {
         self.stack_mode_requested = false;
         self.stack_showing_flat = false;
         self.cancel_stack_script_pending();
-        self.install_prepared_aggregate_items(items, image_metas, page_identity_index);
+        self.install_prepared_aggregate_items(
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Collection,
+            ),
+            items,
+            image_metas,
+            page_identity_index,
+        );
         self.invalidate_idx_state_and_queues();
         self.clear_page_edit_state();
         if let Some((snapshot, mut projection)) = page_edits {
@@ -3663,6 +3674,7 @@ impl App {
             self.comic_pages = std::mem::take(&mut projection.comic);
             self.local_adjust_pages = std::mem::take(&mut projection.local_adjust);
         }
+        self.reproject_page_edit_owners();
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
@@ -3671,7 +3683,7 @@ impl App {
         self.initialize_converted_archive_cache_paths();
         self.video_thumb_overrides = video_sidecars;
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
 
         self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = selected.is_some();
@@ -3817,6 +3829,68 @@ mod tests {
         CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
     };
     use crate::grid_item::ThumbnailState;
+
+    #[test]
+    fn g1_collection_real_handler_reopen_preserves_vertical_flow_and_book_return() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.default_spread_mode = SpreadMode::RtlCover;
+        app.settings.default_reading_flow = ReadingFlow::Vertical;
+        app.settings.default_reading_direction = ReadingDirection::Rtl;
+        let book = temp.path().join("collection-a2-original-book");
+        std::fs::create_dir_all(&book).unwrap();
+        let pages = [book.join("01.png"), book.join("02.png")];
+        for page in &pages {
+            image::RgbImage::new(2, 3).save(page).unwrap();
+        }
+        app.load_folder(book.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        let collection = collection_with_sources(
+            &client,
+            &pages.map(|page| (page, CollectionResolvedKind::Image)),
+        );
+        app.open_collection_grid_from_navigation(collection.collection_id());
+        wait_for_grid(&mut app, collection.collection_id());
+        assert_eq!(
+            app.extracted_result_surface(),
+            Some(ExtractedSurface::Collection)
+        );
+        // Released Collection root installation retains the mounted reader's flow.
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::RtlCover);
+            assert_eq!(app.spread_mode, SpreadMode::Rtl);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.close_fullscreen();
+        }
+        assert!(matches!(app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Path(path)) if path == &book));
+        app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back);
+        app.settle_open_path_classification_for_test();
+        app.finish_history_restore_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        app.shutdown_collection_runtime_for_exit();
+    }
 
     #[test]
     fn audit_collection_grid_readers_with_foreign_writers() {
@@ -4426,7 +4500,7 @@ mod tests {
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -5736,7 +5810,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -5745,9 +5819,10 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui| app.render_grid(ui)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
         draw(&mut app);
         draw(&mut app);
@@ -5821,7 +5896,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -5830,9 +5905,10 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui| app.render_grid(ui)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
         draw(&mut app);
         draw(&mut app);
@@ -6368,11 +6444,22 @@ mod tests {
             source_key: anchor.source_key,
             path: child.clone(),
         };
-        app.current_folder = Some(child);
+        app.current_folder = Some(child.clone());
         app.items = vec![
             GridItem::Image(temp.path().join("b.jpg")),
             GridItem::Image(temp.path().join("a.jpg")),
         ];
+        // Physical source adoption replaces the root's extracted recipe together with rows.
+        app.projection_recipe = super::super::book_materialization::ProjectionRecipe::for_physical(
+            &app.settings,
+            &child,
+            &child,
+            &app.items,
+        );
+        assert!(matches!(
+            app.projection_recipe,
+            super::super::book_materialization::ProjectionRecipe::Book(_)
+        ));
         app.visible_indices = vec![0, 1];
         app.settings.details_sort_key = DetailsSortKey::Name;
         app.rebuild_details_order();
@@ -7190,17 +7277,17 @@ mod tests {
             app.visible_indices = vec![0];
             app.items_generation = app.items_generation.wrapping_add(1);
             app.fullscreen_idx = Some(0);
-            app.pending_return_to_parent = false;
+            app.pending_return_to_parent.clear();
 
             app.handle_fullscreen_close_request();
-            assert!(app.pending_return_to_parent);
+            assert!(app.pending_return_to_parent.is_pending());
             assert_eq!(app.fullscreen_idx, Some(0));
             let close_consumed_before_render = source == &pdf;
             let nav = if close_consumed_before_render {
                 let ctx = egui::Context::default();
                 ctx.begin_pass(egui::RawInput::default());
                 let nav = app.handle_keyboard(&ctx);
-                let _ = ctx.end_pass();
+                ctx.end_pass().drop_without_applying_deltas();
                 nav.expect("frame-start keyboard handling must consume the close request")
             } else {
                 app.take_pending_return_to_parent_nav()
@@ -7665,6 +7752,8 @@ mod tests {
             app.fs_cache.insert(
                 0,
                 super::super::FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: Arc::new(pixels),
                     source_dims: Some([2, 1]),
@@ -7868,7 +7957,7 @@ mod tests {
         app.top_level_grid_view
             .replace_surface(TopLevelGridSurface::Rating { stars: 3 });
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.selected = Some(4);
         app.scroll_offset_y = 700.0;
         let selected_key = app.rating_path_key(4).unwrap();
@@ -8216,6 +8305,14 @@ mod tests {
         if zip {
             assert!(app.items.iter().any(|item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "chapter/")));
             app.zip_nav_enter("chapter/");
+            let refresh_route = app.facet_navigation.route().clone();
+            app.keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGridReload = F13\n");
+            assert!(history_grid_key(&mut app, egui::Key::F13).is_none());
+            poll_real_history_load(&mut app, Some(&source), None);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "chapter");
+            assert_eq!(app.facet_navigation.route(), &refresh_route);
+            assert_eq!(app.folder_nav_back_stack, outer_back);
+            assert_eq!(app.folder_nav_forward_stack, outer_forward);
             assert!(app.items.iter().any(|item| matches!(item, GridItem::ZipImage { entry_name, .. } if entry_name == "chapter/second.png")));
             assert_eq!(app.folder_nav_current_target(), Some(source_target.clone()));
             assert_eq!(app.folder_nav_back_stack, outer_back);
@@ -8599,7 +8696,8 @@ mod tests {
         app.epub_convert = Some(saved);
         drop(original);
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert_eq!(app.folder_nav_current_target(), root);
         assert_eq!(app.items, before_rows);
         let Some(mut transition) = app.top_level_grid_view.take_history_navigation_transition()
@@ -9061,7 +9159,7 @@ mod tests {
         assert_collection_mutation_refresh(|app, folder| {
             app.note_exported_file_for_folder_refresh(&folder.join("export.png"));
             assert!(app.folder_refresh_pending.is_some());
-            app.consume_folder_refresh_pending();
+            app.consume_folder_refresh_pending(&egui::Context::default());
             assert!(app.folder_refresh_pending.is_none());
         });
     }

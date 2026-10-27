@@ -81,7 +81,53 @@ pub(super) struct DirectMediaPrepared {
     tags: HashMap<String, Vec<String>>,
 }
 
+#[cfg(test)]
+impl DirectMediaPrepared {
+    pub(super) fn image_fixture_for_test(path: PathBuf) -> Self {
+        Self {
+            item: GridItem::Image(path),
+            metadata: Some((10, 20)),
+            rating: crate::rating_sort::RatingSortKey::supported(0).unwrap(),
+            rating_generation: 0,
+            rotation: crate::rotation_db::Rotation::None,
+            tags: Default::default(),
+        }
+    }
+}
+
 impl App {
+    /// One admission for an explicit activation/bookmark, before any continuation starts.
+    /// Retire projected main requests and process-wide open owners, keeping independent waits.
+    pub(super) fn admit_explicit_main_open_request(&mut self) {
+        if !self.main_folder_history_available() {
+            return;
+        }
+        let conversion_bookmark = self
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.completion.bookmark_owner())
+            .cloned();
+        self.retire_replaced_main_list_requests(None);
+        // Unlike a surface reselect, this explicit request also replaces the process-wide
+        // resolver slot when its current owner is a detached bookmark still being prepared.
+        self.cancel_unresolved_open("explicit_main_open");
+        if let Some(request_id) = self
+            .bookmark_open_pending
+            .as_ref()
+            .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
+        {
+            self.cancel_bookmark_open_request(request_id, "explicit_main_open");
+        }
+        if let Some(owner) = conversion_bookmark {
+            self.finish_replaced_startup_open_owner(
+                StartupOpenPathOwner::Bookmark(owner),
+                "explicit_main_open",
+            );
+        }
+        self.cancel_archive_convert_for_navigation("explicit_main_open");
+        self.cancel_pending_folder_nav();
+    }
+
     pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
         self.startup_open_path = Some(crate::path_key::normalize_input_path(&path));
     }
@@ -103,6 +149,16 @@ impl App {
     pub(super) fn poll_activation_open_paths(&mut self, ctx: &egui::Context) {
         if self.remote_session_blocks_local_control() {
             self.reject_activation_open_paths_for_remote(ctx);
+            return;
+        }
+        if self.composition_editor_modal_active() {
+            let rejected = self.activation_open_path_rx.try_iter().count();
+            if rejected != 0 {
+                crate::logger::log(format!(
+                    "composition editor: rejected {rejected} activation request(s)"
+                ));
+                self.show_feedback_warning("本の構成を編集中のため、別の本を開けません".into());
+            }
             return;
         }
         // Keep the channel queued while a document dialog owns local admission. Draining it
@@ -168,7 +224,7 @@ impl App {
             crate::logger::log(format!(
                 "single_instance: rejected {rejected} activation open request(s) during Remote ownership"
             ));
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
             );
             ctx.request_repaint();
@@ -203,10 +259,15 @@ impl App {
                 requested.display()
             ));
             if matches!(source, StartupOpenPathSource::Activation) {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
                 );
             }
+            return;
+        }
+        if self.composition_editor_modal_active() {
+            crate::logger::log("composition editor: rejected path open");
+            self.show_feedback_warning("本の構成を編集中のため、別の本を開けません".into());
             return;
         }
         if self.document_open_modal_admission_blocked() {
@@ -285,24 +346,26 @@ impl App {
         // exception: scope admission can still refuse the request, so its supersede is deferred
         // and completion-side consumers hold the prior owner's result instead.
         if matches!(source, StartupOpenPathSource::Activation) && !defer_activation_supersede {
-            self.cancel_archive_convert_for_navigation("activation_navigation");
-            if let Some(request_id) = self
-                .bookmark_open_pending
-                .as_ref()
-                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
-            {
-                self.cancel_bookmark_open_request(request_id, "activation_navigation");
-            }
+            self.admit_explicit_main_open_request();
         }
+        // BookmarkRow classification can finish after snapshot activation's provisional
+        // admission. It is the earlier request's continuation, not another explicit click.
+        let hold_bookmark_continuation = matches!(source, StartupOpenPathSource::Bookmark)
+            && self.activation_open_resolve_holds_prior_completion();
         let mut held_resolve_for_activation_admission = None;
-        if let Some(mut pending) = self.startup_open_path_resolve_pending.take() {
+        if !hold_bookmark_continuation
+            && let Some(mut pending) = self.startup_open_path_resolve_pending.take()
+        {
             if defer_activation_supersede {
                 if matches!(pending.owner, StartupOpenPathOwner::Activation) {
                     crate::logger::log(format!(
                         "startup open: replace pending activation resolve requested={}",
                         pending.requested.display()
                     ));
-                    self.defer_current_bookmark_open_timeout_by(pending.elapsed());
+                    self.defer_activation_bookmark_timeout_by(
+                        pending.elapsed(),
+                        pending.held_resolve_for_activation_admission.as_deref(),
+                    );
                     held_resolve_for_activation_admission =
                         pending.held_resolve_for_activation_admission.take();
                     drop(pending);
@@ -392,17 +455,20 @@ impl App {
 
         match spawn_result {
             Ok(_) => {
-                self.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-                    requested: requested_owner,
-                    owner,
-                    cancel,
-                    rx,
-                    started_at: std::time::Instant::now(),
-                    toast_shown: false,
-                    held_resolve_for_activation_admission,
-                    diagnostic,
-                    navigation,
-                });
+                self.install_startup_open_path_resolve_pending(
+                    StartupOpenPathResolvePending {
+                        requested: requested_owner,
+                        owner,
+                        cancel,
+                        rx,
+                        started_at: std::time::Instant::now(),
+                        toast_shown: false,
+                        held_resolve_for_activation_admission,
+                        diagnostic,
+                        navigation,
+                    },
+                    hold_bookmark_continuation,
+                );
             }
             Err(e) => {
                 crate::logger::log(format!(
@@ -422,6 +488,27 @@ impl App {
                     });
                 }
                 let held_duration = resolve_started_at.elapsed();
+                if hold_bookmark_continuation {
+                    // Preserve the existing synchronous spawn-failure fallback, but leave its
+                    // result behind the same activation admission gate as a worker result.
+                    let (tx, rx) = mpsc::channel();
+                    let _ = tx.send(result);
+                    self.install_startup_open_path_resolve_pending(
+                        StartupOpenPathResolvePending {
+                            requested: requested_owner,
+                            owner,
+                            cancel,
+                            rx,
+                            started_at: resolve_started_at,
+                            toast_shown: false,
+                            held_resolve_for_activation_admission,
+                            diagnostic,
+                            navigation,
+                        },
+                        true,
+                    );
+                    return;
+                }
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
                     result,
@@ -433,6 +520,27 @@ impl App {
                     ctx,
                 );
             }
+        }
+    }
+
+    fn install_startup_open_path_resolve_pending(
+        &mut self,
+        pending: StartupOpenPathResolvePending,
+        held_continuation: bool,
+    ) {
+        if held_continuation {
+            let activation = self
+                .startup_open_path_resolve_pending
+                .as_mut()
+                .expect("provisional activation owns the resolver slot");
+            let previous = activation
+                .held_resolve_for_activation_admission
+                .replace(Box::new(pending));
+            if let Some(previous) = previous {
+                self.finish_replaced_startup_open_pending(*previous, "resolver_replaced");
+            }
+        } else {
+            self.startup_open_path_resolve_pending = Some(pending);
         }
     }
 
@@ -531,7 +639,7 @@ impl App {
                     } else if matches!(source, StartupOpenPathSource::Activation) {
                         self.resume_activation_held_open(held, held_duration);
                     }
-                    self.show_feedback_toast("パスの確認を完了できませんでした".to_string());
+                    self.show_feedback_warning("パスの確認を完了できませんでした".to_string());
                 }
                 ctx.request_repaint();
             }
@@ -629,7 +737,7 @@ impl App {
             if matches!(source, StartupOpenPathSource::InitialStartup) {
                 self.open_default_startup_target();
             }
-            self.show_feedback_toast(message);
+            self.show_feedback_warning(message);
             return;
         }
         if matches!(source, StartupOpenPathSource::Activation) {
@@ -650,7 +758,17 @@ impl App {
                     self.show_snapshot_out_of_scope_open_feedback();
                     return;
                 }
-                Some(_) => {}
+                Some(_) => {
+                    if self.is_snapshot_active() {
+                        self.admit_explicit_main_open_request();
+                        if let Some(held) = held {
+                            self.finish_replaced_startup_open_pending(
+                                *held,
+                                "activation_navigation",
+                            );
+                        }
+                    }
+                }
             }
         }
         if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner
@@ -663,7 +781,7 @@ impl App {
                 bookmark_owner.request_id,
                 "relative_page_missing_or_unsafe",
             );
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
             return;
@@ -730,7 +848,7 @@ impl App {
             crate::logger::log(format!(
                 "startup open: activation open failed for {requested_display}"
             ));
-            self.show_feedback_toast("開けるパスが見つかりませんでした".to_string());
+            self.show_feedback_warning("開けるパスが見つかりませんでした".to_string());
         }
     }
 
@@ -748,7 +866,7 @@ impl App {
         held: Option<Box<StartupOpenPathResolvePending>>,
         held_duration: std::time::Duration,
     ) {
-        self.defer_current_bookmark_open_timeout_by(held_duration);
+        self.defer_activation_bookmark_timeout_by(held_duration, held.as_deref());
         let Some(held) = held else {
             return;
         };
@@ -765,24 +883,65 @@ impl App {
     }
 
     fn defer_current_bookmark_open_timeout_by(&mut self, duration: std::time::Duration) {
+        self.defer_current_bookmark_open_timeout_at(duration, std::time::Instant::now());
+    }
+
+    fn defer_activation_bookmark_timeout_by(
+        &mut self,
+        duration: std::time::Duration,
+        held: Option<&StartupOpenPathResolvePending>,
+    ) {
+        self.defer_current_bookmark_open_timeout_by(duration);
+        // The resolver is process-wide, but its clocks belong to the exact leased context.
+        // Do not scan independent readers or compensate a newer bookmark's clocks there.
+        #[cfg(windows)]
+        if let Some(StartupOpenPathOwner::Bookmark(owner)) = held.map(|held| &held.owner)
+            && let Some(lease) = owner.detached_lease
+            && self.detached_viewer_window_id() != Some(lease.window_id)
+            && let Some((context, _)) = self.locate_window_context(lease.window_id)
+        {
+            let _ = self.with_viewer_context(context, |app| {
+                if app
+                    .bookmark_open_pending
+                    .as_ref()
+                    .is_some_and(|p| p.request_id() == owner.request_id)
+                {
+                    app.defer_current_bookmark_open_timeout_by(duration);
+                }
+            });
+        }
+    }
+
+    fn defer_current_bookmark_open_timeout_at(
+        &mut self,
+        duration: std::time::Duration,
+        now: std::time::Instant,
+    ) {
         let Some(pending) = self.bookmark_open_pending.as_mut() else {
             return;
         };
         match pending {
             crate::bookmark_browser::PendingBookmarkOpen::Media(pending) => {
-                if let Some(resumed_at) = pending.started_at.checked_add(duration) {
+                if let Some(resumed_at) = pending
+                    .started_at
+                    .checked_add(duration.min(now.saturating_duration_since(pending.started_at)))
+                {
                     pending.started_at = resumed_at;
                 }
             }
             crate::bookmark_browser::PendingBookmarkOpen::Book(pending) => {
-                if let Some(resumed_at) = pending.started_at.checked_add(duration) {
+                if let Some(resumed_at) = pending
+                    .started_at
+                    .checked_add(duration.min(now.saturating_duration_since(pending.started_at)))
+                {
                     pending.started_at = resumed_at;
                 }
                 if let crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
                     started_at,
                     ..
                 } = &mut pending.stage
-                    && let Some(resumed_at) = started_at.checked_add(duration)
+                    && let Some(resumed_at) = started_at
+                        .checked_add(duration.min(now.saturating_duration_since(*started_at)))
                 {
                     *started_at = resumed_at;
                 }
@@ -875,6 +1034,19 @@ impl App {
         reason: &'static str,
     ) {
         if let StartupOpenPathOwner::Bookmark(bookmark_owner) = owner {
+            #[cfg(windows)]
+            if let Some(lease) = bookmark_owner.detached_lease
+                && self.detached_viewer_window_id() != Some(lease.window_id)
+            {
+                // The pending/held slot may already have been taken. Its supplied lease,
+                // rather than another current resolver's fields, still owns termination.
+                if let Some((context, _)) = self.locate_window_context(lease.window_id) {
+                    let _ = self.with_viewer_context(context, |app| {
+                        app.cancel_bookmark_open_request(bookmark_owner.request_id, reason);
+                    });
+                }
+                return;
+            }
             self.cancel_bookmark_open_request(bookmark_owner.request_id, reason);
         }
     }
@@ -900,11 +1072,41 @@ impl App {
         }
     }
 
-    /// A normal navigation supersedes an unresolved startup/activation/bookmark open. The
-    /// resolver is removed before its receiver can be polled; bookmark-owned state is cleared
-    /// only when its request ID is still current.
-    pub(crate) fn cancel_unresolved_open_for_navigation(&mut self) {
-        self.cancel_unresolved_open("normal_navigation");
+    /// New Local requests replace unresolved main opens, including a target still waiting for
+    /// modal admission. Reloads keep both deferred and resolving targets after Remote returns.
+    pub(crate) fn cancel_unresolved_open_for_navigation(&mut self, explicit_request: bool) {
+        if !explicit_request || self.remote_session_blocks_local_control() {
+            return;
+        }
+        self.startup_open_path = None;
+        let pending = self.startup_open_path_resolve_pending.take();
+        self.startup_open_path_resolve_pending =
+            pending.and_then(|pending| self.retire_unresolved_main_open_pending(pending));
+    }
+
+    fn retire_unresolved_main_open_pending(
+        &mut self,
+        mut pending: StartupOpenPathResolvePending,
+    ) -> Option<StartupOpenPathResolvePending> {
+        let held = pending.held_resolve_for_activation_admission.take();
+        let held = held.and_then(|held| self.retire_unresolved_main_open_pending(*held));
+        #[cfg(windows)]
+        if matches!(&pending.owner, StartupOpenPathOwner::Bookmark(owner)
+            if owner.detached_lease.is_some())
+        {
+            pending.held_resolve_for_activation_admission = held.map(Box::new);
+            return Some(pending);
+        }
+        // Detach the held chain before finishing this owner: replacement of main cannot
+        // recursively cancel a bookmark resolver owned by an independent reader lease.
+        // Same line as `cancel_unresolved_open`, so a dropped late result is explainable.
+        crate::logger::log(format!(
+            "startup open: cancel resolve reason=normal_navigation source={} requested={}",
+            pending.owner.perf_tag(),
+            pending.requested.display()
+        ));
+        self.finish_replaced_startup_open_pending(pending, "normal_navigation");
+        held
     }
 
     pub(crate) fn cancel_unresolved_open_for_remote_session(&mut self) {
@@ -961,6 +1163,7 @@ impl App {
                     matches!(
                         pending.stage,
                         crate::bookmark_browser::PendingBookOpenStage::Resolving
+                            | crate::bookmark_browser::PendingBookOpenStage::Qualifying(_)
                     )
                 })
                 .map(|pending| pending.request_id),
@@ -1125,6 +1328,7 @@ impl App {
             || archive_matches
             || pending_matches;
         if pending_matches {
+            self.retire_book_identity_permission(request_id.0);
             crate::logger::log(format!(
                 "[bookmark-open] finish request id={} reason={reason}",
                 request_id.0
@@ -1205,7 +1409,7 @@ impl App {
                     resolution.kind,
                 );
             return match self
-                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                     openable,
                     auto_fullscreen,
                     owner.open_request_owner(),
@@ -1213,6 +1417,7 @@ impl App {
                     None,
                     super::StartupListIntent::container_open(auto_fullscreen),
                     navigation,
+                    MainListRequestStage::Continuation,
                 ) {
                 FolderOpenOutcome::Loaded
                 | FolderOpenOutcome::Classifying
@@ -1270,8 +1475,17 @@ impl App {
                 result.rar_volume_proof.as_ref(),
             ) {
                 DetachedBuild::Built(descriptor) => {
-                    return if self.continue_active_detached_book_context_from_descriptor(descriptor)
-                    {
+                    #[cfg(all(windows, feature = "test-script"))]
+                    let count_descriptor = descriptor.clone();
+                    let started =
+                        self.continue_active_detached_book_context_from_descriptor(descriptor);
+                    #[cfg(all(windows, feature = "test-script"))]
+                    if started {
+                        // The resolver admits this bookmark's first descriptor load. Converted
+                        // archive callbacks use a different continuation and retain their owner.
+                        self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+                    }
+                    return if started {
                         StartupOpenApplyOutcome::Opened
                     } else {
                         StartupOpenApplyOutcome::NotOpenable
@@ -1355,7 +1569,7 @@ impl App {
             crate::folder_tree::OpenablePathKind::File => OpenPathKind::File,
         });
         let outcome = self
-            .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+            .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                 openable,
                 auto_fullscreen,
                 owner.open_request_owner(),
@@ -1367,6 +1581,7 @@ impl App {
                     super::StartupListIntent::container_open(auto_fullscreen)
                 },
                 navigation,
+                MainListRequestStage::Continuation,
             );
         if let Some(scan) = scan {
             scan.finish(
@@ -1547,12 +1762,15 @@ impl App {
         }
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
-        DetachedBuild::Built(self.start_active_detached_book_context(
-            descriptor,
-            ctx,
-            placement_seed,
-            Some(pending),
-        ))
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_descriptor = descriptor.clone();
+        let started =
+            self.start_active_detached_book_context(descriptor, ctx, placement_seed, Some(pending));
+        #[cfg(all(windows, feature = "test-script"))]
+        if started {
+            self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+        }
+        DetachedBuild::Built(started)
     }
 
     /// Full-feature book opens continue through the mounted/main context so editing and linked
@@ -1813,6 +2031,9 @@ impl App {
         });
         let policy = self.page_identity_index.policy.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
+        let basis_generation = self.items_generation;
+        let saved_projection_recipe = self.projection_recipe.clone();
+        let saved_viewing_state = self.capture_snapshot_viewing_state();
         let saved_items = self.items.clone();
         let saved_thumbnails = self.thumbnails.clone();
         let saved_image_metas = self.image_metas.clone();
@@ -1865,6 +2086,16 @@ impl App {
             crate::rating_sort::RatingSortKey::Unsupported => None,
         };
         self.items = reader_items;
+        // A direct audio/video exception makes the reader a mixed ordinary list. The saved
+        // grid recipe is restored by the existing DirectMedia snapshot on return.
+        if self.projection_recipe.extracted_surface().is_none()
+            && matches!(
+                self.items[target_idx],
+                GridItem::Video(_) | GridItem::Audio(_)
+            )
+        {
+            self.projection_recipe = super::book_materialization::ProjectionRecipe::OrdinaryList;
+        }
         self.image_metas = reader_metas;
         if let Some(stars) = target_rating {
             self.rating_cache.insert(target_idx, stars);
@@ -1892,6 +2123,7 @@ impl App {
             origin: origin_path,
             filter_at_capture: self.current_filter_state(),
             source_label: crate::snapshot::SnapshotSourceLabel::DirectMedia {
+                basis_generation,
                 target: requested.clone(),
                 policy,
                 reader_order,
@@ -1900,6 +2132,8 @@ impl App {
             generation_id,
             saved_items: saved_items.clone(),
             saved_page_identity_index: saved_page_identity_index.clone(),
+            saved_projection_recipe: saved_projection_recipe.clone(),
+            saved_viewing_state,
             saved_thumbnails: saved_thumbnails.clone(),
             saved_image_metas: saved_image_metas.clone(),
             saved_visible_indices,
@@ -1910,6 +2144,7 @@ impl App {
             list_view_thumbnails: saved_thumbnails,
             list_view_image_metas: saved_image_metas,
             list_view_page_identity_index: saved_page_identity_index.clone(),
+            list_view_projection_recipe: saved_projection_recipe,
             pre_snapshot_search_origin: None,
         });
         self.top_level_grid_view.begin_with_origin(
@@ -2260,6 +2495,1360 @@ fn resolve_startup_open_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn section1285_resolver(
+        app: &mut App,
+        owner: StartupOpenPathOwner,
+        requested: &Path,
+    ) -> (mpsc::Sender<StartupOpenPathResolveResult>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(requested.to_path_buf()).unwrap(),
+            owner,
+            navigation: None,
+            cancel: Arc::clone(&cancel),
+            rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+            held_resolve_for_activation_admission: None,
+            diagnostic: None,
+        });
+        (tx, cancel)
+    }
+
+    fn section1285_result(requested: &Path) -> StartupOpenPathResolveResult {
+        StartupOpenPathResolveResult {
+            requested: requested.to_path_buf(),
+            resolved: Some(crate::folder_tree::OpenablePathResolution {
+                path: requested.to_path_buf(),
+                kind: crate::folder_tree::OpenablePathKind::Directory,
+                requested_is_file: false,
+            }),
+            rar_volume_proof: None,
+            bookmark_relative_page_openable: None,
+            elapsed_ms: 1.0,
+            direct_media: None,
+        }
+    }
+
+    fn section1419_row(path: &Path) -> crate::bookmark_browser::BookmarkBrowserRow {
+        crate::bookmark_browser::BookmarkBrowserRow {
+            source: crate::bookmark_browser::BookmarkRowSource::Book(
+                crate::book_bookmarks::BookBookmark {
+                    id: 419,
+                    container_key: crate::adjustment_db::normalize_path(path),
+                    container_path: path.to_path_buf(),
+                    container_kind: crate::book_bookmarks::BookContainerKind::ImageFolder,
+                    page_identity: crate::book_bookmarks::PageIdentity::RelativePath(
+                        "page.jpg".into(),
+                    ),
+                    page_index_hint: 0,
+                    created_at_ms: 1,
+                    title: None,
+                },
+            ),
+            item: GridItem::Folder(path.to_path_buf()),
+            relative_page_provenance: None,
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 1,
+            missing: false,
+        }
+    }
+
+    fn section1419_complete_resolver(app: &mut App, ctx: &egui::Context) {
+        let pending = app
+            .startup_open_path_resolve_pending
+            .as_mut()
+            .expect("B resolver");
+        let path = pending.requested.to_path_buf();
+        let source = pending.owner.source();
+        pending.cancel.store(true, Ordering::Relaxed);
+        pending.cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        pending.rx = rx;
+        tx.send(resolve_startup_open_path(path, source, None, true))
+            .unwrap();
+        app.poll_startup_open_path_resolve(ctx);
+        app.finish_history_restore_preparation_for_test();
+        app.finish_page_identity_preparation_for_test();
+        let _ = app.with_active_viewer_context(|reader| {
+            if let Some(pending) = reader.folder_pane_open_pending.as_mut() {
+                let path = pending.path.clone();
+                pending.cancel.store(true, Ordering::Relaxed);
+                pending.cancel = Arc::new(AtomicBool::new(false));
+                let (tx, rx) = mpsc::channel();
+                tx.send(Ok(scan_directory(&path))).unwrap();
+                pending.rx = rx;
+                assert!(matches!(
+                    reader.poll_detached_physical_folder_open(ctx),
+                    DetachedPhysicalFolderOpenPoll::Applied
+                ));
+            }
+            reader.finish_history_restore_preparation_for_test();
+            reader.finish_page_identity_preparation_for_test();
+        });
+    }
+
+    fn section1419_candidate(app: &mut App, target: &Path, ctx: &egui::Context) {
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.items = vec![GridItem::Folder(target.to_path_buf())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        assert!(app.handle_gamepad_grid_accept(ctx).is_none());
+        assert!(matches!(
+            app.folder_pane_open_pending.as_ref().map(|p| &p.purpose),
+            Some(FolderOpenScanPurpose::GridFolderCandidate { .. })
+        ));
+    }
+
+    // Drive real admissions and assert retirement before polling any completion. Pane,
+    // classification, DFS and history use controlled channels for both late-notification
+    // orders. Smart's private multi-stage worker has no existing channel replacement hook:
+    // its presence before B and absence immediately after B guard retirement regardless of
+    // worker timing; polling it below does not claim to force worker completion. Collection
+    // uses an already-ready queued continuation (no worker), not the synchronous shell open.
+    #[test]
+    fn section1419_activation_and_bookmark_retire_earlier_main_requests() {
+        for earlier in [
+            "pane",
+            "candidate",
+            "classification",
+            "bookmark_row",
+            "dfs",
+            "history",
+            "smart",
+            "collection",
+        ] {
+            for bookmark in [false, true] {
+                for earlier_first in [false, true] {
+                    let mut app = setup_app_for_test();
+                    app.active_quick_folder_slot = None;
+                    app.settings.detached_viewer_open_images_in_window = false;
+                    let origin = app.tmp.path().join("origin");
+                    let a = app.tmp.path().join(
+                        if matches!(earlier, "classification" | "bookmark_row") {
+                            "earlier.epub"
+                        } else {
+                            "earlier"
+                        },
+                    );
+                    let b = app.tmp.path().join("later");
+                    for path in [&origin, &a, &b] {
+                        std::fs::create_dir(path).unwrap();
+                    }
+                    std::fs::write(a.join("page.jpg"), b"fixture").unwrap();
+                    std::fs::write(a.join("clip.mp4"), b"fixture").unwrap();
+                    std::fs::write(b.join("page.jpg"), b"fixture").unwrap();
+                    app.current_folder = Some(origin.clone());
+                    let ctx = egui::Context::default();
+                    let mut pane = None;
+                    let mut classification = None;
+                    let mut dfs = None;
+                    let mut history = None;
+                    match earlier {
+                        "pane" | "candidate" => {
+                            if earlier == "pane" {
+                                app.start_folder_pane_open(a.clone());
+                            } else {
+                                section1419_candidate(&mut app, &a, &ctx);
+                            }
+                            let pending = app.folder_pane_open_pending.as_mut().unwrap();
+                            let (tx, rx) = mpsc::channel();
+                            pending.rx = rx;
+                            pane = Some((tx, pending.cancel.clone()));
+                        }
+                        "classification" | "bookmark_row" => {
+                            if earlier == "bookmark_row" {
+                                app.open_bookmark_browser_row(&ctx, &section1419_row(&a));
+                            } else {
+                                assert!(matches!(
+                                    app.start_open_path_classification(
+                                        a.clone(),
+                                        ClassifiedOpenContinuation::Direct {
+                                            auto_fullscreen: false,
+                                            owner: OpenRequestOwner::Navigation,
+                                            restore_intent: StartupListIntent::ExplicitList,
+                                        }
+                                    ),
+                                    OpenAdmission::Accepted
+                                ));
+                            }
+                            let mut pending = app
+                                .top_level_grid_view
+                                .take_open_path_classification()
+                                .unwrap();
+                            let (tx, rx) = mpsc::channel();
+                            pending.rx = rx;
+                            classification = Some((tx, pending.cancel.clone()));
+                            app.top_level_grid_view
+                                .set_open_path_classification(Some(pending));
+                        }
+                        "dfs" => {
+                            app.start_folder_nav(origin.clone(), true, FolderNavMode::Grid);
+                            let pending = app.folder_nav_pending.as_mut().unwrap();
+                            let (tx, rx) = mpsc::channel();
+                            pending.rx = rx;
+                            dfs = Some((tx, pending.cancel.clone()));
+                        }
+                        "history" => {
+                            assert!(app.start_physical_history_transition(
+                                PhysicalHistoryIntent::Navigation {
+                                    replay: None,
+                                    auto_fullscreen: false
+                                },
+                                a.clone(),
+                                StartupListIntent::ExplicitList
+                            ));
+                            let Some(HistoryNavigationTransition::Physical(request)) =
+                                app.top_level_grid_view.history_navigation_transition_mut()
+                            else {
+                                panic!("A physical history owner");
+                            };
+                            let PhysicalHistoryPhase::Preflighting { preflight, .. } =
+                                &mut request.phase
+                            else {
+                                panic!("A history preflight");
+                            };
+                            let (controlled, tx) =
+                                collection_navigation::PhysicalHistoryPreflight::controlled_for_test();
+                            *preflight = controlled;
+                            history = Some(tx);
+                        }
+                        "smart" => {
+                            let mut definition = crate::settings::SmartFolderDefinition::new("A");
+                            definition.rules.push(crate::settings::SmartFolderRule::new(
+                                origin.clone(),
+                                true,
+                                Default::default(),
+                            ));
+                            let id = definition.id;
+                            app.settings.smart_folders.push(definition);
+                            app.open_smart_folder_staged(id, false);
+                            assert!(app.smart_folder_transition.is_some());
+                        }
+                        "collection" => {
+                            // A bare open_collection_grid_from_navigation installs a shell
+                            // synchronously and has no navigation pending in this fixture.
+                            // Seed the existing ready continuation owner so omitting its
+                            // retirement cannot pass merely because no worker has replied.
+                            app.open_collection_grid_from_navigation(
+                                crate::collection_store::CollectionId::new(),
+                            );
+                            app.top_level_grid_view.set_collection_navigation_pending(Some(
+                                collection_navigation::CollectionNavigationPending::AwaitingOuterContinuation {
+                                    steps: 1,
+                                    fullscreen: false,
+                                    resume_slideshow: false,
+                                    native_toast: false,
+                                },
+                            ));
+                            assert!(app.top_level_grid_view.collection_navigation_pending());
+                        }
+                        _ => unreachable!(),
+                    }
+                    app.settings.detached_viewer_open_images_in_window = false;
+                    if bookmark {
+                        app.open_bookmark_browser_row(&ctx, &section1419_row(&b));
+                    } else {
+                        app.start_startup_open_path_resolve(
+                            b.clone(),
+                            StartupOpenPathSource::Activation,
+                            &ctx,
+                        );
+                    }
+                    assert!(
+                        app.folder_pane_open_pending.is_none(),
+                        "{earlier}/{bookmark}"
+                    );
+                    assert!(
+                        app.top_level_grid_view.open_path_classification().is_none(),
+                        "{earlier}/{bookmark}: A classification owner must retire at B admission"
+                    );
+                    assert!(
+                        app.folder_nav_pending.is_none(),
+                        "{earlier}/{bookmark}: A DFS owner must retire at B admission"
+                    );
+                    assert!(
+                        app.top_level_grid_view
+                            .history_navigation_transition()
+                            .is_none(),
+                        "{earlier}/{bookmark}: A history owner must retire at B admission"
+                    );
+                    assert!(
+                        app.smart_folder_transition.is_none(),
+                        "{earlier}/{bookmark}: A Smart owner must retire at B admission"
+                    );
+                    assert!(
+                        !app.top_level_grid_view.collection_navigation_pending(),
+                        "{earlier}/{bookmark}: A Collection owner must retire at B admission"
+                    );
+                    assert!(
+                        app.startup_open_path_resolve_pending.is_some(),
+                        "{earlier}/{bookmark}"
+                    );
+                    let late_a = |app: &mut App| {
+                        if let Some((tx, cancel)) = &pane {
+                            assert!(cancel.load(Ordering::Relaxed));
+                            assert!(tx.send(Ok(scan_directory(&a))).is_err());
+                            assert!(app.poll_folder_pane_open(&ctx).is_none());
+                        }
+                        if let Some((tx, cancel)) = &classification {
+                            assert!(cancel.load(Ordering::Relaxed));
+                            assert!(
+                                tx.send(Ok(ClassifiedOpenPath {
+                                    rar_volume_proof: None,
+                                    kind: OpenPathKind::Directory,
+                                    folder_scan: Some(scan_directory(&a))
+                                }))
+                                .is_err()
+                            );
+                            app.poll_open_path_classification(&ctx);
+                        }
+                        if let Some((tx, cancel)) = &dfs {
+                            assert!(cancel.load(Ordering::Relaxed));
+                            assert!(
+                                tx.send(FolderNavThreadResult {
+                                    target: Some(FolderNavTarget {
+                                        route: FolderNavRoute::FullFeature(a.clone()),
+                                        smart_kind: None,
+                                        scanned: FolderNavScanResult::Ready(scan_directory(&a)),
+                                    }),
+                                    hit_image_folder: false,
+                                })
+                                .is_err()
+                            );
+                        }
+                        if let Some(tx) = &history {
+                            let payload =
+                                collection_navigation::PhysicalHistoryPreflightPayload::Folder(
+                                    scan_directory(&a),
+                                );
+                            assert!(tx.send(Ok(payload)).is_err());
+                        }
+                        app.poll_collection_history_transition(&ctx);
+                        assert!(app.poll_folder_nav().is_none());
+                        app.poll_smart_folder(&ctx);
+                        app.poll_collection_navigation(&ctx);
+                    };
+                    if earlier_first {
+                        late_a(&mut app);
+                        assert!(app.startup_open_path_resolve_pending.is_some());
+                    }
+                    section1419_complete_resolver(&mut app, &ctx);
+                    if !earlier_first {
+                        late_a(&mut app);
+                    }
+                    assert_eq!(
+                        app.current_folder.as_ref(),
+                        Some(&b),
+                        "{earlier}/{bookmark}/{earlier_first}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1419_classified_bookmark_click_retires_pane_before_classification() {
+        for detached in [false, true] {
+            let mut app = setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let a = app.tmp.path().join("A");
+            let b = app.tmp.path().join("B.epub");
+            std::fs::create_dir(&a).unwrap();
+            std::fs::create_dir(&b).unwrap();
+            app.current_folder = Some(a.clone());
+            app.start_folder_pane_open(a);
+            let cancel = app
+                .folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .cancel
+                .clone();
+            app.settings.detached_viewer_open_images_in_window = detached;
+            app.open_bookmark_browser_row(&egui::Context::default(), &section1419_row(&b));
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.folder_pane_open_pending.is_none());
+            assert!(app.top_level_grid_view.open_path_classification().is_some());
+            app.settle_open_path_classification_for_test();
+            let pending = app
+                .startup_open_path_resolve_pending
+                .as_ref()
+                .expect("classified continuation resolver");
+            assert!(
+                matches!(&pending.owner, StartupOpenPathOwner::Bookmark(owner) if owner.detached_lease.is_some() == detached)
+            );
+        }
+    }
+
+    fn section1419_arm_book(app: &mut App, path: &Path, now: std::time::Instant) {
+        let row = section1419_row(path);
+        let crate::bookmark_browser::BookmarkRowSource::Book(bookmark) = row.source else {
+            unreachable!()
+        };
+        app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+            crate::bookmark_browser::PendingBookOpen {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(419),
+                bookmark_source: crate::pdf_loader::LeasedEpubPath::try_new(path.to_path_buf())
+                    .unwrap(),
+                bookmark,
+                relative_page_provenance: None,
+                started_at: now,
+                stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+            },
+        ));
+    }
+
+    #[test]
+    fn section1419_timeout_compensation_is_per_clock_after_stage_transition() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("book");
+        let base = std::time::Instant::now();
+        section1419_arm_book(&mut app, &path, base);
+        let pending = app
+            .bookmark_open_pending
+            .as_mut()
+            .unwrap()
+            .book_mut()
+            .unwrap();
+        pending.stage = crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
+            started_at: base + std::time::Duration::from_secs(7),
+            entered_archive_prefix: false,
+        };
+        app.defer_current_bookmark_open_timeout_at(
+            std::time::Duration::from_secs(8),
+            base + std::time::Duration::from_secs(10),
+        );
+        let pending = app.bookmark_open_pending.as_ref().unwrap().book().unwrap();
+        assert_eq!(pending.started_at, base + std::time::Duration::from_secs(8));
+        assert!(
+            matches!(pending.stage, crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { started_at, .. }
+            if started_at == base + std::time::Duration::from_secs(10))
+        );
+        app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+            crate::bookmark_browser::PendingMediaOpen {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(420),
+                path,
+                pts_secs: 0.0,
+                started_at: base + std::time::Duration::from_secs(9),
+                last_wait: None,
+            },
+        ));
+        app.defer_current_bookmark_open_timeout_at(
+            std::time::Duration::from_secs(8),
+            base + std::time::Duration::from_secs(10),
+        );
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .unwrap()
+                .media()
+                .unwrap()
+                .started_at,
+            base + std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn section1419_explicit_admission_cancels_all_main_bookmark_stages_but_memory_clear_keeps_page_wait()
+     {
+        for stage in ["resolving", "qualifying", "page", "media"] {
+            let mut app = setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let path = app.tmp.path().join("book");
+            section1419_arm_book(&mut app, &path, std::time::Instant::now());
+            if stage == "qualifying" {
+                app.bookmark_open_pending
+                    .as_mut()
+                    .unwrap()
+                    .book_mut()
+                    .unwrap()
+                    .stage = crate::bookmark_browser::PendingBookOpenStage::Qualifying(Box::new(
+                    crate::bookmark_browser::BookOpenQualification {
+                        navigation: None,
+                        return_grid: BookmarkViewReturnGridState {
+                            row_keys: vec![],
+                            selected_key: None,
+                            opened_key: (1, 419),
+                            scroll_offset_y: 0.0,
+                        },
+                    },
+                ));
+            } else if stage == "page" {
+                app.bookmark_open_pending
+                    .as_mut()
+                    .unwrap()
+                    .book_mut()
+                    .unwrap()
+                    .begin_page_wait();
+                app.clear_quick_folder_slots();
+                assert!(app.bookmark_open_pending.is_some());
+            } else if stage == "media" {
+                app.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+                        crate::bookmark_browser::PendingMediaOpen {
+                            request_id: crate::bookmark_browser::BookmarkOpenRequestId(419),
+                            path,
+                            pts_secs: 0.0,
+                            started_at: std::time::Instant::now(),
+                            last_wait: None,
+                        },
+                    ));
+                app.clear_quick_folder_slots();
+                assert!(app.bookmark_open_pending.is_some());
+            }
+            app.admit_explicit_main_open_request();
+            assert!(app.bookmark_open_pending.is_none(), "{stage}");
+        }
+    }
+
+    #[test]
+    fn section1419_snapshot_bookmark_classification_continuation_is_held_until_admission() {
+        for admitted in [false, true] {
+            for detached in [false, true] {
+                let mut app = setup_app_for_test();
+                app.active_quick_folder_slot = None;
+                app.settings.detached_viewer_open_images_in_window = detached;
+                let a = app.tmp.path().join("A.epub");
+                let b = app.tmp.path().join("B");
+                let outside = app.tmp.path().join("outside");
+                for path in [&a, &b, &outside] {
+                    std::fs::create_dir(path).unwrap();
+                }
+                app.current_folder = Some(app.tmp.path().to_path_buf());
+                app.items = vec![GridItem::Folder(a.clone()), GridItem::Folder(b.clone())];
+                app.thumbnails = vec![ThumbnailState::Pending; 2];
+                app.image_metas = vec![None; 2];
+                app.visible_indices = vec![0, 1];
+                app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                app.finish_page_identity_preparation_for_test();
+                let ctx = egui::Context::default();
+                app.open_bookmark_browser_row(&ctx, &section1419_row(&a));
+                let mut classification = app
+                    .top_level_grid_view
+                    .take_open_path_classification()
+                    .unwrap();
+                let (a_tx, a_rx) = mpsc::channel();
+                classification.rx = a_rx;
+                app.top_level_grid_view
+                    .set_open_path_classification(Some(classification));
+                let destination = if admitted { &b } else { &outside };
+                app.start_startup_open_path_resolve(
+                    destination.clone(),
+                    StartupOpenPathSource::Activation,
+                    &ctx,
+                );
+                let activation = app.startup_open_path_resolve_pending.as_mut().unwrap();
+                let activation_cancel = activation.cancel.clone();
+                let (b_tx, b_rx) = mpsc::channel();
+                activation.rx = b_rx;
+                a_tx.send(Ok(ClassifiedOpenPath {
+                    rar_volume_proof: None,
+                    kind: OpenPathKind::Directory,
+                    folder_scan: Some(scan_directory(&a)),
+                }))
+                .unwrap();
+                app.poll_open_path_classification(&ctx);
+                let activation = app
+                    .startup_open_path_resolve_pending
+                    .as_ref()
+                    .expect("B survives A continuation");
+                assert!(matches!(activation.owner, StartupOpenPathOwner::Activation));
+                assert!(!activation_cancel.load(Ordering::Relaxed));
+                let held = activation
+                    .held_resolve_for_activation_admission
+                    .as_ref()
+                    .expect("A is held");
+                assert!(matches!(held.owner, StartupOpenPathOwner::Bookmark(_)));
+                let held_cancel = held.cancel.clone();
+                let held_window = match &held.owner {
+                    StartupOpenPathOwner::Bookmark(owner) => {
+                        owner.detached_lease.map(|lease| lease.window_id)
+                    }
+                    _ => None,
+                };
+                b_tx.send(resolve_startup_open_path(
+                    destination.clone(),
+                    StartupOpenPathSource::Activation,
+                    None,
+                    true,
+                ))
+                .unwrap();
+                app.poll_startup_open_path_resolve(&ctx);
+                if admitted {
+                    assert!(held_cancel.load(Ordering::Relaxed));
+                    assert!(app.bookmark_open_pending.is_none());
+                    if let Some(window) = held_window {
+                        assert!(matches!(
+                            app.detached_window_state(window),
+                            None | Some(DetachedWindowState::Closing)
+                        ));
+                        if let Some((context, _)) = app.locate_window_context(window) {
+                            app.with_window_context_for_test(context, |reader| {
+                                assert!(reader.bookmark_open_pending.is_none())
+                            });
+                        }
+                    }
+                    app.finish_history_restore_preparation_for_test();
+                    assert_eq!(app.current_folder.as_ref(), Some(&b));
+                } else {
+                    assert!(!held_cancel.load(Ordering::Relaxed));
+                    assert!(matches!(
+                        app.startup_open_path_resolve_pending
+                            .as_ref()
+                            .map(|p| &p.owner),
+                        Some(StartupOpenPathOwner::Bookmark(_))
+                    ));
+                    if detached {
+                        app.with_active_viewer_context(|active| {
+                            assert!(
+                                active
+                                    .bookmark_open_pending
+                                    .as_ref()
+                                    .unwrap()
+                                    .book()
+                                    .unwrap()
+                                    .started_at
+                                    <= std::time::Instant::now()
+                            );
+                        })
+                        .unwrap();
+                    } else {
+                        assert!(
+                            app.bookmark_open_pending
+                                .as_ref()
+                                .unwrap()
+                                .book()
+                                .unwrap()
+                                .started_at
+                                <= std::time::Instant::now()
+                        );
+                    }
+                    section1419_complete_resolver(&mut app, &ctx);
+                    if detached {
+                        app.with_active_viewer_context(|active| {
+                            assert_eq!(active.current_folder.as_ref(), Some(&a))
+                        })
+                        .unwrap();
+                    } else {
+                        assert_eq!(app.current_folder.as_ref(), Some(&a));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1419_snapshot_replacement_and_refusal_never_advance_new_bookmark_clock_into_future() {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let member = app.tmp.path().join("member");
+        let outside = app.tmp.path().join("outside");
+        std::fs::create_dir(&member).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = vec![GridItem::Folder(member.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
+        let ctx = egui::Context::default();
+        app.start_startup_open_path_resolve(
+            outside.clone(),
+            StartupOpenPathSource::Activation,
+            &ctx,
+        );
+        app.startup_open_path_resolve_pending
+            .as_mut()
+            .unwrap()
+            .started_at = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        section1419_arm_book(&mut app, &member, std::time::Instant::now());
+        app.start_startup_open_path_resolve(
+            outside.clone(),
+            StartupOpenPathSource::Activation,
+            &ctx,
+        );
+        assert!(
+            app.bookmark_open_pending
+                .as_ref()
+                .unwrap()
+                .book()
+                .unwrap()
+                .started_at
+                <= std::time::Instant::now()
+        );
+        app.startup_open_path_resolve_pending
+            .as_mut()
+            .unwrap()
+            .started_at = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        app.bookmark_open_pending
+            .as_mut()
+            .unwrap()
+            .book_mut()
+            .unwrap()
+            .begin_page_wait();
+        section1419_complete_resolver(&mut app, &ctx);
+        let pending = app.bookmark_open_pending.as_ref().unwrap().book().unwrap();
+        assert!(pending.started_at <= std::time::Instant::now());
+        assert!(
+            matches!(pending.stage, crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { started_at, .. }
+            if started_at <= std::time::Instant::now())
+        );
+    }
+
+    #[test]
+    fn section1419_candidate_main_continuation_keeps_provisional_activation() {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let a = app.tmp.path().join("candidate");
+        let b = app.tmp.path().join("activation");
+        for path in [&a, &b] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(a.join("clip.mp4"), b"fixture").unwrap();
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        let ctx = egui::Context::default();
+        section1419_candidate(&mut app, &a, &ctx);
+        // The snapshot activation slot is installed with a controlled receiver: candidate's
+        // main continuation must not retire it, even before scope admission finishes.
+        let (_tx, cancel) = section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &b);
+        section1285_complete_main_scan(&mut app, &a, &ctx);
+        assert_eq!(app.current_folder.as_ref(), Some(&a));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_some());
+    }
+
+    #[test]
+    fn section1419_retired_held_detached_context_does_not_panic_on_refusal_or_replacement() {
+        for replacement in [false, true] {
+            let mut app = setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let member = app.tmp.path().join("member");
+            let outside = app.tmp.path().join("outside");
+            std::fs::create_dir(&member).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            app.items = vec![GridItem::Folder(member.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            app.finish_page_identity_preparation_for_test();
+            let context = app.build_window_context_for_test(1419, |reader| {
+                section1419_arm_book(reader, &member, std::time::Instant::now());
+            });
+            let owner =
+                StartupOpenPathOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+                    request_id: crate::bookmark_browser::BookmarkOpenRequestId(419),
+                    target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(member.clone()),
+                    detached_lease: Some(DetachedSessionLease { window_id: 1419 }),
+                });
+            let (_held_tx, held_cancel) = section1285_resolver(&mut app, owner, &member);
+            let ctx = egui::Context::default();
+            app.start_startup_open_path_resolve(
+                outside.clone(),
+                StartupOpenPathSource::Activation,
+                &ctx,
+            );
+            assert!(
+                app.startup_open_path_resolve_pending
+                    .as_ref()
+                    .unwrap()
+                    .held_resolve_for_activation_admission
+                    .is_some()
+            );
+            app.retire_context(context, "section1419-owner-closed", |_| ())
+                .unwrap();
+            assert!(app.locate_window_context(1419).is_none());
+            let generation = app.items_generation;
+            if replacement {
+                app.start_startup_open_path_resolve(
+                    outside,
+                    StartupOpenPathSource::Activation,
+                    &ctx,
+                );
+            } else {
+                section1419_complete_resolver(&mut app, &ctx);
+            }
+            assert!(!held_cancel.load(Ordering::Relaxed));
+            assert_eq!(app.items_generation, generation);
+            assert!(app.is_snapshot_active());
+        }
+    }
+
+    #[test]
+    fn section1419_failed_activation_does_not_resume_the_retired_pane() {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("origin");
+        let a = app.tmp.path().join("A");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir(&a).unwrap();
+        app.current_folder = Some(origin.clone());
+        app.start_folder_pane_open(a.clone());
+        let pending = app.folder_pane_open_pending.as_mut().unwrap();
+        let cancel = pending.cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        pending.rx = rx;
+        let ctx = egui::Context::default();
+        app.start_startup_open_path_resolve(a.clone(), StartupOpenPathSource::Activation, &ctx);
+        assert!(cancel.load(Ordering::Relaxed));
+        let pending = app.startup_open_path_resolve_pending.as_mut().unwrap();
+        let (b_tx, b_rx) = mpsc::channel();
+        pending.rx = b_rx;
+        let mut result = section1285_result(&a);
+        result.resolved = None;
+        b_tx.send(result).unwrap();
+        app.poll_startup_open_path_resolve(&ctx);
+        assert!(tx.send(Ok(scan_directory(&a))).is_err());
+        assert!(app.poll_folder_pane_open(&ctx).is_none());
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+    }
+
+    #[test]
+    fn section1419_detached_bookmark_adopts_without_mutating_sibling_context() {
+        for classified in [false, true] {
+            let mut app = setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let origin = app.tmp.path().join("origin");
+            let a = app.tmp.path().join("earlier-pane");
+            let b = app
+                .tmp
+                .path()
+                .join(if classified { "book.epub" } else { "book" });
+            for path in [&origin, &a, &b] {
+                std::fs::create_dir(path).unwrap();
+            }
+            app.current_folder = Some(origin.clone());
+            let sibling = app.build_window_context_for_test(99419, |reader| {
+                reader.current_folder = Some(a.clone());
+                reader.items = vec![GridItem::Folder(a.clone())];
+            });
+            let sibling_generation =
+                app.with_window_context_for_test(sibling, |reader| reader.items_generation);
+            app.start_folder_pane_open(a.clone());
+            let cancel = app
+                .folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .cancel
+                .clone();
+            app.settings.detached_viewer_open_images_in_window = true;
+            let ctx = egui::Context::default();
+            app.open_bookmark_browser_row(&ctx, &section1419_row(&b));
+            assert!(cancel.load(Ordering::Relaxed));
+            if classified {
+                app.settle_open_path_classification_for_test();
+            }
+            section1419_complete_resolver(&mut app, &ctx);
+            assert_eq!(app.current_folder.as_ref(), Some(&origin));
+            app.with_active_viewer_context(|reader| {
+                assert_eq!(reader.current_folder.as_ref(), Some(&b))
+            })
+            .unwrap();
+            app.with_window_context_for_test(sibling, |reader| {
+                assert_eq!(reader.items_generation, sibling_generation);
+                assert_eq!(reader.current_folder.as_ref(), Some(&a));
+                assert!(matches!(reader.items.as_slice(), [GridItem::Folder(path)] if path == &a));
+            });
+        }
+    }
+
+    #[test]
+    fn section1285_new_main_requests_retire_startup_and_activation_resolvers() {
+        for activation in [false, true] {
+            for request in ["collection", "smart", "recent", "history", "dfs"] {
+                let mut app = setup_app_for_test();
+                app.active_quick_folder_slot = None;
+                let origin = app.tmp.path().join("origin");
+                let stale = app.tmp.path().join("stale-initial");
+                std::fs::create_dir(&origin).unwrap();
+                std::fs::create_dir(&stale).unwrap();
+                app.current_folder = Some(origin.clone());
+                let owner = if activation {
+                    StartupOpenPathOwner::Activation
+                } else {
+                    StartupOpenPathOwner::InitialStartup
+                };
+                let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
+                // Published-but-unpolled completion must lose in the same way as slow I/O.
+                tx.send(section1285_result(&stale)).unwrap();
+                match request {
+                    "collection" => app.open_collection_grid_from_navigation(
+                        crate::collection_store::CollectionId::new(),
+                    ),
+                    "smart" => {
+                        let mut definition = crate::settings::SmartFolderDefinition::new("Next");
+                        definition.rules.push(crate::settings::SmartFolderRule::new(
+                            origin.clone(),
+                            true,
+                            Default::default(),
+                        ));
+                        let id = definition.id;
+                        app.settings.smart_folders.push(definition);
+                        app.open_smart_folder_staged(id, false);
+                        assert!(app.smart_folder_transition.is_some());
+                    }
+                    "recent" => app.enter_reading_history_from_menu(),
+                    "history" => {
+                        app.push_nav_history_entry(reading_history_synthetic_path());
+                        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+                        assert!(app.items_are_reading_history_view);
+                    }
+                    "dfs" => app.start_folder_nav(origin, true, FolderNavMode::Grid),
+                    _ => unreachable!(),
+                }
+                assert!(cancel.load(Ordering::Relaxed), "{request}/{activation}");
+                assert!(app.startup_open_path_resolve_pending.is_none());
+                let folder = app.current_folder.clone();
+                let generation = app.items_generation;
+                app.poll_startup_open_path_resolve(&egui::Context::default());
+                assert_eq!(app.current_folder, folder);
+                assert_eq!(app.items_generation, generation);
+                assert!(tx.send(section1285_result(&stale)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn section1285_deferred_modal_target_is_replaced_by_explicit_local_navigation() {
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        let target = app.tmp.path().join("initial");
+        let other = app.tmp.path().join("local-choice");
+        std::fs::create_dir(&other).unwrap();
+        app.set_startup_open_path(target.clone());
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let epub = app.tmp.path().join("modal.epub");
+        std::fs::write(&epub, b"fixture").unwrap();
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &epub,
+            PdfOpenFailure::NotConverted,
+            StartupListIntent::ExplicitList,
+        );
+        let ctx = egui::Context::default();
+        app.poll_deferred_startup_open_path(&ctx);
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
+        app.load_folder(other.clone());
+        assert!(app.startup_open_path.is_none());
+        app.poll_deferred_startup_open_path(&ctx);
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert_eq!(app.current_folder.as_ref(), Some(&other));
+    }
+
+    #[test]
+    fn section1285_same_location_explicit_open_replaces_deferred_target_but_reload_keeps_it() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("adopted");
+        std::fs::create_dir(&folder).unwrap();
+        app.load_folder(folder.clone());
+        let target = app.tmp.path().join("initial");
+        app.set_startup_open_path(target.clone());
+        app.reload_current_folder_preserving_override();
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.load_folder(folder);
+        assert!(app.startup_open_path.is_none());
+    }
+
+    #[test]
+    fn section1285_reload_keeps_unresolved_initial_request_without_user_navigation() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("adopted");
+        let target = app.tmp.path().join("initial");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        app.load_folder(folder);
+        let (tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        app.reload_current_folder_preserving_override();
+        assert!(!cancel.load(Ordering::Relaxed));
+        tx.send(section1285_result(&target)).unwrap();
+        app.poll_startup_open_path_resolve(&egui::Context::default());
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn section1285_fix_and_unfix_list_retire_older_main_resolvers() {
+        let mut app = direct_reader_fixture();
+        let stale = app.tmp.path().join("old-initial");
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &stale);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert!(cancel.load(Ordering::Relaxed));
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &stale);
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_none());
+    }
+
+    #[test]
+    fn section1285_remote_retains_deferred_target_through_operations_and_local_reload() {
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        let folder = app.tmp.path().join("adopted");
+        let target = app.tmp.path().join("initial");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        app.load_folder(folder);
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "section1285".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        let ctx = egui::Context::default();
+        app.poll_remote_session(&ctx);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.retire_replaced_main_list_requests(None);
+        app.enter_reading_history();
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.poll_deferred_startup_open_path(&ctx);
+        assert!(app.startup_open_path.is_none());
+        assert_eq!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .unwrap()
+                .requested
+                .as_path(),
+            target.as_path()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1285_main_collection_keeps_detached_bookmark_even_under_activation() {
+        for held in [false, true] {
+            let mut app = setup_app_for_test();
+            let path = app.tmp.path().join("detached.zip");
+            let mut owner = arm_section1339_bookmark(&mut app, 1285, &path);
+            owner.detached_lease = Some(DetachedSessionLease { window_id: 1285 });
+            let (_tx, cancel) =
+                section1285_resolver(&mut app, StartupOpenPathOwner::Bookmark(owner), &path);
+            let mut activation_cancel = None;
+            if held {
+                let previous = app.startup_open_path_resolve_pending.take().unwrap();
+                let (_activation_tx, token) =
+                    section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &path);
+                activation_cancel = Some(token);
+                app.startup_open_path_resolve_pending
+                    .as_mut()
+                    .unwrap()
+                    .held_resolve_for_activation_admission = Some(Box::new(previous));
+            }
+            app.open_collection_grid_from_navigation(crate::collection_store::CollectionId::new());
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert!(
+                matches!(app.startup_open_path_resolve_pending.as_ref().map(|p| &p.owner),
+                Some(StartupOpenPathOwner::Bookmark(owner)) if owner.detached_lease.is_some())
+            );
+            if let Some(cancel) = activation_cancel {
+                assert!(cancel.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    #[test]
+    fn section1285_classification_handoffs_preserve_later_activation() {
+        for continuation in ["direct", "scan", "navigation", "physical"] {
+            let mut app = setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let target = app.tmp.path().join("directory.epub");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("page.jpg"), b"image").unwrap();
+            let earlier = app.tmp.path().join("earlier");
+            let (_earlier_tx, earlier_cancel) =
+                section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &earlier);
+            let next = match continuation {
+                "direct" => ClassifiedOpenContinuation::Direct {
+                    auto_fullscreen: false,
+                    owner: OpenRequestOwner::Navigation,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                "scan" => ClassifiedOpenContinuation::DirectScan {
+                    pre_scan: None,
+                    owner: OpenRequestOwner::Navigation,
+                    grid_effects: None,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                "navigation" => ClassifiedOpenContinuation::DirectNavigation {
+                    pre_scan: None,
+                    owner: OpenRequestOwner::Navigation,
+                    pane_epub_restore: None,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                "physical" => ClassifiedOpenContinuation::Physical {
+                    intent: PhysicalHistoryIntent::Navigation {
+                        replay: None,
+                        auto_fullscreen: false,
+                    },
+                    dfs_continuation: None,
+                    restore_intent: StartupListIntent::ExplicitList,
+                },
+                _ => unreachable!(),
+            };
+            assert!(matches!(
+                app.start_open_path_classification(target.clone(), next),
+                OpenAdmission::Accepted
+            ));
+            assert!(earlier_cancel.load(Ordering::Relaxed));
+            let mut candidate = app
+                .top_level_grid_view
+                .take_open_path_classification()
+                .unwrap();
+            let (classified_tx, classified_rx) = mpsc::channel();
+            candidate.rx = classified_rx;
+            app.top_level_grid_view
+                .set_open_path_classification(Some(candidate));
+            let later = app.tmp.path().join("later-activation");
+            let (_later_tx, later_cancel) =
+                section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &later);
+            classified_tx
+                .send(Ok(ClassifiedOpenPath {
+                    rar_volume_proof: None,
+                    kind: OpenPathKind::Directory,
+                    folder_scan: Some(
+                        folder_scan::scan_directory_with_convertible_archives(
+                            &target, false, false, false,
+                        )
+                        .unwrap(),
+                    ),
+                }))
+                .unwrap();
+            app.poll_open_path_classification(&egui::Context::default());
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            app.finish_history_restore_preparation_for_test();
+            assert_eq!(app.current_folder.as_ref(), Some(&target), "{continuation}");
+            assert!(!later_cancel.load(Ordering::Relaxed), "{continuation}");
+            assert_eq!(
+                app.startup_open_path_resolve_pending
+                    .as_ref()
+                    .unwrap()
+                    .requested
+                    .as_path(),
+                later.as_path(),
+                "{continuation}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn section1285_complete_main_scan(app: &mut App, path: &Path, ctx: &egui::Context) {
+        let mut pending = app.folder_pane_open_pending.take().unwrap();
+        pending.cancel.store(true, Ordering::Relaxed);
+        pending.cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(scan_directory(path))).unwrap();
+        pending.rx = rx;
+        app.folder_pane_open_pending = Some(pending);
+        app.post_render_main_navigation(
+            ctx,
+            update_phases::MainFrameNavigation {
+                fav_nav: None,
+                toolbar_fav_nav: None,
+                fullscreen_close_nav: None,
+                keyboard_nav: None,
+                keyboard_nav_from_fullscreen_close: false,
+                gamepad_nav: None,
+                address_nav: None,
+                open_folder_nav: None,
+                context_nav: None,
+                folder_pane_nav: None,
+                grid_nav: None,
+            },
+        );
+        app.finish_page_identity_preparation_for_test();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section1285_candidate_main_join_retires_older_startup_and_activation() {
+        for mixed in [true, false] {
+            for activation in [false, true] {
+                let mut app = setup_app_for_test();
+                app.active_quick_folder_slot = None;
+                let parent = app.tmp.path().join("library");
+                let target = parent.join("candidate");
+                let stale = app.tmp.path().join("stale-resolve");
+                std::fs::create_dir_all(&target).unwrap();
+                std::fs::create_dir(&stale).unwrap();
+                std::fs::write(target.join("page.jpg"), b"fixture").unwrap();
+                if mixed {
+                    std::fs::write(target.join("clip.mp4"), b"fixture").unwrap();
+                }
+                app.settings.detached_viewer_open_images_in_window = true;
+                app.settings.auto_fullscreen_image_folders = true;
+                app.current_folder = Some(parent);
+                app.items = vec![GridItem::Folder(target.clone())];
+                app.thumbnails = vec![ThumbnailState::Pending];
+                app.image_metas = vec![None];
+                app.visible_indices = vec![0];
+                app.selected = Some(0);
+                let owner = if activation {
+                    StartupOpenPathOwner::Activation
+                } else {
+                    StartupOpenPathOwner::InitialStartup
+                };
+                let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
+                let ctx = egui::Context::default();
+                assert!(app.handle_gamepad_grid_accept(&ctx).is_none());
+                assert!(matches!(
+                    app.folder_pane_open_pending.as_ref().map(|p| &p.purpose),
+                    Some(FolderOpenScanPurpose::GridFolderCandidate { .. })
+                ));
+                assert!(
+                    cancel.load(Ordering::Relaxed),
+                    "section1419: candidate click retires unresolved startup before choosing its viewer"
+                );
+                if !mixed {
+                    // A slow candidate can return to main with a PageContinuation intent too.
+                    app.settings.detached_viewer_open_images_in_window = false;
+                }
+                assert!(tx.send(section1285_result(&stale)).is_err());
+                section1285_complete_main_scan(&mut app, &target, &ctx);
+                assert!(
+                    cancel.load(Ordering::Relaxed),
+                    "mixed={mixed}, activation={activation}"
+                );
+                assert!(app.startup_open_path_resolve_pending.is_none());
+                app.poll_startup_open_path_resolve(&ctx);
+                assert_eq!(app.current_folder.as_ref(), Some(&target));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section1285_accepted_pane_join_preserves_later_activation() {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let target = app.tmp.path().join("pane");
+        std::fs::create_dir(&target).unwrap();
+        let initial = app.tmp.path().join("initial");
+        let (_initial_tx, initial_cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &initial);
+        app.start_folder_pane_open(target.clone());
+        assert!(initial_cancel.load(Ordering::Relaxed));
+        let later = app.tmp.path().join("later-activation");
+        let (later_tx, later_cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &later);
+        let ctx = egui::Context::default();
+        section1285_complete_main_scan(&mut app, &target, &ctx);
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+        assert!(!later_cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .unwrap()
+                .requested
+                .as_path(),
+            later.as_path()
+        );
+        later_tx.send(section1285_result(&later)).unwrap();
+    }
+
+    #[test]
+    fn section1285_explicit_zip_level_moves_retire_unresolved_main_opens() {
+        for activation in [false, true] {
+            for operation in ["enter", "back", "dfs"] {
+                let mut app = setup_app_for_test();
+                app.active_quick_folder_slot = None;
+                let book = app.tmp.path().join("levels.zip");
+                let entries = ["cover.jpg", "chapter/a.jpg", "chapter/b.jpg"]
+                    .into_iter()
+                    .map(|name| crate::zip_loader::ZipImageEntry {
+                        entry_name: name.into(),
+                        uncompressed_size: 0,
+                        mtime: 0,
+                        container_ancestry: Vec::new(),
+                    })
+                    .collect();
+                app.current_folder = Some(book.clone());
+                let mut nav = crate::zip_tree::ZipNavState::new(Arc::new(
+                    crate::zip_tree::ZipTree::build(book, entries),
+                ));
+                if operation == "back" {
+                    nav.enter("chapter/");
+                }
+                app.zip_nav = Some(nav);
+                let stale = app.tmp.path().join("stale-resolve");
+                std::fs::create_dir(&stale).unwrap();
+                let owner = if activation {
+                    StartupOpenPathOwner::Activation
+                } else {
+                    StartupOpenPathOwner::InitialStartup
+                };
+                let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
+                tx.send(section1285_result(&stale)).unwrap();
+                match operation {
+                    "enter" => app.zip_nav_enter("chapter/"),
+                    "back" => assert!(app.zip_nav_back()),
+                    "dfs" => assert!(app.zip_nav_handle_ctrl_updown(true)),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    cancel.load(Ordering::Relaxed),
+                    "{operation}, activation={activation}"
+                );
+                assert!(app.startup_open_path_resolve_pending.is_none());
+                let level = app.zip_nav.as_ref().unwrap().current().to_vec();
+                let generation = app.items_generation;
+                app.poll_startup_open_path_resolve(&egui::Context::default());
+                assert_eq!(app.zip_nav.as_ref().unwrap().current(), level);
+                assert_eq!(app.items_generation, generation);
+            }
+        }
+    }
+
+    #[test]
+    fn section1285_zip_root_back_without_a_move_keeps_unresolved_open() {
+        let mut app = setup_app_for_test();
+        let book = app.tmp.path().join("root.zip");
+        app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
+            crate::zip_tree::ZipTree::build(book, Vec::new()),
+        )));
+        let target = app.tmp.path().join("activation");
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &target);
+        assert!(!app.zip_nav_back());
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_some());
+    }
+
+    #[test]
+    fn section1285_untouched_initial_resolver_still_opens_its_target() {
+        let mut app = setup_app_for_test();
+        let target = app.tmp.path().join("initial");
+        std::fs::create_dir(&target).unwrap();
+        let (tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        tx.send(section1285_result(&target)).unwrap();
+        app.poll_startup_open_path_resolve(&egui::Context::default());
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "completed receiver retires normally"
+        );
+    }
 
     #[cfg(windows)]
     fn create_dir_link(target: &Path, link: &Path) -> bool {

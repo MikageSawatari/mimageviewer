@@ -117,7 +117,7 @@ impl App {
                 })
                 .collect(),
         };
-        let id = egui::Id::new((
+        let id = egui::Id::unique((
             "overview-demand-trace",
             self.projected_viewer_context_id().serial(),
         ));
@@ -158,6 +158,12 @@ impl App {
             Some(GridItem::Video(_) | GridItem::Audio(_))
         ) {
             return Some("動画・音声ではページ一覧を開けません");
+        }
+        // The existing owner must adopt its canonical flat and commit any
+        // accepted navigation before the overview can replace the page canvas.
+        // Refuse this entrance; never queue an overview or retire presentation.
+        if self.page_turn_barrier_active() {
+            return Some("ページめくりが終わってからページ一覧を開いてください");
         }
         if self.ring_picker.is_some()
             || self.gamepad_favorite_picker.is_some()
@@ -379,6 +385,10 @@ impl App {
                 let Some(current_idx) = self.fullscreen_idx else {
                     return false;
                 };
+                // Admission ends the overview. The ordinary navigation owner may
+                // complete now, wait for composition permission, or refuse later.
+                // Withdraw overview demand before that owner starts its work.
+                self.close_page_overview_with_ctx(ctx);
                 self.land_still_page_navigation_target(
                     ctx,
                     current_idx,
@@ -386,10 +396,6 @@ impl App {
                     crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
                     &mut None,
                 );
-                if self.fullscreen_idx != Some(target.items_idx) {
-                    return false;
-                }
-                self.close_page_overview_with_ctx(ctx);
             }
             PageOverviewCommand::SetCursor { stamp, target } => {
                 let selection = PageOverviewSelect {
@@ -636,6 +642,27 @@ mod tests {
             app.slideshow_playing,
         );
         let ctx = egui::Context::default();
+        // egui 0.37 synchronizes the native theme on a fresh viewport's first
+        // pass. Observe that no-action output separately; the command pass
+        // below must still emit no navigation or presentation commands at all.
+        ctx.begin_pass(Default::default());
+        let output = ctx.end_pass();
+        let initial_commands = output
+            .viewport_output
+            .iter()
+            .map(|(id, viewport)| (*id, viewport.commands.clone()))
+            .collect::<Vec<_>>();
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            initial_commands,
+            vec![(
+                egui::ViewportId::ROOT,
+                vec![egui::ViewportCommand::SetTheme(
+                    egui::SystemTheme::SystemDefault
+                )],
+            )],
+            "fresh no-action viewport output",
+        );
         ctx.begin_pass(Default::default());
         for (action, press_count) in [
             (crate::keymap::KeyAction::FsCtrlNavNext, 3),
@@ -667,11 +694,15 @@ mod tests {
         assert!(app.page_overview.session().is_some());
         assert_eq!(app.page_overview.session().unwrap().view().cursor, 0);
         let output = ctx.end_pass();
+        let commands = output
+            .viewport_output
+            .iter()
+            .map(|(id, viewport)| (*id, viewport.commands.clone()))
+            .collect::<Vec<_>>();
+        output.drop_without_applying_deltas();
         assert!(
-            output
-                .viewport_output
-                .values()
-                .all(|viewport| viewport.commands.is_empty())
+            commands.iter().all(|(_, commands)| commands.is_empty()),
+            "inactive actions emitted viewport commands: {commands:?}",
         );
     }
 

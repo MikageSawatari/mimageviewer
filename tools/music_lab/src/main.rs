@@ -83,6 +83,7 @@ const TRANSIENT_ACCENT_MIN: f32 = 0.42;
 fn main() -> eframe::Result {
     let startup_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
@@ -100,6 +101,8 @@ fn main() -> eframe::Result {
 }
 
 fn setup_fonts(ctx: &egui::Context) {
+    ctx.options_mut(|options| options.quit_shortcuts.clear());
+    ctx.global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
     let mut fonts = egui::FontDefinitions::default();
     let font_paths = [
         r"C:\Windows\Fonts\YuGothM.ttc",
@@ -752,7 +755,8 @@ struct MusicLabApp {
 }
 
 impl eframe::App for MusicLabApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root_ui.ctx().clone();
         apply_dark_visuals(ctx);
         let update_start = Instant::now();
         self.frame_stats.record_frame();
@@ -765,19 +769,19 @@ impl eframe::App for MusicLabApp {
         self.frame_stats.record_poll(stage_start.elapsed());
 
         let stage_start = Instant::now();
-        self.draw_top_bar(ctx);
+        self.draw_top_bar(root_ui);
         self.frame_stats.record_top(stage_start.elapsed());
 
         let stage_start = Instant::now();
-        self.draw_left_panel(ctx);
+        self.draw_left_panel(root_ui);
         self.frame_stats.record_left(stage_start.elapsed());
 
         let stage_start = Instant::now();
-        self.draw_right_panel(ctx);
+        self.draw_right_panel(root_ui);
         self.frame_stats.record_right(stage_start.elapsed());
 
         let stage_start = Instant::now();
-        self.draw_bottom_bar(ctx);
+        self.draw_bottom_bar(root_ui);
         self.frame_stats.record_bottom(stage_start.elapsed());
 
         let stage_start = Instant::now();
@@ -793,9 +797,13 @@ impl eframe::App for MusicLabApp {
         let timeline_follow_playhead = &mut self.timeline_follow_playhead;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(app_bg()))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 if let Some(track) = track {
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             timeline_stats = draw_timeline(
@@ -813,6 +821,10 @@ impl eframe::App for MusicLabApp {
                     (loading_track, partial_analysis)
                 {
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             timeline_stats = draw_timeline(
@@ -831,6 +843,10 @@ impl eframe::App for MusicLabApp {
                         });
                 } else if let Some(loading_track) = loading_track {
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             timeline_stats =
@@ -854,11 +870,12 @@ impl eframe::App for MusicLabApp {
 }
 
 impl MusicLabApp {
-    fn draw_top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("music_lab_top")
-            .exact_height(48.0)
+    fn draw_top_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        egui::Panel::top("music_lab_top")
+            .exact_size(48.0)
             .frame(app_panel_frame())
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     if ui.button("Open").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
@@ -946,12 +963,13 @@ impl MusicLabApp {
             });
     }
 
-    fn draw_left_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("music_lab_left")
+    fn draw_left_panel(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        egui::Panel::left("music_lab_left")
             .resizable(true)
-            .default_width(220.0)
+            .default_size(220.0)
             .frame(app_panel_frame())
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.heading("Bookmarks");
                 if ui
                     .add_enabled(self.track.is_some(), egui::Button::new("Add current"))
@@ -983,12 +1001,13 @@ impl MusicLabApp {
             });
     }
 
-    fn draw_right_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("music_lab_right")
+    fn draw_right_panel(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        egui::Panel::right("music_lab_right")
             .resizable(true)
-            .default_width(260.0)
+            .default_size(260.0)
             .frame(app_panel_frame())
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.heading("Details");
                 if let Some(track) = &self.track {
                     ui.label(track.path.display().to_string());
@@ -1116,11 +1135,12 @@ impl MusicLabApp {
             });
     }
 
-    fn draw_bottom_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("music_lab_bottom")
-            .exact_height(190.0)
+    fn draw_bottom_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        egui::Panel::bottom("music_lab_bottom")
+            .exact_size(190.0)
             .frame(app_panel_frame())
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 if self.player.is_none() {
                     let text = if self.loading_track.is_some() {
                         "Spectrum analyzer waiting for playback buffer"
@@ -1145,7 +1165,11 @@ impl MusicLabApp {
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
-        let Some(path) = dropped_files.into_iter().find_map(|file| file.path) else {
+        let Some(path) = dropped_files
+            .into_iter()
+            .map(|file| file.path().to_path_buf())
+            .next()
+        else {
             return;
         };
         if is_supported_media_path(&path) {
@@ -1880,9 +1904,8 @@ fn timeline_manual_scroll_requested(
     if !pointer_over_timeline {
         return false;
     }
-    ui.input(|input| {
-        input.raw_scroll_delta.y.abs() > 0.0 || input.smooth_scroll_delta.y.abs() > 0.5
-    })
+    remaining_wheel_delta(ui.ctx()).y.abs() > 0.0
+        || ui.input(|input| input.smooth_scroll_delta.y.abs() > 0.5)
 }
 
 fn timeline_focus_row(position_secs: f64, row_secs: f64, rows: usize) -> Option<usize> {
@@ -2734,7 +2757,7 @@ fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
 fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
     match kind {
         TimelineMetricKind::LoudnessBassRoot => "Height RMS, color bass root",
-        TimelineMetricKind::Key => "Transient-suppressed chroma profile",
+        TimelineMetricKind::Key => "Height confidence, color key",
     }
 }
 
@@ -4690,4 +4713,44 @@ mod tests {
         let bin = timeline_bin_at_time(&bins, 0.75).expect("bin");
         assert_eq!(bin.rms, 0.7);
     }
+}
+
+// Project only unconsumed wheel events, using the same unit and modifier mapping as egui.
+fn remaining_wheel_delta(ctx: &egui::Context) -> egui::Vec2 {
+    let options = ctx.options(|o| o.input_options);
+    ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    phase,
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+                if *phase != egui::TouchPhase::Move {
+                    return None;
+                }
+                let delta = match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
+                    egui::MouseWheelUnit::Page => input.viewport_rect().height() * *delta,
+                };
+                let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
+                let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
+                Some(if horizontal && !vertical {
+                    egui::vec2(delta.x + delta.y, 0.0)
+                } else if vertical && !horizontal {
+                    egui::vec2(0.0, delta.x + delta.y)
+                } else {
+                    delta
+                })
+            })
+            .fold(egui::Vec2::ZERO, |sum, delta| sum + delta)
+    })
 }

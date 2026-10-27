@@ -15,8 +15,7 @@ use mimageviewer::folder_tree::{SUPPORTED_EXTENSIONS, is_apple_double};
 use mimageviewer::pdf_loader::{self, CancelWaitPolicy, JobPriority};
 use mimageviewer::similar_image::{PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat};
 use mimageviewer::thumb_loader::{
-    DctDecodeError, apply_exif_orientation, apply_exif_orientation_from_bytes,
-    decode_jpeg_turbo_scaled_from_bytes,
+    DctDecodeError, apply_exif_orientation_from_bytes, decode_jpeg_turbo_scaled_from_bytes,
 };
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
@@ -1905,7 +1904,6 @@ fn decode_jpeg_at_target(path: &Path, bytes: &[u8], target_edge: u32) -> Result<
         )),
         Err(DctDecodeError::Fallback(_)) => {
             let (image, _, _) = decode_full(path, bytes)?;
-            let image = apply_exif_orientation(image, path);
             let source_dims = image.dimensions();
             Ok(DecodedImage {
                 rgba: image.to_rgba8(),
@@ -2025,20 +2023,26 @@ fn decode_full(path: &Path, bytes: &[u8]) -> Result<(DynamicImage, String, Strin
             "LibRaw Full development".to_owned(),
         ));
     }
-    match image::load_from_memory(bytes) {
-        Ok(image) => Ok((image, "image_full".to_owned(), "direct decode".to_owned())),
-        Err(image_error) => match mimageviewer::wic_decoder::decode_to_dynamic_image(path) {
-            Some(image) => Ok((
-                image,
-                "wic_full".to_owned(),
-                format!("image crate failed: {image_error}"),
-            )),
-            None => Err(format!(
-                "decode {}: image crate failed ({image_error}); WIC failed",
-                path.display()
-            )),
-        },
-    }
+    let hint = path.to_string_lossy();
+    let source = mimageviewer::image_decode::Source::Bytes { bytes, hint: &hint };
+    let decoded = mimageviewer::image_decode::decode(
+        source,
+        mimageviewer::avif_decoder::Workload::Background,
+        false,
+        None,
+    )
+    .map_err(|error| format!("decode {}: {error}", path.display()))?;
+    let method = match decoded.decoder {
+        mimageviewer::stats::DecodeSource::Libavif => "libavif_full",
+        mimageviewer::stats::DecodeSource::Wic => "wic_full",
+        mimageviewer::stats::DecodeSource::Susie => "susie_full",
+        _ => "image_full",
+    };
+    Ok((
+        decoded.oriented(source),
+        method.to_owned(),
+        "shared decode".to_owned(),
+    ))
 }
 
 fn read_exif_orientation_for_source_dims(bytes: &[u8]) -> u16 {
@@ -2662,16 +2666,12 @@ fn decode_full_oriented_for_synthesis(path: &Path, bytes: &[u8]) -> Result<RgbaI
             }
             Err(DctDecodeError::Fallback(_)) => {
                 let (image, _, _) = decode_full(path, bytes)?;
-                apply_exif_orientation(image, path)
+                image
             }
         }
     } else {
         let (image, _, _) = decode_full(path, bytes)?;
-        if mimageviewer::raw_format::is_raw_path(path) {
-            image
-        } else {
-            apply_exif_orientation(image, path)
-        }
+        image
     };
     Ok(image.to_rgba8())
 }

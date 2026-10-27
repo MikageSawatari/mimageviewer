@@ -2,6 +2,12 @@
 
 ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
 動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
+進行中のページめくりと通常flat完了待ち（既存`page_turn_barrier_active()`のTurning／Completing）では
+Oによる新規入場を受け付けない。受理済み移動を保持し、完了後にもう一度Oを押す。
+HUD／リング／パッドも`open_page_overview_for_viewer`→`open_page_overview`の同じ受付へ通す。
+入場要求の保留・自動再実行・新しい取消処理は作らない。Oの既存operation観測が通常flat完了へ
+進める場合と、一覧入場の受付がownerを変更することは区別する（2026-10-27の新coordinator手順2、
+一覧設計書§25.4）。旧選択肢2の即退役を採択した意味ではない。現行gateの指定自動検証は同§25.6へ記録する。
 一覧中の scope は Global + FsCommon + FsPageOverview とし、FsImage／Rating は同時 active にしない。
 一覧確定は `FsPageOverviewConfirm`（Enter）、画面送りは `FsPageOverviewPagePrev`／
 `FsPageOverviewPageNext`（PageUp／PageDown）、先頭末尾は `FsPageOverviewFirst`／
@@ -32,6 +38,119 @@ TILE11の接続修正・検証記録は[一覧設計書§23](detached-book-page-
 Ctrl／sibling navigation → Confirm → その他の一覧操作／固定 cursor とし、一つの edge を一度消費する。
 toggle を Enter に割り当てると Confirm との競合を表示し、実行時は toggle だけで一回取消す。
 潜在的な競合は一時的な modal／nav lock によって消さず、一覧の全許可集合で検査する。
+
+## 手動の前後移動ループ（§1.400）
+
+`fullscreen_manual_nav_wrap`（既定OFF）がONなら、既存の手動前後移動Actionは現在の閲覧順・
+表示対象の端で折り返す。新しいKeyAction・既定キー・トグル操作は追加しない。
+`FsNextImage` / `FsPrevImage` / 縦方向版 / `FsPageNext` / `FsPagePrev` と、動画・音声の
+`VideoNextFile` / `VideoPrevFile`、同じ入口を通るホイール・クリック・HUD・マウス割り当て・
+ゲームパッドに適用する。連結読みでは項目をまたぐ静止画単位の明示移動だけが対象。
+単ページ / 分割の `FsSpreadShift*` と `ImageSpreadShift*` は既存のsource単位Delta移動として折り返す。
+見開きでの同操作は組み合わせ調整なので対象外。
+
+`FsJumpFirst` / `FsJumpLast`、`FsFixedJump*`、スタックジャンプ、シーク、Ctrl+↑↓ /
+Ctrl+PageUp/PageDown、連結方向のスクロール、自動送りは変更しない。再割り当てしたキーでも
+Actionの意味に従う。対象が1表示単位で動けなければ境界案内を保ち、折り返した場合は案内を出さない。
+Remoteの固定操作は対象外。設定と着地規則は [手動前後移動ループ設計](manual-nav-wrap-plan.md) を参照。
+
+## 保存済み位置の全件クリア（§1.394）
+
+`ClearVideoMediaMemory` / `ClearBookResumePositions` は独立した Global / Press 操作で、
+どちらも既定キーなし。操作カスタマイズの「全体共通」に表示する。確認ダイアログは付けない。
+一覧、画像フルスクリーン、egui 動画・音声、native 動画の既存 `ToggleAlwaysOnTop` と同じ
+Global の keymap helper を使う。文字入力・IME・モーダル・編集モードの入力所有を優先し、
+native 転送対象にも登録する。detached の述語・viewport 配送は変更しない。
+
+動画側は `Settings::clear_video_media_memory` に対象を集約し、環境設定の編集値とコマンドの
+live 値を同じ関数で消す。対象は再生位置、視聴済み記録、音声トラック選択だけ。
+コマンドは件数（各記録別）または空を発火面へ通知し、その場では同期保存しない。
+記録時と同じく終了時等の既存保存機会に永続化する。環境設定は従来どおり OK で反映、
+キャンセルでは破棄する。古い draft の OK も最新 live を merge し、消した記録を復活させない。
+
+App 共通の `media_memory_clear_generation` をキー消去と環境設定 OK の消去で進める。
+空の消去も世代境界とし、draft のボタン・変更比較・キャンセルでは進めない。
+`MediaResumeUpdate` は採取時の世代を保持し、通常適用と teardown 適用の双方で照合する。
+旧世代から再生位置・視聴済み・音声選択や resume thumbnail の要求を復活させない。
+対象外の閲覧履歴 progress 更新は世代によらず従来どおり行う。
+
+| 採取元 | 世代と適用時点 |
+| --- | --- |
+| `poll_video` 定期採取 | native キー処理より前の世代を保持し、処理後の適用で検査 |
+| `save_all_video_resume_positions`（表示中・終了時の保存） | プレイヤー採取時の現在世代、同じ UI 呼出し内で適用 |
+| `viewer_context_media_teardown_plan`（別窓の破棄・終了時保存） | App の現在世代を採取関数へ渡し、保持した plan の適用時にも検査 |
+| `apply_remote_media_resume_update` | session 検証後の受信処理で現在世代を付け、直ちに適用 |
+| 音声トラック確定 | poll の tick 直後、明示選択の Unchanged、Remote の選択記憶はいずれも採取した UI 呼出し内で即適用。旧更新を保持しない |
+
+音楽ビューの早期受付も既存 `music_normalize_modal_active` を使い、その内側の
+`normalize_scan_is_modal_for_current_player` を native と共有する。音楽のしおりモーダルも
+受付を止める。文字入力・IME は各入力所有者に任せ、native に root の文字入力状態を混ぜない。
+
+本側は既存 `clear_book_resume_async` の writer FIFO、追加後続変更の受付、`Delta::Clear`、
+`last_book_resume` の解除、失敗時のメーター再読込を共有する。完了の件数・空・失敗は
+環境設定の結果欄、コマンドは発火コンテキストと面を完了票に保持し、既存
+`with_viewer_context` 内から発火元の既存トーストへ通知する。root poll時のmainや兄弟の
+native overlayへ送らない。発火コンテキスト退役後の通知はログに残して破棄する。
+egui の完了通知は既存の App 共通トーストを使い、同じ面の別窓へ切り替えた場合は
+表示中の窓に出す。egui の窓を追跡する状態は追加しない。
+先行 clear の完了票が未処理なら、キーと環境設定ボタンのどちらも「クリア中です」と通知して
+再要求を拒否する。先行の件数・通知先・変更受付状態を保ち、待ち行列は作らない。
+閲覧履歴・しおり・構成・見開き調整・タグ・評価・編集・最近のフォルダ・A/B の場所は消さない。
+消去後も通常の閲覧・再生による新規記録を続ける。
+
+設計の簡素化: 新しい保存 worker・待機状態・モーダルは追加せず既存の所有境界を再利用する。
+動画は live の変更だけ、本は既存 FIFO の clear だけなので閲覧を追加で止める必要はない。
+まれな失敗は割り切り（ログ + 通知 + 既存の本メーター再読込）。保存前の強制終了は
+通常の再生位置記録と同じ扱いにする。
+
+Remote は本体の同じ live media 記録と BookResumeWriter を読み書きする。
+本の再開読取は writer の受付済み操作後を読む。操作権によるローカル入力の既存遮断と
+旧 session の write 拒否を維持し、Remote 専用クリア・IPC・キャッシュ無効化は追加しない。
+
+`FsPageTurnAnimationToggle` は `FsImage` / `Press`、既定キーなしの操作。
+静止画フルスクリーンの「その他の機能」の他のON/OFF行と同様にKeyActionを持ち、
+操作カスタマイズでキーを割り当てられる。HUD行には割り当てた先頭chordを表示する。
+通常窓/F12から環境設定と同じ全体設定 `page_turn_animation_enabled` を変更する。
+メニューの並びは固定で、toolbar/HUDの表示項目カスタマイズ対象ではない。
+動画・音楽には適用せず、新しい既定キーやリング操作は追加しない。
+
+音楽ビュー上部の「…」→「音名の色」はマウス・タッチの固定入力で、keymap対象外。
+低頻度の見た目の好み設定なので専用キーを追加しない。開いたメニューは次のキー押下で閉じ、
+そのキー本来の操作を続ける。パネル内のホイール・Ctrl+ホイール・タッチ、および外側クリックで
+閉じる入力は背面のタイムラインへ渡さず、閉じたフレームもその入力の所有を保つ。
+パネル表示中に開始したドラッグやタッチは、キーで閉じた後もボタンの解放／接点の終了まで
+パネル側が所有する。キー本来の操作は続け、新しく開始した操作は通常どおり受け付ける。
+
+## 構成のある本の表示キー（§1.242 B2）
+
+`FsViewSpread` / `FsViewLandscapeSplit`は閲覧方法だけを切り替える。既定キーなしでカスタム割当の対象。
+`FsSpreadSingle`も構成本ではmode-only。2026-10-14利用者決定Q31により、既存の見開きActionも
+構成の方向・表紙と完全一致する場合はmode-onlyとして受け付ける。既定は
+`FsSpreadLtr` = 2（左→右・表紙なし）、`FsSpreadLtrCover` = 3（左→右・表紙あり）、
+`FsSpreadRtl` = 4（右→左・表紙なし）、`FsSpreadRtlCover` = 5（右→左・表紙あり）。NumPadも同じ。
+Action名と既定割当は変更せず、再割当したキーにも同じ判定を適用する。
+不一致は構成を変更せず、現在のkeymapで一致Actionに割り当てたキーとPCの構成編集を案内する。
+一致Actionが未割当なら`FsViewSpread`の割当、それも未割当ならHUDの「見開き」を案内する。方向付き横長分割Action（既定8/9）、
+読む方向切替、見開きずらしは引き続き共通受付で拒否する。Single/Splitの通常ページ送りfallbackは維持する。
+本別mode欄だけを保存し、構成/方向/表紙/休眠shiftを書き換えない。構成なしの既存割当は維持する。
+HUDの「見開き」は構成の方向と表紙に一致するActionの割当・選択状態を表示する。
+「横長分割」のshortcutは`FsViewLandscapeSplit`のカスタム割当だけを表示し、旧8/9を案内しない。
+hoverも有効なActionだけを案内する。固定Pad Selectは構成本では単ページと構成に一致する見開きを循環し、
+pickerも同じ共通受付を使う。通常本の五種類の循環と抽出一覧の単ページ/見開き循環は維持する。
+Remoteの既存`SetSpread`も最新構成の方向・表紙と一致する見開き要求だけをmode-onlyへ通す。
+不一致はWebの固定キー2/3/4/5のうち一致するキーとPCの構成編集を案内する。
+WebはPCのkeymapを参照せず、IPC形状・既定キーは変更しない。
+`FsTogglePageAfterCoverAlone` / `FsToggleLastPageAlone`は通常本と同じ自動規則の本別値を変更できる。
+端配置・末尾表紙も既存HUD/preferenceで変更し、構成record/revisionへ保存しない。
+
+## 抽出一覧の表示キー（§1.242 G1）
+
+検索・評価・スマートフォルダ・コレクション・★固定・サブ展開の結果を直接見るときは、
+新規openで単ページに戻る。既存`FsSpreadLtr/Rtl`とcover付きは一時見開き、
+`FsSpreadSplitLtr/Rtl`は一時横長分割として受け、読む方向は全体既定からのsession snapshotを使う。
+`FsReadingDirectionToggle`と見開きずらしは無効。Single/Split時のずらしキーは従来のページ送りfallbackを保つ。
+キー/リング/パッドは既存KeyActionと共通表示setterを通し、結果の表示設定を記憶しない。
+新Action・既定割当は追加しない。通常の本・通常一覧の既存キーは変更しない。
 
 `GridOrganizeFiles` はサムネイル一覧のカーソル項目／チェック済み項目の「ファイル整理先」を開く。
 既定キーはなし。操作カスタマイズからキー、リング（マウス／パッド）、マウスジェスチャ、
@@ -84,6 +203,15 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
 
 `ToggleAlwaysOnTop` は Global / Press の操作で、既定キーはない。操作カスタマイズでキーを割り当てると、main・egui フルスクリーン・native 動画の発火面から同じ設定を切り替える。設定メニュー先頭のチェック項目からも操作でき、ON/OFF の通知は発火した面だけに表示する。
+
+`UndoLastAction` は Global / Press、既定 `Ctrl+Z`。グリッド・画像ビューアでは、本への追加直後の
+一回取消を先に扱い、有効な追加がなければ従来の評価・タグ・補正Undoへ進む。取消は今回作った
+コピーだけをごみ箱へ移し、元ファイル・既存ページ・本フォルダを残す。追加のRedoはない。
+後続の編集・ファイル操作・場所切替で失効する。選択・チェック・スクロールだけでは失効しない。
+処理中または本の変更検出で取消を拒否した入力では、古いメタデータUndoを続けて実行しない。
+消しゴム・隠蔽・テキスト等の編集専用Undoと、TextEdit / IME / ダイアログの入力所有を優先する。
+メタデータRedoの `Ctrl+Y` / `Ctrl+Shift+Z` は固定入力のまま維持する。
+
 ゲームパッド全体は `Settings::gamepad_enabled` で無効にできる (操作カスタマイズ →
 設定 → ゲームパッド)。これは割り当ての変更ではなく**デバイスを読むかどうか**の設定で、
 無効の間は `GamepadRuntime` が読み取りスレッドごと止まる。読み捨てるだけにすると、
@@ -96,9 +224,14 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 これは `KeyAction` / コマンド設定の完全カスタマイズではなく、マウス・ゲームパッド用の
 固定入力レイヤーで扱う。
 レーティングは専用の `[Rating]` グループ (`RatingItem1..5/Clear/StepUp/StepDown`、
-`RatingContainer1..5/Clear/StepUp/StepDown`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
+`RatingContainer1..5/Clear/StepUp/StepDown`、`RatingBookPreferred1..5/Clear/StepUp/StepDown`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
 同じ割り当てを共有する。v2.2.0 からは物理キー寄りの `KeySlot` を正本にし、通常の数字キーとテンキー数字を別キーとして扱う。互換性のため、従来の数字キー既定操作は `1` と `Numpad1` のように両方を既定割り当てにする。
 `StepUp/StepDown` は標準キーなし。未評価は操作時だけ ★3 を基準にし、上げると ★4、下げると ★2 を保存する。★5 から上げる / ★1 から下げる操作は書き込み・Undo を作らない。チェック済み項目は各自の現在値から一括で変化し、1 回の Undo で戻せる。コンテナ用は直接指定と同じく現在開いているフォルダ / ZIP / PDF 本体が対象。
+「本を優先」の8操作はすべて標準キーなし。一覧ではアイテム用と同じく選択 / チェック項目を評価する。
+画像閲覧・動画・音楽では、採用済み `ProjectionRecipe::Book` のときだけ開いている本全体を評価し、
+通常一覧・抽出結果の閲覧では表示中のアイテムを評価する。本の★は親一覧の本のセルと同じ保存先を使う。
+本の recipe と物理状態が一致しないときは書き込まず「この本は評価できません」と通知する。
+既存アイテム用 / コンテナ用の対象規則と標準キーは変えない。詳細は [§1.417 の設計](book-preferred-rating-plan.md) を参照。
 評価変更で表示条件から外れた場合、グリッド選択は現在の表示順、フルスクリーンは現在の読書順で次の残存対象、なければ前へ移る。読む順の「次」は RTL でも左右キーの向きで反転しない。ページがゼロなら現在の絞り込み済みページ一覧へ戻り、フィルタを解除しない。自動移動・一覧復帰で評価通知と評価 Undo を消さず、直後の `Ctrl+Z` は評価を戻して、同じ一覧・条件で対象となる元画像へ復帰する。通常の手動移動・close の履歴終了方針は維持する。
 マウス / パッドのピッカーの★は保存済み live preview を維持し、その preview だけで離脱する既存行を終了まで残す。現在ページと各行の preview は維持するが、新しい検索 hit・件数・明示 sort は通常どおり更新する。終端で最終成功値の一件 Undo を記録し、次 / 前 / 現在一覧の移動を一度決める。新しい `KeyAction` は追加しない。所有・復帰不可・取消の詳細は [§1.371 の計画](rating-filter-fullscreen-plan.md) を参照。
 本体 <kbd>Enter</kbd> と `NumpadEnter` も別スロットであり、押下操作、KeyHold、native 動画、
@@ -162,6 +295,8 @@ ZIP/PDF内ページは実ファイルに置き換えず拒否し、入力時に�
 外部ツール起動は `ExternalToolPicker`、固定スロットの `ExternalTool1..10`、
 コンテナー用ピッカーの `ExternalToolForContainer` を、いずれも標準キーなしの `Grid` Action として扱う。
 固定スロットは登録順の 1〜10 番に対応し、ツールを並べ替えると同じ Action が指すツールも変わる。
+`ExternalToolPicker`／固定スロットはchecked優先、なければselectedの実フォルダを含む項目を渡す。
+実フォルダは選択したフォルダ自身のパスで、ZIP内directoryは対象外。`ExternalToolForContainer`の現在地1件という意味は変えない（§1.397）。
 動的な Action は作らず、設定 UI では対応するスロット番号を明示する。
 同時に有効になり得る Action へ同じキーを割り当てた場合や、予約扱いの
 Escape / 修飾なし矢印キー、サムネイル一覧の <kbd>Shift</kbd>+矢印範囲選択へ割り当てた場合は
@@ -188,7 +323,7 @@ Escape / 修飾なし矢印キー、サムネイル一覧の <kbd>Shift</kbd>+�
 先頭 chord を `現在地フィルタ (Ctrl+F)` のように表示する。
 ★フィルタボタン / スマートフィルタ内の★項目 / フォルダバー右側のコンテナ★ tooltip も、
 `RatingItem*` / `RatingContainer*` の実割り当てから `F1〜F6` / `Shift+F1〜F6` などの
-表示を作る。
+表示を作る。これら既存の表示用 helper には `RatingBookPreferred*` の割り当てを混ぜない。
 静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
 popup の shortcut 表記は、`分析ツール [Shift+Z]` や `パネル表示 [I / Tab]`
 のように実割り当てから作る。native 動画 overlay の top bar / bottom HUD / jump panel /
@@ -255,21 +390,28 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
-ただし IME composition 中の <kbd>Esc</kbd> press だけは、各 egui Context の input plugin が
-`Memory::begin_pass` より前に RawInput から除去する。これは変換キャンセルを egui の focus
-navigation に見せず未確定文字の選択を保つためで、release は残す。続く `Disabled` に
-`Commit` が無い場合だけ、同じ plugin が空の `Preedit("")` を直前へ 1 回補う。
-非 composing 時と 300ms grace 中だけの Esc は除去せず、通常のパネル / モーダル操作へ渡す。
+Windows の `allow_ime` が true のとき、IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
+clipboard event にしない。native presenter は `VK_PROCESSKEY` を egui key にしない。
+本体 Win32 queue と native 生キー公開も 0xE5 の press / repeat を捨てるため、JIS 記号の
+scan-code shortcut に IME 処理済みキーが一致することはない。
+egui-winit は物理キーの押下を Hidden（press 未配送）/ Forwarded（配送済み）として所有し、Process repeat でも Forwarded を保持する。
+本家 0.34.0 #7967 の HashSet との差分はこの型付き状態、allow_ime にかかわらない release の状態除去・Hidden のみ遮断、focus 喪失時の全消去。
+Win32 queue / native 生キー経路の release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
+取消の `Disabled` / 空 `Commit` に非空 `Commit` が無い場合だけ、input plugin が
+空の `Preedit("")` を補い、未確定文字を取り消す。アプリ操作の抑止は今 pass の Ime 列を
+反映した後の composing だけで決まり、Commit 後の通常 Enter / Escape / shortcut は即座に通る。
 composition state は viewport ごとに独立し、main / fullscreen / detached を共有する App Context と
-native presenter Context の両方へ同じ plugin を登録する。
+native presenter Context の両方へ同じ plugin を登録する。viewport 消滅・focus 喪失は当該状態を終了する。
 IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が一時的に外れる場合があるため、
 `ime_focus` が直前 pass の helper-managed field を 1 pass の `FocusRecovery` owner として保持する。
-この owner は TextEdit の再描画前から keymap を抑止し、同じ pass で field の focus を復帰する。
-pointer 入力を伴う focus 移動は優先して復帰しない。アプリ全体の Tab traversal 無効化、IME field の
+この owner は TextEdit の再描画前から keymap を抑止する。focus 復帰は別判定で、`lost_focus()`、
+pointer 無しの key press、他 widget の focus 無し、かつ composing または Enter / Escape press 無しの場合だけ行う。
+helper の retry は同条件（`lost_focus()` 以外）で次 pass 限り有効で、初回要求用の呼び出し側 latch には書かない。
+pointer 入力や他 widget への focus 移動を優先する。アプリ全体の Tab traversal 無効化、IME field の
 focus 保持、keymap の操作発火抑止は別責務であり、同じ event をそれぞれの ownership 境界で扱う。
 Hover で出す side panel 内の helper-managed field が実際に focus を持つ間は、その field を次 pass
 にも登録できるよう panel lifetime を keyboard focus でも維持する。これは focus を取り戻す処理ではなく、
-pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻る。IME を条件にした 1-pass
+pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻る。1-pass
 `FocusRecovery` の条件と上限は変更しない。
 
 診断は通常 logger の `[text-input-key]` として恒久的に残す。helper field が focused または直前 pass で
@@ -295,9 +437,12 @@ Windows の `KeySlot` 経路は Win32 key-down edge をフレーム単位で取�
 `Keymap::consume_action_press_count()` が返す回数を既存の typed request / accumulator へ渡す。
 
 `EachPhysicalPress` にできるのは、同じ方向へ 1 step ずつ進むように反復の意味が明確で、
-順番どおりの複数実行が安全であり、下流に明示的な累積上限がある操作だけとする。現在の対象は
+順番どおりの複数実行が安全であり、下流に明示的な累積上限または準備中の受付拒否がある操作だけとする。累積する対象は
 `FsCtrlNavPrev` / `FsCtrlNavNext` / `FsSiblingPrev` / `FsSiblingNext`。これらは既存の
-folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。トグル、削除などの破壊的操作、
+folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。
+`FsListOrderPrev` / `FsListOrderNext` も物理押下を数えるが、準備中は既存の sequence / 表示待ち lock で
+拒否し、累積しない。egui のキーリピートは Ctrl+↑↓ と同じく、物理押下が無いフレームでは最大 1 回にまとめる。
+トグル、削除などの破壊的操作、
 ダイアログ表示、設定変更、単発の保存処理は `SinglePerFrame` のままにし、同一フレームの
 複数 edge を回数分発火させない。ページ送り系は、固定矢印入力、見開き単位、連結読みスクロール、
 割合ジャンプで 1 step の意味が異なるため、共通の回数適用規則を定めるまでは対象外とする。
@@ -370,6 +515,8 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| 本の構成editor (G4、next-book) | 実ページのクリック、左のページ順ドラッグ・非表示、右のページ指定、各編集button、IME-safe な Enter = 保存 / Escape = キャンセル | 本HUD・本一覧右クリック・「本」menuから開く局所UI。新しい KeyAction は設けない。Enter はフォーカスwidgetがなく確認中でないときだけ保存し、Escape は確認を先に閉じる。保存 / 再読込中は取消を受け付けず、IME変換中は Enter / Escape の保存・取消を行わない。modal owner が背面の閲覧 / メタ情報 / ナビゲータ入力を止める。解除確認は明示buttonで行う。組の変更確認はなく、結果を直接表示し元に戻す/やり直すで修正する |
+| 画像folder→ZIP変換 (G) | 「ZIP に変換」「取消」「閉じる」、IME-safe な Escape = 取消 / 閉じる | folder右クリックと構成対象外案内から開く局所UI。新しい KeyAction / global shortcut は設けない。変換は明示buttonで確定し、取消可能なphaseだけEscapeを受け付ける。保存確定以降は取消しない。process modal ownerがmain / fullscreen / detachedの背面操作と新しいopenを止める |
 | 環境設定の持ち運び | 設定の復元の「環境設定を書き出し…」「環境設定を取り込み…」、説明 Modal の「書き出す」「ファイルを選ぶ」、取り込み後の環境設定の Enter / Escape | ダイアログ内だけのファイル操作で、新しい KeyAction は設けない。Enter / Escape は IME-safe な dialog helper を通す。環境設定表示中は新しい転送入口二つだけを無効化し、既存の復元操作は変更しない。取り込み完了時にも環境設定が開いていれば draft を変更せず通知する。転送 Modal の表示中は背後の環境設定へ Enter / Escape を渡さず、操作カスタマイズの「押して入力」も捕捉を停止する。待機状態と入力欄は保持し、Modal を閉じれば捕捉を再開する。通常の設定復元の表示だけでは捕捉を停止しない。転送 job 中は説明 Modal と設定復元の実行 / キャンセル / × / Enter / Escape を無効にし、メインの背面設定メニュー・ツールバーは既存の設定復元/common modal と説明 Modal で止める。別窓・fullscreen・native 動画への転送専用入力遮断は加えない。検証成功後の環境設定は既存 OK / キャンセルを使う。操作カスタマイズ自体は転送対象外で既存共有を使う |
 | モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>←</kbd> / <kbd>↑</kbd> = 削除を選択、<kbd>→</kbd> / <kbd>↓</kbd> = キャンセルを選択、<kbd>Enter</kbd> = 選択中を実行 | 破壊的操作の確認ダイアログだけで意味を持つフォーカスローカル入力のため keymap 対象外。ごみ箱へ移す確認は削除、完全削除の可能性がある確認はキャンセルを初期選択にする。表示中に各キーを消費して背面の KeyAction へ漏らさず、Enter は IME-safe helper で判定する。IME 変換中は Y / N / Esc / Enter の確認操作を行わない |
 | 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。静止画 FS では raw-key permit を要求し、TextInput の全 phase では editor に残す一方、非テキスト `FocusedUi` はスライダー等にページ矢印を奪われないよう通す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
@@ -404,13 +551,21 @@ dispatch ではない。`Ctrl+G/S/E` の既存割当は維持する。メニュ�
 サムネイル一覧の操作として変更・解除できる。Everything の入力は明示送信とし、IME確定の
 Enter では送信せず、確定後の Enter または「検索」で送信する。
 
+§1.386: 可否条件は維持し、両メニューの無効時は理由を hover 表示する。拒否された実効Actionの
+非repeat押下がmain ROOTのMain surfaceのapplication shortcut ownerに届いた場合だけ、MainWindow面に一時通知する。
+Modal／文字入力／IME／focus recovery／他viewportのキーは通知も消費もしない。Remoteは現状Modal所有なので
+hoverで理由を確認する。ROOT上でもFullscreen surfaceが所有するキーは既存viewer操作へ残す。
+fullscreen/native側からROOTへの新しい転送は加えない。
+通知はWin32 pendingを当該native frameへ取り込んだ直後の1か所で処理する。後段の実行dispatchでは
+再通知せず、同じ押下のegui/native両キューを既存keymap helperで同時に消費する。
+
 `GridColumnCount11..20` のリング・マウス割り当てを旧版から守るには、公開時にアプリ版番号を v4.1.0 より上げることが前提。`settings.db` は保存時の版番号が実行版より新しければ、旧版の起動時に読み込み前の `Incompatible` 判定で保存を止める。同じ v4.1.0 の開発ビルド間ではこの判定が働かず、旧版の `sanitize()` が未知のリング・マウス操作を `None` に置き換えて保存し得る。版番号の更新はリリース作業で行う。
 
 | キー | 動作 |
 |---|---|
 | <kbd>Ctrl</kbd>+<kbd>R</kbd> | main の一覧から Everything ファイル名検索バーを開く。Action: `GlobalEverythingSearch`。閉じる操作は×/Esc。取得・準備中は取消可能なmainのモーダルを使い、完成した一覧だけを採用する |
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
-| <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
+| <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ。Everything (Ctrl+R) 中は開いたフォルダ・本の内部を 1 段戻り、起点からは結果一覧へ戻る。検索の最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
 | 既定キーなし (`GridRename`) | 選択中の実ファイル / 実フォルダ 1 項目の名前を変更する。複数チェック中は実行せず通知する。Grid 文脈だけで、画像 / 動画フルスクリーンには入れない |
 | 既定キーなし (`GridReload`) | 現在の一覧を、その一覧種別の再読み込み / 再スキャン / 再クエリ経路で更新する。スマートフォルダ / サブ展開の走査中は二重起動せず、★固定中は何もしない。表示中のフォルダツリーペインも同時に再読み込みする |
@@ -571,7 +726,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>LB</kbd> / <kbd>RB</kbd> | Ctrl+↑ / Ctrl+↓ と同じ前 / 次フォルダ移動 |
 | <kbd>LT</kbd> / <kbd>RT</kbd> | グリッドでは連続スクロール、画像ではズームアウト / ズームイン、動画では連続シーク |
 | 右スティック上下 | 画像フルスクリーンのズーム。LT/RT より速め |
-| <kbd>Select</kbd> | グリッドでは場所リストを開き、ドライブ一覧 / 閲覧履歴 / 本棚フォルダ / 既知フォルダ / ドライブを上下で選んで <kbd>A</kbd> で移動する。画像フルスクリーンでは見開きモードを巡回切り替え (単ページ / 見開き 左→右 / 左→右(表紙あり) / 右→左 / 右→左(表紙あり))。動画フルスクリーンではブックマーク / チャプター / ピンの一覧を開き、上下で選んで <kbd>A</kbd> で移動する |
+| <kbd>Select</kbd> | グリッドでは場所リストを開き、ドライブ一覧 / 閲覧履歴 / 本棚フォルダ / 既知フォルダ / ドライブを上下で選んで <kbd>A</kbd> で移動する。画像フルスクリーンの通常本では見開きモードを巡回切り替え (単ページ / 見開き 左→右 / 左→右(表紙あり) / 右→左 / 右→左(表紙あり))。構成本では単ページと構成の方向・表紙に一致する見開き、抽出一覧では単ページと一時見開きを切り替える。動画フルスクリーンではブックマーク / チャプター / ピンの一覧を開き、上下で選んで <kbd>A</kbd> で移動する |
 | <kbd>X</kbd>+方向パッド / 左スティック | リングショートカット。<kbd>X</kbd> を押しながら方向を選び、<kbd>X</kbd> を離すと現在コンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン) のスロットに設定された一発アクションを実行する。左スティックは軽く触れた程度では方向確定せず無方向扱い。方向なしで離すと専用ピッカーパネルを開き、方向で行選択/値変更、<kbd>A</kbd> で一覧を開くか一覧項目を選択、<kbd>X</kbd> / <kbd>B</kbd> で確定して閉じる。<kbd>B</kbd> でリング選択もキャンセルできる。<kbd>X</kbd> リング中とピッカー表示中の方向入力は通常ナビゲーションへ流さない |
 | <kbd>Y</kbd> | グリッドではフォルダツリーペインを開閉する。表示時は現在フォルダへツリーカーソルを移す。非表示にする時、ツリーカーソルが別フォルダへ動いていれば <kbd>A</kbd>/<kbd>Enter</kbd> 相当でそのフォルダへ移動してグリッドへ戻る (動いていなければ単に閉じる)。動画では S キー相当。画像では Y+左右で Ctrl+左右相当の見開き 1 ページずらし、Y+上下で Home/End 相当の先頭 / 末尾移動 |
 | フォルダツリー表示中の方向パッド / 左スティック / <kbd>A</kbd> | ツリーカーソルを上下左右に移動し、<kbd>A</kbd> で選択フォルダを開く。決定後はツリーを自動で閉じ、グリッドへ戻る |
@@ -584,7 +739,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 |---|---|
 | <kbd>?</kbd> (既定) | 画像フルスクリーンで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーと、中央 / 左右タップ・2 本指ズーム / パンの「タッチ操作」は別枠で表示する |
 | <kbd>I</kbd> / <kbd>Tab</kbd> | 左右パネルの表示モード (通常ホバー / クリック表示) を切り替える。Action: `FsToggleMetadata`。画像フルスクリーン、native 動画、egui 音楽ビューで共通。native 動画では effective chord を presenter から App へ転送する |
-| <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次のファイル (見開き中は前 / 次の見開き = 2 ページ送り)。左右の方向は環境設定で「ページ表示 / 読み方向に合わせる」（既定）または「シークバー方向に合わせる」を選べる。最後 / 最初の見開きでは 1 回目の入力で境界案内を表示する |
+| <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次のファイル (見開き中は前 / 次の見開き = 2 ページ送り)。左右の方向は環境設定で「ページ表示 / 読み方向に合わせる」（既定）または「シークバー方向に合わせる」を選べる。最後 / 最初の見開きでは、手動の前後移動ループがOFF、または折り返せる別の表示単位がない場合、1 回目の入力で境界案内を表示する。ループONで折り返せる場合は反対側の端へ移る |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次のファイル (= 一般慣例で左右と同義)。見開きの境界判定も左右と共通。縦連結では縦スクロール、横連結では前 / 次ファイル。スライドショー中もフォルダ内移動は再生を止めない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 通常はプレーン <kbd>↑</kbd>/<kbd>↓</kbd> と同義 (前 / 次ファイル)。**ファイル名スタックのフラット読書中 (v2.0.0)** は「前 / 次のスタックの先頭画像へジャンプ」(= 今の投稿の残りをスキップ。`Shift+↑` はスタック途中なら現スタック先頭、先頭なら前スタック先頭)。端では no-op (次フォルダは <kbd>Ctrl</kbd>+<kbd>↓</kbd>)。スタックジャンプ部分の Action: `FsStackJumpPrev` / `FsStackJumpNext`。動画再生中は音量 (下表参照) |
 | 既定キーなし (`FsPagePrev` / `FsPageNext`) | コマンド設定でキーを割り当てると、前 / 次のページへ移動する。矢印ナビゲーションは固定扱いのまま残しつつ、明示的にページ送りへ割り当てたい場合の Action |
@@ -592,6 +747,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。修飾なし矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネル・ページジャンプ・Home/End 先頭末尾移動など副作用が明確な操作は KeyAction 化して競合検出対象にする |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。端の no-op は保存しない)。適格な本では既定ONの全体記憶設定に従い、実際の内部アンカーのPageRefを`spread_shift.db`へ保存する。通常一覧と記憶OFFではセッション調整。`spread_db`のmodeは保存し直さない。Single / Split モードでは従来の前 / 次ページ移動。ページ表示が RTL なら左右の意味を反転し、「カーソルキー左右の方向」の影響は受けない。リング / マウス / パッド用の操作候補には、この左右版に加えて PageUp/PageDown と同じく RTL でも前 / 次を反転しない「前 / 次」版を用意する |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。スマートフォルダでは Folder 内 DFS の端と root 直下の本から、一覧表示順の Folder/PDF/ZIP/変換書庫へ移る。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 一覧の表示順で前 / 次の本を開く。Action: `FsListOrderPrev` / `FsListOrderNext` (`FsCommon` / Press / `EachPhysicalPress`)。最後に通常フォルダ一覧から本を開く操作を受け付けた時点の絞り込み・並べ替え順を使い、その一覧の中だけを移動する。Ctrl+↑↓ の DFS と異なりサブフォルダへは降りない。使える範囲・停止条件は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) 参照 |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 同じ親直下の前 / 次の兄弟フォルダへ移動する。Action: `FsSiblingPrev` / `FsSiblingNext`。独立 detached 静止画窓でも窓自身の物理兄弟順を使う |
 | <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸 → 指定サイズで循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
 | 既定キーなし (`FsTogglePageAfterCoverAlone` / `FsToggleLastPageAlone`) | 表紙あり見開きで、表紙の次 / 最終ページを白い相方付きで単独表示する本別設定を切り替える。全体設定に従う状態からは現在の実効値の反対を明示保存する。表紙なし見開き・単ページ・横長分割では値だけ変更し、表示には適用しない |
@@ -609,7 +765,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>Alt</kbd>+<kbd>N</kbd> | `FsNavigatorToggle`。ナビゲータの固定表示を切り替える。単ページ / 見開き / 比較表示 / 360 度パノラマで、縮小画像と現在の表示範囲を示す。左ドラッグは範囲指定ズーム（パノラマでは選択の高さを視野角にして中心を移動）、右ドラッグはパン、ダブルクリックはその位置を中央へ移動、ホイールはナビゲータ自体のサイズ変更。ヘッダーの四隅ボタンで配置を選ぶ。固定表示の状態・配置・サイズは保存する。全体可視時も表示し、画面が画像より広いときは枠を全体に保って画像を内側へ縮める。比較中は現在の Wipe / Diff / ピン表示と同じ全体合成を示す。連結読み・動画・編集 / 分析モードでは表示しない。ルーペとは用途が異なるため同時表示できる。既定 <kbd>Alt</kbd>+<kbd>N</kbd> は `FsImage` 文脈の既定 chord と衝突しない |
 | ホイールクリックに全画面ズームモードを割り当て | 短クリックでズーム状態を ON/OFF する。Z キーの押下中照準表示は出さず、現在のカーソル位置でズーム状態へ入る。ズーム状態中は中ボタン押し込み + 上下ドラッグで倍率を変えられる |
 | <kbd>Shift</kbd>+<kbd>Z</kbd> | 画像分析モード (旧 <kbd>Z</kbd>。Z を全画面ズームへ明け渡したため移動) |
-| <kbd>S</kbd> | スライドショー 再生 / 停止。ホバーバーの ▶ ボタンは停止中のみページ送り間隔・連結読みスクロール設定・末尾動作を設定するポップアップを開き、再生中の一時停止ボタンは即停止する。動画はスキップして継続。縦/横連結読み中は待機時間ごとに設定割合だけ短時間スクロールし、終端で通常の末尾動作へ合流する。フォルダ内移動 (矢印 / ホイール / クリック / Home / End) では止まらず、Ctrl+↑↓ のフォルダ移動・S・Space・Esc で止まる |
+| <kbd>S</kbd> | スライドショー 再生 / 停止。ホバーバーの ▶ / 一時停止ボタンも即時に開始 / 停止する。ページ送り間隔・連結読みスクロール設定・末尾動作は上部の「…」→「スライドショー」または環境設定で変更する。動画はスキップして継続。縦/横連結読み中は待機時間ごとに設定割合だけ短時間スクロールし、終端で通常の末尾動作へ合流する。フォルダ内移動 (矢印 / ホイール / クリック / Home / End) では止まらず、Ctrl+↑↓ のフォルダ移動・S・Space・Esc で止まる |
 | <kbd>Shift</kbd>+<kbd>S</kbd> | `FsSeekStripToggle`。下部のサムネイル列を表示 / 非表示にする。フィルム状ボタンと上下ドラッグも同じ `still_seek_strip_visible` を切り替える |
 | <kbd>M</kbd> | ルーペ トグル。360 度パノラマモード中とテキスト注釈モード中は表示しない。テキスト注釈モードに入ってもトグル状態は保持する |
 | <kbd>G</kbd> | ピクセルグリッド表示 ON/OFF (ユーザーズームが等倍より拡大中、かつ高倍率時のみ画像ピクセル境界を表示) |
@@ -741,8 +897,8 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | 入力 | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | 切り取りモードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いの操作は別枠で表示する |
-| <kbd>Ctrl</kbd>+<kbd>E</kbd> | 切り取りを確定し、現在の表示結果を別ファイルへエクスポートする |
-| <kbd>Esc</kbd> | 切り取りモードを終了する |
+| <kbd>Ctrl</kbd>+<kbd>E</kbd> | ドラッグ中も現在の切り取り範囲を先に確定・保存し、現在の表示結果を別ファイルへエクスポートする。Action: `CropExecute` |
+| <kbd>Esc</kbd> | ドラッグ中は開始前の切り取り設定（crop なしも含む）へ戻し、保存せずドラッグだけを取り消す。モードは維持する。ドラッグしていなければ切り取りモードを終了する固定操作 |
 | <kbd>Ctrl</kbd>+左ドラッグ | 既存の切り取り枠やハンドル上からでも、新しい切り取り範囲を作成する。Action: `CropForceCreateHold`。既定は <kbd>Ctrl</kbd> で、操作カスタマイズから変更・無効化できる |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン。`CropSpacePan` と `CropForceCreateHold` を同時に押した場合もパンを優先する。開始後に修飾キーを押す、または離しても、同じ左ドラッグを切り取り操作へ切り替えない |
 | マウスドラッグ | 切り取り範囲を作成、移動、またはリサイズする。アスペクト固定時は、辺なら反対辺、角なら反対角を固定して拡大縮小する |
@@ -754,12 +910,38 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | 入力 | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | SNS 分割モードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts` |
-| パネルの「分割して書き出す」 | エクスポートダイアログへ進む。画像が小さく選択枚数を配置できない間は無効 |
+| パネルの「分割して書き出す」 | ドラッグ中も現在の枠配置を先に確定して、エクスポートダイアログへ進む。画像が小さく選択枚数を配置できない間は無効 |
 | `SnsSplitExecute` の利用者割り当て | パネルボタンと同じ書き出しを実行する。標準キーはなく、操作カスタマイズで割り当てられる |
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | 通常の `FsExport`。SNS 分割中は書き出さず、パネルの「分割して書き出す」を案内する |
-| <kbd>Esc</kbd> | SNS 分割モードを終了する固定操作 |
+| <kbd>Esc</kbd> | ドラッグ中は開始前の枠配置へ戻し、ドラッグだけを取り消す。モードは維持する。ドラッグしていなければ SNS 分割モードを終了する固定操作 |
 | マウスドラッグ | 枠全体を移動するか、四隅・辺のハンドルで比率を保って拡大縮小する。辺なら反対辺、角なら反対角を固定する |
 | マウスホイール / <kbd>Ctrl</kbd>+マウスホイール | 画像上ではズーム。パネル上ではスクロールまたはズーム |
+
+### crop / SNS 枠ドラッグの終了操作
+
+終了理由は `ui_crop::OverlayDragEnd`、確定／取消の対応はその `finish()` の match を正本にする。
+終端は引き続き `OverlayDragFinish::{Commit, Cancel}` の二つだけ。
+
+| 操作・境界 | 終了理由 | 終端 |
+|---|---|---|
+| primary release、focus を保持した窓外 release の物理ボタン up、欠落 release 後の次の press | `Released` | 確定 |
+| `CropExecute`、`SnsSplitExecute`、SNS パネルの「分割して書き出す」、出力準備成功後のモード完了 | `Execute` | 現在値を先に確定して使う |
+| ドラッグ中の Escape | `Escape` | 取り消してモードを維持 |
+| パネルの終了、ページ移動、close、別ツール／補正モード、再入場、preview snapshot、恒久的な park | `ModeExit` | 取り消して既存の終了・切替を続ける |
+| items／編集投影の入替、削除、世代・対象ページの変更 | `OwnerChanged` | 取り消し。別 owner へ復元しない |
+| 本の構造操作の開始（構造 owner が存在する最初の poll、FS 開始・結果採用より前） | `BookStructure` | 全 context の所有ドラッグを取り消し。DB は保存せず、完了後も古いドラッグを再開しない |
+| フォーカス喪失 | `FocusLost` | 取り消し |
+| 右ボタン押下 | `SecondaryPress` | 取り消し |
+| 前面 UI への primary 入力所有移譲 | `FrontUiClaim` | 取り消し |
+| パネルの数値・比率・自動 crop、SNS の枚数・比率等の明示設定変更 | `SettingsChanged` | 旧ドラッグを取り消して明示設定を採用 |
+
+crop の確定は現在の範囲を既存 DB／sidecar 保存経路へ一度だけ渡す。SNS の枠配置は従来どおり
+セッション内の値で、確定した現在の枠列を export snapshot へ渡す。出力準備が失敗しても確定を取り消さない。
+実行入口と取消を伴うモード終了入口を分け、書き出しを取消経路へ通さない。
+別 context の一時 mount は終了操作ではなく、所有者を維持する。F12 は既存の overlay edit policy で受け付けない。
+SNS 中の通常 `FsExport` は案内だけを表示し、枠の確定・取消やモード終了を行わない。
+本の構造操作中は crop／SNS ともキー・パネル・raw pointer の新規入力を受け付けない。
+取消しは `poll_book_structural_op` が単独で所有し、入力 handler が呼ばれなくても実行する。
 
 ## テキスト注釈モード
 
@@ -807,6 +989,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | 修飾なしマウスホイール | 前 / 次のファイル（既定）、または音量調整 | `Settings.ring_shortcuts.video_normal_wheel_action`。動画・音声共通で、操作カスタマイズ「マウスボタン」から選択。パネル・モーダル・ストリップ、360度・拡大表示など既存の入力所有を優先し、KeyAction にはしない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量を dB フェーダー目盛りの 1/4 幅で上下 | |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効。切り離した detached 窓 / always-new 窓ではメイン一覧を動かさず、案内だけ出す |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 最後に通常フォルダ一覧から本を開く操作を受け付けた時点の、その一覧の表示順で前 / 次の本を開く | `FsListOrderPrev` / `FsListOrderNext`。native presenter でも同じ handler を使う。別窓・★固定中・保持した一覧に現在の本が無いときは案内だけ出し、準備中の追加入力は受け付けない。native の repeat 受付は既存 Ctrl+↑↓ と同じく無視 |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | 同じ親の直下だけを対象にし、空フォルダも skip しない。検索中は無効。切り離した detached 窓 / always-new 窓では無効 |
 | <kbd>M</kbd> | ミュート トグル | |
 | 既定キーなし | 次の再生可能な音声トラックへ循環 | Action: `VideoNextAudioTrack`。`[FsVideo]` で割り当て可能。動画 HUD と動画→音声モード HUD の「音声 N」からも直接選べる。1 本以下では何もしない |
@@ -923,3 +1106,19 @@ Explorer方式では選択を解除し、Check方式では維持する。
 環境設定の対象がONなら、既存 `FsToggleWindowMode` によるF11全画面の間だけ固定表示を自動表示へ投影する。
 HUD・native VK・カスタム割り当て・初回fullscreenも同じ表示先契約。新しい固定キーやKeyActionは追加しない。
 F12通常窓は抑制せず、その窓のF11拡大だけが対象。ナビゲータは既存 `FsNavigatorHold`（既定Alt）を使う。
+
+## ツールバーに固定した検索欄 (§1.409)
+
+既存 `GlobalFavSearch / GlobalLocalSearch / GlobalMetadataSearch / GlobalEverythingSearch` の
+受付条件を維持し、対象の固定がONなら同じ欄へpending text-input focusで移す。
+固定Ctrl+Gは終了toggleにせずfocusする。固定OFFの一時バーとCtrl+G toggleは従来どおり。
+新しいKeyActionは追加しない。Enter/EscはIME helperを通す固定の入力操作である。
+
+Escは全検索バー描画後の単一routerが一度だけ消費する。modal/IME→描画前の検索入力owner→
+適用結果または有効sessionの順。非active欄ではfocus解除だけ。検索終了時に固定欄のdraftは
+保持し、Everything実行中は取消だけを行う。egui begin_passでfocusが消えたときは既存recoveryの
+viewport/pass/pointer優先条件に従って入力Idを捕捉し、描画後のhas_focusで選び直さない。
+
+固定OFFの一時バーのEscは、そのバーの×と同じく共通検索sessionを終了して元一覧へ戻る。
+別sourceの結果を残したまま未送信入力を閉じて入力先だけ戻す(b)は、固定欄に限る。
+全OFFとG/Rの片方だけ固定の場合も、この入力ownerの区別を保つ。

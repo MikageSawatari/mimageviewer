@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::folder_scan::ScannedDir;
-#[cfg(test)]
-use super::top_level_grid_view::CollectionGridThumbnailSources;
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridLoadState, CollectionGridNavigationSources,
-    CollectionGridPosition, CollectionGridPreparedInstall, CollectionGridPreparedThumbnailDelivery,
-    CollectionGridPresentationSources, CollectionGridSession, CollectionGridViewportAnchor,
-    TopLevelGridRestore, TopLevelGridSurface,
+    CollectionGridPosition, CollectionGridPreparedInstall, CollectionGridPresentationSources,
+    CollectionGridSession, CollectionGridViewportAnchor, TopLevelGridRestore, TopLevelGridSurface,
+};
+#[cfg(test)]
+use super::top_level_grid_view::{
+    CollectionGridPreparedThumbnailDelivery, CollectionGridThumbnailSources,
 };
 use super::{App, FolderOpenOutcome, HistoryTrigger, ManualMediaNavigationLanding};
 use crate::collection_store::{
@@ -45,6 +46,7 @@ enum CollectionNavigationAction {
         display_unit_step: bool,
         landing: ManualMediaNavigationLanding,
         still_only: bool,
+        wrap: bool,
     },
     Slideshow {
         fs_idx: usize,
@@ -65,17 +67,20 @@ enum CollectionNavigationAction {
     VideoContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
         wraps: bool,
     },
     #[cfg(windows)]
     VideoAudioModeContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
         wraps: bool,
     },
     MusicContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
         wraps: bool,
     },
 }
@@ -141,9 +146,10 @@ impl CollectionNavigationAction {
                     CollectionNavigationTail::Stop
                 }
             }
-            Self::Manual { .. } | Self::OuterGrid { .. } | Self::OuterFullscreen { .. } => {
-                CollectionNavigationTail::Stop
-            }
+            Self::Manual { wrap: true, .. } => CollectionNavigationTail::WrapExcludingCurrent,
+            Self::Manual { wrap: false, .. }
+            | Self::OuterGrid { .. }
+            | Self::OuterFullscreen { .. } => CollectionNavigationTail::Stop,
         }
     }
 
@@ -405,7 +411,7 @@ pub(crate) enum PhysicalHistoryPreflightPoll {
 }
 
 pub(crate) struct PhysicalHistoryPreflight {
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<crate::pdf_loader::NavigationPreflightCancel>,
     receiver: std::sync::mpsc::Receiver<Result<PhysicalHistoryPreflightPayload, String>>,
 }
 
@@ -415,7 +421,7 @@ impl PhysicalHistoryPreflight {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(Ok(payload)).expect("seed physical preflight");
         Self {
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
             receiver,
         }
     }
@@ -423,6 +429,21 @@ impl PhysicalHistoryPreflight {
     #[cfg(test)]
     pub(crate) fn ready_for_test(payload: PhysicalHistoryPreflightPayload) -> Self {
         Self::prepared(payload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controlled_for_test() -> (
+        Self,
+        std::sync::mpsc::Sender<Result<PhysicalHistoryPreflightPayload, String>>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (
+            Self {
+                cancel: Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
+                receiver,
+            },
+            sender,
+        )
     }
 
     pub(crate) fn poll(&mut self) -> PhysicalHistoryPreflightPoll {
@@ -439,7 +460,7 @@ impl PhysicalHistoryPreflight {
 
 impl Drop for PhysicalHistoryPreflight {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
     }
 }
 
@@ -560,7 +581,7 @@ pub(in crate::app) enum CollectionNavigationPending {
         watch: CollectionRevisionWatch,
         prepared: Arc<CollectionPreparedSnapshot>,
         target_kind: CollectionNavigationTargetKind,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<crate::pdf_loader::NavigationPreflightCancel>,
         receiver: std::sync::mpsc::Receiver<
             Result<Option<CollectionNavigationPreflightReady>, CollectionPrepareError>,
         >,
@@ -579,7 +600,7 @@ pub(in crate::app) enum CollectionNavigationPending {
         target: CollectionPreparedNavigationTarget,
         password: String,
         save: bool,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<crate::pdf_loader::NavigationPreflightCancel>,
         receiver: std::sync::mpsc::Receiver<std::io::Result<crate::pdf_loader::PdfEnumerateResult>>,
     },
     AwaitingOuterContinuation {
@@ -593,6 +614,7 @@ pub(in crate::app) enum CollectionNavigationPending {
         landing: ManualMediaNavigationLanding,
         display_unit_step: bool,
         still_only: bool,
+        wrap: bool,
         stamp: CollectionNavigationContinuationStamp,
     },
 }
@@ -673,10 +695,11 @@ impl CollectionNavigationPending {
 
     pub(crate) fn cancel(&self) {
         match self {
-            Self::Preparing { cancel, .. }
-            | Self::Preflighting { cancel, .. }
-            | Self::PdfPasswordPreflighting { cancel, .. } => {
+            Self::Preparing { cancel, .. } => {
                 cancel.store(true, Ordering::Release);
+            }
+            Self::Preflighting { cancel, .. } | Self::PdfPasswordPreflighting { cancel, .. } => {
+                cancel.cancel()
             }
             Self::RequestNeeded { .. } | Self::Snapshot { .. } => {}
             Self::AwaitingPdfPassword { .. } => {}
@@ -709,18 +732,21 @@ impl CollectionNavigationPending {
         landing: ManualMediaNavigationLanding,
         still_only: bool,
         display_unit_step: bool,
+        wrap: bool,
     ) -> bool {
         if let Self::AwaitingManualContinuation {
             steps,
             landing: active_landing,
             display_unit_step: active_display_unit_step,
             still_only: active_still_only,
+            wrap: active_wrap,
             ..
         } = self
         {
             if *active_landing != landing
                 || *active_still_only != still_only
                 || *active_display_unit_step != display_unit_step
+                || *active_wrap != wrap
                 || (*steps != 0 && steps.signum() != delta.signum())
             {
                 return false;
@@ -743,6 +769,7 @@ impl CollectionNavigationPending {
             landing: active_landing,
             still_only: active_still_only,
             display_unit_step: active_display_unit_step,
+            wrap: active_wrap,
             ..
         } = action
         else {
@@ -751,6 +778,7 @@ impl CollectionNavigationPending {
         if *active_landing != landing
             || *active_still_only != still_only
             || *active_display_unit_step != display_unit_step
+            || *active_wrap != wrap
             || active.signum() != delta.signum()
         {
             return false;
@@ -886,7 +914,7 @@ fn preflight_candidates(
     still_only: bool,
     tree_options: crate::folder_tree::FolderTreeOptions,
     show_hidden_files: bool,
-    cancel: &Arc<AtomicBool>,
+    cancel: &Arc<crate::pdf_loader::NavigationPreflightCancel>,
     collection_id: CollectionId,
     request_sequence: u64,
 ) -> Result<Option<CollectionNavigationPreflightReady>, CollectionPrepareError> {
@@ -915,13 +943,13 @@ fn preflight_candidates(
                     let qualifies = if still_only {
                         crate::folder_tree::folder_has_still_image_with_options(
                             path,
-                            Some(cancel),
+                            Some(cancel.flag()),
                             tree_options.clone(),
                         )
                     } else {
                         crate::folder_tree::folder_should_stop_with_options(
                             path,
-                            Some(cancel),
+                            Some(cancel.flag()),
                             tree_options.clone(),
                         )
                     };
@@ -934,7 +962,7 @@ fn preflight_candidates(
                             tree_options.include_epub,
                             show_hidden_files,
                             &tree_options.file_type_visibility,
-                            Some(cancel),
+                            Some(cancel.flag()),
                         )
                         .ok()
                         .filter(|scan| {
@@ -959,7 +987,7 @@ fn preflight_candidates(
                 CollectionResolvedKind::Zip => {
                     crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                         path,
-                        Some(cancel),
+                        Some(cancel.flag()),
                     )
                     .ok()
                     .filter(|enumeration| !enumeration.entries.is_empty())
@@ -988,10 +1016,10 @@ fn preflight_candidates(
                     {
                         None
                     } else {
-                        match crate::pdf_loader::enumerate_pages_with_options(
+                        match crate::pdf_loader::enumerate_pages_for_navigation(
                             path,
                             candidate.pdf_password.as_deref(),
-                            Some(Arc::clone(cancel)),
+                            cancel,
                             crate::pdf_loader::EnumerateOptions {
                                 want_direction: candidate.want_direction,
                             },
@@ -1042,7 +1070,10 @@ fn preflight_candidates(
                             return Some(CollectionNavigationPreflightPayload::RarOpen);
                         }
                         match crate::archive_converter::scan_summary_with_password_cancelable(
-                            path, format, None, cancel,
+                            path,
+                            format,
+                            None,
+                            cancel.flag(),
                         ) {
                             Ok(summary)
                                 if summary.image_count != 0
@@ -1166,11 +1197,11 @@ impl App {
             || {
                 self.spread_db.as_ref().is_ok_and(|db| {
                     let stored = db.get_state_with_fallback(&path, None);
-                    stored.mode.is_some() || stored.direction.is_some()
+                    !stored.needs_document_direction(true)
                 })
             },
         );
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let spawn = std::thread::Builder::new()
@@ -1213,7 +1244,7 @@ impl App {
                                 tree_options.include_epub,
                                 show_hidden_files,
                                 &tree_options.file_type_visibility,
-                                Some(&worker_cancel),
+                                Some(worker_cancel.flag()),
                             )
                             .map(PhysicalHistoryPreflightPayload::Folder)
                             .map_err(|error| format!("フォルダを読み込めません: {error}"))
@@ -1237,7 +1268,7 @@ impl App {
                                 && let Ok(enumeration) =
                                     crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                                         &backing_path,
-                                        Some(&worker_cancel),
+                                        Some(worker_cancel.flag()),
                                     )
                             {
                                 return Ok(PhysicalHistoryPreflightPayload::ZipCached {
@@ -1247,17 +1278,17 @@ impl App {
                             }
                             crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                                 &path,
-                                Some(&worker_cancel),
+                                Some(worker_cancel.flag()),
                             )
                             .map(|raw| crate::zip_loader::PreparedZipEnumeration::prepare(path.clone(), raw, tree_options.file_type_visibility.clone()))
                             .map(PhysicalHistoryPreflightPayload::Zip)
                             .map_err(|error| format!("書庫を読み込めません: {error}"))
                         }
                         CollectionResolvedKind::Pdf => {
-                            match crate::pdf_loader::enumerate_pages_with_options(
+                            match crate::pdf_loader::enumerate_pages_for_navigation(
                                 &path,
                                 pdf_password.as_deref(),
-                                Some(Arc::clone(&worker_cancel)),
+                                &worker_cancel,
                                 crate::pdf_loader::EnumerateOptions { want_direction },
                             ) {
                                 Ok(pages) if !pages.pages.is_empty() => {
@@ -1313,7 +1344,7 @@ impl App {
                                 && let Ok(enumeration) =
                                     crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                                         &backing_path,
-                                        Some(&worker_cancel),
+                                        Some(worker_cancel.flag()),
                                     )
                             {
                                 return Ok(PhysicalHistoryPreflightPayload::ZipCached {
@@ -1325,7 +1356,7 @@ impl App {
                                 &path,
                                 format,
                                 password.as_deref(),
-                                &worker_cancel,
+                                worker_cancel.flag(),
                             ) {
                                 Ok(summary) => {
                                     Ok(PhysicalHistoryPreflightPayload::ConvertibleArchive(summary))
@@ -1372,13 +1403,16 @@ impl App {
     }
 
     fn cancel_transferred_collection_archive_navigation(&mut self, reason: &'static str) -> bool {
+        let context_id = self.collection_grid_context_id();
         let transferred = self.archive_convert.as_ref().is_some_and(|state| {
             matches!(
                 &state.completion,
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
                     intent
                 ) if intent.collection_grid_owner.as_ref().is_some_and(|owner| {
-                    owner.navigation_request.is_some()
+                    owner.navigation_request.as_ref().is_some_and(|request| {
+                        request.origin.context_id == context_id
+                    })
                 })
             )
         });
@@ -1386,6 +1420,7 @@ impl App {
     }
 
     pub(crate) fn cancel_collection_slideshow_navigation_intent(&mut self) {
+        let context_id = self.collection_grid_context_id();
         let transferred_slideshow = self.archive_convert.as_ref().is_some_and(|state| {
             matches!(
                 &state.completion,
@@ -1393,7 +1428,9 @@ impl App {
                     intent
                 ) if intent.collection_grid_owner.as_ref().and_then(|owner| {
                     owner.navigation_request.as_ref()
-                }).is_some_and(CollectionNavigationRequest::is_slideshow)
+                }).is_some_and(|request| {
+                    request.origin.context_id == context_id && request.is_slideshow()
+                })
             )
         });
         let is_slideshow = self
@@ -1611,7 +1648,7 @@ impl App {
         request.lease.activate(now, "admission");
         if !self.collection_navigation_request_is_current(&request) {
             request.lease.finish(now, "replaced");
-            self.finish_collection_navigation_without_target_no_context(&request.action);
+            self.finish_collection_navigation_rejected_request(ctx, &request);
             return;
         }
         if !request.lease.is_due(now) {
@@ -1629,7 +1666,7 @@ impl App {
             Ok(None) => {
                 self.finish_collection_navigation_read_error(
                     ctx,
-                    &request.action,
+                    &request,
                     "保存先が利用できません",
                 );
                 return;
@@ -1639,7 +1676,7 @@ impl App {
                 return;
             }
             Err(error) => {
-                self.finish_collection_navigation_store_error(ctx, &request.action, &error);
+                self.finish_collection_navigation_store_error(ctx, &request, &error);
                 return;
             }
         };
@@ -1654,7 +1691,7 @@ impl App {
                     return;
                 }
                 Err(error) => {
-                    self.finish_collection_navigation_store_error(ctx, &request.action, &error);
+                    self.finish_collection_navigation_store_error(ctx, &request, &error);
                     return;
                 }
             },
@@ -1666,7 +1703,7 @@ impl App {
                 return;
             }
             Err(error) => {
-                self.finish_collection_navigation_store_error(ctx, &request.action, &error);
+                self.finish_collection_navigation_store_error(ctx, &request, &error);
                 return;
             }
         };
@@ -1727,27 +1764,35 @@ impl App {
     fn finish_collection_navigation_read_error(
         &mut self,
         ctx: &egui::Context,
-        action: &CollectionNavigationAction,
+        request: &CollectionNavigationRequest,
         reason: &str,
     ) {
-        self.finish_collection_navigation_without_target_no_context(action);
-        if matches!(action, CollectionNavigationAction::Slideshow { .. }) {
+        if !self.collection_navigation_request_owner_is_current(request) {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+            return;
+        }
+        // A terminal failure consumes this EOF claim. Rolling it back would silently retry
+        // the same EOF and could resume an internal loop after its metadata was cleared.
+        if !self.finish_collection_navigation_eof(&request.action) {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+        }
+        if request.is_slideshow() {
             self.stop_slideshow_playback();
         }
-        self.show_feedback_toast(format!("コレクションを読み込めませんでした: {reason}"));
+        self.show_feedback_warning(format!("コレクションを読み込めませんでした: {reason}"));
         ctx.request_repaint();
     }
 
     fn finish_collection_navigation_store_error(
         &mut self,
         ctx: &egui::Context,
-        action: &CollectionNavigationAction,
+        request: &CollectionNavigationRequest,
         error: &CollectionStoreError,
     ) {
         crate::logger::log(format!(
             "[collection-nav] terminal store read failed: {error}"
         ));
-        self.finish_collection_navigation_read_error(ctx, action, &error.user_message());
+        self.finish_collection_navigation_read_error(ctx, request, &error.user_message());
     }
 
     pub(crate) fn start_collection_manual_navigation(
@@ -1756,8 +1801,9 @@ impl App {
         fs_idx: usize,
         delta: i32,
         landing: ManualMediaNavigationLanding,
+        wrap: bool,
     ) -> bool {
-        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, false)
+        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, false, wrap)
     }
 
     pub(crate) fn start_collection_manual_display_unit_navigation(
@@ -1766,8 +1812,9 @@ impl App {
         fs_idx: usize,
         delta: i32,
         landing: ManualMediaNavigationLanding,
+        wrap: bool,
     ) -> bool {
-        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, true)
+        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, true, wrap)
     }
 
     fn start_collection_manual_navigation_inner(
@@ -1777,6 +1824,7 @@ impl App {
         delta: i32,
         landing: ManualMediaNavigationLanding,
         display_unit_step: bool,
+        wrap: bool,
     ) -> bool {
         if delta == 0 {
             return false;
@@ -1799,16 +1847,41 @@ impl App {
                 } if *active_landing == landing
                     && self.collection_navigation_manual_continuation_is_current(stamp, landing)
             );
-            if continuation_is_current
-                && pending.accumulate_manual(delta, landing, still_only, display_unit_step)
-            {
-                let sequence = self
-                    .top_level_grid_view
-                    .advance_collection_navigation_sequence();
-                pending.set_intent_sequence(sequence);
-                self.top_level_grid_view
-                    .set_collection_navigation_pending(Some(pending));
-                return true;
+            if continuation_is_current {
+                let accepted = match &mut pending {
+                    CollectionNavigationPending::AwaitingManualContinuation {
+                        steps,
+                        display_unit_step: active_display_unit_step,
+                        still_only: active_still_only,
+                        wrap: active_wrap,
+                        ..
+                    } if *active_wrap != wrap => {
+                        // A changed wrap policy starts a new intent, discarding the old queued
+                        // inputs. Keep the landing owner until its native swap completes: the
+                        // caller's presenter index may still belong to the previous root order.
+                        *steps = delta.clamp(-32, 32);
+                        *active_display_unit_step = display_unit_step;
+                        *active_still_only = still_only;
+                        *active_wrap = wrap;
+                        true
+                    }
+                    _ => pending.accumulate_manual(
+                        delta,
+                        landing,
+                        still_only,
+                        display_unit_step,
+                        wrap,
+                    ),
+                };
+                if accepted {
+                    let sequence = self
+                        .top_level_grid_view
+                        .advance_collection_navigation_sequence();
+                    pending.set_intent_sequence(sequence);
+                    self.top_level_grid_view
+                        .set_collection_navigation_pending(Some(pending));
+                    return true;
+                }
             }
             self.top_level_grid_view
                 .set_collection_navigation_pending(Some(pending));
@@ -1831,7 +1904,13 @@ impl App {
             .advance_collection_navigation_sequence();
         if self
             .top_level_grid_view
-            .accumulate_collection_manual_navigation(delta, landing, still_only, display_unit_step)
+            .accumulate_collection_manual_navigation(
+                delta,
+                landing,
+                still_only,
+                display_unit_step,
+                wrap,
+            )
         {
             if let Some(pending) = self
                 .top_level_grid_view
@@ -1855,6 +1934,7 @@ impl App {
                 display_unit_step,
                 landing,
                 still_only,
+                wrap,
             },
         )
     }
@@ -2023,12 +2103,16 @@ impl App {
         let Some(origin) = self.collection_root_navigation_origin(fs_idx, false) else {
             return false;
         };
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return false;
+        };
         self.enqueue_or_reuse_collection_automatic_navigation(
             ctx,
             origin,
             CollectionNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 wraps: self.video_continuous_mode.wraps(),
             },
         )
@@ -2044,12 +2128,16 @@ impl App {
         let Some(origin) = self.collection_root_navigation_origin(fs_idx, false) else {
             return false;
         };
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return false;
+        };
         self.enqueue_or_reuse_collection_automatic_navigation(
             ctx,
             origin,
             CollectionNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 wraps: self.video_continuous_mode.wraps(),
             },
         )
@@ -2064,12 +2152,16 @@ impl App {
         let Some(origin) = self.collection_root_navigation_origin(fs_idx, false) else {
             return false;
         };
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return false;
+        };
         self.enqueue_or_reuse_collection_automatic_navigation(
             ctx,
             origin,
             CollectionNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 wraps: self.video_continuous_mode.wraps(),
             },
         )
@@ -2105,24 +2197,23 @@ impl App {
             self.finish_collection_navigation_without_target_no_context(&request.action);
             return true;
         }
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let worker_cancel = Arc::clone(&cancel);
         let worker_path = target.source_path.clone();
         let worker_password = password.clone();
         let want_direction = self.settings.follow_document_reading_direction
             && self.spread_db.as_ref().is_ok_and(|db| {
-                db.get_state_with_fallback(&worker_path, None)
-                    .mode
-                    .is_none()
+                let stored = db.get_state_with_fallback(&worker_path, None);
+                stored.needs_document_direction(true)
             });
         let (sender, receiver) = std::sync::mpsc::channel();
         let spawn = std::thread::Builder::new()
             .name("collection-pdf-password-preflight".into())
             .spawn(move || {
-                let result = crate::pdf_loader::enumerate_pages_with_options(
+                let result = crate::pdf_loader::enumerate_pages_for_navigation(
                     &worker_path,
                     Some(&worker_password),
-                    Some(worker_cancel),
+                    &worker_cancel,
                     crate::pdf_loader::EnumerateOptions { want_direction },
                 );
                 let _ = sender.send(result);
@@ -2312,7 +2403,7 @@ impl App {
                 let _ = sender.send(result);
             });
         if spawn.is_err() {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
         self.top_level_grid_view
@@ -2360,7 +2451,7 @@ impl App {
                     CollectionNavigationTargetKind::OuterContainer,
                 );
             } else {
-                self.finish_collection_navigation_without_target(ctx, &request.action);
+                self.finish_collection_navigation_request_without_target(ctx, &request);
             }
             return;
         }
@@ -2382,9 +2473,8 @@ impl App {
                 want_direction: target.resolved_kind == CollectionResolvedKind::Pdf
                     && self.settings.follow_document_reading_direction
                     && self.spread_db.as_ref().is_ok_and(|db| {
-                        db.get_state_with_fallback(&target.source_path, None)
-                            .mode
-                            .is_none()
+                        let stored = db.get_state_with_fallback(&target.source_path, None);
+                        stored.needs_document_direction(true)
                     }),
                 target,
             })
@@ -2396,7 +2486,7 @@ impl App {
         };
         let tree_options = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
         let show_hidden_files = self.settings.show_hidden_files;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
         let warm_live_delivery = request
@@ -2425,7 +2515,7 @@ impl App {
                 if let Some((owner, retained)) = warm_live_delivery
                     && !worker_cancel.load(Ordering::Acquire)
                 {
-                    let live = match super::collection_grid::prepare_collection_grid_live_thumbnail_sources(retained.payload.clone(), &worker_cancel) {
+                    let live = match super::collection_grid::prepare_collection_grid_live_thumbnail_sources(retained.payload.clone(), worker_cancel.flag()) {
                         Ok(live) => live,
                         Err(error) => { let _ = sender.send(Err(error)); return; }
                     };
@@ -2454,7 +2544,7 @@ impl App {
                 let _ = sender.send(result);
             });
         if spawn.is_err() {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
         self.top_level_grid_view
@@ -2500,7 +2590,7 @@ impl App {
         match pending {
             CollectionNavigationPending::RequestNeeded { request, watch } => {
                 if !self.collection_navigation_request_is_current(&request) {
-                    self.finish_collection_navigation_without_target_no_context(&request.action);
+                    self.finish_collection_navigation_rejected_request(ctx, &request);
                 } else if !request.lease.is_due(Instant::now()) {
                     self.top_level_grid_view
                         .set_collection_navigation_pending(Some(
@@ -2517,35 +2607,36 @@ impl App {
             } => {
                 let observation = observe_revision(&watch, request.origin.collection_id);
                 match receiver.try_recv() {
-                    Ok(Ok(snapshot)) => match observation {
-                        RevisionObservation::Deleted => {
-                            self.finish_collection_navigation_without_target(ctx, &request.action)
+                    Ok(Ok(snapshot)) => {
+                        match observation {
+                            RevisionObservation::Deleted => self
+                                .finish_collection_navigation_request_without_target(ctx, &request),
+                            RevisionObservation::Revision(revision)
+                                if revision > snapshot.revision() =>
+                            {
+                                self.restart_collection_navigation(ctx, request)
+                            }
+                            _ if snapshot.collection_id() == request.origin.collection_id => self
+                                .spawn_collection_navigation_prepare(ctx, request, watch, snapshot),
+                            _ => self
+                                .finish_collection_navigation_request_without_target(ctx, &request),
                         }
-                        RevisionObservation::Revision(revision)
-                            if revision > snapshot.revision() =>
-                        {
-                            self.restart_collection_navigation(ctx, request)
-                        }
-                        _ if snapshot.collection_id() == request.origin.collection_id => {
-                            self.spawn_collection_navigation_prepare(ctx, request, watch, snapshot)
-                        }
-                        _ => self.finish_collection_navigation_without_target(ctx, &request.action),
-                    },
+                    }
                     Ok(Err(error)) if error.is_read_retryable() => {
                         self.defer_collection_navigation_read(ctx, request, Some(watch));
                     }
                     Ok(Err(error)) => {
-                        self.finish_collection_navigation_store_error(ctx, &request.action, &error)
+                        self.finish_collection_navigation_store_error(ctx, &request, &error)
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => self
                         .finish_collection_navigation_read_error(
                             ctx,
-                            &request.action,
+                            &request,
                             "応答が途切れました",
                         ),
                     Err(crossbeam_channel::TryRecvError::Empty) => {
                         if matches!(observation, RevisionObservation::Deleted) {
-                            self.finish_collection_navigation_without_target(ctx, &request.action);
+                            self.finish_collection_navigation_request_without_target(ctx, &request);
                         } else {
                             self.top_level_grid_view
                                 .set_collection_navigation_pending(Some(
@@ -2568,7 +2659,7 @@ impl App {
             } => match observe_revision(&watch, request.origin.collection_id) {
                 RevisionObservation::Deleted => {
                     cancel.store(true, Ordering::Release);
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 }
                 RevisionObservation::Revision(revision) if revision > exact_revision => {
                     cancel.store(true, Ordering::Release);
@@ -2618,7 +2709,7 @@ impl App {
                         self.finish_collection_navigation_without_target_no_context(&request.action)
                     }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.finish_collection_navigation_without_target(ctx, &request.action)
+                        self.finish_collection_navigation_request_without_target(ctx, &request)
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         self.top_level_grid_view
@@ -2643,13 +2734,13 @@ impl App {
                 receiver,
             } => match observe_revision(&watch, request.origin.collection_id) {
                 RevisionObservation::Deleted => {
-                    cancel.store(true, Ordering::Release);
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    cancel.cancel();
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 }
                 RevisionObservation::Revision(revision)
                     if revision > prepared.collection_revision =>
                 {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.restart_collection_navigation(ctx, request);
                 }
                 _ if request
@@ -2657,7 +2748,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|owner| owner.page_edit_revision != self.page_edit_revision) =>
                 {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.restart_collection_navigation(ctx, request);
                 }
                 _ => match receiver.try_recv() {
@@ -2667,7 +2758,7 @@ impl App {
                         // poll observation and this landing reply.
                         match observe_revision(&watch, request.origin.collection_id) {
                             RevisionObservation::Deleted => self
-                                .finish_collection_navigation_without_target(ctx, &request.action),
+                                .finish_collection_navigation_request_without_target(ctx, &request),
                             RevisionObservation::Revision(revision)
                                 if revision > prepared.collection_revision =>
                             {
@@ -2686,7 +2777,7 @@ impl App {
                                 )
                             }
                             _ => self
-                                .finish_collection_navigation_without_target(ctx, &request.action),
+                                .finish_collection_navigation_request_without_target(ctx, &request),
                         }
                     }
                     Ok(Ok(None)) => {
@@ -2720,14 +2811,14 @@ impl App {
                                 CollectionNavigationTargetKind::OuterContainer,
                             );
                         } else {
-                            self.finish_collection_navigation_without_target(ctx, &request.action)
+                            self.finish_collection_navigation_request_without_target(ctx, &request)
                         }
                     }
                     Ok(Err(CollectionPrepareError::Cancelled)) => {
                         self.finish_collection_navigation_without_target_no_context(&request.action)
                     }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.finish_collection_navigation_without_target(ctx, &request.action)
+                        self.finish_collection_navigation_request_without_target(ctx, &request)
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         self.top_level_grid_view
@@ -2776,7 +2867,7 @@ impl App {
                         ));
                 } else {
                     self.pdf_password_request = None;
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 }
             }
             CollectionNavigationPending::PdfPasswordPreflighting {
@@ -2793,14 +2884,14 @@ impl App {
                 if !self.collection_navigation_exact_target_is_current(&request, &prepared, &target)
                     || matches!(observation, RevisionObservation::Deleted)
                 {
-                    cancel.store(true, Ordering::Release);
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    cancel.cancel();
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 } else if matches!(
                     observation,
                     RevisionObservation::Revision(revision)
                         if revision > prepared.collection_revision
                 ) {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.restart_collection_navigation(ctx, request);
                 } else {
                     match receiver.try_recv() {
@@ -2885,7 +2976,7 @@ impl App {
                         Ok(Ok(_))
                         | Ok(Err(_))
                         | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            self.finish_collection_navigation_without_target(ctx, &request.action)
+                            self.finish_collection_navigation_request_without_target(ctx, &request)
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => self
                             .top_level_grid_view
@@ -2909,6 +3000,7 @@ impl App {
                 landing,
                 display_unit_step,
                 still_only,
+                wrap,
                 stamp,
             } => {
                 if !self.collection_navigation_manual_continuation_is_current(&stamp, landing) {
@@ -2930,6 +3022,7 @@ impl App {
                                 landing,
                                 display_unit_step,
                                 still_only,
+                                wrap,
                                 stamp,
                             },
                         ));
@@ -2942,6 +3035,7 @@ impl App {
                             fs_idx,
                             if forward { 1 } else { -1 },
                             landing,
+                            wrap,
                         )
                     } else {
                         self.start_collection_manual_navigation(
@@ -2949,6 +3043,7 @@ impl App {
                             fs_idx,
                             if forward { 1 } else { -1 },
                             landing,
+                            wrap,
                         )
                     };
                     if started
@@ -3034,11 +3129,20 @@ impl App {
         &self,
         request: &CollectionNavigationRequest,
     ) -> bool {
+        !self
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| matches!(session.load, CollectionGridLoadState::Deleted { .. }))
+            && self.collection_navigation_request_owner_is_current(request)
+    }
+
+    /// A deleted Collection cannot supply a target, but still owns its fullscreen EOF terminal.
+    fn collection_navigation_request_owner_is_current(
+        &self,
+        request: &CollectionNavigationRequest,
+    ) -> bool {
         let owner_current = match self.top_level_grid_view.collection_session() {
-            Some(session) => {
-                session.identity.collection_id == request.origin.collection_id
-                    && !matches!(session.load, CollectionGridLoadState::Deleted { .. })
-            }
+            Some(session) => session.identity.collection_id == request.origin.collection_id,
             None => matches!(
                 self.top_level_grid_view.return_to(),
                 Some(TopLevelGridRestore::Collection(restore))
@@ -3071,27 +3175,40 @@ impl App {
             CollectionNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             }
             | CollectionNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             } => {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_continuous_mode.is_enabled()
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+                    && self.media_navigation_eof_transport_is_current(
+                        *fs_idx,
+                        *seek_serial,
+                        *player_identity,
+                    )
             }
             #[cfg(windows)]
             CollectionNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             } => {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_continuous_mode.is_enabled()
                     && self.video_audio_mode == Some(*fs_idx)
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+                    && self.media_navigation_eof_transport_is_current(
+                        *fs_idx,
+                        *seek_serial,
+                        *player_identity,
+                    )
             }
             CollectionNavigationAction::OuterGrid { .. } => {
                 self.fullscreen_idx.is_none()
@@ -3573,6 +3690,8 @@ impl App {
         payload: PhysicalHistoryPreflightPayload,
         restore_intent: super::StartupListIntent,
     ) -> Option<PreparedCollectionOuterAdoption> {
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_intent = restore_intent.clone();
         // This immutable membership also proves every target lookup in the outer root installer.
         // Its preserved-player/EPUB admission branch is excluded by preserve_active_media=false.
         if !root
@@ -3640,6 +3759,8 @@ impl App {
             route.child(Self::facet_scope_for_location(&location)),
         );
         let adoption = self.prepare_main_list_adoption(navigation, destination)?;
+        #[cfg(all(windows, feature = "test-script"))]
+        self.test_script_record_folder_load_owner(&count_intent);
         Some(PreparedCollectionOuterAdoption {
             listing,
             token,
@@ -3693,13 +3814,13 @@ impl App {
             .as_ref()
             .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
         {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
 
         match observe_revision(&watch, request.origin.collection_id) {
             RevisionObservation::Deleted => {
-                self.finish_collection_navigation_without_target(ctx, &request.action);
+                self.finish_collection_navigation_request_without_target(ctx, &request);
                 return;
             }
             RevisionObservation::Revision(revision) if revision > prepared.collection_revision => {
@@ -3725,7 +3846,7 @@ impl App {
             return;
         }
         if !self.collection_navigation_exact_target_is_current(&request, &prepared, &ready.target) {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
         let loops_current_media = request
@@ -3738,7 +3859,10 @@ impl App {
             if let Some(fs_idx) = self.fullscreen_idx
                 && let Some(super::FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
-                player.seek(0.0);
+                player.seek(
+                    0.0,
+                    crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
+                );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
@@ -3753,7 +3877,7 @@ impl App {
                     Ok(request) => request,
                     Err(reason) => {
                         self.show_open_admission_refusal(reason);
-                        self.finish_collection_navigation_without_target(ctx, &request.action);
+                        self.finish_collection_navigation_request_without_target(ctx, &request);
                         return;
                     }
                 };
@@ -3931,7 +4055,7 @@ impl App {
                 continuation,
             );
             let outcome = self
-                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                     ready.target.source_path,
                     false,
                     owner,
@@ -3939,7 +4063,8 @@ impl App {
                     None,
                     restore_intent.clone(),
                     request.navigation.take(),
-                );
+            super::MainListRequestStage::Continuation,
+        );
             match action {
                 CollectionNavigationAction::OuterFullscreen {
                     resume_slideshow, ..
@@ -4059,6 +4184,12 @@ impl App {
                 self.finish_collection_navigation_without_target(ctx, &action);
                 return;
             };
+            #[cfg(all(windows, feature = "test-script"))]
+            if is_outer_target {
+                // Without a main history request, this adopted Collection lease owns the
+                // physical load. Its InternalHydration calls below only execute that owner.
+                self.test_script_record_folder_load_owner(&restore_intent);
+            }
             Some(landing)
         };
         let target_idx = landing.as_ref().map_or(0, |landing| landing.target_idx);
@@ -4314,6 +4445,7 @@ impl App {
                 queued_steps,
                 display_unit_step,
                 still_only,
+                wrap,
                 ..
             } => {
                 match landing {
@@ -4351,6 +4483,7 @@ impl App {
                                     landing,
                                     display_unit_step,
                                     still_only,
+                                    wrap,
                                     stamp,
                                 },
                             ));
@@ -4406,6 +4539,65 @@ impl App {
         ctx.request_repaint();
     }
 
+    fn finish_collection_navigation_rejected_request(
+        &mut self,
+        ctx: &egui::Context,
+        request: &CollectionNavigationRequest,
+    ) {
+        if request.action.is_media_eof()
+            && self.collection_navigation_request_owner_is_current(request)
+        {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
+        } else {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+        }
+    }
+
+    fn finish_collection_navigation_request_without_target(
+        &mut self,
+        ctx: &egui::Context,
+        request: &CollectionNavigationRequest,
+    ) {
+        if !request.action.is_media_eof()
+            || self.collection_navigation_request_owner_is_current(request)
+        {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
+        } else {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+        }
+    }
+
+    fn finish_collection_navigation_eof(&mut self, action: &CollectionNavigationAction) -> bool {
+        match action {
+            CollectionNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            }
+            | CollectionNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
+                true
+            }
+            #[cfg(windows)]
+            CollectionNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn finish_collection_navigation_without_target(
         &mut self,
         ctx: &egui::Context,
@@ -4420,6 +4612,7 @@ impl App {
                 }
                 let _ = landing;
                 self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end: *delta > 0,
                     at: std::time::Instant::now(),
                 });
@@ -4429,7 +4622,7 @@ impl App {
                 self.release_fs_nav_lock();
             }
             CollectionNavigationAction::OuterGrid { forward, .. } => {
-                self.show_feedback_toast(if *forward {
+                self.show_feedback_warning(if *forward {
                     "コレクション内の次のコンテナはありません".into()
                 } else {
                     "コレクション内の前のコンテナはありません".into()
@@ -4452,12 +4645,29 @@ impl App {
                 let _ = native_toast;
                 self.release_fs_nav_lock();
             }
-            CollectionNavigationAction::VideoContinuousEof { .. }
-            | CollectionNavigationAction::MusicContinuousEof { .. } => {
+            CollectionNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            }
+            | CollectionNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
                 self.show_feedback_toast("コレクション末尾です".into());
             }
             #[cfg(windows)]
-            CollectionNavigationAction::VideoAudioModeContinuousEof { .. } => {
+            CollectionNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
                 self.show_feedback_toast("コレクション末尾です".into());
             }
         }
@@ -4562,6 +4772,258 @@ mod tests {
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn cancellation_slideshow_request(
+        app: &App,
+        context_id: crate::app::ViewerContextId,
+    ) -> CollectionNavigationRequest {
+        CollectionNavigationRequest {
+            origin: CollectionNavigationOrigin {
+                context_id,
+                collection_id: CollectionId::new(),
+                surface_generation: app.top_level_grid_view.generation(),
+                items_generation: app.items_generation,
+                intent_sequence: app.top_level_grid_view.collection_navigation_sequence(),
+                anchor: None,
+            },
+            action: CollectionNavigationAction::Slideshow {
+                fs_idx: 0,
+                end_action: app.settings.slideshow_end_action,
+                outer: true,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+            lease: navigation_test_lease(),
+            book_owner: None,
+            navigation: None,
+        }
+    }
+
+    fn transferred_archive_for_cancellation(
+        app: &mut App,
+        request: CollectionNavigationRequest,
+    ) -> (
+        Arc<AtomicBool>,
+        std::sync::mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg>,
+    ) {
+        use crate::app::top_level_grid_view::{
+            CollectionGridRequestStamp, CollectionGridSourceOpenOwner,
+        };
+        use crate::ui_dialogs::archive_convert::{
+            ArchiveConvertCompletionPolicy, ArchiveConvertPhase, ArchiveConvertState,
+        };
+        let path = PathBuf::from("C:/fixture/collection-slideshow.7z");
+        let source_key = crate::collection_store::CollectionRegistration::from_trusted_path(
+            &path,
+            CollectionResolvedKind::ConvertibleArchive,
+        )
+        .unwrap()
+        .source_key()
+        .clone();
+        let owner = CollectionGridSourceOpenOwner {
+            stamp: CollectionGridRequestStamp {
+                context_id: request.origin.context_id,
+                surface_generation: request.origin.surface_generation,
+                collection_id: request.origin.collection_id,
+            },
+            accepted_revision: 1,
+            wanted_revision: 1,
+            anchor: CollectionGridViewportAnchor {
+                entry_id: CollectionEntryId::new(),
+                source_key,
+            },
+            navigation_prepared: None,
+            navigation_origin: None,
+            navigation_request: Some(request),
+            navigation_watch: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.archive_convert = Some(Box::new(ArchiveConvertState {
+            src_path: path.clone(),
+            input_seq: 0,
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+            password: None,
+            password_input: String::new(),
+            phase: ArchiveConvertPhase::Scanning,
+            cancel: cancel.clone(),
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            completion: ArchiveConvertCompletionPolicy::MainGridArchive(
+                crate::app::MainGridArchiveTransitionIntent {
+                    source_path: path,
+                    reading_history_return_from: None,
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: false,
+                    smart_folder_owner: crate::app::SmartGridArchiveOwner::None,
+                    rating_grid_owner: None,
+                    collection_grid_owner: Some(owner),
+                    collection_navigation_continuation: None,
+                },
+            ),
+            restore_intent: crate::app::StartupListIntent::PageContinuation,
+            pending_sibling_output: None,
+            auto_fullscreen: true,
+            deferred_fullscreen: None,
+            suppress_confirm: true,
+            suppress_confirm_next_time: false,
+        }));
+        (cancel, tx)
+    }
+
+    fn assert_transferred_archive_still_owned(
+        app: &App,
+        cancel: &Arc<AtomicBool>,
+        context_id: crate::app::ViewerContextId,
+    ) {
+        use crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy;
+        let state = app
+            .archive_convert
+            .as_ref()
+            .expect("foreign archive owner survives");
+        assert!(Arc::ptr_eq(&state.cancel, cancel));
+        assert!(!cancel.load(Ordering::Acquire));
+        let ArchiveConvertCompletionPolicy::MainGridArchive(intent) = &state.completion else {
+            panic!("the same transferred completion owner must remain installed");
+        };
+        let request = intent
+            .collection_grid_owner
+            .as_ref()
+            .unwrap()
+            .navigation_request
+            .as_ref()
+            .unwrap();
+        assert_eq!(request.origin.context_id, context_id);
+        assert!(request.is_slideshow());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_slideshow_cancel_preserves_foreign_transferred_archive_and_local_sequence() {
+        let mut app = setup_app_for_test();
+        let sibling = app.build_window_context_for_test(94_101, |_| {});
+        let request = cancellation_slideshow_request(&app, sibling);
+        let (cancel, tx) = transferred_archive_for_cancellation(&mut app, request);
+        let sequence = app.top_level_grid_view.collection_navigation_sequence();
+        app.cancel_collection_slideshow_navigation_intent();
+        assert_eq!(
+            app.top_level_grid_view.collection_navigation_sequence(),
+            sequence
+        );
+        assert_transferred_archive_still_owned(&app, &cancel, sibling);
+        // General cancellation has its own context-owned sequence, but still cannot take
+        // the process-global archive receiver from a different viewer.
+        app.cancel_collection_navigation_intent();
+        assert_transferred_archive_still_owned(&app, &cancel, sibling);
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::Rejected {
+                        message: "foreign receiver remains live".into()
+                    }
+                ))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_slideshow_cancel_retires_local_pending_without_cancelling_foreign_archive() {
+        let mut app = setup_app_for_test();
+        let sibling = app.build_window_context_for_test(94_102, |_| {});
+        let transferred = cancellation_slideshow_request(&app, sibling);
+        let (cancel, _tx) = transferred_archive_for_cancellation(&mut app, transferred);
+        let local = cancellation_slideshow_request(&app, app.collection_grid_context_id());
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::RequestNeeded {
+                request: local,
+                watch: None,
+            }));
+        let sequence = app.top_level_grid_view.collection_navigation_sequence();
+        app.cancel_collection_slideshow_navigation_intent();
+        assert!(
+            app.top_level_grid_view
+                .take_collection_navigation_pending()
+                .is_none()
+        );
+        assert_ne!(
+            app.top_level_grid_view.collection_navigation_sequence(),
+            sequence
+        );
+        assert_transferred_archive_still_owned(&app, &cancel, sibling);
+    }
+
+    #[test]
+    fn slideshow_ring_stop_cancels_collection_navigation_intent() {
+        let mut app = setup_app_for_test();
+        app.items = vec![crate::grid_item::GridItem::Image(PathBuf::from(
+            "C:/fixture/slideshow.png",
+        ))];
+        app.fullscreen_idx = Some(0);
+        app.slideshow_playing = true;
+        app.slideshow_anchor_idx = Some(0);
+        let request = cancellation_slideshow_request(&app, app.collection_grid_context_id());
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::RequestNeeded {
+                request,
+                watch: None,
+            }));
+        let sequence = app.top_level_grid_view.collection_navigation_sequence();
+        app.apply_ring_action(
+            &egui::Context::default(),
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            crate::ring_shortcut::RingActionId::ImageSlideshow,
+            "test",
+        );
+        assert!(!app.slideshow_playing);
+        assert!(app.slideshow_anchor_idx.is_none());
+        assert!(
+            app.top_level_grid_view
+                .take_collection_navigation_pending()
+                .is_none()
+        );
+        assert_ne!(
+            app.top_level_grid_view.collection_navigation_sequence(),
+            sequence
+        );
+    }
+
+    #[test]
+    fn collection_slideshow_cancel_retires_same_context_archive_despite_stale_generation() {
+        for slideshow_only in [false, true] {
+            let mut app = setup_app_for_test();
+            let mut request =
+                cancellation_slideshow_request(&app, app.collection_grid_context_id());
+            request.origin.items_generation = app.items_generation.wrapping_add(1);
+            request.origin.surface_generation =
+                app.top_level_grid_view.generation().wrapping_add(1);
+            request.origin.intent_sequence = app
+                .top_level_grid_view
+                .collection_navigation_sequence()
+                .wrapping_add(1);
+            let (cancel, tx) = transferred_archive_for_cancellation(&mut app, request);
+            if slideshow_only {
+                app.cancel_collection_slideshow_navigation_intent();
+            } else {
+                app.cancel_collection_navigation_intent();
+            }
+            assert!(app.archive_convert.is_none());
+            assert!(cancel.load(Ordering::Acquire));
+            assert!(
+                tx.send(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                        crate::ui_dialogs::archive_convert::ArchiveScanOutcome::Rejected {
+                            message: "retired receiver".into()
+                        }
+                    ))
+                )
+                .is_err()
+            );
+        }
+    }
 
     fn write_single_page_zip(path: &std::path::Path, page: &str) {
         let file = std::fs::File::create(path).unwrap();
@@ -4996,7 +5458,10 @@ mod tests {
         );
         let sibling = app.push_window_context_for_test(&ctx, 133902, |owner| {
             owner.fs_nav_locked_gen = Some(owner.items_generation);
-            owner.fs_holdover_tex = Some(super::super::FsHoldover::FolderNavigation(None));
+            owner.fs_holdover_tex = Some(super::super::FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary,
+            ));
         });
         let sibling_before = app
             .with_viewer_context(sibling, |owner| {
@@ -5016,6 +5481,8 @@ mod tests {
         app.fs_cache.insert(
             0,
             super::super::FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(pixels),
                 source_dims: Some([2, 1]),
@@ -5196,6 +5663,8 @@ mod tests {
         app.adopt_main_facet_route(root_route.clone());
         app.settings.facet_filter.exts.insert("zip".into());
         let history = app.folder_nav_history_snapshot();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         assert!(app.start_collection_outer_grid_navigation(&ctx, true));
         assert!(
@@ -5224,6 +5693,13 @@ mod tests {
             app.poll_collection_navigation(&ctx);
             std::thread::sleep(Duration::from_millis(2));
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
+            app.finish_page_identity_preparation_for_test();
+            app.poll_collection_navigation(&ctx);
+            assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
+        }
         assert_eq!(app.current_folder.as_ref(), Some(&book));
         assert!(app.items.iter().any(|item| matches!(item, crate::grid_item::GridItem::ZipImage { entry_name, .. } if entry_name == "page.jpg")));
         assert!(!app.facet_filter_active());
@@ -5241,6 +5717,114 @@ mod tests {
                 .position,
             CollectionGridPosition::PhysicalSource { .. }
         ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_prepared_collection_outer_owner_before_install_once() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book.zip");
+        write_single_page_zip(&book, "page.jpg");
+        let (mut app, client) = start_ready_app(&temp.path().join("outer-count.db"));
+        app.active_quick_folder_slot = None;
+        let created = recv(client.create_collection("outer count".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &book,
+                            CollectionResolvedKind::Zip,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(added.snapshot.collection_id()) {
+            assert!(Instant::now() < deadline);
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let root = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: root.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(root, None);
+        app.selected = None;
+        assert!(app.start_collection_outer_grid_navigation(&ctx, true));
+        let (mut request, root, ready) = loop {
+            assert!(
+                Instant::now() < deadline,
+                "outer request must reach preflight"
+            );
+            let pending = app
+                .top_level_grid_view
+                .take_collection_navigation_pending()
+                .unwrap();
+            if let CollectionNavigationPending::Preflighting {
+                request,
+                prepared,
+                receiver,
+                ..
+            } = pending
+            {
+                let ready = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                break (request, prepared, ready);
+            }
+            app.top_level_grid_view
+                .set_collection_navigation_pending(Some(pending));
+            app.poll_collection_navigation(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(request.navigation.is_some());
+        let CollectionNavigationPreflightPayload::Zip(zip) = ready.payload else {
+            panic!("the real registered ZIP must yield its prepared listing");
+        };
+        let before_loads = app.test_script_folder_load_requests;
+        let before_generation = app.items_generation;
+        let before_items = app.items.clone();
+        let prepared = app
+            .prepare_collection_outer_physical_adoption(
+                &mut request,
+                &root,
+                &ready.target,
+                PhysicalHistoryPreflightPayload::Zip(zip),
+                super::super::StartupListIntent::ExplicitList,
+            )
+            .expect("the current physical owner is accepted");
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
+        assert_eq!(app.items_generation, before_generation);
+        assert_eq!(
+            app.items, before_items,
+            "admission has not installed the listing"
+        );
+        app.install_collection_outer_physical_adoption(
+            &mut request,
+            root,
+            &ready.target,
+            prepared,
+            super::super::StartupListIntent::ExplicitList,
+            None,
+        );
+        app.finish_page_identity_preparation_for_test();
+        app.poll_collection_navigation(&ctx);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(app.items_generation > before_generation);
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -5955,7 +6539,7 @@ mod tests {
                 watch: client.subscribe().unwrap(),
                 prepared,
                 target_kind,
-                cancel: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
                 receiver,
             }));
         let key = crate::adjustment_db::normalize_path(&second);
@@ -6315,6 +6899,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: Some(Arc::new(owner)),
             perf_started_at: None,
@@ -6589,6 +7174,7 @@ mod tests {
         let video = CollectionNavigationAction::VideoContinuousEof {
             fs_idx: 0,
             seek_serial: 7,
+            player_identity: 0,
             wraps: false,
         };
         assert!(!pending.matches_automatic_intent(&origin_at_request, &video));
@@ -6597,6 +7183,7 @@ mod tests {
             &CollectionNavigationAction::VideoContinuousEof {
                 fs_idx: 0,
                 seek_serial: 8,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -6617,6 +7204,7 @@ mod tests {
             &CollectionNavigationAction::VideoContinuousEof {
                 fs_idx: 0,
                 seek_serial: 7,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -6625,6 +7213,7 @@ mod tests {
             &CollectionNavigationAction::VideoContinuousEof {
                 fs_idx: 0,
                 seek_serial: 8,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -6633,6 +7222,7 @@ mod tests {
             &CollectionNavigationAction::MusicContinuousEof {
                 fs_idx: 0,
                 seek_serial: 7,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -6758,6 +7348,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
@@ -6949,6 +7540,7 @@ mod tests {
             &[], // Collection root owns reader order; a caller's list display order is irrelevant.
             0,
             1,
+            false,
             "collection_manual_route_test",
             ManualMediaNavigationLanding::Fullscreen,
         );
@@ -7511,6 +8103,255 @@ mod tests {
     }
 
     #[test]
+    fn navigation_preflight_pdf_enqueues_critical() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("foreground.pdf");
+        std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+        let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&path);
+        let (app, _) = start_ready_app(&temp.path().join("collection.db"));
+        let preflight = app.start_physical_history_preflight(path, None).unwrap();
+        let job = pool.take();
+        let priority = job.priority();
+        job.complete(1);
+        let result = preflight
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            PhysicalHistoryPreflightPayload::PdfPages(_)
+        ));
+        assert_eq!(priority, crate::pdf_loader::JobPriority::Critical);
+    }
+
+    #[test]
+    fn navigation_preflight_collection_candidates_release_each_pdf_and_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("empty.pdf");
+        let second = temp.path().join("next.pdf");
+        let never = temp.path().join("never.pdf");
+        let first_pool = crate::pdf_loader::TestPdfEnumeratePool::new(&first);
+        let second_pool = crate::pdf_loader::TestPdfEnumeratePool::new(&second);
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            preflight_candidates(
+                vec![
+                    candidate(first, CollectionResolvedKind::Pdf),
+                    candidate(second, CollectionResolvedKind::Pdf),
+                    candidate(never, CollectionResolvedKind::Pdf),
+                ],
+                1,
+                false,
+                crate::folder_tree::FolderTreeOptions::default(),
+                false,
+                &worker_cancel,
+                CollectionId::new(),
+                1,
+            )
+        });
+        let first_job = first_pool.take();
+        assert_eq!(
+            first_job.priority(),
+            crate::pdf_loader::JobPriority::Critical
+        );
+        first_job.complete(0);
+        let second_job = second_pool.take();
+        assert_eq!(
+            second_job.priority(),
+            crate::pdf_loader::JobPriority::Critical
+        );
+        cancel.cancel();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(CollectionPrepareError::Cancelled)
+        ));
+        assert!(second_job.cancelled());
+    }
+
+    #[test]
+    fn navigation_preflight_password_and_open_failures_keep_existing_payloads() {
+        use crate::pdf_loader::PdfReadError;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("errors.pdf");
+        std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+        let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&path);
+        let (app, _) = start_ready_app(&temp.path().join("collection.db"));
+        for failure in [
+            PdfReadError::PasswordRequired,
+            PdfReadError::NotConverted,
+            PdfReadError::EpubUnavailable {
+                reason: Arc::from("test"),
+            },
+        ] {
+            let preflight = app
+                .start_physical_history_preflight(path.clone(), None)
+                .unwrap();
+            let job = pool.take();
+            assert_eq!(job.priority(), crate::pdf_loader::JobPriority::Critical);
+            job.fail(failure.clone());
+            let payload = preflight
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                (&failure, payload),
+                (
+                    PdfReadError::PasswordRequired,
+                    PhysicalHistoryPreflightPayload::PdfPasswordRequired
+                ) | (
+                    PdfReadError::NotConverted,
+                    PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::NotConverted
+                    )
+                ) | (
+                    PdfReadError::EpubUnavailable { .. },
+                    PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::EpubUnavailable(_)
+                    )
+                )
+            ));
+            let worker_path = path.clone();
+            let worker = std::thread::spawn(move || {
+                preflight_candidates(
+                    vec![candidate(worker_path, CollectionResolvedKind::Pdf)],
+                    1,
+                    false,
+                    crate::folder_tree::FolderTreeOptions::default(),
+                    false,
+                    &Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
+                    CollectionId::new(),
+                    1,
+                )
+            });
+            pool.take().fail(failure.clone());
+            let ready = worker.join().unwrap().unwrap().unwrap();
+            assert!(matches!(
+                (failure, ready.payload),
+                (
+                    PdfReadError::PasswordRequired,
+                    CollectionNavigationPreflightPayload::PdfPasswordRequired
+                ) | (
+                    PdfReadError::NotConverted,
+                    CollectionNavigationPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::NotConverted
+                    )
+                ) | (
+                    PdfReadError::EpubUnavailable { .. },
+                    CollectionNavigationPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::EpubUnavailable(_)
+                    )
+                )
+            ));
+        }
+        let preflight = app.start_physical_history_preflight(path, None).unwrap();
+        pool.take().complete(0);
+        assert!(
+            preflight
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .err()
+                .unwrap()
+                .contains("ページがありません")
+        );
+    }
+
+    #[test]
+    fn navigation_preflight_collection_password_resume_enqueues_critical() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&pdf);
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("password".into()).unwrap());
+        let snapshot = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &pdf,
+                            CollectionResolvedKind::Pdf,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        )
+        .snapshot;
+        let prepared = prepare_snapshot(&snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .clone();
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        let mut request = CollectionNavigationRequest {
+            origin: app.collection_outer_navigation_origin(Some(0)).unwrap(),
+            action: CollectionNavigationAction::OuterFullscreen {
+                fs_idx: 0,
+                forward: true,
+                resume_slideshow: false,
+                native_toast: false,
+                queued_steps: 0,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+            lease: navigation_test_lease(),
+            book_owner: None,
+            navigation: None,
+        };
+        request.lease.pause(Instant::now(), "pdf_password_input");
+        let watch = client.subscribe().unwrap();
+        let revision_wake = CollectionRevisionWake::spawn(&egui::Context::default(), &watch);
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Pdf);
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(
+                CollectionNavigationPending::AwaitingPdfPassword {
+                    request,
+                    watch,
+                    revision_wake,
+                    prepared,
+                    target,
+                },
+            ));
+        assert!(app.resume_collection_pdf_password_request(&pdf, "secret".into(), false));
+        let job = pool.take();
+        assert_eq!(job.priority(), crate::pdf_loader::JobPriority::Critical);
+        job.complete(1);
+        let pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap();
+        let CollectionNavigationPending::PdfPasswordPreflighting { receiver, .. } = pending else {
+            panic!("password preflight must be running");
+        };
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .pages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn epub_pdf_preflight_keeps_typed_open_failure_for_the_request_owner() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("book.epub");
@@ -7521,7 +8362,7 @@ mod tests {
             false,
             crate::folder_tree::FolderTreeOptions::default(),
             false,
-            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
             CollectionId::new(),
             1,
         )
@@ -7574,7 +8415,7 @@ mod tests {
             false,
             crate::folder_tree::FolderTreeOptions::default(),
             false,
-            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
             CollectionId::new(),
             1,
         )
@@ -7590,7 +8431,8 @@ mod tests {
     #[test]
     fn collection_preflight_observes_cancellation_before_filesystem_work() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
-        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
+        cancel.cancel();
         let result = preflight_candidates(
             vec![candidate(
                 PathBuf::from(r"Z:\never-probed.jpg"),
@@ -7731,7 +8573,7 @@ mod tests {
         // Submission consumes the visible password request, while the context's typed
         // preflight continues to own the same physical book until adoption/cancellation.
         app.pdf_password_request = None;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let (_sender, receiver) = std::sync::mpsc::channel();
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(
@@ -7847,7 +8689,7 @@ mod tests {
         let request_id = request.lease.request_id();
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Image);
         let (sender, receiver) = std::sync::mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(CollectionNavigationPending::Preflighting {
                 request,
@@ -8049,6 +8891,336 @@ mod tests {
     }
 
     #[test]
+    fn manual_collection_wrap_handler_lands_at_the_latest_actor_order_endpoints() {
+        use crate::ui_fullscreen::FsPageNav;
+
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for forward in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(|name| temp.path().join(name));
+            for path in &paths {
+                image::RgbImage::new(90, 160).save(path).unwrap();
+            }
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let created = recv(
+                client
+                    .create_collection("latest wrap order".into())
+                    .unwrap(),
+            );
+            let registrations = paths
+                .iter()
+                .map(|path| {
+                    crate::collection_store::CollectionRegistration::from_trusted_path(
+                        path,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let added = recv(
+                client
+                    .add_batch(created.collection_id(), created.revision(), registrations)
+                    .unwrap(),
+            );
+            let prepared = prepare_snapshot(&added.snapshot);
+            app.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: prepared.collection_id,
+                }),
+                None,
+            );
+            app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+            app.spread_mode = crate::settings::SpreadMode::Single;
+            app.settings.fullscreen_manual_nav_wrap = true;
+            app.settings.page_turn_animation_enabled = false;
+            let current_idx = if forward { 3 } else { 0 };
+            app.fullscreen_idx = Some(current_idx);
+            // Keep the current endpoint but change the opposite endpoint in the actor only.
+            // The handler must not land at the opposite end of the stale installed order.
+            let latest_order = if forward { [1, 0, 2, 3] } else { [0, 3, 1, 2] };
+            let entry_ids = latest_order.map(|index| prepared.entries[index].entry_id);
+            let latest = recv(
+                client
+                    .reorder_manual(
+                        prepared.collection_id,
+                        prepared.collection_revision,
+                        entry_ids.to_vec(),
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .prepared()
+                    .unwrap()
+                    .collection_revision,
+                prepared.collection_revision
+            );
+            let ctx = egui::Context::default();
+            let delta = if forward { 1 } else { -1 };
+            let nav = app.spread_page_nav(delta);
+            assert_eq!(nav, FsPageNav::Delta(delta));
+            app.handle_fs_navigation(&ctx, false, false, None, None, None, nav, None, current_idx);
+            assert!(app.top_level_grid_view.collection_navigation_pending());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.top_level_grid_view.collection_navigation_pending() {
+                assert!(Instant::now() < deadline, "latest-order wrap did not land");
+                app.poll_collection_navigation(&ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let target_idx = if forward { 0 } else { 3 };
+            let expected_original = if forward { 1 } else { 2 };
+            assert_eq!(app.fullscreen_idx, Some(target_idx));
+            assert!(
+                matches!(&app.items[target_idx], crate::grid_item::GridItem::Image(path)
+                if path == &paths[expected_original])
+            );
+            let installed = app
+                .top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .prepared()
+                .unwrap();
+            assert_eq!(installed.collection_revision, latest.revision());
+            assert_eq!(
+                installed
+                    .entries
+                    .iter()
+                    .map(|entry| entry.entry_id)
+                    .collect::<Vec<_>>(),
+                entry_ids
+            );
+            assert!(app.fs_boundary_hint.is_none());
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    fn manual_collection_wrap_with_one_split_image_changes_slice_without_a_collection_request() {
+        use crate::page_split::{PresentationStep, SplitDirection};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::{FsPageNav, FsWrapTarget};
+
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("landscape.jpg");
+        image::RgbImage::new(160, 90).save(&image).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("split image".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &image,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(prepared, None);
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_manual_nav_wrap = true;
+        app.settings.page_turn_animation_enabled = false;
+        app.record_page_dims_for_spread(0, (160, 90));
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::None);
+        let ctx = egui::Context::default();
+        for mode in [SpreadMode::SplitLtr, SpreadMode::SplitRtl] {
+            app.spread_mode = mode;
+            app.viewer_navigation_caches.invalidate();
+            let direction = SplitDirection::from_spread_mode(mode).unwrap();
+            let steps = [
+                PresentationStep {
+                    source_idx: 0,
+                    slice: direction.first(),
+                },
+                PresentationStep {
+                    source_idx: 0,
+                    slice: direction.second(),
+                },
+            ];
+            for forward in [false, true] {
+                let current = if forward { steps[1] } else { steps[0] };
+                let target = if forward { steps[0] } else { steps[1] };
+                app.fullscreen_page_slice = current.slice;
+                assert!(
+                    app.collection_root_navigation_origin(0, true).is_some(),
+                    "the fixture must be eligible for collection-root navigation"
+                );
+                let sequence = app.top_level_grid_view.collection_navigation_sequence();
+                let nav = app.spread_page_nav(if forward { 1 } else { -1 });
+                assert_eq!(
+                    nav,
+                    FsPageNav::Wrap(FsWrapTarget {
+                        idx: 0,
+                        slice: Some(target.slice),
+                        forward,
+                    })
+                );
+                app.handle_fs_navigation(&ctx, false, false, None, None, None, nav, None, 0);
+                assert_eq!(app.fullscreen_idx, Some(0));
+                assert_eq!(app.fullscreen_page_slice, target.slice);
+                assert!(app.fs_boundary_hint.is_none());
+                assert!(!app.top_level_grid_view.collection_navigation_pending());
+                assert_eq!(
+                    app.top_level_grid_view.collection_navigation_sequence(),
+                    sequence,
+                    "same-source wrapping must not issue a collection request"
+                );
+            }
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn manual_collection_wrap_without_another_display_unit_finishes_at_the_boundary() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for case in ["image", "video", "audio", "spread", "missing"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let (extension, kind) = match case {
+                "video" => ("mp4", CollectionResolvedKind::Video),
+                "audio" => ("mp3", CollectionResolvedKind::Audio),
+                _ => ("jpg", CollectionResolvedKind::Image),
+            };
+            let current = temp.path().join(format!("current.{extension}"));
+            let other = temp.path().join("other.jpg");
+            std::fs::write(&current, b"current fixture").unwrap();
+            std::fs::write(&other, b"other fixture").unwrap();
+            let mut registrations = vec![
+                crate::collection_store::CollectionRegistration::from_trusted_path(&current, kind)
+                    .unwrap(),
+            ];
+            if matches!(case, "spread" | "missing") {
+                registrations.push(
+                    crate::collection_store::CollectionRegistration::from_trusted_path(
+                        &other,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                );
+            }
+            let created = recv(client.create_collection(case.into()).unwrap());
+            let added = recv(
+                client
+                    .add_batch(created.collection_id(), created.revision(), registrations)
+                    .unwrap(),
+            );
+            let prepared = prepare_snapshot(&added.snapshot);
+            app.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: prepared.collection_id,
+                }),
+                None,
+            );
+            app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+            app.fullscreen_idx = Some(0);
+            if case == "missing" {
+                std::fs::remove_file(&other).unwrap();
+            }
+            let ctx = egui::Context::default();
+            for delta in [-1, 1] {
+                app.fs_boundary_hint = None;
+                let mut origin = app.collection_root_navigation_origin(0, false).unwrap();
+                if case == "spread" {
+                    origin.anchor.as_mut().unwrap().partner =
+                        Some(App::collection_navigation_identity_at(&prepared, 1).unwrap());
+                }
+                origin.intent_sequence = app
+                    .top_level_grid_view
+                    .advance_collection_navigation_sequence();
+                assert!(app.enqueue_collection_navigation(
+                    &ctx,
+                    origin,
+                    CollectionNavigationAction::Manual {
+                        fs_idx: 0,
+                        delta,
+                        queued_steps: 0,
+                        display_unit_step: true,
+                        landing: ManualMediaNavigationLanding::Fullscreen,
+                        still_only: false,
+                        wrap: true,
+                    }
+                ));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.top_level_grid_view.collection_navigation_pending() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{case}, {delta}: navigation did not finish"
+                    );
+                    app.poll_collection_navigation(&ctx);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(app.fullscreen_idx, Some(0), "{case}, {delta}");
+                assert!(
+                    matches!(app.fs_boundary_hint,
+                        Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == (delta > 0)
+                    ),
+                    "{case}, {delta}: an exhausted manual wrap must emit its boundary hint"
+                );
+            }
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    fn manual_request_repeats_merge_only_when_wrap_matches() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        for wrap in [false, true] {
+            let mut request =
+                cancellation_slideshow_request(&app, app.collection_grid_context_id());
+            request.action = CollectionNavigationAction::Manual {
+                fs_idx: 0,
+                delta: 1,
+                queued_steps: 0,
+                display_unit_step: true,
+                landing: ManualMediaNavigationLanding::Fullscreen,
+                still_only: true,
+                wrap,
+            };
+            let mut pending = CollectionNavigationPending::RequestNeeded {
+                request,
+                watch: Some(client.subscribe().unwrap()),
+            };
+            assert!(!pending.accumulate_manual(
+                1,
+                ManualMediaNavigationLanding::Fullscreen,
+                true,
+                true,
+                !wrap,
+            ));
+            assert!(pending.accumulate_manual(
+                1,
+                ManualMediaNavigationLanding::Fullscreen,
+                true,
+                true,
+                wrap,
+            ));
+            assert!(
+                matches!(pending.action(), Some(CollectionNavigationAction::Manual {
+                queued_steps: 1, wrap: active_wrap, ..
+            }) if *active_wrap == wrap)
+            );
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn manual_repeats_queue_while_the_previous_landing_is_pending() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let target_path = PathBuf::from(r"C:\collection\target.jpg");
@@ -8059,6 +9231,7 @@ mod tests {
             landing: ManualMediaNavigationLanding::Fullscreen,
             display_unit_step: true,
             still_only: true,
+            wrap: false,
             stamp: CollectionNavigationContinuationStamp {
                 context_id: super::super::viewer_context_registry::ViewerContextId::for_test(7),
                 collection_id: CollectionId::new(),
@@ -8073,18 +9246,34 @@ mod tests {
             },
         };
 
-        assert!(
-            pending.accumulate_manual(1, ManualMediaNavigationLanding::Fullscreen, true, true,)
-        );
-        assert!(
-            pending.accumulate_manual(1, ManualMediaNavigationLanding::Fullscreen, true, true,)
-        );
+        assert!(pending.accumulate_manual(
+            1,
+            ManualMediaNavigationLanding::Fullscreen,
+            true,
+            true,
+            false
+        ));
+        assert!(!pending.accumulate_manual(
+            1,
+            ManualMediaNavigationLanding::Fullscreen,
+            true,
+            true,
+            true,
+        ));
+        assert!(pending.accumulate_manual(
+            1,
+            ManualMediaNavigationLanding::Fullscreen,
+            true,
+            true,
+            false
+        ));
         pending.set_intent_sequence(18);
         assert!(!pending.accumulate_manual(
             -1,
             ManualMediaNavigationLanding::Fullscreen,
             true,
             true,
+            false,
         ));
         assert!(matches!(
             pending,
@@ -8148,6 +9337,7 @@ mod tests {
                     landing: ManualMediaNavigationLanding::Fullscreen,
                     display_unit_step: false,
                     still_only: false,
+                    wrap: true,
                     stamp: CollectionNavigationContinuationStamp {
                         context_id,
                         collection_id: prepared.collection_id,
@@ -8165,15 +9355,160 @@ mod tests {
             1,
             1,
             ManualMediaNavigationLanding::Fullscreen,
+            true,
         ));
+        let pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap();
         assert!(matches!(
-            app.top_level_grid_view.take_collection_navigation_pending(),
-            Some(CollectionNavigationPending::AwaitingManualContinuation {
+            &pending,
+            CollectionNavigationPending::AwaitingManualContinuation {
                 steps: 1,
+                wrap: true,
                 stamp: CollectionNavigationContinuationStamp { target_idx: 0, .. },
                 ..
-            })
+            }
         ));
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(pending));
+        app.settings.fullscreen_manual_nav_wrap = false;
+        app.poll_collection_navigation(&egui::Context::default());
+        let pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap();
+        assert!(
+            matches!(
+                pending.action(),
+                Some(CollectionNavigationAction::Manual { wrap: true, .. })
+            ),
+            "queued input must retain its captured wrap after the setting changes"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn changed_manual_wrap_replaces_queued_input_from_the_pending_native_landing() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let paths = [temp.path().join("old.mp4"), temp.path().join("target.mp4")];
+        for path in &paths {
+            std::fs::write(path, b"video fixture").unwrap();
+        }
+        let registrations = paths
+            .iter()
+            .map(|path| {
+                crate::collection_store::CollectionRegistration::from_trusted_path(
+                    path,
+                    CollectionResolvedKind::Video,
+                )
+                .unwrap()
+            })
+            .collect();
+        let created = recv(client.create_collection("native landing".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(created.collection_id(), created.revision(), registrations)
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        let ctx = egui::Context::default();
+        for previous_wrap in [false, true] {
+            for caller_idx in [0, 2] {
+                // Index 0 is the old presenter and now identifies a different prepared entry;
+                // index 2 represents an old order that was longer than the latest root.
+                app.fullscreen_idx = Some(0);
+                let sequence = app
+                    .top_level_grid_view
+                    .advance_collection_navigation_sequence();
+                let now = Instant::now();
+                app.native_video_fast_swap_pending =
+                    Some(super::super::NativeVideoFastSwapPending {
+                        target_idx: 1,
+                        target_path: paths[1].clone(),
+                        source_epoch: 1,
+                        started_at: now,
+                        deadline: now + Duration::from_secs(5),
+                        parked_live_window_id: None,
+                    });
+                let stamp = CollectionNavigationContinuationStamp {
+                    context_id: app.collection_grid_context_id(),
+                    collection_id: prepared.collection_id,
+                    surface_generation: app.top_level_grid_view.generation(),
+                    items_generation: app.items_generation,
+                    intent_sequence: sequence,
+                    target_idx: 1,
+                    target: App::collection_navigation_identity_at(&prepared, 1).unwrap(),
+                };
+                app.top_level_grid_view
+                    .set_collection_navigation_pending(Some(
+                        CollectionNavigationPending::AwaitingManualContinuation {
+                            steps: 3,
+                            landing: ManualMediaNavigationLanding::NativeVideo,
+                            display_unit_step: false,
+                            still_only: false,
+                            wrap: previous_wrap,
+                            stamp,
+                        },
+                    ));
+                let wrap = !previous_wrap;
+                assert!(
+                    app.start_collection_manual_navigation(
+                        &ctx,
+                        caller_idx,
+                        1,
+                        ManualMediaNavigationLanding::NativeVideo,
+                        wrap,
+                    ),
+                    "a changed wrap policy must remain owned by the collection landing"
+                );
+                // Polling during the swap must keep the new intent without issuing a request
+                // against either the transient presenter index or the unfinished target.
+                app.poll_collection_navigation(&ctx);
+                let pending = app
+                    .top_level_grid_view
+                    .take_collection_navigation_pending()
+                    .unwrap();
+                assert!(
+                    matches!(&pending,
+                        CollectionNavigationPending::AwaitingManualContinuation {
+                            steps: 1, wrap: active_wrap,
+                            stamp: CollectionNavigationContinuationStamp { target_idx: 1, intent_sequence, .. },
+                            ..
+                        } if *active_wrap == wrap && *intent_sequence != sequence
+                    ),
+                    "the new input replaces the three old queued steps"
+                );
+                app.top_level_grid_view
+                    .set_collection_navigation_pending(Some(pending));
+                app.native_video_fast_swap_pending = None;
+                app.fullscreen_idx = Some(1);
+                app.poll_collection_navigation(&ctx);
+                let pending = app
+                    .top_level_grid_view
+                    .take_collection_navigation_pending()
+                    .unwrap();
+                let request = pending.request().unwrap();
+                assert!(matches!(&request.action,
+                    CollectionNavigationAction::Manual { fs_idx: 1, delta: 1, queued_steps: 0, wrap: active_wrap, .. }
+                    if *active_wrap == wrap
+                ));
+                assert_eq!(
+                    request.origin.anchor.as_ref().unwrap().primary.entry_id,
+                    prepared.entries[1].entry_id
+                );
+            }
+        }
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -8197,6 +9532,342 @@ mod tests {
         assert_ne!(view.collection_navigation_sequence(), initial_sequence);
         assert!(view.take_collection_navigation_retired_fs_lock());
         assert!(!view.take_collection_navigation_retired_fs_lock());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn now_playing_collection_eof_terminal_errors_and_cancellations_respect_request_owner() {
+        use crate::effetune::NowPlayingOwner;
+        use crate::video::{PlaybackStartOrigin, VideoContinuousMode, VideoPlayer};
+        for kind in ["music", "video", "audio_mode"] {
+            for terminal in [
+                "read_error",
+                "disconnected",
+                "prepare_error",
+                "deleted",
+                "deleted_disconnected",
+                "deleted_deferred",
+                "deleted_admission",
+                "cancelled",
+                "superseded",
+                "context",
+                "player",
+                "seek",
+            ] {
+                let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+                let temp = tempfile::tempdir().unwrap();
+                let (mut app, client) = start_ready_app(&temp.path().join("eof.db"));
+                let created = recv(client.create_collection("eof".into()).unwrap());
+                let collection_id = created.collection_id();
+                app.top_level_grid_view.begin(
+                    TopLevelGridSurface::Collection(CollectionGridIdentity { collection_id }),
+                    None,
+                );
+                let path = temp.path().join("failed-eof.mp3");
+                app.items = vec![if kind == "music" {
+                    super::super::GridItem::Audio(path.clone())
+                } else {
+                    super::super::GridItem::Video(path.clone())
+                }];
+                app.fullscreen_idx = Some(0);
+                if kind == "audio_mode" {
+                    app.video_audio_mode = Some(0);
+                }
+                app.video_continuous_mode = VideoContinuousMode::ContinuousLoop;
+                let player = VideoPlayer::local_ready_disconnected_for_test(path);
+                player.bind_playback_viewer_context(app.projected_viewer_context_id().serial());
+                player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+                let identity = player.media_identity();
+                let success = player.take_playback_success().unwrap();
+                player.set_loop_enabled(false);
+                player.mark_eof_for_test(30.0);
+                let serial = player.current_seek_serial();
+                app.fs_cache.insert(
+                    0,
+                    super::super::FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+                app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+                assert_eq!(
+                    app.effetune.now_playing_owner(),
+                    Some(NowPlayingOwner::Local(identity))
+                );
+                app.video_continuous_last_eof = Some((0, serial));
+                let action = match kind {
+                    "music" => CollectionNavigationAction::MusicContinuousEof {
+                        fs_idx: 0,
+                        seek_serial: serial,
+                        player_identity: identity,
+                        wraps: true,
+                    },
+                    "video" => CollectionNavigationAction::VideoContinuousEof {
+                        fs_idx: 0,
+                        seek_serial: serial,
+                        player_identity: identity,
+                        wraps: true,
+                    },
+                    "audio_mode" => CollectionNavigationAction::VideoAudioModeContinuousEof {
+                        fs_idx: 0,
+                        seek_serial: serial,
+                        player_identity: identity,
+                        wraps: true,
+                    },
+                    _ => unreachable!(),
+                };
+                let mut request = CollectionNavigationRequest {
+                    origin: CollectionNavigationOrigin {
+                        context_id: app.collection_grid_context_id(),
+                        collection_id,
+                        surface_generation: app.top_level_grid_view.generation(),
+                        items_generation: app.items_generation,
+                        intent_sequence: app.top_level_grid_view.collection_navigation_sequence(),
+                        anchor: None,
+                    },
+                    action,
+                    root_thumbnail_sources: None,
+                    perf_started_at: None,
+                    lease: navigation_test_lease(),
+                    book_owner: None,
+                    navigation: None,
+                };
+                assert!(app.collection_navigation_request_is_current(&request));
+                let revision = app.effetune.now_playing_snapshot_for_test().revision;
+                let ctx = egui::Context::default();
+                match terminal {
+                    "deleted"
+                    | "deleted_disconnected"
+                    | "deleted_deferred"
+                    | "deleted_admission" => {
+                        app.top_level_grid_view
+                            .collection_session_mut()
+                            .unwrap()
+                            .load = CollectionGridLoadState::Deleted { installed: None };
+                        assert!(!app.collection_navigation_request_is_current(&request));
+                        assert!(app.collection_navigation_request_owner_is_current(&request));
+                    }
+                    "superseded" => {
+                        app.top_level_grid_view
+                            .advance_collection_navigation_sequence();
+                    }
+                    "context" => {
+                        request.origin.context_id = super::super::ViewerContextId::for_test(
+                            app.projected_viewer_context_id().serial() + 100,
+                        );
+                    }
+                    "player" => {
+                        let replacement = VideoPlayer::local_ready_disconnected_for_test(
+                            temp.path().join("replacement.mp3"),
+                        );
+                        replacement.mark_eof_for_test(30.0);
+                        app.fs_cache.insert(
+                            0,
+                            super::super::FsCacheEntry::Video {
+                                player: Box::new(replacement),
+                                load_seq: 0,
+                            },
+                        );
+                    }
+                    "seek" => {
+                        if let Some(super::super::FsCacheEntry::Video { player, .. }) =
+                            app.fs_cache.get(&0)
+                        {
+                            player.seek(0.0, crate::video::SeekOrigin::User);
+                        }
+                    }
+                    _ => {}
+                }
+                if terminal == "deleted_deferred" {
+                    app.top_level_grid_view
+                        .set_collection_navigation_pending(Some(
+                            CollectionNavigationPending::RequestNeeded {
+                                request,
+                                watch: None,
+                            },
+                        ));
+                    app.poll_collection_navigation(&ctx);
+                } else if terminal == "deleted_admission" {
+                    app.start_or_defer_collection_navigation(&ctx, request, None);
+                } else if matches!(terminal, "prepare_error" | "cancelled") {
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    if terminal == "cancelled" {
+                        sender.send(Err(CollectionPrepareError::Cancelled)).unwrap();
+                    }
+                    drop(sender);
+                    app.top_level_grid_view
+                        .set_collection_navigation_pending(Some(
+                            CollectionNavigationPending::Preparing {
+                                request,
+                                watch: client.subscribe().unwrap(),
+                                exact_revision: created.revision(),
+                                cancel: Arc::new(AtomicBool::new(false)),
+                                receiver,
+                            },
+                        ));
+                    app.poll_collection_navigation(&ctx);
+                } else if matches!(terminal, "disconnected" | "deleted_disconnected") {
+                    let (sender, receiver) = crossbeam_channel::unbounded();
+                    drop(sender);
+                    app.top_level_grid_view
+                        .set_collection_navigation_pending(Some(
+                            CollectionNavigationPending::Snapshot {
+                                request,
+                                watch: client.subscribe().unwrap(),
+                                receiver,
+                            },
+                        ));
+                    app.poll_collection_navigation(&ctx);
+                } else {
+                    if terminal == "deleted" {
+                        app.finish_collection_navigation_request_without_target(&ctx, &request);
+                    } else {
+                        app.finish_collection_navigation_read_error(
+                            &ctx,
+                            &request,
+                            "fixture failure",
+                        );
+                    }
+                }
+                let is_failure = matches!(
+                    terminal,
+                    "read_error"
+                        | "disconnected"
+                        | "prepare_error"
+                        | "deleted"
+                        | "deleted_disconnected"
+                        | "deleted_deferred"
+                        | "deleted_admission"
+                );
+                assert_eq!(
+                    app.effetune.now_playing_owner().is_none(),
+                    is_failure,
+                    "{kind}/{terminal}"
+                );
+                assert_eq!(
+                    app.video_continuous_last_eof,
+                    is_failure.then_some((0, serial)),
+                    "{kind}/{terminal}"
+                );
+                if !is_failure {
+                    assert_eq!(
+                        app.effetune.now_playing_snapshot_for_test().revision,
+                        revision,
+                        "{kind}/{terminal}"
+                    );
+                }
+                app.shutdown_collection_runtime_for_exit();
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn now_playing_collection_same_source_eof_reuses_start_and_final_tail_clears() {
+        use crate::effetune::NowPlayingOwner;
+        use crate::video::{PlaybackStartOrigin, VideoContinuousMode, VideoPlayer};
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("single.mp3");
+        std::fs::write(&path, b"identity-only fixture").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("single.db"));
+        let created = recv(client.create_collection("single".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &path,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.fullscreen_idx = Some(0);
+        app.video_continuous_mode = VideoContinuousMode::ContinuousLoop;
+        let player = VideoPlayer::local_ready_disconnected_for_test(path.clone());
+        player.bind_playback_viewer_context(app.projected_viewer_context_id().serial());
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let identity = player.media_identity();
+        let success = player.take_playback_success().unwrap();
+        player.mark_eof_for_test(30.0);
+        let serial = player.current_seek_serial();
+        app.fs_cache.insert(
+            0,
+            super::super::FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        let revision = app.effetune.now_playing_snapshot_for_test().revision;
+        let mut request = manual_navigation_request(&mut app, 0);
+        request.action = CollectionNavigationAction::MusicContinuousEof {
+            fs_idx: 0,
+            seek_serial: serial,
+            player_identity: identity,
+            wraps: true,
+        };
+        // handle_music_continuous_eof claims this generation before enqueueing navigation.
+        app.video_continuous_last_eof = Some((0, serial));
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Audio);
+        assert!(app.collection_navigation_exact_target_is_current(&request, &prepared, &target));
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        app.commit_collection_navigation(
+            &egui::Context::default(),
+            request,
+            client.subscribe().unwrap(),
+            prepared,
+            CollectionNavigationPreflightReady {
+                owner: crate::pdf_loader::LeasedEpubPath::try_new(path).unwrap(),
+                target,
+                payload: CollectionNavigationPreflightPayload::Media,
+                rejected: vec![],
+            },
+        );
+        let Some(super::super::FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) else {
+            panic!()
+        };
+        assert_eq!(player.current_seek_serial(), serial + 1);
+        player.complete_seek_for_test(0.0);
+        assert!(player.take_playback_success().is_none());
+        app.publish_mounted_local_now_playing(&[]);
+        assert_eq!(
+            app.effetune.now_playing_snapshot_for_test().revision,
+            revision
+        );
+        let Some(super::super::FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) else {
+            panic!()
+        };
+        player.mark_eof_for_test(30.0);
+        let serial = player.current_seek_serial();
+        app.finish_collection_navigation_without_target(
+            &egui::Context::default(),
+            &CollectionNavigationAction::MusicContinuousEof {
+                fs_idx: 0,
+                seek_serial: serial,
+                player_identity: identity,
+                wraps: false,
+            },
+        );
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]
@@ -8253,6 +9924,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
@@ -8391,6 +10063,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
@@ -8891,6 +10564,7 @@ mod tests {
             display_unit_step: false,
             landing: ManualMediaNavigationLanding::Fullscreen,
             still_only: true,
+            wrap: false,
         };
         assert_eq!(manual.direction(), CollectionNavigationDirection::Backward);
         assert_eq!(
@@ -8900,10 +10574,19 @@ mod tests {
         assert_eq!(manual.tail(), CollectionNavigationTail::Stop);
         assert!(!manual.is_media_eof());
         assert_eq!(manual.history_trigger(), HistoryTrigger::UserChosen);
+        let mut wrapping_manual = manual.clone();
+        if let CollectionNavigationAction::Manual { wrap, .. } = &mut wrapping_manual {
+            *wrap = true;
+        }
+        assert_eq!(
+            wrapping_manual.tail(),
+            CollectionNavigationTail::WrapExcludingCurrent
+        );
 
         let eof = CollectionNavigationAction::MusicContinuousEof {
             fs_idx: 4,
             seek_serial: 9,
+            player_identity: 0,
             wraps: true,
         };
         assert_eq!(eof.target_kind(), CollectionNavigationTargetKind::Audio);

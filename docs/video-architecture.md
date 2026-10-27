@@ -16,6 +16,15 @@ native overlayは必須のGPU資源 `NativeEguiOverlayGpu` とCPU側の入力・
 configure / submissionは製品rendererの既存境界に残る。検証範囲は
 [locked chrome抑制の実装追補](fullscreen-locked-chrome-suppression-plan.md#13-実装レビュー追補2026-10-08)を参照。
 
+§1.387 I1（2026-10-16、v4.7.1の次のリリース向け、実装・自動検証済み）では、CPU logical passの
+中間hiddenによるDComp detachを外し、既存batchの最終visibilityをGPU finalizerへ渡す。
+最終表示・非表示とも既存のclear/submit/Present後にattach/detachを一回だけ適用し、
+dirtyなし・logical passなしの正常returnではPresent/Commitを増やさない。hidden cleanup、
+texture set/free、入力/IME/commandの累積契約を保つ。finalizer失敗は成功inventoryを公開せず
+既存render fault/dropで終了し、placement candidateのprime失敗は旧coreを維持する既存abortへ戻す。
+単発・batch・dirty・resize・設定更新・primeのcallerを同じ終端へ接続する。
+D1設計受入とI1の自動/実機受入は別であり、[調査・I1台帳](video-secondary-monitor-flicker-investigation.md#89-i1実装と検証台帳2026-10-16作業中)を参照。
+
 ## 設計目標
 
 | 優先順位 | 目標 |
@@ -210,6 +219,31 @@ terminal error を返して従来どおり presenter を停止する。`SurfaceE
 は surface / swapchain 条件として epoch を invalidate せず、`Other` も callback latch が立った場合だけ
 device loss と診断する。旧 generation の遅い callback は successor の latch と一致しない。
 
+I1のadapter診断はperf有効時だけepoch生成時にキャッシュする。wgpu DX12の実deviceを
+`Device::as_hal`のborrow guard内で読み、`raw_device().GetAdapterLuid()`のscalar値だけを保持する。
+adapterのname/vendor/device/backend等も併記するが、名称の一致だけでD3D11との同一性を判定しない。
+診断値はdevice選択・gate・loss callbackの方針に影響せず、照会不能はunknownと理由を記録する。
+
+I1の定常診断は`native_diagnostics.rs`が既存pump/render ownerごとに保持する。
+perf有効時だけoutput IDを割り当て、window epoch/target role/ownerと、各snapshotの
+observed_us/revisionで相関する。時刻原点は`perf::program_start()`。source epoch/device generation/
+surface revision等はそのownerが観測したsampleへ記録し、別threadのsnapshotを同時点とみなさない。
+固定counterとscalar snapshotを既存出口で約1秒ごとに集約し、区間ごとの詳細は最大8件、
+以後は種別別のtotal/omitted/first/lastを残す。既存処理が止まれば記録も止まり、次の起床・退役で
+区間を送る。OFFではsample closure・追加時計・monitor/adapter query・JSON化を行わず、
+新しい診断thread/tick・同期I/O・共有診断mutex・flush完了待ちは追加しない。
+負荷改善や点滅解消の実測結果は未確定であり、測定とjournal欠落/詳細省略を区別する。
+
+A1の`video_transform`はsurface交換とgeometry-only更新の両方で、同じ
+`commit_video_visual_transform`が算出して実COM操作へ渡した行列・target・surface revisionを
+Commit成功後に記録する。交換予定のsurface寸法/SAR/orientationを使い、失敗時は前の適用済み
+snapshotを保つ。通常frameでgeometry更新が省略されても、交換後の診断値が旧行列に残らない。
+上下バー・左右panel・stripの描画rectはpaint時の値を最終logical output/batchへ渡し、
+`drawn_rects`へHUD client物理px（pppを乗じた4辺）で記録する。描かなかった部位はfalse。
+logical passとeguiの再passごとに初期化し、中間passの矩形を最終非表示へ残さない。
+drag中に全面へ拡張するpumpの入力regionは描画矩形の代用にしない。perf OFFでは新しい
+rect採取を無効にし、固定table/field/詳細8件の上限・既存非同期配送を維持する。
+
 `VideoPlayer::tick(ctx)` は再生制御 / 意味的 deadline / ホバーサムネイル要求を扱う。
 フレームの実体描画は native presenter 内のスレッドが行うため、native 経路では
 フレームレート cadence を返さない。`ctx` は player ごとの `VideoUiWake` に一度結び、
@@ -222,6 +256,12 @@ user seek coalesce (250ms)、open 進捗 HUD (50ms) の最短 one-shot だけを
 ### NativeVideoPlacement と detached viewer
 
 native presenter の表示先は `NativeVideoPlacement` を正本にする。
+detached host の通常配置・F11 restore は runtime が物理外枠座標で所有し、HWND 登録時に
+`detached_window_geometry` で適用する。builder の位置・寸法は生成前の仮配置に限る。
+配置の適用だけでは Hidden host を見せず、最大化を含む可視化は既存の表示 commit が行う。
+F11・終了・再作成や park の判断時は HWND を読み直し、通常 frame の egui 観測は変更通知として扱う。
+判断時・通常観測の最大化状態は未処理の app command を優先し、無ければ HWND の状態を使う。
+pending は OS の一致、次の root 出力の入力 hook、または backend の close 通知入口（出力処理後、対象 host のみ）で解除する。
 
 - `MainWindowChild`: main HWND の child window。メインウィンドウ内に表示する。
 - `FullscreenBorderless`: monitor rect 全体の borderless presenter。fullscreen 専用 HUD overlay HWND、
@@ -348,8 +388,12 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   presenter の egui Context にも App と同じ IME input plugin を登録し、composition state を
   viewport 単位で所有する。native event queue が次の egui pass を待つ間は、plugin snapshot に
   `pending_events` を read-only 投影して Ctrl+V/C/X と Enter/Esc の gate を決め、presenter-local な
-  composition bool / timestamp は持たない。変換中 Esc press の除去と空 preedit 補完は
-  plugin の RawInput 境界へ一本化する。
+  composition bool / timestamp は持たない。IME 処理済みの `VK_PROCESSKEY` は native key
+  変換で egui key にせず（Windows の winit 経路は allow_ime=true のとき Process press と対応 release を遮断）、取消時の空 preedit 補完は
+  plugin の RawInput 境界へ一本化する。shortcut の抑止は今 pass の composing のみで判定し、
+  Commit / Disabled 後の通常キーは直ちに通す。focus 復帰と helper 所有の次 pass 限りの retry は
+  pointer 無しの key press・他 widget の focus 無し・composing または Enter / Esc press 無しを条件にする。
+  初回 focus 要求用の呼び出し側 latch には retry を書き込まない。
   Backspace / Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
   overlay 側がキーを保持し、Space を文字として入力できるようにする。
@@ -562,8 +606,11 @@ VST z-order 操作の各経路 (`set_all_guis_topmost` / `set_all_guis_visible_b
 `user_hide_slot_gui` / `remove_plugin` / `disable_with_reason`) の末尾で `DspBridge::fire_hud_raise_hook`
 が `AtomicBool` latest-value latch を set → App `update` が `swap(false)` → 1 件以上来てれば fullscreen 中の
 `VideoPlayer::request_hud_raise()` を 1 回呼ぶ (= coalesce) → bounded render command と pump control を経て pump が
-`NativeVideoOutputCommand::RaiseHudToTop` を受けて **即時/16ms/64ms の short retry burst** で
+`NativeVideoOutputCommand::RaiseHudToTop` を受けて **即時/16ms/50ms の short retry burst** で
 `SetWindowPos(hud, HWND_TOPMOST)` を呼ぶ (= 非同期 VST IPC の z-order 反映を確実に拾う)。
+移動・サイズ変更のない HUD 自前 raise だけに `SWP_NOSENDCHANGING` を付け、自己通知による再要求を防ぐ。
+HUD の `WM_WINDOWPOSCHANGING` は `SWP_NOZORDER` 付きの通知から raise を要求せず、外部の z-order 通知・VST hook・hover polling と既存の許可判定・burst は維持する。
+これは不要な HUD 前面化の繰り返しの修正であり、サブモニターの点滅との因果は未確定。初回表示・再表示・配置切替での HUD 復帰は実機で確認する。
 
 各 raise burst 直前で `foreground_allows_hud_raise` を通す (= command / event / polling のすべての
 raise 経路で **allowlist 判定**):
@@ -577,7 +624,7 @@ raise 経路で **allowlist 判定**):
 詳細は [vst3-integration.md](vst3-integration.md) の "Fullscreen focus handoff" 節を参照。
 
 **Geometry / DPI / UI 表示倍率の同期**: presenter HWND の `WM_WINDOWPOSCHANGED` →
-`GeometryChanged` event → HUD HWND の `SetWindowPos` + overlay surface resize。HUD HWND の
+`GeometryChanged` event → HUD geometry要求 + overlay surface resize。HUD HWND の
 `WM_DPICHANGED` → `DpiChanged` event → `set_overlay_pixels_per_point(dpi/96.0)` + HUD
 `set_hud_geometry(suggested_rect)` + `resize_overlay_surface_only`。`NativeEguiOverlay` は main egui
 Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源を
@@ -586,6 +633,13 @@ Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源�
 設定変更と同じ close 経路で active fullscreen / detached / native presenter session を閉じる。
 再 open で新倍率を適用するため、短い再生中断は許容する。presenter HWND 自身
 (= video transform / background) には影響させず、VST editor の別 HWND にもアプリ内倍率を掛けない。
+
+I1ではResize / GeometryChanged / DpiChangedのgeometry要求を既存HUD ownerへ揃え、
+最低1pxへ正規化したscreen pixel rectとその場の`GetWindowRect`の4辺が完全一致するときだけ
+`SetWindowPos`を省く。負座標を維持し、query失敗や不一致は既存のNOACTIVATE/NOZORDER/
+NOOWNERZORDERで一回適用する。前回要求/成功のcacheでは省かず、外部移動・OS clamp・
+HWND再生成後の同じ要求も現在OS状態で判定する。geometry skipでppp/DPI更新やsurface resizeを
+省略せず、外部監視tick・retry・新しいpending状態を追加しない。実操作後の追加queryはperf ON時だけとする。
 
 **UI フォント / コントラストの同期**: `NativeVideoOutputConfig` → `NativeRenderConfig` は
 `text_contrast` に加えて `UiFontSettings` も保持し、`NativeEguiOverlay` の独立
@@ -1143,6 +1197,13 @@ keyframe が疎すぎる material unavailable も同じ UI surface と入力 gat
 
 #### `mod.rs` (`VideoPlayer`)
 - 公開 API (`open` / `tick` / `seek` / `set_volume` / `set_loop_enabled` / `shutdown`)
+- 再生するseek APIは必須の `SeekOrigin::User` / `Internal(InternalContinuation)` を受ける。
+  UserはEOF／再生意図なしの受付時、DSP取得より前にUserPlayを登録し、actorの既存start判定を使う。
+  内部Pauseでは非EOFのSuccessReady／Establishedを保持し、ユーザーPauseによるNoneへの破棄と区別する。
+  Loop・音声トラック・DSP・cached openの内部seekはstartを増やさず、seekによる再生強制は従来どおり。
+  Now Playingの最終EOFはAppの再生方針／連続navigationの結果確定が判断する。
+  非同期の次候補確認中をplayerのEOF状態だけでclearしない。詳細と全入口分類は
+  [EffeTune自動表示計画](effetune-auto-open-plan.md#eof後のユーザーseek入口の分類2026-10-17) を参照。
 - decoder スレッド・audio スレッドのライフサイクル管理
 - native presenter のライフタイム管理 (`native_output: Option<NativeVideoOutput>`)
 - remote-owned player に限る headless video output consumer の起動・停止・join
@@ -2119,6 +2180,44 @@ headless回帰はproductionと同じdriver / wheel planner、実eguiのstrip han
 fixtureの制御時計は単調に進めるが、実GPU出力・USER32配送や実処理時間を検証したことにはしない。
 検証の完了範囲は [v3.7.0 作業台帳](v3.7.0-priority-work.md) を参照。
 
+#### シーク操作の終端と論理pass（§1.192）
+
+pointer release、またはeguiへ配送するEscape押下を積んだ直後も、同じbatch driverで論理passを
+閉じる。後続move / press / wheelは次のpassへ送り、releaseの位置を後続入力で上書きしない。
+source resetがbatch外で積んだ終端は `batch_prepare` 直後に先に消費する。追加passを含めても
+外側batchのPresentは一回。新たな待機・再試行・入力制限は設けない。
+
+入力生成側が `NativePointerTermination` を記録し、pending eventsと同時にtakeする。
+実releaseは全ボタンの `Released { button, pos }`、capture loss / CANCELMODE / touch Cancel /
+認識器の非活性化 / source resetの合成releaseは `Cancelled { button: Some(...) }`、eguiへ届く
+Escapeは `Cancelled { button: None }`。Escapeを記録したpassでは実releaseよりCancelを優先する。
+通常のstrip表示中にnative側で消費するEscapeは、従来の `CloseSeekStrip { Escape }` と同時に
+drag所有を外す別経路であり、後続releaseからCommitを出さない。
+
+シーク行とstripはResponseの `drag_stopped` ではなく、所有中のgestureとこの終端事実で終了する。
+実releaseは最終位置でシーク／上払いopen／下ドラッグclose／commitを判定する。Scrubの最終
+Seekには0.10秒の間引きを適用せず、最後に送った値と同値なら重複送信しない。Undecidedのままなら
+従来どおりSeekを出す。Cancelではシーク行は何も出さず、stripは実際に送った最後の
+`MoveSeekStrip` 中心がある場合だけその中心でCommitする。
+通常帯はどのボタンでも終えるが、0面積の帯は従来どおりPrimaryの終端かEscapeだけで終える。
+0面積の全体表示は押下時の軸、通常帯の全体表示は現在の軸でrelease中心を求める。
+所有をtakeすることでeguiのdiscardによる複数passでも終端commandは一回だけになる。
+drag開始時の原点と鍵ボタンの除外判定は `pointer - total_drag_delta` で押下点を復元して使う。
+HUD hiddenの片付けは従来どおり所有を捨てるだけで、Cancel時のCommit規則を適用しない。
+
+音量slider、音楽HUD seek、減光HUDがbutton入力を捨てる既存経路、最初のbatch内で完結するgestureは
+本修正の対象外。GPU不要の実overlay fixtureとbatch targetで自動検証し、実HWND配送は別の実機確認とする。
+
+2026-10-25の未コミット§1.192差分での検証（通常feature、nextest default）:
+
+- `cargo fmt` と `cargo fmt --check`: 成功、整形差分なし。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: exit 0。ログ `target/check-1192-final.log`。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/render_core|seek_strip|native_window|native_touch|overlay/)'`:
+  exit 0、602成功・0失敗・13705対象外。新規22件と既存resize回帰のCancel中心検査を含む。
+  ログ `target/nextest-1192-focused.log`。full lib / test-fullは実行していない。
+- `.\scripts\build-dev.ps1 -PreserveRuntime`: exit 0、core / remote service / EPUB worker生成成功。
+  PE検査はruntime=4 / pe=3で成功。通常profileの成果物は起動しておらず、実機確認は未実施。
+
 #### `native_touch.rs` (`NativeTouchAdapter`)
 
 Win32 依存を持たない純粋部分を両 wndproc から分離する。bounded ownership state、
@@ -2182,11 +2281,13 @@ intent だけで host と接続する。
 | ファイル / 範囲 | 責務 | 主な型 |
 |---|---|---|
 | `native_window_pump.rs` | bounded request/ack、window-host reducer、全 placement の create/pump/publish/destroy、observation/intent 適用、typed shutdown/quarantine | `NativeWindowPumpRenderClient`, `PumpLifecycleEvent`, `PumpPlacementRequest` |
+| `native_diagnostics.rs` | I1: perf ON限定のoutput相関ID、owner別固定counter/scalar snapshot、既存境界での有界集約。新しい起床・同期I/Oを所有しない | `DiagnosticOutputId`, `NativeDiagnostics`, `DiagnosticSample` |
 | `native_window_host.rs` | presenter/HUD topology、visibility/geometry/region/z-order/focus/IME/cursor mutation、thread affinity | `NativeWindowHost`, `NativeRenderTargets`, `NativeWindowIntent` |
 | `native_window_host/hud_window.rs` | HUD HWND RAII owner と wndproc/region mutation | `HudOverlayWindow` |
 | `native_touch.rs` | presenter / HUD `PT_TOUCH` stream の bounded ownership 純ロジック、typed source、共通 recognizer adapter、座標/command 写像 | `NativeTouchOwnership`, `NativeTouchAdapter` |
 | `native_presenter/mod.rs` | render facade と `overlay_draw` module 宣言 | — |
 | `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
+| `native_presenter/overlay_gpu.rs` | process-owned Instance/device epoch cache、configure/submission gate、device-loss latch、I1の生成時adapter/LUID診断 | `OverlayGpuService`, `DeviceEpoch` |
 | `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
 | `native_presenter/grade_pipeline.rs` | 色調補正 / Creative LUT shader pipeline | `VideoGradePipeline` |
 | `native_presenter/resample_pipeline.rs` | 表示 orientation、Lanczos3 / NIS / nearest、生成 topology 駆動 Anime4K multi-pass、RGBA16F 中間 RT | `VideoResamplePipeline` |
@@ -2516,6 +2617,16 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 
 ## ライフサイクル管理
 
+- **native output の故障と source swap (§1.135)**: render thread の panic / terminal error と pump の
+  `record_fault` は、output lifetime で共有する一方向の `faulted` を詳細ログ・通知より先に立てる。
+  panic payload の `&str` / `String` またはエラー詳細は最初の故障ログに残し、`init_error` には
+  利用者向けの固定文言を渡す。通知を take しても故障印は残る。`reusable_for_swap` は
+  `!closed && !faulted` とし、source swap の即時開始、deferred 開始・完了で確認する。
+  通常ナビの `try_start_native_video_fast_swap` は decoder 枠が空いていても deferred で集約する。
+  故障後は既存の BackendFault close / shutdown に任せ、自動再試行はしない。次に利用者が動画を
+  開いたときの通常 `start_fs_load` → `VideoPlayer::open(Some(config))` で新しい output を作る。
+  まれな失敗はログと通知で割り切り、故障種別・専用の回復状態・poll 終端の統合は追加しない。
+  永続 `video_seek_strip_state` は消さず、detached 述語 / viewport 経路も変更しない。
 - **VideoPlayer の Drop**: `cancel.store(true)` → decoder thread が exit、`audio.take()` で cpal stream 停止
 - **VideoPlayer.shutdown() の用途**: 動画切替時に Drop より早く audio を切るため (= 残音を防ぐ)
 - **GpuVideoDevice の Drop**: D3D11 リソース全解放、fence の NT shared handle を `CloseHandle`
@@ -3940,3 +4051,13 @@ ui_snapshotは直列で123件成功し、既存PNGと一致した。cargo fmt / 
 通常profileのcore・remote service・EPUB PDF workerを生成した。製品起動・実機操作・commitは
 行っていない。実機では測定がrelease前に終了してもフレーム送りが再開せず、新しい押下で
 通常の反復が戻ることを利用者が確認する。
+
+
+## 一時通知の表示時間（§1.402）
+
+通知の種類、文字数・指定秒数・動画の既定時間、設定の倍率と例外は
+[通知時間ポリシーと棚卸し](notification-duration-policy.md) を正本とする。
+App で寿命とnative fadeを確定して渡し、描画側は倍率を再適用しない。
+標準ではnativeの既存linger/fadeの不一致、保存完了のegui1.2秒/native1.8秒も維持する。
+動画内部で発行する通知だけは、既存 chrome snapshot の選択値から同じ関数で一度確定する。
+処理の寿命に連動する進捗表示、ナビゲーション境界の専用ヒントは独立した表示を維持する。

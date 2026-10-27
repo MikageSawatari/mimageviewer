@@ -363,13 +363,32 @@ pub(crate) struct RatingPhysicalRestore {
     pub(crate) subfolder_restore: Option<SubfolderExpansionRestoreState>,
 }
 
-/// Session-only Rating position. Pixel offsets and their aspect dependency travel together.
-/// Rating rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
+/// Session-only grid position. Pixel offsets and their aspect dependency travel together.
+/// Synthetic rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
 #[derive(Clone, Debug)]
-pub(crate) struct RatingGridPosition {
+pub(crate) struct SessionGridPosition {
     pub(crate) scroll_offset_y: f32,
     pub(crate) selected_key: Option<String>,
     pub(crate) aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+}
+
+/// Identity of the expansion whose rows own a saved position (no filesystem access).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubfolderExpansionPositionKey {
+    root: String,
+    roots: Vec<String>,
+}
+
+impl SubfolderExpansionPositionKey {
+    pub(crate) fn new(root: &std::path::Path, roots: &[PathBuf]) -> Self {
+        Self {
+            root: crate::path_key::normalize_keep_drive(root),
+            roots: roots
+                .iter()
+                .map(|path| crate::path_key::normalize_keep_drive(path))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1274,60 +1293,105 @@ pub(crate) enum TopLevelGridSurface {
 }
 
 impl super::App {
+    /// A synthetic surface can still own a physical descendant. Its position and the
+    /// adopted row producer decide refresh routing, not the parent's surface alone.
+    pub(super) fn current_grid_reload_is_physical(&self) -> bool {
+        if self.projection_recipe.extracted_surface().is_some() {
+            return false;
+        }
+        match self.top_level_grid_view.surface() {
+            TopLevelGridSurface::Folder => true,
+            TopLevelGridSurface::Collection(_) => self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(
+                        session.position,
+                        CollectionGridPosition::PhysicalSource { .. }
+                    )
+                }),
+            TopLevelGridSurface::SmartFolder(state) => {
+                !matches!(state.position, SmartFolderPosition::Root)
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
+                !self.items_are_global_search_view
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
+                !self.favsearch.on_results_grid()
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag) => !self.items_are_tag_view,
+            TopLevelGridSurface::Rating { .. } => !self.items_are_rating_view,
+            _ => false,
+        }
+    }
+
     /// 現在の最上位一覧を、その surface が所有する再入場経路で更新する。
     pub(crate) fn reload_top_level_grid(&mut self, ctx: &egui::Context) {
         let surface = self.top_level_grid_view.surface().clone();
+        if matches!(surface, TopLevelGridSurface::Folder)
+            && self.projection_recipe.extracted_surface().is_some()
+        {
+            // Dismissing a search changes its UI before its replacement source is accepted.
+            // The retained reader rows still belong to that extracted source.
+            return;
+        }
         let folder_pane_active = self.effective_folder();
 
-        match surface {
-            TopLevelGridSurface::Folder => {
-                let local_search = self.show_search_bar.then(|| self.search_query.clone());
-                self.reload_current_folder_preserving_override();
-                if let Some(query) = local_search {
-                    self.show_search_bar = true;
-                    self.search_query = query;
-                    self.reexecute_search_for_installed_list(ctx);
+        if self.current_grid_reload_is_physical() {
+            self.reload_current_physical_list();
+        } else {
+            match surface {
+                TopLevelGridSurface::Folder => {
+                    let local_search = self.show_search_bar.then(|| self.search_query.clone());
+                    self.reload_current_folder_preserving_override();
+                    if let Some(query) = local_search {
+                        self.show_search_bar = true;
+                        self.search_query = query;
+                        self.reexecute_search_for_installed_list(ctx);
+                    }
                 }
-            }
-            TopLevelGridSurface::SmartFolder(state) => {
-                if self.smart_folder_busy() {
-                    return;
+                TopLevelGridSurface::SmartFolder(state) => {
+                    if self.smart_folder_busy() {
+                        return;
+                    }
+                    let _ = self.refresh_smart_folder_staged(state.definition_id);
                 }
-                let _ = self.refresh_smart_folder_staged(state.definition_id);
-            }
-            TopLevelGridSurface::SubfolderExpansion => {
-                if self.subfolder_expansion_busy() {
-                    return;
+                TopLevelGridSurface::SubfolderExpansion => {
+                    if self.subfolder_expansion_busy() {
+                        return;
+                    }
+                    if let Some(snapshot) = self.subfolder_expansion_snapshot.as_ref() {
+                        self.start_subfolder_expansion_scan_roots(
+                            snapshot.root.clone(),
+                            snapshot.roots.clone(),
+                        );
+                    }
                 }
-                if let Some(snapshot) = self.subfolder_expansion_snapshot.as_ref() {
-                    self.start_subfolder_expansion_scan_roots(
-                        snapshot.root.clone(),
-                        snapshot.roots.clone(),
-                    );
+                TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
+                    self.refresh_global_search(ctx);
                 }
-            }
-            TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
-                self.spawn_global_search(ctx);
-            }
-            TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
-                self.execute_favsearch();
-            }
-            TopLevelGridSurface::Search(TopLevelSearchView::Tag) => {
-                self.open_tag_view_with_query(Some(self.tag_view.query.clone()), false);
-            }
-            TopLevelGridSurface::Rating { .. } => self.reload_current_rating_view_preserving_sort(),
-            TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
-            TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
-            TopLevelGridSurface::DriveList => {
-                let origin = self.selected.and_then(|index| match self.items.get(index) {
-                    Some(crate::grid_item::GridItem::Folder(path)) => Some(path.clone()),
-                    _ => None,
-                });
-                self.enter_drive_list(origin);
-            }
-            TopLevelGridSurface::Snapshot => {}
-            TopLevelGridSurface::Collection(identity) => {
-                self.open_collection_grid(identity.collection_id, None);
+                TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
+                    self.execute_favsearch();
+                }
+                TopLevelGridSurface::Search(TopLevelSearchView::Tag) => {
+                    self.open_tag_view_with_query(Some(self.tag_view.query.clone()), false);
+                }
+                TopLevelGridSurface::Rating { .. } => {
+                    self.reload_current_rating_view_preserving_sort()
+                }
+                TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
+                TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
+                TopLevelGridSurface::DriveList => {
+                    let origin = self.selected.and_then(|index| match self.items.get(index) {
+                        Some(crate::grid_item::GridItem::Folder(path)) => Some(path.clone()),
+                        _ => None,
+                    });
+                    self.enter_drive_list(origin);
+                }
+                TopLevelGridSurface::Snapshot => {}
+                TopLevelGridSurface::Collection(identity) => {
+                    self.open_collection_grid(identity.collection_id, None);
+                }
             }
         }
 
@@ -1345,7 +1409,11 @@ pub(crate) struct TopLevelGridView {
     return_to: Option<TopLevelGridOrigin>,
     generation: u64,
     /// At most five star lists, owned by this viewer context's navigation session.
-    rating_grid_positions: std::collections::HashMap<u8, RatingGridPosition>,
+    rating_grid_positions: std::collections::HashMap<u8, SessionGridPosition>,
+    reading_history_position: Option<SessionGridPosition>,
+    subfolder_expansion_position: Option<(SubfolderExpansionPositionKey, SessionGridPosition)>,
+    /// A committed departure saves the original rows/presentation only once.
+    pub(crate) departed_items_generation: Option<u64>,
     /// The completed smart-folder result has exactly the same lifetime as this surface plus
     /// descendants opened from it. `begin` is an explicit top-level transition and always drops
     /// the old session; `replace_surface` preserves it only while the same smart-folder surface
@@ -1381,6 +1449,9 @@ impl Clone for TopLevelGridView {
             generation: self.generation,
             // A duplicated viewer does not inherit another context's navigation positions.
             rating_grid_positions: Default::default(),
+            reading_history_position: None,
+            subfolder_expansion_position: None,
+            departed_items_generation: None,
             // Context duplication may copy the visible grid identity for an independent viewer,
             // but the main smart-folder result remains owned by the main top-level surface.
             smart_folder_session: None,
@@ -1427,6 +1498,9 @@ impl Default for TopLevelGridView {
             return_to: None,
             generation: 0,
             rating_grid_positions: Default::default(),
+            reading_history_position: None,
+            subfolder_expansion_position: None,
+            departed_items_generation: None,
             smart_folder_session: None,
             collection_session: None,
             collection_navigation_pending: None,
@@ -1440,17 +1514,50 @@ impl Default for TopLevelGridView {
 }
 
 impl TopLevelGridView {
-    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: RatingGridPosition) {
+    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: SessionGridPosition) {
         self.rating_grid_positions
             .insert(stars.clamp(1, 5), position);
     }
 
-    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&RatingGridPosition> {
+    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&SessionGridPosition> {
         self.rating_grid_positions.get(&stars)
     }
 
-    pub(crate) fn clear_rating_grid_positions(&mut self) {
+    pub(crate) fn reading_history_position(&self) -> Option<&SessionGridPosition> {
+        self.reading_history_position.as_ref()
+    }
+
+    pub(crate) fn save_reading_history_position(&mut self, position: SessionGridPosition) {
+        self.reading_history_position = Some(position);
+    }
+
+    pub(crate) fn clear_reading_history_position(&mut self) {
+        self.reading_history_position = None;
+    }
+
+    pub(crate) fn subfolder_expansion_position(
+        &self,
+        key: &SubfolderExpansionPositionKey,
+    ) -> Option<&SessionGridPosition> {
+        self.subfolder_expansion_position
+            .as_ref()
+            .filter(|(saved_key, _)| saved_key == key)
+            .map(|(_, position)| position)
+    }
+
+    pub(crate) fn save_subfolder_expansion_position(
+        &mut self,
+        key: SubfolderExpansionPositionKey,
+        position: SessionGridPosition,
+    ) {
+        self.subfolder_expansion_position = Some((key, position));
+    }
+
+    pub(crate) fn clear_session_grid_positions(&mut self) {
         self.rating_grid_positions.clear();
+        self.reading_history_position = None;
+        self.subfolder_expansion_position = None;
+        self.departed_items_generation = None;
     }
 
     pub(crate) fn surface(&self) -> &TopLevelGridSurface {
@@ -1709,11 +1816,12 @@ impl TopLevelGridView {
         landing: super::ManualMediaNavigationLanding,
         still_only: bool,
         display_unit_step: bool,
+        wrap: bool,
     ) -> bool {
         self.collection_navigation_pending
             .as_mut()
             .is_some_and(|pending| {
-                pending.accumulate_manual(delta, landing, still_only, display_unit_step)
+                pending.accumulate_manual(delta, landing, still_only, display_unit_step, wrap)
             })
     }
 

@@ -325,27 +325,45 @@ impl App {
     /// Keep a destructive settings-family worker owned by the live App when a root-window close
     /// would otherwise end the process. A plain close handled by the existing tray-hide path
     /// remains a hide; process-exit close is replayed after the worker reaches terminal.
+    #[cfg(test)]
     pub(crate) fn defer_settings_family_root_close(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|input| input.viewport().close_requested()) {
-            return;
+        if ctx.input_for(egui::ViewportId::ROOT, |input| {
+            input.viewport().close_requested()
+        }) {
+            let intent = if self.sidecar_restore_root_lifecycle_close_requested() {
+                crate::app::root_lifecycle::RootCloseIntent::ApplicationQuit
+            } else {
+                crate::app::root_lifecycle::RootCloseIntent::WindowClose
+            };
+            self.accept_settings_family_root_close(ctx, intent);
         }
-        let application_quit = self.sidecar_restore_root_lifecycle_close_requested();
-        let plain_close_hides_to_tray = !application_quit
-            && self.settings.minimize_to_tray_on_close
-            && self.tray_controller.is_some();
+    }
+
+    pub(crate) fn accept_settings_family_root_close(
+        &mut self,
+        ctx: &egui::Context,
+        intent: crate::app::root_lifecycle::RootCloseIntent,
+    ) -> bool {
+        use crate::app::root_lifecycle::RootCloseIntent;
+        let application_quit = matches!(intent, RootCloseIntent::ApplicationQuit);
+        let plain_close_hides_to_tray = matches!(intent, RootCloseIntent::TrayHide)
+            || (!application_quit
+                && self.settings.minimize_to_tray_on_close
+                && self.tray_controller.is_some());
         let Some(requested) =
             settings_family_deferred_root_close(application_quit, plain_close_hides_to_tray)
         else {
-            return;
+            return false;
         };
-        if self
+        let deferred = self
             .settings_restore_state
             .family_operation
-            .defer_root_close(requested)
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            .defer_root_close(requested);
+        if deferred {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
             ctx.request_repaint();
         }
+        deferred
     }
 
     /// Final process-exit fence for the destructive settings-family worker and its retry task.
@@ -409,7 +427,7 @@ impl App {
         }
 
         self.poll_operation_share_task(ctx);
-        self.poll_settings_family_operation(ctx);
+        self.service_settings_family_operation(ctx);
         let preferences_transfer_was_open =
             self.settings_restore_state.preferences_transfer.is_some();
         self.show_preferences_transfer_dialog(ctx);
@@ -433,6 +451,7 @@ impl App {
             || self.settings_restore_state.preferences_transfer.is_some();
 
         egui::Window::new("設定の復元")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -488,6 +507,9 @@ impl App {
     }
 
     fn execute_pending_settings_restore(&mut self, pending: PendingAction, ctx: &egui::Context) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let dir = crate::data_dir::get();
         let action = match &pending {
             PendingAction::Restore(source) => {
@@ -524,7 +546,7 @@ impl App {
         }
     }
 
-    fn poll_settings_family_operation(&mut self, ctx: &egui::Context) {
+    pub(crate) fn service_settings_family_operation(&mut self, ctx: &egui::Context) {
         let mut deferred_close = None;
         let state = std::mem::replace(
             &mut self.settings_restore_state.family_operation,
@@ -635,8 +657,14 @@ impl App {
         };
         if let Some(close) = deferred_close {
             match close {
-                DeferredRootClose::WindowClose => self.request_main_window_close(ctx),
-                DeferredRootClose::ApplicationQuit => self.request_application_quit(ctx),
+                DeferredRootClose::WindowClose => self.resume_root_lifecycle_close(
+                    ctx,
+                    crate::app::root_lifecycle::RootCloseIntent::WindowClose,
+                ),
+                DeferredRootClose::ApplicationQuit => self.resume_root_lifecycle_close(
+                    ctx,
+                    crate::app::root_lifecycle::RootCloseIntent::ApplicationQuit,
+                ),
             }
         }
     }
@@ -653,7 +681,7 @@ impl App {
         if let Some(message) = message {
             super::show_startup_modal(
                 ctx,
-                egui::Id::new("settings_family_operation_modal"),
+                egui::Id::unique("settings_family_operation_modal"),
                 |ui| {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -745,8 +773,10 @@ impl App {
         // 背景の通常 UI を操作できてしまい、Terminal の「続行不可」分類が画面上は
         // 機能しなかった。Modal なら backdrop が背景クリックを全部吸う + 背景フォーカスを
         // 完全に奪う。
-        let response =
-            super::show_startup_modal(ctx, egui::Id::new("settings_restore_result_modal"), |ui| {
+        let response = super::show_startup_modal(
+            ctx,
+            egui::Id::unique("settings_restore_result_modal"),
+            |ui| {
                 draw_settings_restore_result_content(
                     ui,
                     title,
@@ -754,7 +784,8 @@ impl App {
                     kind,
                     remote_resume_error.as_deref(),
                 )
-            });
+            },
+        );
 
         let (mut closing, retry_remote, exit_for_remote) = response.inner;
 
@@ -1141,6 +1172,7 @@ impl App {
                 let mut window_open = true;
                 let mut save = false;
                 egui::Window::new("操作カスタマイズを書き出す")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1188,8 +1220,9 @@ impl App {
                 previous,
             } => {
                 let mut window_open = true;
-                let modal_size = operation_modal_size(ctx.available_rect().size());
+                let modal_size = operation_modal_size(ctx.content_rect().size());
                 egui::Window::new("操作カスタマイズの差分")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1269,8 +1302,9 @@ impl App {
                 let preview = crate::operation_customize_share::diff(&current, bundle);
                 let mut window_open = true;
                 let mut apply = false;
-                let modal_size = operation_modal_size(ctx.available_rect().size());
+                let modal_size = operation_modal_size(ctx.content_rect().size());
                 egui::Window::new("操作カスタマイズを取り込む")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1331,7 +1365,7 @@ impl App {
             OperationModal::ResetConfirm => {
                 let mut window_open = true;
                 let mut reset = false;
-                egui::Window::new("操作カスタマイズを初期値に戻す")
+                egui::Window::new("操作カスタマイズを初期値に戻す").drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1390,6 +1424,10 @@ fn draw_operation_customize_body(app: &mut App, ui: &mut egui::Ui) {
     let backups = app.settings_restore_state.backups.clone();
     let now = SystemTime::now();
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .max_height(340.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
@@ -1750,7 +1788,7 @@ fn load_previous_operation_bundle(
 
 fn draw_operation_modal_scroll_body(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
     modal_height: f32,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
@@ -1758,6 +1796,10 @@ fn draw_operation_modal_scroll_body(
     let body_size = egui::vec2(ui.available_width(), body_height);
     ui.allocate_ui_with_layout(body_size, egui::Layout::top_down(egui::Align::Min), |ui| {
         egui::ScrollArea::both()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt(id_salt)
             .auto_shrink([false, false])
             .max_height(body_height)
@@ -1915,7 +1957,8 @@ mod tests {
     }
 
     #[test]
-    fn hidden_explicit_quit_keeps_the_wake_until_the_exact_task_reissues_close() {
+    fn egui037_continuation_root_lifecycle_hidden_explicit_quit_keeps_the_wake_until_the_exact_task_reissues_close()
+     {
         let mut app = crate::app::setup_app_for_test();
         app.settings.minimize_to_tray_on_close = false;
         app.window_visible = false;
@@ -1932,6 +1975,7 @@ mod tests {
             task,
             deferred_close: None,
         };
+        let finish_save = app.sent_composition_save_for_lifecycle_test();
         let ctx = egui::Context::default();
         let mut raw = egui::RawInput::default();
         raw.viewports
@@ -1940,7 +1984,9 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let blocked = ctx.run(raw, |ctx| app.defer_settings_family_root_close(ctx));
+        let blocked = crate::test_ui::headless_paint_output(
+            ctx.run_pass(raw, |ctx| app.service_root_lifecycle(ctx)),
+        );
         assert!(
             blocked
                 .viewport_output
@@ -1958,26 +2004,77 @@ mod tests {
         ));
         assert!(app.tray_resident_media_updates_needed());
         let app_source = include_str!("../app.rs");
-        let update = app_source
-            .find("fn update(&mut self, ctx: &egui::Context")
-            .expect("eframe update wrapper");
-        let update_source = &app_source[update..];
+        let app_trait = app_source
+            .split_once("impl eframe::App for App {")
+            .expect("eframe application callbacks")
+            .1;
+        let (logic_source, ui_source) = app_trait
+            .split_once("fn logic(&mut self, ctx: &egui::Context")
+            .expect("eframe logic callback")
+            .1
+            .split_once("fn ui(&mut self, ui: &mut egui::Ui")
+            .expect("eframe UI callback");
+        let ui_source = ui_source.split_once("fn on_exit(").unwrap().0;
+        assert!(logic_source.contains("self.service_app_logic(ctx, frame)"));
+        assert!(ui_source.contains("self.update_frame(ui, frame)"));
+        assert!(!ui_source.contains("accept_root_lifecycle_before_frame("));
+        let logic_service = include_str!("../app/logic_service.rs");
+        let close_latch = logic_service
+            .find("self.accept_root_lifecycle_before_frame(ctx)")
+            .expect("logic close latch");
+        let tray_checkpoint = logic_service
+            .find("self.service_root_lifecycle_tray_checkpoint(ctx, lifecycle)")
+            .expect("logic tray checkpoint");
+        let tray_wake = logic_service
+            .find("self.sync_tray_resident_media_wake()")
+            .expect("logic tray wake publication");
         assert!(
-            update_source
-                .find("defer_settings_family_root_close(ctx)")
-                .expect("close latch")
-                < update_source
-                    .find("self.update_frame(ctx, frame)")
-                    .expect("tray wake publication pass"),
-            "the hidden-root close latch must precede update_frame's tray wake publication"
+            close_latch < tray_checkpoint && tray_checkpoint < tray_wake,
+            "the hidden-root close latch and tray checkpoint must precede logic's wake publication"
+        );
+        let integration =
+            include_str!("../../vendor/eframe/src/native/epi_integration.rs").replace("\r\n", "\n");
+        let full_update = integration
+            .split_once("pub fn update(\n")
+            .expect("native full update")
+            .1
+            .split_once("pub fn update_logic_only(")
+            .unwrap()
+            .0;
+        assert!(
+            full_update
+                .find("app.logic(ui.ctx(), &mut self.frame)")
+                .unwrap()
+                < full_update.find("app.ui(ui, &mut self.frame)").unwrap(),
+            "the full pass must service the close latch before the display callback"
+        );
+
+        finish_save(Ok(()));
+        let still_blocked =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.service_root_lifecycle(ctx)
+            }));
+        assert!(!app.composition_editor_writes_pending());
+        assert!(
+            still_blocked.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(
+            !still_blocked.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close),
+            "a save receipt cannot bypass the settings worker's barrier"
         );
 
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                app.poll_settings_family_operation(ctx)
-            });
+            let output = crate::test_ui::headless_paint_output(
+                ctx.run_pass(egui::RawInput::default(), |ctx| {
+                    app.service_root_lifecycle(ctx)
+                }),
+            );
             if output
                 .viewport_output
                 .get(&egui::ViewportId::ROOT)
@@ -1987,6 +2084,8 @@ mod tests {
             }
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
+
+            output.drop_without_applying_deltas();
         }
         assert!(matches!(
             app.settings_restore_state.family_operation,
@@ -1994,6 +2093,22 @@ mod tests {
         ));
         assert!(worker_finished.load(std::sync::atomic::Ordering::Acquire));
         assert!(!app.tray_resident_media_updates_needed());
+        let again =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.service_root_lifecycle(ctx)
+            }));
+        assert!(
+            !again
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::Close))
+        );
+
+        again.drop_without_applying_deltas();
+
+        blocked.drop_without_applying_deltas();
+
+        still_blocked.drop_without_applying_deltas();
     }
 
     #[test]
@@ -2084,22 +2199,25 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 420.0))
-            .build(move |ctx| {
-                crate::ui_fonts::configure_fonts(ctx);
-                if !fonts_ready {
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("操作カスタマイズの差分");
-                    ui.horizontal(|ui| {
-                        let _ = ui.selectable_label(false, "標準");
-                        let _ = ui.selectable_label(true, "現在");
-                        let _ = ui.selectable_label(false, "前世代");
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::ui_fonts::configure_fonts(ctx);
+                    if !fonts_ready {
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("操作カスタマイズの差分");
+                        ui.horizontal(|ui| {
+                            let _ = ui.selectable_label(false, "標準");
+                            let _ = ui.selectable_label(true, "現在");
+                            let _ = ui.selectable_label(false, "前世代");
+                        });
+                        ui.separator();
+                        draw_operation_diff(ui, &operation_diff);
                     });
-                    ui.separator();
-                    draw_operation_diff(ui, &operation_diff);
                 });
             });
         harness.run();
@@ -2112,38 +2230,43 @@ pub(super) fn draw_restore_result_snapshot_fixture(ctx: &egui::Context, fixture:
         "設定の復元に失敗しました。".to_owned(),
         "読み込みエラーの詳細。".repeat(240),
     ];
-    super::show_startup_modal(ctx, egui::Id::new("settings_restore_result_modal"), |ui| {
-        let kind = match fixture {
-            "restore_success" => ResultKind::Success,
-            "restore_recoverable" | "restore_remote" => ResultKind::FailedRecoverable,
-            _ => ResultKind::FailedTerminal,
-        };
-        let remote_error = "リモート再接続エラーの詳細。".repeat(120);
-        let success_lines = vec![
-            "設定の復元が完了しました。".to_owned(),
-            "退避ファイル: 設定バックアップ。".repeat(100),
-        ];
-        draw_settings_restore_result_content(
-            ui,
-            if kind == ResultKind::Success {
-                "復元完了"
-            } else {
-                "エラー"
-            },
-            if kind == ResultKind::Success {
-                &success_lines
-            } else {
-                &lines
-            },
-            kind,
-            (fixture == "restore_remote").then_some(remote_error.as_str()),
-        )
-    });
+    super::show_startup_modal(
+        ctx,
+        egui::Id::unique("settings_restore_result_modal"),
+        |ui| {
+            let kind = match fixture {
+                "restore_success" => ResultKind::Success,
+                "restore_recoverable" | "restore_remote" => ResultKind::FailedRecoverable,
+                _ => ResultKind::FailedTerminal,
+            };
+            let remote_error = "リモート再接続エラーの詳細。".repeat(120);
+            let success_lines = vec![
+                "設定の復元が完了しました。".to_owned(),
+                "退避ファイル: 設定バックアップ。".repeat(100),
+            ];
+            draw_settings_restore_result_content(
+                ui,
+                if kind == ResultKind::Success {
+                    "復元完了"
+                } else {
+                    "エラー"
+                },
+                if kind == ResultKind::Success {
+                    &success_lines
+                } else {
+                    &lines
+                },
+                kind,
+                (fixture == "restore_remote").then_some(remote_error.as_str()),
+            )
+        },
+    );
 }
 
 pub(super) fn draw_restore_list_snapshot_fixture(ctx: &egui::Context) {
     let backups = restore_backup_snapshot_fixture();
     egui::Window::new("設定の復元")
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(&mut true)
         .resizable(true)
         .collapsible(false)
@@ -2402,7 +2525,8 @@ mod small_screen_tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -2411,6 +2535,7 @@ mod small_screen_tests {
                     }
                     crate::settings::apply_ui_scale_factor(ctx, scale);
                     egui::Window::new("設定の復元")
+                        .drag_area(egui::WindowDrag::Anywhere)
                         .fixed_size(egui::vec2(200.0, ctx.content_rect().height() - 80.0))
                         .default_pos(egui::pos2(60.0, 40.0))
                         .show(ctx, |ui| {
@@ -2419,7 +2544,11 @@ mod small_screen_tests {
                 });
             harness.run_steps(12);
             let node = harness.get_by_label("設定を完全リセット…");
-            let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+            let id = unsafe {
+                egui::Id::from_high_entropy_bits(
+                    (u128::from(node.accesskit_node().id()) >> 64) as u64,
+                )
+            };
             let response = harness.ctx.read_response(id).unwrap();
             assert!(harness.ctx.content_rect().contains_rect(response.rect));
             assert!(
@@ -2439,7 +2568,8 @@ mod small_screen_tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -2447,6 +2577,7 @@ mod small_screen_tests {
                         return;
                     }
                     egui::Window::new("設定の復元")
+                        .drag_area(egui::WindowDrag::Anywhere)
                         .fixed_size(egui::vec2(500.0, 420.0))
                         .default_pos(egui::pos2(60.0, 40.0))
                         .show(ctx, |ui| {
@@ -2493,14 +2624,16 @@ fn draw_restore_confirm_dialog(
         ),
         PendingAction::FullReset => (
             "設定を完全リセット",
-            "settings.db / bak1〜bak10 を含む設定ファイル一式を削除します。".to_string(),
-            "現在の設定一式は別名でバックアップしてから削除します。\n\
+            "settings.db / bak1〜bak10 を含む設定ファイル一式を削除し、本の構成を解除します。"
+                .to_string(),
+            "現在の設定一式と本の構成は別名でバックアップしてから削除・解除します。\n\
                  完了後、アプリを自動で終了します。次回起動時は初期状態になります。",
             "リセットして終了",
         ),
     };
 
     egui::Window::new(title)
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(confirm_open)
         .collapsible(false)
         .resizable(false)

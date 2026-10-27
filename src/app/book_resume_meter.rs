@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use super::App;
+use super::{ActionSurface, App};
 use crate::book_resume_db::{BookResumeWriter, MeterReadResult, ReadingMeterValue};
+use crate::keymap::KeyAction;
 
 #[derive(Clone)]
 enum Delta {
@@ -37,12 +38,20 @@ struct PendingRead {
     deltas: Vec<Delta>,
 }
 
+struct PendingClear {
+    rx: mpsc::Receiver<Result<usize, String>>,
+    origin: Option<(
+        super::viewer_context_registry::ViewerContextId,
+        ActionSurface,
+    )>,
+}
+
 #[derive(Default)]
 pub(crate) struct BookResumeMeters {
     // NULL行も保持するので、環境設定の登録件数に同期DB countは不要。
     rows: Option<HashMap<String, Option<ReadingMeterValue>>>,
     pending: Option<PendingRead>,
-    clear: Option<mpsc::Receiver<Result<usize, String>>>,
+    clear: Option<PendingClear>,
     // path自身をmemo keyにする。items/idxの差替えやviewer切替で別セルを指さない。
     keys: HashMap<PathBuf, ResumeMeterPathKeys>,
 }
@@ -67,6 +76,9 @@ pub(crate) fn media_resume_fraction(position: f64, duration: f64) -> Option<f32>
 }
 
 impl BookResumeMeters {
+    pub(crate) fn read_pending(&self) -> bool {
+        self.pending.is_some()
+    }
     pub(crate) fn reload(&mut self, writer: &BookResumeWriter) {
         self.pending = Some(PendingRead {
             rx: writer.read_all(),
@@ -145,6 +157,55 @@ impl BookResumeMeters {
 }
 
 impl App {
+    /// Input ownership (modal, text/IME, viewer focus) is decided by the existing callers.
+    pub(crate) fn consume_saved_position_clear_shortcuts(
+        &mut self,
+        ctx: &egui::Context,
+        surface: ActionSurface,
+    ) -> bool {
+        // Share the current-player normalize predicate with native input. Text/IME
+        // ownership stays with each caller (native receives a root egui Context).
+        if self.fullscreen_idx.is_some_and(|idx| {
+            self.music_normalize_modal_active(idx)
+                || (self.fs_music_view_active(idx) && self.music_bookmark_modal_open())
+        }) {
+            return false;
+        }
+        for action in [
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
+        ] {
+            if self.keymap.consume_action_no_repeat(ctx, action) {
+                self.execute_saved_position_clear(action, surface);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn execute_saved_position_clear(
+        &mut self,
+        action: KeyAction,
+        surface: ActionSurface,
+    ) {
+        match action {
+            KeyAction::ClearVideoMediaMemory => {
+                let (positions, watched, tracks) = self.clear_live_video_media_memory();
+                let message = if positions == 0 && watched == 0 && tracks == 0 {
+                    "保存済みの再生位置・視聴済み記録・音声トラックの選択はありません".into()
+                } else {
+                    format!(
+                        "再生位置 {positions} 件、視聴済み記録 {watched} 件、音声トラックの選択 {tracks} 件をクリアしました"
+                    )
+                };
+                // Like recording playback progress, save at the existing settings boundaries.
+                self.show_feedback_toast_on(message, surface);
+            }
+            KeyAction::ClearBookResumePositions => self.clear_book_resume_async_on(Some(surface)),
+            _ => unreachable!("not a saved-position clear action"),
+        }
+    }
+
     pub(crate) fn thumbnail_resume_meter(&mut self, idx: usize) -> Option<f32> {
         if !self.settings.thumb_show_resume_meter {
             return None;
@@ -184,18 +245,21 @@ impl App {
         idx: usize,
         value: Option<ReadingMeterValue>,
         identity: Option<crate::book_resume_db::PageIdentity>,
-    ) {
+    ) -> bool {
         let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
         let record = (path, idx, value, identity);
         if self.last_book_resume.as_ref() == Some(&record) {
-            return;
+            return true;
         }
-        if let Some(writer) = &self.book_resume_writer
-            && writer.record_identity(&record.0, idx, value, record.3.clone())
-        {
+        let recorded = self
+            .book_resume_writer
+            .as_ref()
+            .is_some_and(|writer| writer.record_identity(&record.0, idx, value, record.3.clone()));
+        if recorded {
             self.book_resume_meters.record(&record.0, value);
         }
         self.last_book_resume = Some(record);
+        recorded
     }
 
     pub(crate) fn reload_book_resume_meters(&mut self) {
@@ -205,10 +269,41 @@ impl App {
     }
 
     pub(crate) fn clear_book_resume_async(&mut self) {
+        self.clear_book_resume_async_on(None);
+    }
+
+    fn clear_book_resume_async_on(&mut self, surface: Option<ActionSurface>) {
+        // Keep the first completion ticket, even if the worker already replied but
+        // the UI has not polled it yet. Do not admit another mutation or enqueue it.
+        if self.book_resume_meters.clear.is_some() {
+            let message = "本の読書位置をクリア中です".to_string();
+            if let Some(state) = &mut self.pref_state {
+                state.book_resume_clear_result = Some(message.clone());
+            }
+            if let Some(surface) = surface {
+                self.show_feedback_warning_on(message, surface);
+            } else {
+                self.show_feedback_warning(message);
+            }
+            return;
+        }
+        if self.book_resume_writer.is_some() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
+        let origin = surface.map(|surface| (self.projected_viewer_context_id(), surface));
         if let Some(writer) = &self.book_resume_writer {
-            self.book_resume_meters.clear = Some(writer.clear());
+            self.book_resume_meters.clear = Some(PendingClear {
+                rx: writer.clear(),
+                origin,
+            });
             self.book_resume_meters.update(Delta::Clear);
             self.last_book_resume = None;
+        } else if let Some(surface) = surface {
+            crate::logger::log("book-resume clear: writer unavailable");
+            self.show_feedback_warning_on(
+                "読書位置をクリアできませんでした。再起動してください".into(),
+                surface,
+            );
         }
     }
 
@@ -294,7 +389,7 @@ impl App {
         if let Some(result) = self.book_resume_meters.poll() {
             if let Err(error) = result {
                 crate::logger::log(format!("book-resume meter: {error}"));
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "読書位置のメーターを取得できませんでした。再起動してください".into(),
                 );
             }
@@ -304,25 +399,45 @@ impl App {
             ctx.request_repaint();
         }
         let clear_result =
-            self.book_resume_meters
-                .clear
-                .as_ref()
-                .and_then(|rx| match rx.try_recv() {
+            self.book_resume_meters.clear.as_ref().and_then(|pending| {
+                match pending.rx.try_recv() {
                     Ok(result) => Some(result),
                     Err(mpsc::TryRecvError::Empty) => None,
                     Err(mpsc::TryRecvError::Disconnected) => Some(Err("worker stopped".into())),
-                });
+                }
+            });
         if let Some(result) = clear_result {
-            self.book_resume_meters.clear = None;
-            if result.is_err() {
+            let pending = self.book_resume_meters.clear.take().expect("pending clear");
+            if let Err(error) = &result {
+                crate::logger::log(format!("book-resume clear: {error}"));
                 self.reload_book_resume_meters();
             }
+            let kind = crate::feedback::FeedbackKind::result(result.is_err());
+            let message = match result {
+                Ok(0) => "保存済みの本の読書位置はありません".into(),
+                Ok(count) => format!("{count} 件の読書位置をクリアしました"),
+                Err(error) => format!("読書位置のクリアに失敗しました: {error}"),
+            };
             if let Some(ps) = &mut self.pref_state {
                 ps.book_resume_entry_count = self.book_resume_meters.count();
-                ps.book_resume_clear_result = Some(match result {
-                    Ok(count) => format!("{count} 件の読書位置をクリアしました"),
-                    Err(error) => format!("クリアに失敗しました: {error}"),
-                });
+                ps.book_resume_clear_result = Some(message.clone());
+            }
+            if let Some((context, surface)) = pending.origin {
+                // Completion is polled from main, after the initiating viewer was unmounted.
+                // Use its existing context owner to reach the correct native overlay.
+                if self
+                    .with_viewer_context(context, |app| {
+                        app.show_feedback_result_on(message, surface, kind);
+                    })
+                    .is_err()
+                {
+                    crate::logger::log(format!(
+                        "book-resume clear feedback: origin context {} is gone",
+                        context.serial()
+                    ));
+                }
+            } else if self.pref_state.is_none() {
+                self.show_feedback_result(message, kind);
             }
             ctx.request_repaint();
         }

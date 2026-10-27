@@ -451,6 +451,9 @@ $copies = @(
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
     @{ src = 'LIBRAW-LICENSE.txt';                    dst = 'LIBRAW-LICENSE.txt' }
+    @{ src = 'LIBAVIF-LICENSE.txt'; dst = 'LIBAVIF-LICENSE.txt' }
+    @{ src = 'DAV1D-LICENSE.txt'; dst = 'DAV1D-LICENSE.txt' }
+    @{ src = 'LIBYUV-LICENSE.txt'; dst = 'LIBYUV-LICENSE.txt' }
     @{ src = 'ZLIB-LICENSE.txt';                      dst = 'ZLIB-LICENSE.txt' }
     @{ src = 'LIBJPEG-TURBO-LICENSE.txt';             dst = 'LIBJPEG-TURBO-LICENSE.txt' }
     @{ src = 'vendor\egui-wgpu\LICENSE-MIT';         dst = 'egui-LICENSE-MIT.txt' }

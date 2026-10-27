@@ -1,119 +1,248 @@
-# egui 0.33.3 のローカル変更
+# egui 0.37.0 のローカル変更（段2a-1／2a-2／2a-3）
 
-別バージョン検索の長押し表示を修正する際、ナビゲーターの入力順序を
-egui のクリック判定と対応付けるために追加した、読み取り専用の API である。
-この読み取り専用APIはクリックの判定条件、時刻、入力イベントの生成・消費を変更しない。
-2026-10-10には、前面popup終了時に未配送のwheel平滑化分を破棄する限定APIを追加した。
-以下の元APIの検証・レビュー記録は当時の差分だけを示す。追加APIの境界は末尾に記録する。
+原本とchecksum・VCSの記録は [upstream-provenance.json](../upstream-provenance.json) を参照。
+段2a-1では0.37.0原本を基準に、旧`vendor/egui`の既存パッチを付け直した。
+段2a-2のIME中断要求の生成・集約修正と段2a-3の非描画退役は末尾の追補に記録する。
+rootの依存切替・製品操作差の受入れはこの段階に含めない。
+README、Cargo.toml.orig、同梱Cargo.lockは原本を保持する。
 
-## 出典
+## 差分台帳
 
-- crates.io package: `egui-0.33.3.crate`
-- package SHA-256: `6a9b567d356674e9a5121ed3fedfb0a7c31e059fe71f6972b691bcd0bfc284e3`
-- upstream repository: `https://github.com/emilk/egui`
-- `.cargo_vcs_info.json` の commit: `44cdd653e2317d300fb8a6c9c36b03f23991e803`
-- upstream package path: `crates/egui`
-- 検証日: 2026-09-08
+分類は [更新計画 §4.8](../../docs/egui-0.37-update-plan.md#48-vendorパッチ台帳) に従う。
 
-Cargo registry の archive checksum を導入前の root `Cargo.lock` と照合し、
-archive 内の106ファイルと展開済み registry source の全 bytes が一致することを確認した。
-registry 管理用の `.cargo-ok` と生成された `target/` はコピーしない。
-この文書とライセンス本文の追加を除き、原本からの Rust 差分は
-`src/input_state/mod.rs` の API と回帰テストだけである。
+| 項目 | 分類 | 変更と保証 |
+| --- | --- | --- |
+| `PointerState::released_buttons_with_click_counts` | (b) 保持 | `src/input_state/mod.rs`。本家が判定した全button releaseを順に値へ射影し、非clickは`None`で残す。判定やイベントの生成・消費は変更しない |
+| 旧クリック分類fixture | (c) 新分類へ移行 | 旧位置列`(20,20)→(30,30)→(40,40)→(50,50)`は全てcount 1。別の近接位置列で1/2/3/3を検査し、全button・非click・focus区間・順序・discard後の非再生を維持する |
+| `InputState::discard_pending_scroll` | (b) 新ownerへ適応 | `src/input_state/mod.rs`。0.37の`WheelState::unprocessed_wheel_delta`だけをゼロにし、scrollとwheel zoomの未来passへの残量を終端する |
+| repaint delay witness | (b) 保持 | `src/context.rs`とCargo.tomlの`miv-repaint-witness` feature。現在viewportのschedulerを読み、outstandingがあれば0、有限delayならその値、要求なしなら`None`。状態を変更しない |
+| 本家click分類 | (a) 差分不要 | 0.37の距離・時間条件をそのまま使用する。旧分類を再実装せず、本家の事実を別回帰で固定する |
+| license本文 | (b) 保持 | 旧vendorのMIT / Apache本文をbyte変更なしで同梱する |
 
-## API の境界
+段2a-1ではIME中断要求のviewport所有・pass出力集約を変更していない（段2a-2追補を参照）。
+非描画viewport退役入口は段2a-3追補を参照。
 
-`PointerState::released_buttons_with_click_counts()` は、当該 pass で egui が判定した
-全 button release を順序通りに返す。
+## Wheel終端の境界
 
-```rust
-impl Iterator<Item = (PointerButton, Option<(Pos2, u32)>)> + '_
-```
+前面popup等の既存入力ownerが終了するpassの終端に呼ぶ。現在passのpublic deltaと
+wheel eventの消費は呼出側が行う。新WheelStateでは旧scroll／zoomの二つのqueueが一つに
+統合されているため、未配送deltaだけを破棄する。現在delta、pointer、focus、touch、
+gestureのstatus・source・時刻・modifier latchは保持し、次passの新規wheelは通常どおり処理する。
+開いている間の平滑化を毎pass消す用途や、汎用の非表示入力終端には使わない。
 
-click でない release も `None` として返すため、raw release 列と序数が一致する。
-返すのは値の射影であり、内部の mutable state や内部イベント型は公開しない。
-呼出側は全 button・全 focus 区間へ注釈してから、viewport、位置、操作 owner、focus を
-判定する。この API 自体は、特定 widget が click を所有することを保証しない。
+## 回帰と検証の扱い
 
-通常の `Response::double_clicked()` は pass 全体の判定を参照するため、同一 pass 内で
-focus が切り替わる場合の release を特定する用途には情報が不足する。
-アプリで別のクリック時間窓を実装したり、egui の入力処理を再実行したりしないための境界である。
+- 射影は旧2回帰を移植し、実`Context::run_ui`でdiscardを通す。検査後のFullOutputは
+  `drop_without_applying_deltas`でheadless明示破棄する。
+- 分類は近接／離れたclick、6 logical points未満・ちょうど・超過（倍率1／2）、
+  doubleの厳密な時間境界、tripleの直近二区間条件を検査する。
+- wheelはscroll／zoom双方の未配送残量、現passと所有状態の保持、後続idleでの非再生、
+  新規wheelの受理を検査する。終端しない比較経路では残量が再生されることも確認する。
+- witnessは要求なし／遅延／即時／outstandingを読み、schedulerが変わらないことを検査する。
 
-## 統合
+準備graph・実行件数・command・結果は親担当の段2a検証台帳に記録する。
+本書は旧版の成功結果を0.37へ流用せず、未実行の回帰を成功済みとは扱わない。
 
-- root workspace では本 crate を除外し、`[patch.crates-io]` から同じ path を指定する。
-- standalone の `vendor/eframe` と `vendor/egui-wgpu` にも `../egui` の patch を置く。
-- 直接依存だけを path 化し、推移的な registry egui と型を分裂させない。
-- root と両 standalone の dependency graph / lock を確認し、同じ local egui 一実体へ揃える。
-- `scripts/test-full.ps1` は既存の検証に加え、本 crate の無 filter lib tests を実行する。
+## ライセンス
 
-## ライセンスの保持
+packageの`MIT OR Apache-2.0`宣言は維持する。原本crateには本文がないため、
+旧`vendor/egui`の同名本文をコピーする。
 
-package の `MIT OR Apache-2.0` 宣言は変更しない。原本 archive はライセンス本文を
-含まないため、既存 `vendor/egui-wgpu` の同名本文を変更せず同梱する。
-
-| コピー元 | コピー元の SHA-256 |
+| コピー元 | SHA-256 |
 | --- | --- |
-| `../egui-wgpu/LICENSE-MIT` | `3fceb7b317f3c70451942b0e123723a2e250c7eaf970ce4b490a57a94c5588ff` |
-| `../egui-wgpu/LICENSE-APACHE` | `1ac50a5abd5cff5331d59928d83369b66b0099a88f0111dc2175526b3c666dec` |
+| `../../vendor/egui/LICENSE-MIT` | `3fceb7b317f3c70451942b0e123723a2e250c7eaf970ce4b490a57a94c5588ff` |
+| `../../vendor/egui/LICENSE-APACHE` | `1ac50a5abd5cff5331d59928d83369b66b0099a88f0111dc2175526b3c666dec` |
 
-MIT の本文・著作権表示は、同じ upstream commit の
-[LICENSE-MIT](https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/LICENSE-MIT)
-でも確認した。上表の hash は既存 repository 内のコピー元の値であり、remote ファイルの
-byte hash としては主張しない。About の既存ライセンス本文表示は維持する。
+## 段2a-2: IME中断要求の生成・集約（2026-10-17）
 
-## 検証記録
+設計第4.4版§4.5と、detached計画§11で合意済みの所有境界を準備graphで実装した。
+対象HEADは`8023e4bdd`。以下は**実装担当の内部確認**であり、正式な独立レビュー・受入れではない。
 
-- 原本との差分、読み取り専用 API、2件の回帰、manifest / gate 接続を独立 Astra がレビュー済み。
-- `cargo test --manifest-path vendor/egui/Cargo.toml --lib`: 25成功、0失敗。
-  記録: `target/r4-vendor-egui-tests2.log`。初回 offline 実行は未取得依存で開始できず、製品失敗ではない。
-- 追加回帰は、非 click を含む全 button の release 順序と、discard 後の第二 pass への非再生を確認する。
-- アプリ側の Flat / Panorama ordered 入力は54件成功、focus snapshot と release 後移動の補強も各1件成功。
-- root の `cargo fmt --all -- --check` 成功時、本 crate の変更ファイルの bytes が変わらないことを確認済み。
+| 項目 | 分類 | 変更と保証 |
+| --- | --- | --- |
+| IME中断要求のviewport所有 | (b・新規) | `src/memory/mod.rs`。Memory共通のrequested_interrupt_imeを既存のviewport別Focusへ移す。interrupt_ime、request_focus、request_focus_next_frameは現在のFocusだけを更新する |
+| pass開始・出力の対象 | (b・新規) | Focus::begin_passで対象entryだけresetする。end_passの既存getterは同じviewportのFocusを読み、子end後の既存viewport復帰で親Focusへ戻る。手動退避・復元や第二mapは作らない |
+| 未配送PlatformOutput集約 | (b・新規) | `src/data/output.rs`。同じviewportの新IME metadataを採り、中断要求は旧・新のORを保持。新Noneなら旧Someを保持し、take後や次の新規runへ要求を持ち越さない |
+| 実入れ子・実discard回帰 | (b・新規) | `src/context/ime_interrupt_tests.rs`、登録はcontext.rs。共通名ime_interruptで選択する6件。親子のPlatformOutputは混ぜない |
 
-ライセンス2本文の配置と上表の hash 一致を確認済み。原本106ファイルとの差分は引き続き
-`src/input_state/mod.rs` だけで、追加は本書とライセンス2本文（合計109ファイル、生成 target を除く）。
-root / eframe / egui-wgpu / egui standalone の cargo tree は、すべて同じ local egui 一実体。
-既存3 lock の差分は egui の registry source / checksum 2行の除去だけで、version 更新はない。
-記録: `target/r4-cargo-tree-{root-egui,eframe-egui,egui-wgpu-egui,egui-standalone}1.log`。
-アプリ全体の最終 gate は target/r4-test-full-final4-j1.log で成功（main lib 7693成功、38ignored）。
-portable のビルド・24 runtime files の更新照合も成功した。実機確認は利用者の返答待ちである。
-段階結果と残作業は [レビュー修正記録](../../docs/duplicate-detection-review-fixes-20260907.md) を参照。
+Focus map全体が既存のserde(skip)対象であるため、新しい永続形式・設定は作らない。
+移管した既存要求以外のbool、App補助フラグ、追加repaint、新queue、retryは追加していない。
+後続の非描画退役・eframe・egui-wgpu・root製品graphには触れない。
 
-## InputState::discard_pending_scroll（2026-10-10）
+回帰は実show_viewport_immediateのheadless rendererから、同じContextの子run_uiを実行する。
+実TextEditと事前focus passを使い、親のみ／子のみ／両方／なしについて3要求入口を検査する。
+親子ともSome(IMEOutput)、各1pass、親へのviewport復帰、次の要求なしrunで両方falseを確認する。
+rendererはthread-localの元callbackへ必ず戻す。Memoryのviewport IDをテストから切り替えない。
 
-### 必要性と呼出境界
+実discard回帰は第1passだけ要求し、第2passでTextEditの位置とpurposeを変える。
+再passの実行、最新rect／cursor_rect／purposeと中断要求true、次の新規runでfalseを検査する。
+補助回帰はSome/None・要求有無の16組とtake後の消失を検査する。
+全FullOutputは各viewport別に検査用metadataを採取してから、headlessで明示破棄する。
 
-publicなraw_scroll_delta / smooth_scroll_delta / Event::MouseWheelを消費しても、egui内部の
-平滑化待ちwheelが次frameに再生成される。前面popupを閉じた後、同じwheelの残りが背面panelへ
-配送されることを防ぐため、InputState自身に未配送分の終端APIを設ける。
+修正前は6件中4失敗。所有修正だけ／集約修正だけを戻す変異はそれぞれ4成功・2失敗で、
+修正済みbytesへ復元後は6件全成功。準備graphの全lib結果はegui 98件、egui-winit 43件、
+egui-ime 26件が成功（各exit 0）。commandと証拠は[段2台帳](../../docs/egui-0.37-stage2-verification.md)に記録する。
 
-fullscreen共通HUD境界でframeの前面ownerをキー処理・ナビゲータ入力より前に確定し、
-入力を退避して対象regionの描画直前だけ戻す。全前面描画後にpublic delta・wheel eventの残りを
-消費し、選択済みtargetが閉じている終了frameだけ本APIを呼ぶ。開いている間の平滑化を毎frame
-破棄したり、Appの遅延フラグ・時間窓で遮断したりしない。キー終了でも既存キー転送は維持する。
+本家にも報告する価値がある。実入れ子run_ui／実discardの最小回帰と、各修正の独立した修正前後の証拠を添えられる（今回は未送信）。
 
-### 破棄対象と保持対象
+## 段2a-3: 承認済み子viewportの非描画退役（2026-10-17）
 
-`src/input_state/mod.rs`の本APIはprivateな`unprocessed_scroll_delta`と
-`unprocessed_scroll_delta_for_zoom`だけをゼロにする。publicなdelta・eventの消費は呼出側の
-既存境界が行う。pointer / focus / touch・gestureの状態、次frameに届く新規wheelは変更しない。
-内部fieldを公開せず、既存入力ownerが保有する未配送queueの終端だけを提供する。
+開始HEAD `9c54f4f1d`。設計第4.4版§4.2・§4.8・段2a順序11と、detached計画§11の
+Close lifecycle構造合意に基づく。以下は**実装担当の内部確認**である。
 
-### 回帰と依存更新時に保持すべき差分
+| 項目 | 分類 | 変更と保証 |
+| --- | --- | --- |
+| `Context::retire_viewport` | (b・新規) | 承認済み子とその子孫の登録を終了し、実際に除去したIDを返す。ROOT／pass中は拒否、未知／重複はno-op。同じIDの明示的な新規openは可能 |
+| 通常GCと共通の退役処理 | (b・新規) | `src/context.rs`。viewport登録・親関係・viewport別Memory・font galley cacheを同じ処理で除去。子孫を同じ終了境界へ合流する |
+| viewport別Memory終了 | (b・新規) | `src/memory/mod.rs`。対象のareas／interactions／Focus（IME中断要求を含む）／popupsだけを除去。現在ownerが対象ならROOTへ戻す。兄弟は変更しない |
+| callback所有物の破棄 | (b・新規) | 明示入口と通常GCとも、除去したViewportStateをContext lockの外へ移してからdropする |
+| 実Context回帰 | (b・新規) | `src/context/viewport_retirement_tests.rs`の8件。兄弟の入力・実TextEdit IME・状態、後続出力、hide/minimize、通常GC、owner復帰、lock外drop、未配送texture delta、入口制約を検査 |
 
-src/ui_fullscreen.rsの実render_fullscreen_viewport回帰で、実HUDから開くfit / overflowの
-クリック終了＋wheel、overflowのキー終了＋wheel、後続idle frameの平滑化残り消費、終了後の
-新規wheel配送を確認する。固定ナビゲータとの実重なりでは、元raw snapshotを保持し、即時・
-予約consumerへの射影だけから前面所有wheelを除くことを確認する。
+呼出しはcompleteなrun_ui／run_pass／run_logicの終了後、plugin callbackおよびbackend／Contextの
+lock外とする。先行出力・texture deltaの配送と、閉じたIDの新規publish停止はbackend ownerの責務。
+共有texture manager・widget data／cache・plugin所有状態は消去しない。新しい抑止ラッチ・
+退役済みIDリスト・App補助フラグ・追加repaint・保持queue・retryは追加しない。
+egui-ime pluginの状態は従来のRawInput live-set処理に従うため、本入口でplugin全体をresetしない。
 
-依存更新時は本APIの宣言と上記2内部queueの破棄、fullscreenの終了時呼出、キー・raw navigator
-処理より前のframe所有確定、上記アプリ回帰を保持する。upstreamに同等の終端APIがある場合は
-同じ破棄範囲・終了境界・回帰を満たすAPIへ置換する。読み取り専用の
-released_buttons_with_click_counts APIと元の順序／focus回帰も別途保持する。
-追加APIについて本台帳は独立レビュー完了を主張しない。
+Memory終了を外す変異は4成功／4失敗、通常GCの共通処理を外す変異は6成功／2失敗（各exit 101）。
+修正済みbytesへの復元後は8件全成功。全libはegui 106件、egui-winit 43件、egui-ime 26件が成功。
+egui-winitの既存兄弟IME回帰は、metadataだけでなく親からdeferred子登録を維持するfixtureへ適応した。
+producerとassertは変更していない。command・初回失敗の原因・証拠は[段2台帳](../../docs/egui-0.37-stage2-verification.md)に記録する。
 
-2026-10-10の追加実経路2件（specified_scale_overflow_key_close_owns_wheel_and_forwards_key /
-specified_scale_overflow_wheel_owns_real_pinned_navigator_overlap）は、修正前にそれぞれ背面offsetの変化、
-固定ナビゲータsizeの変化で失敗することを確認した。修正後のspecified 88件とnavigator 58件は成功。
-対象APIの実装は本追補では変更せず、終了境界への接続とconsumer用射影を検証した。
+eframeのClose受付・消費・backend window／surface／State終了は段2cへ残す。
+本家へは通常GCのviewport別Memory残留とlock下callback破棄を、最小回帰と共に報告する価値がある（未送信）。
+
+## 段2c-4a: 処理済み子Closeのcached metadata消費（2026-10-17）
+
+`Context::consume_viewport_close`を限定追加した（b・新規）。**実装担当の内部確認**。
+eframeの子Close hookが承認／拒否した一回だけ、既存の全ViewportState.input.raw.viewportsから
+対象Closeを消費する。root／UI pass中は拒否し、通常input events・兄弟Close・他metadataは保つ。
+public input_mut_forで未知IDを列挙すると登録を作るため、既存内部mapだけを走査する。
+未知IDで登録を作らず、新しいCloseは抑止しない。新状態・queue・一括resetは追加しない。
+実Contextのrun_logic後snapshotと次の新Closeを検査する回帰を追加した。
+承認時の登録終了は既存retire_viewportのままで、IME policy整理は準備egui-imeの明示入口へ接続する。
+検証結果は段2台帳。正式な独立ACCEPT・実機確認ではない。
+
+
+## Stage 3: approved viewport retirement (design revision 4.5, 2026-10-17)
+
+Implementation record only; independent acceptance and execution evidence belong
+in the stage-3 verification ledger.
+
+- ViewportRegistration identifies one real Context registration. The read-only
+  Context::viewport_registration lookup never creates a target. Existing App
+  bindings may retain Context plus this identity after Context GC.
+- approve_viewport_retirement captures the exact target and owned descendants,
+  normalizes overlapping approvals in the existing root command column, and
+  emits RetireApproved. It does not request Close, repaint, UI, or native cleanup.
+- Full/LogicOnly/direct begin-end/pass-outside drains share the output contract.
+  Dynamic run_depth and the existing viewport stack keep authority in that same
+  root column through immediate nesting and discard retries. No second queue,
+  pending flag, retirement history, or retry was added.
+- ViewportOutput carries its own registration and exact parent registration.
+  append never mixes builders/callbacks/ordinary commands from different lives.
+  Old output cannot modify or recreate a reopened same-ID native viewport.
+- retire_approved_viewports uses the normal target-limited Context GC cleanup;
+  user callbacks drop outside the Context lock. Additional TextureHandle frees
+  can be transferred to the existing shared renderer owner.
+- consume_registered_viewport_close checks and consumes atomically, preserving
+  Close metadata belonging to a new same-ID registration created by a hook.
+
+The new stage3_viewport_retirement_tests module adds six real Context scenarios
+for logic, GC/discard, immediate nesting, append/reopen, overlap/direct end_pass,
+and unlocked callback drop/additional free. Existing stage-2 retirement tests
+remain intact. The first compile found a module-name collision and an associated
+setter called as a method; both source errors have been corrected.
+
+An additional discard/native-reopen texture ordering gap remains unresolved:
+run_dyn can retain pass-1 texture output while a pass-2 immediate renderer submits
+an old native callback's free first. No new delivery callback has been added;
+the design owner must decide that new ownership boundary before implementation.
+
+## Stage 3: formal vendor graph
+
+Earlier descriptions of vendor-next/preparation-only graphs are historical.
+Stage 3 uses the formal vendor/ crates from the root Cargo.toml and Cargo.lock.
+Each normalized vendor manifest has its own [workspace] and [patch.crates-io]
+pointing at the same formal egui, egui-winit, egui-wgpu, and eframe crates.
+Cargo.toml.orig and the upstream README are retained. Original upstream lockfile
+hashes remain in the provenance inventory. Active standalone Cargo.lock files were
+initially copied from the root lock during WIP setup and are resolved/recorded by
+ordinary offline Cargo; they are not original upstream lockfiles.
+The shared IME implementation lives in crates/egui-ime; egui-winit and
+eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
+were moved to vendor/upstream-provenance.json. Graph migration is not evidence
+that runtime checks or release gates have passed.
+
+
+## Stage 3: discard texture delivery (design revision 4.6, 2026-10-17)
+
+Implementation record and implementer internal inspection only. Independent
+acceptance and command results belong in the stage-3 verification ledger.
+
+- Context::enter_discard_texture_delivery installs a Context-identity-bound,
+  thread-local resource dispatcher with an RAII restore guard. Captures can be
+  non-Send; native backends capture Weak references to existing renderer owners.
+  The dispatcher owns no pending delta and invokes consumers outside its TLS
+  borrow and Context/texture-manager locks.
+- run_dyn moves only its accumulated textures_delta after a real retry is
+  confirmed, after output hooks and before the next begin_pass. Final/limited
+  passes and direct begin/end keep ordinary FullOutput delivery; no matching
+  scope preserves headless behavior. Nested immediate retries share the scope.
+- Four discard_texture_delivery regressions cover Context isolation, normal /
+  early-return / unwind restoration, limits/direct/empty output, actual plugin
+  mutation/IME output and receipt-model observation, and nested immediate retry.
+  Receipt-model tests are not evidence for the product page-turn plugin.
+
+## Stage 5: Rust 1.99 warning cleanup (2026-10-17)
+
+- `src/containers/scene.rs`: remove the `core::f32` module import so
+  `f32::EPSILON` resolves to the primitive associated constant instead of the
+  deprecated module constant. The numeric value and scene behavior are unchanged.
+  No TextEdit compatibility patch is added; the upstream 0.37 same-batch pointer
+  focus/Text behavior was explicitly accepted by the mIV user.
+
+## Stage 7: retain the unpublished font reservation (2026-10-17)
+
+`Context::take_viewport_retirement_texture_delta` now checks the existing
+Managed(0) TextureManager metadata under the same write lock before taking any
+pending delta. Until the first real atlas is published, every update remains
+with TextureManager. The first normal end_pass replaces the upstream 0x0 font
+reservation with the valid atlas and exports the complete batch. Nothing is
+filtered, discarded, replayed, or moved into an additional pending owner.
+
+The pass-outside retirement collector previously drained that reservation on
+the first ordinary WindowEvent, even without a close request. A ready wgpu
+renderer then attempted to create a zero-width texture. Upstream 0.37's ordinary
+Full path publishes the real font atlas before draining, and its renderer has
+no zero-size discard contract. Published-atlas metadata (rather than the
+existence of Fonts during begin_pass) defines this resource publication boundary.
+Subsequent no-paint updates/free-only delivery and font reload remain supported.
+The Context regression checks pre-Full whole/partial/free ownership, real font
+definition changes, and no duplicate delivery. See the stage-7 startup ledger.
+
+## Section 1.445: preserve live Slider edits through normalization (2026-10-26)
+
+The deferred-edit patch in 4d7b1b0ea was rejected: callers rely on live values
+before changing adjustment scope, replacing a settings page, or painting a mask.
+That change and its additional Escape cleanup have been withdrawn.
+
+- Slider passes a get/set closure to DragValue instead of a local f64 bridge.
+  The setter applies existing SliderCore rounding; the getter returns the same
+  effective value as Slider::get_value. EditState remembers what the next frame
+  will read, including rounding, clamping and storage conversion. User text is
+  kept while the rounded value is applied immediately.
+- The #8403 external-change comparison remains intact. Changes made by other
+  code still invalidate the text. Upstream introduced it in
+  d802a982ce959839d92f4f6718fdffa41143110e, included in egui 0.36.2.
+- Equal-value writes are skipped; passive stepped-slider clamping does not snap
+  untouched off-grid settings. Existing non-step decimal rounding remains.
+- DragValue reads storage back after numeric operations before generating their
+  display text (arrows/AccessKit); typed text is not reformatted this way.
+- SliderCore shares number-field configuration through a get/set helper.
+  No new pending state or application-side ordering change is introduced.
+- Widget tests cover live text, external changes, storage conversion, off-grid
+  values, numeric-operation text and changed flags. Application tests use actual
+  panels/handlers for scope, preferences navigation/draft budget and erase input.
+
+Evidence: [docs/section445-stepped-slider-input.md](../../docs/section445-stepped-slider-input.md).

@@ -347,7 +347,7 @@ fn section1335_normal_close_parent_branch_never_accepts_intermediate_book_list()
     open_zip(&mut env, &book, true);
     let before = env.settings.startup_list_restore.clone();
     env.handle_fullscreen_close_request();
-    assert!(env.pending_return_to_parent);
+    assert!(env.pending_return_to_parent.is_pending());
     assert!(env.fullscreen_idx.is_some());
     assert_eq!(env.settings.startup_list_restore, before);
     let nav = env.take_pending_return_to_parent_nav().unwrap();
@@ -490,7 +490,7 @@ fn section1335_snapshot_and_reading_history_direct_pages_keep_physical_restore_r
     for snapshot in [false, true] {
         let (mut env, parent, book) = book_env();
         open_zip(&mut env, &book, true);
-        env.close_fullscreen(); // Internal close is deliberately not a list action.
+        env.close_fullscreen(); // A true viewer exit alone is deliberately not a list action.
         let before = env.settings.startup_list_restore.clone();
         if snapshot {
             env.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
@@ -1151,7 +1151,7 @@ fn close_root_to_tray(app: &mut App) {
         .or_default()
         .events
         .push(egui::ViewportEvent::Close);
-    let output = ctx.run(raw, |ctx| assert!(app.maybe_intercept_close(ctx)));
+    let output = ctx.run_pass(raw, |ctx| assert!(app.maybe_intercept_close(ctx)));
     assert!(!app.window_visible);
     assert!(
         output.viewport_output[&egui::ViewportId::ROOT]
@@ -1159,6 +1159,7 @@ fn close_root_to_tray(app: &mut App) {
             .iter()
             .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
     );
+    output.drop_without_applying_deltas();
 }
 
 #[cfg(windows)]
@@ -1324,7 +1325,7 @@ fn section1335_tray_explicit_book_list_hide_restore_keeps_normally_opened_and_ba
                 ..Default::default()
             });
             assert!(env.handle_fullscreen_root_key_input(&ctx));
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
         assert!(env.fullscreen_idx.is_none());
         assert_physical(&env, &book, Some(""));
@@ -1525,7 +1526,7 @@ fn section1335_back_to_list_key_rejected_by_modal_then_accepted_updates_record_o
         env.handle_fullscreen_root_key_input(&ctx),
         "modal consumes leaked root input"
     );
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(env.fullscreen_idx, viewed);
     assert_eq!(env.settings.startup_list_restore, before);
     assert_physical(&env, &parent, None);
@@ -1542,7 +1543,7 @@ fn section1335_back_to_list_key_rejected_by_modal_then_accepted_updates_record_o
         ..Default::default()
     });
     assert!(env.handle_fullscreen_root_key_input(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert!(env.fullscreen_idx.is_none());
     assert_physical(&env, &book, Some(""));
 }
@@ -1794,7 +1795,7 @@ fn section1335_reading_empty_normal_folder_then_inner_zip_keeps_restore_at_each_
     assert_eq!(env.settings.startup_list_restore, before);
     let ctx = egui::Context::default();
     let mut reason = None;
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
         if reason.is_none() {
             reason = Some(env.reopen_fullscreen_after_folder_nav_load(
                 ctx,
@@ -1803,7 +1804,8 @@ fn section1335_reading_empty_normal_folder_then_inner_zip_keeps_restore_at_each_
                 HistoryTrigger::UserChosen,
             ));
         }
-    });
+    })
+    .drop_without_applying_deltas();
     assert_eq!(reason, Some("enumerate_defer"));
     assert!(
         matches!(
@@ -2377,11 +2379,12 @@ fn section1335_favorite_reading_sibling_fallbacks_preserve_last_accepted_physica
             queued_steps: 0,
         });
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             if let Some(result) = result.take() {
                 env.apply_folder_nav_result(ctx, result);
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(env.settings.startup_list_restore, departure);
         settle_book(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&next));
@@ -2902,18 +2905,19 @@ fn section1335_collection_ctrl_down_zip_adoption_restores_with_sidecars_on_and_o
 
         // Use the actual grid Ctrl+Down handler, including its Collection OuterGrid request.
         ctx.begin_pass(egui::RawInput {
-            modifiers: egui::Modifiers::CTRL,
-            events: vec![egui::Event::Key {
-                key: egui::Key::ArrowDown,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::CTRL,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+                .chain(vec![egui::Event::Key {
+                    key: egui::Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }])
+                .collect(),
             ..Default::default()
         });
         assert!(env.handle_keyboard(&ctx).is_none());
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(env.top_level_grid_view.collection_navigation_pending());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -3221,7 +3225,7 @@ fn section1335_extra_video_egui_close_key_restores_folder_list() {
     });
     let _ = env.keyboard_owner_for_pass(&ctx);
     env.handle_video_input(&ctx, index, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_extra_video_close_restarts_list(&mut env, &media_folder);
 }
 
@@ -3231,7 +3235,7 @@ fn section1335_extra_video_normal_parent_return_still_restores_parent_list() {
     open_zip(&mut env, &book, true);
     let before = env.settings.startup_list_restore.clone();
     env.handle_fullscreen_close_request();
-    assert!(env.pending_return_to_parent);
+    assert!(env.pending_return_to_parent.is_pending());
     assert!(env.fullscreen_idx.is_some());
     assert_eq!(env.settings.startup_list_restore, before);
     let nav = env.take_pending_return_to_parent_nav().unwrap();
@@ -3454,6 +3458,9 @@ fn direct_tray_image_folder_book_env() -> (phase_c_support::AppTestEnv, PathBuf,
     env.last_cell_h = 40.0;
     env.scroll_offset_y = 80.0;
     env.selected = Some(index);
+    // Finish startup's resume read before the fixture's timed navigation.
+    // Later position writes still need their own receipt before DB assertions.
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     open_selected_image_folder_book(&mut env, &book);
     assert_eq!(
         restore_cursor(&env),
@@ -3476,7 +3483,7 @@ fn backspace_image_folder_book_to_list(app: &mut App, book: &Path) {
         ..Default::default()
     });
     assert!(app.handle_fullscreen_root_key_input(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert!(app.fullscreen_idx.is_none());
     assert_eq!(app.current_folder.as_deref(), Some(book));
     assert_physical(app, book, None);
@@ -3621,6 +3628,7 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_
         crate::settings::Settings::load().startup_list_restore,
         before
     );
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     assert_eq!(env.book_resume_db.as_ref().unwrap().get(&book), Some(1));
     let generation = env.items_generation;
     env.sync_after_restore(&egui::Context::default());
@@ -3640,6 +3648,7 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_
     settle_book(&mut env);
     assert_eq!(env.current_folder.as_ref(), Some(&book));
     assert!(env.fullscreen_idx.is_none());
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     assert_eq!(env.resume_page_for_container(), Some(1));
 }
 
@@ -3663,19 +3672,6 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_keeps_backspace_exp
     assert_eq!(env.current_folder.as_ref(), Some(&book));
     assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
     assert_eq!(env.settings.startup_list_restore, before);
-    // Tray persistence stays asynchronous; inspect the admitted position only after its ACK.
-    let writer = env.book_resume_writer.as_ref().expect("book-resume writer");
-    let read = writer
-        .read_position_after(
-            &crate::path_key::normalize(&book),
-            writer.watermarks().admitted,
-        )
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("book-resume writer acknowledgment");
-    assert!(read.status.is_ok(), "{:?}", read.status);
-    assert_eq!(
-        read.position.as_ref().map(|position| position.page),
-        Some(1)
-    );
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     assert_eq!(env.resume_page_for_container(), Some(1));
 }

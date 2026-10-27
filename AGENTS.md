@@ -5,6 +5,26 @@ contains the broader project context and operational notes; read only the
 sections relevant to the current task instead of treating the whole file as
 always-active guidance.
 
+## User Reports And Forum Replies
+
+- Before drafting a reply (especially for 5ch), read the relevant conversation
+  from the initial report through the latest response. Keep track of answered
+  questions, reported test results, local findings, and remaining unknowns;
+  never ask again for information already supplied.
+- Minimize the reporter's effort. Investigate source, existing logs, and local
+  test options first. Do not ask them to "try it just in case" or exhaust a
+  speculative test matrix. Request another check only when its result would
+  materially change the next investigation or decision; explain that purpose
+  and keep the request small. After repeated checks, prefer acknowledging the
+  evidence and taking the investigation back to the developer.
+- Reassess hypotheses against all reported results before proposing a test.
+  Distinguish a confirmed cause, a code defect candidate, and an unverified
+  explanation; do not turn a plausible mechanism into a diagnosis.
+- Keep 5ch replies brief, appreciative, and free of unnecessary internal detail.
+  Do not promise a fix or imply ongoing/background investigation unless that
+  work is actually underway. State completed work, current limits, and the next
+  concrete step accurately, preserving who observed each runtime result.
+
 ## Model Roles And Coordination
 
 - Default development roles (2026-09-23 decision, Codex models updated 2026-09-30):
@@ -84,6 +104,14 @@ always-active guidance.
   virtual folders, presets, adjustments, AI features, or UI responsiveness,
   read the related document listed near the top of `CLAUDE.md` in the
   required-before-work section.
+- `CLAUDE.md` keeps only always-active rules and their summaries. Procedures
+  and reference details live in task-specific documents listed in its
+  "作業の種類ごとに読む文書" table (coding conventions, native dependencies,
+  build/test for native verification, git workflow, public wording, release
+  checklist, Codex CLI usage). When a task matches a row, read that document
+  in full; the CLAUDE.md summary alone is not enough. Old references to a
+  `CLAUDE.md` section that no longer exists resolve through its
+  "移した節の行き先" table.
 - If a task touches keyboard shortcuts, key events, or shortcut documentation,
   read `docs/keymap-spec.md` and `docs/key-customization-impl-plan.md`. New
   keyboard operations should go through `KeyAction` / keymap helpers unless the
@@ -205,14 +233,20 @@ always-active guidance.
 ## UI And Tests
 
 - For display, scroll, fullscreen, dialog, or layout changes, check
-  the `CLAUDE.md` sections for UI/scroll behavior, `egui::Window` dialogs, and
-  UI responsiveness review points as needed.
-- Preserve Japanese IME behavior. For text input changes, read the
-  `CLAUDE.md` IME section first.
+  `docs/coding-conventions.md` (UI/scroll behavior, `egui::Window` dialogs,
+  panels, UI responsiveness review points) as needed.
+- Preserve Japanese IME behavior. For text input changes, read the IME
+  section of `docs/coding-conventions.md` first.
 - Changes that affect visible UI should include or update snapshot coverage
   when practical. See the UI snapshot test section in `CLAUDE.md`.
 - Run the narrowest relevant tests first, then broaden when the change touches
   shared behavior.
+- During iteration use `scripts/test-focused.ps1` or an explicit test filter.
+  Run the unfiltered main-library suite through `scripts/test-lib-full.ps1`
+  (nextest), not direct unfiltered `cargo test -p mimageviewer --lib`.
+  Reviewers reuse a successful ledger entry for the same source and conditions;
+  do not rerun it. The final `scripts/test-full.ps1` gate also uses nextest
+  (workspace and vendor graphs) and runs doctests separately with `cargo test --doc`.
 - During ordinary edit/test iteration, do not default to
   `cargo test --workspace`. Prefer `cargo check -p mimageviewer --bin
   mimageviewer-core`, `cargo test -p mimageviewer --lib <filter>`, or a
@@ -251,7 +285,7 @@ always-active guidance.
   build gates. Existing normal-profile launch prohibitions still apply.
 - The canonical release idle/perf procedure is the user-run PowerShell command
   `scripts/ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved`; see
-  `CLAUDE.md` Phase 2 9.6/9.7 and `docs/release-check-automation-plan.md`.
+  `docs/release-checklist.md` Phase 2 9.6/9.7 and `docs/release-check-automation-plan.md`.
   Minimize other application windows before starting and leave the PC untouched
   through build and run. Adoption does not grant agent launch approval or relax
   disposable-portable and real-settings protection; manual scripts remain the

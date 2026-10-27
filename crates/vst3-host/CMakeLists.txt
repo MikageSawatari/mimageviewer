@@ -23,19 +23,21 @@
 ## (PDFium / Susie ワーカーと同パターン)。
 
 cmake_minimum_required(VERSION 3.20)
-project(mimageviewer-vst3-host CXX)
+project(mimageviewer-vst3-host CXX RC)
 
 # One shared identity implementation for both embedding and validation. Normalize
-# CRLF to LF byte-wise; preserve every other byte. Sorted slash-relative names
-# contribute name:lowercase-SHA256(normalized-bytes)\n, then hash that UTF-8 text.
-# Generated headers, SDK downloads and binaries are excluded.
+# CRLF to LF byte-wise for text; the shared icon uses its raw binary bytes.
+# Sorted slash-relative names contribute name:lowercase-SHA256(bytes)\n,
+# then hash that UTF-8 text. Generated headers, SDK and built artifacts are excluded.
 file(GLOB_RECURSE HOST_IDENTITY_FILES CONFIGURE_DEPENDS
     RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.rc"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
-list(APPEND HOST_IDENTITY_FILES "CMakeLists.txt")
+list(APPEND HOST_IDENTITY_FILES "CMakeLists.txt" "../../assets/icon.ico"
+    "../../assets/effetune.ico" "../../scripts/generate-effetune-icon.py")
 foreach(HOST_IDENTITY_FILE IN LISTS HOST_IDENTITY_FILES)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/${HOST_IDENTITY_FILE}")
@@ -93,6 +95,8 @@ add_executable(mimageviewer-vst3-host
     src/protocol.cpp
     src/vcrt_preload.cpp
     src/now_playing_notify.cpp
+    src/gui_frame.cpp
+    src/host_icon.rc
 )
 
 target_include_directories(mimageviewer-vst3-host PRIVATE
@@ -139,6 +143,7 @@ if(WIN32)
         user32
         dwmapi
         ole32
+        uuid
         shell32
         comctl32    # SetWindowSubclass / RemoveWindowSubclass for plugin child HWND hooks
         advapi32
@@ -197,6 +202,24 @@ set_target_properties(mimageviewer-vst3-host PROPERTIES
 # UTF-8/Windows-path and CRT-policy tests load only an inert fixture DLL,
 # never plugins or the product host.
 enable_testing()
+add_executable(vst3-gui-frame-tests tests/gui_frame.cpp src/gui_frame.cpp src/host_app.cpp src/protocol.cpp src/host_icon.rc
+    "${VST3_SDK_ROOT}/pluginterfaces/base/coreiids.cpp"
+    "${VST3_SDK_ROOT}/pluginterfaces/base/funknown.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/common/commoniids.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/hostclasses.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/vstinitiids.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/utility/stringconvert.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/common/commonstringconvert.cpp")
+target_include_directories(vst3-gui-frame-tests PRIVATE include)
+target_compile_definitions(vst3-gui-frame-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(vst3-gui-frame-tests PRIVATE user32 ole32 uuid)
+add_test(NAME vst3-gui-frame-boundaries COMMAND vst3-gui-frame-tests)
+set_tests_properties(vst3-gui-frame-boundaries PROPERTIES TIMEOUT 60)
+if(MSVC)
+    target_compile_options(vst3-gui-frame-tests PRIVATE /utf-8 /W4 /permissive-)
+    set_property(TARGET vst3-gui-frame-tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 add_library(vst3-loader-path-fixture SHARED tests/loader_path_fixture.cpp)
 add_executable(vst3-path-tests tests/path_boundaries.cpp)
 target_include_directories(vst3-path-tests PRIVATE include)
@@ -214,6 +237,9 @@ add_executable(vst3-now-playing-tests tests/now_playing.cpp src/now_playing_noti
 target_include_directories(vst3-now-playing-tests PRIVATE include)
 add_test(NAME vst3-now-playing-boundaries COMMAND vst3-now-playing-tests)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME vst3-protocol-handshake
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_hello.py" "$<TARGET_FILE:mimageviewer-vst3-host>")
+set_tests_properties(vst3-protocol-handshake PROPERTIES TIMEOUT 20)
 add_test(NAME vst3-now-playing-headless
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/now_playing_headless.py" "$<TARGET_FILE:vst3-now-playing-tests>")
 set_tests_properties(vst3-now-playing-headless PROPERTIES TIMEOUT 60)

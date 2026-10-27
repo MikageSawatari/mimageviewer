@@ -16,21 +16,24 @@ fn draw_calendar_date_row(ui: &mut egui::Ui, label: &str, date: &mut Option<Face
     ui.horizontal(|ui| {
         ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(
+            let response = ui.add(
                 egui::DragValue::new(&mut value.year)
                     .range(1970..=9999)
                     .suffix("年"),
             );
-            ui.add(
+            crate::ui_helpers::set_accessibility_label_with(&response, || format!("{label} / 年"));
+            let response = ui.add(
                 egui::DragValue::new(&mut value.month)
                     .range(1..=12)
                     .suffix("月"),
             );
-            ui.add(
+            crate::ui_helpers::set_accessibility_label_with(&response, || format!("{label} / 月"));
+            let response = ui.add(
                 egui::DragValue::new(&mut value.day)
                     .range(1..=31)
                     .suffix("日"),
             );
+            crate::ui_helpers::set_accessibility_label_with(&response, || format!("{label} / 日"));
         });
     });
     value.sanitize();
@@ -65,7 +68,7 @@ use crate::ui_main::draw_facet_size_value_row as draw_size_value_row;
 
 fn draw_size_filter(ui: &mut egui::Ui, filter: &mut SubfolderExpansionScanFilter) {
     ui.horizontal(|ui| {
-        ui.label("サイズ:");
+        let field_label = ui.label("サイズ:");
         egui::ComboBox::from_id_salt("subfolder_expansion_dialog_size")
             .selected_text(
                 filter
@@ -88,7 +91,9 @@ fn draw_size_filter(ui: &mut egui::Ui, filter: &mut SubfolderExpansionScanFilter
                         max: None,
                     });
                 }
-            });
+            })
+            .response
+            .labelled_by(field_label.id);
         ui.label(egui::RichText::new("ファイルのみ").weak());
     });
     if let Some(FacetSizePreset::Range { mut min, mut max }) = filter.size_preset {
@@ -115,41 +120,46 @@ fn draw_size_filter(ui: &mut egui::Ui, filter: &mut SubfolderExpansionScanFilter
 }
 
 fn draw_date_filter(ui: &mut egui::Ui, filter: &mut SubfolderExpansionScanFilter) {
-    ui.horizontal(|ui| {
-        ui.label("日付:");
-        egui::ComboBox::from_id_salt("subfolder_expansion_dialog_date")
-            .selected_text(
-                filter
-                    .date_preset
-                    .map_or_else(|| "すべて".to_string(), FacetDatePreset::label),
-            )
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut filter.date_preset, None, "すべて");
-                for &preset in FacetDatePreset::all() {
-                    ui.selectable_value(&mut filter.date_preset, Some(preset), preset.label());
-                }
-                ui.separator();
-                let custom_selected =
-                    matches!(filter.date_preset, Some(FacetDatePreset::CustomDays(_)));
-                if ui.selectable_label(custom_selected, "日数を指定").clicked() {
-                    let days = match filter.date_preset {
-                        Some(FacetDatePreset::CustomDays(days)) => days,
-                        _ => 30,
-                    };
-                    filter.date_preset = Some(FacetDatePreset::CustomDays(days));
-                }
-                let range_selected =
-                    matches!(filter.date_preset, Some(FacetDatePreset::Range { .. }));
-                if ui.selectable_label(range_selected, "期間を指定").clicked() {
-                    let today = FacetCalendarDate::today_local();
-                    filter.date_preset = Some(FacetDatePreset::Range {
-                        start: Some(today),
-                        end: Some(today),
-                    });
-                }
-            });
-        ui.label(egui::RichText::new("ファイルのみ").weak());
-    });
+    let date_label = ui
+        .horizontal(|ui| {
+            let field_label = ui.label("日付:");
+            egui::ComboBox::from_id_salt("subfolder_expansion_dialog_date")
+                .selected_text(
+                    filter
+                        .date_preset
+                        .map_or_else(|| "すべて".to_string(), FacetDatePreset::label),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filter.date_preset, None, "すべて");
+                    for &preset in FacetDatePreset::all() {
+                        ui.selectable_value(&mut filter.date_preset, Some(preset), preset.label());
+                    }
+                    ui.separator();
+                    let custom_selected =
+                        matches!(filter.date_preset, Some(FacetDatePreset::CustomDays(_)));
+                    if ui.selectable_label(custom_selected, "日数を指定").clicked() {
+                        let days = match filter.date_preset {
+                            Some(FacetDatePreset::CustomDays(days)) => days,
+                            _ => 30,
+                        };
+                        filter.date_preset = Some(FacetDatePreset::CustomDays(days));
+                    }
+                    let range_selected =
+                        matches!(filter.date_preset, Some(FacetDatePreset::Range { .. }));
+                    if ui.selectable_label(range_selected, "期間を指定").clicked() {
+                        let today = FacetCalendarDate::today_local();
+                        filter.date_preset = Some(FacetDatePreset::Range {
+                            start: Some(today),
+                            end: Some(today),
+                        });
+                    }
+                })
+                .response
+                .labelled_by(field_label.id);
+            ui.label(egui::RichText::new("ファイルのみ").weak());
+            field_label.id
+        })
+        .inner;
 
     match filter.date_preset {
         Some(FacetDatePreset::CustomDays(mut days)) => {
@@ -160,6 +170,7 @@ fn draw_date_filter(ui: &mut egui::Ui, filter: &mut SubfolderExpansionScanFilter
                             .range(1..=36_500)
                             .suffix(" 日以内"),
                     )
+                    .labelled_by(date_label)
                     .changed()
                 {
                     filter.date_preset = Some(FacetDatePreset::CustomDays(days));
@@ -207,7 +218,7 @@ impl App {
         let enter_pressed = self.dialog_enter_pressed(ctx);
 
         let response =
-            egui::Modal::new(egui::Id::new("subfolder_expansion_dialog")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("subfolder_expansion_dialog")).show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.heading("サブ展開");
                 ui.add_space(8.0);
@@ -215,14 +226,16 @@ impl App {
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("走査する階層:");
+                    let field_label = ui.label("走査する階層:");
                     egui::ComboBox::from_id_salt("subfolder_expansion_dialog_depth")
                         .selected_text(selected_depth.label())
                         .show_ui(ui, |ui| {
                             for choice in SubfolderExpansionDepthChoice::ALL {
                                 ui.selectable_value(&mut selected_depth, choice, choice.label());
                             }
-                        });
+                        })
+                        .response
+                        .labelled_by(field_label.id);
                 });
 
                 ui.add_space(8.0);

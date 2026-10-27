@@ -172,7 +172,7 @@ impl App {
         // ツールバーのピンタグ専用 (= グリッド面固定)。
         let surface = crate::app::ActionSurface::MainWindow;
         let Some(folder) = self.current_folder.clone() else {
-            self.show_feedback_toast_on("タグを付けるコンテナがありません".to_string(), surface);
+            self.show_feedback_warning_on("タグを付けるコンテナがありません".to_string(), surface);
             return;
         };
         // 合成ビューでは実コンテナが無いので no-op + 通知。判定は経路ごとに異なる:
@@ -185,7 +185,7 @@ impl App {
             || self.items_are_tag_view
             || self.items_are_drive_list
         {
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "この画面ではコンテナにタグを付けられません".to_string(),
                 surface,
             );
@@ -212,7 +212,10 @@ impl App {
         mode: &str,
         surface: crate::app::ActionSurface,
     ) {
-        let name_owned = name.to_string();
+        let name_owned = crate::tags_db::normalize_tag_display_name(name);
+        if name_owned.is_empty() {
+            return;
+        }
         crate::logger::log(format!(
             "[TAG] toggle requested: tag=#{name} mode={mode} \
              selected={:?} fullscreen_idx={:?} checked_count={}",
@@ -227,6 +230,7 @@ impl App {
         if !self.precheck_tag_write_available("toggle") {
             return;
         }
+        self.prepare_page_edit_history_boundary();
         // 複数選択は all-or-nothing: 全対象に付与済みなら全削除、それ以外は全付与。
         // 結果は `poll_tag_write_results` が完了時にまとめてトースト表示する。
         // ラベルは worker キュー全体で共有する 1 フィールドなので、**バリデーション通過後**
@@ -343,14 +347,15 @@ impl App {
             return;
         }
         let paths: Vec<PathBuf> = targets.iter().map(|target| target.path.clone()).collect();
-        if !self.precheck_tag_write_available(if add { "add" } else { "remove" }) {
-            return;
-        }
-        self.hydrate_tags_cache_for_paths(&paths);
         let tag_key = crate::tags_db::normalize_tag_key(&name);
         if tag_key.is_empty() {
             return;
         }
+        if !self.precheck_tag_write_available(if add { "add" } else { "remove" }) {
+            return;
+        }
+        self.prepare_page_edit_history_boundary();
+        self.hydrate_tags_cache_for_paths(&paths);
 
         let with_hash = crate::tags_db::format_display_tag(&name);
         self.tag_toast_label = Some(with_hash.clone());
@@ -410,6 +415,7 @@ impl App {
         if !self.precheck_tag_write_available("clear") {
             return;
         }
+        self.prepare_page_edit_history_boundary();
         // ラベル/発火面はバリデーション通過後に設定する (toggle/add と同じ規約。
         // 早期 return 経路で上書きすると in-flight の前バッチの完了トーストが
         // 誤った面/ラベルで表示される — Codex P3)。
@@ -452,15 +458,23 @@ impl App {
     /// 利用不可ならエラートーストを表示して `false` を返す。
     /// 呼び出し側は `false` のとき capture / submit を一切スキップすること。
     fn precheck_tag_write_available(&mut self, op_label: &str) -> bool {
+        // Only request admission uses this precheck; worker result adoption and
+        // its follow-up content-identity records must remain runnable.
+        if self.book_structural_op.is_some() {
+            self.show_feedback_warning("製本処理中です".into());
+            return false;
+        }
         self.ensure_tag_write_handle();
         if self.tag_write_handle.is_none() {
             crate::logger::log(format!(
                 "[TAG] '{op_label}' aborted: tag_write_handle unavailable"
             ));
-            self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
+            self.show_feedback_warning(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return false;
         }
-        true
+        // Admission precedes optimistic cache changes and pending Undo capture,
+        // not merely the later worker submit. All callers have accepted targets.
+        self.admit_book_append_followup_mutation()
     }
 
     /// タグ書き込みジョブ投入の共通経路。
@@ -493,7 +507,7 @@ impl App {
             crate::logger::log(format!(
                 "[TAG] submit '{op_label}' aborted: tag_write_handle unavailable"
             ));
-            self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
+            self.show_feedback_warning(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return;
         };
         crate::logger::log(format!(
@@ -691,8 +705,8 @@ impl App {
             let msg = format!("タグ書き込み失敗 {} 件: {}", errors.len(), preview);
             // 発火面が分かるバッチはその面に出す (undo 復元など面未記録は従来どおり全面)。
             match self.tag_toast_surface {
-                Some(surface) => self.show_feedback_toast_on(msg, surface),
-                None => self.show_feedback_toast(msg),
+                Some(surface) => self.show_feedback_warning_on(msg, surface),
+                None => self.show_feedback_warning(msg),
             }
         } else if just_completed && (added + removed + cleared + restored + noop) > 0 {
             let label = self.tag_toast_label.take();

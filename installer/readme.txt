@@ -1,5 +1,5 @@
 ﻿================================================================
- mImageViewer (エムイメージビューワー) Version 4.6.0
+ mImageViewer (エムイメージビューワー) Version 4.8.3
 ================================================================
 
 Windows 向け 高速サムネイル画像ビューワー
@@ -50,7 +50,7 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   - RAR / CBR / 7z / LZH の ZIP 変換閲覧（RAR / CBR はパスワード付きにも対応）
   - PDF 表示（PDF 表示エンジン内蔵、パスワード付き対応）
   - DRM のない EPUB を PDF に変換して閲覧（音声・動画は含まれません）
-  - RAW 表示・現像（内蔵）/ HEIC / AVIF / JPEG XL 表示（Windows の表示機能）
+  - RAW 表示・現像・AVIF 表示（内蔵）/ HEIC / JPEG XL 表示（Windows の表示機能）
   - Susie 画像プラグイン（.spi、32bit）対応
   - 動画インライン再生（MP4 / MKV / MOV / AVI / WMV / MPG / HEVC / AV1 等、
     GPU ハードウェアデコード対応、シーク / 倍速再生 / タイル モード /
@@ -98,14 +98,13 @@ AI 機能は DirectML（Microsoft 公式）を利用します。
 DirectML.dll は Windows 11 に標準で同梱
 されているため、対応 OS ならば追加インストールは不要です。
 
-RAW は追加インストールなしで表示・現像できます。
-HEIC / AVIF / JPEG XL を表示するには Windows Imaging
+RAW の表示・現像と AVIF の表示は追加インストール不要です。
+HEIC / JPEG XL を表示するには Windows Imaging
 Component（WIC）が必要ですが、Windows 11 には標準で
 含まれています。追加が必要な場合は Microsoft Store から次を入れます:
   - HEIC / HEIF: HEIF 画像表示オプション
     HEIC は、HEVC に対応していない PC では HEVC ビデオ拡張機能も必要です。
     HEVC ビデオ拡張機能は有料の場合があります。
-  - AVIF: AV1 ビデオ拡張機能
   - JPEG XL: JPEG XL 画像表示オプション
 
 
@@ -218,6 +217,7 @@ https://mikage.to/mimageviewer/privacy.html
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - LibRaw (CDDL-1.0): LibRaw LLC
     ライセンス全文と著作権表記: LIBRAW-LICENSE.txt
+    AVIF のライセンス全文と著作権表記: LIBAVIF-LICENSE.txt / DAV1D-LICENSE.txt / LIBYUV-LICENSE.txt
     対応ソース: https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz
   - zlib 1.3.1 (zlib): Jean-loup Gailly and Mark Adler
     ライセンス全文: ZLIB-LICENSE.txt

@@ -146,9 +146,11 @@ fn adopt_cached(app: &mut App, cached: &Path) {
     let deadline = Instant::now() + WORKER_TIMEOUT;
     loop {
         app.poll_rar_archive_navigation_for_test(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.show_archive_convert_dialog(ctx)
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.show_archive_convert_dialog(ctx)
+            })
+            .drop_without_applying_deltas();
         app.poll_zip_enumerate();
         app.poll_sidecar_restore(&ctx);
         if app.archive_convert.is_none()

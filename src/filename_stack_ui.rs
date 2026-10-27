@@ -44,12 +44,17 @@ pub(crate) enum StackPreparePending {
     Retry(StackRetryPending),
 }
 
+pub(crate) enum InitialStackDeletionRestart {
+    Physical,
+    Subfolder(crate::app::StartupListIntent),
+}
+
 /// The accepted aggregate stays with the same bundle while fullscreen uses the flat order.
 /// Refreshing owns the aggregate grid until the replacement projection is accepted.
 pub(crate) enum StackReturnState {
     Ready {
         view: Arc<StackView>,
-        prepared: StackPreparedItems,
+        prepared: Box<StackPreparedItems>,
     },
     Refreshing {
         view: Arc<StackView>,
@@ -61,7 +66,85 @@ pub(crate) enum StackReturnState {
     },
 }
 
+/// Immutable deletion input captured from the existing viewer owner. The delete
+/// worker prepares it before its terminal message; it never owns a second pending job.
+pub(crate) struct StackDeletionSource {
+    view: Arc<StackView>,
+    context_id: crate::app::ViewerContextId,
+    generation: u64,
+    retained: bool,
+    available_edits: crate::app::page_edit_snapshot::PageEditAvailability,
+    rating_available: bool,
+    tags_available: bool,
+    visibility: crate::file_type_visibility::FileTypeVisibility,
+    logical_container: Option<PathBuf>,
+    #[cfg(test)]
+    test_epoch_scope: Option<crate::page_edit_write_epoch::TestEpochHandle>,
+}
+
+pub struct StackDeletionPrepared {
+    source: StackDeletionSource,
+    view: Arc<StackView>,
+    retained: Option<StackReadOutcome>,
+}
+
+impl std::fmt::Debug for StackDeletionPrepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StackDeletionPrepared")
+            .field("generation", &self.source.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl StackDeletionPrepared {
+    pub(crate) fn discard_retained_for_test(&mut self) {
+        self.retained = None;
+    }
+}
+
+impl StackDeletionSource {
+    pub(crate) fn prepare(self, succeeded: &[PathBuf]) -> StackDeletionPrepared {
+        #[cfg(test)]
+        let _test_epoch_scope = self
+            .test_epoch_scope
+            .map(crate::page_edit_write_epoch::TestEpochScope::enter);
+        let view = Arc::new(self.view.without_removed_paths(succeeded));
+        let retained = self.retained.then(|| {
+            let (items, metas) = view.materialize_aggregated();
+            read_stack_candidate(
+                StackCandidateOrder::new(items, metas),
+                self.available_edits,
+                self.rating_available,
+                self.tags_available,
+                &AtomicBool::new(false),
+                self.visibility.clone(),
+                self.logical_container.clone(),
+            )
+        });
+        StackDeletionPrepared {
+            source: self,
+            view,
+            retained,
+        }
+    }
+}
+
 impl StackPreparePending {
+    /// Only a flat-reader switch owns a later fullscreen open. Grouping and
+    /// rebuilding an already displayed aggregate are passive preparation.
+    pub(crate) fn open_pending(&self) -> bool {
+        match self {
+            Self::Switching(pending) => matches!(pending.target, StackSwitchTarget::Flat { .. }),
+            Self::Retry(pending) => matches!(
+                &pending.source,
+                StackRetrySource::SwitchReady(_, StackSwitchTarget::Flat { .. }, ..)
+                    | StackRetrySource::SwitchFresh(_, StackSwitchTarget::Flat { .. })
+            ),
+            Self::Extracting(_) | Self::Grouping(_) => false,
+        }
+    }
+
     fn cancel(&self) {
         let token = match self {
             Self::Extracting(pending) => &pending.cancel,
@@ -74,6 +157,7 @@ impl StackPreparePending {
 }
 
 struct StackGroupingSource {
+    hydration_intent: crate::app::StartupListIntent,
     visibility: crate::file_type_visibility::FileTypeVisibility,
     logical_container: Option<PathBuf>,
     folder: PathBuf,
@@ -371,7 +455,7 @@ fn read_stack_candidate(
         #[cfg(test)]
         if order.read_failures.as_ref().is_some_and(|remaining| {
             remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                     count.checked_sub(1)
                 })
                 .is_ok()
@@ -572,6 +656,195 @@ fn stack_script_keys_for_images(
 }
 
 impl crate::app::App {
+    /// A successful visible removal invalidates an unfinished grouping's input,
+    /// even when the underlying physical row comparison will otherwise be Equal.
+    pub(crate) fn retire_initial_stack_for_deletion(
+        &mut self,
+    ) -> Option<InitialStackDeletionRestart> {
+        if !self.stack_mode_requested || self.stack_showing_flat || self.stack_view.is_some() {
+            return None;
+        }
+        let pending = self.stack_script_pending.as_ref()?;
+        let (source, context, generation, count, sequence) = match pending {
+            StackPreparePending::Extracting(p) => (
+                &p.source,
+                p.context_id,
+                p.items_generation,
+                p.item_count,
+                p.sequence,
+            ),
+            StackPreparePending::Grouping(p) => (
+                p.source.as_ref(),
+                p.context_id,
+                p.items_generation,
+                p.item_count,
+                p.sequence,
+            ),
+            StackPreparePending::Retry(p) => match &p.source {
+                StackRetrySource::GroupFresh(source, ..)
+                | StackRetrySource::GroupReady(source, ..) => (
+                    source.as_ref(),
+                    p.context_id,
+                    p.items_generation,
+                    p.item_count,
+                    p.sequence,
+                ),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if context != self.virtual_list_context_id()
+            || generation != self.items_generation
+            || count != self.items.len()
+            || sequence != self.stack_request_sequence
+            || !self
+                .current_folder
+                .as_ref()
+                .is_some_and(|folder| crate::folder_tree::path_eq(folder, &source.folder))
+        {
+            return None;
+        }
+        let restart = match &source.listing {
+            StackListingSource::Normal(..) => InitialStackDeletionRestart::Physical,
+            StackListingSource::Subfolder(entries, _) => {
+                if !self
+                    .subfolder_expansion_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| Arc::ptr_eq(entries, &snapshot.entries))
+                {
+                    return None;
+                }
+                InitialStackDeletionRestart::Subfolder(source.hydration_intent.clone())
+            }
+        };
+        let pending = self.stack_script_pending.take().unwrap();
+        pending.cancel();
+        self.stack_request_sequence = self.stack_request_sequence.wrapping_add(1);
+        self.retire_smart_folder_payloads([
+            Box::new(pending) as crate::app::smart_folder::RetiredSmartFolderPayload
+        ]);
+        if matches!(restart, InitialStackDeletionRestart::Physical) {
+            let previous = self.folder_observation.take();
+            self.retire_smart_folder_payloads([
+                Box::new(previous) as crate::app::smart_folder::RetiredSmartFolderPayload
+            ]);
+        }
+        Some(restart)
+    }
+
+    pub(crate) fn resume_initial_stack_after_deletion(
+        &mut self,
+        restart: InitialStackDeletionRestart,
+    ) {
+        if let InitialStackDeletionRestart::Subfolder(intent) = restart {
+            self.start_subfolder_stack_grouping(
+                self.current_selected_representative_path(),
+                intent,
+            );
+        }
+        // Physical input is rebuilt by the existing delete-terminal rescan.
+    }
+
+    pub(crate) fn capture_stack_deletion(&self) -> Option<StackDeletionSource> {
+        Some(StackDeletionSource {
+            view: self.stack_view.as_ref()?.clone(),
+            context_id: self.virtual_list_context_id(),
+            generation: self.items_generation,
+            retained: matches!(
+                self.stack_return_state,
+                Some(StackReturnState::Ready { .. })
+            ),
+            available_edits: crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+            rating_available: self.rating_db.is_some(),
+            tags_available: self.tags_db.is_some(),
+            visibility: self.listing_file_type_visibility().clone(),
+            logical_container: self.archive_source_override.clone(),
+            #[cfg(test)]
+            test_epoch_scope: crate::page_edit_write_epoch::TestEpochScope::capture(),
+        })
+    }
+
+    pub(crate) fn adopt_stack_deletion(&mut self, prepared: StackDeletionPrepared) {
+        let StackDeletionPrepared {
+            source,
+            view,
+            retained,
+        } = prepared;
+        if self.virtual_list_context_id() != source.context_id
+            || self.items_generation != source.generation
+            || !self
+                .stack_view
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &source.view))
+        {
+            // A replacement list cannot inherit a projection from the old delete owner.
+            // Its own successful row removals need ordinary preparation, not Equal.
+            if self.stack_view.is_some()
+                && self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|folder| crate::folder_tree::path_eq(folder, &source.view.folder))
+            {
+                let previous = self.folder_observation.take();
+                self.retire_smart_folder_payloads([
+                    Box::new(previous) as crate::app::smart_folder::RetiredSmartFolderPayload
+                ]);
+            }
+            self.retire_smart_folder_payloads([Box::new((source, view, retained))
+                as crate::app::smart_folder::RetiredSmartFolderPayload]);
+            return;
+        }
+        let previous = self.stack_view.replace(view.clone());
+        let previous_return = match self.stack_return_state.take() {
+            Some(StackReturnState::Ready {
+                view: old,
+                prepared: old_prepared,
+            }) => {
+                match retained.and_then(|read| read.into_prepared().ok().flatten()) {
+                    Some(prepared) => {
+                        self.stack_return_state = Some(StackReturnState::Ready {
+                            view,
+                            prepared: Box::new(prepared),
+                        })
+                    }
+                    None => {
+                        crate::logger::log(
+                            "stack deletion: retained projection could not be prepared",
+                        );
+                        self.show_feedback_warning("スタックの保存情報を読み取れませんでした。最新の情報に更新してください".into());
+                        // There is no accepted aggregate to expose. Keep the survivor flat
+                        // order until the ordinary deferred reload prepares a new list.
+                        let previous = self.folder_observation.take();
+                        self.retire_smart_folder_payloads([Box::new(previous)
+                            as crate::app::smart_folder::RetiredSmartFolderPayload]);
+                        self.retain_folder_refresh(
+                            crate::app::book_append_refresh::FolderRefreshRequest {
+                                folder: view.folder.clone(),
+                                cause:
+                                    crate::app::book_append_refresh::FolderRefreshCause::Operation,
+                            },
+                        );
+                    }
+                }
+                Some(StackReturnState::Ready {
+                    view: old,
+                    prepared: old_prepared,
+                })
+            }
+            Some(StackReturnState::Refreshing { view: old }) => {
+                self.stack_return_state = Some(StackReturnState::Refreshing { view });
+                Some(StackReturnState::Refreshing { view: old })
+            }
+            Some(StackReturnState::Recovering { view: old }) => {
+                self.stack_return_state = Some(StackReturnState::Refreshing { view });
+                Some(StackReturnState::Recovering { view: old })
+            }
+            None => None,
+        };
+        self.retire_smart_folder_payloads([Box::new((previous, previous_return, source))
+            as crate::app::smart_folder::RetiredSmartFolderPayload]);
+    }
+
     /// 進行中のスタックスクリプトワーカーをキャンセルして破棄する。
     pub(crate) fn cancel_stack_script_pending(&mut self) {
         if let Some(p) = self.stack_script_pending.take() {
@@ -598,6 +871,31 @@ impl crate::app::App {
         script_enabled: bool,
         group_per_parent: bool,
     ) {
+        self.spawn_stack_script_worker_with_intent(
+            folder,
+            listing,
+            separator,
+            order,
+            existing_keys,
+            folder_signature,
+            script_enabled,
+            group_per_parent,
+            crate::app::StartupListIntent::InternalInstall,
+        );
+    }
+
+    pub(crate) fn spawn_stack_script_worker_with_intent(
+        &mut self,
+        folder: PathBuf,
+        listing: StackListingSource,
+        separator: char,
+        order: crate::rating_sort::ListingOrderRequest,
+        existing_keys: std::collections::HashSet<String>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
+        script_enabled: bool,
+        group_per_parent: bool,
+        hydration_intent: crate::app::StartupListIntent,
+    ) {
         self.cancel_stack_script_pending();
         debug_assert!(
             matches!(order, crate::rating_sort::ListingOrderRequest::Standard(sort) if !sort.is_rating())
@@ -608,6 +906,7 @@ impl crate::app::App {
                 )
         );
         let source = StackGroupingSource {
+            hydration_intent,
             visibility: self.settings.file_type_visibility.clone(),
             logical_container: self.archive_source_override.clone(),
             folder,
@@ -790,11 +1089,13 @@ impl crate::app::App {
                 }
                 let view = Arc::new(view);
                 let (items, metas) = view.materialize_aggregated();
-                let mut order = StackCandidateOrder::new(items, metas);
+                let order = StackCandidateOrder::new(items, metas);
                 #[cfg(test)]
-                {
+                let order = {
+                    let mut order = order;
                     order.read_failures = worker_source.read_failures.clone();
-                }
+                    order
+                };
                 let read = read_stack_candidate(
                     order,
                     worker_source.available_edits,
@@ -909,6 +1210,9 @@ impl crate::app::App {
 
     /// Accept only a candidate prepared for the mounted bundle and its exact source order.
     pub(crate) fn poll_stack_script(&mut self, ctx: &egui::Context) {
+        if self.delete_pending.is_some() {
+            return;
+        }
         let Some(pending) = self.stack_script_pending.take() else {
             return;
         };
@@ -1002,7 +1306,7 @@ impl crate::app::App {
         }
         // Separator, script and display-order changes re-group the same listing. Its captured
         // sort request remains valid until an explicit listing preparation replaces it.
-        self.spawn_stack_script_worker(
+        self.spawn_stack_script_worker_with_intent(
             source.folder.clone(),
             source.listing.clone(),
             self.settings.stack_separator,
@@ -1011,6 +1315,7 @@ impl crate::app::App {
             folder_signature,
             self.settings.stack_script_enabled,
             source.group_per_parent,
+            source.hydration_intent.clone(),
         );
     }
 
@@ -1119,11 +1424,24 @@ impl crate::app::App {
         if self.fullscreen_idx.is_some() {
             self.park_detached_session_for_stack_aggregation(ctx);
         }
-        if self.fullscreen_idx.is_some() {
+        // Accepting a background aggregate is a viewer end only when this
+        // context owns a session; a cold list-only PDF keeps its prompt.
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.apply_stack_group_ready(
             pending.source.folder.clone(),
+            match &pending.source.listing {
+                StackListingSource::Normal(_, _) => {
+                    crate::app::book_materialization::ProjectionRecipe::OrdinaryList
+                }
+                StackListingSource::Subfolder(_, _) => {
+                    crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                        crate::app::book_materialization::ExtractedSurface::SubfolderExpansion,
+                    )
+                }
+            },
+            pending.source.hydration_intent.clone(),
             pending.existing_keys,
             pending.folder_signature,
             view,
@@ -1140,6 +1458,8 @@ impl crate::app::App {
     fn apply_stack_group_ready(
         &mut self,
         folder: PathBuf,
+        recipe: crate::app::book_materialization::ProjectionRecipe,
+        hydration_intent: crate::app::StartupListIntent,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         view: Arc<StackView>,
@@ -1165,11 +1485,13 @@ impl crate::app::App {
             });
         self.start_loading_stack_items(
             folder,
+            recipe,
             prepared,
             existing_keys,
             folder_signature,
             pin_map,
             select,
+            hydration_intent,
         );
         if is_subfolder_expansion_stack {
             self.restore_subfolder_expansion_view_state_after_items_install();
@@ -1196,9 +1518,9 @@ impl crate::app::App {
                 notice.push('\n');
                 notice.push_str(&stack_notice);
             }
-            self.show_feedback_toast(notice);
+            self.show_feedback_warning(notice);
         } else if let Some(stack_notice) = stack_notice {
-            self.show_feedback_toast(stack_notice);
+            self.show_feedback_warning(stack_notice);
         }
     }
 
@@ -1425,7 +1747,9 @@ impl crate::app::App {
             StackSwitchTarget::Flat { index } => {
                 self.stack_return_state = Some(StackReturnState::Ready {
                     view,
-                    prepared: retained_aggregate.expect("flat switch has accepted aggregate"),
+                    prepared: Box::new(
+                        retained_aggregate.expect("flat switch has accepted aggregate"),
+                    ),
                 });
                 self.stack_showing_flat = true;
                 self.fs_open_intent_from_grid = true;
@@ -1480,7 +1804,7 @@ impl crate::app::App {
                     Some(StackReturnState::Refreshing { view: current }) if Arc::ptr_eq(current, &view))
             {
                 self.stack_return_state = Some(StackReturnState::Recovering { view });
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "編集情報を更新できませんでした。自動で再試行します。".into(),
                 );
             }
@@ -1649,7 +1973,7 @@ impl crate::app::App {
     /// (folder_changes=false なので `stack_mode_requested` は維持される)。
     pub(crate) fn toggle_stack_mode(&mut self) {
         if !self.stack_mode_available() {
-            self.show_feedback_toast("スタック表示は通常フォルダまたはサブ展開で使えます".into());
+            self.show_feedback_warning("スタック表示は通常フォルダまたはサブ展開で使えます".into());
             return;
         }
         if self.items_are_subfolder_expansion_view {
@@ -1683,7 +2007,7 @@ impl crate::app::App {
         if self.stack_mode_requested && self.stack_script_pending.is_none() {
             // スクリプトが失敗して既定ルールへフォールバックした場合は最優先で知らせる。
             if self.stack_script_error.is_some() {
-                self.show_feedback_toast(
+                self.show_feedback_error(
                     "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)"
                         .into(),
                 );
@@ -1692,7 +2016,7 @@ impl crate::app::App {
                 .as_ref()
                 .is_some_and(|sv| !sv.has_collapsible_stack())
             {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "まとめられるスタックがありませんでした (分類ルールはヘルプ参照)".into(),
                 );
             } else if let Some(rule) = self.stack_active_rule.clone() {
@@ -1742,11 +2066,21 @@ impl crate::app::App {
         }
 
         if self.subfolder_expansion_snapshot.is_none() {
-            self.show_feedback_toast("サブ展開のスナップショットがありません".into());
+            self.show_feedback_warning("サブ展開のスナップショットがありません".into());
             return;
         }
 
-        let snapshot = self.subfolder_expansion_snapshot.as_ref().unwrap();
+        self.start_subfolder_stack_grouping(target, crate::app::StartupListIntent::InternalInstall);
+    }
+
+    fn start_subfolder_stack_grouping(
+        &mut self,
+        target: Option<PathBuf>,
+        intent: crate::app::StartupListIntent,
+    ) {
+        let Some(snapshot) = self.subfolder_expansion_snapshot.as_ref() else {
+            return;
+        };
         let listing = StackListingSource::Subfolder(
             Arc::clone(&snapshot.entries),
             snapshot.stack_rating_source.clone(),
@@ -1757,7 +2091,7 @@ impl crate::app::App {
         self.stack_view = None;
         self.stack_return_state = None;
         let order = snapshot.stack_order_request;
-        self.spawn_stack_script_worker(
+        self.spawn_stack_script_worker_with_intent(
             crate::app::subfolder_expansion_synthetic_path(),
             listing,
             self.settings.stack_separator,
@@ -1766,6 +2100,7 @@ impl crate::app::App {
             None,
             self.settings.stack_script_enabled,
             true,
+            intent,
         );
     }
 
@@ -1855,6 +2190,9 @@ impl crate::app::App {
     /// フラットフルスクリーンが閉じたら集約グリッドへ戻す (毎フレーム reconcile、
     /// `render_grid` の直前で呼ぶ)。スタックモードが解除済み (フォルダナビ等) なら何もしない。
     pub(crate) fn stack_reconcile_after_fullscreen_close(&mut self, ctx: &egui::Context) {
+        if self.delete_pending.is_some() {
+            return;
+        }
         if self.fullscreen_idx.is_some() {
             return;
         }
@@ -1873,7 +2211,7 @@ impl crate::app::App {
                 .and_then(|flat| view.group_of_flat_index(flat))
                 .map(|group| view.aggregated_index_of_group(group));
             let current = Self::stack_prepared_stamps_current(&prepared);
-            self.swap_stack_view_items(prepared, &view.folder, select);
+            self.swap_stack_view_items(*prepared, &view.folder, select);
             self.stack_showing_flat = false;
             if !current {
                 self.stack_return_state = Some(StackReturnState::Refreshing {
@@ -1928,7 +2266,9 @@ impl crate::app::App {
     /// The mounted bundle and staged location owner determine whether grid items accept input.
     /// All grid input owners (key, pointer, touch, ring, gamepad, and menu) use this gate.
     pub(crate) fn grid_item_input_allowed(&self) -> bool {
-        !self.location_navigation_pending()
+        self.book_structural_op.is_none()
+            && self.image_folder_zip_operation.is_none()
+            && !self.location_navigation_pending()
             && !matches!(self.stack_return_state.as_ref(),
             Some(StackReturnState::Refreshing { view })
                 if self.stack_view.as_ref().is_some_and(|current| Arc::ptr_eq(current, view)))
@@ -1957,7 +2297,27 @@ impl crate::app::App {
             page_identity_index,
             ..
         } = prepared;
-        self.install_prepared_aggregate_items(items, metas, page_identity_index);
+        let retained_physical_record =
+            !crate::folder_tree::path_eq(folder, &crate::app::subfolder_expansion_synthetic_path())
+                && self.stack_mode_requested
+                && self
+                    .stack_view
+                    .as_ref()
+                    .is_some_and(|view| view.folder == folder)
+                && self.current_folder.as_deref() == Some(folder)
+                && self.folder_observation.as_ref().is_some_and(|record| {
+                    record.source == folder && record.generation == self.items_generation
+                });
+        let recipe = match self.projection_recipe.extracted_surface() {
+            Some(surface) => {
+                crate::app::book_materialization::ProjectionRecipe::ExtractedResult(surface)
+            }
+            None => crate::app::book_materialization::ProjectionRecipe::OrdinaryList,
+        };
+        self.install_prepared_aggregate_items(recipe, items, metas, page_identity_index);
+        if retained_physical_record {
+            self.folder_observation.as_mut().unwrap().generation = self.items_generation;
+        }
         if crate::folder_tree::path_eq(folder, &crate::app::subfolder_expansion_synthetic_path()) {
             self.restore_subfolder_expansion_view_state_after_items_install();
         }
@@ -1973,7 +2333,7 @@ impl crate::app::App {
         self.xmp_cache.clear();
         self.clear_tags_cache();
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.move_grid_cursor(select, crate::app::GridCursorIntent::Automatic);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = select.is_some();
@@ -2073,6 +2433,186 @@ mod tests {
         }
     }
 
+    // Produce a real candidate, but hold delivery until after the competing PDF
+    // open. This fixes the ordering without sleeps or a synthetic grouping result.
+    fn hold_stack_grouping_completion(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        folder: PathBuf,
+    ) -> (
+        StackGroupReady,
+        std::sync::mpsc::Sender<Result<Option<StackGroupReady>, String>>,
+    ) {
+        app.load_folder_with_scan(folder.clone(), None);
+        finish_list_hydration_for_test(app, ctx);
+        app.stack_mode_requested = true;
+        app.load_folder_with_scan(folder, None);
+        finish_list_hydration_for_test(app, ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            app.stack_script_pending,
+            Some(StackPreparePending::Grouping(_))
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grouping did not start"
+            );
+            app.poll_stack_script(ctx);
+            std::thread::yield_now();
+        }
+        let Some(StackPreparePending::Grouping(mut pending)) = app.stack_script_pending.take()
+        else {
+            unreachable!();
+        };
+        let ready = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .expect("collapsible stack candidate");
+        let (deliver, rx) = std::sync::mpsc::channel();
+        pending.rx = rx;
+        app.stack_script_pending = Some(StackPreparePending::Grouping(pending));
+        (ready, deliver)
+    }
+
+    #[test]
+    fn stack_grouping_completion_preserves_cold_list_pdf_password_request_and_input() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("stack-list-password");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["111_p0.png", "111_p1.png", "222_p0.png", "222_p1.png"] {
+            image::RgbImage::new(1, 1).save(folder.join(name)).unwrap();
+        }
+        let pdf = folder.join("password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let (ready, deliver) = hold_stack_grouping_completion(&mut app, &ctx, folder.clone());
+        assert!(
+            ready.view.has_collapsible_stack(),
+            "real grouping candidate: flat={:?}, items={:?}, separator={:?}, script={}",
+            ready.view.materialize_flat().0,
+            app.items,
+            app.settings.stack_separator,
+            app.settings.stack_script_enabled
+        );
+        let generation = app.items_generation;
+        let count = app.items.len();
+        app.load_pdf_as_folder(pdf.clone());
+        app.pdf_enumerate_pending.as_mut().expect("cold PDF open").2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items.len(), count);
+        assert_eq!(app.pdf_password_dialog_path().as_ref(), Some(&pdf));
+        assert!(!app.projected_viewer_session_open());
+        assert!(app.common_modal_dialog_open());
+        assert!(app.stack_mode_requested);
+        assert!(matches!(
+            app.stack_script_pending,
+            Some(StackPreparePending::Grouping(_))
+        ));
+        app.pdf_password_input = "typed password".into();
+        assert!(deliver.send(Ok(Some(ready))).is_ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Drive adoption and hydration, checking prompt ownership at every poll.
+        while app.stack_view.is_none() || app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "aggregate did not settle: requested={} pending={} folder={:?}",
+                app.stack_mode_requested,
+                app.stack_script_pending.is_some(),
+                app.current_folder
+            );
+            if !app.sidecar_restore_active() {
+                app.poll_stack_script(&ctx);
+            }
+            app.poll_sidecar_restore(&ctx);
+            assert_eq!(app.pdf_password_dialog_path().as_ref(), Some(&pdf));
+            assert_eq!(app.pdf_password_input, "typed password");
+            std::thread::yield_now();
+        }
+        assert!(
+            app.stack_view
+                .as_ref()
+                .is_some_and(|view| view.has_collapsible_stack())
+        );
+        assert!(app.pdf_password_request.is_some());
+        assert_eq!(app.pdf_password_dialog_path().as_ref(), Some(&pdf));
+        assert_eq!(app.pdf_password_input, "typed password");
+        assert!(!app.projected_viewer_session_open());
+    }
+
+    #[test]
+    fn stack_grouping_completion_ends_waiting_viewer_before_late_pdf_success() {
+        use crate::app::{DeferredFsReopen, DeferredFsTarget, HistoryTrigger, ViewerPresentation};
+        for presentation in [
+            ViewerPresentation::Fullscreen,
+            ViewerPresentation::MainWindow,
+            ViewerPresentation::DetachedWindow,
+        ] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let folder = app.tmp.path().join("stack-reader-wait");
+            std::fs::create_dir(&folder).unwrap();
+            for name in ["111_p0.png", "111_p1.png", "222_p0.png", "222_p1.png"] {
+                image::RgbImage::new(1, 1).save(folder.join(name)).unwrap();
+            }
+            let pdf = folder.join("late.pdf");
+            std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let (ready, deliver) = hold_stack_grouping_completion(&mut app, &ctx, folder);
+            app.load_pdf_as_folder(pdf.clone());
+            let (handle, complete) = crate::pdf_loader::pending_enumerate_handle_for_test(&pdf);
+            let cancel = Arc::clone(&handle.cancel);
+            app.pdf_enumerate_pending.as_mut().expect("cold PDF open").2 = handle;
+            app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+            app.viewer_presentation = presentation;
+            #[cfg(windows)]
+            {
+                app.native_video_in_window_active = presentation == ViewerPresentation::MainWindow;
+            }
+            app.show_whats_new = true;
+            app.show_mouse_nav_migration_prompt = false;
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.projected_viewer_session_open());
+            assert!(!app.whats_new_visible());
+            assert!(deliver.send(Ok(Some(ready))).is_ok());
+            app.poll_stack_script(&ctx);
+            assert!(app.stack_view.is_some(), "{presentation:?}");
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.pdf_enumerate_pending.is_none());
+            assert!(app.fs_nav_after_pdf_enumerate.is_none());
+            complete(Ok(vec![crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 1,
+                file_size: 4,
+            }]));
+            app.poll_pdf_enumerate();
+            finish_list_hydration_for_test(&mut app, &ctx);
+            assert!(app.fullscreen_idx.is_none());
+            assert!(!app.projected_viewer_session_open());
+            assert!(app.whats_new_visible(), "{presentation:?}");
+        }
+    }
+
     #[test]
     fn rating_subfolder_stack_toggle_keeps_prepared_order_in_aggregate_and_flat_views() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
@@ -2117,6 +2657,12 @@ mod tests {
         }
         let view = app.stack_view.as_ref().expect("subfolder stack prepared");
         assert_eq!(
+            app.projection_recipe,
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::SubfolderExpansion
+            )
+        );
+        assert_eq!(
             view.groups
                 .iter()
                 .map(|group| group
@@ -2143,7 +2689,168 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.stack_showing_flat);
+        assert!(app.extracted_result_surface().is_some());
         assert_eq!(app.items[1].name(), "b_2.jpg");
+    }
+
+    #[test]
+    fn g1_subfolder_stack_book_reopen_preserves_vertical_flow_and_original_book() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let books_root = app.tmp.path().join("books");
+        let folder = books_root.join("subfolder-stack-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, stars) in [
+            ("a_1.jpg", 1),
+            ("a_2.jpg", 2),
+            ("b_1.jpg", 5),
+            ("b_2.jpg", 4),
+        ] {
+            let path = folder.join(name);
+            image::RgbImage::new(1, 1).save(&path).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
+                .unwrap();
+        }
+        app.settings.sort_order = SortOrder::RatingDesc;
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        // A compiled Book supplies the source/return flow without causing the
+        // subfolder scan to collapse these pages into a Folder row.
+        app.settings.book_root = Some(books_root);
+        app.settings.default_spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.settings.default_reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        app.load_folder(folder.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        let synthetic = crate::app::subfolder_expansion_synthetic_path();
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set_flow(
+                &synthetic,
+                crate::settings::ReadingFlow::Vertical,
+                crate::settings::ReadingDirection::Rtl,
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingFlow::Paged,
+                crate::settings::ReadingDirection::Ltr,
+            )
+            .unwrap();
+        let stored = app
+            .spread_db
+            .as_ref()
+            .unwrap()
+            .get_state_with_fallback(&synthetic, None);
+        app.start_subfolder_expansion_scan_roots(folder.clone(), vec![folder.clone()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.items_are_subfolder_expansion_view && std::time::Instant::now() < deadline {
+            app.poll_subfolder_expansion(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.items_are_subfolder_expansion_view);
+        finish_list_hydration_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.subfolder_expansion_snapshot
+                .as_ref()
+                .unwrap()
+                .stack_order_request,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::Numeric)
+        );
+        app.toggle_subfolder_stack_mode();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Publishing stack_view precedes the installed listing's hydration terminal.
+        // A flat open during that modal would remain deferred until the terminal is pumped.
+        finish_list_hydration_for_test(&mut app, &ctx);
+        let view = app.stack_view.as_ref().expect("subfolder stack prepared");
+        assert_eq!(
+            app.projection_recipe,
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::SubfolderExpansion
+            )
+        );
+        assert_eq!(
+            view.groups
+                .iter()
+                .map(|group| group
+                    .representative()
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["a_1.jpg", "b_1.jpg"]
+        );
+        assert_eq!(
+            view.materialize_flat()
+                .0
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"]
+        );
+        app.stack_enter_flat_fullscreen(&ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.stack_showing_flat);
+        finish_list_hydration_for_test(&mut app, &ctx);
+        assert!(!app.sidecar_restore_active());
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.extracted_result_surface().is_some());
+        assert_eq!(app.items[1].name(), "a_2.jpg");
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        app.apply_fullscreen_spread_mode(&ctx, 1, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Rtl);
+        app.close_fullscreen();
+        assert_eq!(app.fullscreen_idx, None);
+        app.stack_reconcile_after_fullscreen_close(&ctx);
+        assert!(!app.stack_showing_flat);
+        app.stack_enter_flat_fullscreen(&ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stack reopen did not settle"
+            );
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        finish_list_hydration_for_test(&mut app, &ctx);
+        assert!(!app.sidecar_restore_active());
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(app.items[1].name(), "a_2.jpg");
+        assert_eq!(
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None),
+            stored
+        );
+        app.close_fullscreen();
+        app.stack_reconcile_after_fullscreen_close(&ctx);
+        app.exit_subfolder_expansion_view();
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+        assert!(app.extracted_result_surface().is_none());
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
     }
 
     #[test]
@@ -2371,6 +3078,10 @@ mod tests {
             app.fs_feedback_toast.as_ref().map(|toast| &toast.0)
         ));
         assert_eq!(view.groups.len(), 2);
+        assert_eq!(
+            app.projection_recipe,
+            crate::app::book_materialization::ProjectionRecipe::OrdinaryList
+        );
         assert_eq!(view.index_map_builds, 2, "Rating installs a retained order");
         assert_eq!(
             view.groups[0].representative().path.file_name().unwrap(),
@@ -2813,6 +3524,42 @@ mod tests {
     }
 
     #[test]
+    fn book_structure_rejects_flat_stack_open_until_its_accepted_fullscreen_is_adopted() {
+        let mut app = crate::app::setup_app_for_test();
+        let dir = app.tmp.path().join("stack-open");
+        std::fs::create_dir(&dir).unwrap();
+        let paths = [dir.join("post_0.png"), dir.join("post_1.png")];
+        for path in &paths {
+            image::RgbaImage::new(1, 1).save(path).unwrap();
+        }
+        stack_page_edit_fixture(&mut app, dir, &paths);
+        let books = app.tmp.path().join("books");
+        std::fs::create_dir_all(books.join("Old")).unwrap();
+        app.settings.book_root = Some(books.clone());
+        let ctx = egui::Context::default();
+        app.stack_enter_flat_fullscreen(&ctx, 0);
+        assert!(app.stack_script_pending.as_ref().unwrap().open_pending());
+        app.start_book_rename(&ctx, "Old".into(), "New".into());
+        assert!(app.book_structural_op.is_none());
+        assert!(books.join("Old").exists());
+        assert!(!books.join("New").exists());
+        assert!(app.stack_script_pending.as_ref().unwrap().open_pending());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat {
+            app.poll_stack_script(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "refusal preserves the accepted fullscreen tail"
+        );
+        app.start_book_rename(&ctx, "Old".into(), "New".into());
+        assert!(app.book_structural_op.is_some());
+    }
+
+    #[test]
     fn visibility_stack_preparation_pairs_final_order_policy_and_logical_identity() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
@@ -2896,6 +3643,7 @@ mod tests {
         app.stack_view = None;
         app.stack_mode_requested = true;
         let source = Arc::new(StackGroupingSource {
+            hydration_intent: crate::app::StartupListIntent::InternalInstall,
             visibility: app.settings.file_type_visibility.clone(),
             logical_container: app.archive_source_override.clone(),
             folder,

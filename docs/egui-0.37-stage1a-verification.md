@@ -1,0 +1,381 @@
+# egui 0.37 更新・段1a 検証台帳
+
+2026-10-16、`egui-036` / 開始HEAD `f65b606c1f0d48d64c091042e1d14e93b520d5a2`。
+[更新計画第4.2版](egui-0.37-update-plan.md)の段1aを実装した。
+Rust 1.99.0、egui 0.33.3、wgpu 27.0.1を維持する。
+製品起動・live試験・`test-full.ps1`・snapshot更新・コミット・ブランチ操作・pushは行わない。
+開始時に`src/video/dsp/mod.rs`だけ変更表示があり、Gitの内容差分はなかった。
+対象外としてバイト列を保護し、整形後もSHA-256
+`2f099cbba3855cbce0f5ae1a5034b9ccea668b0ff6cfae98e8b5bca2a09a8ae0`の一致を確認した。
+
+以下は初回実装の記録。`5b70ec387`の独立レビュー後の修正と最新の検証結果は、
+末尾の「独立レビュー後の修正」に追記する。初回の失敗記録は履歴として保持する。
+
+## 依存・コメント
+
+- `src` / `crates` / `tools` / `tests` / `build.rs`の`wgpu_hal`、`windows_058`、
+  `create_texture_from_hal`、`as_hal`を検索し、削除前の直接利用がないことを確認した。
+- ルート`Cargo.toml`の`wgpu-hal`と`windows_058`別名を除去した。
+  `wgpu = "27"`、本体の`windows = "0.61"`は変更しない。
+- 同manifestの旧D3D11→wgpu import説明と`src/app.rs`の
+  `wgpu_render_state`説明を現行用途へ訂正した。動画本体はD3D11 native presenter内で
+  shared resourceを開き、wgpuは静止画縮小・比較・パノラマ・HUD overlayに使う。
+- `src/video/decoder.rs`、`src/video/gpu_renderer/{mod,d3d11_device}.rs`も、
+  旧D3D12共有・毎フレーム新規出力・keyed mutex未使用という説明を現行へ訂正した。
+  VPP intermediate → CopyResource → BGRA8 pool、`OpenSharedResource1`、
+  `OpenSharedFence`、Context4のSignal/Waitとwriter/reader keyの所有を説明する。
+  3ファイルはHEAD比で`//`コメント行を除いた全行の完全一致を機械確認した。
+  明示された過去のwgpu OOM記録は維持した。
+- `cargo tree --offline ... -i wgpu-hal`と`cargo metadata --locked --offline`で確認した。
+  `Cargo.lock`の差はmimageviewerの依存辺`wgpu-hal`と`windows 0.58.0`の2行削除だけ。
+  895 packageの集合・版・checksumは不変。間接`wgpu-hal 27.0.4`と`windows 0.58.0`は残る。
+  `windows_062`などの別名追加はない。
+
+証跡は`target/egui037-stage1a/wgpu-hal-tree.txt`、`metadata-full.json`。
+
+## accessibilityの対象と方法
+
+registry rootは
+`C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\`。
+`egui_kittest-0.37.0/src/accessibility.rs`と`egui-0.37.0/src/accessibility.rs`を読んだ。
+検査対象はvisible、非read-onlyのinput role。Button、CheckBox、ColorWell、ComboBox、
+TextInput系、Slider、SpinButton、RadioButton、Link、menu/list option、Tab、TreeItem、
+Splitter等を含み、非空labelまたはplaceholderが必要になる。Unknownの独自canvasや
+read-only表示、native Win32入力はこの検査と分ける。
+
+本体の入力生成、IME helper、空文字checkbox、画像・ベクターボタン、custom interact、
+既存tooltip/hoverを静的に確認した。テスト専用の仮名や検査無効化は追加しない。
+
+- `Response::labelled_by`で既存のlabel・見出し・行/列header・選択肢と関連付けた。
+  このAPIは0.33.3と0.37.0の両方に残る。可視widget・ID・描画順を増やさない。
+- `ui_helpers::set_accessibility_label`は`Context::accesskit_node_builder`で
+  nodeのlabelだけを設定する。0.37の`Response::accessible_name`と同じ方式であり、
+  role、numeric/text value、checked、disabled、range、actionは再構築しない。
+  `widget_info`全体の上書きによる既存metadataの欠落を避けた。
+- 標準`on_hover_text`は0.37で既存tooltipから名前を補うので、そのためだけの個別変更はしない。
+  独自`HoverTipExt`の通常・暗色・disabledとtest-script観測入口の計4経路には、
+  hoverの有無にかかわらず既存tooltipを空名へ補う共通処理を追加した。
+  明示名・`labelled_by`を優先し、Unknown/Labelは命名しない。tooltipの位置・描画は維持する。
+- 新しい可視文字、tooltip、placeholderは追加していない。読み上げ専用名は実際の操作の意味を表し、
+  ComboBoxの現在選択値を部品名で代用しない。IME・focus・key処理は変更しない。
+
+### 対応箇所
+
+数はループの生成数ではなく静的な命名対象箇所。共通slider macroは定義を1箇所として数え、
+local-effect ComboBoxは20の製品呼出箇所、resume matrixは6入力として数える。
+同じ入力への行/列2本の関係は1箇所。合計**220箇所**。
+加えて上記4つの共通hover入口を対応した。共通描画の呼出・macro展開・動的loopにより
+実行時の部品数はこれより増え、既存名を持つ部品にはhover fallbackの名前を重ねない。
+
+| 変更ファイル | 箇所数 | 対応 |
+| --- | ---: | --- |
+| `src/ui_main.rs` | 34 | toolbar/facet等のComboBox 20、DragValue 11、本の名前等のTextEdit 3 |
+| `src/ui_folder_pane.rs` | 1 | drive選択 |
+| `src/global_search_ui.rs` | 3 | お気に入り・種類・検索対象 |
+| `src/local_adjust_effect_ui.rs` | 20 | local-effect ComboBoxの意味名を共通helperへ渡す |
+| `src/ui_adjustment_panel.rs` | 13 | slider macro 2、個別slider 8、enable checkbox、適用量DragValue、LUT選択 |
+| `src/ui_text.rs` | 19 | font sample、数値15、ComboBox 2、stamp-size slider |
+| `src/ui_crop.rs` | 5 | 縦横比とX/Y/W/H |
+| `src/ui_sns_split.rs` | 1 | 継ぎ目の割合 |
+| `src/ui_raw.rs` | 1 | 同時現像数 |
+| `src/ui_dialogs/preferences/pages.rs` | 87 | 表示・動画・入力・AI・再開等の既存項目ラベルと意味名 |
+| `src/ui_dialogs/preferences/name_colors.rs` | 3 | カテゴリ・HEX・色well |
+| `src/ui_dialogs/preferences.rs` | 1 | 場所 |
+| `src/ui_dialogs/archive_cache_manager.rs` | 1 | 元ファイル行のcheckbox |
+| `src/ui_dialogs/cache_manager.rs` | 1 | 最終更新からの日数 |
+| `src/ui_dialogs/collections.rs` | 3 | 作成・改名 |
+| `src/ui_dialogs/export_batch.rs` | 1 | 長辺指定 |
+| `src/ui_dialogs/fav_add.rs` | 1 | 表示名 |
+| `src/ui_dialogs/favorites_editor.rs` | 1 | 表示名header |
+| `src/ui_dialogs/smart_folder_editor.rs` | 4 | 名前・条件・並び方 |
+| `src/ui_dialogs/subfolder_expansion.rs` | 7 | サイズ・日付・日数・深さ |
+| `src/ui_dialogs/tag_editor.rs` | 1 | タグ名header |
+| `src/ui_dialogs/thumb_quality.rs` | 2 | サイズ・品質 |
+| `src/ui_fullscreen.rs` | 5 | slideshow描画ラベル4、export長辺指定1。viewport経路は変更しない |
+| `src/video/native_presenter/overlay_draw.rs` | 5 | filter・Anime4K budget・LUT・適用量・共通grade slider |
+
+`src/ui_helpers.rs`には共通命名処理と非対話回帰1件も追加した。
+hoverなしでの命名、既存名/label関係の優先、disabled、Slider/DragValueのrole・数値・範囲、
+checkboxのchecked保持を検査する。
+共通grade sliderは8呼出、調整slider macroは5呼出、address入力は通常/disabledの2分岐を持つ。
+上の220を実行時の全input node数とは扱わない。
+
+### 変更しない箇所・残件
+
+- **可視文字追加を必要とする製品部品／利用者相談が要る既知箇所: 0。**
+  今回見つけた製品入力は既存label・既存tooltip・読み上げ専用の意味名で対応できた。
+- その他の標準button/checkbox/radio等の非空可視名、`.text`付きslider、`from_label`のComboBox、
+  既存hint付き入力、既存標準tooltip、上流color pickerの名前は維持した。
+  `ui_erase` / `ui_conceal` / `ui_view_trim`、music/metadata/composition editor、
+  Everything検索、Remote PIN欄等はこのため変更不要。dialogは全55ファイルを確認した。
+- `crates/egui-ime`は呼出元が意味名を所有する描画helper。共通の仮名は付けない。
+  `egui_focus_policy` / `keymap`等のテスト用raw入力は製品描画とは分ける。
+- 製品描画と非共通のfixtureは段3で正式graphと一緒に確認する。
+  `ui_main`の`ten-sort-rows` / `collection-sort-rows` / `probe_combo`、
+  `ui_folder_pane`の`folder_pane_drive_combo_test`のHarness直書き4箇所、
+  local-effectの`repair_quality_theme_regression` 1箇所が既知。
+  後者は共通helperの新引数へ空文字を渡し、テストだけの名は付けない。
+  さらに`ui_main`の`sort-popup-test` / `probe` / `from_id_salt(text)`3箇所の
+  raw Context geometry probe計5箇所は現在kittestの検査外。追加相談は不要。
+- 0.33の`labelled_by`は関係追加、0.37は自身のlabelをclearして関係を優先する。
+  `.text`なしSliderの内部数値nodeへの連結も0.37の`slider.rs:644-652`が補う。
+  旧版ですべてのinput nodeが命名済みと実証したとはしない。
+- 静的監査には動的状態や全画面の取りこぼしがあり得る。
+  **段3の0.37切替時にkittestの実検査が出す残りを補完する。**
+  Unknown role等を含むスクリーンリーダー操作全体の完全性を保証する監査ではない。
+
+ファイル別の変更不要理由・命名箇所・fixture位置は
+`target/egui037-stage1a/{main,adjust,dialog}-audit.md`。
+独立レビューは別contextの`gpt-6.1-sol` / `xhigh`が実施し、P1/P2指摘なし。
+実行検証は実装担当が所有し、レビュー担当は再実行しない。
+
+## 検証
+
+ログは`target/egui037-stage1a/`。通常feature・追加featureなし。
+`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`を使用し、
+`UPDATE_SNAPSHOTS`は未設定の別processで比較する。
+[基準台帳](egui-0.37-baseline.md)の両integration targetと50 lib filterを個別実行する。
+結果は下表へ追記する。
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功。15.678 / 16.276秒 | 0 / 0 |
+| `python scripts/check_ui_glyphs.py` | dangerous glyph 0件 | 0 |
+| `git diff --check` | 成功 | 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、60.264秒、既存警告あり | 0 |
+| `cargo check --workspace` | ランチャーの前提実行ファイル3本の不足でbuild script停止。236.763秒 | 101 |
+| 変更moduleの焦点nextest | 2,115 passed、0 failed、11,178 skipped。実行86.816秒、compile込み594.101秒 | 0 |
+| `cargo test -p mimageviewer --test ui_snapshot` | 181 passed、0 failed/ignored。実行25.53秒、compile込み514.890秒 | 0 |
+| `cargo test -p mimageviewer --test book_composition_editor_snapshots` | 11 passed、0 failed/ignored。実行8.70秒、compile込み15.646秒 | 0 |
+| 基準台帳のlib snapshot全50 filterを個別に通常比較 | 全103 passed、各filter 0件選択なし、全command成功 | 各0 |
+| PNG SHA-256照合 | 追跡445枚すべて開始時と一致。更新0枚 | 0 |
+| `scripts/test-lib-full.ps1` 初回 | 13,234実行、13,233 passed、1 failed、59 skipped。実行489.383秒、compile込み686.950秒 | 100 |
+| 初回失敗1件の単独nextest | 1 passed、13,292 skipped。実行0.307秒 | 0 |
+| 最終`cargo check -p mimageviewer --bin mimageviewer-core` | 成功、17.872秒 | 0 |
+| 参考`cargo check --workspace --exclude mimageviewer-launcher` | 成功、22.537秒。workspace全体成功の代替とはしない | 0 |
+| 最終`cargo fmt --check` / glyph / diff検査 | 成功。glyph 0件、16.561 / 2.346 / 0.247秒 | 各0 |
+| `scripts/test-lib-full.ps1` 最終再確認 | 13,234実行、13,233 passed、同じ1 failed、59 skipped。実行426.565秒、compile込み515.774秒 | 100 |
+| 確認用`build-dev.ps1` | 未実施。全件gateが未通過で、検証用buildの前提を満たさない | — |
+
+workspace checkの不足物は`target/release/`の`mimageviewer-core.exe`、
+`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`。
+`crates/launcher/build.rs`がこれらを`include_bytes!`の実入力として要求する。
+製品のコンパイルエラーやMSBuild失敗ではない。代用exeの配置やbuild規則の変更は行わない。
+この結果をworkspace全体成功とは扱わない。
+
+焦点filterは`ui_helpers` / `ui_dialogs` / `local_adjust_effect_ui` /
+`ui_adjustment_panel` / `ui_text` / `ui_crop` / `ui_raw` / `ui_sns_split` /
+`ui_main` / `ui_folder_pane` / `global_search_ui` / `ui_fullscreen` /
+`video::native_presenter::overlay_draw`のmodule部分文字列の和集合。
+完全なcommand・exit・時間は`focused-results.json`、出力は`focused-nextest.log`、
+JUnitは`focused-junit.xml`。追加した`ui_helpers::accessibility_names_tests`の1件も
+JUnit上で実行・成功を確認した。slow表示1件は既存still-seek geometry回帰で、86.746秒で成功した。
+
+snapshotのcommand・時間・exitは`snapshots-results.json`、件数は`snapshot-summary.json`、
+全50 filterは`lib-snapshot-filters.json`。PNGの開始時ハッシュは`snapshots-before.json`。
+integration 192件＋lib 103件＝295テストが成功した。
+snapshot/focused後のvideo 3ファイルの追補はコメントのみであり、非コメント行の完全一致を確認したため、
+同じ描画・実行コードに対する成功結果を再利用する。最終check/buildと全件再確認は追補後のソースで行う。
+
+### lib全件初回の失敗
+
+`app::tests::still_window_mode_key_tests::detached_native_video_navigation_syncs_main_selection`が
+`src/app/tests.rs:62195`の`media navigation worker did not finish`で失敗した。
+helperは10,000回のpoll/yieldで完了を待つ。テストrunnerのtimeoutではなく、当該helperのassertである。
+全件runでは1.055秒、同一条件の単独nextestでは0.307秒で成功した。
+並列負荷とworker schedulingの関係は未検証であり、原因や既知baseline失敗とは断定しない。
+テスト上限・fixture・ignore・製品動作・detached経路は変更しない。
+
+初回runは`target/test-lib-full/runs/20261016T043618443Z-12065cab/`。
+source IDは`9c7b446b66b8e3dcb86f6cd9b6ddf8a1e058034956c4b12c088b0ec5d81ee72d`。
+`target/egui037-stage1a/full-initial-results.json`と同runの`stderr.log` / `junit.xml`が初回失敗の証跡。
+単独のcommand・結果は`full-failure-isolated.log` / `full-failure-isolated.exit.txt`。
+初回全件を成功扱いせず、コメント整理後の全件を一度再確認する。
+コメントの残件は独立レビューで再確認し、`gpu_renderer/mod.rs`の経路図も含めて解決した。
+非コメント行は3ファイルともHEADと完全一致。再検索で残るwgpu記述は非依存説明と明示された過去のOOM記録だけ。
+
+### 最終再確認・残る検証上の障害
+
+同じ既定条件の全件再確認でも、上記1件だけが同じassertで失敗した（1.125秒）。
+他の13,233件は成功し、59件は既存ignore。単独成功をもって全件成功へ置き換えない。
+原因は未確定であり、全件負荷との因果や段0b時点でも起きた失敗とは断定しない。
+対象テストは直接のUI描画を行う前のnavigation worker完了待ちで失敗している。
+`src/app/tests.rs`とdetached/viewportの処理経路は変更していない。
+依頼の境界に従って、そのfixture・待機方式・製品経路をこの段で変更して通すことはせず、
+設計担当へ調査・扱いを返す。3回目の全件再実行や上限緩和は行わない。
+
+最終runは`target/test-lib-full/runs/20261016T045208590Z-fb6eb63c/`。
+source IDは`ff427ad2057ae8f9cf8f70d34b680fef463f9a6928bcaa9057f0e98eabf964fb`。
+`lib-full.log` / `full-results.json`と同runの`stderr.log` / `junit.xml`を保存した。
+両runのJUnitを`full-summary.json`で照合し、新規命名回帰1件と、基準台帳にある
+ページめくりの過去間欠候補1件も両runで成功したことを確認した。
+失敗した全件の成功台帳は発行されていない。
+
+最終core / launcher除外check・fmt・glyph・diffのcommand/exit/時間は
+`remaining-checks-results.json`。全件再確認後、445 PNGのSHA-256と対象外DSPのバイト列を再照合して一致した。
+その後は本台帳の結果追記のみでRust・manifest・lock・fixture・scriptは変更していない。
+
+確認用buildは、リポジトリの検証用build前提（自動検証green）が満たされないため未作成。
+成果物を起動したり、存在しない新buildの起動を利用者に依頼したりしない。
+**実装差分はレビュー可能だが、workspace全体checkとlib全件gateは未通過であり、段1aの受入れ完了とはしない。**
+
+## 設計書との差異・未実施
+
+機能・構造の設計変更はない。`widget_info`全体の再設定に代えて、同じ公開AccessKit node APIで
+名前だけを設定しmetadataを保った。意味名の静的対応は見積りより広がったが、
+見た目・製品操作・detached述語・viewport配送/生成/終了・永続データは変更していない。
+変更は計33ファイル（31 source/manifest/lock＋計画のリンク・本台帳）で、12〜30ファイルの規模見積りを3ファイル上回る。
+初回の未通過workspace checkと、全件gateの再現した失敗・確認用build未実施は上記のとおり残す。
+live / ignored hardware、実0.37 graphでの検査、製品起動、`test-full.ps1`、
+snapshot更新は未実施。依頼に従い未コミットで設計担当へ渡す。
+
+## 独立レビュー後の修正
+
+2026-10-16、基点`5b70ec387fa4c8ca3031a76f9bda00fd3d6f6196`。
+独立レビューの`ACCEPT WITH CHANGES`（P2/P3各1件）と、利用者が今回明示した
+テストfixtureの変更依頼に対応する。未コミット差分で返し、egui / wgpu / Rustの版と
+manifest / Cargo.lockを変更しない。対象外DSPのSHA-256も開始時と一致する。
+
+### 名前・tooltipの生成コスト
+
+- `src/ui_helpers.rs`の3種のhover helperとtest-script用の観測helperで、
+  AccessKitのnode callbackが実行され、未命名の入力nodeが名前を必要とするときだけ
+  `WidgetText`へ変換する。既存の名前・labelled_byは優先する。
+  変換結果は同じ呼出しのtooltip描画にも使い、二重変換を避ける。
+- AccessKit無効なら、tooltipの描画closureまで変換しない。非hover時には変換0回。
+  dark Style cloneを避ける既存のanchor gateも維持する。
+- `set_accessibility_label_with`は生成closureをnode callback内でだけ呼ぶ。
+  `preferences/pages.rs`の5箇所、`subfolder_expansion.rs`の年月日3箇所、
+  `ui_main.rs`の日付・サイズ単位4箇所、合計12箇所の名前専用`format!`を移した。
+- 回帰4件を追加。既存の`Cell<usize>`による構築回数検査にならい、変換回数・
+  動的名の構築回数を数える。無効＋非hoverで0回、有効でも既存名／関係ありは0回、
+  未命名入力は1回、実tooltip描画時は1回で有効時の変換結果を再利用することを検査する。
+  全体allocator hookや製品用の計測機構は追加しない。
+- `accesskit_node_builder`が無効時にcallbackを呼ばない契約を、現vendor 0.33.3の
+  `context.rs`とregistry本家0.37.0の同APIで再確認した。API廃止予定への依存は増やさない。
+
+### 同型入力の名前の区別
+
+`src/ui_text.rs`のDragValue全15箇所を静的監査し、14箇所を既存語句と軸／側で区別した。
+残るEchoの「数」は既存labelled_byで識別できる。
+
+| 対象 | 箇所数 | 読み上げ専用名／関連付け |
+| --- | ---: | --- |
+| 吹き出し先端 | 2 | 先端 X / 先端 Y |
+| ウィンドウ四辺余白 | 4 | 余白 左 / 上 / 右 / 下 |
+| 名前プレート位置 | 2 | 位置 X / 位置 Y |
+| 文字の影・Echo、ウィンドウの影 | 6 | 影 X / Y、Echo X / Y（別panelの影も同様） |
+| 文字の影・発光のSlider | 2 | 影 広がり / 発光 広がり |
+| 名前プレート・立ち絵枠のSlider | 2 | 名前プレート 余白 / 立ち絵枠 余白 |
+| 反復する外フチ太さのSlider | 反復1箇所 | 既存の外フチ{N}の可視ラベルへlabelled_by |
+
+固定18箇所は`set_label`で名前のみ変更し、外フチは既存ラベルを再利用する。
+実描画AccessKit回帰2件で計18制御の一意名・role・numeric_valueを検査する。
+可視文字・tooltip・placeholder・値・範囲は変更しない。
+新しい可視文字の相談が要る既知部品は引き続き0件。静的監査の網羅性を保証するものではなく、
+段3の0.37 kittest実検査で残りを補完する。
+
+### テストfixtureの期限待ち・棚卸し
+
+`src/app/tests.rs`の32 helper/test、42箇所のworker完了待ちを、
+`Instant::now() + Duration::from_secs(10)`の壁時計期限へ変更した。
+3箇所がyield、39箇所がsleepを伴う回数上限だった。
+差分の機械照合で、削除42行がfor header、追加84行が期限宣言＋while headerだけであることを確認。
+poll本体・待つ対象・完了条件・assert/panic・yield/sleep間隔は不変。
+期限到達時の成功扱い、retry、ignore、製品コード変更はない。
+
+| 対象群 | 変更したhelper/test（同名内の複数待機も含む） |
+| --- | --- |
+| 10,000 yield | `poll_media_navigation_until_done_for_test`、`colorize_display_gate_requires_final_effect_for_creative_lut`、`colorize_display_gate_waits_for_creative_lut_without_colorize` |
+| Phase A2 | `phase_a2_wait_for_mask`、`phase_a2_late_local_adjust_commit_and_delete_reconcile`、`phase_a2_sibling_write_refreshes_parked_bundle_on_remount` |
+| Phase B search | `phase_b_search_streaming_result_projects_saved_mask`、`phase_b_search_rebuild_retains_done_and_new_page_edits`、`phase_b_query_change_discards_old_stream_and_prepare`、`phase_b_search_rebases_after_no_snapshot_edit_commit` |
+| Phase B rating | `phase_b_rating_list_projects_saved_mask_after_local_sort`、`phase_b_rating_pending_result_publishes_after_shared_star_write`、`phase_b_rating_pending_result_rebases_after_tag_write`、`phase_b_rating_pending_result_rebases_after_book_page_copy`、`phase_b_rating_rejects_edit_written_without_view_snapshot` |
+| Phase B history | `phase_b_reading_history_opened_folder_resolves_masked_member_before_paint`、`phase_b_reading_history_opened_zip_resolves_masked_member_before_paint` |
+| Phase C navigation | `finish_staged_physical_history_for_test`、`finish_rating_navigation_for_test`、`rating_1328_folder_or_pdf_return`、`folder_history_dispatch_restores_rating_view`、`finish_context_jump_hydration` |
+| Archive | `converted_archive_cache_path_poll_rebuilds_rollup_edit_filter`、`poll_archive_decisions_for_test`、`install_new_items_resolves_converted_archive_cache_paths_async`、`converted_archive_cache_refresh_includes_archive_reached_through_folder_pin`、`archive_cache_arrival_reloads_the_dependent_folder_pin_only_once` |
+| Book / render | `wait_for_book_op`、`enter_conceal_mode_keeps_erase_result_with_post_filter`、`conceal_boundary_change_recomposes_current_preview_pixels` |
+| Rating navigation | `rating_view_nav_open_dedupes_only_after_visible_adoption_and_close_clears_stack`、`rating_view_back_from_opened_container_returns_to_result_grid` |
+
+`normalize_scan_navigation_without_openable_candidate_keeps_scan`は共通media helperを使うため同時に対応する。
+[過去の間欠失敗記録](effetune-integration-plan.md)の10,000 yield方式と同じfixture上の問題として扱う。
+worker schedulingが過去の各失敗の原因だったとは断定せず、全件の実測結果を別に記録する。
+
+除外した固定回数ループは、searchの旧結果が復活しないことを見る100回の負の観測区間、
+Stop要求の2回反復（内側の完了待ちは回数制限なし）、idle pollの10回計測、
+file-organizeの4終端結果列挙、eguiの固定pass/repaint消化、反復入力、
+120frameの未完了維持、retained表示確認、fixture生成。いずれも回数自体が検査内容である。
+製品のdetached述語・viewport経路は変更しない。
+
+### 修正後の検証
+
+検証ownerは実装担当。通常feature、Rust 1.99.0、既定test profile、
+`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`、`UPDATE_SNAPSHOTS`未設定。
+証跡は`target/egui037-stage1a/review-fix/`。初回記録のログは上書きしない。
+今回変更で失効した焦点・snapshot・lib全件を再実行する。
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功 | 0 / 0 |
+| core check | 成功 | 0 |
+| core check `--features test-script` | tooltip観測helperのcfg経路もコンパイル成功、204.904秒 | 0 |
+| glyph / `git diff --check` | dangerous glyph 0件、差分検査成功 | 0 / 0 |
+| 焦点nextest | 1,998＋rating navigation 12＝2,010 passed、0 failed。新規回帰6件を含む | 0 / 0 |
+| integration snapshot 2本＋lib 50 filter | 181＋11＋103＝295 passed、全filter 0件選択なし | 各0 |
+| 445 PNG SHA-256 | 全枚一致、更新0枚 | 0 |
+| `scripts/test-lib-full.ps1` | 13,240実行、13,237 passed、3 failed、59 skipped。7 slow / 7 leaky。実行572.399秒、全体585.208秒 | 100 |
+| 全件失敗3件の診断用nextest | 3 passed、13,296 skipped。実行2.673秒、全体6.184秒 | 0 |
+| 最終`cargo fmt --check` / glyph / `git diff --check` | 成功、dangerous glyph 0件。26.905 / 3.545 / 0.186秒 | 各0 |
+| 確認用`build-dev.ps1` | 未実施。全件gateが未通過のため、検証用buildの前提未成立 | — |
+
+焦点のcommand・所要時間・exitは`focused-results.json` / `focused-rating-results.json`、
+出力は`focused-nextest.log` / `focused-rating-nextest.log`。
+snapshotは`snapshots-results.json` / `snapshot-summary.json`と52本の個別ログに保存した。
+feature付きcheckは`test-script-check-results.json` / `core-check-test-script.log`。
+実装とは別contextの`gpt-6.1-sol / xhigh`による読み取り専用の独立レビューは**ACCEPT**。
+確認blobは`ui_helpers=d79a29d5`、`ui_text=e449272f`、`app/tests=064e46b7`で、
+焦点・snapshot実行後も一致する。レビュー担当による重複テストは行っていない。
+
+#### 修正後の全件失敗と残課題
+
+全件runは`target/test-lib-full/runs/20261016T053552535Z-49316d11/`。
+source IDは`efcffb2d858cd2099e3599b00e4e8610d78e5a9471d72c35f2658085f6ba1053`。
+今回の変更で成功台帳は再利用されず、新規実行された。`full-results.json` / `lib-full.log`と
+同runの`stderr.log` / `junit.xml`、照合結果の`full-summary.json`を保存した。
+全件成功台帳は発行されていない。
+
+今回対象の過去失敗2件（`detached_native_video_navigation_syncs_main_selection`と
+`normalize_scan_navigation_without_openable_candidate_keeps_scan`）、新規回帰6件、
+従来の命名回帰1件は、全件JUnit上ですべて成功した。
+ただし次の別の3件が失敗したため、全件gateの成功とは扱わない。
+
+| 失敗テスト | 全件での失敗内容 | 今回の変更との関係・扱い |
+| --- | --- | --- |
+| `app::tests::smart_folder_transition_tests::no_resident_smart_pdf_missing_root_row_rolls_back_history` | `tests.rs:95760`、`missing row scan timed out`。既存の5秒期限に到達 | この待機は元から壁時計方式で未変更。5秒を延ばす修正は入れない |
+| `app::tests::still_window_mode_key_tests::remote_acquire_retires_startup_resolves_and_rejects_new_activations` | `tests.rs:73570`、実測`AcquiringRemote`、期待`RemoteActive` | lease解放後の単一poll直後のassert。回数上限の完了待ちではなく、このテスト本体は未変更 |
+| `pdf_loader::tests::abort_on_cancel_returns_interrupted_immediately` | `pdf_loader.rs:10313`、200ms未満のassertに対し221ms | 未変更ファイルの取消応答時間検査。時間期待値は変更しない |
+
+3件だけをexplicit filterで診断再実行すると3/3成功した。
+command / exitは`diagnose-full-failures-results.json`、ログとJUnitは
+`full-failures-isolated.log` / `full-failures-isolated-junit.xml`。
+これを全件成功の代わりにはせず、並列負荷やschedulingが各失敗の原因だったとも断定しない。
+独立レビューでも3件のテスト本体とPDF mockがHEADと全文一致し、回数待機の変換漏れでないことを確認した。
+追加の上限変更をせず、失敗を記録してbuildを保留する境界判断も支持され、差分へのACCEPTを維持している。
+回数上限のworker待機という依頼対象外の期待値変更や、製品処理の変更は行わない。
+全件後も445 PNGのSHA-256と対象外DSPのバイト列が一致し、manifest / lockの追加差分は0。
+最終結果記録の追記以外に、検証後のRust・fixture変更は行っていない。
+最終整形・glyph・差分検査は`final-checks-results.json`と各`*-final.log`。
+本台帳への結果追記後も`git diff --check`を再実行してexit 0を確認した。
+
+今回の依頼は、前回は対象外だったfixture待機の変更を明示的に追加したもの。
+製品設計との差異はなく、依存差分も増やさない。
+前回のworkspace check未通過（launcherのrelease入力3本不足）は別途残る。
+live、製品起動、`test-full.ps1`、snapshot更新、コミット・branch操作・pushは行わない。
+
+#### 再起動後の全件再実行と段1aの受入れ（2026-10-16、設計担当）
+
+PC再起動後、同じworktreeとHEAD `68994b047`で、他のcargo/nextestプロセスが無いことを確かめてから
+`scripts/test-lib-full.ps1`を設計担当が実行した。結果は **13,240 passed / 0 failed / 59 skipped、418.378秒、exit 0**
+（run dir `target/test-lib-full/runs/20261016T080041419Z-1a279085`）。上記の3件は今回すべて成功した。
+並行する別セッションのテスト負荷と重なった実行でだけ失敗したことになるが、原因を負荷と断定はしない。
+3件のテスト本体は未変更のまま残し、同じ失敗が再び出たら別課題として扱う。
+独立レビュー（GPT-6.1 Sol / xhigh）は`68994b047`をACCEPTした。以上で段1aを受け入れる。

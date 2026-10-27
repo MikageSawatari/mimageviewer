@@ -822,7 +822,7 @@ impl KeySlot {
     /// 実害 (2026-08-05): フルスクリーン中の NumpadEnter は fullscreen viewport の Win32 edge
     /// になる一方、egui イベントは main viewport にも届く。main 側には対応する edge が無いので
     /// egui へ落ち、`Key::Enter` を `FsClose` (既定 Enter) が拾って表示が閉じていた。
-    fn egui_event_cannot_identify_slot(self) -> bool {
+    pub(crate) fn egui_event_cannot_identify_slot(self) -> bool {
         matches!(
             self,
             KeyName::Enter
@@ -1415,6 +1415,9 @@ pub enum KeyAction {
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
     ToggleAlwaysOnTop,
+    ClearVideoMediaMemory,
+    ClearBookResumePositions,
+    UndoLastAction,
     HelpShowContextShortcuts,
     GridFavoritePrev,
     GridFavoriteNext,
@@ -1674,6 +1677,8 @@ pub enum KeyAction {
     FsJumpLast,
     FsCtrlNavPrev,
     FsCtrlNavNext,
+    FsListOrderPrev,
+    FsListOrderNext,
     FsSiblingPrev,
     FsSiblingNext,
     FsPagePrev,
@@ -1700,6 +1705,14 @@ pub enum KeyAction {
     RatingContainerClear,
     RatingContainerStepUp,
     RatingContainerStepDown,
+    RatingBookPreferred1,
+    RatingBookPreferred2,
+    RatingBookPreferred3,
+    RatingBookPreferred4,
+    RatingBookPreferred5,
+    RatingBookPreferredClear,
+    RatingBookPreferredStepUp,
+    RatingBookPreferredStepDown,
     FsContinuousScrollForward,
     FsContinuousScrollBack,
     FsSpreadShiftLeft,
@@ -1726,6 +1739,7 @@ pub enum KeyAction {
     FsPanorama,
     FsPanoramaProjection,
     FsNavigatorToggle,
+    FsPageTurnAnimationToggle,
     FsNavigatorHold,
     FsPixelGrid,
     FsLoupeLockToggle,
@@ -1740,6 +1754,8 @@ pub enum KeyAction {
     FsBgCycle,
     FsPin,
     FsSpreadSingle,
+    FsViewSpread,
+    FsViewLandscapeSplit,
     FsSpreadLtr,
     FsSpreadLtrCover,
     FsSpreadRtl,
@@ -1989,6 +2005,9 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
     KeyAction::ToggleAlwaysOnTop,
+    KeyAction::ClearVideoMediaMemory,
+    KeyAction::ClearBookResumePositions,
+    KeyAction::UndoLastAction,
     KeyAction::HelpShowContextShortcuts,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
@@ -2248,6 +2267,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsJumpLast,
     KeyAction::FsCtrlNavPrev,
     KeyAction::FsCtrlNavNext,
+    KeyAction::FsListOrderPrev,
+    KeyAction::FsListOrderNext,
     KeyAction::FsSiblingPrev,
     KeyAction::FsSiblingNext,
     KeyAction::FsPagePrev,
@@ -2274,6 +2295,14 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::RatingContainerClear,
     KeyAction::RatingContainerStepUp,
     KeyAction::RatingContainerStepDown,
+    KeyAction::RatingBookPreferred1,
+    KeyAction::RatingBookPreferred2,
+    KeyAction::RatingBookPreferred3,
+    KeyAction::RatingBookPreferred4,
+    KeyAction::RatingBookPreferred5,
+    KeyAction::RatingBookPreferredClear,
+    KeyAction::RatingBookPreferredStepUp,
+    KeyAction::RatingBookPreferredStepDown,
     KeyAction::FsContinuousScrollForward,
     KeyAction::FsContinuousScrollBack,
     KeyAction::FsSpreadShiftLeft,
@@ -2300,6 +2329,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPanorama,
     KeyAction::FsPanoramaProjection,
     KeyAction::FsNavigatorToggle,
+    KeyAction::FsPageTurnAnimationToggle,
     KeyAction::FsNavigatorHold,
     KeyAction::FsPixelGrid,
     KeyAction::FsLoupeLockToggle,
@@ -2314,6 +2344,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsBgCycle,
     KeyAction::FsPin,
     KeyAction::FsSpreadSingle,
+    KeyAction::FsViewSpread,
+    KeyAction::FsViewLandscapeSplit,
     KeyAction::FsSpreadLtr,
     KeyAction::FsSpreadLtrCover,
     KeyAction::FsSpreadRtl,
@@ -3354,6 +3386,23 @@ const RATING_CONTAINER_ACTIONS: &[(KeyAction, u8)] = &[
     (KeyAction::RatingContainerClear, 0),
 ];
 
+const RATING_BOOK_PREFERRED_ACTIONS: &[(KeyAction, u8)] = &[
+    (KeyAction::RatingBookPreferred1, 1),
+    (KeyAction::RatingBookPreferred2, 2),
+    (KeyAction::RatingBookPreferred3, 3),
+    (KeyAction::RatingBookPreferred4, 4),
+    (KeyAction::RatingBookPreferred5, 5),
+    (KeyAction::RatingBookPreferredClear, 0),
+];
+
+/// The target policy requested by a rating shortcut, resolved by its input owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatingTargetFamily {
+    Item,
+    Container,
+    BookPreferred,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RatingStepDirection {
     Up,
@@ -3376,20 +3425,29 @@ pub fn step_rating(current: u8, direction: RatingStepDirection) -> Option<u8> {
     }
 }
 
-fn rating_step_actions(container: bool) -> [(KeyAction, RatingStepDirection); 2] {
-    if container {
-        [
+fn rating_step_actions(family: RatingTargetFamily) -> [(KeyAction, RatingStepDirection); 2] {
+    match family {
+        RatingTargetFamily::Item => [
+            (KeyAction::RatingItemStepUp, RatingStepDirection::Up),
+            (KeyAction::RatingItemStepDown, RatingStepDirection::Down),
+        ],
+        RatingTargetFamily::Container => [
             (KeyAction::RatingContainerStepUp, RatingStepDirection::Up),
             (
                 KeyAction::RatingContainerStepDown,
                 RatingStepDirection::Down,
             ),
-        ]
-    } else {
-        [
-            (KeyAction::RatingItemStepUp, RatingStepDirection::Up),
-            (KeyAction::RatingItemStepDown, RatingStepDirection::Down),
-        ]
+        ],
+        RatingTargetFamily::BookPreferred => [
+            (
+                KeyAction::RatingBookPreferredStepUp,
+                RatingStepDirection::Up,
+            ),
+            (
+                KeyAction::RatingBookPreferredStepDown,
+                RatingStepDirection::Down,
+            ),
+        ],
     }
 }
 
@@ -3693,11 +3751,19 @@ pub const LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenLocationDownloads,
 ];
 
-fn rating_actions(container: bool) -> &'static [(KeyAction, u8)] {
+fn rating_actions(family: RatingTargetFamily) -> &'static [(KeyAction, u8)] {
+    match family {
+        RatingTargetFamily::Item => RATING_ITEM_ACTIONS,
+        RatingTargetFamily::Container => RATING_CONTAINER_ACTIONS,
+        RatingTargetFamily::BookPreferred => RATING_BOOK_PREFERRED_ACTIONS,
+    }
+}
+
+fn display_rating_family(container: bool) -> RatingTargetFamily {
     if container {
-        RATING_CONTAINER_ACTIONS
+        RatingTargetFamily::Container
     } else {
-        RATING_ITEM_ACTIONS
+        RatingTargetFamily::Item
     }
 }
 
@@ -4004,6 +4070,9 @@ impl KeyAction {
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             ToggleAlwaysOnTop => "ToggleAlwaysOnTop",
+            ClearVideoMediaMemory => "ClearVideoMediaMemory",
+            ClearBookResumePositions => "ClearBookResumePositions",
+            UndoLastAction => "UndoLastAction",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
@@ -4265,6 +4334,8 @@ impl KeyAction {
             FsJumpLast => "FsJumpLast",
             FsCtrlNavPrev => "FsCtrlNavPrev",
             FsCtrlNavNext => "FsCtrlNavNext",
+            FsListOrderPrev => "FsListOrderPrev",
+            FsListOrderNext => "FsListOrderNext",
             FsSiblingPrev => "FsSiblingPrev",
             FsSiblingNext => "FsSiblingNext",
             FsPagePrev => "FsPagePrev",
@@ -4291,6 +4362,14 @@ impl KeyAction {
             RatingContainerClear => "RatingContainerClear",
             RatingContainerStepUp => "RatingContainerStepUp",
             RatingContainerStepDown => "RatingContainerStepDown",
+            RatingBookPreferred1 => "RatingBookPreferred1",
+            RatingBookPreferred2 => "RatingBookPreferred2",
+            RatingBookPreferred3 => "RatingBookPreferred3",
+            RatingBookPreferred4 => "RatingBookPreferred4",
+            RatingBookPreferred5 => "RatingBookPreferred5",
+            RatingBookPreferredClear => "RatingBookPreferredClear",
+            RatingBookPreferredStepUp => "RatingBookPreferredStepUp",
+            RatingBookPreferredStepDown => "RatingBookPreferredStepDown",
             FsContinuousScrollForward => "FsContinuousScrollForward",
             FsContinuousScrollBack => "FsContinuousScrollBack",
             FsSpreadShiftLeft => "FsSpreadShiftLeft",
@@ -4317,6 +4396,7 @@ impl KeyAction {
             FsPanorama => "FsPanorama",
             FsPanoramaProjection => "FsPanoramaProjection",
             FsNavigatorToggle => "FsNavigatorToggle",
+            FsPageTurnAnimationToggle => "FsPageTurnAnimationToggle",
             FsNavigatorHold => "FsNavigatorHold",
             FsPixelGrid => "FsPixelGrid",
             FsLoupeLockToggle => "FsLoupeLockToggle",
@@ -4331,6 +4411,8 @@ impl KeyAction {
             FsBgCycle => "FsBgCycle",
             FsPin => "FsPin",
             FsSpreadSingle => "FsSpreadSingle",
+            FsViewSpread => "FsViewSpread",
+            FsViewLandscapeSplit => "FsViewLandscapeSplit",
             FsSpreadLtr => "FsSpreadLtr",
             FsSpreadLtrCover => "FsSpreadLtrCover",
             FsSpreadRtl => "FsSpreadRtl",
@@ -4735,6 +4817,9 @@ impl KeyAction {
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
             ToggleAlwaysOnTop => "常に最前面を切り替える",
+            ClearVideoMediaMemory => "再生位置・視聴済み記録と音声トラックの選択をすべてクリア",
+            ClearBookResumePositions => "本の読書位置をすべてクリア",
+            UndoLastAction => "直前の操作を元に戻す",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
@@ -5004,6 +5089,8 @@ impl KeyAction {
             FsJumpLast => "末尾の項目へ移動する",
             FsCtrlNavPrev => "前のフォルダまたは検索結果へ移動する",
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
+            FsListOrderPrev => "一覧の表示順で前の本を開く",
+            FsListOrderNext => "一覧の表示順で次の本を開く",
             FsSiblingPrev => "前の兄弟フォルダへ移動する",
             FsSiblingNext => "次の兄弟フォルダへ移動する",
             FsPagePrev => "前のページへ移動する",
@@ -5030,6 +5117,14 @@ impl KeyAction {
             RatingContainerClear => "レーティングを解除する（コンテナ）",
             RatingContainerStepUp => "評価を1段階上げる（コンテナ）",
             RatingContainerStepDown => "評価を1段階下げる（コンテナ）",
+            RatingBookPreferred1 => "星1を付ける（本を優先）",
+            RatingBookPreferred2 => "星2を付ける（本を優先）",
+            RatingBookPreferred3 => "星3を付ける（本を優先）",
+            RatingBookPreferred4 => "星4を付ける（本を優先）",
+            RatingBookPreferred5 => "星5を付ける（本を優先）",
+            RatingBookPreferredClear => "レーティングを解除する（本を優先）",
+            RatingBookPreferredStepUp => "評価を1段階上げる（本を優先）",
+            RatingBookPreferredStepDown => "評価を1段階下げる（本を優先）",
             FsContinuousScrollForward => "連結表示中に次の画面分へスクロールする",
             FsContinuousScrollBack => "連結表示中に前の画面分へスクロールする",
             FsSpreadShiftLeft => "見開き表示を左方向へ1ページずらす",
@@ -5056,6 +5151,7 @@ impl KeyAction {
             FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
+            FsPageTurnAnimationToggle => "ページめくりアニメーションを切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
             FsPixelGrid => "ピクセルグリッド表示を切り替える",
             FsLoupeLockToggle => "ルーペの固定表示を切り替える",
@@ -5070,6 +5166,8 @@ impl KeyAction {
             FsBgCycle => "透過背景色を切り替える",
             FsPin => "現在の項目を代表サムネイルに固定または解除する",
             FsSpreadSingle => "単ページ表示に切り替える",
+            FsViewSpread => "本の読む方向で見開き表示に切り替える",
+            FsViewLandscapeSplit => "本の読む方向で横長ページを分割表示する",
             FsSpreadLtr => "左開き見開き表示に切り替える",
             FsSpreadLtrCover => "左開き表紙単独の見開き表示に切り替える",
             FsSpreadRtl => "右開き見開き表示に切り替える",
@@ -5301,6 +5399,9 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
+            | ClearVideoMediaMemory
+            | ClearBookResumePositions
+            | UndoLastAction
             | HelpShowContextShortcuts => KeyContext::Global,
             GlobalEverythingSearch
             | GridFavoritePrev
@@ -5546,8 +5647,10 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
             FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
-            | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext | FsPanorama
-            | FsPanoramaProjection | FsPageOverviewToggle => KeyContext::FsCommon,
+            | FsCtrlNavPrev | FsCtrlNavNext | FsListOrderPrev | FsListOrderNext | FsSiblingPrev
+            | FsSiblingNext | FsPanorama | FsPanoramaProjection | FsPageOverviewToggle => {
+                KeyContext::FsCommon
+            }
             FsPageOverviewConfirm
             | FsPageOverviewPagePrev
             | FsPageOverviewPageNext
@@ -5570,7 +5673,15 @@ impl KeyAction {
             | RatingContainer5
             | RatingContainerClear
             | RatingContainerStepUp
-            | RatingContainerStepDown => KeyContext::Rating,
+            | RatingContainerStepDown
+            | RatingBookPreferred1
+            | RatingBookPreferred2
+            | RatingBookPreferred3
+            | RatingBookPreferred4
+            | RatingBookPreferred5
+            | RatingBookPreferredClear
+            | RatingBookPreferredStepUp
+            | RatingBookPreferredStepDown => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsClose
@@ -5604,6 +5715,7 @@ impl KeyAction {
             | FsImageAnalysis
             | FsZoomMode
             | FsNavigatorToggle
+            | FsPageTurnAnimationToggle
             | FsNavigatorHold
             | FsPixelGrid
             | FsLoupeLockToggle
@@ -5618,6 +5730,8 @@ impl KeyAction {
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
+            | FsViewSpread
+            | FsViewLandscapeSplit
             | FsSpreadLtr
             | FsSpreadLtrCover
             | FsSpreadRtl
@@ -5813,6 +5927,9 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
+            | ClearVideoMediaMemory
+            | ClearBookResumePositions
+            | UndoLastAction
             | HelpShowContextShortcuts
             | GlobalEverythingSearch
             | GridFavoritePrev
@@ -6073,6 +6190,8 @@ impl KeyAction {
             | FsJumpLast
             | FsCtrlNavPrev
             | FsCtrlNavNext
+            | FsListOrderPrev
+            | FsListOrderNext
             | FsSiblingPrev
             | FsSiblingNext
             | FsPagePrev
@@ -6099,6 +6218,14 @@ impl KeyAction {
             | RatingContainerClear
             | RatingContainerStepUp
             | RatingContainerStepDown
+            | RatingBookPreferred1
+            | RatingBookPreferred2
+            | RatingBookPreferred3
+            | RatingBookPreferred4
+            | RatingBookPreferred5
+            | RatingBookPreferredClear
+            | RatingBookPreferredStepUp
+            | RatingBookPreferredStepDown
             | FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
@@ -6124,6 +6251,7 @@ impl KeyAction {
             | FsPanorama
             | FsPanoramaProjection
             | FsNavigatorToggle
+            | FsPageTurnAnimationToggle
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsEraseMode
@@ -6135,6 +6263,8 @@ impl KeyAction {
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
+            | FsViewSpread
+            | FsViewLandscapeSplit
             | FsSpreadLtr
             | FsSpreadLtrCover
             | FsSpreadRtl
@@ -6344,14 +6474,13 @@ impl KeyAction {
     }
 
     /// Actions whose repeated physical presses are safe and meaningful as
-    /// cumulative steps opt in here. Toggles, dialogs, destructive operations,
+    /// steps opt in here. Toggles, dialogs, destructive operations,
     /// and other one-shot commands remain single-dispatch by default.
     pub fn press_multiplicity(self) -> PressMultiplicity {
         use KeyAction::*;
         match self {
-            FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
-                PressMultiplicity::EachPhysicalPress
-            }
+            FsCtrlNavPrev | FsCtrlNavNext | FsListOrderPrev | FsListOrderNext | FsSiblingPrev
+            | FsSiblingNext => PressMultiplicity::EachPhysicalPress,
             _ => PressMultiplicity::SinglePerFrame,
         }
     }
@@ -6366,7 +6495,10 @@ impl KeyAction {
             GlobalEverythingSearch => ChordList::one(Chord::ctrl(R)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
-            ToggleAlwaysOnTop => ChordList::EMPTY,
+            ToggleAlwaysOnTop | ClearVideoMediaMemory | ClearBookResumePositions => {
+                ChordList::EMPTY
+            }
+            UndoLastAction => ChordList::one(Chord::ctrl(Z)),
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
             | GridFavoriteNext
@@ -6621,6 +6753,8 @@ impl KeyAction {
             FsJumpLast => ChordList::one(Chord::key(End)),
             FsCtrlNavPrev => ChordList::one(Chord::ctrl(Up)),
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
+            FsListOrderPrev => ChordList::one(Chord::ctrl_shift(Up)),
+            FsListOrderNext => ChordList::one(Chord::ctrl_shift(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
             FsSiblingNext => ChordList::one(Chord::ctrl(PageDown)),
             FsPagePrev | FsPageNext => ChordList::EMPTY,
@@ -6644,6 +6778,14 @@ impl KeyAction {
             RatingContainer5 => ChordList::one(Chord::shift(F5)),
             RatingContainerClear => ChordList::one(Chord::shift(F6)),
             RatingContainerStepUp | RatingContainerStepDown => ChordList::EMPTY,
+            RatingBookPreferred1
+            | RatingBookPreferred2
+            | RatingBookPreferred3
+            | RatingBookPreferred4
+            | RatingBookPreferred5
+            | RatingBookPreferredClear
+            | RatingBookPreferredStepUp
+            | RatingBookPreferredStepDown => ChordList::EMPTY,
             FsContinuousScrollForward => ChordList::one(Chord::key(PageDown)),
             FsContinuousScrollBack => ChordList::one(Chord::key(PageUp)),
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
@@ -6671,6 +6813,7 @@ impl KeyAction {
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
+            FsPageTurnAnimationToggle => ChordList::EMPTY,
             FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
             FsPixelGrid => ChordList::one(Chord::key(G)),
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
@@ -6685,6 +6828,7 @@ impl KeyAction {
             FsBgCycle => ChordList::one(Chord::shift(B)),
             FsPin => ChordList::one(Chord::key(P)),
             FsSpreadSingle => digit_pair(Num1, Numpad1),
+            FsViewSpread | FsViewLandscapeSplit => ChordList::EMPTY,
             FsSpreadLtr => digit_pair(Num2, Numpad2),
             FsSpreadLtrCover => digit_pair(Num3, Numpad3),
             FsSpreadRtl => digit_pair(Num4, Numpad4),
@@ -6932,6 +7076,7 @@ pub(crate) enum PageTurnPressKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PageTurnKeyInput {
+    pub operation_id: crate::key_input::KeyOperationId,
     pub kind: PageTurnPressKind,
     pub chord: Chord,
     pub still_held: bool,
@@ -6956,7 +7101,7 @@ struct PageTurnEdgeHold {
 }
 
 fn page_turn_edge_hold_id(viewport: egui::ViewportId) -> egui::Id {
-    egui::Id::new(("page_turn_edge_hold", viewport))
+    egui::Id::unique(("page_turn_edge_hold", viewport))
 }
 
 /// Leave the edge's own answer to "is the key still down" where the rest of the pass can find it.
@@ -7056,7 +7201,7 @@ enum IniTemplateKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RatingKey {
-    pub container: bool,
+    pub family: RatingTargetFamily,
     pub edit: RatingEdit,
 }
 
@@ -7137,7 +7282,10 @@ fn native_video_shortcut_action(action: KeyAction) -> bool {
             KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
         ) || matches!(
             action,
-            KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+            KeyAction::ToggleDetachedViewerMode
+                | KeyAction::ToggleAlwaysOnTop
+                | KeyAction::ClearVideoMediaMemory
+                | KeyAction::ClearBookResumePositions
         ))
 }
 
@@ -7843,7 +7991,7 @@ impl Keymap {
     }
 
     pub fn rating_key_action(container: bool, stars: u8) -> Option<KeyAction> {
-        rating_actions(container)
+        rating_actions(display_rating_family(container))
             .iter()
             .copied()
             .find_map(|(action, action_stars)| (action_stars == stars).then_some(action))
@@ -7854,7 +8002,7 @@ impl Keymap {
     }
 
     pub fn rating_chord_summary_label(&self, container: bool) -> Option<String> {
-        let labels = rating_actions(container)
+        let labels = rating_actions(display_rating_family(container))
             .iter()
             .copied()
             .filter_map(|(action, stars)| {
@@ -7913,9 +8061,9 @@ impl Keymap {
     pub fn consume_rating_action(
         &self,
         ctx: &egui::Context,
-        container: bool,
+        family: RatingTargetFamily,
     ) -> Option<RatingEdit> {
-        rating_actions(container)
+        rating_actions(family)
             .iter()
             .copied()
             .find_map(|(action, stars)| {
@@ -7923,7 +8071,7 @@ impl Keymap {
                     .then_some(RatingEdit::Assign(stars))
             })
             .or_else(|| {
-                rating_step_actions(container)
+                rating_step_actions(family)
                     .into_iter()
                     .find_map(|(action, direction)| {
                         self.consume_action(ctx, action)
@@ -7940,19 +8088,23 @@ impl Keymap {
         if key.repeat {
             return None;
         }
-        for container in [true, false] {
-            for (action, stars) in rating_actions(container).iter().copied() {
+        for family in [
+            RatingTargetFamily::Container,
+            RatingTargetFamily::Item,
+            RatingTargetFamily::BookPreferred,
+        ] {
+            for (action, stars) in rating_actions(family).iter().copied() {
                 if self.matches_vk_action(action, key) {
                     return Some(RatingKey {
-                        container,
+                        family,
                         edit: RatingEdit::Assign(stars),
                     });
                 }
             }
-            for (action, direction) in rating_step_actions(container) {
+            for (action, direction) in rating_step_actions(family) {
                 if self.matches_vk_action(action, key) {
                     return Some(RatingKey {
-                        container,
+                        family,
                         edit: RatingEdit::Step(direction),
                     });
                 }
@@ -8080,6 +8232,13 @@ impl Keymap {
         if outcome == "no_match" {
             return;
         }
+        let operation_id = match result {
+            PageTurnConsumeResult::Trigger(input)
+            | PageTurnConsumeResult::DroppedReleasedRepeat(input) => {
+                format!("Key({:?})", input.operation_id).into()
+            }
+            _ => serde_json::Value::Null,
+        };
         crate::perf::event(
             "input",
             "page_turn_consume",
@@ -8088,6 +8247,7 @@ impl Keymap {
             &[
                 ("action", serde_json::Value::from(action.ini_name())),
                 ("outcome", serde_json::Value::from(outcome)),
+                ("operation_id", operation_id),
                 (
                     "kind",
                     match kind {
@@ -8802,6 +8962,9 @@ impl Keymap {
                 let os_held = self.page_turn_chord_held(ctx, level_permit, chord);
                 let still_held = !edges.released_after_match && os_held;
                 let result = Self::classify_page_turn_input(PageTurnKeyInput {
+                    operation_id: edges
+                        .operation_id
+                        .expect("matching press has ingress identity"),
                     kind,
                     chord,
                     still_held,
@@ -8898,7 +9061,15 @@ impl Keymap {
         };
         let os_held = self.page_turn_chord_held(ctx, level_permit, chord);
         let still_held = !released_after_match && os_held;
+        let operation_id = crate::key_input::egui_operation_key_id(ctx, viewport, |edge| {
+            let crate::key_input::KeyOperationEdge::Egui { key, modifiers, .. } = edge else {
+                return false;
+            };
+            chord.matches_egui(key, modifiers)
+        })
+        .expect("matching egui press has ingress identity");
         let result = Self::classify_page_turn_input(PageTurnKeyInput {
+            operation_id,
             kind,
             chord,
             still_held,
@@ -9386,9 +9557,13 @@ impl Keymap {
     /// KeyHold actions. This is evidence-only: it does not consume input or
     /// alter routing.
     #[cfg(all(windows, feature = "test-script"))]
-    pub(crate) fn test_script_key_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        crate::keyboard_input::focused_key_state_permit(ctx)
-            .is_some_and(|permit| self.key_held_chord(ctx, permit, chord))
+    pub(crate) fn test_script_key_held_chord(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        chord: Chord,
+    ) -> bool {
+        self.key_held_chord(ctx, permit, chord)
     }
 
     fn modifier_held_chord(
@@ -9916,6 +10091,18 @@ mod tests {
                 "{action:?}"
             );
         }
+        for other in KeyAction::all().iter().copied().filter(|other| {
+            *other != KeyAction::FsPageOverviewToggle
+                && actions_can_overlap(KeyAction::FsPageOverviewToggle, *other)
+        }) {
+            assert!(
+                !other
+                    .default_chords()
+                    .iter()
+                    .any(|chord| chord == Chord::key(KeyName::O)),
+                "the overview O default conflicts with {other:?}"
+            );
+        }
     }
 
     #[test]
@@ -9962,6 +10149,33 @@ mod tests {
                 .iter()
                 .any(|row| row.spec.action == KeyAction::ToggleDetachedViewerMode
                     || row.spec.action == KeyAction::FsCtrlNavPrev)
+        );
+    }
+
+    #[test]
+    fn generic_book_view_actions_are_assignable_without_default_bindings() {
+        let mut settings = KeymapSettings::default();
+        for (action, key) in [
+            (KeyAction::FsViewSpread, KeyName::F13),
+            (KeyAction::FsViewLandscapeSplit, KeyName::F14),
+        ] {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert!(Keymap::default().effective_chords(action).is_empty());
+            assert!(
+                Keymap::default_reference_ini()
+                    .contains(&format!("# {} = none", action.ini_name()))
+            );
+            settings.set_override_chords(action, vec![Chord::key(key)]);
+            assert_eq!(
+                Keymap::from_settings(&settings).effective_chords(action),
+                &[Chord::key(key)]
+            );
+        }
+        assert_eq!(
+            Keymap::default().effective_chords(KeyAction::FsSpreadLtr),
+            &[Chord::key(KeyName::Num2), Chord::key(KeyName::Numpad2)]
         );
     }
 
@@ -10015,6 +10229,15 @@ mod tests {
         ));
         assert!(native_video_shortcut_action(KeyAction::FsToggleWindowMode));
         assert!(native_video_shortcut_action(KeyAction::VideoTileMode));
+        for action in [
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
+        ] {
+            assert!(native_video_shortcut_action(action), "{action:?}");
+            assert!(!page_overview_action_allowed(action), "{action:?}");
+        }
         let keymap = Keymap::empty();
         assert!(
             !keymap
@@ -10079,7 +10302,7 @@ mod tests {
             ),
             None
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         ctx.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::Enter,
@@ -10100,7 +10323,7 @@ mod tests {
             None
         );
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -10138,11 +10361,55 @@ mod tests {
 
     fn begin_key_pass(ctx: &egui::Context, key: egui::Key, modifiers: egui::Modifiers) {
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![key_event(key, modifiers)],
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                key_event(key, modifiers),
+            ],
             ..Default::default()
         });
+        assert_eq!(ctx.input(|input| input.modifiers), modifiers);
+        assert!(ctx.input(|input| matches!(input.events.first(), Some(egui::Event::ModifiersChanged(value)) if *value == modifiers)));
         cache_test_keyboard_owner(ctx);
+    }
+
+    #[test]
+    fn last_action_undo_keeps_redo_and_editor_input_priority() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        begin_key_pass(
+            &ctx,
+            egui::Key::Z,
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(keymap.consume_fixed_chord(&ctx, Chord::ctrl_shift(KeyName::Z)));
+        assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
+        ctx.end_pass().drop_without_applying_deltas();
+
+        for editor in [
+            KeyAction::EraseUndo,
+            KeyAction::ConcealUndo,
+            KeyAction::TextUndo,
+        ] {
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::CTRL);
+            assert!(keymap.consume_action(&ctx, editor));
+            assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+        let rebound = Keymap::from_ini_str("[Global]\nUndoLastAction = F16\n");
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(rebound.consume_action(&ctx, KeyAction::UndoLastAction));
+        assert!(!rebound.consume_action(&ctx, KeyAction::UndoLastAction));
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -10169,8 +10436,15 @@ mod tests {
                 !keymap.consume_action(&ctx, undo),
                 "Ctrl+Shift+Z must not fall through to {undo:?}"
             );
-            assert_eq!(ctx.input(|input| input.events.len()), 0);
-            let _ = ctx.end_pass();
+            assert_eq!(
+                ctx.input(|input| input
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, egui::Event::Key { .. }))
+                    .count()),
+                0
+            );
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
@@ -10183,7 +10457,7 @@ mod tests {
                 modal: false,
                 text_input: None,
                 focused_ui: ctx
-                    .wants_keyboard_input()
+                    .egui_wants_keyboard_input()
                     .then_some(focused_widget.unwrap_or(egui::Id::NULL)),
                 shortcut_scope: Some(crate::keyboard_input::ShortcutScope::new(
                     ctx.viewport_id(),
@@ -10195,15 +10469,18 @@ mod tests {
     }
 
     fn draw_test_focusable(ctx: &egui::Context, id: &'static str) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
-            let _ = ui.interact(rect, egui::Id::new(id), egui::Sense::click_and_drag());
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+                let _ = ui.interact(rect, egui::Id::unique(id), egui::Sense::click_and_drag());
+            })
         });
     }
 
     #[cfg(windows)]
     fn tab_edge(repeat: bool) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x09,
@@ -10231,6 +10508,7 @@ mod tests {
         repeat: bool,
     ) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key,
@@ -10369,6 +10647,7 @@ mod tests {
         crate::key_input::set_test_frame_for_viewport(
             fullscreen_viewport,
             vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 2,
                 source_viewport: fullscreen_viewport,
                 virtual_key: 0x0D,
@@ -10384,7 +10663,7 @@ mod tests {
         crate::key_input::add_test_frame_active_viewport(main_viewport);
 
         let close = keymap.consume_action(&ctx, KeyAction::FsClose);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             !close,
@@ -10412,6 +10691,7 @@ mod tests {
         let ctx = egui::Context::default();
         let viewport = ctx.viewport_id();
         let numpad_press = crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: viewport,
             virtual_key: 0x0D,
@@ -10434,7 +10714,7 @@ mod tests {
 
         let hold = keymap.take_key_hold_edges(&ctx, KeyAction::FsZoomMode);
         let close = keymap.consume_action(&ctx, KeyAction::FsClose);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(hold, (true, false), "テンキー Enter で hold の押下が立つ");
         assert!(!close, "同じ押下で Enter 割り当ての FsClose を発火させない");
@@ -11180,6 +11460,26 @@ mod tests {
     }
 
     #[test]
+    fn last_action_undo_is_registered_and_customizable() {
+        let action = KeyAction::UndoLastAction;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::Global);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            vec![Chord::ctrl(KeyName::Z)],
+        );
+        let rebound = Keymap::from_ini_str("[Global]\nUndoLastAction = F16\n");
+        assert_eq!(
+            rebound.effective_chords(action),
+            vec![Chord::key(KeyName::F16)]
+        );
+        let disabled = Keymap::from_ini_str("[Global]\nUndoLastAction = none\n");
+        assert!(disabled.effective_chords(action).is_empty());
+    }
+
+    #[test]
     fn command_catalog_has_one_spec_per_key_action() {
         let specs: Vec<CommandSpec> = command_catalog().collect();
         assert_eq!(specs.len(), KeyAction::all().len());
@@ -11501,7 +11801,7 @@ mod tests {
         let default = Keymap::empty();
         begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
         assert!(!default.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let rebound = Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
         assert!(rebound.warnings().is_empty());
@@ -11513,7 +11813,7 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
         assert!(rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
         assert!(!rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let key = crate::video::native_window::NativeVideoKeyEvent {
             receipt: crate::mouse_seek_debug::test_receipt(1),
@@ -11826,6 +12126,8 @@ mod tests {
             KeyAction::FsToggleWindowMode,
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -11853,6 +12155,8 @@ mod tests {
             KeyAction::FsToggleWindowMode,
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -12933,6 +13237,34 @@ mod tests {
     }
 
     #[test]
+    fn page_turn_animation_toggle_is_unbound_image_fullscreen_press() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let action = KeyAction::FsPageTurnAnimationToggle;
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(action.default_chords().iter().count(), 0);
+        let keymap = Keymap::from_ini_str("[FsImage]\nFsPageTurnAnimationToggle = Ctrl+Shift+A\n");
+        assert_eq!(keymap.effective_chords(action).iter().count(), 1);
+        let ctx = egui::Context::default();
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        begin_key_pass(&ctx, egui::Key::A, modifiers);
+        assert!(!Keymap::default().consume_action(&ctx, action));
+        assert!(keymap.consume_action(&ctx, action));
+        assert!(
+            !keymap.consume_action(&ctx, action),
+            "one press cannot toggle twice"
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
     fn navigator_hold_uses_alt_modifier_hold_in_image_fullscreen() {
         let navigator_hold = KeyAction::FsNavigatorHold;
         assert_eq!(navigator_hold.context(), KeyContext::FsImage);
@@ -13018,10 +13350,12 @@ mod tests {
     }
 
     #[test]
-    fn press_multiplicity_selects_only_cumulative_fullscreen_folder_navigation() {
+    fn press_multiplicity_selects_fullscreen_folder_navigation_physical_presses() {
         for action in [
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -13046,6 +13380,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn list_order_navigation_defaults_are_distinct_shared_press_actions() {
+        let keymap = Keymap::empty();
+        for (action, key) in [
+            (KeyAction::FsListOrderPrev, KeyName::Up),
+            (KeyAction::FsListOrderNext, KeyName::Down),
+        ] {
+            let chord = Chord::ctrl_shift(key);
+            assert_eq!(action.context(), KeyContext::FsCommon);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                vec![chord]
+            );
+            assert!(ALL_ACTIONS.contains(&action));
+            for scopes in [FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES] {
+                assert_eq!(
+                    keymap.resolve_first_action_for_chord(chord, scopes, ALL_ACTIONS),
+                    Some(action)
+                );
+            }
+            assert_eq!(
+                keymap.resolve_first_action_for_chord(chord, GRID_ACTIVE_SCOPES, ALL_ACTIONS),
+                None
+            );
+            assert!(
+                !KeyAction::FsCtrlNavPrev
+                    .default_chords()
+                    .iter()
+                    .any(|c| c == chord)
+            );
+            assert!(
+                !KeyAction::FsCtrlNavNext
+                    .default_chords()
+                    .iter()
+                    .any(|c| c == chord)
+            );
+        }
+        let keymap =
+            Keymap::from_ini_str("[FsCommon]\nFsListOrderPrev = F16\nFsListOrderNext = F17\n");
+        for (action, key) in [
+            (KeyAction::FsListOrderPrev, KeyName::F16),
+            (KeyAction::FsListOrderNext, KeyName::F17),
+        ] {
+            assert_eq!(
+                keymap.resolve_first_action_for_chord(
+                    Chord::key(key),
+                    FS_VIDEO_ACTIVE_SCOPES,
+                    ALL_ACTIONS
+                ),
+                Some(action)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_navigation_counts_physical_presses_and_coalesces_repeat_like_ctrl_nav() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        for (repeats, expected) in [(vec![false, false, true], 2), (vec![true, true], 1)] {
+            ctx.begin_pass(Default::default());
+            cache_test_keyboard_owner(&ctx);
+            crate::key_input::set_test_frame(
+                repeats
+                    .iter()
+                    .map(|&repeat| {
+                        let mut edge = ctrl_down_edge(repeat);
+                        edge.shift = true;
+                        edge
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsListOrderNext),
+                expected
+            );
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+                0
+            );
+            crate::key_input::set_test_frame(repeats.into_iter().map(ctrl_down_edge).collect());
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+                expected,
+                "ListOrder and Ctrl navigation share the same physical-press/repeat policy"
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn counted_action_consumes_two_same_frame_physical_presses() {
@@ -13065,7 +13492,7 @@ mod tests {
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x28
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13087,7 +13514,7 @@ mod tests {
             keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
             3
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13109,7 +13536,7 @@ mod tests {
             keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
             1
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13119,6 +13546,57 @@ mod tests {
             .overrides
             .insert(KeyAction::FsPageNext, vec![Chord::key(KeyName::Right)]);
         keymap
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_egui_operation_id_survives_repeat_normalization_on_replay() {
+        struct ReplayedPress;
+        impl egui::Plugin for ReplayedPress {
+            fn debug_name(&self) -> &'static str {
+                "replayed_page_press"
+            }
+            fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: Some(egui::Key::ArrowRight),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        let _serial = crate::key_input::lock_test_input();
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        ctx.add_plugin(ReplayedPress);
+        crate::key_input::install_operation_input_plugin(&ctx);
+        let mut identities = Vec::new();
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            cache_test_keyboard_owner(ctx);
+            let result = keymap.consume_page_turn_action(ctx, None, KeyAction::FsPageNext);
+            let input = match result {
+                PageTurnConsumeResult::Trigger(input) if ctx.current_pass_index() == 0 => input,
+                PageTurnConsumeResult::DroppedReleasedRepeat(input)
+                    if ctx.current_pass_index() > 0 =>
+                {
+                    input
+                }
+                unexpected => panic!("unexpected replay result: {unexpected:?}"),
+            };
+            // The OFF plugin performs no eager observation. The actual
+            // matched fallback consumer creates generic provenance lazily.
+            let snapshot = crate::key_input::egui_operation_key_edges(ctx, ctx.viewport_id());
+            assert_eq!(input.operation_id, snapshot[0].operation_id());
+            identities.push(input.operation_id);
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("page turn id replay");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0], identities[1]);
     }
 
     #[cfg(windows)]
@@ -13177,13 +13655,15 @@ mod tests {
         assert_eq!(
             keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13202,13 +13682,15 @@ mod tests {
         assert_eq!(
             keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
             PageTurnConsumeResult::DroppedReleasedRepeat(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13230,7 +13712,7 @@ mod tests {
             keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
             PageTurnConsumeResult::NoMatch
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13254,13 +13736,15 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
                 still_held: true,
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13284,13 +13768,15 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
                 still_held: true,
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13314,6 +13800,8 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::DroppedReleasedRepeat(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
@@ -13321,7 +13809,7 @@ mod tests {
             })
         );
         assert!(!crate::key_input::pressed_key_down(viewport, |_| true));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13345,13 +13833,15 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13367,7 +13857,7 @@ mod tests {
 
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13388,7 +13878,7 @@ mod tests {
             keymap.consume_action_press_count(&ctx, KeyAction::FsSlideshow),
             1
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13414,9 +13904,14 @@ mod tests {
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::S, egui::Modifiers::SHIFT);
         assert!(!keymap.consume_action(&ctx, KeyAction::FsSlideshow));
-        let remaining = ctx.input(|i| i.events.len());
+        let remaining = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()
+        });
         assert_eq!(remaining, 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13428,20 +13923,28 @@ mod tests {
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_fallback_text");
+        let text_id = egui::Id::unique("keymap_owned_fallback_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13451,26 +13954,34 @@ mod tests {
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_win32_text");
+        let text_id = egui::Id::unique("keymap_owned_win32_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x54, 0x14)]);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(keymap.diagnostic_peek_action_press(&ctx, KeyAction::FsPostFilterNext));
         assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         assert!(crate::key_input::pressed_key_down(
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x54
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13499,7 +14010,7 @@ mod tests {
         assert!(crate::key_input::consume_key_down(sibling, true, |edge| {
             edge.virtual_key == 0x5A
         }));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13513,10 +14024,15 @@ mod tests {
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
 
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
         assert!(keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
-        assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        assert!(ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .all(|event| !matches!(event, egui::Event::Key { .. }))
+        }));
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13528,20 +14044,28 @@ mod tests {
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_pressed_text");
+        let text_id = egui::Id::unique("keymap_owned_pressed_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(!keymap.pressed_action(&ctx, KeyAction::FsPostFilterNext));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13553,23 +14077,31 @@ mod tests {
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_hold_text");
+        let text_id = egui::Id::unique("keymap_owned_hold_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::NONE);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert_eq!(
             keymap.take_key_hold_edges(&ctx, KeyAction::FsZoomMode),
             (false, false)
         );
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
+        ctx.end_pass().drop_without_applying_deltas();
     }
     #[cfg(windows)]
     #[test]
@@ -13595,11 +14127,15 @@ mod tests {
         crate::key_input::set_test_frame(vec![tab_edge(false), tab_edge(true)]);
 
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert!(ctx.input(|i| i.events.is_empty()));
+        assert!(ctx.input(|i| {
+            i.events
+                .iter()
+                .all(|event| !matches!(event, egui::Event::Key { .. }))
+        }));
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         draw_test_focusable(&ctx, "tab_claim_surface");
-        let _ = ctx.end_pass();
-        assert!(!ctx.wants_keyboard_input());
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(!ctx.egui_wants_keyboard_input());
 
         ctx.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {
@@ -13614,10 +14150,14 @@ mod tests {
         cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(true)]);
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert!(ctx.input(|i| i.events.is_empty()));
+        assert!(ctx.input(|i| {
+            i.events
+                .iter()
+                .all(|event| !matches!(event, egui::Event::Key { .. }))
+        }));
         draw_test_focusable(&ctx, "tab_repeat_claim_surface");
-        let _ = ctx.end_pass();
-        assert!(!ctx.wants_keyboard_input());
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[cfg(windows)]
@@ -13633,26 +14173,26 @@ mod tests {
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         draw_test_focusable(&ctx, "tab_then_shortcuts_surface");
-        let _ = ctx.end_pass();
-        assert!(!ctx.wants_keyboard_input());
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(!ctx.egui_wants_keyboard_input());
 
         begin_key_pass(&ctx, egui::Key::I, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x49, 0x17)]);
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x71, 0x3c)]);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, false),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
             Some(RatingEdit::Assign(2))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::Home, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x24, 0x47)]);
         assert!(keymap.consume_action(&ctx, KeyAction::FsJumpFirst));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13671,11 +14211,18 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::Tab, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         assert!(keymap.consume_action(&ctx, KeyAction::FsSlideshow));
         draw_test_focusable(&ctx, "reassigned_tab_surface");
-        let _ = ctx.end_pass();
-        assert!(!ctx.wants_keyboard_input());
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[cfg(windows)]
@@ -13686,36 +14233,48 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
-        let first_id = egui::Id::new("keymap_tab_first_text");
-        let second_id = egui::Id::new("keymap_tab_second_text");
+        let first_id = egui::Id::unique("keymap_tab_first_text");
+        let second_id = egui::Id::unique("keymap_tab_second_text");
         let mut first = String::new();
         let mut second = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let first_response = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
                 let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
                 first_response.request_focus();
             });
-        });
-        ctx.begin_pass(egui::RawInput {
-            events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
-            ..Default::default()
-        });
-        cache_test_keyboard_owner(&ctx);
-        crate::key_input::set_test_frame(vec![tab_edge(false)]);
-
-        assert!(ctx.wants_keyboard_input());
-        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert_eq!(ctx.input(|i| i.events.len()), 1);
-        assert!(crate::key_input::pressed_key_down(
-            ctx.viewport_id(),
-            |edge| edge.virtual_key == 0x09
-        ));
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
-            let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
-        });
-        let _ = ctx.end_pass();
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |root_ui| {
+                // The focus-policy plugin runs at the real Ui begin-pass boundary.
+                cache_test_keyboard_owner(&ctx);
+                crate::key_input::set_test_frame(vec![tab_edge(false)]);
+                assert!(ctx.egui_wants_keyboard_input());
+                assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+                assert_eq!(
+                    ctx.input(|i| i
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event, egui::Event::Key { .. }))
+                        .count()),
+                    1
+                );
+                assert!(crate::key_input::pressed_key_down(
+                    ctx.viewport_id(),
+                    |edge| edge.virtual_key == 0x09
+                ));
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
+                    let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
+                });
+            },
+        )
+        .drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 
@@ -13727,21 +14286,43 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
-        let focused_id = egui::Id::new("modal_focus_surface");
-        ctx.memory_mut(|memory| memory.request_focus(focused_id));
-        ctx.begin_pass(egui::RawInput {
-            events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
-            ..Default::default()
-        });
-        cache_test_keyboard_owner(&ctx);
-        crate::key_input::set_test_frame(vec![tab_edge(false)]);
+        let focused_id = egui::Id::unique("modal_focus_surface");
+        ctx.run_ui(Default::default(), |root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+                ui.interact(rect, focused_id, egui::Sense::click_and_drag())
+                    .request_focus();
+            });
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(focused_id));
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |root_ui| {
+                cache_test_keyboard_owner(&ctx);
+                crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
-        assert!(ctx.wants_keyboard_input());
-        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
-        draw_test_focusable(&ctx, "modal_focus_surface");
-        let _ = ctx.end_pass();
-        assert!(ctx.wants_keyboard_input());
+                assert!(ctx.egui_wants_keyboard_input());
+                assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+                assert_eq!(
+                    ctx.input(|input| input
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event, egui::Event::Key { .. }))
+                        .count()),
+                    1
+                );
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+                    let _ = ui.interact(rect, focused_id, egui::Sense::click_and_drag());
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(ctx.egui_wants_keyboard_input());
     }
 
     #[test]
@@ -13772,6 +14353,216 @@ mod tests {
         }
     }
 
+    fn book_preferred_rating_actions() -> [KeyAction; 8] {
+        [
+            KeyAction::RatingBookPreferred1,
+            KeyAction::RatingBookPreferred2,
+            KeyAction::RatingBookPreferred3,
+            KeyAction::RatingBookPreferred4,
+            KeyAction::RatingBookPreferred5,
+            KeyAction::RatingBookPreferredClear,
+            KeyAction::RatingBookPreferredStepUp,
+            KeyAction::RatingBookPreferredStepDown,
+        ]
+    }
+
+    #[test]
+    fn book_preferred_rating_catalog_and_ini_settings_roundtrip() {
+        let mut ini = String::from("[Rating]\n");
+        for (offset, action) in book_preferred_rating_actions().into_iter().enumerate() {
+            assert_eq!(
+                KeyAction::all()
+                    .iter()
+                    .filter(|candidate| **candidate == action)
+                    .count(),
+                1
+            );
+            assert_eq!(action.context(), KeyContext::Rating);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert!(action.description().ends_with("（本を優先）"));
+            assert!(!action.description().contains(' '));
+            assert!(Keymap::default_reference_ini().contains(&format!(
+                "# {} = none ; {}\n",
+                action.ini_name(),
+                action.description()
+            )));
+            ini.push_str(&format!("{} = F{}\n", action.ini_name(), offset + 13));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        assert_eq!(settings.overrides.len(), 8);
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&encoded).unwrap());
+        for (offset, action) in book_preferred_rating_actions().into_iter().enumerate() {
+            let expected = vec![Chord::key(
+                [
+                    KeyName::F13,
+                    KeyName::F14,
+                    KeyName::F15,
+                    KeyName::F16,
+                    KeyName::F17,
+                    KeyName::F18,
+                    KeyName::F19,
+                    KeyName::F20,
+                ][offset],
+            )];
+            assert_eq!(parsed.effective_chords(action), expected);
+            assert_eq!(restored.effective_chords(action), expected);
+        }
+    }
+
+    #[test]
+    fn rating_existing_defaults_are_unchanged_with_book_preferred_actions() {
+        let keymap = Keymap::empty();
+        for (family, shifted) in [
+            (RatingTargetFamily::Item, false),
+            (RatingTargetFamily::Container, true),
+        ] {
+            for ((action, _), key) in rating_actions(family).iter().zip([
+                KeyName::F1,
+                KeyName::F2,
+                KeyName::F3,
+                KeyName::F4,
+                KeyName::F5,
+                KeyName::F6,
+            ]) {
+                assert_eq!(
+                    keymap.effective_chords(*action),
+                    vec![if shifted {
+                        Chord::shift(key)
+                    } else {
+                        Chord::key(key)
+                    }]
+                );
+            }
+            for (action, _) in rating_step_actions(family) {
+                assert!(keymap.effective_chords(action).is_empty());
+            }
+        }
+        for action in book_preferred_rating_actions() {
+            assert!(keymap.effective_chords(action).is_empty());
+        }
+    }
+
+    #[test]
+    fn book_preferred_rating_consume_respects_family_and_exact_modifiers() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::from_ini_str(
+            "[Rating]\nRatingBookPreferred1 = Ctrl+F13\nRatingBookPreferred2 = Ctrl+F14\n\
+             RatingBookPreferred3 = Ctrl+F15\nRatingBookPreferred4 = Ctrl+F16\n\
+             RatingBookPreferred5 = Ctrl+F17\nRatingBookPreferredClear = Ctrl+F18\n\
+             RatingBookPreferredStepUp = Ctrl+F19\nRatingBookPreferredStepDown = Ctrl+F20\n",
+        );
+        let ctx = egui::Context::default();
+        for (key, edit) in [
+            (egui::Key::F13, RatingEdit::Assign(1)),
+            (egui::Key::F14, RatingEdit::Assign(2)),
+            (egui::Key::F15, RatingEdit::Assign(3)),
+            (egui::Key::F16, RatingEdit::Assign(4)),
+            (egui::Key::F17, RatingEdit::Assign(5)),
+            (egui::Key::F18, RatingEdit::Assign(0)),
+            (egui::Key::F19, RatingEdit::Step(RatingStepDirection::Up)),
+            (egui::Key::F20, RatingEdit::Step(RatingStepDirection::Down)),
+        ] {
+            begin_key_pass(&ctx, key, egui::Modifiers::NONE);
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::BookPreferred),
+                None
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+            begin_key_pass(&ctx, key, egui::Modifiers::CTRL);
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::Container),
+                None
+            );
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
+                None
+            );
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::BookPreferred),
+                Some(edit)
+            );
+            assert_eq!(
+                keymap.consume_rating_action(&ctx, RatingTargetFamily::BookPreferred),
+                None
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn book_preferred_rating_native_family_priority_and_forwarding() {
+        let _guard = crate::key_input::lock_test_input();
+        let mut event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x7c, // F13
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        let keymap = Keymap::from_ini_str(
+            "[Rating]\nRatingBookPreferred3 = F13\nRatingBookPreferredStepDown = F14\n",
+        );
+        keymap.install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&event));
+        assert_eq!(
+            keymap.native_video_rating_action(&event),
+            Some(RatingKey {
+                family: RatingTargetFamily::BookPreferred,
+                edit: RatingEdit::Assign(3),
+            })
+        );
+        event.virtual_key = 0x7d; // F14
+        assert!(native_video_fullscreen_shortcut_key(&event));
+        assert_eq!(
+            keymap.native_video_rating_action(&event),
+            Some(RatingKey {
+                family: RatingTargetFamily::BookPreferred,
+                edit: RatingEdit::Step(RatingStepDirection::Down),
+            })
+        );
+        event.repeat = true;
+        assert_eq!(keymap.native_video_rating_action(&event), None);
+        event.repeat = false;
+        event.virtual_key = 0x7c;
+        for (ini, family) in [
+            (
+                "[Rating]\nRatingContainer2 = F13\nRatingItem2 = F13\nRatingBookPreferred2 = F13\n",
+                RatingTargetFamily::Container,
+            ),
+            (
+                "[Rating]\nRatingItem2 = F13\nRatingBookPreferred2 = F13\n",
+                RatingTargetFamily::Item,
+            ),
+        ] {
+            let keymap = Keymap::from_ini_str(ini);
+            assert!(!keymap.warnings().is_empty()); // Existing duplicate-binding rules remain in force.
+            assert_eq!(
+                keymap.native_video_rating_action(&event),
+                Some(RatingKey {
+                    family,
+                    edit: RatingEdit::Assign(2),
+                })
+            );
+        }
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&event));
+    }
+
     #[test]
     fn rating_actions_are_exact_and_customizable() {
         // consume_action consults the process-global Win32 key frame on Windows;
@@ -13786,13 +14577,23 @@ mod tests {
         let ctx = egui::Context::default();
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::SHIFT);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), None);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, true),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
+            None
+        );
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Container),
             Some(RatingEdit::Assign(2))
         );
-        assert_eq!(ctx.input(|i| i.events.len()), 0);
-        let _ = ctx.end_pass();
+        assert_eq!(
+            ctx.input(|i| i
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            0
+        );
+        ctx.end_pass().drop_without_applying_deltas();
 
         let keymap = Keymap::from_ini_str(
             r#"
@@ -13802,33 +14603,50 @@ mod tests {
         );
         assert!(keymap.warnings().is_empty());
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::NONE);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), None);
-        assert_eq!(ctx.input(|i| i.events.len()), 1);
-        let _ = ctx.end_pass();
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
+            None
+        );
+        assert_eq!(
+            ctx.input(|i| i
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
+        ctx.end_pass().drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, false),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
             Some(RatingEdit::Assign(1))
         );
-        assert_eq!(ctx.input(|i| i.events.len()), 0);
-        let _ = ctx.end_pass();
+        assert_eq!(
+            ctx.input(|i| i
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            0
+        );
+        ctx.end_pass().drop_without_applying_deltas();
 
         let keymap = Keymap::from_ini_str(
             "[Rating]\nRatingItemStepUp = Ctrl+F1\nRatingContainerStepDown = Alt+F2\n",
         );
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, false),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Item),
             Some(RatingEdit::Step(RatingStepDirection::Up))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::ALT);
         assert_eq!(
-            keymap.consume_rating_action(&ctx, true),
+            keymap.consume_rating_action(&ctx, RatingTargetFamily::Container),
             Some(RatingEdit::Step(RatingStepDirection::Down))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -14042,6 +14860,7 @@ mod tests {
     #[test]
     fn key_hold_slot_matching_distinguishes_both_enter_directions() {
         let edge = |extended| crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x0D,
@@ -14847,7 +15666,7 @@ mod tests {
             begin_key_pass(&ctx, egui::Key::F13, egui::Modifiers::NONE);
             assert!(keymap.consume_action_no_repeat(&ctx, action));
             assert!(!keymap.consume_action_no_repeat(&ctx, action));
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
@@ -14965,6 +15784,69 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn saved_position_clear_actions_are_unassigned_global_and_roundtrip_ini_and_settings() {
+        let actions = [
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
+        ];
+        let ini = "[Global]\nClearVideoMediaMemory = F16\nClearBookResumePositions = F17\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&encoded).unwrap());
+        for (action, key) in actions.into_iter().zip([KeyName::F16, KeyName::F17]) {
+            assert!(ALL_ACTIONS.contains(&action));
+            assert_eq!(action.context(), KeyContext::Global);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert!(Keymap::empty().effective_chords(action).is_empty());
+            assert_eq!(restored.effective_chords(action), vec![Chord::key(key)]);
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert!(
+                Keymap::default_reference_ini()
+                    .contains(&format!("# {} = none", action.ini_name()))
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saved_position_clear_bindings_reach_native_forwarding_and_egui_once() {
+        let _guard = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::from_ini_str(
+            "[Global]\nClearVideoMediaMemory = F16\nClearBookResumePositions = F17\n",
+        );
+        keymap.install_global_native_video_shortcuts();
+        for (action, key, vk) in [
+            (KeyAction::ClearVideoMediaMemory, egui::Key::F16, 0x7f),
+            (KeyAction::ClearBookResumePositions, egui::Key::F17, 0x80),
+        ] {
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, key, egui::Modifiers::NONE);
+            assert!(keymap.consume_action_no_repeat(&ctx, action));
+            assert!(!keymap.consume_action_no_repeat(&ctx, action));
+            ctx.end_pass().drop_without_applying_deltas();
+            let native = crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
+                virtual_key: vk,
+                scan_code: 0,
+                extended: false,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                repeat: false,
+            };
+            assert!(native_video_fullscreen_shortcut_key(&native));
+        }
+        Keymap::empty().install_global_native_video_shortcuts();
     }
 
     #[test]

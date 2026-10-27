@@ -10,10 +10,12 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GA_PARENT, GW_OWNER, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow,
-    GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SET_WINDOW_POS_FLAGS,
-    SHOW_WINDOW_CMD, SetForegroundWindow, SetWindowPos, ShowWindow,
+    DestroyWindow, GA_PARENT, GW_OWNER, GetAncestor, GetClassNameW, GetWindow, GetWindowRect,
+    IsWindow, IsWindowVisible, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SetForegroundWindow,
+    SetWindowPos, ShowWindow,
 };
+#[cfg(not(test))]
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransitionTarget {
@@ -448,7 +450,8 @@ pub(crate) fn observe_dwm_cloak(
     );
 }
 
-fn snapshot(hwnd_raw: u64) -> String {
+#[cfg(not(test))]
+fn foreground_snapshot_fields() -> String {
     let foreground = unsafe { GetForegroundWindow() };
     let foreground_raw = foreground.0 as usize as u64;
     let foreground_role = role_for(foreground_raw, WindowRole::Other);
@@ -465,14 +468,28 @@ fn snapshot(hwnd_raw: u64) -> String {
     } else {
         "<ours>".to_owned()
     };
-    let foreground_fields = format!(
+    format!(
         "fg={} fg_role={} fg_pid={} fg_tid={} fg_class={:?}",
         fmt_hwnd(foreground_raw),
         foreground_role.label(),
         foreground_pid,
         foreground_tid,
         foreground_class,
-    );
+    )
+}
+
+#[cfg(test)]
+fn foreground_snapshot_fields() -> String {
+    let foreground = crate::test_native_focus::foreground_hwnd();
+    format!(
+        "fg={} fg_role={} fg_pid=0 fg_tid=0 fg_class=\"<headless>\"",
+        fmt_hwnd(foreground),
+        role_for(foreground, WindowRole::Other).label(),
+    )
+}
+
+fn snapshot(hwnd_raw: u64) -> String {
+    let foreground_fields = foreground_snapshot_fields();
     if hwnd_raw == 0 {
         return format!(
             "alive=false {foreground_fields} visible=false rect=<none> parent=0x0 owner=0x0 cloaked=?"

@@ -183,21 +183,7 @@ impl ExternalToolMenuTarget {
     }
 
     fn add_grid_item(&mut self, item: &crate::grid_item::GridItem) {
-        use crate::grid_item::GridItem;
-        match item {
-            GridItem::Image(_)
-            | GridItem::Video(_)
-            | GridItem::Audio(_)
-            | GridItem::ZipFile(_)
-            | GridItem::PdfFile(_)
-            | GridItem::ConvertibleArchive { .. }
-            | GridItem::Stack { .. } => self.has_target = true,
-            GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
-                self.has_target = true;
-                self.has_virtual_page = true;
-            }
-            _ => self.has_unsupported = true,
-        }
+        self.add_target(&LaunchTarget::from_grid_item(Some(item)));
     }
     /// 解決済み集合からメニューの capability を決める。
     ///
@@ -262,7 +248,8 @@ impl LaunchTarget {
         match item {
             Some(GridItem::Image(path)) => Self::ImagePage(path.clone()),
             Some(
-                GridItem::Video(path)
+                GridItem::Folder(path)
+                | GridItem::Video(path)
                 | GridItem::Audio(path)
                 | GridItem::ZipFile(path)
                 | GridItem::PdfFile(path),
@@ -2716,7 +2703,7 @@ impl crate::app::App {
         let tool = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
             Ok(tool) => tool.clone(),
             Err(error) => {
-                self.show_feedback_toast(error);
+                self.show_feedback_error(error);
                 return;
             }
         };
@@ -3117,7 +3104,7 @@ impl crate::app::App {
             Some(Ok(true)) => match preparing.purpose {
                 ExternalPreparationPurpose::ForPicker(target_kind) => {
                     if self.settings.external_tools.is_empty() {
-                        self.show_feedback_toast("外部ツールが登録されていません".to_string());
+                        self.show_feedback_warning("外部ツールが登録されていません".to_string());
                         return;
                     }
                     self.external_tool_operation =
@@ -3154,13 +3141,13 @@ impl crate::app::App {
                             }
                         }
                         Err(error) => {
-                            self.show_feedback_toast(format!("{}: {error}", tool.display_name()))
+                            self.show_feedback_warning(format!("{}: {error}", tool.display_name()))
                         }
                     }
                 }
             },
-            Some(Err(error)) => self.show_feedback_toast(error),
-            None => self.show_feedback_toast(
+            Some(Err(error)) => self.show_feedback_error(error),
+            None => self.show_feedback_warning(
                 "対象のウィンドウを閉じたため、外部ツールの準備をキャンセルしました".to_string(),
             ),
         }
@@ -3172,10 +3159,11 @@ impl crate::app::App {
         };
         let count = preparing.requests.len();
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::new("external_tool_preparing")).show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            cancel = draw_external_tool_preparing_body(ui, count);
-        });
+        let response =
+            egui::Modal::new(egui::Id::unique("external_tool_preparing")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                cancel = draw_external_tool_preparing_body(ui, count);
+            });
         if cancel || response.should_close() || self.dialog_escape_pressed(ctx) {
             self.external_tool_operation = ExternalOperation::Idle;
         } else {
@@ -3219,9 +3207,9 @@ impl crate::app::App {
                     ExternalOperation::Launching(ExternalLaunching::Ready(pending))
             }
             Err(error) if target_count == 1 => {
-                self.show_feedback_toast(format!("{tool_name}: {error}"))
+                self.show_feedback_warning(format!("{tool_name}: {error}"))
             }
-            Err(error) => self.show_feedback_toast(format!(
+            Err(error) => self.show_feedback_warning(format!(
                 "{tool_name}: {target_count} 件の起動を開始できませんでした ({error})"
             )),
         }
@@ -3249,9 +3237,9 @@ impl crate::app::App {
                         self.external_tool_operation = ExternalOperation::Materializing(pending)
                     }
                     Err(error) if target_count == 1 => {
-                        self.show_feedback_toast(format!("{tool_name}: {error}"))
+                        self.show_feedback_warning(format!("{tool_name}: {error}"))
                     }
-                    Err(error) => self.show_feedback_toast(format!(
+                    Err(error) => self.show_feedback_warning(format!(
                         "{tool_name}: {target_count} 件の準備を開始できませんでした ({error})"
                     )),
                 }
@@ -3339,7 +3327,12 @@ impl crate::app::App {
             }
         }
         if !finished.is_empty() {
-            self.show_feedback_toast(external_launch_completion_summary(&finished));
+            self.show_feedback_result(
+                external_launch_completion_summary(&finished),
+                crate::feedback::FeedbackKind::result(
+                    finished.iter().any(|item| !item.failures.is_empty()),
+                ),
+            );
         }
         if !matches!(self.external_tool_operation, ExternalOperation::Idle)
             || !self.external_tool_retired_launch.is_empty()
@@ -3390,8 +3383,8 @@ impl crate::app::App {
         };
         let mut launch = false;
         let mut cancel = false;
-        let response =
-            egui::Modal::new(egui::Id::new("external_tool_launch_confirmation")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("external_tool_launch_confirmation"))
+            .show(ctx, |ui| {
                 ui.set_min_width(440.0);
                 if confirmation_target_count.is_some() {
                     ui.heading("複数の対象を外部ツールで開きますか？");
@@ -3468,8 +3461,8 @@ impl crate::app::App {
         let (completed, total, stage) = pending.progress.snapshot();
         let can_cancel = pending.can_cancel_before_launch();
         let mut cancel = false;
-        let response =
-            egui::Modal::new(egui::Id::new("external_tool_materialize_progress")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("external_tool_materialize_progress"))
+            .show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading("外部ツールへ渡すファイルを準備中");
                 ui.add_space(8.0);
@@ -3557,7 +3550,7 @@ impl crate::app::App {
         );
         let mut selected_tool = None;
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::new("external_tool_picker")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("external_tool_picker")).show(ctx, |ui| {
             ui.set_min_width(360.0);
             ui.heading(match target_kind {
                 ExternalToolPickerTargetKind::GridItems => "外部ツールを選択",
@@ -3565,6 +3558,10 @@ impl crate::app::App {
             });
             ui.add_space(8.0);
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(360.0)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -3636,12 +3633,12 @@ impl crate::app::App {
                             scanned_entries: 0,
                         });
                 } else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "対象が移動したため、外部ツールをもう一度選択してください".to_string(),
                     );
                 }
             } else {
-                self.show_feedback_toast("外部ツールを選択できませんでした".to_string());
+                self.show_feedback_warning("外部ツールを選択できませんでした".to_string());
             }
         } else if cancel {
             self.external_tool_operation = ExternalOperation::Idle;
@@ -3652,6 +3649,86 @@ impl crate::app::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_material_entry_external_tool_snapshots_canonical_metadata_without_raw_reload() {
+        use crate::app::composite_pixels_revision_tests::{evict_pair_cpu, warm_final_pair};
+        use crate::materializer::{MaterializePageEdits, MaterializeSource};
+        use crate::page_dims::{CanonicalPageDimensions, PagePixelDimensions};
+
+        let ctx = egui::Context::default();
+        let (mut app, keys) = warm_final_pair(&ctx);
+        app.final_composite_cache
+            .get_mut(&keys[1])
+            .unwrap()
+            .canonical_dims = Some(CanonicalPageDimensions::new(1200, 1800));
+        app.page_dims_cache.clear();
+        let generation = app.items_generation;
+        app.page_dims_cache
+            .record(generation, 0, PagePixelDimensions::Thumbnail((160, 240)));
+        evict_pair_cpu(&mut app);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.viewer_navigation_caches.invalidate();
+        let mut tool = ExternalTool::defaults_for_editing();
+        tool.payload = PayloadPolicy::TempEdited;
+        let snapshots = app.external_request_snapshots();
+        let crate::grid_item::GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } = &app.items[0]
+        else {
+            panic!("retained fixture is a PDF page");
+        };
+        let pdf_path = pdf_path.clone();
+        let page_num = *page_num;
+        let request = app
+            .materialize_target(
+                &tool,
+                &LaunchTarget::PdfPage {
+                    pdf_path: pdf_path.clone(),
+                    page_num,
+                },
+                Some(0),
+                &snapshots,
+            )
+            .expect("external-tool entry must prepare a source snapshot after Retained eviction");
+        assert!(
+            matches!(request.source, MaterializeSource::PdfPage { pdf_path: path, page_num: page, .. }
+            if path == pdf_path && page == page_num)
+        );
+        let Some(MaterializePageEdits::Single(edits)) = request.page_edits else {
+            panic!("PDF materialization must preserve its page edits");
+        };
+        assert_eq!(edits.comic_source_dims, Some([1200, 1800]));
+        assert!(!edits.load_page_params_from_db);
+        assert_eq!(edits.page_key, app.page_path_key(0).unwrap());
+
+        // The existing physical-file route still carries the original path;
+        // preparation does not turn an ordinary file into displayed-page pixels.
+        let file = app.tmp.path().join("external-original.png");
+        let request = app
+            .materialize_target(
+                &tool,
+                &LaunchTarget::ImagePage(file.clone()),
+                None,
+                &snapshots,
+            )
+            .unwrap();
+        assert!(
+            matches!(request.source, MaterializeSource::File { path, image_page: true } if path == file)
+        );
+        assert!(!app.fs_cache.contains_key(&0));
+        assert!(!app.fs_pending.contains_key(&0));
+        assert!(!app.fs_upload_backlog_contains(0));
+        assert_eq!(
+            app.final_composite_cache.get(&keys[1]).unwrap().pixels.size,
+            [8, 12]
+        );
+        assert!(matches!(
+            app.external_tool_operation,
+            ExternalOperation::Idle
+        ));
+    }
 
     fn finish_picker_preparation(app: &mut crate::app::App) {
         for _ in 0..1000 {
@@ -5029,7 +5106,7 @@ mod tests {
     #[test]
     fn the_external_tool_modals_are_drawn_from_one_place_only() {
         let source = include_str!("external_tool.rs");
-        let app = include_str!("app.rs");
+        let app = concat!(include_str!("app.rs"), include_str!("app/update_phases.rs"));
         let fullscreen = include_str!("ui_fullscreen.rs");
 
         for name in [
@@ -5098,23 +5175,74 @@ mod tests {
     /// 動画を閉じるまで外部ツールが起動しない状態になっていた (Codex Sol 指摘 #2)。
     #[test]
     fn the_launch_boundary_is_acked_even_when_the_frame_body_returns_early() {
+        assert!(launch_boundary_ack_survives_early_return(
+            include_str!("app.rs"),
+            include_str!("app/update_phases.rs"),
+        ));
+    }
+
+    fn launch_boundary_ack_survives_early_return(app: &str, phases: &str) -> bool {
+        let Some((_, wrapper)) = app.split_once("self.update_frame(ui, frame);") else {
+            return false;
+        };
+        let Some((tail, _)) = wrapper.split_once("fn on_exit(") else {
+            return false;
+        };
+        if !tail.contains("self.render_update_external_tool_checkpoint(ctx);") {
+            return false;
+        }
+        let Some((_, checkpoint)) = phases.split_once("fn render_update_external_tool_checkpoint(")
+        else {
+            return false;
+        };
+        let Some((checkpoint, _)) = checkpoint.split_once("\n    }") else {
+            return false;
+        };
+        let Some(draw) = checkpoint.find("self.show_external_tool_modals(ctx);") else {
+            return false;
+        };
+        let Some(ack) =
+            checkpoint.find("self.authorize_external_tool_launch_boundaries_after_ui();")
+        else {
+            return false;
+        };
+        draw < ack
+    }
+
+    #[test]
+    fn the_launch_boundary_audit_rejects_a_skipped_or_reversed_checkpoint() {
         let app = include_str!("app.rs");
-        let wrapper = app
-            .split_once("self.update_frame(ctx, frame);")
-            .expect("`eframe::App::update` は本体を update_frame へ委譲すること")
-            .1;
-        let tail = wrapper
-            .split_once("fn on_exit(")
-            .expect("update の terminal tail は on_exit より前にあること")
-            .0;
-        assert!(
-            tail.contains("self.show_external_tool_modals(ctx);"),
-            "早期 return を飛び越える tail で modal を描いていない"
+        let phases = include_str!("app/update_phases.rs");
+        let call = "self.render_update_external_tool_checkpoint(ctx);";
+        let missing_call = app.replace(call, "");
+        assert!(!launch_boundary_ack_survives_early_return(
+            &missing_call,
+            phases
+        ));
+        // Moving the call into update_frame would lose it on native/fullscreen returns.
+        let before_frame = missing_call.replace(
+            "self.update_frame(ui, frame);",
+            &format!("{call}\nself.update_frame(ui, frame);"),
         );
-        assert!(
-            tail.contains("self.authorize_external_tool_launch_boundaries_after_ui();"),
-            "早期 return を飛び越える tail で spawn 境界を ACK していない"
+        assert_ne!(
+            before_frame, missing_call,
+            "the mutation must reach the frame call"
         );
+        assert!(!launch_boundary_ack_survives_early_return(
+            &before_frame,
+            phases
+        ));
+        let draw = "self.show_external_tool_modals(ctx);";
+        let ack = "self.authorize_external_tool_launch_boundaries_after_ui();";
+        let reversed = phases
+            .replace(draw, "SWAP_DRAW")
+            .replace(ack, draw)
+            .replace("SWAP_DRAW", ack);
+        assert!(!launch_boundary_ack_survives_early_return(app, &reversed));
+        assert!(!launch_boundary_ack_survives_early_return(
+            app,
+            &phases.replace(ack, ""),
+        ));
     }
 
     /// supersede 済みの要求は進捗 modal に出ない。**入力ブロックも同じ述語から導く**ので、
@@ -5279,6 +5407,226 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn folder_target_selected_path_and_settings_preview_agree() {
+        let folder = PathBuf::from(r"C:\Pictures\選択したフォルダ");
+        let item = crate::grid_item::GridItem::Folder(folder.clone());
+        let targets = resolve_external_targets(
+            std::slice::from_ref(&item),
+            &[0],
+            &HashSet::new(),
+            ExternalTargetSource::GridKey { selected: Some(0) },
+        );
+        assert_eq!(targets, vec![LaunchTarget::RealFile(folder.clone())]);
+        // Preferences captures this same resolver's value before building its preview.
+        let preview_target = LaunchTarget::from_grid_item(Some(&item));
+        assert_eq!(preview_target, targets[0]);
+        for payload in [
+            PayloadPolicy::TempEdited,
+            PayloadPolicy::TempOriginal,
+            PayloadPolicy::OriginalFile,
+        ] {
+            let mut tool = file_list_test_tool(SelectionPolicy::Single);
+            tool.arguments = "{files}".to_string();
+            tool.payload = payload;
+            let preview = build_launch_request_for_preview(&tool, &preview_target).unwrap();
+            assert_eq!(preview.files, vec![folder.clone()]);
+            assert_eq!(
+                preview.files,
+                build_launch_request(&tool, &targets[0]).unwrap().files
+            );
+        }
+    }
+
+    #[test]
+    fn folder_target_checked_order_limits_and_virtual_refusal_are_preserved() {
+        use crate::grid_item::GridItem;
+        let items = vec![
+            GridItem::Folder("first".into()),
+            GridItem::Image("page.jpg".into()),
+            GridItem::Folder("last".into()),
+        ];
+        let checked = HashSet::from([0, 1, 2]);
+        let targets = resolve_external_targets(
+            &items,
+            &[2, 1, 0],
+            &checked,
+            ExternalTargetSource::GridKey { selected: Some(0) },
+        );
+        assert_eq!(
+            targets,
+            vec![
+                LaunchTarget::RealFile("last".into()),
+                LaunchTarget::ImagePage("page.jpg".into()),
+                LaunchTarget::RealFile("first".into())
+            ]
+        );
+        let mut tool = file_list_test_tool(SelectionPolicy::Single);
+        tool.arguments = "{files}".to_string();
+        assert!(
+            build_launch_operation(&tool, &targets)
+                .unwrap_err()
+                .contains("3 件")
+        );
+        for selection in [SelectionPolicy::Each, SelectionPolicy::Batch] {
+            tool.selection = selection;
+            let operation = build_launch_operation(&tool, &targets).unwrap();
+            let files: Vec<_> = operation
+                .requests
+                .into_iter()
+                .flat_map(|request| request.files)
+                .collect();
+            assert_eq!(
+                files,
+                vec![
+                    PathBuf::from("last"),
+                    PathBuf::from("page.jpg"),
+                    PathBuf::from("first")
+                ]
+            );
+        }
+        tool.max_targets = 2;
+        assert!(build_launch_operation(&tool, &targets).is_err());
+        // Context-menu container routing still ignores checked items and sends exactly one path.
+        assert_eq!(
+            resolve_external_targets(
+                &items,
+                &[2, 1, 0],
+                &checked,
+                ExternalTargetSource::Container {
+                    path: Some("first".into())
+                }
+            ),
+            vec![LaunchTarget::RealFile("first".into())]
+        );
+
+        let mixed = [
+            items[0].clone(),
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: None,
+            },
+        ];
+        for checked in [HashSet::from([1]), HashSet::from([0, 1])] {
+            let targets = resolve_external_targets(
+                &mixed,
+                &[0, 1],
+                &checked,
+                ExternalTargetSource::GridKey { selected: Some(0) },
+            );
+            assert!(targets.iter().any(|target| matches!(
+                target,
+                LaunchTarget::Virtual(crate::grid_item::FileOperationRefusal::ArchiveDirectory)
+            )));
+            assert!(
+                validate_materializable_targets(&targets)
+                    .unwrap_err()
+                    .contains("圧縮ファイル内のフォルダ")
+            );
+            assert!(build_launch_operation(&tool, &targets).is_err());
+        }
+    }
+
+    #[test]
+    fn folder_target_menu_capability_matches_the_shared_resolver() {
+        use crate::grid_item::GridItem;
+        for item in [
+            GridItem::Folder("folder".into()),
+            GridItem::Image("page.jpg".into()),
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: None,
+            },
+            GridItem::ZipImage {
+                zip_path: "book.zip".into(),
+                entry_name: "page.jpg".into(),
+            },
+            GridItem::PdfPage {
+                pdf_path: "book.pdf".into(),
+                page_num: 2,
+                content_type: None,
+            },
+            GridItem::Stack {
+                key: "pages".into(),
+                representative: "page.jpg".into(),
+                count: 2,
+            },
+        ] {
+            let target = LaunchTarget::from_grid_item(Some(&item));
+            let mut menu = ExternalToolMenuTarget::default();
+            menu.add_grid_item(&item);
+            assert_eq!(
+                menu,
+                ExternalToolMenuTarget::from_launch_targets(&[target]),
+                "{item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_target_picker_and_slot_prepare_directory_without_image_output() {
+        use crate::materializer::{MaterializeSource, Materializer};
+        let mut app = crate::app::setup_app_for_test();
+        // An image-looking directory name must still follow the non-image path.
+        let folder = app.tmp.path().join("folder.jpg");
+        std::fs::create_dir(&folder).unwrap();
+        app.items = vec![crate::grid_item::GridItem::Folder(folder.clone())];
+        app.visible_indices = vec![0];
+        app.checked.clear();
+        app.selected = Some(0);
+        app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Single)];
+        app.request_grid_external_tool_picker();
+        finish_picker_preparation(&mut app);
+        let ExternalOperation::Picker(picker) = &app.external_tool_operation else {
+            panic!("folder picker was refused")
+        };
+        assert_eq!(picker.locators.len(), 1);
+        assert_eq!(
+            picker.locators[0].target(),
+            &LaunchTarget::RealFile(folder.clone())
+        );
+        assert_eq!(
+            external_tool_capability(&app.settings.external_tools[0], picker.capability),
+            Some((true, None))
+        );
+        app.external_tool_operation = ExternalOperation::Idle;
+
+        let artifacts = app.tmp.path().join("materialized");
+        let manager = Materializer::new_at_for_test(artifacts.clone(), 1397);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for payload in [
+            PayloadPolicy::TempEdited,
+            PayloadPolicy::TempOriginal,
+            PayloadPolicy::OriginalFile,
+        ] {
+            app.settings.external_tools[0].payload = payload;
+            app.launch_grid_external_tool_slot(&egui::Context::default(), 1);
+            // Stop at request preparation; never reach the external-process launch boundary.
+            let mut preparing = take_preparing(&mut app);
+            finish_snapshot_for_test(&mut app, &mut preparing);
+            assert_eq!(preparing.requests.len(), 1);
+            let request = &preparing.requests[0];
+            assert!(
+                matches!(&request.source, MaterializeSource::File { path, image_page: false } if path == &folder)
+            );
+            assert!(request.page_edits.is_none());
+            let prepared = manager
+                .session()
+                .materialize(request, &cancel, generation)
+                .unwrap();
+            assert_eq!(prepared.path(), folder.as_path());
+            assert!(
+                !artifacts.exists(),
+                "a directory must not create image output"
+            );
+        }
     }
 
     #[test]

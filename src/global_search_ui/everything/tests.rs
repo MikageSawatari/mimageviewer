@@ -1,12 +1,12 @@
-//! Headless lifecycle checks. The name-search transport is never called: completed datasets
-//! enter the same Search prepare/adoption owner used by production.
 #![cfg(test)]
 
+//! Headless lifecycle checks. The name-search transport is never called: completed datasets
+//! enter the same Search prepare/adoption owner used by production.
 use super::*;
 use crate::everything_results::{EverythingDataset, EverythingPreparedRow, EverythingStats};
 use crate::settings::{ListingSortMetadata, SortOrder};
 
-fn dataset(items: Vec<GridItem>) -> Arc<EverythingDataset> {
+pub(crate) fn dataset(items: Vec<GridItem>) -> Arc<EverythingDataset> {
     let count = items.len();
     Arc::new(EverythingDataset {
         rows: items
@@ -14,12 +14,22 @@ fn dataset(items: Vec<GridItem>) -> Arc<EverythingDataset> {
             .enumerate()
             .map(|(index, item)| EverythingPreparedRow {
                 physical_key: crate::path_key::physical_path_spelling(
-                    item.file_operation_path().unwrap(),
+                    item.drag_source_path().unwrap(),
                 )
                 .unwrap(),
-                item,
-                image_meta: Some((index as i64 + 10, index as i64 + 20)),
-                sort_meta: ListingSortMetadata::new(index as i64 + 10, Some(index as i64 + 20)),
+                item: item.clone(),
+                image_meta: Some((
+                    index as i64 + 10,
+                    if matches!(item, GridItem::Folder(_)) {
+                        0
+                    } else {
+                        index as i64 + 20
+                    },
+                )),
+                sort_meta: ListingSortMetadata::new(
+                    index as i64 + 10,
+                    (!matches!(item, GridItem::Folder(_))).then_some(index as i64 + 20),
+                ),
             })
             .collect(),
         stats: EverythingStats {
@@ -37,7 +47,7 @@ fn accepted_dataset(app: &App) -> &Arc<EverythingDataset> {
     dataset
 }
 
-fn start_fake_run(
+pub(crate) fn start_fake_run(
     app: &mut App,
     ctx: &egui::Context,
     query: &str,
@@ -49,7 +59,7 @@ fn start_fake_run(
     app.global_search.pending = None;
     app.global_search.page_edit_prepare = None;
     app.global_search.run_sequence = app.global_search.run_sequence.wrapping_add(1);
-    app.global_search.query = query.into();
+    app.global_search.everything_draft = query.into();
     app.global_search.visibility = app.settings.file_type_visibility.clone();
     app.global_search.page_edit_prepare = Some(
         SearchPageEditPrepare::spawn(
@@ -93,7 +103,12 @@ fn poll_until(app: &mut App, ctx: &egui::Context, reason: &str, ready: impl Fn(&
     }
 }
 
-fn adopt(app: &mut App, ctx: &egui::Context, query: &str, dataset: Arc<EverythingDataset>) {
+pub(crate) fn adopt(
+    app: &mut App,
+    ctx: &egui::Context,
+    query: &str,
+    dataset: Arc<EverythingDataset>,
+) {
     start_fake_run(app, ctx, query);
     queue(app, Arc::clone(&dataset));
     poll_until(app, ctx, "completed dataset did not adopt", |app| {
@@ -150,9 +165,14 @@ fn completed_dataset_publishes_rows_stamps_identity_and_source_at_one_ready_boun
     assert_eq!(app.items, old_items);
     assert!(matches!(
         app.global_search.accepted,
-        SearchAccepted::Metadata
+        SearchAccepted::Metadata { .. }
     ));
     assert!(app.everything_search_progress_visible());
+    assert_eq!(
+        app.everything_search_entry_availability(),
+        EverythingSearchEntryAvailability::OtherOperation
+    );
+    assert!(!app.everything_search_entry_allowed());
     app.release_search_ready_for_test();
     poll_until(&mut app, &ctx, "Ready did not adopt", |app| {
         app.global_search.pending.is_none()
@@ -163,6 +183,15 @@ fn completed_dataset_publishes_rows_stamps_identity_and_source_at_one_ready_boun
     assert!(app.items_are_global_search_view);
     assert!(!app.everything_search_progress_visible());
     assert_eq!(app.global_search.last_executed, "ext:jpg");
+    assert_eq!(
+        app.projection_recipe,
+        crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+            crate::app::book_materialization::ExtractedSurface::Search(
+                crate::app::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+        ),
+        "prepared Everything rows use the G1 extracted projection at adoption",
+    );
     for (index, item) in app.items.iter().enumerate() {
         assert_eq!(
             app.page_identity_index
@@ -263,7 +292,7 @@ fn stale_prepared_pins_and_tags_retry_before_any_metadata_is_published() {
     assert!(app.everything_search_progress_visible());
     assert!(matches!(
         app.global_search.accepted,
-        SearchAccepted::Metadata
+        SearchAccepted::Metadata { .. }
     ));
     crate::app::RATING_INSTALL_UI_TAG_PREWARMS.with(|calls| assert_eq!(calls.get(), 0));
     app.hold_next_search_ready_for_test();
@@ -343,7 +372,7 @@ fn failed_new_query_keeps_the_old_accepted_source_and_dataset() {
         .unwrap();
     app.poll_search_page_edit_prepare(&ctx);
     assert_eq!(app.items, rows);
-    assert_eq!(app.global_search.query, "new");
+    assert_eq!(app.global_search.everything_draft, "new");
     assert_eq!(app.global_search.last_executed, "old");
     assert_eq!(
         app.global_search.reject_message.as_deref(),
@@ -449,7 +478,7 @@ fn editing_draft_does_not_invalidate_sorting_of_the_submitted_dataset() {
         0,
         app.items_generation,
     ));
-    app.global_search.query = "draft only".into();
+    app.global_search.everything_draft = "draft only".into();
     app.settings.sort_order = SortOrder::FileNameDesc;
     app.hold_next_search_ready_for_test();
     app.rebuild_items_from_global_search();
@@ -474,7 +503,7 @@ fn editing_draft_does_not_invalidate_sorting_of_the_submitted_dataset() {
     assert_eq!(app.image_metas, vec![Some((10, 20)), Some((11, 21))]);
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     assert_eq!(app.global_search.last_executed, "submitted");
-    assert_eq!(app.global_search.query, "draft only");
+    assert_eq!(app.global_search.everything_draft, "draft only");
 }
 
 #[test]
@@ -584,6 +613,12 @@ fn physical_open_acceptance_keeps_logical_archive_identity_and_returns_exact_sel
     } if logical_source == &logical && return_anchor == &logical)
     );
     app.current_folder = Some(cache.clone());
+    app.projection_recipe = crate::app::book_materialization::ProjectionRecipe::Book(
+        crate::app::book_materialization::BookScope::Archive {
+            logical_root: logical.clone(),
+            prefix: Vec::new(),
+        },
+    );
     app.items = vec![GridItem::ZipImage {
         zip_path: cache,
         entry_name: "page.jpg".into(),
@@ -593,7 +628,7 @@ fn physical_open_acceptance_keeps_logical_archive_identity_and_returns_exact_sel
     app.items_generation = app.items_generation.wrapping_add(1);
     app.selected = Some(0);
     app.hold_next_search_ready_for_test();
-    assert!(app.return_from_everything_child());
+    assert!(app.return_from_everything_child(EverythingReturn::Parent));
     poll_until(
         &mut app,
         &ctx,
@@ -613,6 +648,15 @@ fn physical_open_acceptance_keeps_logical_archive_identity_and_returns_exact_sel
     assert_eq!(app.items[app.selected.unwrap()], archive);
     assert!(app.scroll_to_selected);
     assert_eq!(app.global_search.last_executed, "book");
+    assert_eq!(
+        app.projection_recipe,
+        crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+            crate::app::book_materialization::ExtractedSurface::Search(
+                crate::app::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+        ),
+        "return from an Everything book child restores the extracted recipe",
+    );
 }
 
 #[test]
@@ -642,13 +686,397 @@ fn zip_prefix_parent_stays_in_the_physical_child_before_returning_to_results() {
     assert!(!nav.at_root());
     app.current_folder = Some(zip);
     app.zip_nav = Some(nav);
-    assert!(app.return_from_everything_child());
+    assert!(app.return_from_everything_child(EverythingReturn::Parent));
     assert!(app.zip_nav.as_ref().unwrap().at_root());
     assert!(app.everything_has_physical_child());
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     assert!(app.items.iter().any(
         |item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "chapter/")
     ));
+}
+
+fn assert_return_only(app: &App) {
+    assert!(
+        matches!(
+            app.global_search.pending,
+            Some(SearchProducer::Everything {
+                intent: EverythingIntent::Return,
+                ..
+            })
+        ),
+        "retained return must never start an IPC Query"
+    );
+}
+
+#[test]
+fn folder_rows_share_size_sort_rating_mask_and_kind_tag_facets() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let folder = GridItem::Folder(app.tmp.path().join("name.zip"));
+    let image = GridItem::Image(app.tmp.path().join("image.jpg"));
+    let result = dataset(vec![folder.clone(), image.clone()]);
+    let ratings = HashMap::from([(search_item_rating_key(&folder).unwrap(), 4)]);
+    let mask = [false, false, false, false, true, false];
+    let (items, metas) = project_dataset(
+        &result,
+        SortOrder::SizeAsc,
+        &ratings,
+        &mask,
+        &Default::default(),
+    );
+    assert_eq!(
+        items,
+        vec![folder.clone()],
+        "rating mask must include folder ratings"
+    );
+    assert_eq!(metas, vec![Some((10, 0))]);
+    for sort in [SortOrder::SizeAsc, SortOrder::SizeDesc] {
+        let (items, _) = project_dataset(&result, sort, &ratings, &[true; 6], &Default::default());
+        assert_eq!(
+            items,
+            vec![image.clone(), folder.clone()],
+            "folder size is unknown, not zero bytes"
+        );
+    }
+    let mut tags = crate::tags_db::TagsDb::open_at(&app.tmp.path().join("folder-tags.db")).unwrap();
+    let key = crate::tags_db::item_key_for_path(folder.drag_source_path().unwrap());
+    tags.set_item_tags(&key, ["folder-tag"], crate::tags_db::source::EDIT)
+        .unwrap();
+    app.tags_db = Some(tags);
+    app.settings
+        .facet_filter
+        .kinds
+        .insert(crate::settings::FacetItemKind::Folder);
+    app.settings.facet_filter.tags.insert("folder-tag".into());
+    adopt(&mut app, &ctx, "mixed", Arc::clone(&result));
+    assert_eq!(
+        app.items.len(),
+        2,
+        "facets must not replace the retained dataset"
+    );
+    assert_eq!(app.visible_indices.len(), 1);
+    assert_eq!(app.items[app.visible_indices[0]], folder);
+    assert_eq!(app.tags_cache[&key], vec!["#folder-tag"]);
+    assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
+}
+
+#[test]
+fn folder_activation_parent_chain_gamepad_return_research_and_close_keep_one_owner() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let origin = app.tmp.path().join("origin");
+    let folder = app.tmp.path().join("hit");
+    let sub = folder.join("sub");
+    std::fs::create_dir(&origin).unwrap();
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(origin.join("original.jpg"), b"image").unwrap();
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    let row = GridItem::Folder(folder.clone());
+    let result = dataset(vec![
+        row.clone(),
+        GridItem::Image(app.tmp.path().join("other.jpg")),
+    ]);
+    adopt(&mut app, &ctx, "folder", Arc::clone(&result));
+    let index = app.items.iter().position(|item| item == &row).unwrap();
+    let nav = app.grid_physical_navigation(index, folder.clone(), false);
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    app.finish_page_identity_preparation_for_test();
+    assert!(
+        app.everything_has_physical_child(),
+        "real post-install callback must accept Folder"
+    );
+    assert_eq!(app.current_folder.as_ref(), Some(&folder));
+    assert!(
+        matches!(&app.global_search.accepted, SearchAccepted::Everything {
+        position: EverythingPosition::PhysicalChild { logical_source, return_anchor, .. }, ..
+    } if logical_source == &folder && return_anchor == &folder)
+    );
+    app.load_folder(sub.clone());
+    app.finish_page_identity_preparation_for_test();
+    assert!(app.handle_grid_parent_folder_action().is_none());
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(app.current_folder.as_ref(), Some(&folder));
+    assert_eq!(app.items[app.selected.unwrap()], GridItem::Folder(sub));
+    assert!(app.everything_has_physical_child());
+    assert!(app.global_search.pending.is_none());
+    assert!(app.handle_gamepad_grid_back().is_none());
+    assert_return_only(&app);
+    poll_until(&mut app, &ctx, "gamepad return did not adopt", |app| {
+        !app.everything_has_physical_child()
+    });
+    assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
+    assert_eq!(app.items[app.selected.unwrap()], row);
+    assert!(app.scroll_to_selected);
+    let next = dataset(vec![GridItem::Folder(app.tmp.path().join("replacement"))]);
+    adopt(&mut app, &ctx, "replacement", Arc::clone(&next));
+    assert!(Arc::ptr_eq(accepted_dataset(&app), &next));
+    assert!(!Arc::ptr_eq(accepted_dataset(&app), &result));
+    app.close_global_search();
+    app.finish_history_restore_preparation_for_test();
+    assert!(!app.global_search.active);
+    assert_eq!(app.current_folder.as_ref(), Some(&origin));
+    assert_eq!(
+        app.items,
+        vec![GridItem::Image(origin.join("original.jpg"))]
+    );
+}
+
+#[test]
+fn results_return_skips_deep_zip_and_physical_parents_of_folder_child() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.current_folder = Some(app.tmp.path().to_path_buf());
+    let folder = app.tmp.path().join("hit");
+    let zip = folder.join("sub/book.zip");
+    let result = dataset(vec![GridItem::Folder(folder.clone())]);
+    adopt(&mut app, &ctx, "folder", Arc::clone(&result));
+    assert!(app.accept_everything_physical_child(&folder));
+    let tree = Arc::new(crate::zip_tree::ZipTree::build(
+        zip.clone(),
+        ["root.jpg", "chapter/deep/page.jpg"]
+            .map(|name| crate::zip_loader::ZipImageEntry {
+                entry_name: name.into(),
+                uncompressed_size: 1,
+                mtime: 1,
+                container_ancestry: Vec::new(),
+            })
+            .to_vec(),
+    ));
+    let mut nav = crate::zip_tree::ZipNavState::new(tree);
+    nav.enter("chapter/deep/");
+    app.current_folder = Some(zip);
+    app.zip_nav = Some(nav);
+    assert!(app.return_from_everything_child(EverythingReturn::Results));
+    assert_return_only(&app);
+    assert!(
+        !app.zip_nav.as_ref().unwrap().at_root(),
+        "Results must not step zip_nav"
+    );
+    poll_until(&mut app, &ctx, "direct return did not adopt", |app| {
+        !app.everything_has_physical_child()
+    });
+    assert!(app.zip_nav.is_none());
+    assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
+    assert_eq!(app.items[app.selected.unwrap()], GridItem::Folder(folder));
+}
+
+#[cfg(windows)]
+#[test]
+fn image_folder_book_accepts_main_install_but_independent_open_keeps_results_root() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let folder = app.tmp.path().join("image-folder");
+    std::fs::create_dir(&folder).unwrap();
+    image::RgbImage::new(2, 2)
+        .save(folder.join("001.png"))
+        .unwrap();
+    app.current_folder = Some(app.tmp.path().to_path_buf());
+    let result = dataset(vec![GridItem::Folder(folder.clone())]);
+    adopt(&mut app, &ctx, "images", Arc::clone(&result));
+    let rows = app.items.clone();
+    let generation = app.items_generation;
+    assert!(app.start_active_detached_book_context_from_scanned_folder(
+        folder.clone(),
+        crate::app::folder_scan::scan_directory(&folder),
+        &ctx,
+        None
+    ));
+    app.with_active_viewer_context(|viewer| {
+        viewer.finish_page_identity_preparation_for_test();
+        assert_eq!(viewer.current_folder.as_ref(), Some(&folder));
+        assert!(
+            viewer
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(_)))
+        );
+    })
+    .expect("independent viewer installed");
+    assert_eq!(app.items, rows);
+    assert_eq!(app.items_generation, generation);
+    assert!(!app.everything_has_physical_child());
+    assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
+    // Main image-book install uses the same accepted callback as an ordinary folder.
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.pending_auto_fs_open = true;
+    app.load_folder_with_scan(
+        folder.clone(),
+        Some(crate::app::folder_scan::scan_directory(&folder)),
+    );
+    app.finish_page_identity_preparation_for_test();
+    assert!(app.everything_has_physical_child());
+    assert_eq!(app.current_folder.as_ref(), Some(&folder));
+}
+
+#[test]
+fn cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return() {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let folder = app.tmp.path().join("hit");
+    let child = folder.join("nested");
+    std::fs::create_dir_all(&child).unwrap();
+    let video = child.join("movie.mp4");
+    std::fs::write(&video, b"video").unwrap();
+    let pin_db =
+        Arc::new(FolderThumbPinDb::open_at(&app.tmp.path().join("folder-pins.db")).unwrap());
+    pin_db
+        .set(
+            &folder,
+            &FolderPinSource::File {
+                rel: "nested".into(),
+                kind: FileKind::Folder,
+            },
+        )
+        .unwrap();
+    pin_db
+        .set(
+            &child,
+            &FolderPinSource::File {
+                rel: "movie.mp4".into(),
+                kind: FileKind::Video,
+            },
+        )
+        .unwrap();
+    let video_db =
+        crate::video_pins::VideoPinDb::open_at(&app.tmp.path().join("video-pins.db")).unwrap();
+    let encode = |color: [u8; 3]| {
+        let mut bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .encode(
+                image::RgbImage::from_pixel(4, 3, image::Rgb(color)).as_raw(),
+                4,
+                3,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        bytes
+    };
+    let webp = encode([18, 90, 140]);
+    video_db.set_pin(&video, 2.0, &webp).unwrap();
+    app.folder_thumb_pin_db = Some(Arc::clone(&pin_db));
+    app.video_pin_db = Some(video_db);
+    app.settings.folder_thumb_depth = 3;
+    // Non-default representative policy must use the same key as the loader.
+    app.settings
+        .file_type_visibility
+        .excluded_extensions
+        .insert("png".into());
+    let catalog =
+        Arc::new(crate::catalog::CatalogDb::open(&app.tmp.path().join("cache"), &folder).unwrap());
+    let first_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    app.current_color_catalog = Some(Arc::clone(&catalog));
+    app.current_color_cache_map = Some(Arc::clone(&first_cache));
+    app.current_folder = Some(app.tmp.path().to_path_buf());
+    let result = dataset(vec![
+        GridItem::Folder(folder.clone()),
+        GridItem::Folder(child.clone()),
+    ]);
+    adopt(&mut app, &ctx, "folders", Arc::clone(&result));
+    let keys = first_cache
+        .read()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys.len(),
+        2,
+        "direct and cascaded video pin both seed a cold cache"
+    );
+    for key in &keys {
+        assert!(key.contains("|types:"));
+        let entry = catalog.load_one(key).unwrap().unwrap();
+        assert_eq!(entry.jpeg_data, webp);
+        assert_eq!(
+            entry.folder_provenance,
+            Some(crate::catalog::FolderThumbProvenance::Seeded)
+        );
+        assert_eq!(first_cache.read().unwrap()[key].jpeg_data, webp);
+    }
+    assert!(
+        keys.iter()
+            .any(|key| key.contains(folder.to_string_lossy().as_ref()))
+    );
+    assert_eq!(
+        app.video_pin_db
+            .as_ref()
+            .unwrap()
+            .bulk_lookup_calls_for_test(),
+        0,
+        "UI must not read pin BLOBs from its connection"
+    );
+    assert!(app.accept_everything_physical_child(&folder));
+    // A physical child replaces the existing thumbnail owner. Retained search prepare
+    // must seed that new owner, rather than the one captured at the first query.
+    let return_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    app.current_color_cache_map = Some(Arc::clone(&return_cache));
+    assert!(app.return_from_everything_child(EverythingReturn::Results));
+    assert_return_only(&app);
+    poll_until(&mut app, &ctx, "folder pin return did not adopt", |app| {
+        !app.everything_has_physical_child()
+    });
+    assert_eq!(return_cache.read().unwrap().len(), 2);
+    assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
+    // The source pin changes without changing video stat: replace the actual bytes.
+    let replacement = encode([190, 10, 40]);
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 3.0, &replacement)
+        .unwrap();
+    let generation = app.items_generation;
+    app.rebuild_items_from_global_search();
+    poll_until(&mut app, &ctx, "changed folder pin did not adopt", |app| {
+        app.items_generation != generation
+    });
+    for key in keys {
+        assert_eq!(return_cache.read().unwrap()[&key].jpeg_data, replacement);
+    }
+}
+
+#[test]
+fn thumbnail_owner_replaced_while_ready_is_pending_is_recaptured_on_retry() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let folder = app.tmp.path().join("folder");
+    let catalog =
+        Arc::new(crate::catalog::CatalogDb::open(&app.tmp.path().join("cache"), &folder).unwrap());
+    app.current_color_catalog = Some(catalog);
+    app.current_color_cache_map = Some(Arc::new(std::sync::RwLock::new(HashMap::new())));
+    let result = dataset(vec![GridItem::Folder(folder)]);
+    adopt(&mut app, &ctx, "folder", Arc::clone(&result));
+    app.hold_next_search_ready_for_test();
+    app.rebuild_items_from_global_search();
+    poll_until(
+        &mut app,
+        &ctx,
+        "Ready not held before owner replacement",
+        App::search_ready_is_held_for_test,
+    );
+    let generation = app.items_generation;
+    let cancel = app.search_prepare_cancel_for_test();
+    let replacement = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    app.current_color_cache_map = Some(Arc::clone(&replacement));
+    app.release_search_ready_for_test();
+    poll_until(
+        &mut app,
+        &ctx,
+        "retry kept using the retired thumbnail owner",
+        |app| app.items_generation != generation,
+    );
+    assert!(app.search_prepare_metrics_for_test().stale_rejections > 0);
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &replacement
+    ));
+    assert!(
+        Arc::ptr_eq(&app.search_prepare_cancel_for_test(), &cancel),
+        "reuse the existing prepare owner"
+    );
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
 }
 
 #[cfg(windows)]
@@ -823,7 +1251,7 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
     app.thumbnails = vec![ThumbnailState::Pending];
     app.items_generation = app.items_generation.wrapping_add(1);
     app.hold_next_search_ready_for_test();
-    assert!(app.return_from_everything_child());
+    assert!(app.return_from_everything_child(EverythingReturn::Parent));
     poll_until(
         &mut app,
         &ctx,
@@ -844,7 +1272,7 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
         "retained return must also prepare video pins on the worker"
     );
     check_sibling(&mut app);
-    assert!(app.return_from_everything_child());
+    assert!(app.return_from_everything_child(EverythingReturn::Parent));
     poll_until(
         &mut app,
         &ctx,
@@ -892,7 +1320,7 @@ fn search_dataset_and_worker_move_with_the_owner_during_registry_park_roundtrips
     let sibling = app.build_window_context_for_test(1377, |mounted| {
         assert!(matches!(
             mounted.global_search.accepted,
-            SearchAccepted::Metadata
+            SearchAccepted::Metadata { .. }
         ));
         assert!(mounted.global_search.pending.is_none());
         assert!(mounted.global_search.page_edit_prepare.is_none());
@@ -901,7 +1329,7 @@ fn search_dataset_and_worker_move_with_the_owner_during_registry_park_roundtrips
         app.with_window_context_for_test(sibling, |mounted| {
             assert!(matches!(
                 mounted.global_search.accepted,
-                SearchAccepted::Metadata
+                SearchAccepted::Metadata { .. }
             ));
             assert!(mounted.global_search.pending.is_none());
             assert!(mounted.global_search.page_edit_prepare.is_none());
@@ -925,10 +1353,11 @@ fn source_boundary_discards_index_owned_undo_before_new_rows_can_use_the_index()
     let ctx = egui::Context::default();
     let old = app.tmp.path().join("old.jpg");
     adopt(&mut app, &ctx, "old", dataset(vec![GridItem::Image(old)]));
+    let target = app.page_adjustment_target_for_idx(0).unwrap();
     app.meta_undo
         .push(crate::undo_stack::UndoEntry::LocalAdjustment {
             changes: vec![crate::undo_stack::LocalAdjustmentChange {
-                idx: 0,
+                target,
                 before: local_adjust_core::LocalAdjustmentLayers::default(),
                 after: local_adjust_core::LocalAdjustmentLayers::default(),
             }],
@@ -986,7 +1415,7 @@ fn canceled_return_preserves_child_and_can_prepare_again_without_querying_everyt
     app.thumbnails = vec![ThumbnailState::Pending];
     app.items_generation = app.items_generation.wrapping_add(1);
     app.hold_next_search_ready_for_test();
-    assert!(app.return_from_everything_child());
+    assert!(app.return_from_everything_child(EverythingReturn::Parent));
     poll_until(
         &mut app,
         &ctx,
@@ -1000,7 +1429,7 @@ fn canceled_return_preserves_child_and_can_prepare_again_without_querying_everyt
     assert_eq!(app.items, vec![page]);
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     assert!(!app.everything_search_progress_visible());
-    assert!(app.return_from_everything_child());
+    assert!(app.return_from_everything_child(EverythingReturn::Parent));
     assert!(app.everything_running_is_current());
     assert!(
         app.global_search.page_edit_prepare.is_some(),
@@ -1035,7 +1464,7 @@ fn failed_return_preserves_the_accepted_physical_child_rows() {
     app.items_generation = app.items_generation.wrapping_add(1);
     let (prepare, _command_rx, output_tx) = stalled_prepare();
     app.global_search.page_edit_prepare = Some(prepare);
-    assert!(app.return_from_everything_child());
+    assert!(app.return_from_everything_child(EverythingReturn::Parent));
     let wish = app
         .global_search
         .page_edit_prepare

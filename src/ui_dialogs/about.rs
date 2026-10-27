@@ -5,11 +5,20 @@ use eframe::egui;
 
 const EGUI_LICENSE_MIT: &str = include_str!("../../vendor/egui-wgpu/LICENSE-MIT");
 const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-APACHE");
+const LIBAVIF_LICENSE: &str = include_str!("../../LIBAVIF-LICENSE.txt");
+const DAV1D_LICENSE: &str = include_str!("../../DAV1D-LICENSE.txt");
+const LIBYUV_LICENSE: &str = include_str!("../../LIBYUV-LICENSE.txt");
 const LIBRAW_LICENSE: &str = include_str!("../../LIBRAW-LICENSE.txt");
 const ZLIB_LICENSE: &str = include_str!("../../ZLIB-LICENSE.txt");
 const RUST_DEFLATE_NOTICES: &str = include_str!("../../RUST-DEFLATE-NOTICES.txt");
 const EVERYTHING_IPC_NOTICE: &str = include_str!("../../EVERYTHING-IPC-NOTICE.txt");
 const LIBJPEG_TURBO_LICENSE: &str = include_str!("../../LIBJPEG-TURBO-LICENSE.txt");
+// HarmNet の推論と重みは core に埋め込むため、portable を含む全構成で表示する。
+const HARMNET_NOTICE: (&str, &str, &str) = (
+    "EffeTune Note Spectrogram (HarmNet L)",
+    "MIT — © 2025-2026 Yoshiyuki Kobayashi",
+    include_str!("../../third_party/effetune-harmnet/LICENSE"),
+);
 const IJG_ATTRIBUTION: &str =
     "This software is based in part on the work of the Independent JPEG Group.";
 
@@ -18,6 +27,10 @@ fn draw_license_text(ui: &mut egui::Ui, title: &str, id: &str, text: &str) {
         .id_salt(id)
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .id_salt(format!("{id}_scroll"))
                 .max_height(180.0)
                 .show(ui, |ui| {
@@ -59,28 +72,55 @@ pub fn draw_raw_license_snapshot_fixture(ui: &mut egui::Ui) {
     );
 }
 
-// portable は EffeTune の bundle / notices を同梱しない。
+/// Bundled AVIF versions and full notices, shared by the dialog and headless UI tests.
+#[doc(hidden)]
+pub fn draw_avif_license_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.label(format!(
+        "AVIF 同梱版: {}",
+        crate::avif_decoder::BUILD_ID.trim()
+    ));
+    draw_license_text(
+        ui,
+        "libavif ライセンス・著作権表記 全文",
+        "about_libavif_license",
+        LIBAVIF_LICENSE,
+    );
+    draw_license_text(
+        ui,
+        "dav1d ライセンス・著作権表記 全文",
+        "about_dav1d_license",
+        DAV1D_LICENSE,
+    );
+    draw_license_text(
+        ui,
+        "libyuv ライセンス・著作権表記 全文",
+        "about_libyuv_license",
+        LIBYUV_LICENSE,
+    );
+}
+
+// portable は Mixwright bundle / notices を同梱しない。HarmNet は上の共通 notice。
 #[cfg(not(feature = "portable"))]
 const EFFETUNE_NOTICES: &[(&str, &str, &str)] = &[
     (
         "EffeTune Mixwright THIRD-PARTY-NOTICES 全文",
         "Contents/Resources/THIRD-PARTY-NOTICES.txt",
         include_str!(
-            "../../third_party/effetune-mixwright/v0.13.0/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+            "../../third_party/effetune-mixwright/v0.14.0/Contents/Resources/THIRD-PARTY-NOTICES.txt"
         ),
     ),
     (
         "EffeTune WebView THIRD-PARTY-NOTICES 全文",
         "Contents/Resources/webview/THIRD-PARTY-NOTICES.txt",
         include_str!(
-            "../../third_party/effetune-mixwright/v0.13.0/Contents/Resources/webview/THIRD-PARTY-NOTICES.txt"
+            "../../third_party/effetune-mixwright/v0.14.0/Contents/Resources/webview/THIRD-PARTY-NOTICES.txt"
         ),
     ),
     (
         "EffeTune DSP NOTICE 全文",
         "Contents/Resources/webview/plugins/dsp/NOTICE.txt",
         include_str!(
-            "../../third_party/effetune-mixwright/v0.13.0/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
+            "../../third_party/effetune-mixwright/v0.14.0/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
         ),
     ),
 ];
@@ -96,14 +136,23 @@ impl App {
         let pack_about = self.ensure_editing_pack_about();
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         egui::Window::new("バージョン情報")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
             .vscroll(true)
+            .drag_to_scroll(egui::scroll_area::DragScroll::Always)
             .default_width(620.0)
             .max_height((ctx.content_rect().height() - 80.0).max(320.0))
             .default_pos(dialog_pos)
             .show(ctx, |ui| {
+                #[cfg(test)]
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::unique("about_outer_scroll_geometry"),
+                        (ui.clip_rect(), ui.cursor().min.y),
+                    )
+                });
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
                     ui.heading("mImageViewer");
@@ -131,6 +180,9 @@ impl App {
                         ui.label("LGPLv3-or-later — FFmpeg project");
                         ui.end_row();
 
+                        ui.label("AVIF (libavif / dav1d / libyuv)");
+                        ui.label("BSD ? AOMedia / VideoLAN / libyuv authors");
+                        ui.end_row();
                         ui.label("LibRaw");
                         ui.label("CDDL-1.0 — LibRaw LLC");
                         ui.end_row();
@@ -145,6 +197,10 @@ impl App {
 
                         ui.label("UnRAR");
                         ui.label("UnRAR license — Alexander Roshal / RARLAB");
+                        ui.end_row();
+
+                        ui.label(HARMNET_NOTICE.0);
+                        ui.label(HARMNET_NOTICE.1);
                         ui.end_row();
 
                         #[cfg(not(feature = "portable"))]
@@ -223,11 +279,20 @@ impl App {
 
                 ui.add_space(8.0);
                 draw_raw_license_snapshot_fixture(ui);
+                ui.separator();
+                draw_avif_license_snapshot_fixture(ui);
+
                 draw_license_text(
                     ui,
                     "Everything IPC 定義 (MIT) 全文",
                     "about_everything_ipc_notice",
                     EVERYTHING_IPC_NOTICE,
+                );
+                draw_license_text(
+                    ui,
+                    &format!("{} — MIT License 全文", HARMNET_NOTICE.0),
+                    "about_harmnet_license",
+                    HARMNET_NOTICE.2,
                 );
 
                 ui.add_space(6.0);
@@ -257,6 +322,10 @@ impl App {
                         .id_salt(("about_effetune_notice", relative_path))
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
                                 .id_salt(("about_effetune_notice_scroll", relative_path))
                                 .max_height(180.0)
                                 .show(ui, |ui| {
@@ -315,15 +384,82 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn egui037_about_builtin_scrollarea_mouse_drag_changes_offset() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.show_about_dialog = true;
+        let draw = |app: &mut crate::app::App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.show_about_dialog_window(&ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..4 {
+            draw(&mut app, vec![]);
+        }
+        let geometry = || {
+            ctx.data(|data| {
+                data.get_temp::<(egui::Rect, f32)>(egui::Id::unique("about_outer_scroll_geometry"))
+                    .unwrap()
+            })
+        };
+        let (clip, before) = geometry();
+        let start = egui::pos2(clip.right() - 28.0, clip.center().y);
+        let end = start - egui::vec2(0.0, 75.0);
+        draw(&mut app, vec![egui::Event::PointerMoved(start)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![]);
+        let (after_clip, after) = geometry();
+        assert!(
+            (after_clip.min - clip.min).length() < 1.0,
+            "drag scroll must retain the Window position"
+        );
+        assert!(
+            before - after > 20.0,
+            "actual built-in ScrollArea offset must advance on mouse drag: before={before}, after={after}"
+        );
+    }
+
     use super::{
-        EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, IJG_ATTRIBUTION, LIBJPEG_TURBO_LICENSE,
-        LIBRAW_LICENSE, ZLIB_LICENSE,
+        DAV1D_LICENSE, EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, IJG_ATTRIBUTION, LIBAVIF_LICENSE,
+        LIBJPEG_TURBO_LICENSE, LIBRAW_LICENSE, LIBYUV_LICENSE, ZLIB_LICENSE,
     };
 
     #[test]
     fn embedded_raw_notices_equal_tracked_files_with_bsd_and_ijg_attribution() {
         for (file, embedded) in [
             ("LIBRAW-LICENSE.txt", LIBRAW_LICENSE),
+            ("LIBAVIF-LICENSE.txt", LIBAVIF_LICENSE),
+            ("DAV1D-LICENSE.txt", DAV1D_LICENSE),
+            ("LIBYUV-LICENSE.txt", LIBYUV_LICENSE),
             ("ZLIB-LICENSE.txt", ZLIB_LICENSE),
             ("LIBJPEG-TURBO-LICENSE.txt", LIBJPEG_TURBO_LICENSE),
         ] {
@@ -347,6 +483,63 @@ mod tests {
         assert!(EGUI_LICENSE_MIT.contains("Copyright (c) 2018-2021 Emil Ernerfeldt"));
         assert!(EGUI_LICENSE_APACHE.contains("Apache License"));
         assert!(EGUI_LICENSE_APACHE.contains("Version 2.0, January 2004"));
+    }
+
+    // cfg を付けず、通常構成と portable 構成の両方で同じ登録・本文を検査する。
+    #[test]
+    fn harmnet_notice_is_registered_with_embedded_mit_license_in_every_build_flavor() {
+        use super::HARMNET_NOTICE;
+        assert_eq!(HARMNET_NOTICE.0, "EffeTune Note Spectrogram (HarmNet L)");
+        assert!(HARMNET_NOTICE.1.contains("MIT"));
+        let license = HARMNET_NOTICE.2;
+        assert!(license.contains("Copyright (c) 2025-2026, Yoshiyuki Kobayashi"));
+        assert!(license.contains("Permission is hereby granted, free of charge"));
+        assert!(license.contains("THE SOFTWARE IS PROVIDED \"AS IS\""));
+        let tracked = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("third_party/effetune-harmnet/LICENSE"),
+        )
+        .expect("HarmNet MIT license must be present");
+        assert_eq!(license, tracked);
+    }
+
+    #[test]
+    fn harmnet_notice_is_drawn_and_full_license_can_be_opened_in_every_build_flavor() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.show_about_dialog = true;
+        // Isolate the optional pack from the fixture; the dialog uses its normal
+        // rendering path, including the notice grid and collapsing license text.
+        app.editing_pack_about_loaded = true;
+        app.editing_pack_about = None;
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(eframe::egui::vec2(900.0, 2000.0))
+            .build_ui_state(
+                move |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    app.show_about_dialog_window(ctx);
+                },
+                app,
+            );
+        harness.run();
+        harness.get_by_label("EffeTune Note Spectrogram (HarmNet L)");
+        assert!(
+            harness.query_by_label(super::HARMNET_NOTICE.2).is_none(),
+            "the full text starts collapsed"
+        );
+        harness
+            .get_by_label("EffeTune Note Spectrogram (HarmNet L) — MIT License 全文")
+            .click_accesskit();
+        harness.run();
+        harness.get_by_label(super::HARMNET_NOTICE.2);
     }
 
     #[cfg(not(feature = "portable"))]
@@ -386,7 +579,7 @@ mod tests {
         for &(_, relative_path, embedded) in EFFETUNE_NOTICES {
             let tracked = std::fs::read(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("third_party/effetune-mixwright/v0.13.0")
+                    .join("third_party/effetune-mixwright/v0.14.0")
                     .join(relative_path),
             )
             .expect("Approved EffeTune notice must be present");
@@ -410,7 +603,7 @@ mod tests {
         }
         let vendor_version = std::fs::read_to_string(vendor.parent().unwrap().join("VERSION"))
             .expect("EffeTune vendor VERSION must be present");
-        assert_eq!(vendor_version.trim(), "v0.13.0");
+        assert_eq!(vendor_version.trim(), "v0.14.0");
         for &(_, relative_path, embedded) in EFFETUNE_NOTICES {
             let source = std::fs::read(vendor.join(relative_path))
                 .expect("EffeTune vendor notice must be present");

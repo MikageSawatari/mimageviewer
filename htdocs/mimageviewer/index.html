@@ -31,8 +31,8 @@
     "applicationCategory": "MultimediaApplication",
     "applicationSubCategory": "画像ビューア",
     "operatingSystem": "Windows 11 (64bit)",
-    "softwareVersion": "4.6.0",
-    "dateModified": "2026-10-12",
+    "softwareVersion": "4.8.3",
+    "dateModified": "2026-10-26",
     "inLanguage": "ja",
     "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。mImageViewer 本体の画像 AI 処理は利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
@@ -1039,7 +1039,7 @@
       <div class="feature-card">
         <div class="icon">📖</div>
         <h3>見開き表示</h3>
-        <p>2 ページを並べて表示。左右どちらの読み方向にも、表紙単独表示や連続スクロール読みにも対応します。合わせ直した見開きは本ごとに記憶し、横長の画像を左右に分けて 1 ページずつ読む「横長分割」も選べます。</p>
+        <p>左右の見開き・表紙単独・連続スクロール・横長分割に対応。見開きの調整を本ごとに記憶し、リモートにも反映します。通常フォルダにも<a href="manual/settings.html">既定のページ構成を使う設定</a>があります。検索・抽出一覧は単ページから始まり、一時的な見開きでも読めます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🗃️</div>
@@ -1059,7 +1059,7 @@
       <div class="feature-card">
         <div class="icon">📷</div>
         <h3>RAW・HEIC・AVIF・レトロ形式対応</h3>
-        <p>各社 RAW の表示・現像を内蔵し、まず埋め込みプレビューを表示します。HEIC・AVIF・JPEG XL・TIFF は Windows の表示機能で、PI / MAG / PIC など PC-98 / X68000 時代の形式も Susie プラグイン（.spi）で閲覧できます。</p>
+        <p>各社 RAW の表示・現像と AVIF の表示を内蔵しています。HEIC・JPEG XL・TIFF は Windows の表示機能で、PI / MAG / PIC など PC-98 / X68000 時代の形式も Susie プラグイン（.spi）で閲覧できます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🎬</div>
@@ -1104,7 +1104,7 @@
       <div class="feature-card">
         <div class="icon">🔍</div>
         <h3>横断検索・絞り込み</h3>
-        <p>Ctrl+F で今の一覧を絞り込み、Ctrl+G でお気に入り全体のファイル名・EXIF・AI プロンプトなどを横断検索。Ctrl+R は PC の Everything を使い、お気に入り外のファイルも探せます。<a href="manual/search.html">検索の使い分け</a></p>
+        <p>Ctrl+F で今の一覧を絞り込み、Ctrl+G でお気に入り全体のファイル名・EXIF・AI プロンプトなどを横断検索。Ctrl+R は PC の Everything を使い、お気に入り外のファイル・フォルダも探せます。<a href="manual/search.html">検索の使い分け</a></p>
       </div>
       <div class="feature-card">
         <div class="icon">📱</div>
@@ -1133,7 +1133,7 @@
       <li><strong>全画面中の固定表示</strong> — 上部バー・下部バーとストリップ・右情報パネル・ナビゲータを、F11 全画面の間だけ自動表示に切り替えられます。固定設定は保持します</li>
       <li><strong>その他の機能パネル</strong> — 上部バー右端の「×」の左にある「…」から、ナビゲータ・分析・ピクセルグリッド・ルーペ固定をタッチ / マウス共通で操作</li>
       <li><strong>アニメーション再生</strong> — GIF・APNG・Animated WebP をフルスクリーンでそのまま再生</li>
-      <li><strong>スライドショー</strong> — 間隔指定で自動送り。末尾でループ / 次フォルダ / 停止を選択</li>
+      <li><strong>スライドショー</strong> — 再生ボタンですぐに開始・停止。上部の「…」から間隔や末尾のループ / 次フォルダ / 停止を変更</li>
       <li><strong>360 度パノラマビュー</strong> — equirectangular パノラマを視点を動かして閲覧。消しゴム・隠蔽加工・補正レイヤーは高画質化には反映されません</li>
       <li><strong>PDF 表示</strong> — ページごとにサムネイル / 全画面表示。パスワード付きにも対応し、保存済みパスワードがある PDF は一覧にページ数を表示</li>
       <li><strong>EPUB 閲覧</strong> — DRM のない EPUB を変換して閲覧。変換した PDF を元の本と同じフォルダに保存することもできます</li>
@@ -1148,13 +1148,14 @@
       <li><strong>SNS 分割書き出し</strong> — 1 枚の絵を 2〜4 枚に切り分け、複数枚投稿で 1 枚の絵に見せるための画像を作成</li>
       <li><strong>バリエーション一括エクスポート</strong> — 補正・消しゴム・隠蔽の結果を JPEG/PNG/WebP で別ファイル保存</li>
       <li><strong>キャプチャコピー</strong> — 表示中の画像 / ページや、ドラッグした範囲をクリップボードへコピー</li>
-      <li><strong>外部ツール連携</strong> — よく使うアプリを登録し、右クリックやキー 1 つで表示中のページを渡して開く。ZIP / PDF の中のページや動画のコマも渡せます。複数の対象はファイルの一覧を書いたリストでも渡せます</li>
+      <li><strong>外部ツール連携</strong> — よく使うアプリを登録し、右クリックやキー 1 つで選択したフォルダーや表示中のページを渡して開く。ZIP / PDF の中のページや動画のコマも渡せます。複数の対象はファイルの一覧を書いたリストでも渡せます</li>
       <li><strong>画像色で絞り込み</strong> — 選んだ色を主要色に含む画像だけを抽出（カラー検索）</li>
       <li><strong>コンテナ検索</strong> — Ctrl+S でフォルダ・ZIP・PDF を名前で横断検索</li>
       <li><strong>代表サムネを手動で指定</strong> — フォルダ / ZIP / PDF の表紙を好きな 1 枚に固定</li>
       <li><strong>お気に入りフォルダ</strong> — よく使うフォルダに名前を付けて登録</li>
       <li><strong>スマートフォルダ</strong> — ダウンロード先と複数の整理済みフォルダなど、任意の場所から本・画像・動画・音声を表示条件付きのフラット一覧へ集約</li>
       <li><strong>フォルダツリー巡回</strong> — 左ツリー表示と Ctrl+↑↓ の深さ優先フォルダ移動</li>
+      <li><strong>一覧順で本を巡回</strong> — Ctrl+Shift+↑↓ で、最後に通常フォルダ一覧から本を開いたときの絞り込み・並べ替え順に前後の本を表示。<a href="manual/fullscreen.html#list-order-navigation">使い方</a></li>
       <li><strong>自動索引管理</strong> — ファイル追加 / 更新 / 削除を自動監視して索引を最新に維持</li>
       <li><strong>同名ファイル処理</strong> — 同名 ZIP を優先し、書庫 + フォルダ、動画・音声 + 画像なども自動整理</li>
       <li><strong>ZIP ファイルへ変換</strong> — RAR / 7z / LZH と同じ場所へ、通常ファイルとして残る同名 ZIP を作成</li>
@@ -1166,8 +1167,9 @@
       <li><strong>動画タイルモード</strong> — 動画全体を等間隔サムネで一覧し、クリック位置から再生</li>
       <li><strong>VST3 プラグイン対応</strong> — 動画・音楽の音声を VST3 チェーンに通して分析・加工（別プロセスで隔離）</li>
       <li><strong>ゲームパッド対応</strong> — Xbox 系パッドで一覧移動・ページ送り・フォルダ操作</li>
-      <li><strong>操作カスタマイズの共有・比較</strong> — キー、リング / マウス、通常メニュー / 右クリックメニューの構成を 1 ファイルで共有し、標準や過去の状態との差分を確認して再起動なしで取り込み。一覧の先頭 / 末尾は、選択を移動する操作と選択を保つスクロールを個別に割り当て可能。最近開いたフォルダ履歴、A/B の記憶した場所と一覧位置のクリアも割り当て可能。一覧のファイル整理先選択と画像のズーム／フィット方式切り替えも、リング、マウスジェスチャ、戻る／進む／ホイールクリックへ割り当て可能</li>
-      <li><strong>カスタマイズ可能なツールバー</strong> — 表示セクション・並び順・表示形式・場所メニューや絞り込みボタンを右クリックで調整</li>
+      <li><strong>操作カスタマイズの共有・比較</strong> — キー、リング / マウス、通常メニュー / 右クリックメニューの構成を 1 ファイルで共有し、標準や過去の状態との差分を確認して再起動なしで取り込み。一覧の先頭 / 末尾は、選択を移動する操作と選択を保つスクロールを個別に割り当て可能。最近開いたフォルダ履歴、A/B の記憶した場所と一覧位置、保存済みの再生位置・読書位置のクリアもキーへ割り当て可能。一覧のファイル整理先選択と画像のズーム／フィット方式切り替えも、リング、マウスジェスチャ、戻る／進む／ホイールクリックへ割り当て可能</li>
+      <li><strong>通知の表示時間</strong> — 短い / 標準 / 長いから選択。警告やエラーは短い設定でも読む時間を確保します</li>
+      <li><strong>カスタマイズ可能なツールバー</strong> — 表示セクション・並び順・表示形式・場所メニューや絞り込みボタンを右クリックで調整。4種類の検索欄も個別に常設可能</li>
       <li><strong>サムネイル画質設定</strong> — キャッシュのサイズと品質を A/B 比較で調整</li>
       <li><strong>タスクトレイ常駐</strong> — 閉じても監視を継続し、重いリソースは解放</li>
       <li><strong>外部追加ファイルの自動反映</strong> — 他アプリが追加 / 削除したファイルを手動リロード不要で反映</li>
@@ -1181,7 +1183,7 @@
 
   <section id="formats">
     <h2>対応フォーマット</h2>
-    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP、各社 RAW（内蔵）／ HEIC・AVIF・JPEG XL・TIFF（Windows の表示機能）。<a href="manual/formats.html#raw">RAW の対応形式と制限</a></p>
+    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP、各社 RAW・AVIF（追加インストール不要）／ HEIC・JPEG XL・TIFF（Windows の表示機能）。<a href="manual/formats.html#raw">RAW の対応形式と制限</a></p>
     <p><strong>アニメーション：</strong>アニメーション GIF、APNG、Animated WebP</p>
     <p><strong>動画：</strong>MP4、AVI、MOV、MKV、WMV、MPEG（サムネイル表示 + フルスクリーン再生）</p>
     <p><strong>ドキュメント：</strong>PDF（ページごとに表示、パスワード付き対応）</p>
@@ -1201,6 +1203,7 @@
     </ul>
     <p style="margin-top:0.9rem; font-size:0.82rem; color:#888; line-height:1.7;">
       ※ 動作確認は主に NVIDIA GeForce 環境で行っています。Intel / AMD など他の GPU でも動作しますが、不具合がありましたらご連絡ください。
+      表示処理の失敗などで終了した場合の案内とログの場所は、<a href="manual/troubleshooting.html#display-failure">トラブルシューティング</a>をご覧ください。
     </p>
   </section>
 
@@ -1209,15 +1212,13 @@
     <h2>安心して使えます</h2>
     <div class="trust-grid">
       <div class="trust-item">
-        <h3>🔒 AI 処理は PC の中で</h3>
+        <h3>🔒 本体の画像 AI 処理は PC の中で</h3>
         <p>AI アップスケール・ノイズ除去・消しゴムの補完・画像タイプの自動判別は、
           <strong>すべてお使いの PC の GPU で実行</strong>されます。AI 処理のために画像を外部へアップロードすることはありません。</p>
       </div>
       <div class="trust-item">
         <h3>🌐 通信が発生する場面</h3>
-        <p>新しいバージョンの確認（<strong>設定でオフにできます</strong>）のほかは、追加コンポーネントのダウンロード・リモート閲覧・Web ページの画像の取り込みなど、
-          <strong>ご自分で選んだ機能を使うときだけ</strong>通信します。画像・動画・音声が開発者のサーバーへ送られることはありません。
-          Everything 検索の問い合わせは同じ PC 内の IPC で行い、外部の検索サービスを使いません。</p>
+        <p>更新確認（<strong>設定でオフにできます</strong>）のほかは、追加コンポーネントの取得・リモート閲覧・Web 画像の取り込みなど、<strong>ご自分で選んだ機能だけ</strong>が通信します。画像・動画・音声は開発者のサーバーへ送信しません。Everything 検索は同じ PC 内で行います。</p>
       </div>
       <div class="trust-item">
         <h3>✅ コード署名済み</h3>
@@ -1240,6 +1241,7 @@
       </div>
     </div>
     <p class="trust-note">
+      音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。
       通信の内容・データの保存場所（アンインストール後も残るものを含む）の一覧は <a href="privacy.html">プライバシーポリシー</a>、
       実装は <a href="https://github.com/MikageSawatari/mimageviewer">ソースコード（GitHub）</a> をご覧ください。
     </p>
@@ -1250,13 +1252,13 @@
     <h2>ダウンロード</h2>
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
-        <div class="version">mImageViewer v4.6.0</div>
-        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-10-12</div>
+        <div class="version">mImageViewer v4.8.3</div>
+        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-10-26</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
         <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラ版</a>
         <a class="btn-download" style="background:linear-gradient(135deg,#ffb0d9,#d63384);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">単体 exe 版</a>
-        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v4.6.0.zip">ポータブル版（zip）</a>
+        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v4.8.3.zip">ポータブル版（zip）</a>
       </div>
 
       <!-- Microsoft Store（副導線） -->
@@ -1453,6 +1455,7 @@
     </p>
     <ul style="font-size:0.82rem; color:#888; line-height:1.5;">
       <li>libopenh264（BSD-2-Clause + 特許条項） — <a href="https://github.com/cisco/openh264">github.com/cisco/openh264</a></li>
+      <li>AVIF 表示: libavif（BSD-2-Clause）・dav1d（BSD-2-Clause）・libyuv（BSD-3-Clause）。ライセンス全文と著作権表記はアプリの「バージョン情報」から確認でき、配布物には LIBAVIF-LICENSE.txt・DAV1D-LICENSE.txt・LIBYUV-LICENSE.txt も同梱しています</li>
       <li>libdav1d（BSD-2-Clause） — <a href="https://code.videolan.org/videolan/dav1d">code.videolan.org/videolan/dav1d</a></li>
       <li>libsvtav1（BSD-3-Clause + 特許条項） — <a href="https://gitlab.com/AOMediaCodec/SVT-AV1">gitlab.com/AOMediaCodec/SVT-AV1</a></li>
       <li>libaom（BSD-2-Clause + AOM 特許ライセンス） — <a href="https://aomedia.googlesource.com/aom/">aomedia.googlesource.com/aom</a></li>

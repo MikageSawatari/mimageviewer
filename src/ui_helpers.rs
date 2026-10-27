@@ -13,6 +13,158 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// Own immutable snapshot assets until their Context is dropped. kittest 0.37
+/// handles texture frees before capture, so draw-local handles cannot own them.
+/// Content and sampling are part of the key: fixture names alone can repeat.
+/// This is only for the snapshot fixture entry points, not product image loading.
+pub(crate) fn load_snapshot_texture(
+    ctx: &egui::Context,
+    name: impl Into<String>,
+    image: egui::ColorImage,
+    options: egui::TextureOptions,
+) -> egui::TextureHandle {
+    let name = name.into();
+    let key = egui::Id::unique((
+        "snapshot-texture-asset",
+        &name,
+        image.size,
+        &image.pixels,
+        options,
+    ));
+    if let Some(texture) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(key)) {
+        return texture;
+    }
+    let texture = ctx.load_texture(name, image, options);
+    ctx.data_mut(|data| data.insert_temp(key, texture.clone()));
+    texture
+}
+
+/// Virtualized grids own the complete row slot (tile plus their explicit gap).
+/// egui's show_rows otherwise adds Ui item_spacing a second time.
+pub(crate) fn show_fixed_slot_rows<R>(
+    ui: &mut egui::Ui,
+    scroll: egui::ScrollArea,
+    slot_height: f32,
+    rows: usize,
+    draw: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        scroll.show_rows(ui, slot_height, rows, draw)
+    })
+    .inner
+}
+
+#[cfg(test)]
+mod calculated_grid_height_tests {
+    use super::*;
+    use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+
+    #[test]
+    fn calculated_reorder_grid_slots_fit_and_scroll_to_last_row() {
+        for height in [440.0, 140.0] {
+            let ctx = egui::Context::default();
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, height));
+            let draw = |events| {
+                let mut measured = None;
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|root_ui| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    root_ui,
+                                    |ui| {
+                                        // Both reorder dialogs use 78pt tiles, 8pt explicit Grid gaps,
+                                        // and calculate a complete 86pt slot for scrolling and End.
+                                        ui.spacing_mut().item_spacing.y = 13.0; // unrelated ambient style
+                                        let output = show_fixed_slot_rows(
+                                            ui,
+                                            egui::ScrollArea::vertical()
+                                                .scroll_source(egui::scroll_area::ScrollSource {
+                                                    drag: egui::scroll_area::DragScroll::Always,
+                                                    ..Default::default()
+                                                })
+                                                .max_height(430.0)
+                                                .auto_shrink([false, false]),
+                                            86.0,
+                                            5,
+                                            |ui, rows| {
+                                                egui::Grid::new("reorder")
+                                                    .num_columns(2)
+                                                    .spacing(egui::vec2(8.0, 8.0))
+                                                    .show(ui, |ui| {
+                                                        for _ in rows {
+                                                            for _ in 0..2 {
+                                                                ui.allocate_exact_size(
+                                                                    egui::vec2(58.0, 78.0),
+                                                                    egui::Sense::click(),
+                                                                );
+                                                            }
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            },
+                                        );
+                                        measured = Some(ScrollLayout::from_output(&output));
+                                    },
+                                )
+                            });
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                measured.unwrap()
+            };
+            let mut before = draw(vec![]);
+            for _ in 0..3 {
+                before = draw(vec![]);
+            }
+            assert_eq!(
+                before.content.y, 430.0,
+                "virtual slots and keyboard content height agree"
+            );
+            before.assert_height(
+                if height > 400.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                viewport,
+                ctx.pixels_per_point(),
+            );
+            if height < 400.0 {
+                let mut after = before;
+                for frame in 0..40 {
+                    after = draw(if frame == 0 {
+                        vec![
+                            egui::Event::PointerMoved(before.inner.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -4000.0),
+                                modifiers: egui::Modifiers::NONE,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    });
+                }
+                after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+            }
+            assert_eq!(
+                ctx.global_style().spacing.item_spacing.y,
+                3.0,
+                "local row-slot style must not leak"
+            );
+        }
+    }
+}
+
 /// Partition a modal input shield around the exact controls drawn in this frame.
 /// No persistent hit-area state; both renderers pass their HUD drawing rectangles.
 pub(crate) fn modal_shield_rects(full: egui::Rect, allowed: &[egui::Rect]) -> Vec<egui::Rect> {
@@ -280,11 +432,11 @@ const BRUSH_WHEEL_POINT_PER_NOTCH: f32 = 40.0;
 pub(crate) fn draw_panel_tab_button(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     selected: bool,
 ) -> egui::Response {
-    let response = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let response = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
     let background = if selected {
         egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
     } else if response.hovered() {
@@ -311,11 +463,13 @@ fn shift_wheel_notches(events: &[egui::Event]) -> f32 {
                 unit,
                 delta,
                 modifiers,
+                phase,
+                ..
             } = event
             else {
                 return None;
             };
-            if *modifiers != egui::Modifiers::SHIFT {
+            if *modifiers != egui::Modifiers::SHIFT || *phase != egui::TouchPhase::Move {
                 return None;
             }
             // Shift による egui の水平スクロール化は raw_scroll_delta へ反映される。
@@ -356,12 +510,8 @@ pub(crate) fn apply_brush_radius_wheel(
 
     *radius = crate::manual_mask_tools::brush_radius_after_wheel(*radius, notches, min, max);
     let applied = *radius;
-    ctx.input_mut(|input| {
-        input.raw_scroll_delta = egui::Vec2::ZERO;
-        input.smooth_scroll_delta = egui::Vec2::ZERO;
-        input
-            .events
-            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+    crate::wheel_input::consume_remaining_wheel_inputs(ctx, |wheel| {
+        wheel.modifiers == egui::Modifiers::SHIFT && wheel.phase == egui::TouchPhase::Move
     });
     Some(applied)
 }
@@ -827,15 +977,27 @@ fn cursor_extent_physical_win() -> Option<(f32, f32)> {
 #[allow(dead_code)]
 fn cursor_anchor_rect(ctx: &egui::Context) -> Option<egui::Rect> {
     let pos = ctx.pointer_hover_pos()?;
-    let ppp = ctx.pixels_per_point();
-    let (above, below) = match cursor_extent_physical() {
+    Some(cursor_anchor_rect_from_extent(
+        pos,
+        ctx.pixels_per_point(),
+        cursor_extent_physical(),
+    ))
+}
+
+/// Resolve measured or explicitly supplied physical cursor extents without OS access.
+fn cursor_anchor_rect_from_extent(
+    pos: egui::Pos2,
+    ppp: f32,
+    extent_physical: Option<(f32, f32)>,
+) -> egui::Rect {
+    let (above, below) = match extent_physical {
         Some((a, b)) => (a / ppp, b / ppp),
         None => (0.0, CURSOR_FALLBACK_EXTENT),
     };
-    Some(egui::Rect::from_min_max(
+    egui::Rect::from_min_max(
         egui::pos2(pos.x, pos.y - above),
         egui::pos2(pos.x, pos.y + below),
-    ))
+    )
 }
 
 /// hover 中のウィジェットだけカーソル実寸を計測する（毎フレーム全ウィジェットで
@@ -847,6 +1009,42 @@ fn anchor_for(resp: &egui::Response) -> Option<egui::Rect> {
         .flatten()
 }
 
+/// Fixture input: physical pixels above/below the hotspot, independent of the desktop cursor.
+pub(crate) fn hover_tip_disabled_with_cursor_extent(
+    response: egui::Response,
+    text: impl Into<egui::WidgetText>,
+    extent_physical: (f32, f32),
+) -> egui::Response {
+    let anchor = response
+        .contains_pointer()
+        .then(|| response.ctx.pointer_hover_pos())
+        .flatten()
+        .map(|pos| {
+            cursor_anchor_rect_from_extent(
+                pos,
+                response.ctx.pixels_per_point(),
+                Some(extent_physical),
+            )
+        });
+    hover_tip_disabled_at_anchor(response, text, anchor)
+}
+
+fn hover_tip_disabled_at_anchor(
+    response: egui::Response,
+    text: impl Into<egui::WidgetText>,
+    anchor: Option<egui::Rect>,
+) -> egui::Response {
+    let text = tooltip_text_with_accessibility(&response, text);
+    show_offset_tooltip(
+        &response.ctx,
+        egui::Tooltip::for_disabled(&response),
+        false,
+        anchor,
+        text,
+    );
+    response
+}
+
 /// tooltip をカーソル画像の外側へずらして表示する共通処理。
 #[allow(dead_code)]
 fn show_offset_tooltip(
@@ -854,7 +1052,7 @@ fn show_offset_tooltip(
     tip: egui::Tooltip<'_>,
     dark: bool,
     anchor: Option<egui::Rect>,
-    text: impl Into<egui::WidgetText>,
+    text: impl FnOnce() -> egui::WidgetText,
 ) {
     show_offset_tooltip_with_observer(ctx, tip, dark, anchor, text, |_, _| {});
 }
@@ -865,7 +1063,7 @@ fn show_offset_tooltip_with_observer(
     tip: egui::Tooltip<'_>,
     dark: bool,
     anchor: Option<egui::Rect>,
-    text: impl Into<egui::WidgetText>,
+    text: impl FnOnce() -> egui::WidgetText,
     on_render: impl FnOnce(&egui::Ui, &egui::Response),
 ) {
     let mut tip = tip.gap(TOOLTIP_GAP);
@@ -873,19 +1071,24 @@ fn show_offset_tooltip_with_observer(
         Some(rect) => tip.popup = tip.popup.anchor(rect),
         None => tip = tip.at_pointer(),
     }
+    let frame = if dark {
+        crate::os_theme::dark_popup_frame(ctx)
+    } else {
+        egui::Frame::popup(&ctx.global_style())
+    };
+    let content_width = (ctx.content_rect().width() - frame.total_margin().sum().x).max(1.0);
+    tip.popup = tip.popup.frame(frame);
     if dark {
-        tip.popup = tip
-            .popup
-            .style(crate::os_theme::dark_popup_style(ctx))
-            .frame(crate::os_theme::dark_popup_frame(ctx));
+        tip.popup = tip.popup.style(crate::os_theme::dark_popup_style(ctx));
     }
     tip.show(|ui| {
-        // 動的な内容で Area が縮まないよう最大幅を固定する（egui issue #5167）。
-        ui.set_max_width(ui.spacing().tooltip_width);
+        // Keep dynamic Area sizing stable, bounded by the actual viewport in
+        // UI points (including zoom), with room for the popup frame.
+        ui.set_max_width(ui.spacing().tooltip_width.min(content_width));
         if dark {
             crate::os_theme::apply_dark_ui(ui);
         }
-        let label = ui.add(egui::Label::new(text));
+        let label = ui.add(egui::Label::new(text()).wrap());
         on_render(ui, &label);
     });
 }
@@ -898,13 +1101,14 @@ pub(crate) fn hover_tip_disabled_observed(
     text: &'static str,
     on_render: impl FnOnce(&egui::Ui, &egui::Response, &'static str),
 ) -> egui::Response {
+    let tooltip_text = tooltip_text_with_accessibility(&response, text);
     let anchor = anchor_for(&response);
     show_offset_tooltip_with_observer(
         &response.ctx,
         egui::Tooltip::for_disabled(&response),
         false,
         anchor,
-        text,
+        tooltip_text,
         |ui, label| on_render(ui, label, text),
     );
     response
@@ -925,8 +1129,57 @@ pub(crate) trait HoverTipExt {
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self;
 }
 
+/// Supply a spoken name without replacing the widget's role, value or state.
+/// Like egui 0.37's `Response::accessible_name`, this changes only the label.
+/// A DragValue's meaning is named separately from its numeric value.
+/// Both versions expose this API; no visible text is added.
+pub(crate) fn set_accessibility_label(response: &egui::Response, label: &str) {
+    set_accessibility_label_with(response, || label);
+}
+
+/// Build a dynamic spoken name only when AccessKit visits the widget's node.
+pub(crate) fn set_accessibility_label_with<S: AsRef<str>>(
+    response: &egui::Response,
+    label: impl FnOnce() -> S,
+) {
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        let label = label();
+        let label = label.as_ref();
+        if !label.trim().is_empty() {
+            node.set_label(label);
+        }
+    });
+}
+
+/// Match 0.37's hover-text fallback while preserving explicit names/relations.
+/// Convert at most once: when an unnamed AccessKit node needs it, or when the
+/// tooltip content is rendered. With neither consumer, conversion is skipped.
+fn tooltip_text_with_accessibility<T: Into<egui::WidgetText>>(
+    response: &egui::Response,
+    text: T,
+) -> impl FnOnce() -> egui::WidgetText + use<T> {
+    let mut pending = Some(text);
+    let mut converted = None;
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        if !matches!(
+            node.role(),
+            egui::accesskit::Role::Unknown | egui::accesskit::Role::Label
+        ) && node.labelled_by().is_empty()
+            && node.label().is_none_or(str::is_empty)
+        {
+            let text: egui::WidgetText = pending.take().unwrap().into();
+            if !text.text().trim().is_empty() {
+                node.set_label(text.text());
+            }
+            converted = Some(text);
+        }
+    });
+    move || converted.unwrap_or_else(|| pending.unwrap().into())
+}
+
 impl HoverTipExt for egui::Response {
     fn hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
+        let text = tooltip_text_with_accessibility(&self, text);
         let anchor = anchor_for(&self);
         show_offset_tooltip(
             &self.ctx,
@@ -939,6 +1192,7 @@ impl HoverTipExt for egui::Response {
     }
 
     fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
+        let text = tooltip_text_with_accessibility(&self, text);
         let anchor = anchor_for(&self);
         // The fullscreen bar contains many buttons. Avoid cloning a complete dark Style for
         // every button on every frame when no tooltip can be shown.
@@ -956,14 +1210,279 @@ impl HoverTipExt for egui::Response {
 
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self {
         let anchor = anchor_for(&self);
-        show_offset_tooltip(
-            &self.ctx,
-            egui::Tooltip::for_disabled(&self),
-            false,
-            anchor,
-            text,
+        hover_tip_disabled_at_anchor(self, text, anchor)
+    }
+}
+
+#[cfg(test)]
+mod accessibility_names_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cursor_anchor_uses_explicit_physical_extents_and_logical_fallback() {
+        let pos = egui::pos2(80.0, 60.0);
+        assert_eq!(
+            cursor_anchor_rect_from_extent(pos, 1.0, Some((4.0, 30.0))),
+            egui::Rect::from_min_max(egui::pos2(80.0, 56.0), egui::pos2(80.0, 90.0))
         );
-        self
+        assert_eq!(
+            cursor_anchor_rect_from_extent(pos, 2.0, Some((4.0, 30.0))),
+            egui::Rect::from_min_max(egui::pos2(80.0, 58.0), egui::pos2(80.0, 75.0))
+        );
+        for ppp in [1.0, 2.0] {
+            assert_eq!(
+                cursor_anchor_rect_from_extent(pos, ppp, None),
+                egui::Rect::from_min_max(pos, egui::pos2(80.0, 94.0))
+            );
+        }
+    }
+
+    struct CountedTooltip<'a>(&'a Cell<usize>);
+
+    impl From<CountedTooltip<'_>> for egui::WidgetText {
+        fn from(text: CountedTooltip<'_>) -> Self {
+            text.0.set(text.0.get() + 1);
+            "操作の説明".into()
+        }
+    }
+
+    #[test]
+    fn non_hovered_tooltips_skip_conversion_without_accesskit() {
+        let ctx = egui::Context::default();
+        let conversions = Cell::new(0);
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.button("").hover_tip(CountedTooltip(&conversions));
+                        ui.button("").hover_tip_dark(CountedTooltip(&conversions));
+                        ui.add_enabled(false, egui::Button::new(""))
+                            .hover_tip_disabled(CountedTooltip(&conversions));
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
+        assert_eq!(conversions.get(), 0);
+    }
+
+    #[test]
+    fn accesskit_only_converts_tooltips_for_unnamed_input_nodes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let conversions = Cell::new(0);
+                        ui.button("").hover_tip(CountedTooltip(&conversions));
+                        ui.button("").hover_tip_dark(CountedTooltip(&conversions));
+                        ui.add_enabled(false, egui::Button::new(""))
+                            .hover_tip_disabled(CountedTooltip(&conversions));
+                        assert_eq!(conversions.get(), 3);
+
+                        let named_conversions = Cell::new(0);
+                        ui.button("既存名")
+                            .hover_tip(CountedTooltip(&named_conversions));
+                        let label = ui.label("既存ラベル");
+                        ui.button("")
+                            .labelled_by(label.id)
+                            .hover_tip(CountedTooltip(&named_conversions));
+                        ui.label("説明")
+                            .hover_tip(CountedTooltip(&named_conversions));
+                        assert_eq!(named_conversions.get(), 0);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn tooltip_rendering_converts_once_and_reuses_accesskit_text() {
+        for accesskit in [false, true] {
+            let ctx = egui::Context::default();
+            if accesskit {
+                ctx.enable_accesskit();
+            }
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response = ui.button("");
+                            let conversions = Cell::new(0);
+                            let text = tooltip_text_with_accessibility(
+                                &response,
+                                CountedTooltip(&conversions),
+                            );
+                            assert_eq!(conversions.get(), usize::from(accesskit));
+                            let renders = Cell::new(0);
+                            show_offset_tooltip_with_observer(
+                                ctx,
+                                egui::Tooltip::for_widget(&response),
+                                false,
+                                Some(response.rect),
+                                text,
+                                |_, _| {
+                                    renders.set(renders.get() + 1);
+                                    assert_eq!(conversions.get(), 1);
+                                },
+                            );
+                            assert_eq!(renders.get(), 1);
+                            assert_eq!(conversions.get(), 1);
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn tooltip_text_wraps_inside_zoomed_viewport_after_resize_in_both_themes() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_zoom_factor(2.0);
+            // Reuse one tooltip Area while the physical work area gets smaller.
+            for width in [960.0, 640.0, 480.0] {
+                for _ in 0..3 {
+                    crate::test_ui::headless_paint_output(ctx.run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width / 2.0, 290.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|ui| {
+                                let response = ui.button("Anchor");
+                                show_offset_tooltip_with_observer(
+                                    ctx,
+                                    egui::Tooltip::for_widget(&response),
+                                    dark,
+                                    Some(response.rect),
+                                    || "A long explanation must remain fully readable even when the UI is enlarged and the work area becomes smaller. ".repeat(3).into(),
+                                    |ui, label| {
+                                        assert!(label.rect.width() <= ctx.content_rect().width());
+                                        assert!(ui.clip_rect().contains_rect(label.rect), "viewport={:?}, label={:?}", ctx.content_rect(), label.rect);
+                                    },
+                                );
+                            });
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_accessibility_names_are_built_only_in_node_callback() {
+        for accesskit in [false, true] {
+            let ctx = egui::Context::default();
+            if accesskit {
+                ctx.enable_accesskit();
+            }
+            let mut id = egui::Id::NULL;
+            let output =
+                crate::test_ui::headless_paint_output(ctx.run_pass(Default::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response = ui.button("");
+                            id = response.id;
+                            let builds = Cell::new(0);
+                            set_accessibility_label_with(&response, || {
+                                builds.set(builds.get() + 1);
+                                format!("対象 / {}", 1)
+                            });
+                            assert_eq!(builds.get(), usize::from(accesskit));
+                        })
+                    });
+                }));
+            if accesskit {
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                let node = &nodes
+                    .iter()
+                    .find(|(node_id, _)| node_id.0 == id.value())
+                    .unwrap()
+                    .1;
+                assert_eq!(node.label(), Some("対象 / 1"));
+            }
+        }
+    }
+
+    #[test]
+    fn tooltip_names_are_available_without_hover_and_preserve_widget_metadata() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut slider_value = 0.25;
+        let mut ids = Vec::new();
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ids.clear();
+                        ids.push(ui.button("").hover_tip("通常の操作").id);
+                        ids.push(ui.button("").hover_tip_dark("暗色の操作").id);
+                        ids.push(
+                            ui.add_enabled(false, egui::Button::new(""))
+                                .hover_tip_disabled("無効な操作")
+                                .id,
+                        );
+                        ids.push(
+                            ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0))
+                                .hover_tip("適用量")
+                                .id,
+                        );
+                        ids.push(ui.button("既存の名前").hover_tip("補足説明").id);
+                        let label = ui.label("既存ラベル");
+                        let response = ui.button("").labelled_by(label.id).hover_tip("別の説明");
+                        ids.push(response.id);
+                        ids.push(label.id);
+                        let mut days = 7;
+                        let drag = ui.add(egui::DragValue::new(&mut days).range(1..=30));
+                        set_accessibility_label(&drag, "日数");
+                        ids.push(drag.id);
+                        let mut checked = true;
+                        let checkbox = ui.checkbox(&mut checked, "");
+                        set_accessibility_label(&checkbox, "対象");
+                        ids.push(checkbox.id);
+                    })
+                });
+            }));
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let node = |index: usize| {
+            &nodes
+                .iter()
+                .find(|(id, _)| id.0 == ids[index].value())
+                .unwrap()
+                .1
+        };
+        for (index, name) in [
+            "通常の操作",
+            "暗色の操作",
+            "無効な操作",
+            "適用量",
+            "既存の名前",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(node(index).label(), Some(name));
+        }
+        assert!(node(2).is_disabled());
+        assert_eq!(node(3).role(), egui::accesskit::Role::Slider);
+        assert_eq!(node(3).numeric_value(), Some(0.25));
+        assert_eq!(node(3).min_numeric_value(), Some(0.0));
+        assert_eq!(node(3).max_numeric_value(), Some(1.0));
+        assert_eq!(
+            node(5).labelled_by(),
+            &[egui::accesskit::NodeId(ids[6].value())]
+        );
+        assert!(node(5).label().is_none_or(str::is_empty));
+        assert_eq!(node(7).label(), Some("日数"));
+        assert_eq!(node(7).role(), egui::accesskit::Role::SpinButton);
+        assert_eq!(node(7).numeric_value(), Some(7.0));
+        assert_eq!(node(8).label(), Some("対象"));
+        assert_eq!(node(8).toggled(), Some(egui::accesskit::Toggled::True));
     }
 }
 
@@ -1073,8 +1592,8 @@ fn clamp_cursor_range(
     let Some(mut range) = range else {
         return CCursorRange::one(CCursor::new(char_count));
     };
-    range.primary.index = range.primary.index.min(char_count);
-    range.secondary.index = range.secondary.index.min(char_count);
+    range.primary.index = range.primary.index.min(egui::text::CharIndex(char_count));
+    range.secondary.index = range.secondary.index.min(egui::text::CharIndex(char_count));
     range
 }
 
@@ -1765,6 +2284,14 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
 // アイテムナビゲーション
 // -----------------------------------------------------------------------
 
+/// One-based still-image position shared by the HUD and bookmark hints.
+pub(crate) fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
+    image_indices
+        .iter()
+        .position(|&image_idx| image_idx == idx)
+        .map(|pos| pos + 1)
+}
+
 /// `display_order` の中から、連結読み・ページジャンプ・スライドショーで使う
 /// 静止画ページ (通常画像 + ZIP 画像 + PDF ページ) の item index を返す。
 ///
@@ -1806,6 +2333,42 @@ pub(crate) fn reset_still_image_display_indices_build_count_for_test() {
 #[cfg(test)]
 pub(crate) fn still_image_display_indices_build_count_for_test() -> usize {
     STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.get()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdjacentStep {
+    pub(crate) idx: usize,
+    pub(crate) wrapped: bool,
+}
+
+/// Manual navigation alone may cross the ends of the owning context's order.
+/// Keep the non-wrapping helper unchanged for automatic navigation and prefetch.
+pub(crate) fn adjacent_idx_in_order_wrapping(
+    nav_indices: &[usize],
+    current: usize,
+    delta: i32,
+    wrap: bool,
+) -> Option<AdjacentStep> {
+    if let Some(idx) = adjacent_idx_in_order(nav_indices, current, delta) {
+        return Some(AdjacentStep {
+            idx,
+            wrapped: false,
+        });
+    }
+    if !wrap || delta == 0 || nav_indices.len() <= 1 {
+        return None;
+    }
+    // An absent current has no defined position in this order; preserve the
+    // existing fallback rather than inventing a wrap from a different context.
+    let position = nav_indices.iter().position(|&idx| idx == current)?;
+    let idx = if delta > 0 && position == nav_indices.len() - 1 {
+        *nav_indices.first()?
+    } else if delta < 0 && position == 0 {
+        *nav_indices.last()?
+    } else {
+        return None;
+    };
+    (idx != current).then_some(AdjacentStep { idx, wrapped: true })
 }
 
 pub(crate) fn adjacent_idx_in_order(
@@ -1882,6 +2445,37 @@ pub fn adjacent_page_navigation_idx(
     } else {
         adjacent_navigable_idx(items, display_order, current, delta)
     }
+}
+
+pub(crate) fn adjacent_page_navigation_idx_wrapping(
+    items: &[GridItem],
+    display_order: &[usize],
+    current: usize,
+    delta: i32,
+    continuous_reading: bool,
+    wrap: bool,
+) -> Option<AdjacentStep> {
+    let nav = if continuous_reading {
+        still_image_display_indices(items, display_order)
+    } else {
+        display_order
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                matches!(
+                    items.get(idx),
+                    Some(
+                        GridItem::Image(_)
+                            | GridItem::Video(_)
+                            | GridItem::Audio(_)
+                            | GridItem::ZipImage { .. }
+                            | GridItem::PdfPage { .. }
+                    )
+                )
+            })
+            .collect()
+    };
+    adjacent_idx_in_order_wrapping(&nav, current, delta, wrap)
 }
 
 fn page_jump_nav_indices(items: &[GridItem], display_order: &[usize]) -> Vec<usize> {
@@ -2290,6 +2884,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_texture_assets_survive_local_drop_without_name_or_context_aliasing() {
+        fn harness(colors: [egui::Color32; 2]) -> egui_kittest::Harness<'static, ()> {
+            crate::test_ui::builder()
+                .with_size(egui::vec2(64.0, 32.0))
+                .build_ui(move |ui| {
+                    for (index, color) in colors.into_iter().enumerate() {
+                        // Same name, distinct immutable assets. The local handle
+                        // is dropped before kittest processes this pass's delta.
+                        let texture = load_snapshot_texture(
+                            ui.ctx(),
+                            "same-fixture-name",
+                            egui::ColorImage::new([4, 4], vec![color; 16]),
+                            egui::TextureOptions::NEAREST,
+                        );
+                        let x = 8.0 + 24.0 * index as f32;
+                        ui.ctx()
+                            .layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::unique("fixture-assets"),
+                            ))
+                            .image(
+                                texture.id(),
+                                egui::Rect::from_min_size(
+                                    egui::pos2(x, 8.0),
+                                    egui::vec2(16.0, 16.0),
+                                ),
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                    }
+                })
+        }
+        fn assert_pixels(h: &mut egui_kittest::Harness<'_, ()>, colors: [egui::Color32; 2]) {
+            let image = h.render().expect("offscreen fixture readback");
+            for (index, color) in colors.into_iter().enumerate() {
+                assert_eq!(
+                    image.get_pixel(12 + 24 * index as u32, 12).0,
+                    color.to_array()
+                );
+            }
+        }
+        let first_colors = [egui::Color32::RED, egui::Color32::GREEN];
+        let second_colors = [egui::Color32::BLUE, egui::Color32::YELLOW];
+        let mut first = harness(first_colors);
+        let mut second = harness(second_colors);
+        first.run();
+        second.run();
+        let allocated = first.ctx.tex_manager().read().num_allocated();
+        first.run_steps(6);
+        assert_eq!(
+            first.ctx.tex_manager().read().num_allocated(),
+            allocated,
+            "repeated passes reuse the same fixture assets"
+        );
+        assert_pixels(&mut first, first_colors);
+        assert_pixels(&mut second, second_colors);
+        drop(first);
+        second.run_steps(2);
+        assert_pixels(&mut second, second_colors);
+    }
+
+    #[test]
     fn typed_format_badge_colors_preserve_archives_and_distinguish_video() {
         use crate::thumb_overlay_layout::FormatBadgeKind;
 
@@ -2315,21 +2971,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn egui037_wheel_brush_radius_consumes_only_its_modifier_route() {
+        let ctx = egui::Context::default();
+        let wheel = |modifiers, phase| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            modifiers,
+            phase,
+            source: egui::MouseWheelSource::Unknown,
+        };
+        let mut radius = 20.0;
+        let mut applied = None;
+        let mut remaining = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                events: vec![
+                    wheel(egui::Modifiers::NONE, egui::TouchPhase::Move),
+                    wheel(egui::Modifiers::SHIFT, egui::TouchPhase::Move),
+                    wheel(egui::Modifiers::CTRL, egui::TouchPhase::Move),
+                    wheel(egui::Modifiers::SHIFT, egui::TouchPhase::End),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                applied = apply_brush_radius_wheel(ctx, Some(&mut radius), 1.0, 100.0, true);
+                remaining = ctx.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .filter_map(|event| {
+                            if let egui::Event::MouseWheel {
+                                modifiers, phase, ..
+                            } = event
+                            {
+                                Some((*modifiers, *phase))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            applied,
+            Some(crate::manual_mask_tools::brush_radius_after_wheel(
+                20.0, 1.0, 1.0, 100.0
+            ))
+        );
+        assert_eq!(
+            remaining,
+            vec![
+                (egui::Modifiers::NONE, egui::TouchPhase::Move),
+                (egui::Modifiers::CTRL, egui::TouchPhase::Move),
+                (egui::Modifiers::SHIFT, egui::TouchPhase::End),
+            ]
+        );
+    }
+
     fn begin_wheel_pass(ctx: &egui::Context, modifiers: egui::Modifiers) {
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, 1.0),
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 1.0),
+                    modifiers,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                }])
+                .collect(),
             ..Default::default()
         });
     }
 
     fn wheel_input_remaining(ctx: &egui::Context) -> bool {
+        let wheel_options = ctx.options(|o| o.input_options);
         ctx.input(|input| {
-            input.raw_scroll_delta != egui::Vec2::ZERO
+            crate::wheel_input::remaining_wheel_delta(input, wheel_options) != egui::Vec2::ZERO
                 || input.smooth_scroll_delta != egui::Vec2::ZERO
                 || input
                     .events
@@ -2347,7 +3067,7 @@ mod tests {
         assert_eq!(applied, Some(4.0));
         assert_eq!(radius, 4.0);
         assert!(!wheel_input_remaining(&ctx));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -2356,7 +3076,7 @@ mod tests {
         begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
         assert_eq!(apply_brush_radius_wheel(&ctx, None, 1.0, 100.0, true), None);
         assert!(wheel_input_remaining(&ctx));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -2370,7 +3090,7 @@ mod tests {
         );
         assert_eq!(radius, 3.0);
         assert!(wheel_input_remaining(&ctx));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -2388,7 +3108,7 @@ mod tests {
             );
             assert_eq!(radius, 3.0);
             assert!(wheel_input_remaining(&ctx));
-            let _ = ctx.end_pass();
+            let _ = ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
@@ -2396,41 +3116,46 @@ mod tests {
     fn bucket_region_controls_stay_inside_a_200px_visible_ui() {
         let ctx = egui::Context::default();
         let mut controls_rect = egui::Rect::NOTHING;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(900.0, 500.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let visible_rect = egui::Rect::from_min_size(
-                            ui.cursor().left_top(),
-                            egui::vec2(200.0, 400.0),
-                        );
-                        // ScrollArea の content Ui は、先行 widget が幅を広げると表示範囲より
-                        // 大きい max_rect を持ちうる。clip はパネル幅のままという実機条件を再現する。
-                        let wide_rect = egui::Rect::from_min_size(
-                            visible_rect.min,
-                            egui::vec2(800.0, visible_rect.height()),
-                        );
-                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
-                        child.set_clip_rect(visible_rect);
-                        let mut region = crate::mask_db::BucketRegion::Connected;
-                        controls_rect = draw_bucket_region_controls(
-                            &mut child,
-                            &mut region,
-                            &mut 0.0,
-                            &mut 1.0,
-                            &mut 10.0,
-                        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let visible_rect = egui::Rect::from_min_size(
+                                    ui.cursor().left_top(),
+                                    egui::vec2(200.0, 400.0),
+                                );
+                                // ScrollArea の content Ui は、先行 widget が幅を広げると表示範囲より
+                                // 大きい max_rect を持ちうる。clip はパネル幅のままという実機条件を再現する。
+                                let wide_rect = egui::Rect::from_min_size(
+                                    visible_rect.min,
+                                    egui::vec2(800.0, visible_rect.height()),
+                                );
+                                let mut child =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                                child.set_clip_rect(visible_rect);
+                                let mut region = crate::mask_db::BucketRegion::Connected;
+                                controls_rect = draw_bucket_region_controls(
+                                    &mut child,
+                                    &mut region,
+                                    &mut 0.0,
+                                    &mut 1.0,
+                                    &mut 10.0,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(
             controls_rect.width() <= 200.0 + 0.5,
@@ -2443,47 +3168,52 @@ mod tests {
     fn tool_settings_heading_stays_inside_a_200px_visible_ui_and_skips_none() {
         let ctx = egui::Context::default();
         let mut heading_rect = egui::Rect::NOTHING;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(900.0, 500.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let visible_rect = egui::Rect::from_min_size(
-                            ui.cursor().left_top(),
-                            egui::vec2(200.0, 200.0),
-                        );
-                        let wide_rect = egui::Rect::from_min_size(
-                            visible_rect.min,
-                            egui::vec2(800.0, visible_rect.height()),
-                        );
-                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
-                        child.set_clip_rect(visible_rect);
-                        let before_none = child.cursor().top();
-                        assert!(
-                            draw_tool_settings_heading(
-                                &mut child,
-                                None,
-                                egui::Color32::from_gray(200),
-                            )
-                            .is_none()
-                        );
-                        assert_eq!(child.cursor().top(), before_none);
-                        heading_rect = draw_tool_settings_heading(
-                            &mut child,
-                            Some("隙間補完"),
-                            egui::Color32::from_gray(200),
-                        )
-                        .expect("a configured tool must draw its heading");
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let visible_rect = egui::Rect::from_min_size(
+                                    ui.cursor().left_top(),
+                                    egui::vec2(200.0, 200.0),
+                                );
+                                let wide_rect = egui::Rect::from_min_size(
+                                    visible_rect.min,
+                                    egui::vec2(800.0, visible_rect.height()),
+                                );
+                                let mut child =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                                child.set_clip_rect(visible_rect);
+                                let before_none = child.cursor().top();
+                                assert!(
+                                    draw_tool_settings_heading(
+                                        &mut child,
+                                        None,
+                                        egui::Color32::from_gray(200),
+                                    )
+                                    .is_none()
+                                );
+                                assert_eq!(child.cursor().top(), before_none);
+                                heading_rect = draw_tool_settings_heading(
+                                    &mut child,
+                                    Some("隙間補完"),
+                                    egui::Color32::from_gray(200),
+                                )
+                                .expect("a configured tool must draw its heading");
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(
             heading_rect.width() <= 200.0 + 0.5,
@@ -3031,6 +3761,209 @@ mod tests {
         ];
         let vi = vec![0, 1];
         assert_eq!(first_slideshow_still_idx(&items, &vi), Some(1));
+    }
+
+    #[test]
+    fn manual_nav_wrap_adjacent_order_off_matches_existing_resolution() {
+        for order in [&[][..], &[2][..], &[4, 0, 3, 1][..], &[3, 1][..]] {
+            for current in 0..7 {
+                for delta in [-9, -1, 0, 1, 9] {
+                    assert_eq!(
+                        adjacent_idx_in_order_wrapping(order, current, delta, false),
+                        adjacent_idx_in_order(order, current, delta).map(|idx| AdjacentStep {
+                            idx,
+                            wrapped: false
+                        }),
+                        "order={order:?}, current={current}, delta={delta}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_adjacent_order_wraps_only_at_endpoints() {
+        let order = [7, 3, 9];
+        for (current, delta, idx, wrapped) in [
+            (9, 1, 7, true),
+            (7, -1, 9, true),
+            (7, 1, 3, false),
+            (9, -1, 3, false),
+            (3, 1, 9, false),
+            (3, -1, 7, false),
+            // Preserve the old clamped multi-step move; crossing the end
+            // from inside the order is not a second, implicit wrap.
+            (3, 9, 9, false),
+            (3, -9, 7, false),
+        ] {
+            assert_eq!(
+                adjacent_idx_in_order_wrapping(&order, current, delta, true),
+                Some(AdjacentStep { idx, wrapped })
+            );
+        }
+        assert_eq!(adjacent_idx_in_order_wrapping(&order, 7, 0, true), None);
+    }
+
+    #[test]
+    fn manual_nav_wrap_adjacent_order_empty_and_singleton_have_no_self_target() {
+        for order in [&[][..], &[4][..]] {
+            for wrap in [false, true] {
+                for delta in [-1, 0, 1] {
+                    assert_eq!(adjacent_idx_in_order_wrapping(order, 4, delta, wrap), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_absent_current_keeps_numeric_fallback_without_wrapping() {
+        let order = [8, 2, 5];
+        for wrap in [false, true] {
+            for (delta, idx) in [(1, 5), (-1, 2)] {
+                assert_eq!(
+                    adjacent_idx_in_order_wrapping(&order, 4, delta, wrap),
+                    Some(AdjacentStep {
+                        idx,
+                        wrapped: false
+                    })
+                );
+            }
+            assert_eq!(adjacent_idx_in_order_wrapping(&order, 9, 1, wrap), None);
+            assert_eq!(adjacent_idx_in_order_wrapping(&order, 0, -1, wrap), None);
+            assert_eq!(adjacent_idx_in_order_wrapping(&order, 4, 0, wrap), None);
+        }
+    }
+
+    fn manual_nav_wrap_mixed_items() -> Vec<GridItem> {
+        use std::path::PathBuf;
+
+        vec![
+            GridItem::Folder(PathBuf::from("/a/folder")),
+            GridItem::Image(PathBuf::from("/a/one.jpg")),
+            GridItem::Video(PathBuf::from("/a/two.mp4")),
+            GridItem::Audio(PathBuf::from("/a/three.mp3")),
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("/a/book.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::Image(PathBuf::from("/a/five.jpg")),
+        ]
+    }
+
+    #[test]
+    fn manual_nav_wrap_page_navigation_off_matches_existing_target_sets() {
+        let items = manual_nav_wrap_mixed_items();
+        for order in [
+            &[][..],
+            &[3][..],
+            &[3, 0, 5, 4, 2, 1, 999][..],
+            &[0, 4, 2][..],
+        ] {
+            for continuous in [false, true] {
+                for current in 0..8 {
+                    for delta in [-9, -1, 0, 1, 9] {
+                        assert_eq!(
+                            adjacent_page_navigation_idx_wrapping(
+                                &items, order, current, delta, continuous, false
+                            ),
+                            adjacent_page_navigation_idx(&items, order, current, delta, continuous)
+                                .map(|idx| AdjacentStep {
+                                    idx,
+                                    wrapped: false
+                                }),
+                            "order={order:?}, continuous={continuous}, current={current}, delta={delta}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_page_navigation_uses_sorted_filtered_order_including_audio() {
+        let items = manual_nav_wrap_mixed_items();
+        // Detail-sort result: Audio is first, Image is last; folder is not
+        // navigable and source-index order must not replace the given order.
+        let sorted = [3, 0, 5, 4, 2, 1, 999];
+        for (current, delta, idx, wrapped) in [
+            (1, 1, 3, true),
+            (3, -1, 1, true),
+            (5, -1, 3, false),
+            (4, 1, 2, false),
+        ] {
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &sorted, current, delta, false, true),
+                Some(AdjacentStep { idx, wrapped })
+            );
+        }
+        // Filtering removes Audio and both Images. Wrap only within the
+        // remaining PDF / Video targets, without restoring hidden entries.
+        let filtered = [0, 4, 2];
+        for (current, delta, idx) in [(2, 1, 4), (4, -1, 2)] {
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(
+                    &items, &filtered, current, delta, false, true
+                ),
+                Some(AdjacentStep { idx, wrapped: true })
+            );
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_continuous_navigation_wraps_in_still_image_order_only() {
+        let items = manual_nav_wrap_mixed_items();
+        let order = [3, 0, 5, 4, 2, 1];
+        assert_eq!(still_image_display_indices(&items, &order), vec![5, 4, 1]);
+        for (current, delta, idx, wrapped) in [
+            (1, 1, 5, true),
+            (5, -1, 1, true),
+            (5, 1, 4, false),
+            (1, -1, 4, false),
+        ] {
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &order, current, delta, true, true),
+                Some(AdjacentStep { idx, wrapped })
+            );
+        }
+        assert_eq!(
+            adjacent_page_navigation_idx_wrapping(&items, &[0, 3, 2, 4], 4, 1, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_nav_wrap_page_navigation_absent_current_and_empty_scopes_do_not_wrap() {
+        let items = manual_nav_wrap_mixed_items();
+        for continuous in [false, true] {
+            for delta in [-1, 1] {
+                assert_eq!(
+                    adjacent_page_navigation_idx_wrapping(&items, &[], 1, delta, continuous, true),
+                    None
+                );
+                assert_eq!(
+                    adjacent_page_navigation_idx_wrapping(&items, &[1], 1, delta, continuous, true),
+                    None
+                );
+            }
+            // Current source is excluded from this filtered scope. Its
+            // existing numeric neighbor is retained, but it cannot wrap.
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &[4, 1], 2, 1, continuous, true),
+                Some(AdjacentStep {
+                    idx: 4,
+                    wrapped: false
+                })
+            );
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &[4, 1], 5, 1, continuous, true),
+                None
+            );
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &[4, 1], 0, -1, continuous, true),
+                None
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,10 @@
 最終更新: 2026-09-15  
 状態: Phase 4 製品実装、独立 completion review、focused / full / static gateを完了。`target/dev-runtime`のresidentを停止しないためverification buildだけ保留。
 
+2026-10-18追補 (§1.400): PC手動前後移動の設定ON時は現在表示単位を除外して折り返す。
+この追補の実装・検証状態と既存制約の正本は [manual-nav-wrap-plan.md](manual-nav-wrap-plan.md)。
+以下のPhase 4完了記録は本追補の検証証拠を兼ねない。Remoteの前後移動は変更しない。
+
 ## 1. 目的と範囲
 
 本書は [`collection-spec-proposal.md`](collection-spec-proposal.md) で確定した次の挙動を、現在の producer と viewer-context ownership へ接続する Phase 4 の実装計画である。
@@ -68,7 +72,7 @@ CollectionNavigationDisplayUnit {
 CollectionEntryIdentity { entry_id, source_key }
 
 CollectionNavigationIntent =
-    DirectManual { direction, step_count, landing, media_set }
+    DirectManual { direction, step_count, landing, media_set, wrap }
   | OuterCtrl { direction, landing }
   | SlideshowImage { end_action }
   | SlideshowNextContainer
@@ -80,7 +84,7 @@ CollectionNavigationTarget =
   | OuterContainer(ImageLike | StillImage)
 
 CollectionNavigationDirection = Forward | Backward
-CollectionNavigationTail = Stop | Loop
+CollectionNavigationTail = Stop | Loop | WrapExcludingCurrent
 
 CollectionNavigationStamp {
     request_id,
@@ -131,7 +135,11 @@ resolver は次の順に anchor を決める。
 
 単一項目では上のanchorをそのまま使う。root直接登録画像の見開きdisplay unitでは、primary / partnerをそれぞれentry ID、次にそのidentity自身のsource keyで最新preparedへ解決する。Forwardは生存するdisplay unit identityのうち最新順で最も後ろ、Backwardは最も前をdirectional anchorにする。片方だけremoveされても残った側を使い、両方とも解決できない場合だけheadへfallbackする。これによりpartnerを次targetとして再表示せず、見開きの歩幅を維持する。
 
-anchor がある場合だけ、Forward は後方、Backward は前方を検索する。Backward の着地も既存 Ctrl+↑ と同じく target container の先頭 image-like とし、container 内末尾へは着地しない。Ctrl の端は wrap せず境界結果を返す。EOF の `ContinuousLoop` と slideshow の `LoopFolder` だけが最初の同種媒体へ wrap する。
+anchor がある場合だけ、Forward は後方、Backward は前方を検索する。Backward の着地も既存 Ctrl+↑ と同じく target container の先頭 image-like とし、container 内末尾へは着地しない。Ctrl の端は wrap せず境界結果を返す。EOF の `ContinuousLoop` と slideshow の `LoopFolder` は従来の `Loop` で最初の同種媒体へ wrap し、現在項目への再着地も許す。
+PCの手動前後移動は `fullscreen_manual_nav_wrap` がONのときだけ `WrapExcludingCurrent` を使う。
+折り返し部分から最新prepared上で解決できた現在のprimary / partner両方の位置を除き、
+現在の表示単位だけしか残らない場合や、他候補がすべて欠損している場合は境界結果を返す。
+OFFは既存の `Stop`。自動送りの `Loop` の意味は変更しない。
 
 Grid root に fullscreen / child origin が無く selection も無い場合は origin-less head として扱う。Ctrl+↑だけを暗黙に末尾へ送る特例は設けない。
 
@@ -172,9 +180,10 @@ prepared snapshot は container root の存在と kind を持つが、内部に�
 
 collection root の直接登録 media から fullscreen を開いている時は、paged image の矢印 / wheel / page action、動画・音声の `VideoNextFile` / `VideoPrevFile`、native presenter の手動前後送りを `DirectManual` へ接続する。候補集合は現在の `adjacent_navigable_idx` と同じ Image / Video / Audio であり、未openの Folder / ZIP / PDF / ConvertibleArchive と placeholder は飛ばす。
 
-- Forward / Backward は最新 prepared の有効順を使う。anchorが残る端ではwrapせず既存の先頭 / 末尾hint、anchorがremove済みならheadへ着地する。
+- Forward / Backward は最新 prepared の有効順を使う。anchorが残る端では設定OFFなら既存の先頭 / 末尾hint、ONなら `WrapExcludingCurrent` で反対側を有限に探す。動ける別表示単位が無ければONでも境界hint。anchorがremove済みなら従来どおりheadへ着地する。
 - root直接登録画像の見開きは、request時にprimary / partner stable identityをcaptureする。Forwardは最新prepared上で生存する二つの後端、Backwardは前端から進み、全identity消失時だけheadへ着地する。target決定後の見開きpartner構築は既存`spread_page_nav(_for_indices)` / landing処理へ委ねる。
 - `delta` の絶対値が1を超えるnative / queued inputは、既存の「有効候補をstep_count件進む」意味を保つ。各user inputは一つのactor snapshotをdecision pointとし、そのprepared内でstep_count件解決する。別入力としてqueueされたstepは前のtarget commit後に最新を取り直す。
+- `CollectionNavigationAction::Manual` と `AwaitingManualContinuation` は開始時の `wrap` を保持する。通常pending / native swap待ちのcontinuationとも同じ `wrap` の入力だけを合流し、残りstepの再発行へ保持値を渡す。設定変更後の異なる `wrap` の新入力は旧要求へ合流しない。`AwaitingManualContinuation` では旧queued stepsを破棄し、新delta / wrapと新sequenceで既存continuation payloadを置換する。進行中のnative着地は維持し、`landing_ready` 後に `stamp.target_idx` を起点として新しいManual要求を発行する。
 - splitの同一source内移動と連結読みの現在scroll/layout内の移動は既存処理を維持する。連結読みでitem境界を越える明示移動だけStillImage候補のcollection requestを使う。
 - target commit後は既存 `open_fullscreen_from_fs_navigation` またはnative manual landingを使い、`HistoryTrigger::UserChosen`、cursor / spread / split / presentationを維持する。
 - root collection以外、またはcollection childのImage / ZipImage / PdfPage / Video / Audioは既存のcurrent `items`順を使う。child pageをouter direct media列へ混ぜない。

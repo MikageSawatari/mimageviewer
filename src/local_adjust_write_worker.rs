@@ -61,6 +61,8 @@ use crate::local_adjust_db::LocalAdjustDb;
 pub(crate) struct LocalAdjustWriteCompletion {
     pub key: String,
     pub generation: u64,
+    /// 実際に書いた要求の所有者。後続要求の origin を借りない。
+    pub origin: Option<crate::app::LocalAdjustWriteOrigin>,
     pub layers: local_adjust_core::LocalAdjustmentLayers,
     pub outcome: EditStoreOutcome,
 }
@@ -68,6 +70,7 @@ pub(crate) struct LocalAdjustWriteCompletion {
 /// まだ書いていない 1 ページ分の文書。key ごとに 1 つだけ持つ。
 struct QueuedWrite {
     generation: u64,
+    origin: Option<crate::app::LocalAdjustWriteOrigin>,
     layers: local_adjust_core::LocalAdjustmentLayers,
 }
 
@@ -90,6 +93,15 @@ struct Shared {
     ready: Condvar,
     /// worker スレッドが生きているか。spawn 失敗・panic・正常終了で false。
     alive: AtomicBool,
+    /// テストだけで、要求取得後・DB書込前を一度止める。
+    #[cfg(test)]
+    write_pause: Mutex<Option<TestWritePause>>,
+}
+
+#[cfg(test)]
+struct TestWritePause {
+    reached: Sender<()>,
+    resume: Receiver<()>,
 }
 
 impl Shared {
@@ -118,6 +130,8 @@ impl LocalAdjustWriteHandle {
             }),
             ready: Condvar::new(),
             alive: AtomicBool::new(true),
+            #[cfg(test)]
+            write_pause: Mutex::new(None),
         });
         let (result_tx, result_rx) = unbounded::<LocalAdjustWriteCompletion>();
 
@@ -158,6 +172,25 @@ impl LocalAdjustWriteHandle {
         key: String,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) -> Result<u64, EditStoreOutcome> {
+        self.submit_inner(key, layers, None)
+    }
+
+    /// enqueue 時の所有者を、保存文書と一緒に完了まで保持する。
+    pub(crate) fn submit_with_origin(
+        &self,
+        key: String,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+        origin: crate::app::LocalAdjustWriteOrigin,
+    ) -> Result<u64, EditStoreOutcome> {
+        self.submit_inner(key, layers, Some(origin))
+    }
+
+    fn submit_inner(
+        &self,
+        key: String,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+        origin: Option<crate::app::LocalAdjustWriteOrigin>,
+    ) -> Result<u64, EditStoreOutcome> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut queue = self.shared.lock();
         if queue.stopped || !self.shared.alive.load(Ordering::Acquire) {
@@ -169,7 +202,14 @@ impl LocalAdjustWriteHandle {
         // 古い文書はここで落ちるので、キューに原寸マスクが積み上がらない。
         let replaced = queue
             .documents
-            .insert(key.clone(), QueuedWrite { generation, layers })
+            .insert(
+                key.clone(),
+                QueuedWrite {
+                    generation,
+                    origin,
+                    layers,
+                },
+            )
             .is_some();
         if !replaced {
             queue.items.push_back(QueueItem::Write(key));
@@ -200,6 +240,21 @@ impl LocalAdjustWriteHandle {
         drop(WorkerGuard {
             shared: Arc::clone(&self.shared),
         });
+    }
+
+    /// 次の要求を worker が取得したら通知し、返した Sender の送信／dropまで止める。
+    /// queue のロックは保持しないので、停止中も公開APIから次の要求を積める。
+    #[cfg(test)]
+    pub(crate) fn pause_next_write_for_test(&self) -> (Receiver<()>, Sender<()>) {
+        let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        let mut pause = self.shared.write_pause.lock().unwrap();
+        assert!(pause.is_none(), "前の停止点がまだ取得されていません");
+        *pause = Some(TestWritePause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx)
     }
 
     pub(crate) fn try_recv(&self) -> Option<LocalAdjustWriteCompletion> {
@@ -315,6 +370,14 @@ fn run_worker(db_path: &Path, shared: &Shared, result_tx: &Sender<LocalAdjustWri
                 let Some(write) = shared.lock().documents.remove(&key) else {
                     continue;
                 };
+                #[cfg(test)]
+                {
+                    let pause = shared.write_pause.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        let _ = pause.reached.send(());
+                        let _ = pause.resume.recv();
+                    }
+                }
                 let completion = process_write(db_path, &mut db, key, write);
                 let _ = result_tx.send(completion);
             }
@@ -354,6 +417,7 @@ fn process_write(
     LocalAdjustWriteCompletion {
         key,
         generation: write.generation,
+        origin: write.origin,
         layers: write.layers,
         outcome,
     }
@@ -402,6 +466,111 @@ mod tests {
         local_adjust_core::LocalAdjustmentLayers::new(vec![layer(name)])
     }
 
+    fn origin(context: u64, revision: u64) -> crate::app::LocalAdjustWriteOrigin {
+        crate::app::LocalAdjustWriteOrigin {
+            context: crate::app::ViewerContextId::for_test(context),
+            target: crate::app::PageAdjustmentTarget {
+                page_key: "key".to_string(),
+                location_path: Some(PathBuf::from(format!("context-{context}"))),
+                sidecar_coords: Some((
+                    PathBuf::from(format!("context-{context}")),
+                    "page.png".to_string(),
+                )),
+                compiled_book: false,
+                idx_hint: crate::app::PageIndexHint::Unresolved,
+            },
+            revision,
+        }
+    }
+
+    #[test]
+    fn replacing_a_queued_document_also_replaces_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local_adjust.db");
+        let handle = LocalAdjustWriteHandle::spawn(path.clone());
+        let (reached, resume) = handle.pause_next_write_for_test();
+        handle
+            .submit("blocker".to_string(), doc("blocker"))
+            .unwrap();
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must stop before writing the blocker");
+
+        handle
+            .submit_with_origin("key".to_string(), doc("old"), origin(1, 10))
+            .unwrap();
+        let newest_origin = origin(2, 20);
+        let newest_generation = handle
+            .submit_with_origin("key".to_string(), doc("newest"), newest_origin.clone())
+            .unwrap();
+        {
+            let queue = handle.shared.lock();
+            assert_eq!(queue.items.len(), 1);
+            assert_eq!(queue.documents.len(), 1);
+            assert_eq!(queue.documents["key"].origin, Some(newest_origin.clone()));
+        }
+        resume.send(()).unwrap();
+
+        let completions = handle.shutdown_and_collect();
+
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].key, "blocker");
+        assert_eq!(completions[0].origin, None);
+        assert_eq!(completions[1].generation, newest_generation);
+        assert_eq!(completions[1].origin, Some(newest_origin));
+        assert_eq!(completions[1].layers.as_slice(), doc("newest").as_slice());
+        assert_eq!(completions[1].outcome, EditStoreOutcome::Committed);
+        assert_eq!(
+            LocalAdjustDb::open_at(&path)
+                .unwrap()
+                .get_layers("key")
+                .unwrap()
+                .as_slice(),
+            doc("newest").as_slice()
+        );
+    }
+
+    #[test]
+    fn an_inflight_write_keeps_its_origin_when_the_same_key_is_resubmitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local_adjust.db");
+        let handle = LocalAdjustWriteHandle::spawn(path.clone());
+        let (reached, resume) = handle.pause_next_write_for_test();
+        let old_origin = origin(1, 10);
+        let old_generation = handle
+            .submit_with_origin("key".to_string(), doc("old"), old_origin.clone())
+            .unwrap();
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must take the old request before the next submission");
+
+        let new_origin = origin(2, 20);
+        let new_generation = handle
+            .submit_with_origin("key".to_string(), doc("new"), new_origin.clone())
+            .unwrap();
+        resume.send(()).unwrap();
+
+        let completions = handle.shutdown_and_collect();
+
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].generation, old_generation);
+        assert_eq!(completions[0].origin, Some(old_origin));
+        assert_eq!(completions[0].layers.as_slice(), doc("old").as_slice());
+        assert_eq!(completions[0].outcome, EditStoreOutcome::Committed);
+        assert_eq!(completions[1].generation, new_generation);
+        assert_eq!(completions[1].origin, Some(new_origin));
+        assert_eq!(completions[1].layers.as_slice(), doc("new").as_slice());
+        assert_eq!(completions[1].outcome, EditStoreOutcome::Committed);
+        assert_eq!(
+            LocalAdjustDb::open_at(&path)
+                .unwrap()
+                .get_layers("key")
+                .unwrap()
+                .as_slice(),
+            doc("new").as_slice()
+        );
+    }
+
     #[test]
     fn a_write_that_the_store_accepts_reports_committed_with_the_document_it_wrote() {
         let dir = tempfile::tempdir().unwrap();
@@ -414,6 +583,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].outcome, EditStoreOutcome::Committed);
+        assert_eq!(results[0].origin, None);
         assert_eq!(results[0].layers.as_slice(), document.as_slice());
         assert_eq!(
             LocalAdjustDb::open_at(&path)
@@ -482,14 +652,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("local_adjust.db");
         let handle = LocalAdjustWriteHandle::spawn(path);
+        // worker に取られる前に積み直したことにするため、3 回の積み直しと検査を
+        // 1 つのロックの中で行う。回ごとにロックを手放すと、その間に worker が
+        // 取り出して 0 件になり得る (test-script 付きのビルドで毎回起きた)。
+        let mut queue = handle.shared.lock();
         for name in ["first", "second", "newest"] {
-            // worker に取られる前に積み直したことにする。取られていたら枠は空くので、
-            // この検査は「取られていない分について 1 件しか残らない」を見る。
-            let mut queue = handle.shared.lock();
             queue.documents.insert(
                 "key".to_string(),
                 QueuedWrite {
                     generation: 1,
+                    origin: None,
                     layers: doc(name),
                 },
             );
@@ -498,7 +670,6 @@ mod tests {
             }
         }
 
-        let queue = handle.shared.lock();
         assert_eq!(
             queue.documents.len(),
             1,

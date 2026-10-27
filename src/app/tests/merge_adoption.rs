@@ -276,8 +276,11 @@ fn submit_reading_search_through_bar(app: &mut App) -> Arc<AtomicBool> {
         crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
     app.search_focus_request = true;
     let ctx = egui::Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| app.render_search_bar(ctx));
-    let _ = ctx.run(
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
+        ctx.root_ui(|ui_arg| app.render_search_bar(ui_arg))
+    })
+    .drop_without_applying_deltas();
+    ctx.run_pass(
         egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::Enter,
@@ -288,8 +291,9 @@ fn submit_reading_search_through_bar(app: &mut App) -> Arc<AtomicBool> {
             }],
             ..Default::default()
         },
-        |ctx| app.render_search_bar(ctx),
-    );
+        |ctx| ctx.root_ui(|ui_arg| app.render_search_bar(ui_arg)),
+    )
+    .drop_without_applying_deltas();
     Arc::clone(
         &app.search_pending
             .as_ref()

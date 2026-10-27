@@ -1,6 +1,6 @@
 //! Test-only paint observations shared by platform-independent draw sites.
 
-use crate::gpu_lanczos::{FullscreenPaintResource, TestPaintProvenance};
+use crate::gpu_lanczos::{FullscreenPaintPayload, FullscreenPaintResource, TestPaintProvenance};
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -103,9 +103,35 @@ pub(crate) fn white_companion_paint_records(
     records
 }
 
-pub(crate) fn record_selected_paint_resource(
+/// Read-only submission evidence shared by normal resources and captured presentation materials.
+pub(crate) trait PaintRecordResource {
+    fn paint_texture_id(&self) -> egui::TextureId;
+    fn test_paint_provenance(&self) -> Option<&TestPaintProvenance>;
+}
+
+impl PaintRecordResource for FullscreenPaintResource {
+    fn paint_texture_id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    fn test_paint_provenance(&self) -> Option<&TestPaintProvenance> {
+        self.test_paint_provenance()
+    }
+}
+
+impl PaintRecordResource for FullscreenPaintPayload {
+    fn paint_texture_id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    fn test_paint_provenance(&self) -> Option<&TestPaintProvenance> {
+        self.test_paint_provenance()
+    }
+}
+
+pub(crate) fn record_selected_paint_resource<R: PaintRecordResource + ?Sized>(
     painter: &egui::Painter,
-    resource: &FullscreenPaintResource,
+    resource: &R,
 ) {
     if !CAPTURE_DEPTH.with(|depth| depth.get() > 0) {
         return;
@@ -209,6 +235,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_presentation_record_preserves_provenance_after_source_release() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "native-record-input",
+            egui::ColorImage::filled([8, 8], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_texture_id = texture.id();
+        let proof = TestPaintProvenance {
+            context: crate::app::ViewerContextId::for_test(7),
+            items_generation: 3,
+            item: "captured-page".to_owned(),
+            page: 2,
+        };
+        let source = crate::gpu_lanczos::test_native_resource(
+            FullscreenPaintResource::resampleable(
+                2,
+                texture,
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 3, input: 5 },
+            )
+            .with_test_paint_provenance(proof.clone()),
+            [4, 4],
+        );
+        let payload =
+            FullscreenPaintPayload::PresentationMaterial(source.capture_presentation(&ctx));
+        drop(source);
+        assert!(ctx.tex_manager().read().meta(source_texture_id).is_none());
+        let output = with_capture(|| {
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                record_selected_paint_resource(&painter, &payload);
+                painter.image(
+                    payload.paint_texture_id(),
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(8.0, 8.0)),
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }))
+        });
+        let records = paint_records(egui::ViewportId::ROOT, &output);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].texture, payload.paint_texture_id());
+        assert_eq!(records[0].provenance, proof);
+        assert!(payload.source_texture().is_none());
+    }
+
+    #[test]
     fn multiwindow_scenario_same_texture_keeps_each_submission_provenance() {
         let ctx = egui::Context::default();
         let texture = ctx.load_texture(
@@ -227,7 +300,7 @@ mod tests {
         let second =
             FullscreenPaintResource::direct(texture).with_test_paint_provenance(proof("second"));
         let output = with_capture(|| {
-            ctx.run(egui::RawInput::default(), |ctx| {
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
                 let painter = ctx.layer_painter(egui::LayerId::background());
                 for (index, resource) in [&first, &second].into_iter().enumerate() {
                     record_selected_paint_resource(&painter, resource);
@@ -242,7 +315,7 @@ mod tests {
                         egui::Color32::WHITE,
                     );
                 }
-            })
+            }))
         });
         let records = paint_records(egui::ViewportId::ROOT, &output);
         assert_eq!(records.len(), 2);

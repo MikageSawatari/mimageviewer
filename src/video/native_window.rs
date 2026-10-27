@@ -16,7 +16,7 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_CONTROL, VK_MENU, VK_SHIFT,
+    VK_CONTROL, VK_MENU, VK_PROCESSKEY, VK_SHIFT,
 };
 use windows::Win32::UI::Input::Pointer::{
     GetPointerInfo, GetPointerType, POINTER_FLAG_CANCELED, POINTER_INFO,
@@ -151,8 +151,20 @@ pub(crate) struct NativeVideoWindowEventEnvelope {
     pub(crate) generation: u64,
     pub(crate) source: NativeVideoWindowSource,
     pub(crate) event: NativeVideoWindowEvent,
+    pub(crate) raise_diagnostic: Option<NativeRaiseSample>,
     #[cfg(feature = "test-script")]
     pub(crate) smoke_metadata: Option<super::native_ui_smoke::NativeUiSmokeMessageMetadata>,
+}
+
+/// Bounded provenance travels with the existing latest-value mailbox. A replaced
+/// request retains its own epoch; it is never attributed to the replacement HWND.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeRaiseSample {
+    pub(crate) epoch: u64,
+    pub(crate) sequence: u64,
+    pub(crate) observed_us: u64,
+    pub(crate) flags: u32,
+    pub(crate) insert_after: i64,
 }
 
 const WINDOW_EVENT_LATEST_MOUSE_MOVE: usize = 0;
@@ -186,6 +198,13 @@ struct NativeWindowEventRouteShared {
     next_sequence: AtomicU64,
     latest: Vec<LatestWindowEventSlot>,
     overflow_fault: Arc<AtomicBool>,
+    raise_diagnostics: Option<NativeRaiseRouteDiagnostics>,
+}
+
+struct NativeRaiseRouteDiagnostics {
+    tx: crossbeam_channel::Sender<(NativeRaiseSample, bool)>,
+    rx: crossbeam_channel::Receiver<(NativeRaiseSample, bool)>,
+    overflow: AtomicU64,
 }
 
 /// Lock-free single-value mailbox. Producer and consumer each take ownership
@@ -201,12 +220,13 @@ impl LatestWindowEventSlot {
         }
     }
 
-    fn publish(&self, event: NativeVideoWindowEventEnvelope) {
+    fn publish(
+        &self,
+        event: NativeVideoWindowEventEnvelope,
+    ) -> Option<NativeVideoWindowEventEnvelope> {
         let next = Box::into_raw(Box::new(event));
         let prior = self.value.swap(next, Ordering::AcqRel);
-        if !prior.is_null() {
-            unsafe { drop(Box::from_raw(prior)) };
-        }
+        (!prior.is_null()).then(|| unsafe { *Box::from_raw(prior) })
     }
 
     fn take(&self) -> Option<NativeVideoWindowEventEnvelope> {
@@ -245,13 +265,34 @@ pub(crate) fn native_window_event_route(
     lossless_capacity: usize,
     overflow_fault: Arc<AtomicBool>,
 ) -> (NativeWindowEventRoute, NativeWindowEventReceiver) {
+    native_window_event_route_with_diagnostics(
+        lossless_capacity,
+        overflow_fault,
+        crate::perf::is_enabled(),
+    )
+}
+
+fn native_window_event_route_with_diagnostics(
+    lossless_capacity: usize,
+    overflow_fault: Arc<AtomicBool>,
+    collect_raise: bool,
+) -> (NativeWindowEventRoute, NativeWindowEventReceiver) {
     let (lossless_tx, lossless_rx) = crossbeam_channel::bounded(lossless_capacity);
+    let raise_diagnostics = collect_raise.then(|| {
+        let (tx, rx) = crossbeam_channel::bounded(256);
+        NativeRaiseRouteDiagnostics {
+            tx,
+            rx,
+            overflow: AtomicU64::new(0),
+        }
+    });
     let shared = Arc::new(NativeWindowEventRouteShared {
         next_sequence: AtomicU64::new(1),
         latest: (0..WINDOW_EVENT_LATEST_SLOTS)
             .map(|_| LatestWindowEventSlot::empty())
             .collect(),
         overflow_fault,
+        raise_diagnostics,
     });
     (
         NativeWindowEventRoute {
@@ -266,10 +307,28 @@ pub(crate) fn native_window_event_route(
 }
 
 impl NativeWindowEventRoute {
+    fn record_raise_diagnostic(&self, sample: NativeRaiseSample, replaced: bool) {
+        if let Some(diagnostic) = &self.shared.raise_diagnostics
+            && diagnostic.tx.try_send((sample, replaced)).is_err()
+        {
+            diagnostic.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn send(&self, mut envelope: NativeVideoWindowEventEnvelope) {
         envelope.sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if let Some(diagnostic) = &mut envelope.raise_diagnostic {
+            diagnostic.sequence = envelope.sequence;
+        }
         if let Some(slot) = native_window_event_latest_slot(&envelope.event) {
-            self.shared.latest[slot].publish(envelope);
+            if let Some(sample) = envelope.raise_diagnostic {
+                self.record_raise_diagnostic(sample, false);
+            }
+            if let Some(prior) = self.shared.latest[slot].publish(envelope)
+                && let Some(sample) = prior.raise_diagnostic
+            {
+                self.record_raise_diagnostic(sample, true);
+            }
             return;
         }
         match self.lossless_tx.try_send(envelope) {
@@ -283,6 +342,15 @@ impl NativeWindowEventRoute {
 }
 
 impl NativeWindowEventReceiver {
+    pub(crate) fn drain_raise_diagnostics(&self) -> (Vec<(NativeRaiseSample, bool)>, u64) {
+        let Some(diagnostic) = &self.shared.raise_diagnostics else {
+            return (Vec::new(), 0);
+        };
+        (
+            diagnostic.rx.try_iter().collect(),
+            diagnostic.overflow.swap(0, Ordering::Relaxed),
+        )
+    }
     pub(crate) fn drain(&self) -> Vec<NativeVideoWindowEventEnvelope> {
         let mut events: Vec<_> = self.lossless_rx.try_iter().collect();
         events.extend(self.shared.latest.iter().filter_map(|slot| slot.take()));
@@ -334,10 +402,48 @@ impl NativeVideoWindowEventSink {
             generation: self.generation,
             source: self.source,
             event,
+            raise_diagnostic: None,
             #[cfg(feature = "test-script")]
             smoke_metadata: None,
         };
         self.dispatch(envelope);
+    }
+
+    pub(crate) fn send_hud_raise(&self, flags: u32, insert_after: i64) {
+        self.send_hud_raise_with_clock(flags, insert_after, || {
+            crate::perf::program_start().map_or(0, |start| {
+                start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+            })
+        });
+    }
+
+    fn send_hud_raise_with_clock(
+        &self,
+        flags: u32,
+        insert_after: i64,
+        observed_us: impl FnOnce() -> u64,
+    ) {
+        let diagnostic = if self.pump_route.shared.raise_diagnostics.is_some() {
+            Some(NativeRaiseSample {
+                epoch: self.epoch,
+                flags,
+                insert_after,
+                observed_us: observed_us(),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        self.dispatch(NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch: self.epoch,
+            generation: self.generation,
+            source: self.source,
+            event: NativeVideoWindowEvent::RequestRaiseHud,
+            raise_diagnostic: diagnostic,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
+        });
     }
 
     #[cfg(feature = "test-script")]
@@ -362,6 +468,7 @@ impl NativeVideoWindowEventSink {
             }
         }
         let envelope = NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: self.epoch,
             generation: self.generation,
@@ -1231,6 +1338,15 @@ pub fn foreground_hwnd() -> u64 {
     unsafe { GetForegroundWindow().0 as u64 }
 }
 
+/// Snapshot the strict process-owned foreground target once for physical input.
+/// Unknown/null ownership suppresses gamepad actions, as at the old ingress.
+pub(crate) fn foreground_process_hwnd() -> Option<u64> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        hwnd_belongs_to_current_process_strict(hwnd).then_some(hwnd.0 as u64)
+    }
+}
+
 /// Foreground ownership shared by presenter recovery, HUD input and the VST host.
 /// A bridge process is not sufficient evidence: only its registered, visible
 /// editor window (or a child of that window) belongs to this UI group.
@@ -1690,7 +1806,10 @@ fn log_window_state(label: &str, hwnd: HWND) {
         let mut rect = RECT::default();
         let rect_ok = GetWindowRect(hwnd, &mut rect).is_ok();
         let visible = IsWindowVisible(hwnd).as_bool();
+        #[cfg(not(test))]
         let foreground = GetForegroundWindow();
+        #[cfg(test)]
+        let foreground = HWND(crate::test_native_focus::foreground_hwnd() as *mut _);
         crate::logger::log(format!(
             "[native-video] window {label}: hwnd=0x{:x} visible={} rect_ok={} rect=({},{} {}x{}) foreground=0x{:x}",
             hwnd.0 as usize,
@@ -2149,13 +2268,29 @@ unsafe extern "system" fn wnd_proc(
     // Capture before touch-source/debug helpers, then compare with the value read at the
     // established metadata match point. This trace is observational and covers only the
     // explicitly prepared move or ordinary left-button edge.
-    let ui_smoke_message_entry = if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
-        super::native_ui_smoke::capture_message_entry()
+    let ui_smoke_message_entry = if matches!(
+        msg,
+        WM_MOUSEMOVE
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_MOUSEACTIVATE
+            | WM_CAPTURECHANGED
+            | WM_CANCELMODE
+    ) {
+        super::native_ui_smoke::capture_message_entry(hwnd, msg, lparam.0)
     } else {
         None
     };
     log_win32_message(TouchDebugWindow::Presenter, hwnd, msg, wparam, lparam);
     if let Some(result) = handle_presenter_pointer_message(hwnd, msg, wparam) {
+        #[cfg(feature = "test-script")]
+        super::native_ui_smoke::record_message_disposition(
+            hwnd,
+            ui_smoke_message_entry,
+            lparam.0,
+            "pointer_handled",
+        );
         return result;
     }
     match msg {
@@ -2214,6 +2349,13 @@ unsafe extern "system" fn wnd_proc(
             } else {
                 want_eat
             };
+            #[cfg(feature = "test-script")]
+            super::native_ui_smoke::record_message_disposition(
+                hwnd,
+                ui_smoke_message_entry,
+                lparam.0,
+                if eat { "activate_and_eat" } else { "activate" },
+            );
             if eat {
                 LRESULT(MA_ACTIVATEANDEAT as isize)
             } else {
@@ -2221,8 +2363,9 @@ unsafe extern "system" fn wnd_proc(
             }
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                let key = native_key_event(hwnd, msg, wparam, lparam);
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
+                && let Some(key) = native_key_event(hwnd, msg, wparam, lparam)
+            {
                 crate::key_debug::record_native_video_key(key, true);
                 sink.send(NativeVideoWindowEvent::KeyDown(key));
             }
@@ -2246,8 +2389,9 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                let key = native_key_event(hwnd, msg, wparam, lparam);
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
+                && let Some(key) = native_key_event(hwnd, msg, wparam, lparam)
+            {
                 crate::key_debug::record_native_video_key(key, false);
                 sink.send(NativeVideoWindowEvent::KeyUp(key));
             }
@@ -2420,6 +2564,13 @@ unsafe extern "system" fn wnd_proc(
         | WM_MBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK
         | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
             if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Presenter) {
+                #[cfg(feature = "test-script")]
+                super::native_ui_smoke::record_message_disposition(
+                    hwnd,
+                    ui_smoke_message_entry,
+                    lparam.0,
+                    "touch_discard",
+                );
                 return LRESULT(0);
             }
             if let Some(state) = window_state_mut(hwnd) {
@@ -2729,14 +2880,25 @@ fn ime_composition_string(hwnd: HWND, mode: IME_COMPOSITION_STRING) -> Option<St
     }
 }
 
-fn native_key_event(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
+fn native_key_event(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<NativeVideoKeyEvent> {
+    // This boundary owns both raw shortcut publication and its debug receipt.
+    // IME-owned presses (including repeats) are not application keys. Preserve
+    // releases for any held-key cleanup in the consumers.
+    if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && wparam.0 as u32 == u32::from(VK_PROCESSKEY.0) {
+        return None;
+    }
     // The native presenter WndProc is a separate input route and is explicitly
     // outside the app-side synthetic timeline.
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
     let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
     let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
     let raw = lparam.0 as u64;
-    NativeVideoKeyEvent {
+    Some(NativeVideoKeyEvent {
         receipt: crate::mouse_seek_debug::win32_key_receipt(
             NativeVideoWindowSource::Presenter,
             hwnd.0 as usize as u64,
@@ -2749,7 +2911,7 @@ fn native_key_event(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Nat
         ctrl,
         alt,
         repeat: ((lparam.0 as u64) & (1 << 30)) != 0,
-    }
+    })
 }
 
 fn native_mouse_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoMouseEvent {
@@ -3176,6 +3338,83 @@ mod tests {
     }
 
     #[test]
+    fn processkey_presses_do_not_publish_jis_shortcuts_but_releases_remain() {
+        use crate::keymap::KeyName;
+
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let (render_route, render_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let sink = NativeVideoWindowEventSink::new(
+            9,
+            9,
+            NativeVideoWindowSource::Presenter,
+            pump_route,
+            render_route,
+        );
+        for (key, scan_code) in [
+            (KeyName::JisCaret, 0x0d),
+            (KeyName::JisAt, 0x1a),
+            (KeyName::IntlYen, 0x7d),
+            (KeyName::IntlRo, 0x73),
+        ] {
+            for msg in [WM_KEYDOWN, WM_SYSKEYDOWN] {
+                for repeat in [false, true] {
+                    let lparam = LPARAM((scan_code << 16) | (isize::from(repeat) << 30));
+                    let ordinary = native_key_event(
+                        HWND::default(),
+                        msg,
+                        WPARAM(key.to_vk() as usize),
+                        lparam,
+                    )
+                    .expect("ordinary JIS press remains publishable");
+                    assert_eq!(ordinary.repeat, repeat);
+                    assert!(key.matches_win32(
+                        ordinary.virtual_key,
+                        ordinary.scan_code,
+                        ordinary.extended
+                    ));
+                    sink.send(NativeVideoWindowEvent::KeyDown(ordinary));
+                    assert!(pump_rx.drain().is_empty());
+                    let events = render_rx.drain();
+                    assert!(matches!(events.as_slice(), [envelope]
+                        if matches!(&envelope.event, NativeVideoWindowEvent::KeyDown(event)
+                            if key.matches_win32(event.virtual_key, event.scan_code, event.extended))));
+
+                    let processed = native_key_event(HWND::default(), msg, WPARAM(0xE5), lparam);
+                    assert!(processed.is_none(), "IME-owned {key:?} repeat={repeat}");
+                    if let Some(event) = processed {
+                        sink.send(NativeVideoWindowEvent::KeyDown(event));
+                    }
+                    assert!(pump_rx.drain().is_empty());
+                    assert!(render_rx.drain().is_empty());
+                }
+            }
+            for msg in [WM_KEYUP, WM_SYSKEYUP] {
+                let release = native_key_event(
+                    HWND::default(),
+                    msg,
+                    WPARAM(0xE5),
+                    LPARAM((scan_code << 16) | (1 << 30) | (1 << 31)),
+                )
+                .expect("IME-owned release remains publishable for held-key cleanup");
+                assert_eq!(release.virtual_key, 0xE5);
+                assert!(key.matches_win32(
+                    release.virtual_key,
+                    release.scan_code,
+                    release.extended
+                ));
+                sink.send(NativeVideoWindowEvent::KeyUp(release));
+                assert!(pump_rx.drain().is_empty());
+                let events = render_rx.drain();
+                assert!(matches!(events.as_slice(), [envelope]
+                    if matches!(&envelope.event, NativeVideoWindowEvent::KeyUp(event)
+                        if key.matches_win32(event.virtual_key, event.scan_code, event.extended))));
+            }
+        }
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn native_browser_keydown_is_owned_before_default_appcommand_generation() {
         for msg in [WM_KEYDOWN, WM_SYSKEYDOWN] {
             for virtual_key in [0xA6, 0xA7] {
@@ -3464,10 +3703,103 @@ mod tests {
     }
 
     #[test]
+    fn hud_raise_producer_coalesce_preserves_displaced_epoch_flags_and_sequence() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump, receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), true);
+        let (render, _render_receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), false);
+        let first = NativeVideoWindowEventSink::new(
+            7,
+            7,
+            NativeVideoWindowSource::Hud,
+            pump.clone(),
+            render.clone(),
+        );
+        let second =
+            NativeVideoWindowEventSink::new(8, 8, NativeVideoWindowSource::Hud, pump, render);
+        first.send_hud_raise_with_clock(0x10, -1, || 101);
+        second.send_hud_raise_with_clock(0x20, 0, || 102);
+        let events = receiver.drain();
+        assert_eq!(events.len(), 1, "latest value semantics preserved");
+        let surviving = events[0].raise_diagnostic.unwrap();
+        assert_eq!(
+            (
+                events[0].epoch,
+                surviving.epoch,
+                surviving.flags,
+                surviving.insert_after,
+                surviving.observed_us
+            ),
+            (8, 8, 0x20, 0, 102)
+        );
+        let (samples, lost) = receiver.drain_raise_diagnostics();
+        assert_eq!(lost, 0);
+        assert_eq!(samples.len(), 3);
+        assert_eq!((samples[0].0.epoch, samples[0].1), (7, false));
+        assert_eq!((samples[1].0.epoch, samples[1].1), (8, false));
+        assert_eq!((samples[2].0.epoch, samples[2].1), (7, true));
+        assert_eq!(samples[2].0.sequence, samples[0].0.sequence);
+        assert_eq!(
+            (
+                samples[2].0.flags,
+                samples[2].0.insert_after,
+                samples[2].0.observed_us
+            ),
+            (0x10, -1, 101)
+        );
+        assert!(surviving.sequence > samples[0].0.sequence);
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hud_raise_diagnostics_off_skip_clock_and_overflow_never_faults_product_route() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump, receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), false);
+        let (render, _render_receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), false);
+        let sink = NativeVideoWindowEventSink::new(
+            7,
+            7,
+            NativeVideoWindowSource::Hud,
+            pump,
+            render.clone(),
+        );
+        sink.send_hud_raise_with_clock(0, -1, || panic!("disabled producer must not read clock"));
+        assert!(
+            receiver.shared.raise_diagnostics.is_none(),
+            "OFF allocates no diagnostic channel"
+        );
+        assert!(receiver.drain()[0].raise_diagnostic.is_none());
+        assert!(receiver.drain_raise_diagnostics().0.is_empty());
+        let (pump, receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), true);
+        let sink =
+            NativeVideoWindowEventSink::new(9, 9, NativeVideoWindowSource::Hud, pump, render);
+        for _ in 0..150 {
+            sink.send_hud_raise_with_clock(0, -1, || 200);
+        }
+        let (samples, lost) = receiver.drain_raise_diagnostics();
+        assert_eq!(samples.len(), 256);
+        assert_eq!(
+            lost, 43,
+            "150 issued +149 replaced exceed bounded diagnostic side channel"
+        );
+        assert_eq!(
+            receiver.drain().len(),
+            1,
+            "product latest event survives diagnostic overflow"
+        );
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn lossless_window_event_overflow_is_an_explicit_session_fault() {
         let overflow = Arc::new(AtomicBool::new(false));
         let (route, _rx) = native_window_event_route(1, Arc::clone(&overflow));
         route.send(NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: 1,
             generation: 1,
@@ -3477,6 +3809,7 @@ mod tests {
             smoke_metadata: None,
         });
         route.send(NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: 1,
             generation: 1,
@@ -3494,6 +3827,7 @@ mod tests {
         let overflow = Arc::new(AtomicBool::new(false));
         let (route, rx) = native_window_event_route(1, Arc::clone(&overflow));
         let mouse = |x, token| NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: 3,
             generation: 3,

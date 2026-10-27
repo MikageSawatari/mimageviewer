@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, mpsc};
 
+use crate::app::book_append_refresh::FolderRefreshCause;
 use crate::app::{App, ExternalChangeCheck};
 use crate::grid_item::GridItem;
 use crate::settings::FileOrganizeDestination;
@@ -140,7 +141,7 @@ pub fn show_file_organize_modal(
     destinations: &[FileOrganizeDestination],
     focus: &mut Option<(usize, Option<ShellTransferOperation>)>,
 ) -> egui::ModalResponse<Option<FileOrganizeUiAction>> {
-    egui::Modal::new(egui::Id::new("file_organize_modal")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("file_organize_modal")).show(ctx, |ui| {
         ui.set_width((ctx.content_rect().width() - 48.0).clamp(240.0, 780.0));
         ui.heading("ファイル整理先");
         render_file_organize_contents(ui, sources, destinations, focus)
@@ -224,6 +225,10 @@ pub fn render_file_organize_contents(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("organize_sources")
                     .max_height(height)
                     .min_scrolled_height(0.0)
@@ -307,18 +312,20 @@ pub fn render_file_organize_contents(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 let mut scroll = egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("organize_destinations")
                     .max_height(height)
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, false]);
+                let scroll_id = ui.make_persistent_id(egui::IdSalt::new("organize_destinations"));
                 if let Some(row) = reveal_row {
-                    let offset = egui::scroll_area::State::load(
-                        ui.ctx(),
-                        ui.make_persistent_id(egui::Id::new("organize_destinations")),
-                    )
-                    .unwrap_or_default()
-                    .offset
-                    .y;
+                    let offset = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+                        .unwrap_or_default()
+                        .clamped_offset()
+                        .y;
                     let top = row as f32 * (row_height + spacing.y);
                     // Set the nearest visible offset before show_rows chooses
                     // which rows to draw, including an offscreen selection.
@@ -326,7 +333,7 @@ pub fn render_file_organize_contents(
                         offset.clamp((top + row_height - height).max(0.0), top),
                     );
                 }
-                scroll.show_rows(ui, row_height, destinations.len(), |ui, rows| {
+                let _output = scroll.show_rows(ui, row_height, destinations.len(), |ui, rows| {
                     for row in rows {
                         let destination = &destinations[row];
                         let response = ui
@@ -381,6 +388,11 @@ pub fn render_file_organize_contents(
                         }
                     }
                 });
+                #[cfg(test)]
+                assert_eq!(
+                    _output.id, scroll_id,
+                    "keyboard reveal reads the real ScrollArea owner"
+                );
             },
         );
     }
@@ -401,11 +413,11 @@ impl App {
 
     pub(crate) fn request_file_organize_dialog(&mut self, clicked: Option<usize>) {
         if !matches!(self.file_organize_request, FileOrganizeRequest::Hidden) {
-            self.show_feedback_toast("整理操作が完了するまでお待ちください".to_owned());
+            self.show_feedback_warning("整理操作が完了するまでお待ちください".to_owned());
             return;
         }
         if self.remote_session_blocks_local_control() {
-            self.show_feedback_toast("リモート接続中は整理操作を開始できません".to_owned());
+            self.show_feedback_warning("リモート接続中は整理操作を開始できません".to_owned());
             return;
         }
         match resolve_sources(
@@ -422,7 +434,7 @@ impl App {
                         focus: None,
                     }))
             }
-            Err(message) => self.show_feedback_toast(message),
+            Err(message) => self.show_feedback_warning(message),
         }
     }
 
@@ -453,6 +465,9 @@ impl App {
             self.main_hwnd,
         ) {
             Ok(Some(request)) => {
+                if !self.admit_book_append_followup_mutation() {
+                    return;
+                }
                 let rx = crate::shell_file_ops::transfer_items_async(
                     self.main_hwnd,
                     request.clone(),
@@ -462,14 +477,14 @@ impl App {
                     FileOrganizeRequest::Running(Box::new(FileOrganizeRunning { request, rx }));
             }
             Ok(None) => {}
-            Err(message) => self.show_feedback_toast(message.to_owned()),
+            Err(message) => self.show_feedback_warning(message.to_owned()),
         }
     }
 
     pub(crate) fn poll_file_organize(&mut self, ctx: &egui::Context) {
         if self.file_organize_dialog_visible() && self.remote_session_blocks_local_control() {
             self.file_organize_request = FileOrganizeRequest::Hidden;
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "リモート接続されたため整理先の選択画面を閉じました".to_owned(),
             );
             return;
@@ -490,13 +505,13 @@ impl App {
         };
         let request = running.request;
         match result {
-            Ok(outcome) if outcome.aborted => self.show_feedback_toast(
+            Ok(outcome) if outcome.aborted => self.show_feedback_warning(
                 "操作が中断されました。処理済みの項目は元に戻りません".to_owned(),
             ),
             Ok(_) => {}
             Err(message) => {
                 crate::logger::log(format!("file_organize: {message}"));
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "操作を完了できませんでした。フォルダの内容を確認してください\n{message}"
                 ));
             }
@@ -508,7 +523,11 @@ impl App {
                 .as_deref()
                 .is_some_and(|current| refresh_matches(current, &request))
         {
-            self.check_external_folder_changes(ctx, ExternalChangeCheck::Notified);
+            self.check_folder_changes_with_cause(
+                ctx,
+                ExternalChangeCheck::Notified,
+                FolderRefreshCause::Operation,
+            );
         }
     }
 
@@ -570,8 +589,9 @@ mod tests {
 
     fn navigation_harness(size: egui::Vec2) -> NavigationHarness {
         let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder().with_size(size).build_state(
-            move |ctx, state: &mut (Vec<FileOrganizeDestination>, Option<_>)| {
+        let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+            move |root_ui, state: &mut (Vec<FileOrganizeDestination>, Option<_>)| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
@@ -677,6 +697,8 @@ mod tests {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -600.0),
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         });
         // Hover tooltips can keep requesting repaint; allow the wheel to
         // settle without waiting for the entire Modal to become idle.
@@ -714,14 +736,15 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1000.0, 720.0))
-                .build_state(
-                    |ctx,
+                .build_ui_state(
+                    |root_ui,
                      state: &mut (
                         Vec<FileOrganizeDestination>,
                         Option<(usize, Option<ShellTransferOperation>)>,
                         egui::Rect,
                         bool,
                     )| {
+                        let ctx = &root_ui.ctx().clone();
                         if !state.3 {
                             crate::ui_fonts::configure_fonts(ctx);
                             state.3 = true;
@@ -779,13 +802,15 @@ mod tests {
     fn file_organize_table_buttons_keep_pointer_focus_and_action() {
         use egui_kittest::kittest::Queryable;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1000.0, 720.0))
-            .build_state(
-                |ctx,
+            .build_ui_state(
+                |root_ui,
                  state: &mut (
                     Option<(usize, Option<ShellTransferOperation>)>,
                     Option<FileOrganizeUiAction>,
                 )| {
+                    let ctx = &root_ui.ctx().clone();
                     state.1 = show_file_organize_modal(
                         ctx,
                         &[r"C:\source\image.jpg".into()],

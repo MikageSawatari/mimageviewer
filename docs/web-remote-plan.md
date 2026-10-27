@@ -1,5 +1,55 @@
 # リモート閲覧 (Web) 機能 計画書
 
+## 本の構成（§1.242 B2、2026-10-13）
+
+strict IPCはv71。ContainerPayloadにaccepted `composition_revision`を持ち、実効address/generationと一緒に使う。
+ZIP/PDF/EPUBは共通pure投影で順序・hidden・新tailを適用してから既存件数/byte制限へ通す。
+寸法取得・組生成は返却itemsだけで、Singleは組のための寸法を読まない。
+不完全応答は自動表紙次/最終単独・端配置・末尾表紙を抑止し、範囲内の明示指定を保持する。
+PCとの組の差は通常本と共通の延期§1.368の制約として残す。
+明示白紙は一つのNavigation presentation slotに画面側を載せ、partnerを要求しない。
+Single/端末単ページ強制/Splitではその側を渡さず、通常本のsingleton trimも変更しない。
+構成本のWeb表示メニューは単ページ/見開き/横長分割。方向・表紙・Spread shiftはPC editorへ案内する。
+端配置・表紙次/最終単独・末尾表紙はqualified scopeのAutomaticRuleとして既存writerへ保存できる。
+構成record/revisionのwrite、全本寸法解決、省略相方の追加取得は行わない。
+以下のG段階のv70は当時の実装記録である。
+
+## 抽出一覧の一時表示（§1.242 G1）
+
+評価・スマートフォルダ・保存コレクションの直接閲覧はA2の抽出一覧として扱う。
+新規閲覧はSingle、directionは全体既定を閲覧sessionへ取り込み、一時Spread/Splitはその方向で
+coverなしに投影する。本を開いた後のcontainerは従来の本別表示を使う。
+Webの既存方向/表紙付きキーは抽出一覧では表示種別だけへroutingし、表示メニューは
+単ページ・見開き・横長分割の三択。一時表示要求は既存collection取得/navigation経路へ送り、
+`SetSpread`の書込みを起動しない。保存コレクションの新規route取得では前sessionのmodeを送らない。
+件数/byte上限、policy、navigationのexact snapshot proofは保持する。通常ZIP一覧の子container位置も維持する。
+構成本の`SetViewMode`/binding拒否契約はbook-composition-plan §9.2を参照する。
+2026-10-11 G3でstrict protocolを**v70**へ更新し、`SetViewMode`とderived `composition_managed`を追加した。
+構成あり本の結合`SetSpread`はworkerの最新snapshotで方向・表紙が一致する見開き要求のみ
+既存`SetViewMode` ownerへ渡す（2026-10-14 Q31）。不一致は一致するWebキー2/3/4/5とPC構成編集を案内して拒否する。
+requested modeはtyped LegacySpread資格に保持し、UIの最新snapshotでも再確認する。
+mode-only書込はbinding保存／休眠shift Clearへ進まず、Webの表示分類menuは従来どおり。
+mode-onlyの本別保存は既存spread.db worker、抽出結果は非永続の表示投影。構成/shift writerを呼ばない。
+mode-onlyの読取は休眠bindingと閲覧分類を分離し、親/全体と文書由来の既定方向・表紙を解決してから分類を適用する。
+表示分類は文書方向の読取を止めず、Single/Spread/Splitとも同じ解決済み方向を使う。
+文書情報は要求が所有するReadTargetから取得し、PDFの方向列挙は既存worker経路に留める。
+PCの解除・再入場と同じ純粋resolverを使う内部読取修正で、wire字段とprotocol v70は変更しない。
+非対応ページ名では構成を使わず従来の操作を維持し、通知とlogを出す。書庫や保存構成を変更しない。
+この段でRemote構成editorやG5の表示/export全体を実装済みとはしない。
+2026-10-12の利用者決定でG4Fを切り離す。物理File画像/folderの保存構成は、
+read/write候補・binding受付（qualified/fallback）・`composition_managed`へ使用しない。
+既存のfolder一覧・個別編集・Eのshift scope/saved anchor/grouping・読む方向は保持する。
+保存行は削除せず、pure model/store/明示転送の値として残す。書庫/PDF/EPUBの資格/proofは維持する。
+完全空のwrite admissionは保護対象がないため構成snapshotのエラーに依存せず、非空は従来どおり拒否する。
+wire字段・owner・writer・公開addressを変更せず、protocol v70を維持する。
+構成の受付資格はwrite/read workerが既存の実体分類（metadataのfile/dir）から決める。
+`.pdf`/`.epub`/`.zip`名の実folderは、以前のDocument/Archive行が同じkeyに残っていても対象外。
+通常のwrite検証・binding admission・構成管理表示は同じfile資格を使い、行のdomainではfolderを推測しない。
+実体fileの資格を確定した後も、将来用ImageFolder保存値を現在のfile構成として消費しない既存分岐は維持する。
+UI採用はworkerのadmissionを必須引数として再検証し、拡張子からのfallbackを持たない。
+未修飾のtest-only入口も同じworkerへ通す。UIへの同期FS I/O、追加owner、wire変更はない。
+
+
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから
 自宅 PC の mIV ライブラリを閲覧できるようにする。本書がこの機能の正本。
 
@@ -63,6 +113,19 @@ snapshot/FIFO読取を使う。Remote専用の`spread_shift.db`接続やPC viewe
 §1.364 D3の取得continuationは、閉鎖前に受理済みのshift/resume writeの完了とread snapshot公開も
 FinishAcquireの前提に含める。viewer close自体はshift保存を発生させない。完了readinessをpollし、
 UI threadのDB待機やjoinを追加しない。Remote返却後は既存一覧reloadと次のBook openで保存値を解く。
+
+§1.242 G4のPC構成editor開始/保存は、`SessionHandle::with_local_composition_admission`で
+既存BeginAcquireと同じ`session.inner` mutexへ入り、Local確認とApp共通owner/ticketの採用を
+短い処理で確定する。session側へeditor状態や第二ownerを追加しない。lock内はowner登録と
+非blocking送信だけとし、service状態lock・DB・context mount・worker完了待ちは置かない。
+後のBeginAcquireはeditor中でも受け付け、AcquiringRemoteの全窓closeはfullscreenの有無や
+一時mount先に依存せずglobal editor ownerを閉じる。Preparing/Editingの未保存draftは破棄し、
+Savingの送信済ticketはApp共通の完了管理へ残す。既存UI pollで保存成功/失敗を収穫した後、
+editor ownerとticketがともに終端であることをFinishAcquireの条件へ加える。
+Remoteの最初のread/writeは既存`wait_until_active`でこの終端まで待つ。30秒watchdogと
+取得abort後の既存drainを保ち、旧replyからeditorを復活させない。詳細は
+[本の構成計画 §8.1 / §10.2](book-composition-plan.md#81-開始の確定境界と終了のowner)。
+この接続はcore内部の受付/完了境界だけを変更し、IPC wireとstrict protocol v70は維持する。
 
 - ダイアログには `tailscale status --json` の `Peer.TailscaleIPs` と接続元 IP の照合結果から
   direct / relay と対向端末名を表示する。CLI 失敗・未照合時は「取得できません」と明示する
@@ -645,6 +708,24 @@ remote-web 側で生成すると、本体が持つ以下をすべて複製する
 にする。これにより **F1 が解消する** (remote-web が catalog の内部構造を知らなくなる)。
 副次的に、リモート閲覧が本体のキャッシュを温めるため、次にローカルで開いたときも速くなる。
 
+#### catalog を開けない場合 (backlog §2.18、2026-10-20)
+
+ページ／サムネイルの復号では catalog は任意の高速化用キャッシュであり、open 失敗を
+要求全体の Internal エラーへ変換しない。理由を本体ログに残し、catalog 無しで既存の
+復号経路へ進む。生成結果は catalog へ保存しない。ページ (`full_page`) は現行の
+`SourceOnly` により初めから catalog を開かない。通常画像、ZIP 内画像、PDF／EPUB ページ、
+コンテナ代表サムネイルも、元データから生成できるものは catalog 無しで応答する。
+
+RAW の `CacheOnly` は既存キャッシュだけを使う制約を維持する。writable catalog を
+得られなければ、admission 失効・通常の open エラーのどちらでも、既存の
+`wait_read_admission` → `open_existing_read_only_admitted` による read-only 継続を1回だけ使う。
+書き込み用の移行等が失敗しても読める既存 RAW 行を返すための経路であり、writable open の
+リトライではない。read-only も開けない／行が無い場合は既存のキャッシュ欠落応答とし、
+元画像の生成・現像・catalog への書き込みは許さない。`CacheOnly` 以外はログを残して
+catalog 無しで復号を続ける。再試行、待ち時間や閾値の調整、要求ごとの open 構造の変更は行わない。
+新しい非同期状態や割り込みの組み合わせを追加せず、既存の任意 catalog と読み込み方針で扱う。
+IPC 応答型・protocol 版・catalog の本体側所有は変わらない。
+
 ### 9.3 暫定措置 (撤去済み)
 
 commit `865d9c2a` で導入した remote-web 側のオンデマンド生成と専用 SQLite は、縦串増分で
@@ -1106,7 +1187,8 @@ CSS page gap へ反映する。viewport は `height > width` を縦持ちとし�
 change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
-LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+LTR / RTL の見開き・横長分割モードは本体と同じく方向をそのモードへ揃え、Single の応答も
+保存済み方向を維持する。シークバーはこの `readingDirection` から向きを決め、入力の左右とは独立する。
 変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
 `PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
 案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
@@ -1114,9 +1196,21 @@ LTR / RTL の見開きモードは本体と同じく方向をそのモードへ�
 「文書の綴じ方向に従う」が有効なときに固定世代の方向を採用する。通常 PDF の `/Direction` は
 Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
-RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
-右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
-前後という意味を維持する。見開きの2画像は両方を別 DOM で fetch / decode し、最終寸法から
+横方向入力の反転は `command-core.mjs::inputAdvancesRightToLeft` だけで判定する。本体の
+`SpreadMode::advances_right_to_left` と同じく、Rtl / RtlCover / SplitRtl では反転し、
+Single / Ltr / LtrCover / SplitLtr では反転しない。入力は保存由来の `configured_spread_mode`
+（Web 共通 state の `spreadMode`）を見るため、Single は保存済み方向が RTL でも右 tap zone /
+`ArrowRight` / `›` が次グループになる。縦持ちの表示限定 Single は構成モードを変えないため、
+構成が RTL なら綴じ方向に従って反転を続ける。コンテナ・各コレクションも同じ state 値を使う。
+表示種別だけを変える要求も、受付時に `spreadModeWithReadingDirection` で要求と同じ読み方向へ正規化してから共通 state と再取得要求へ渡し、応答待ちの間も左右入力とラベルの反転を維持する。
+反転時は左 tap zone / `ArrowLeft` / `‹` が次、右 tap zone / `ArrowRight` / `›` が前になる。
+swipe は指でページを送る向きを維持し、反転時は右 swipe が次・左 swipe が前、Single と LTR は
+左 swipe が次・右 swipe が前になる。ボタンの aria-label と端ページのタップ案内も同じ判定から
+動作に合わせ、ラベルはモード変更時に更新する。
+上下矢印と PageUp / PageDown は前後という意味を維持する。本体の
+`fullscreen_horizontal_cursor_direction` 設定は持ち込まず、既定の FollowPage 相当とする。
+§1.259 で入力の左右を本体に揃えた。応答・IPC 型・protocol 版は変更しない。
+見開きの2画像は両方を別 DOM で fetch / decode し、最終寸法から
 共通高さの layout を確定してから page layer を1回で差し替えるため、片側だけの表示や暫定倍率を
 見せない。
 
@@ -1886,12 +1980,22 @@ server 最終 redaction は維持する。
 
 ### 12.27 混在フォルダの本判定と seek overlay parity (protocol v43, 2026-08-11)
 
-通常フォルダの保存値が無い見開き既定は、本体と同じ
-`crate::app::physical_page_order_locked` を `spread_payload` から直接呼んで決める。remote 側に
-画像のみ・自動フルスクリーン等の条件を再記述しない。本と判定された場合だけ端末共通の
-`default_spread_mode` / `default_reading_direction` を使い、それ以外は本体の
-`SpreadRestoreDefaults::NON_BOOK` と同じ Single / LTR とする。明示 request と `spread.db` の保存値は
-従来どおり既定より優先する。ZIP / PDF は `is_open_as_container` により本のままである。
+通常フォルダの保存値が無い見開き既定は、設定 OFF 時の既存動作では列挙した全項目が画像である
+`canonical_image_book` を基準にする（`physical_page_order_locked` と同一ではない）。画像だけなら
+端末共通の `default_spread_mode` / `default_reading_direction`、混在なら Single / LTR を使う。
+`apply_default_spread_to_plain_folders`（既定 OFF）が ON なら、directory scan に成功した folder
+列挙から `SpreadDefaultSource::Directory` と採用済み `sort_locked` を渡し、App と共通の
+`SpreadRestoreDefaults::for_physical_folder` で解決するのは、非本かつ元の全項目が画像である
+`canonical_image_book` の実フォルダだけとする。既定 mode（旧 Vertical は Single）と LTR fallback を使い、
+mode の埋め込み方向を優先する。本扱い・その他は従来の `canonical_image_book` による計算を維持する。
+画像以外を含むフォルダは ON でも既定 Single/LTR のまま。Remote の画像に絞った応答では PC の
+動画・音声などの pairing 境界を保持できないためで、PC 側の混在フォルダへの適用は変更しない。
+各要求の `RemoteReadingSettings` は bool と既定値を共有 settings_kv から一括で読み、engine の
+起動時 Settings を使わない。明示 request と `spread.db` の保存値は従来どおり既定より優先する。
+ZIP/PDF/EPUB の本用既定、Collection の NON_BOOK は変更しない。IPC wire 形式・protocol 版は不変。
+
+既知の制約として、Remote は本用の既定を含め、お気に入り専用の表示状態を解決していない。
+この設定でもお気に入り専用の既定ページ構成ではなく、共有設定の共通既定を使う。
 
 folder container は画像 entry / page group へ絞る前の materialized items をこの判定へ渡す。
 同じ full items から本体 seek overlay の nav item 分類を通して画像・動画・その他の件数を作り、
@@ -3039,3 +3143,15 @@ Remote payload は二端の preference と実効 bool を個別に返す。v59 w
 選んだ端だけを更新して同じ本の他端を保持する。書込後のrefreshは
 現在anchor / slice / historyを維持し、group layoutだけを更新する。詳細は
 [§1.218設計・検証記録](section218-singleton-spread-placement.md)を参照。
+
+
+### AVIF内蔵デコード（§1.407、第2ラウンド）
+
+addressed APIはcoreのcanonical / thumb_loaderを通る。旧 `/api/image` / `/api/image-info` は
+Web UIに`entry.address`なしの互換分岐として残っているため、remote-webの画像supportも
+`libavif-sys`のsafe Rust APIへ接続する。coreへの依存は追加せず、Remote exeにも静的リンクする。
+現行の通常一覧応答はaddress付きで新APIを使う（folder/collection/persistent collectionの応答生成を確認）。
+旧APIの資格確認・保存回転・passthrough条件は維持し、AVIFの画素とprobe寸法には
+clap/irot/imirの適用後結果を用いる。probeはRGBA確保・AV1 decodeを行わない。
+旧APIの需要decodeは4 threads、coreの背景寸法probeは1 thread。
+詳細な入口再棚卸しと検証は[AVIF設計§5](avif-builtin-decoder-plan.md#5-未決記録)に記録する。

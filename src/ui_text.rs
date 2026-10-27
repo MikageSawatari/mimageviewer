@@ -41,7 +41,9 @@ use comic_core::{
 use std::collections::{HashMap, HashSet};
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
-const PANEL_W: f32 = 268.0;
+// 0.37 の塗り色 + 不透明度の行は 268.21875pt。整数 pt の本文予算を
+// 269pt に切り上げ、描画のはみ出しを許容誤差で隠さない。
+const PANEL_W: f32 = 269.0;
 /// ラベル・色ボタンと横並びにする Slider の幅。Area の auto-size が PANEL_W を
 /// 超えて詳細パネル幅を変えないよう、横並び行だけ既定値より狭くする。
 const DETAIL_ROW_SLIDER_W: f32 = 70.0;
@@ -1984,6 +1986,7 @@ impl App {
         let Some(key) = self.page_path_key(target_idx) else {
             return;
         };
+        self.cancel_original_material_entry_intents(None);
 
         if let Some(pivot) = pivot {
             self.text_spread_ctx = Some(pivot);
@@ -2075,6 +2078,7 @@ impl App {
     }
 
     pub(crate) fn reset_text_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         let was_text_mode = self.text_mode;
         self.commit_text_page();
 
@@ -2164,7 +2168,7 @@ impl App {
             self.reset_comic_history(&key);
             return;
         }
-        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input();
         if busy {
             return;
         }
@@ -2182,6 +2186,11 @@ impl App {
             return;
         }
         let cur = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if (cur != self.comic_undo_baseline || !self.comic_undo_stack.is_empty())
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         if let Some(prev) = comic_undo_step(
             &mut self.comic_undo_stack,
             &mut self.comic_redo_stack,
@@ -2203,6 +2212,9 @@ impl App {
             return;
         }
         let cur = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if !self.comic_redo_stack.is_empty() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         if let Some(next) = comic_redo_step(
             &mut self.comic_undo_stack,
             &mut self.comic_redo_stack,
@@ -2258,10 +2270,13 @@ impl App {
     /// テキストフィールドにフォーカスがある間は egui に委ねて (= モード退場しない) 変換
     /// 確定 / キャンセルを壊さない。Ctrl+T は修飾キー付きなので IME と衝突しない。
     pub(crate) fn handle_text_keys(&mut self, ctx: &egui::Context, _fs_idx: usize) -> FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = FsKeyAction::default();
 
         if !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && self.consume_context_shortcuts_help_key(ctx)
         {
             self.show_context_shortcuts_help = true;
@@ -2290,7 +2305,7 @@ impl App {
         // consume 順は `handle_meta_undo_keys` と同じ: Ctrl+Shift+Z (redo) → Ctrl+Y (redo)
         // → Ctrl+Z (undo)。`Modifiers::CTRL` 指定の consume は Shift 併用 Z も拾うため
         // redo を先に握り、Ctrl+Shift+Z が undo 側へ流れないようにする。
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             let redo = self.keymap.consume_action(ctx, KeyAction::TextRedo);
             let undo = self.keymap.consume_action(ctx, KeyAction::TextUndo);
             if undo {
@@ -2351,6 +2366,14 @@ impl App {
         let Some(key) = self.page_path_key(fs_idx) else {
             return;
         };
+        let has_selected = self.comic_docs.get(&key).is_some_and(|objects| {
+            objects
+                .iter()
+                .any(|object| self.text_selected_ids.contains(&object.id))
+        });
+        if !has_selected || !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let Some(objs) = self.comic_docs.get_mut(&key) else {
             return;
         };
@@ -2404,7 +2427,15 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        if self.book_append_undo_in_progress() {
+            return;
+        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
@@ -2419,9 +2450,11 @@ impl App {
 
         let (pressed, down, released, pos) = ctx.input(|i| {
             (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
+                primary_allowed && i.pointer.primary_pressed(),
+                primary_allowed && i.pointer.primary_down(),
+                primary_allowed
+                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                    && i.pointer.primary_released(),
                 i.pointer.interact_pos(),
             )
         });
@@ -2628,6 +2661,10 @@ impl App {
                             .unwrap_or(false)
                     };
                     if changed {
+                        // Geometry edits are non-reentrant, document-only calls.
+                        // Expire in this call before bake/save publication, while
+                        // a selection press or unchanged drag remains read-only.
+                        self.invalidate_book_append_undo();
                         drag.moved = true;
                         self.mark_comic_dirty();
                     }
@@ -3037,16 +3074,21 @@ impl App {
         let mut preview_scale_req: Option<u32> = None;
         let initial_smart_snap_enabled = self.settings.text_smart_snap_enabled;
         let mut smart_snap_enabled = initial_smart_snap_enabled;
+        let append_undo_pending =
+            self.book_append_undo_in_progress() || self.book_structural_op.is_some();
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
-        egui::Area::new(egui::Id::new("text_panel"))
+        egui::Area::new(egui::Id::unique("text_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if append_undo_pending {
+                    ui.disable();
+                }
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("text_panel_click_sink"),
+                    egui::Id::unique("text_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -3222,6 +3264,10 @@ impl App {
                         let list_max =
                             (sink_rect.bottom() - list_top - ACTIONS_RESERVE).clamp(80.0, 2000.0);
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .id_salt("text_panel_scroll")
                             .max_height(list_max)
                             .auto_shrink([false, true])
@@ -3289,14 +3335,17 @@ impl App {
         // しっぽ stash は App 状態だが、closure は self を借りないので `objects` と同様に
         // 一旦ローカルへ取り出して &mut を渡し、closure 後に書き戻す。
         let mut tail_stash = std::mem::take(&mut self.comic_tail_stash);
-        egui::Area::new(egui::Id::new("text_detail_panel"))
+        egui::Area::new(egui::Id::unique("text_detail_panel"))
             .fixed_pos(detail_rect.min)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if append_undo_pending {
+                    ui.disable();
+                }
                 ui.interact(
                     detail_rect,
-                    egui::Id::new("text_detail_panel_click_sink"),
+                    egui::Id::unique("text_detail_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -3316,7 +3365,7 @@ impl App {
                             egui::vec2(PANEL_W, body_height),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
-                                egui::ScrollArea::vertical()
+                                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                     .id_salt("text_detail_scroll")
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
@@ -3435,6 +3484,9 @@ impl App {
         // 解決は冪等なので、配置と無関係な編集で呼んでも同じ pivot になる (Free はドラッグで
         // 置いた位置を保持)。プリセット適用で位置が変わった直後にも効く。
         if changed {
+            // The panel edits a local document removed from comic_docs. Admit
+            // its first changed draft before publishing it back to the owner.
+            self.invalidate_book_append_undo();
             if let Some(id) = selected {
                 let is_positioned_window = objects.iter().any(|o| {
                     o.id == id
@@ -3521,14 +3573,15 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 600.0);
         let default_h = (avail.height() - 120.0).clamp(240.0, 560.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("吹き出しを追加")
-            .id(egui::Id::new("text_add_bubble_dialog"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("text_add_bubble_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -3545,6 +3598,10 @@ impl App {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let cols = ((ui.available_width() / (PRESET_CELL_W + 8.0)).floor()
@@ -3565,6 +3622,9 @@ impl App {
 
         self.text_add_bubble_dialog = open;
         if let Some(preset) = chosen {
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
             let mut objs = self.comic_docs.remove(&key).unwrap_or_default();
             let id = next_id(&objs);
             let z = objs.len() as i32;
@@ -3623,14 +3683,15 @@ impl App {
         let mut cancel_requested = false;
         let avail = ctx.content_rect();
         let default_size = egui::vec2((avail.width() - 32.0).clamp(420.0, 600.0), 430.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("注釈を追加")
-            .id(egui::Id::new("text_add_annotation_dialog"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("text_add_annotation_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -3662,6 +3723,9 @@ impl App {
         }
         self.text_add_annotation_dialog = open;
         if !add_requested || cancel_requested {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
 
@@ -3720,14 +3784,15 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(320.0, 540.0);
         let default_h = (avail.height() - 120.0).clamp(220.0, 460.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("メッセージウィンドウを追加")
-            .id(egui::Id::new("text_add_window_dialog"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("text_add_window_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -3744,6 +3809,10 @@ impl App {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let cols =
@@ -3763,6 +3832,9 @@ impl App {
 
         self.text_add_window_dialog = open;
         if let Some(i) = chosen {
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
             let p = &WIN_PRESETS[i];
             let mut objs = self.comic_docs.remove(&key).unwrap_or_default();
             let id = next_id(&objs);
@@ -3907,14 +3979,14 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 860.0);
         let default_h = (avail.height() - 120.0).clamp(300.0, 660.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("オノマトペを追加")
-            .id(egui::Id::new("text_add_onomatopoeia_dialog"))
+        egui::Window::new("オノマトペを追加").drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("text_add_onomatopoeia_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -3952,7 +4024,7 @@ impl App {
                     .color(egui::Color32::from_gray(180)),
                 );
                 ui.separator();
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         // パック未導入時はカードを無効化して追加をブロックする (見本は見える
@@ -3998,6 +4070,9 @@ impl App {
         sw: f32,
         sh: f32,
     ) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.ensure_comic_font_registry();
         let font_key = self.resolve_onomatopoeia_font(preset.font_candidate);
         let mut tb = preset.build_text(&font_key);
@@ -4102,8 +4177,7 @@ impl App {
         selected: bool,
         allow_build: bool,
     ) -> bool {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), egui::Sense::click());
+        let (rect, resp) = allocate_font_card(ui);
         let hovered = resp.hovered();
         let painter = ui.painter_at(rect);
         let bg = if selected {
@@ -4221,14 +4295,15 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 760.0);
         let default_h = (avail.height() - 120.0).clamp(320.0, 600.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("フォントを見本から選択")
-            .id(egui::Id::new("text_font_dialog"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("text_font_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -4239,13 +4314,14 @@ impl App {
             .show(ctx, |ui| {
                 crate::os_theme::apply_dark_ui(ui);
                 ui.horizontal(|ui| {
-                    ui.label("見本");
+                    let sample_label = ui.label("見本");
                     if crate::ime_focus::add_singleline(
                         ui,
                         &mut self.text_font_dialog_sample,
                         None,
                         |edit| edit.desired_width(180.0),
                     )
+                    .labelled_by(sample_label.id)
                     .changed()
                     {
                         self.font_sample_cache.clear();
@@ -4292,39 +4368,37 @@ impl App {
                 let mut build_budget = 4i32;
                 let mut need_repaint = false;
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, FONT_CARD_H + 8.0, rows, |ui, row_range| {
-                        for row in row_range {
-                            ui.horizontal(|ui| {
-                                for col in 0..cols {
-                                    let idx = row * cols + col;
-                                    let Some(key) = visible.get(idx) else {
-                                        break;
-                                    };
-                                    let selected = key == &current_key;
-                                    // 構築済み (テクスチャ有) か失敗済みなら予算を消費しない。
-                                    let settled = self.font_sample_cache.contains_key(&(
-                                        key.clone(),
-                                        self.text_font_dialog_sample.clone(),
-                                    )) || self.font_sample_failed.contains(key);
-                                    let allow = settled || build_budget > 0;
-                                    if !settled && allow {
-                                        build_budget -= 1;
-                                    }
-                                    if !settled && !allow {
-                                        need_repaint = true;
-                                    }
-                                    if self.draw_font_card(ui, ctx, key, selected, allow) {
-                                        chosen = Some(key.clone());
-                                    }
+                show_font_card_rows(ui, rows, |ui, row_range| {
+                    for row in row_range {
+                        ui.horizontal(|ui| {
+                            for col in 0..cols {
+                                let idx = row * cols + col;
+                                let Some(key) = visible.get(idx) else {
+                                    break;
+                                };
+                                let selected = key == &current_key;
+                                // 構築済み (テクスチャ有) か失敗済みなら予算を消費しない。
+                                let settled = self.font_sample_cache.contains_key(&(
+                                    key.clone(),
+                                    self.text_font_dialog_sample.clone(),
+                                )) || self.font_sample_failed.contains(key);
+                                let allow = settled || build_budget > 0;
+                                if !settled && allow {
+                                    build_budget -= 1;
                                 }
-                            });
-                        }
-                        if need_repaint {
-                            ui.ctx().request_repaint();
-                        }
-                    });
+                                if !settled && !allow {
+                                    need_repaint = true;
+                                }
+                                if self.draw_font_card(ui, ctx, key, selected, allow) {
+                                    chosen = Some(key.clone());
+                                }
+                            }
+                        });
+                    }
+                    if need_repaint {
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
 
         self.text_font_dialog = open;
@@ -4339,6 +4413,14 @@ impl App {
             }
         }
         if let Some(font_key) = chosen {
+            let has_target = self.comic_docs.get(&page_key).is_some_and(|objects| {
+                objects
+                    .iter()
+                    .any(|object| object.id == target && object.text_block().is_some())
+            });
+            if !has_target || !self.admit_book_append_followup_mutation() {
+                return;
+            }
             let mut objs = self.comic_docs.remove(&page_key).unwrap_or_default();
             if let Some(tb) = objs
                 .iter_mut()
@@ -4365,6 +4447,9 @@ impl App {
     /// 選んだフォントファイルをユーザーフォントディレクトリへコピーし、レジストリを
     /// 再列挙して、その表示ラベル (= font_key) を返す。失敗時は `None`。
     fn add_user_font_file(&mut self, path: &std::path::Path) -> Option<String> {
+        if !self.admit_book_append_followup_mutation() {
+            return None;
+        }
         let dir = crate::font_assets::user_fonts_dir();
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
@@ -4446,6 +4531,9 @@ impl App {
                 let Some(tb) = objects[idx].text_block() else {
                     return false;
                 };
+                if !self.admit_book_append_followup_mutation() {
+                    return false;
+                }
                 let preset = TextStylePreset::from_text(id.clone(), name, tb);
                 self.comic_text_presets.push(preset);
                 if let Some(tbm) = objects[idx].text_block_mut() {
@@ -4456,6 +4544,9 @@ impl App {
                 let AnnotationKind::Bubble(b) = &objects[idx].kind else {
                     return false;
                 };
+                if !self.admit_book_append_followup_mutation() {
+                    return false;
+                }
                 let id = self.next_user_preset_id("s");
                 let preset = ShapeStylePreset::from_bubble(id.clone(), name, b);
                 self.comic_shape_presets.push(preset);
@@ -4469,6 +4560,9 @@ impl App {
                 let AnnotationKind::MessageWindow(w) = &objects[idx].kind else {
                     return false;
                 };
+                if !self.admit_book_append_followup_mutation() {
+                    return false;
+                }
                 let id = self.next_user_preset_id("w");
                 let preset = WindowStylePreset::from_window(id.clone(), name, w);
                 self.comic_window_presets.push(preset);
@@ -4501,6 +4595,29 @@ impl App {
             return false;
         };
         // 更新先の種別は target で決める (オブジェクト種別ではない。Codex P2)。
+        let valid_target = match target {
+            PresetTarget::Text => {
+                objects[idx].text_block().is_some()
+                    && self.comic_text_presets.iter().any(|preset| preset.id == id)
+            }
+            PresetTarget::Shape => {
+                matches!(objects[idx].kind, AnnotationKind::Bubble(_))
+                    && self
+                        .comic_shape_presets
+                        .iter()
+                        .any(|preset| preset.id == id)
+            }
+            PresetTarget::Window => {
+                matches!(objects[idx].kind, AnnotationKind::MessageWindow(_))
+                    && self
+                        .comic_window_presets
+                        .iter()
+                        .any(|preset| preset.id == id)
+            }
+        };
+        if !valid_target || !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let mut updated = false;
         match target {
             PresetTarget::Text => {
@@ -4582,6 +4699,18 @@ impl App {
     /// ユーザープリセット `id` を削除し、リンクしていたオブジェクトのリンクを外す。
     fn delete_user_preset(&mut self, objects: &mut [AnnotationObject], id: &str) -> bool {
         if crate::comic_presets::is_system_preset(id) {
+            return false;
+        }
+        let exists = self.comic_text_presets.iter().any(|preset| preset.id == id)
+            || self
+                .comic_shape_presets
+                .iter()
+                .any(|preset| preset.id == id)
+            || self
+                .comic_window_presets
+                .iter()
+                .any(|preset| preset.id == id);
+        if !exists || !self.admit_book_append_followup_mutation() {
             return false;
         }
         let before = self.comic_text_presets.len()
@@ -4755,14 +4884,14 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 600.0);
         let default_h = (avail.height() - 120.0).clamp(280.0, 560.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new(title)
-            .id(egui::Id::new("text_add_stamp_dialog"))
+        egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("text_add_stamp_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -4857,7 +4986,7 @@ impl App {
                 }
 
                 // 絵文字グリッド。
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -4928,6 +5057,9 @@ impl App {
         path: std::path::PathBuf,
     ) {
         use std::sync::atomic::AtomicBool;
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         // 既存の進行中 worker があれば破棄 (連打対策)。
         if let Some(prev) = self.stamp_embed_pending.take() {
             prev.cancel
@@ -4992,7 +5124,7 @@ impl App {
                         );
                     }
                     None => {
-                        self.show_feedback_toast("画像を読み込めませんでした".to_string());
+                        self.show_feedback_warning("画像を読み込めませんでした".to_string());
                     }
                 }
                 false
@@ -5075,6 +5207,19 @@ impl App {
         source: comic_core::StampSource,
         replace_target: Option<u64>,
     ) {
+        if let Some(id) = replace_target
+            && !self.comic_docs.get(key).is_some_and(|objects| {
+                objects.iter().any(|object| {
+                    object.id == id && matches!(object.kind, AnnotationKind::Stamp(_))
+                })
+            })
+        {
+            self.show_feedback_warning("差し替え対象のスタンプが見つかりませんでした".to_string());
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         // ソースをデコードしてアスペクト (w/h) を得る (キャッシュ経由)。
         let skey = crate::comic_stamp::stamp_source_key(&source);
         let aspect = {
@@ -5096,7 +5241,7 @@ impl App {
                 // 未変更のまま dirty/save するのを避け、注釈を戻して中断する (Codex P2)。
                 let Some(obj) = objs.iter_mut().find(|o| o.id == id) else {
                     self.comic_docs.insert(key.to_string(), objs);
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "差し替え対象のスタンプが見つかりませんでした".to_string(),
                     );
                     return;
@@ -6172,6 +6317,26 @@ const ONOMATO_CELL_W: f32 = 184.0;
 /// フォント選択ダイアログの 1 カード寸法 (見本ストリップ + フォント名)。
 const FONT_CARD_W: f32 = 220.0;
 const FONT_CARD_H: f32 = 70.0;
+
+fn allocate_font_card(ui: &mut egui::Ui) -> (egui::Rect, egui::Response) {
+    ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), egui::Sense::click())
+}
+
+fn show_font_card_rows<R>(
+    ui: &mut egui::Ui,
+    rows: usize,
+    draw: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    // Each horizontal row allocates exactly FONT_CARD_H; show_rows adds
+    // the parent's vertical item spacing once.
+    egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
+        .auto_shrink([false, false])
+        .show_rows(ui, FONT_CARD_H, rows, draw)
+}
 
 #[derive(Clone, Copy)]
 struct OnomatopoeiaPreset {
@@ -7253,7 +7418,7 @@ fn edit_object_ui(
 /// ので、ここでは `changed` を立てるだけ (リンク解除は呼び出し側のスタイル差分判定に任せる)。
 fn text_body_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, sel: u64) {
     // 安定 id を与えて記号挿入後にキャレットを復元できるようにする。
-    let text_edit_id = egui::Id::new(("comic_text_edit", sel));
+    let text_edit_id = egui::Id::unique(("comic_text_edit", sel));
     let te_out = egui::TextEdit::multiline(&mut t.text)
         .id(text_edit_id)
         .desired_rows(3)
@@ -7265,7 +7430,7 @@ fn text_body_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, sel: u
     }
     let text_sel: Option<(usize, usize)> = te_out
         .cursor_range
-        .map(|r| (r.primary.index, r.secondary.index));
+        .map(|r| (r.primary.index.0, r.secondary.index.0));
     // 記法 ON のとき、本文欄の直下に記号挿入ボタンを出す。選択範囲があればそれを囲み、
     // 無ければキャレット位置 (末尾) に空ペアを挿入する (ラボ `draw_text_body` 相当)。
     if t.markup_enabled {
@@ -7385,7 +7550,7 @@ fn bubble_struct_toggles_ui(
 /// スタイル (サイズ / 塗り / 枠 / 角丸 / 余白 / オフセット) は 部品 タブ側 (`window_parts_ui`)。
 fn window_name_header_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
     ui.horizontal(|ui| {
-        ui.label("名前");
+        let combo_label = ui.label("名前");
         egui::ComboBox::from_id_salt("win_name_mode")
             .selected_text(name_plate_mode_label(w.name_plate.mode))
             .show_ui(ui, |ui| {
@@ -7402,7 +7567,9 @@ fn window_name_header_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed
                         *changed = true;
                     }
                 }
-            });
+            })
+            .response
+            .labelled_by(combo_label.id);
         if w.name_plate.mode != NamePlateMode::None {
             let mut col = to_c32(w.name_plate.name.color);
             if annotation_color_edit_button(ui, &mut col).changed() {
@@ -7842,7 +8009,7 @@ fn text_block_ui(
             .position(|(_, r)| marker_pairs_eq(&t.markup_rules, r));
         let cur_label = cur_idx.map(|i| sets[i].0).unwrap_or("カスタム");
         ui.horizontal(|ui| {
-            ui.label("記号セット");
+            let combo_label = ui.label("記号セット");
             egui::ComboBox::from_id_salt("marker_set_combo")
                 .selected_text(cur_label)
                 .show_ui(ui, |ui| {
@@ -7852,7 +8019,9 @@ fn text_block_ui(
                             *changed = true;
                         }
                     }
-                });
+                })
+                .response
+                .labelled_by(combo_label.id);
         });
     }
     // 行間 / 字間。
@@ -7879,7 +8048,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         for (i, outline) in t.extra_outlines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
-                ui.label(format!("外フチ{}", i + 1));
+                let outline_label = ui.label(format!("外フチ{}", i + 1));
                 let mut col = to_c32(outline.color);
                 if annotation_color_edit_button(ui, &mut col).changed() {
                     outline.color = from_c32(col);
@@ -7887,6 +8056,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 }
                 *changed |= ui
                     .add(egui::Slider::new(&mut outline.width_px, 0.0..=48.0).text("太さ"))
+                    .labelled_by(outline_label.id)
                     .changed();
                 if ui.small_button("削除").clicked() {
                     remove = Some(i);
@@ -7930,20 +8100,20 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 *changed = true;
             }
             ui.label("X");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.0).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 X");
+            *changed |= response.changed();
             ui.label("Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.1).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 Y");
+            *changed |= response.changed();
         });
         *changed |= ui
             .add(egui::Slider::new(&mut sh.blur_px, 0.0..=48.0).text("ぼかし"))
             .changed();
-        *changed |= ui
-            .add(egui::Slider::new(&mut sh.spread_px, 0.0..=24.0).text("広がり"))
-            .changed();
+        let response = ui.add(egui::Slider::new(&mut sh.spread_px, 0.0..=24.0).text("広がり"));
+        crate::ui_helpers::set_accessibility_label(&response, "影 広がり");
+        *changed |= response.changed();
     }
 
     let mut has_glow = t.glow.is_some();
@@ -7967,9 +8137,9 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         *changed |= ui
             .add(egui::Slider::new(&mut glow.radius_px, 0.0..=64.0).text("半径"))
             .changed();
-        *changed |= ui
-            .add(egui::Slider::new(&mut glow.spread_px, 0.0..=32.0).text("広がり"))
-            .changed();
+        let response = ui.add(egui::Slider::new(&mut glow.spread_px, 0.0..=32.0).text("広がり"));
+        crate::ui_helpers::set_accessibility_label(&response, "発光 広がり");
+        *changed |= response.changed();
     }
 
     let mut has_bg = t.background.is_some();
@@ -8015,10 +8185,11 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 echo.color = from_c32(col);
                 *changed = true;
             }
-            ui.label("数");
+            let coordinate_label = ui.label("数");
             let mut count = echo.count as i32;
             if ui
                 .add(egui::DragValue::new(&mut count).range(1..=12))
+                .labelled_by(coordinate_label.id)
                 .changed()
             {
                 echo.count = count.clamp(1, 12) as u32;
@@ -8027,13 +8198,13 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         });
         ui.horizontal(|ui| {
             ui.label("X");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut echo.offset.0).speed(0.5))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut echo.offset.0).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "Echo X");
+            *changed |= response.changed();
             ui.label("Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut echo.offset.1).speed(0.5))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut echo.offset.1).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "Echo Y");
+            *changed |= response.changed();
         });
     }
 }
@@ -8694,12 +8865,12 @@ fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     // 先端 (tip) を画像座標で直接編集 (キャンバスのハンドルドラッグと等価)。
     ui.horizontal(|ui| {
         ui.label("先端");
-        *changed |= ui
-            .add(egui::DragValue::new(&mut t.tip.0).speed(1.0))
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut t.tip.1).speed(1.0))
-            .changed();
+        let response = ui.add(egui::DragValue::new(&mut t.tip.0).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "先端 X");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut t.tip.1).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "先端 Y");
+        *changed |= response.changed();
     });
     // 付け根の自動配置: 中心→先端のレイが輪郭を抜ける位置に根を付ける (対象を指す)。
     // オフにすると `base_t` で手動指定 (付け根ハンドルのドラッグでも切れる)。先端は固定。
@@ -8971,13 +9142,13 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
                 *changed = true;
             }
             ui.label("X");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.0).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 X");
+            *changed |= response.changed();
             ui.label("Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.1).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 Y");
+            *changed |= response.changed();
         });
     }
 
@@ -9005,18 +9176,18 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
     ui.add_space(2.0);
     ui.label("余白 (左/上/右/下)");
     ui.horizontal(|ui| {
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.left).speed(1.0))
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.top).speed(1.0))
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.right).speed(1.0))
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.bottom).speed(1.0))
-            .changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.left).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 左");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.top).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 上");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.right).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 右");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.bottom).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 下");
+        *changed |= response.changed();
     });
 }
 
@@ -9076,18 +9247,19 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
             *changed |= ui
                 .add(egui::Slider::new(&mut w.name_plate.corner_px, 0.0..=40.0).text("角丸"))
                 .changed();
-            *changed |= ui
-                .add(egui::Slider::new(&mut w.name_plate.padding_px, 0.0..=40.0).text("余白"))
-                .changed();
+            let response =
+                ui.add(egui::Slider::new(&mut w.name_plate.padding_px, 0.0..=40.0).text("余白"));
+            crate::ui_helpers::set_accessibility_label(&response, "名前プレート 余白");
+            *changed |= response.changed();
         }
         ui.horizontal(|ui| {
             ui.label("位置 X/Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut w.name_plate.offset.0).speed(1.0))
-                .changed();
-            *changed |= ui
-                .add(egui::DragValue::new(&mut w.name_plate.offset.1).speed(1.0))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut w.name_plate.offset.0).speed(1.0));
+            crate::ui_helpers::set_accessibility_label(&response, "位置 X");
+            *changed |= response.changed();
+            let response = ui.add(egui::DragValue::new(&mut w.name_plate.offset.1).speed(1.0));
+            crate::ui_helpers::set_accessibility_label(&response, "位置 Y");
+            *changed |= response.changed();
         });
     }
 
@@ -9124,9 +9296,10 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
                 }
             });
         }
-        *changed |= ui
-            .add(egui::Slider::new(&mut w.portrait.margin_px, 0.0..=60.0).text("余白"))
-            .changed();
+        let response =
+            ui.add(egui::Slider::new(&mut w.portrait.margin_px, 0.0..=60.0).text("余白"));
+        crate::ui_helpers::set_accessibility_label(&response, "立ち絵枠 余白");
+        *changed |= response.changed();
     }
 
     // ── 続き指標 ──
@@ -9323,13 +9496,14 @@ fn stamp_ui(
     let mut long = s.half_w.max(s.half_h) * 2.0;
     ui.horizontal(|ui| {
         ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
-        ui.label("大きさ");
+        let size_label = ui.label("大きさ");
         if ui
             .add(
                 egui::Slider::new(&mut long, 16.0..=1600.0)
                     .suffix("px")
                     .clamping(egui::SliderClamping::Edits),
             )
+            .labelled_by(size_label.id)
             .changed()
         {
             let half_long = (long * 0.5).max(8.0);
@@ -9599,6 +9773,240 @@ mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
 
+    fn assert_annotation_accessibility_controls(
+        mut draw: impl FnMut(&mut egui::Ui),
+        expected: &[(&str, egui::accesskit::Role, f64)],
+    ) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 2000.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |ui| draw(ui)));
+            },
+        ));
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        for &(name, role, value) in expected {
+            let matches: Vec<_> = nodes
+                .iter()
+                .filter(|(_, node)| node.label() == Some(name) && node.role() == role)
+                .collect();
+            assert_eq!(matches.len(), 1, "ambiguous or missing control: {name}");
+            assert_eq!(matches[0].1.numeric_value(), Some(value), "{name}");
+        }
+    }
+
+    #[test]
+    fn annotation_coordinate_accessibility_names_distinguish_axes_and_sides() {
+        use egui::accesskit::Role::SpinButton;
+
+        let mut bubble = BubbleObject {
+            tail: Some(default_bubble_tail((21.0, 34.0))),
+            ..Default::default()
+        };
+        let tip = bubble.tail.as_ref().unwrap().tip;
+        assert_annotation_accessibility_controls(
+            |ui| bubble_tail_ui(ui, &mut bubble, &mut false),
+            &[
+                ("先端 X", SpinButton, tip.0 as f64),
+                ("先端 Y", SpinButton, tip.1 as f64),
+            ],
+        );
+
+        let mut window = MessageWindowObject::default();
+        window.padding.left = 11.0;
+        window.padding.top = 22.0;
+        window.padding.right = 33.0;
+        window.padding.bottom = 44.0;
+        window.shadow = Some(ShadowStyle {
+            offset: (7.0, 8.0),
+            ..Default::default()
+        });
+        assert_annotation_accessibility_controls(
+            |ui| window_body_ui(ui, &mut window, &mut false),
+            &[
+                ("影 X", SpinButton, 7.0),
+                ("影 Y", SpinButton, 8.0),
+                ("余白 左", SpinButton, 11.0),
+                ("余白 上", SpinButton, 22.0),
+                ("余白 右", SpinButton, 33.0),
+                ("余白 下", SpinButton, 44.0),
+            ],
+        );
+
+        window.name_plate.mode = NamePlateMode::Boxed;
+        window.name_plate.offset = (15.0, -25.0);
+        window.name_plate.padding_px = 12.0;
+        window.portrait.side = PortraitSide::Left;
+        window.portrait.margin_px = 18.0;
+        assert_annotation_accessibility_controls(
+            |ui| window_parts_ui(ui, &mut window, &mut false),
+            &[
+                ("位置 X", SpinButton, 15.0),
+                ("位置 Y", SpinButton, -25.0),
+                ("名前プレート 余白", egui::accesskit::Role::Slider, 12.0),
+                ("立ち絵枠 余白", egui::accesskit::Role::Slider, 18.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn annotation_effect_accessibility_names_distinguish_shadow_glow_and_echo() {
+        use egui::accesskit::Role::{Slider, SpinButton};
+
+        let mut text = TextBlock {
+            shadow: Some(TextShadowStyle {
+                offset: (1.0, 2.0),
+                spread_px: 3.0,
+                ..Default::default()
+            }),
+            glow: Some(TextGlowStyle {
+                spread_px: 4.0,
+                ..Default::default()
+            }),
+            echo: Some(TextEchoStyle {
+                offset: (5.0, 6.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_annotation_accessibility_controls(
+            |ui| text_effects_ui(ui, &mut text, &mut false),
+            &[
+                ("影 X", SpinButton, 1.0),
+                ("影 Y", SpinButton, 2.0),
+                ("Echo X", SpinButton, 5.0),
+                ("Echo Y", SpinButton, 6.0),
+                ("影 広がり", Slider, 3.0),
+                ("発光 広がり", Slider, 4.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn comic_noop_history_selection_and_presets_preserve_append_revision() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("comic-noop.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        let key = app.page_path_key(0).unwrap();
+        app.comic_undo_key = Some(key.clone());
+        app.comic_docs.insert(key, Vec::new());
+        let revision = app.book_append_undo_revision;
+        app.do_comic_undo();
+        app.do_comic_redo();
+        app.text_selected_ids = vec![999];
+        app.delete_selected_text_object();
+        assert!(!app.delete_user_preset(&mut [], "user:missing"));
+        assert_eq!(app.book_append_undo_revision, revision);
+    }
+
+    #[test]
+    fn accepted_comic_delete_retires_append_before_document_save() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("comic-delete.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        let key = app.page_path_key(0).unwrap();
+        app.comic_docs.insert(
+            key.clone(),
+            vec![AnnotationObject::new_text(
+                7,
+                (10.0, 10.0),
+                TextBlock::default(),
+            )],
+        );
+        app.text_selected_ids = vec![7];
+        let revision = app.book_append_undo_revision;
+        app.delete_selected_text_object();
+        assert!(app.book_append_undo_revision > revision);
+        assert!(app.comic_docs[&key].is_empty());
+    }
+
+    #[test]
+    fn calculated_font_card_rows_match_allocation_and_reach_end() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        for height in [220.0, 110.0] {
+            let ctx = egui::Context::default();
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, height));
+            let draw = |events| {
+                let mut measured = None;
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|root_ui| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    root_ui,
+                                    |ui| {
+                                        let output = show_font_card_rows(ui, 3, |ui, rows| {
+                                            for _ in rows {
+                                                ui.horizontal(|ui| {
+                                                    for _ in 0..2 {
+                                                        allocate_font_card(ui);
+                                                    }
+                                                });
+                                            }
+                                        });
+                                        measured = Some(ScrollLayout::from_output(&output));
+                                    },
+                                )
+                            });
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                measured.unwrap()
+            };
+            let mut before = draw(vec![]);
+            for _ in 0..3 {
+                before = draw(vec![]);
+            }
+            assert_eq!(
+                before.content.y,
+                3.0 * FONT_CARD_H + 2.0 * ctx.global_style().spacing.item_spacing.y
+            );
+            before.assert_height(
+                if height > 200.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                viewport,
+                ctx.pixels_per_point(),
+            );
+            if height < 200.0 {
+                let mut after = before;
+                for frame in 0..40 {
+                    after = draw(if frame == 0 {
+                        vec![
+                            egui::Event::PointerMoved(before.inner.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -4000.0),
+                                modifiers: egui::Modifiers::NONE,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    });
+                }
+                after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+            }
+        }
+    }
+
     #[test]
     fn annotation_color_pickers_do_not_use_egui_additive_default() {
         let source = include_str!("ui_text.rs");
@@ -9650,34 +10058,40 @@ mod tests {
         for _ in 0..2 {
             let mut priming_input = primary_press_input(pos);
             priming_input.events.truncate(1);
-            let _ = ctx.run(priming_input, |ctx| {
-                egui::Area::new(egui::Id::new(0xC010_57u64))
+            let _ = ctx
+                .run_pass(priming_input, |ctx| {
+                    egui::Area::new(egui::Id::unique(0xC010_57u64))
+                        .fixed_pos(egui::pos2(400.0, 100.0))
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
+                })
+                .drop_without_applying_deltas();
+        }
+        let _ = ctx
+            .run_pass(primary_press_input(pos), |ctx| {
+                assert!(ctx.input(|input| input.pointer.primary_pressed()));
+                blocked.set(text_floating_ui_blocks_canvas_input(
+                    ctx,
+                    ctx.input(|input| input.pointer.interact_pos()),
+                ));
+                egui::Area::new(egui::Id::unique(0xC010_57u64))
                     .fixed_pos(egui::pos2(400.0, 100.0))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
-            });
-        }
-        let _ = ctx.run(primary_press_input(pos), |ctx| {
-            assert!(ctx.input(|input| input.pointer.primary_pressed()));
-            blocked.set(text_floating_ui_blocks_canvas_input(
-                ctx,
-                ctx.input(|input| input.pointer.interact_pos()),
-            ));
-            egui::Area::new(egui::Id::new(0xC010_57u64))
-                .fixed_pos(egui::pos2(400.0, 100.0))
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
-        });
+            })
+            .drop_without_applying_deltas();
         assert!(blocked.get());
 
         let unblocked = Cell::new(true);
         let ctx = egui::Context::default();
-        let _ = ctx.run(primary_press_input(pos), |ctx| {
-            unblocked.set(text_floating_ui_blocks_canvas_input(
-                ctx,
-                ctx.input(|input| input.pointer.interact_pos()),
-            ));
-        });
+        let _ = ctx
+            .run_pass(primary_press_input(pos), |ctx| {
+                unblocked.set(text_floating_ui_blocks_canvas_input(
+                    ctx,
+                    ctx.input(|input| input.pointer.interact_pos()),
+                ));
+            })
+            .drop_without_applying_deltas();
         assert!(!unblocked.get());
     }
 
@@ -10418,11 +10832,15 @@ mod tests {
         );
     }
 
-    fn bubble_body_rendered_width(fill: Option<Rgba>) -> f32 {
+    fn bubble_body_rendered_width(fill: Option<Rgba>, height: f32) -> f32 {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use egui_kittest::kittest::{NodeT, Queryable};
         use std::sync::{Arc, Mutex};
 
         let measured = Arc::new(Mutex::new(0.0));
         let measured_in_ui = Arc::clone(&measured);
+        let layout = Arc::new(Mutex::new(None));
+        let rendered_layout = Arc::clone(&layout);
         let mut fonts_ready = false;
         let mut bubble = BubbleObject {
             shape: BubbleShape::RoundRect {
@@ -10436,28 +10854,106 @@ mod tests {
         };
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W + 32.0, 720.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(PANEL_W, 680.0),
+                        egui::vec2(PANEL_W, height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_min_width(PANEL_W);
                             ui.set_max_width(PANEL_W);
                             let mut changed = false;
-                            bubble_body_ui(ui, &mut bubble, &mut changed);
-                            *measured_in_ui.lock().expect("width capture") = ui.min_rect().width();
+                            let output = egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .max_height(height)
+                                .show(ui, |ui| {
+                                    bubble_body_ui(ui, &mut bubble, &mut changed);
+                                    *measured_in_ui.lock().expect("width capture") =
+                                        ui.min_rect().width();
+                                });
+                            *rendered_layout.lock().unwrap() =
+                                Some(ScrollLayout::from_output(&output));
                         },
                     );
                 });
             });
         harness.run();
+        let before = layout.lock().unwrap().unwrap();
+        before.assert_height(
+            if height > 600.0 {
+                HeightExpectation::Fits
+            } else {
+                HeightExpectation::Scrolls
+            },
+            harness.ctx.content_rect(),
+            harness.ctx.pixels_per_point(),
+        );
+        if height < 600.0 {
+            harness.event(egui::Event::PointerMoved(before.inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -4000.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.run_steps(40);
+            layout
+                .lock()
+                .unwrap()
+                .unwrap()
+                .assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+        }
+        let last = harness.get_by_role_and_label(egui::accesskit::Role::Slider, "余白");
+        let last_rect = last.rect();
+        let last_id = unsafe {
+            egui::Id::from_high_entropy_bits((u128::from(last.accesskit_node().id()) >> 64) as u64)
+        };
+        assert!(
+            layout
+                .lock()
+                .unwrap()
+                .unwrap()
+                .inner
+                .contains_rect(last_rect),
+            "last slider clipped: {last_rect:?}"
+        );
+        harness.hover_at(last_rect.center());
+        harness.run_steps(1);
+        assert!(
+            harness
+                .ctx
+                .read_response(last_id)
+                .unwrap()
+                .contains_pointer()
+        );
+        for slider in harness.get_all_by_role(egui::accesskit::Role::Slider) {
+            let rect = slider.rect();
+            assert!(
+                rect.left() >= before.inner.left() && rect.right() <= before.inner.right(),
+                "slider escaped body horizontally: {rect:?} {:?}",
+                before.inner
+            );
+        }
+        let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+        std::fs::create_dir_all(dir).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(dir.join(match (fill.is_some(), height > 600.0) {
+                (true, true) => "bubble-body-fill.png",
+                (false, true) => "bubble-body-no-fill.png",
+                (true, false) => "bubble-body-fill-short-at-end.png",
+                (false, false) => "bubble-body-no-fill-short-at-end.png",
+            }))
+            .unwrap();
         let width = *measured.lock().expect("width result");
         assert!(width > 0.0, "bubble body was not rendered");
         width
@@ -10466,11 +10962,13 @@ mod tests {
     #[test]
     fn bubble_body_stays_within_panel_width_with_fill_on_or_off() {
         for fill in [None, Some(Rgba::WHITE)] {
-            let width = bubble_body_rendered_width(fill);
-            assert!(
-                width <= PANEL_W,
-                "bubble body width {width} exceeded PANEL_W {PANEL_W} (fill={fill:?})"
-            );
+            for height in [680.0, 120.0] {
+                let width = bubble_body_rendered_width(fill, height);
+                assert!(
+                    width <= PANEL_W,
+                    "bubble body width {width} exceeded PANEL_W {PANEL_W} (fill={fill:?} height={height})"
+                );
+            }
         }
     }
 
@@ -10486,6 +10984,7 @@ mod tests {
             ..BubbleObject::default()
         };
         let harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(PANEL_W, 720.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10521,6 +11020,7 @@ mod tests {
             ..BubbleObject::default()
         };
         let harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(PANEL_W, 360.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10557,6 +11057,7 @@ mod tests {
             ..BubbleObject::default()
         };
         let harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(PANEL_W, 420.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10589,7 +11090,8 @@ mod tests {
         let mut cursor_thumbs = HashMap::new();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 460.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -10616,16 +11118,18 @@ mod tests {
                         cursor_thumbs.insert(cache_key, texture);
                     }
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = annotation_dialog_contents_ui(
-                        ui,
-                        &mut preset,
-                        &mut shape_color,
-                        &mut marker_color,
-                        &mut stroke,
-                        &cursor_thumbs,
-                        1920.0,
-                    );
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let _ = annotation_dialog_contents_ui(
+                            ui,
+                            &mut preset,
+                            &mut shape_color,
+                            &mut marker_color,
+                            &mut stroke,
+                            &cursor_thumbs,
+                            1920.0,
+                        );
+                    });
                 });
             });
         harness.run();

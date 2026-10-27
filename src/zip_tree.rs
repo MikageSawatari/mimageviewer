@@ -40,6 +40,9 @@ pub struct ZipTree {
     pub root: ZipTreeNode,
     // Cleanup always sees the complete unprojected enumeration, including excluded rows.
     pub(crate) source_cache_keys: Option<Vec<String>>,
+    // Composition scope/membership must survive policy filtering and wrapper collapse.
+    // The retained source has no parent reference, so this never creates a cycle.
+    source_tree: Option<Arc<ZipTree>>,
 }
 
 /// ツリーの 1 階層。子ディレクトリ (内側アーカイブ含む) と、その階層直下の画像を持つ。
@@ -103,6 +106,7 @@ impl ZipTree {
             zip_path,
             root,
             source_cache_keys: None,
+            source_tree: None,
         }
     }
 
@@ -148,9 +152,19 @@ impl ZipTree {
         }
         Self {
             zip_path: self.zip_path.clone(),
-            root: project_node(&self.root, policy),
+            root: project_node(&self.raw_source().root, policy),
             source_cache_keys: Some(self.all_cache_keys()),
+            source_tree: Some(
+                self.source_tree
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(self.clone())),
+            ),
         }
+    }
+
+    /// Complete unprojected hierarchy. Pure access; never reopens the archive.
+    pub(crate) fn raw_source(&self) -> &Self {
+        self.source_tree.as_deref().unwrap_or(self)
     }
 
     /// `prefix` (セグメント列、空 = ルート) が指す階層ノードを返す。
@@ -253,62 +267,7 @@ impl ZipTree {
         prefix: &[String],
         sort: SortOrder,
     ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
-        let mut items: Vec<GridItem> = Vec::new();
-        let mut metas: Vec<Option<(i64, i64)>> = Vec::new();
-        let Some(node) = self.node_at(prefix) else {
-            return (items, metas);
-        };
-
-        // 現在階層までの prefix 文字列 ("chapters/" や ""、末尾 '/' 付き)。
-        let prefix_str = if prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", prefix.join("/"))
-        };
-
-        // 1) 子コンテナ (ZipDir)。セグメント名で sort。
-        let mut dirs: Vec<_> = node
-            .dirs
-            .iter()
-            .map(|(seg, child)| (seg, child, sort.name_key(seg)))
-            .collect();
-        dirs.sort_by(|(_, _, ak), (_, _, bk)| sort.compare_name_keys(ak, 0, bk, 0));
-        for (seg, child, _) in dirs {
-            // 代表画像。build() は画像エントリの経路上にしかノードを作らないので、
-            // 任意の子ノードは部分木に必ず 1 枚以上画像を持つ → rep は実質的に常に Some。
-            let rep = representative_image(child, sort);
-            items.push(GridItem::ZipDir {
-                zip_path: self.zip_path.clone(),
-                dir_prefix: format!("{prefix_str}{seg}/"),
-                is_archive: segment_is_archive(seg),
-                representative: rep.map(|e| e.entry_name.clone()),
-            });
-            // 代表画像の mtime/size を meta に載せる。これがないと enqueue 経路
-            // (image_metas[i]==None を skip) が ZipDir のサムネ要求を出さず、セルが
-            // 永久 Pending → 毎フレーム repaint になる (Phase 2 Codex P2)。size 列に
-            // 代表画像サイズが出るのは許容 (date 列は details_created_time_path で None)。
-            metas.push(rep.map(|e| (e.mtime, e.uncompressed_size as i64)));
-        }
-
-        // 2) 直下画像 (ZipImage)。basename + mtime で sort。
-        let mut imgs: Vec<_> = node
-            .images
-            .iter()
-            .map(|entry| {
-                let key = sort.name_key(entry_basename(&entry.entry_name));
-                (entry, key)
-            })
-            .collect();
-        imgs.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.mtime, bk, b.mtime));
-        for (e, _) in imgs {
-            items.push(GridItem::ZipImage {
-                zip_path: self.zip_path.clone(),
-                entry_name: e.entry_name.clone(),
-            });
-            metas.push(Some((e.mtime, e.uncompressed_size as i64)));
-        }
-
-        (items, metas)
+        crate::app::book_materialization::materialize_archive_level(self, prefix, sort, None)
     }
 
     /// ツリー全階層の catalog cache キーを集める (Phase 3 の `existing_keys` 用)。
@@ -359,13 +318,31 @@ pub struct ZipNavState {
     /// 開いている外側 ZIP のツリー (列挙完了時に構築、ナビ中は保持)。
     pub tree: Arc<ZipTree>,
     /// 実効 prefix のスタック。`stack[0]` = `collapse_redundant(&[])`。常に非空。
-    stack: Vec<Vec<String>>,
+    stack: Vec<ZipNavLevel>,
+}
+
+/// One accepted navigation level retains both released display collapse and the
+/// original structural book scope. A later policy change cannot reconstruct the
+/// latter from the former, so they travel as one value in the existing stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ZipNavLevel {
+    display: Vec<String>,
+    raw: Vec<String>,
+}
+
+impl ZipNavLevel {
+    fn for_requested(tree: &ZipTree, requested: &[String]) -> Self {
+        Self {
+            display: tree.collapse_redundant(requested),
+            raw: tree.raw_source().collapse_redundant(requested),
+        }
+    }
 }
 
 impl ZipNavState {
     /// ZIP を開いたときの初期状態。ルートを collapse した実効 prefix を底に積む。
     pub fn new(tree: Arc<ZipTree>) -> Self {
-        let root_effective = tree.collapse_redundant(&[]);
+        let root_effective = ZipNavLevel::for_requested(&tree, &[]);
         Self {
             tree,
             stack: vec![root_effective],
@@ -399,14 +376,58 @@ impl ZipNavState {
             if effective.len() <= current.len() || !target.starts_with(&effective) {
                 return None;
             }
-            nav.stack.push(effective);
+            nav.stack.push(ZipNavLevel::for_requested(&nav.tree, child));
         }
         Some(nav)
     }
 
+    /// Refresh against the new tree, falling back only when the requested node disappeared.
+    /// Invalid member paths never participate in ancestor lookup.
+    pub(crate) fn refresh_prefix(tree: Arc<ZipTree>, prefix: &str) -> (Self, ZipRefreshPosition) {
+        if let Some(nav) = Self::restore_prefix(tree.clone(), prefix) {
+            return (nav, ZipRefreshPosition::Preserved);
+        }
+        if !prefix.starts_with('/')
+            && !prefix.contains('\\')
+            && !split_prefix(prefix)
+                .iter()
+                .any(|part| part == "." || part == "..")
+        {
+            let mut parts = split_prefix(prefix);
+            while parts.pop().is_some() {
+                if let Some(nav) = Self::restore_prefix(tree.clone(), &parts.join("/")) {
+                    return (nav, ZipRefreshPosition::Ancestor);
+                }
+            }
+        }
+        (Self::new(tree), ZipRefreshPosition::Ancestor)
+    }
+
+    pub(crate) fn effective_levels(&self) -> Vec<Vec<String>> {
+        // Facet return routes follow accepted display levels. The raw book scope
+        // remains in the same navigation owner and is never substituted here.
+        self.stack
+            .iter()
+            .map(|level| level.display.clone())
+            .collect()
+    }
+
     /// 現在描画すべき実効 prefix。
     pub fn current(&self) -> &[String] {
-        self.stack.last().expect("ZipNavState stack is never empty")
+        &self
+            .stack
+            .last()
+            .expect("ZipNavState stack is never empty")
+            .display
+    }
+
+    /// Canonical book level chosen before file-type policy collapse.
+    pub(crate) fn current_raw(&self) -> &[String] {
+        &self
+            .stack
+            .last()
+            .expect("ZipNavState stack is never empty")
+            .raw
     }
 
     /// 現在が ZIP のルート表示か (= スタック底)。Backspace で ZIP を抜けるか判定に使う。
@@ -424,7 +445,7 @@ impl ZipNavState {
         if self.stack.len() < 2 {
             return None;
         }
-        let parent = &self.stack[self.stack.len() - 2];
+        let parent = &self.stack[self.stack.len() - 2].display;
         let current = self.current();
         if current.len() <= parent.len() || !current.starts_with(parent) {
             return None;
@@ -439,8 +460,8 @@ impl ZipNavState {
     /// で算出してスタックに積む。
     pub fn enter(&mut self, dir_prefix: &str) {
         let segs = split_prefix(dir_prefix);
-        let effective = self.tree.collapse_redundant(&segs);
-        self.stack.push(effective);
+        self.stack
+            .push(ZipNavLevel::for_requested(&self.tree, &segs));
     }
 
     /// 1 段戻る。スタックを pop する。戻れたら `true`、既にルート (底) なら `false`
@@ -486,6 +507,13 @@ impl ZipNavState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ZipRefreshPosition {
+    Open,
+    Preserved,
+    Ancestor,
+}
+
 /// `node` の子ディレクトリ名を表示 sort 順 (= `materialize_level` の ZipDir 並び) で返す。
 fn sorted_dirs(node: &ZipTreeNode, sort: SortOrder) -> Vec<&String> {
     let mut dirs: Vec<_> = node
@@ -503,14 +531,14 @@ fn sorted_dirs(node: &ZipTreeNode, sort: SortOrder) -> Vec<&String> {
 /// は `parent.len()` 位置にある (実効 prefix は親の実効 prefix の真の延長のため)。
 fn parent_dirs_and_pos<'t>(
     tree: &'t ZipTree,
-    stack: &[Vec<String>],
+    stack: &[ZipNavLevel],
     sort: SortOrder,
 ) -> Option<(Vec<&'t String>, usize)> {
     if stack.len() < 2 {
         return None;
     }
-    let parent = &stack[stack.len() - 2];
-    let seg = stack.last()?.get(parent.len())?;
+    let parent = &stack[stack.len() - 2].display;
+    let seg = stack.last()?.display.get(parent.len())?;
     let parent_node = tree.node_at(parent)?;
     let dirs = sorted_dirs(parent_node, sort);
     let pos = dirs.iter().position(|d| *d == seg)?;
@@ -520,14 +548,18 @@ fn parent_dirs_and_pos<'t>(
 /// DFS 前順で次のノードへ。進めたら `true` (stack 更新済み)。ツリー末尾なら `false` —
 /// このとき stack は遡行 pop で壊れているので、**呼び出し側は必ずコピーに対して使う**
 /// (`ZipNavState::dfs_step` がその規約を担保する)。
-fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrder) -> bool {
+fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<ZipNavLevel>, sort: SortOrder) -> bool {
     // 1) 子があれば sort 先頭の子へ降りる (ルートの本一覧からも最初の本へ降りる)。
-    let current = stack.last().expect("zip nav stack is never empty").clone();
+    let current = stack
+        .last()
+        .expect("zip nav stack is never empty")
+        .display
+        .clone();
     if let Some(node) = tree.node_at(&current) {
         if let Some(first) = sorted_dirs(node, sort).first() {
             let mut child = current;
             child.push((*first).clone());
-            stack.push(tree.collapse_redundant(&child));
+            stack.push(ZipNavLevel::for_requested(tree, &child));
             return true;
         }
     }
@@ -538,9 +570,9 @@ fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrde
         };
         if let Some(next_seg) = dirs.get(pos + 1) {
             let next_seg = (*next_seg).clone();
-            let mut child = stack[stack.len() - 2].clone();
+            let mut child = stack[stack.len() - 2].display.clone();
             child.push(next_seg);
-            let effective = tree.collapse_redundant(&child);
+            let effective = ZipNavLevel::for_requested(tree, &child);
             stack.pop();
             stack.push(effective);
             return true;
@@ -551,7 +583,7 @@ fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrde
 
 /// DFS 逆前順で前のノードへ: 前の兄弟が居ればその「最後の子孫」へ降り切り、居なければ
 /// 親へ上がる。ルート表示では `false` (stack 不変、= ZIP の前へ抜ける)。
-fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrder) -> bool {
+fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<ZipNavLevel>, sort: SortOrder) -> bool {
     let Some((dirs, pos)) = parent_dirs_and_pos(tree, stack, sort) else {
         return false;
     };
@@ -561,11 +593,12 @@ fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrd
         return true;
     };
     let prev_seg = dirs[prev_pos].clone();
-    let mut effective = stack[stack.len() - 2].clone();
+    let mut effective = stack[stack.len() - 2].display.clone();
     effective.push(prev_seg);
-    let mut effective = tree.collapse_redundant(&effective);
+    let level = ZipNavLevel::for_requested(tree, &effective);
+    let mut effective = level.display.clone();
     stack.pop();
-    stack.push(effective.clone());
+    stack.push(level);
     // 前の兄弟の「最後の子孫」へ、各段 stack に積みながら降り切る (enter と同じ形を
     // 保つので、着地後の BS が 1 段ずつ正しく戻れる)。
     loop {
@@ -576,8 +609,9 @@ fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrd
             break;
         };
         effective.push(last);
-        effective = tree.collapse_redundant(&effective);
-        stack.push(effective.clone());
+        let level = ZipNavLevel::for_requested(tree, &effective);
+        effective = level.display.clone();
+        stack.push(level);
     }
     true
 }
@@ -593,7 +627,7 @@ fn split_prefix(dir_prefix: &str) -> Vec<String> {
 
 /// セグメント名 (entry_name の一区切り) が内側アーカイブ (.zip / .cbz) か。
 /// `ZipDir.is_archive` バッジ用の suffix 推定 (accepted ambiguity、計画書 §9)。
-fn segment_is_archive(seg: &str) -> bool {
+pub(crate) fn segment_is_archive(seg: &str) -> bool {
     let lower = seg.to_ascii_lowercase();
     // .rar 以下は変換キャッシュ ZIP のフラットパス ("inner.rar/p01.jpg") 由来の
     // セグメント (v1.3.0 入れ子展開)。実 ZIP 内の生 RAR は列挙されないので、
@@ -610,7 +644,7 @@ fn segment_is_archive(seg: &str) -> bool {
 /// この階層に直下画像があれば sort 先頭を返す。無ければ sort 先頭の子ディレクトリへ
 /// 再帰する (= 「最初の本の 1 ページ目」を表紙にする)。`ZipTreeNode::first_image_in_subtree`
 /// (列挙順 fallback) と違い、表示順の先頭ページを選ぶ (Codex P3 対応)。
-fn representative_image(node: &ZipTreeNode, sort: SortOrder) -> Option<&ZipImageEntry> {
+pub(crate) fn representative_image(node: &ZipTreeNode, sort: SortOrder) -> Option<&ZipImageEntry> {
     if !node.images.is_empty() {
         return node
             .images
@@ -688,6 +722,21 @@ mod tests {
         )
     }
 
+    #[test]
+    fn section1353_effective_levels_keep_filtered_display_and_raw_book_scope_separate() {
+        let source = tree(&["root.png", "A/1.jpg"]);
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        let nav = ZipNavState::new(Arc::new(source.project(&policy)));
+        assert_eq!(nav.current(), &["A".to_owned()]);
+        assert!(nav.current_raw().is_empty());
+        let mut levels = nav.effective_levels();
+        assert_eq!(levels, vec![vec!["A".to_owned()]]);
+        levels[0].clear();
+        assert_eq!(nav.current(), &["A".to_owned()]);
+        assert!(nav.current_raw().is_empty());
+    }
+
     fn img_names(node: &ZipTreeNode) -> Vec<&str> {
         node.images.iter().map(|i| i.entry_name.as_str()).collect()
     }
@@ -710,6 +759,62 @@ mod tests {
         assert_eq!(dir_keys(&t.root), vec!["work1"]);
         let sub = t.root.dirs.get("work1").unwrap();
         assert_eq!(img_names(sub), vec!["work1/a.jpg", "work1/b.jpg"]);
+    }
+
+    #[test]
+    fn section1353_refresh_restores_nested_level_or_nearest_existing_ancestor() {
+        for (names, requested, expected, reason) in [
+            (
+                vec!["root.jpg", "A/cover.jpg", "A/sub/1.jpg", "A/sub/2.png"],
+                "A/sub/",
+                vec!["A", "sub"],
+                ZipRefreshPosition::Preserved,
+            ),
+            (
+                vec!["root.jpg", "A/cover.jpg", "A/other.jpg"],
+                "A/sub/deep/",
+                vec!["A"],
+                ZipRefreshPosition::Ancestor,
+            ),
+            (
+                vec!["root.jpg", "B/1.jpg"],
+                "A/sub/",
+                vec![],
+                ZipRefreshPosition::Ancestor,
+            ),
+            (
+                vec!["root.jpg", "A/sub/1.jpg"],
+                "A/",
+                vec!["A", "sub"],
+                ZipRefreshPosition::Preserved,
+            ),
+            (
+                vec!["root.jpg", "inner.zip/cover.jpg", "inner.zip/sub/1.jpg"],
+                "inner.zip/sub/",
+                vec!["inner.zip", "sub"],
+                ZipRefreshPosition::Preserved,
+            ),
+        ] {
+            let (mut restored, actual) =
+                ZipNavState::refresh_prefix(Arc::new(tree(&names)), requested);
+            assert_eq!(restored.current(), s(&expected));
+            assert_eq!(actual, reason);
+            while restored.back() {}
+            assert!(restored.at_root());
+        }
+    }
+
+    #[test]
+    fn section1353_refresh_rebuilds_parents_when_same_level_survives() {
+        let old = Arc::new(tree(&["root.jpg", "A/sub/1.jpg"]));
+        let before = ZipNavState::restore_prefix(old, "A/sub/").unwrap();
+        let fresh = Arc::new(tree(&["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]));
+        let (mut after, reason) = ZipNavState::refresh_prefix(fresh, "A/sub/");
+        assert_eq!(before.current(), after.current());
+        assert_ne!(before.effective_levels(), after.effective_levels());
+        assert_eq!(reason, ZipRefreshPosition::Preserved);
+        assert!(after.back());
+        assert_eq!(after.current(), s(&["A"]));
     }
 
     #[test]

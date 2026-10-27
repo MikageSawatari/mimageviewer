@@ -18,7 +18,7 @@ fn trace_overview_surface(
     stamp: crate::page_overview::PageOverviewStamp,
     route: OverviewSurfaceTrace,
 ) {
-    let id = egui::Id::new(("overview-surface-trace", stamp.context_serial, route));
+    let id = egui::Id::unique(("overview-surface-trace", stamp.context_serial, route));
     let changed = ctx.data_mut(|data| {
         if data.get_temp::<crate::page_overview::PageOverviewStamp>(id) == Some(stamp) {
             false
@@ -48,7 +48,7 @@ fn page_overview_request_ordinals(
 }
 
 fn page_overview_layout_cache_id(view: &crate::page_overview::PageOverviewView) -> egui::Id {
-    egui::Id::new((
+    egui::Id::unique((
         "overview_layout",
         view.stamp.context_serial,
         view.stamp.items_generation,
@@ -209,7 +209,7 @@ impl App {
         .intersect(surface);
         let _response = ui.interact(
             rect,
-            ui.id().with("overview-window-close"),
+            ui.scope_id().with("overview-window-close"),
             egui::Sense::CLICK,
         );
         ui.painter().text(
@@ -257,8 +257,8 @@ impl App {
                     .or_else(|| {
                         ime.then(|| {
                             crate::keyboard_input::TextInputClaim::new(
-                                egui::Id::new("overview-ime"),
-                                crate::keyboard_input::TextInputPhase::ImeGrace,
+                                egui::Id::unique("overview-ime"),
+                                crate::keyboard_input::TextInputPhase::ImeComposing,
                             )
                         })
                     }),
@@ -666,16 +666,10 @@ impl App {
                     .map(|placement| {
                         egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
-                            egui::vec2(
-                                crate::settings::window_geometry_to_viewport_points(
-                                    placement.w,
+                            Self::detached_snapshot_client_size(placement)
+                                / crate::settings::normalize_ui_scale_factor(
                                     self.settings.ui_scale_factor,
                                 ),
-                                crate::settings::window_geometry_to_viewport_points(
-                                    placement.h,
-                                    self.settings.ui_scale_factor,
-                                ),
-                            ),
                         )
                     });
             }
@@ -915,15 +909,27 @@ impl App {
         // Standalone surface entry (tests): only the actual owning viewport may
         // advance its physical input. The full renderer supplies its pre-key snapshot.
         let ctx = ui.ctx().clone();
-        let primary_suppression = if self.page_overview_view().is_some_and(|view| {
+        let (primary_suppression, front) = if self.page_overview_view().is_some_and(|view| {
             self.page_overview_active_context_serial() == Some(view.stamp.context_serial)
                 && ctx.viewport_id() == self.page_overview_viewer_viewport()
         }) {
-            self.advance_viewer_primary_pointer_frame(&ctx)
+            let (front, _) = self.capture_fs_front_pointer_input(&ctx, surface);
+            (
+                self.advance_viewer_primary_pointer_frame(&ctx, front.primary_owned),
+                front,
+            )
         } else {
-            FullscreenPrimarySuppressionDecision::Allow
+            (
+                FullscreenPrimarySuppressionDecision::Allow,
+                FsFrontPointerFrameInput::default(),
+            )
         };
-        self.render_page_overview_surface_with_primary_frame(ui, surface, primary_suppression)
+        self.render_page_overview_surface_with_primary_frame(
+            ui,
+            surface,
+            primary_suppression,
+            front,
+        )
     }
 
     pub(super) fn render_page_overview_surface_with_primary_frame(
@@ -931,12 +937,14 @@ impl App {
         ui: &mut egui::Ui,
         surface: egui::Rect,
         primary_suppression: FullscreenPrimarySuppressionDecision,
+        front: FsFrontPointerFrameInput,
     ) -> bool {
         self.render_page_overview_surface_with_pointer_phase(
             ui,
             surface,
             OverviewPointerPhase::Fresh,
             primary_suppression,
+            front,
         )
     }
 
@@ -950,6 +958,7 @@ impl App {
             surface,
             OverviewPointerPhase::Consumed,
             FullscreenPrimarySuppressionDecision::Allow,
+            FsFrontPointerFrameInput::default(),
         )
     }
 
@@ -993,6 +1002,7 @@ impl App {
         surface: egui::Rect,
         pointer_phase: OverviewPointerPhase,
         primary_suppression: FullscreenPrimarySuppressionDecision,
+        front: FsFrontPointerFrameInput,
     ) -> bool {
         let ctx = ui.ctx().clone();
         let Some(view) = self.page_overview_view() else {
@@ -1002,8 +1012,8 @@ impl App {
         let owns_input_surface = pointer_phase == OverviewPointerPhase::Fresh
             && self.page_overview_active_context_serial() == Some(view.stamp.context_serial)
             && ctx.viewport_id() == self.page_overview_viewer_viewport();
-        let primary_suppressed =
-            owns_input_surface && primary_suppression.suppresses_current_frame();
+        let primary_suppressed = owns_input_surface
+            && (primary_suppression.suppresses_current_frame() || front.primary_owned);
         let mut close_requested = false;
         if owns_input_surface {
             let initial_geometry = crate::ui_page_overview::page_overview_geometry(
@@ -1015,10 +1025,11 @@ impl App {
             let in_chrome = initial_geometry.header.contains(pointer);
             // Recognize the terminal middle edge before any action changes the surface.
             // Dispatch it only while the original overview phase still owns this pass.
-            let middle_short_click = self.update_mouse_middle_short_click(
+            let middle_short_click = self.update_mouse_middle_short_click_with_release(
                 &ctx,
-                !in_chrome && !self.any_dialog_open(),
+                !in_chrome && !self.any_dialog_open() && !front.middle_owned,
                 crate::app::ActionSurface::Viewer,
+                !front.owns_release(egui::PointerButton::Middle),
             );
             let initial_idx = self.fullscreen_idx;
             close_requested |= self.handle_viewer_right_drag_frame(
@@ -1027,6 +1038,7 @@ impl App {
                 false,
                 in_chrome,
                 self.fs_prev_foreground_hwnd,
+                front,
             );
             if !self.continue_page_overview_pointer_phase(ui, surface, view.stamp, initial_idx) {
                 return close_requested;
@@ -1273,7 +1285,7 @@ mod thumbnail_tests {
             actual.cursor_after_move(120, PageOverviewCursorMove::PageDown),
             wrong_root.cursor_after_move(120, PageOverviewCursorMove::PageDown)
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         // F11/linked F12 can keep this exact overview owner while replacing its viewport.
         app.viewer_presentation = ViewerPresentation::MainWindow;
@@ -1314,7 +1326,7 @@ mod thumbnail_tests {
             .is_none()
         );
         assert_eq!(app.page_overview_view().unwrap().scroll_anchor.row, 61);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -1427,16 +1439,17 @@ mod thumbnail_tests {
                     modifiers: Default::default(),
                 }],
             ] {
-                let _ = ctx.run(
+                ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(narrow_surface),
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
+                    |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
+                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                            root_ui,
+                            |ui| {
                                 let original =
                                     App::page_overview_cached_layout(ctx, &captured).unwrap();
                                 let view = passive_page_overview_effective_view(
@@ -1462,9 +1475,11 @@ mod thumbnail_tests {
                                         .into_iter()
                                         .map(App::page_overview_ui_command),
                                 );
-                            });
+                            },
+                        );
                     },
-                );
+                )
+                .drop_without_applying_deltas();
             }
             assert_eq!(
                 commands,
@@ -1593,6 +1608,7 @@ mod tests {
 
     fn control_down_edge(repeat: bool) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x28,
@@ -1655,7 +1671,7 @@ mod tests {
             ),
             None
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         key_pass(
             &ctx,
             vec![
@@ -1672,7 +1688,7 @@ mod tests {
             ),
             Some((KeyAction::FsCtrlNavNext, 1))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -1702,7 +1718,7 @@ mod tests {
             ),
             None
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -1726,6 +1742,6 @@ mod tests {
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x28
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 }

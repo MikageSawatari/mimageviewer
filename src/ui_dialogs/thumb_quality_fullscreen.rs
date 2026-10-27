@@ -60,7 +60,7 @@ impl App {
 
             let divider_t = self.tq.fs_divider.clamp(0.0, 1.0);
 
-            let area_resp = egui::Area::new(egui::Id::new("tq_fs_overlay"))
+            let area_resp = egui::Area::new(egui::Id::unique("tq_fs_overlay"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(screen.min)
                 .show(ctx, |ui| {

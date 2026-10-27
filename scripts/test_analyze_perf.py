@@ -19,6 +19,7 @@ from analyze_perf import (
     analyze_collection,
     analyze_thumb_adjustment_frames,
     analyze_page_turn,
+    analyze_page_turn_animation,
     analyze_remote_page,
     analyze_test_script_input,
     analyze_idle_health,
@@ -2273,6 +2274,312 @@ class DeliveryCompletenessTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     main()
                 self.assertEqual(caught.exception.code, 2)
+
+
+class PageTurnAnimationTests(unittest.TestCase):
+    def operation(self, index=0, *, context="reader-a", window="main", profile="single",
+                  run_id="run-1", outcome="finish", ingress=True):
+        base = {"cat": "page_turn_animation", "context": context, "window": window,
+                "operation_id": str(index), "profile": profile, "run_id": run_id}
+        time = index * .3 + 1
+        input_rows = [{**base, "cat": "input", "kind": "key_edge_ingress", "t": time - .02,
+                       "phase": "Press", "ingress_stage": "win32_enqueue"}] if ingress else []
+        rows = [{**base, "kind": "opportunity", "t": time,
+                 "accepted_t": time, "resource_ready_t": time}]
+        if outcome == "skip":
+            return rows + [{**base, "kind": "skip", "t": time, "reason": "pin_budget"}] + input_rows
+        rows += [{**base, "kind": "offered", "t": time},
+                 {**base, "kind": "start", "t": time, "mesh_cpu_ms": .2, "retain_bytes": 4096},
+                 {**base, "kind": "frame", "t": time + .02, "n": index,
+                  "mesh_cpu_ms": .3, "retain_bytes": 4096},
+                 {**base, "kind": "first_visible", "t": time, "elapsed_ms": 0}]
+        if outcome == "finish":
+            rows += [{**base, "kind": "fully_visible", "t": time + .2, "elapsed_ms": 200},
+                     {**base, "kind": "finish", "t": time + .2}]
+        elif outcome == "cancel":
+            rows += [{**base, "kind": "cancel", "t": time + .1, "reason": "new_input"}]
+        return rows + input_rows
+
+    def complete_rows(self, **kwargs):
+        rows = []
+        for index in range(90):
+            rows += self.operation(index, run_id=f"run-{index // 30 + 1}", **kwargs)
+        return rows
+
+    def analyze(self, rows, **kwargs):
+        return analyze_page_turn_animation(delivery_events(rows, 40),
+                                           required_profiles=("single",), **kwargs)
+
+    def test_complete_scoped_measurement_and_metrics(self):
+        report = self.analyze(self.complete_rows())
+        self.assertEqual(report["status"], "pass")
+        group = report["profiles"][0]
+        self.assertEqual(group["opportunities"], 90)
+        self.assertEqual(group["started_ratio"], 1)
+        self.assertEqual(group["finished_ratio"], 1)
+        self.assertEqual(group["metrics"]["mesh_cpu_ms"]["p95"], .3)
+        self.assertEqual(group["metrics"]["retain_bytes"]["max"], 4096)
+        self.assertAlmostEqual(group["metrics"]["ready_to_fully_visible_ms"]["p95"], 200)
+
+    def test_replay_deduplicates_receipts_and_frames(self):
+        rows = self.complete_rows()
+        report = self.analyze(rows + [dict(row) for row in rows])
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["profiles"][0]["started"], 90)
+        self.assertEqual(report["profiles"][0]["metrics"]["mesh_cpu_ms"]["samples"], 90)
+
+    def test_d4_motion_metrics_separate_slow_preparation_and_deduplicate_replay(self):
+        rows = self.complete_rows()
+        for row in rows:
+            if row["kind"] in ("start", "frame", "finish", "fully_visible"):
+                row.update(clock_origin="first_accepted_curl", accept_to_first_curl_ms=350,
+                           motion_frames=1 if row["kind"] == "start" else 8,
+                           motion_max_gap_ms=0 if row["kind"] == "start" else 60,
+                           motion_elapsed_ms=0 if row["kind"] == "start" else 200,
+                           output_motion_elapsed_ms=0 if row["kind"] == "start" else 250,
+                           progress=0 if row["kind"] == "start" else 1)
+        report = self.analyze(rows + [dict(row) for row in rows])
+        self.assertEqual(report["status"], "pass")
+        metrics = report["profiles"][0]["metrics"]
+        for name, value in (("accept_to_first_curl_ms", 350), ("motion_frames", 8),
+                            ("motion_max_gap_ms", 60), ("first_curl_progress", 0),
+                            ("motion_elapsed_ms", 200), ("output_motion_elapsed_ms", 250)):
+            self.assertEqual(metrics[name]["max"], value)
+            self.assertEqual(metrics[name]["samples"], 90)
+
+    def test_d2_material_snapshots_preserve_allocations_without_changing_gate(self):
+        rows = self.complete_rows()
+        opportunity = next(row for row in rows if row["kind"] == "opportunity")
+        native = {
+            "kind": "native", "source_texture_id": "Managed(1)", "paint_texture_id": "User(2)",
+            "logical_size": [6144, 8192], "paint_size": [1620, 2160],
+            "source_handle_retained": False, "retained_bytes": 13_996_800,
+            "source_uv_domain": [0, 0, 1, 1],
+        }
+        managed = {
+            "kind": "managed", "source_texture_id": "Managed(3)", "paint_texture_id": "Managed(3)",
+            "logical_size": [7, 5], "paint_size": [7, 5],
+            "source_handle_retained": True, "retained_bytes": 140, "source_uv_domain": None,
+        }
+        material = {**opportunity, "kind": "material", "reason": "prepared",
+                    "pin_bytes": 13_996_940, "pin_limit_bytes": 1_012_421_099,
+                    "outgoing_materials": [{"idx": 2, "allocation": native}],
+                    "incoming_materials": [{"idx": 3, "allocation": managed}]}
+        report = self.analyze(rows + [material, dict(material)])
+        self.assertEqual(report["status"], "pass")
+        group = report["profiles"][0]
+        self.assertEqual(group["started"], 90)
+        self.assertEqual(group["metrics"]["pin_bytes"]["samples"], 1)
+        self.assertEqual(group["metrics"]["pin_bytes"]["max"], 13_996_940)
+        self.assertEqual(group["metrics"]["pin_limit_bytes"]["max"], 1_012_421_099)
+        diagnostics = group["material_diagnostics"]
+        self.assertEqual(diagnostics["allocation_kinds"], {"native": 1, "managed": 1})
+        self.assertEqual(len(diagnostics["snapshots"]), 1)
+        snapshot = diagnostics["snapshots"][0]
+        self.assertEqual(snapshot["reason"], "prepared")
+        self.assertEqual(snapshot["allocations"][0], {"side": "outgoing", "idx": 2, "occurrence": None, **native})
+        self.assertEqual(snapshot["allocations"][1], {"side": "incoming", "idx": 3, "occurrence": None, **managed})
+        # Missing optional allocation fields do not invalidate an otherwise complete legacy trace.
+        diagnostic_only = {**opportunity, "kind": "material", "reason": "prepared"}
+        self.assertEqual(self.analyze(rows + [diagnostic_only])["status"], "pass")
+
+    def test_unknown_animation_kind_still_cannot_judge(self):
+        rows = self.complete_rows()
+        rows.append({**rows[0], "kind": "unknown-material-protocol"})
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "CannotJudge")
+        self.assertTrue(any("Unknown animation event kind" in reason for reason in report["incomplete"]))
+
+    def test_acceptance_time_is_not_reported_as_physical_input_time(self):
+        rows = self.complete_rows(ingress=False)
+        report = self.analyze(rows)
+        metrics = report["profiles"][0]["metrics"]
+        self.assertEqual(metrics["accepted_to_resource_ready_ms"]["max"], 0)
+        self.assertNotIn("application_ingress_to_resource_ready_ms", metrics)
+        self.assertEqual(report["status"], "CannotJudge")
+        # A legacy field cannot silently promote acceptance to actual ingress.
+        rows[0]["input_t"] = rows[0]["accepted_t"] - .02
+        self.assertNotIn("application_ingress_to_resource_ready_ms", self.analyze(rows)["profiles"][0]["metrics"])
+
+    def test_real_ingress_identity_correlates_before_acceptance(self):
+        rows = self.complete_rows()
+        report = self.analyze(rows)
+        metrics = report["profiles"][0]["metrics"]
+        self.assertEqual(report["status"], "pass")
+        self.assertAlmostEqual(metrics["application_ingress_to_resource_ready_ms"]["max"], 20)
+        self.assertAlmostEqual(metrics["application_ingress_to_first_visible_ms"]["max"], 20)
+        self.assertAlmostEqual(metrics["application_ingress_to_fully_visible_ms"]["max"], 220)
+        self.assertEqual(metrics["application_ingress_to_first_visible_ms"]["samples"], 90)
+        self.assertEqual(report["input_time_basis"], "application_ingress")
+
+    def test_ingress_replay_uses_original_identity_and_time(self):
+        rows = self.complete_rows()
+        inputs = [row for row in rows if row["kind"] == "key_edge_ingress"]
+        rows += [{**row, "t": row["t"] + .01} for row in inputs]
+        metrics = self.analyze(rows)["profiles"][0]["metrics"]
+        self.assertEqual(metrics["application_ingress_to_resource_ready_ms"]["samples"], 90)
+        self.assertAlmostEqual(metrics["application_ingress_to_resource_ready_ms"]["max"], 20)
+
+    def test_ready_visibility_uses_receipt_clock_not_accepted_elapsed(self):
+        rows = self.complete_rows()
+        for row in rows:
+            if row["kind"] == "opportunity":
+                row["resource_ready_t"] = row["accepted_t"] + .04
+            elif row["kind"] in ("first_visible", "fully_visible"):
+                row["clock_origin"] = "accepted_navigation"
+                row["t"] += .06
+                row["elapsed_ms"] += 60
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "pass")
+        metrics = report["profiles"][0]["metrics"]
+        self.assertAlmostEqual(metrics["accepted_to_resource_ready_ms"]["max"], 40)
+        self.assertAlmostEqual(metrics["ready_to_first_visible_ms"]["max"], 20)
+        self.assertAlmostEqual(metrics["ready_to_fully_visible_ms"]["max"], 220)
+        self.assertAlmostEqual(metrics["application_ingress_to_first_visible_ms"]["max"], 80)
+
+    def test_accepted_elapsed_never_fills_missing_or_reversed_ready_clock(self):
+        for ready in (None, 100):
+            rows = self.complete_rows()
+            for row in rows:
+                if row["kind"] == "opportunity":
+                    row["resource_ready_t"] = ready
+                elif row["kind"] in ("first_visible", "fully_visible"):
+                    row["clock_origin"] = "accepted_navigation"
+            report = self.analyze(rows)
+            with self.subTest(ready=ready):
+                self.assertEqual(report["status"], "CannotJudge")
+                self.assertNotIn("ready_to_first_visible_ms", report["profiles"][0]["metrics"])
+
+    def test_explicit_ready_elapsed_can_fill_absent_original_ready_timestamp(self):
+        rows = self.complete_rows()
+        for row in rows:
+            if row["kind"] == "opportunity":
+                row["resource_ready_t"] = None
+            elif row["kind"] in ("first_visible", "fully_visible"):
+                row["clock_origin"] = "resource_ready"
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "CannotJudge")  # Input-to-ready still lacks its timestamp.
+        self.assertEqual(report["profiles"][0]["metrics"]["ready_to_fully_visible_ms"]["max"], 200)
+
+    def test_missing_mismatched_release_or_late_ingress_cannot_judge(self):
+        for violation in ("missing", "identity", "release", "late"):
+            rows = self.complete_rows()
+            input_row = next(row for row in rows if row["kind"] == "key_edge_ingress")
+            if violation == "missing":
+                rows.remove(input_row)
+            elif violation == "identity":
+                input_row["operation_id"] = "different-original-edge"
+            elif violation == "release":
+                input_row["phase"] = "release"
+            else:
+                input_row["t"] += 1
+            with self.subTest(violation=violation):
+                self.assertEqual(self.analyze(rows)["status"], "CannotJudge")
+
+    def test_same_operation_id_in_other_context_is_independent(self):
+        rows = self.complete_rows() + self.complete_rows(context="reader-b", window="f12-2")
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(len(report["profiles"]), 2)
+
+    def test_unfinished_start_fails_with_complete_delivery(self):
+        report = self.analyze(self.operation(outcome="unfinished"))
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any("unfinished start" in item for item in report["failures"]))
+
+    def test_all_skip_fails_and_keeps_denominator(self):
+        report = self.analyze(self.complete_rows(outcome="skip"))
+        self.assertEqual(report["status"], "fail")
+        group = report["profiles"][0]
+        self.assertEqual(group["skip_reasons"]["pin_budget"], {"count": 90, "ratio": 1})
+        self.assertEqual(group["opportunities"], 90)
+
+    def test_skip_and_cancel_ratios_are_separate(self):
+        rows = []
+        for index in range(90):
+            outcome = "skip" if index < 9 else "cancel" if index < 13 else "finish"
+            rows += self.operation(index, run_id=f"run-{index // 30 + 1}", outcome=outcome)
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "pass")
+        group = report["profiles"][0]
+        self.assertEqual(group["started"], 81)
+        self.assertEqual(group["cancelled"], 4)
+        self.assertAlmostEqual(group["finished_ratio"], 77 / 81)
+        self.assertEqual(group["skip_reasons"]["pin_budget"]["ratio"], .1)
+
+    def test_no_opportunities_or_insufficient_runs_cannot_judge(self):
+        self.assertEqual(self.analyze([])["status"], "CannotJudge")
+        self.assertEqual(self.analyze(self.operation())["status"], "CannotJudge")
+        report = analyze_page_turn_animation(delivery_events(self.complete_rows(), 40))
+        self.assertEqual(report["status"], "CannotJudge")
+        self.assertTrue(any("required warm profile" in item for item in report["incomplete"]))
+
+    def test_missing_delivery_visibility_correlation_and_metrics_cannot_judge(self):
+        self.assertEqual(analyze_page_turn_animation(self.complete_rows(), required_profiles=("single",))["status"], "CannotJudge")
+        for change in ("visibility", "identity", "metrics", "run"):
+            rows = self.complete_rows()
+            if change == "visibility":
+                rows = [row for row in rows if row["kind"] != "first_visible"]
+            elif change == "identity":
+                rows[0]["context"] = 1
+            elif change == "metrics":
+                for row in rows:
+                    row.pop("mesh_cpu_ms", None)
+            else:
+                for row in rows:
+                    row.pop("run_id", None)
+            with self.subTest(change=change):
+                self.assertEqual(self.analyze(rows)["status"], "CannotJudge")
+
+    def test_f12_requires_two_contexts(self):
+        rows = self.complete_rows(profile="f12_single")
+        report = analyze_page_turn_animation(delivery_events(rows, 40), required_profiles=("f12_single",))
+        self.assertEqual(report["status"], "CannotJudge")
+        rows += self.complete_rows(context="reader-b", window="f12-2", profile="f12_single")
+        report = analyze_page_turn_animation(delivery_events(rows, 40), required_profiles=("f12_single",))
+        self.assertEqual(report["status"], "pass")
+
+    def test_short_extra_run_remains_coverage_failure(self):
+        report = self.analyze(self.complete_rows() + self.operation(91, run_id="run-short"))
+        self.assertEqual(report["status"], "CannotJudge")
+
+    def test_terminal_conflict_and_frame_after_cancel_fail(self):
+        for violation in ("both_terminals", "late_frame"):
+            rows = self.complete_rows()
+            extra = self.operation(91, run_id="run-3", outcome="cancel")
+            if violation == "both_terminals":
+                extra.append({**next(row for row in extra if row["kind"] == "cancel"), "kind": "finish"})
+            else:
+                extra.append({**next(row for row in extra if row["kind"] == "frame"), "t": 30, "n": 999})
+            report = self.analyze(rows + extra)
+            with self.subTest(violation=violation):
+                self.assertEqual(report["status"], "fail")
+
+    def test_cli_fallbacks_and_excluded_reasons(self):
+        rows = self.complete_rows()
+        for row in rows:
+            row.pop("profile")
+            row.pop("run_id")
+        rows += [{"t": 35, "cat": "page_turn_animation", "kind": "skip",
+                  "context": "reader-a", "window": "main", "operation_id": "excluded",
+                  "reason": "repeat"}]
+        report = self.analyze(rows, profile="single", run_id="one-capture")
+        self.assertEqual(report["status"], "CannotJudge")  # One capture cannot prove three runs.
+        self.assertEqual(report["profiles"][0]["opportunities"], 90)
+        self.assertEqual(report["excluded_reasons"], {"repeat": 1})
+        self.assertEqual(self.analyze(self.complete_rows(), profile="other", run_id="ignored")["status"], "pass")
+
+    def test_cli_check_exit_codes_and_json(self):
+        for rows, expected in ((self.complete_rows(), 0), (self.complete_rows(outcome="skip"), 1), ([], 2)):
+            with writable_test_directory() as directory:
+                path = directory / "perf.jsonl"
+                output = directory / "report.json"
+                path.write_text("".join(json.dumps(row) + "\n" for row in delivery_events(rows, 40)), encoding="utf-8")
+                with mock.patch.object(sys, "argv", ["analyze_perf.py", str(path), "page-turn-animation", "--check", "--required-profile", "single", "--json-out", str(output)]), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        main()
+                self.assertEqual(caught.exception.code, expected)
+                self.assertTrue(output.is_file())
 
 
 if __name__ == "__main__":

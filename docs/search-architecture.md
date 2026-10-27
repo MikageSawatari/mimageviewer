@@ -20,7 +20,7 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
 | **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
 | **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画 / 音声を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
-| **Ctrl+R** | Everything ファイル名検索 | Everything の構文で対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
+| **Ctrl+R** | Everything ファイル名検索 | Everything の構文で実フォルダと対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
 - **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名を扱う。
@@ -34,7 +34,7 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
   その場で判定する。構造アイテム (Folder / ZIP / PDF) もファイル名で一貫して
   絞り込む (§5.2)。
 
-4 つは UI 上で排他表示される (同時に 2 本開かない)。Ctrl+G/R は同じ検索ownerのsource切替。
+4 つの有効セッションは排他とする。ツールバーへ固定した入力欄は独立に表示できる。Ctrl+G/R は同じ検索ownerのsource切替。
 従来経路の回帰ガードは
 `src/app.rs::phase_c_key_tests`。
 
@@ -50,12 +50,24 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
   `normalize_for_match` (= `to_lowercase`)。**ingest 側・クエリ側・post-filter 側で
   必ずこの 1 関数を通す**。片方だけ NFKC を入れると偽ヒット / 検索漏れが出る。
 
-最小クエリ長:
+最小クエリ長 (Ctrl+G 専用。Ctrl+F / Ctrl+S には適用しない、§1.229):
 
-- CJK を 1 文字でも含む → 2 文字以上
-- 英数字のみ → 3 文字以上 (bigram の爆発的ヒット回避)
+- 通常の include 語が 1 文字なら、他に長い語があっても拒否する (2026-10-19 利用者決定)。
+  bigram 照会の構築前に判定し、post-filter だけの 1 文字検索は行わない。
+- CJK を 1 文字でも含む語は 2 文字以上、その他 (英数字・記号等) は 3 文字以上なら
+  単独で候補を絞れる長さとする。長さは語ごとに空白を除いて数える。
+- 非 CJK 2 文字語は、**AND で上記の長さを満たす include 語が 1 つ以上あるときだけ**許可する。
+  `EOS R5` は両語の部分一致で、順序・隣接・同一ソースを要求しない。`r5` 単独や `sd ai` は拒否。
+  OR は各語の従来の検査を維持し、`EOS R5` を拒否する (短い語で候補が広がるため)。
+- `global_search::QueryTermLength` で索引照会不可 / 長い語との併用が必要 / 十分な長さを区別し、
+  `RejectReason::TooShort` に拒否した語をすべて保持してメッセージへ出す。
+  除外語は検査対象外。タグ候補への橋渡しの `#a` 等の免除と、フレーズの連続一致は維持する。
 - NOT-only (正トークン 0) は **Ctrl+G では拒否** (全件 scan になるため)。Ctrl+F は
   対象件数が小さいので許可。
+
+2 文字語も既存の `build_bigram_and_query` にそのまま渡し、1 個の bigram を top-level Must の
+子照会へ入れる。全語を既存 post-filter でも再確認するため、候補を広げずに絞り込める。
+検査は純粋な語分類だけで完結し、非同期状態・待機や専用の照会経路を追加しない。
 
 Ctrl+R はこのparser、正規化、最小文字数、OR toggle、FTS post-filterを通さず、
 非空queryをそのままEverythingへ明示送信する。自動`ext:`追記も行わない。
@@ -72,18 +84,18 @@ folder/非対応形式を含むraw先頭10,000件の後で、対応形式・表�
 
 `everything_results` は対応候補だけをworkerでstatし、正規化した実path、mtime/size、sort metadataと
 raw/除外/読取不能/重複/上限の件数をimmutable `EverythingDataset` に保持する。
-Folder、unsafe path、未対応形式、非表示種類は除外し、stat失敗をゼロstampに置き換えない。
+Folder は拡張子によらず採用し、通常 scan と同じ mtime／size unknown の sort metadata を持つ。作業用・内部フォルダ、root、unsafe path、未対応形式、非表示種類は除外し、stat失敗をゼロstampに置き換えない。
 同名collapseやsidecar探索で検索hitを別のファイルへ置換しない。通常sort/★/tag/編集準備は
 共通workerで行い、UIは完成したitems/metasと副作用を一つのadoption closureでinstallする。
 Everythingの動画pin WebPもprepare workerのreadonly DBで取得し、完成Arcマップを
-動画thumbnail workerへ渡す。採用時の`lookup_webps_many`やBLOB再取得は行わない。
+動画thumbnail workerへ渡す。Folder の動画 pin（cascade を含む）は既存 helper で同じ prepare worker 上から full-path key の catalog/cache map へ seed する。再投影ごとに現在の thumbnail owner を捕捉・照合する。採用時の`lookup_webps_many`やBLOB再取得は行わない。
 pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存同期bulk lookupは確認済みだが、
 EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。
 
 採用済みEverythingの位置は `EverythingPosition::Root` / `PhysicalChild`。
-ZIP/PDF/EPUB/変換書庫の物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
+実フォルダ・画像フォルダ本・ZIP/PDF/EPUB/変換書庫の main 物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
 取消や失敗で未採用のchildへ進めない。結果へ戻ると保持datasetを共通prepareで再投影し、IPCを再送しない。
-既存thumbnail ownerを利用し、F12 fork/park/promoteではmain検索ownerを複製しない。
+Parent（BS／grid 親／gamepad Back）は ZIP 内部を一段、それ以外は effective_folder が logical_source の厳密な物理子孫なら通常の物理親へ移動し、起点なら Root へ戻す。Results ボタンは階層を飛ばして Root へ戻す。既存thumbnail ownerを利用し、独立 viewer open は main を Root に残す。F12 fork/park/promoteではmain検索ownerを複製しない。
 PDF先行改修は `4510346f5`（master統合 `c1e66f589`）のcontext-owned render epochを前提とする。
 
 Remote query endpoint/result共有、新しい永続設定/索引/検索履歴は追加しない。
@@ -111,6 +123,28 @@ facet のタグ値は表示 `#タグ` ではなく、`tags.db` と同じ `tag_ke
 そのため `INDEX_VERSION` bump は不要で、モデル名の正規化規則は再構築なしに調整できる。
 
 ---
+
+### 1.5 ツールバーの常設検索入力 (§1.409)
+
+4欄はそれぞれ既定OFFの任意セクション。`ui_pinned_search` が単一入力・幅計測・描画操作、
+`app/pinned_search` が受付・開始/切替・明示消去・Escを所有する。
+入力/表示結果/終了先は `edit_owner / applied_owner / closable_owner` として既存stateから導く。
+開始は `ensure_search_session` に集約する。LocalはEnter、Containerは編集で即検索、Metadataは
+既存変更処理とdebounce、EverythingはSubmitのみ。表示/focusだけでは開始しない。
+固定時のshortcutは既存受付後、pending text-input focusでその欄へ移す。
+
+G/Rは `metadata_draft / everything_draft` を個別に持ち、wish比較はMetadata draft、
+Everything採用はimmutable submittedを参照する。`SearchAccepted::Metadata { applied }` は
+採用時のquery/filtersを保持し、source切替後もアドレスと適用表示の正本となる。
+`applied`はOptionであり、正常Batch/正常Doneで成立を確認したrunの一覧採用時だけSomeを公開する。
+未検証/拒否/失敗はNoneとし、成立した0件の結果と区別する。
+終了/切替/install/Snapshotでは固定ONのdraftを保持し、×のみが対象draftを明示消去する。
+Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、固定Local draftをtake/復元しない。
+非同期の再適用も検索条件と現在入力を分け、入力を上書きしない。
+固定OFFの終了時消去は維持する。固定欄の×/Escは適用結果の終了、未送信入力先から保持結果への復帰、
+非active欄の順に所有確認する。一時バーのEscは従来の×と同じ共通検索終了・元一覧復帰とする。全バーのEscは描画前の入力ownerを捕捉し、描画後の単一routerが
+消費する。初回未送信/取消後/PhysicalChildにもclosable ownerで終了先を持つ。
+詳細な幅・フォーカス・簡素化の判断は [ツールバー計画 §2.5](toolbar-customization-plan.md#25-検索欄の個別固定-1409)。
 
 ## 2. モジュールマップ
 
@@ -273,8 +307,14 @@ FTS の Incomplete は「確認未完了」、Stopped/Cancelled は「確認中�
 新しい Full の実行中は「スキャン中」、正常完走と正常な起動確認省略は従来の「監視中」。
 外側/重複のお気に入りも実効所有者集合の失敗を表示する。FTS の共有 maintenance snapshot は
 次回起動再構築の予約、または予約自体の失敗をダイアログ全体に残す。UI は SQL/I/O/待機をしない。
-名前索引の Full 表示訂正は、DB 書込失敗の通知/marker 接続を直したという意味ではない。
-その対応は [バックログ §1.369](next-release-backlog.md#1369-名前コンテナ索引-ctrls-の書込失敗が通知再構築へ揃っていない--1367からの引き継ぎコード調査-2026-10-11) に残る。
+名前索引の DB 更新／削除失敗は、Full／watcher／clear の共通出口から
+`SearchIndexDb` 所有の通知と既存の次回起動再構築印へ送る（§1.369）。
+同じ DB インスタンスの起動中に予約試行と通知をそれぞれ1回に限り、各失敗のログは残す。
+完走印だけの保存失敗は専用通知のみ。未変更、削除0行、取消、FS 不完全観測は再構築へ送らない。
+watcher の成功件数は必要な親更新・subtree 走査・prune が完了した場合だけ増やす。
+名前通知は起動オーバーレイ中・非表示・最小化中に保持し、通常 UI へ復帰したとき5秒表示する。
+UI の drain は通知専用 mutex だけを取り、SQLite／同期 I/O／worker 待機を行わない。
+停止後の保持・全出口・回帰と検証記録は [名前索引の書込失敗計画](name-index-write-failure-plan.md) を参照。
 
 metadata の所有範囲は `metadata_ownership` が純関数で決める。最深 root が所有し、
 同じ正規化 root は UUID 文字列順の最小値で決着する。共通除外と内側の所有 root を
@@ -752,7 +792,7 @@ UI (global_search_ui::render_global_search_bar)
     → global_search::run (別スレッド)
 
   [worker] スレッド内ループ:
-    0. クエリ検証 (最小長、NOT-only 禁止)
+    0. クエリ検証 (mode ごとの最小長、1 文字語拒否、NOT-only 禁止。§1.2)
     1. 正トークンを bigram 分解し build_bigram_and_query で BooleanQuery を構築
        - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/video_meta/tags)
          ごとの OR を各トークンの子クエリにし、mode=AND なら top-level Must で、

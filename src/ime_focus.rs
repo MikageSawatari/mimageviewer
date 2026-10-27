@@ -1,165 +1,22 @@
-//! IME composition focus policy for egui text fields.
+//! mImageViewer's diagnostics facade over shared egui IME repair.
+//!
+//! Composition, helper focus contracts and retries belong to egui-ime.
+//! Keyboard ownership, diagnostic records and logging remain in this crate.
 
-use std::collections::HashMap;
+use egui_ime::TextInputDiagnosticKeyPolicy;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
-const IME_FOCUS_RETRY_ID: &str = "miv_ime_focus_retry";
-const IME_TEXT_FOCUS_CONTRACT_ID: &str = "miv_ime_text_focus_contract";
+pub(crate) use egui_ime::{
+    focused_text_input, ime_composing_with_pending_events, ime_input_active_in_viewport,
+    install_ime_input_policy, recovering_text_input,
+};
+
 const TEXT_INPUT_KEY_DIAGNOSTIC_ID: &str = "miv_text_input_key_diagnostic";
 const TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID: &str = "miv_text_input_key_diagnostic_started";
 const TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BUDGET_BYTES: usize = 1024 * 1024;
 const TEXT_INPUT_KEY_DIAGNOSTIC_LOG_OVERHEAD_BYTES: usize = 64;
-const IME_EVENT_GRACE: Duration = Duration::from_millis(300);
 static TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static TEXT_INPUT_KEY_DIAGNOSTIC_BUDGET_NOTICE_LOGGED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ImeFocusState {
-    composing: bool,
-    last_event_at: Option<Instant>,
-}
-
-impl ImeFocusState {
-    fn input_active_at(self, now: Instant) -> bool {
-        self.composing
-            || self
-                .last_event_at
-                .is_some_and(|at| now.saturating_duration_since(at) < IME_EVENT_GRACE)
-    }
-}
-
-/// Pre-`Memory::begin_pass` owner of IME composition state and input repair.
-///
-/// egui clears keyboard focus when it sees an Escape press in
-/// `Focus::begin_pass`, before any application UI runs. During an active IME
-/// composition that Escape belongs to the IME, so this plugin removes only the
-/// press event (the harmless release is preserved). Windows can then finish the
-/// cancellation with `Disabled` but no empty preedit; in that case the plugin
-/// inserts the `Preedit("")` expected by `TextEdit` while its composition
-/// selection is still intact.
-#[derive(Default)]
-struct ImeInputPlugin {
-    viewports: HashMap<egui::ViewportId, ImeFocusState>,
-}
-
-impl ImeInputPlugin {
-    fn input_active_in_viewport(&self, viewport_id: egui::ViewportId, now: Instant) -> bool {
-        self.viewports
-            .get(&viewport_id)
-            .copied()
-            .unwrap_or_default()
-            .input_active_at(now)
-    }
-
-    fn composing_in_viewport(&self, viewport_id: egui::ViewportId) -> bool {
-        self.viewports
-            .get(&viewport_id)
-            .is_some_and(|state| state.composing)
-    }
-}
-
-impl egui::Plugin for ImeInputPlugin {
-    fn debug_name(&self) -> &'static str {
-        "miv_ime_input_policy"
-    }
-
-    fn input_hook(&mut self, input: &mut egui::RawInput) {
-        let state = self.viewports.entry(input.viewport_id).or_default();
-        normalize_ime_input(&mut input.events, state, Instant::now());
-    }
-}
-
-/// Install the IME input policy before the first pass of an egui context.
-///
-/// `Context::add_plugin` is idempotent by plugin type, so test and production
-/// setup may safely call this more than once.
-pub(crate) fn install_ime_input_policy(ctx: &egui::Context) {
-    ctx.add_plugin(ImeInputPlugin::default());
-}
-
-fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState, now: Instant) {
-    // Only a *non-empty* commit confirms text. Windows ends a cancelled composition
-    // with an empty `Commit("")` (observed sequence on Esc:
-    // `Disabled, Disabled, Commit(""), Disabled, Disabled`), and egui's commit handler
-    // skips `delete_selected` when the prediction is empty, so the preedit stays in the
-    // buffer as if it had been confirmed. Treating that as a real commit would suppress
-    // the cancel below, which is exactly the bug this normalizer exists to fix.
-    let commit_in_input = events.iter().any(
-        |event| matches!(event, egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty()),
-    );
-    let mut composing = state.composing;
-    let mut saw_ime_event = false;
-    let mut normalized = Vec::with_capacity(events.len().saturating_add(1));
-
-    for event in std::mem::take(events) {
-        if composing
-            && matches!(
-                event,
-                egui::Event::Key {
-                    key: egui::Key::Escape,
-                    pressed: true,
-                    ..
-                }
-            )
-        {
-            continue;
-        }
-
-        if let egui::Event::Ime(ime) = &event {
-            saw_ime_event = true;
-            // A composition ends without text either as `Disabled` or as an empty
-            // `Commit("")`, depending on the IME. Whichever arrives first is the point
-            // where the preedit is still selected, so that is where the cancel belongs.
-            let ends_composition_without_text =
-                matches!(ime, egui::ImeEvent::Disabled | egui::ImeEvent::Commit(_))
-                    && !matches!(ime, egui::ImeEvent::Commit(text) if !text.is_empty());
-            if ends_composition_without_text && composing && !commit_in_input {
-                normalized.push(egui::Event::Ime(egui::ImeEvent::Preedit(String::new())));
-            }
-            apply_ime_event(&mut composing, ime);
-        }
-        normalized.push(event);
-    }
-
-    state.composing = composing;
-    if saw_ime_event {
-        state.last_event_at = Some(now);
-    }
-    *events = normalized;
-}
-
-fn apply_ime_event(composing: &mut bool, event: &egui::ImeEvent) {
-    match event {
-        egui::ImeEvent::Enabled => *composing = true,
-        egui::ImeEvent::Preedit(text) => *composing = !text.is_empty(),
-        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => *composing = false,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum TextInputDiagnosticKeyPolicy {
-    #[default]
-    Standard,
-    Sensitive,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ImeTextFocusContract {
-    widget_id: egui::Id,
-    focused_pass: u64,
-    diagnostic_key_policy: TextInputDiagnosticKeyPolicy,
-}
-
-impl Default for ImeTextFocusContract {
-    fn default() -> Self {
-        Self {
-            widget_id: egui::Id::NULL,
-            focused_pass: 0,
-            diagnostic_key_policy: TextInputDiagnosticKeyPolicy::Standard,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticKeyIdentity {
@@ -248,20 +105,12 @@ impl Default for TextInputKeyDiagnostic {
     }
 }
 
-fn focus_retry_id(viewport_id: egui::ViewportId, widget_id: egui::Id) -> egui::Id {
-    egui::Id::new((IME_FOCUS_RETRY_ID, viewport_id, widget_id))
-}
-
-fn text_focus_contract_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new((IME_TEXT_FOCUS_CONTRACT_ID, viewport_id))
-}
-
 fn text_input_key_diagnostic_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new((TEXT_INPUT_KEY_DIAGNOSTIC_ID, viewport_id))
+    egui::Id::unique((TEXT_INPUT_KEY_DIAGNOSTIC_ID, viewport_id))
 }
 
 fn text_input_key_diagnostic_started_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new((TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID, viewport_id))
+    egui::Id::unique((TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID, viewport_id))
 }
 
 fn diagnostic_owner_phase(owner: Option<crate::keyboard_input::KeyboardOwner>) -> &'static str {
@@ -270,7 +119,7 @@ fn diagnostic_owner_phase(owner: Option<crate::keyboard_input::KeyboardOwner>) -
             crate::keyboard_input::TextInputPhase::PendingFocus => "PendingFocus",
             crate::keyboard_input::TextInputPhase::Focused => "Focused",
             crate::keyboard_input::TextInputPhase::FocusRecovery => "FocusRecovery",
-            crate::keyboard_input::TextInputPhase::ImeGrace => "ImeGrace",
+            crate::keyboard_input::TextInputPhase::ImeComposing => "ImeComposing",
         },
         Some(crate::keyboard_input::KeyboardOwner::Modal) => "Modal",
         Some(crate::keyboard_input::KeyboardOwner::FocusedUi { .. }) => "FocusedUi",
@@ -373,7 +222,7 @@ fn diagnostic_is_anomalous(
 
 fn reserve_routine_diagnostic_bytes(line_bytes: usize) -> bool {
     TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BYTES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             routine_diagnostic_bytes_after(used, line_bytes)
         })
         .is_ok()
@@ -464,7 +313,7 @@ pub(crate) fn begin_pass_diagnostics(ctx: &egui::Context) {
     let viewport = ctx.viewport_id();
     let pass = ctx.cumulative_pass_nr();
     let mut previous = None;
-    let mut contract = None;
+    let contract = egui_ime::text_focus_contract_snapshot(ctx);
     let already_started = ctx.data_mut(|data| {
         let started_id = text_input_key_diagnostic_started_id(viewport);
         if data.get_temp::<u64>(started_id) == Some(pass) {
@@ -473,7 +322,6 @@ pub(crate) fn begin_pass_diagnostics(ctx: &egui::Context) {
         data.insert_temp(started_id, pass);
         previous =
             data.remove_temp::<TextInputKeyDiagnostic>(text_input_key_diagnostic_id(viewport));
-        contract = data.get_temp::<ImeTextFocusContract>(text_focus_contract_id(viewport));
         false
     });
     if already_started {
@@ -602,171 +450,30 @@ pub(crate) fn record_side_panel_close(ctx: &egui::Context, call_site: &'static s
     });
 }
 
-/// Sample and return IME activity for the current viewport.
-///
-/// The pre-input plugin owns viewport-local composition state. This function is
-/// a read-only projection for App shortcut gates and TextEdit helpers; it also
-/// starts the existing helper-field diagnostics for the current pass.
+/// Read IME activity and start this viewport pass's existing host diagnostics.
 pub(crate) fn ime_input_active(ctx: &egui::Context) -> bool {
     begin_pass_diagnostics(ctx);
-    let viewport_id = ctx.viewport_id();
-    let now = Instant::now();
-    ctx.with_plugin(|plugin: &mut ImeInputPlugin| plugin.input_active_in_viewport(viewport_id, now))
-        .unwrap_or(false)
+    egui_ime::ime_input_active(ctx)
 }
 
-/// Read IME activity for an explicitly selected viewport without consuming its
-/// event queue or changing its composition state.
-///
-/// The plugin updates this shared state before the selected viewport's pass.
-/// Cross-viewport consumers may then inspect the same Context-owned snapshot.
-pub(crate) fn ime_input_active_in_viewport(
-    ctx: &egui::Context,
-    viewport_id: egui::ViewportId,
-) -> bool {
-    let now = Instant::now();
-    ctx.with_plugin(|plugin: &mut ImeInputPlugin| plugin.input_active_in_viewport(viewport_id, now))
-        .unwrap_or(false)
-}
-
-/// Project unprocessed IME events onto the plugin-owned composition snapshot.
-///
-/// Native presenter events can be queued before its next egui pass. The queue
-/// remains the event owner; this read-only projection avoids a second presenter
-/// composition flag while still making pre-render clipboard routing exact.
-pub(crate) fn ime_composing_with_pending_events(
-    ctx: &egui::Context,
-    viewport_id: egui::ViewportId,
-    pending_events: &[egui::Event],
-) -> bool {
-    let mut composing = ctx
-        .with_plugin(|plugin: &mut ImeInputPlugin| plugin.composing_in_viewport(viewport_id))
-        .unwrap_or(false);
-    for event in pending_events {
-        if let egui::Event::Ime(ime) = event {
-            apply_ime_event(&mut composing, ime);
-        }
-    }
-    composing
-}
-
-/// Return IME activity including native events queued before the next egui pass.
-pub(crate) fn ime_input_active_with_pending_events(
-    ctx: &egui::Context,
-    viewport_id: egui::ViewportId,
-    pending_events: &[egui::Event],
-) -> bool {
-    pending_events
-        .iter()
-        .any(|event| matches!(event, egui::Event::Ime(_)))
-        || ime_input_active_in_viewport(ctx, viewport_id)
-}
-
-/// Return the helper-managed TextEdit that currently owns egui focus.
-///
-/// The contract is recorded while the widget is actually drawn. Reading it in
-/// the next pass lets input handlers that run before panel drawing distinguish
-/// a TextEdit from a focused slider without inspecting feature-specific draft
-/// state.
-pub(crate) fn focused_text_input(ctx: &egui::Context) -> Option<egui::Id> {
-    let focused = ctx.memory(|memory| memory.focused())?;
-    let pass = ctx.cumulative_pass_nr();
-    let id = text_focus_contract_id(ctx.viewport_id());
-    ctx.data(|data| {
-        data.get_temp::<ImeTextFocusContract>(id)
-            .filter(|contract| {
-                contract.widget_id == focused && pass.saturating_sub(contract.focused_pass) <= 1
-            })
-            .map(|contract| contract.widget_id)
-    })
-}
-
-fn keyboard_focus_recovery_input(ctx: &egui::Context) -> bool {
-    ctx.input(|input| {
-        let key_pressed = input
-            .events
-            .iter()
-            .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }));
-        let pointer_pressed = input.events.iter().any(|event| {
-            matches!(
-                event,
-                egui::Event::PointerButton { pressed: true, .. } | egui::Event::Touch { .. }
-            )
-        });
-        key_pressed && !pointer_pressed
-    })
-}
-
-fn remember_text_focus(
-    ctx: &egui::Context,
-    widget_id: egui::Id,
-    diagnostic_key_policy: TextInputDiagnosticKeyPolicy,
-) {
-    let contract = ImeTextFocusContract {
-        widget_id,
-        focused_pass: ctx.cumulative_pass_nr(),
-        diagnostic_key_policy,
-    };
-    let id = text_focus_contract_id(ctx.viewport_id());
-    ctx.data_mut(|data| data.insert_temp(id, contract));
-}
-
-fn forget_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
-    let id = text_focus_contract_id(ctx.viewport_id());
-    ctx.data_mut(|data| {
-        if data
-            .get_temp::<ImeTextFocusContract>(id)
-            .is_some_and(|contract| contract.widget_id == widget_id)
-        {
-            data.remove_temp::<ImeTextFocusContract>(id);
-        }
-    });
-}
-
-/// Return the helper-managed field whose keyboard-driven focus loss must retain
-/// text-input ownership in this pass.
-///
-/// Ownership is deliberately limited to the pass immediately after the field
-/// was observed focused. This covers both IME processing and egui's begin-pass
-/// Escape handling, which can clear focus before the fullscreen handler runs.
-/// Pointer input and focus already moved to another widget both win.
-pub(crate) fn recovering_text_input(ctx: &egui::Context) -> Option<egui::Id> {
-    if !keyboard_focus_recovery_input(ctx) || ctx.memory(|memory| memory.focused()).is_some() {
-        return None;
-    }
-    let pass = ctx.cumulative_pass_nr();
-    let id = text_focus_contract_id(ctx.viewport_id());
-    ctx.data(|data| {
-        data.get_temp::<ImeTextFocusContract>(id)
-            .filter(|contract| pass.saturating_sub(contract.focused_pass) <= 1)
-            .map(|contract| contract.widget_id)
-    })
-}
-
-/// IME 中のキー入力による `TextEdit` の一時的なフォーカス離脱を防止・復帰する。
-///
-/// `focus_request` は、呼び出し側が初回フォーカス等に使う request latch があれば渡す。
-/// 復帰時は同 latch を次 frame 用に立て直す。latch を持たない欄では widget ID ごとの
-/// 一時 latch をこのモジュールが所有する。IME 中でもマウスクリック等、pointer event を
-/// 伴う正当なフォーカス移動は復帰しない。アプリ全体の Tab traversal 無効化は
-/// `crate::egui_focus_policy` の別責務であり、この field-level lock は IME 候補選択中の
-/// focus 保持を独立して保証する。
-/// `ime_active` は必ず `TextEdit` 構築前にこのモジュールで採取する。egui は focus 遷移と
-/// 同じ pass の Ime event を `TextEdit` 内部で queue から除去することがあり、描画後に読むと
-/// fullscreen viewport や native overlay を含む全 context で composition 開始を取り逃がすため。
-///
-/// # mImageViewer の IME 対応範囲
+/// mImageViewer の IME 対応範囲
 ///
 /// コード上 TSF は使用していない。IMM32 を使う経路が 2 つある。
 ///
 /// - main window と fullscreen viewport は winit / egui を通り、`Ime::Preedit` /
 ///   `Ime::Commit` / `Ime::Disabled` 相当の `egui::ImeEvent` を受ける。
+///   IME が処理した `NamedKey::Process` の press / repeat は allow_ime 有効時に egui-winit が
+///   Key / Text / clipboard event にしない。物理キーの押下を Hidden（未配送）/ Forwarded（配送済み）で持ち、
+///   配送済みは後続の Process repeat でも保持する。release は allow_ime にかかわらず状態を除去し Hidden のみ遮断する。
+///   focus 喪失時は全状態を消す。未登録の release と Ime event はそのまま渡す。
 /// - winit 管理外の独立 HWND である native video window は
 ///   `video/native_window.rs` で `WM_IME_STARTCOMPOSITION` /
 ///   `WM_IME_COMPOSITION` / `WM_IME_ENDCOMPOSITION` / `WM_IME_SETCONTEXT` を直接処理する。
 ///   `GCS_COMPSTR` と `GCS_RESULTSTR` を読み、`ISC_SHOWUICOMPOSITIONWINDOW` を落として OS の
 ///   composition window を抑止する。候補位置は `video/native_window_host.rs` が
 ///   `ImmSetCompositionWindow` / `ImmSetCandidateWindow` で設定する。
+///   この経路も `VK_PROCESSKEY` に egui key を割り当てない。共有 plugin は
+///   取消時の空 preedit 補完、composition の追跡と理由に基づく focus 復帰を所有する。
 ///
 /// native 経路は `GCS_COMPATTR` / `GCS_COMPCLAUSE` を読まないため変換対象 clause を区別せず、
 /// egui へ渡す preedit 文字列にも caret range がない。`IMR_RECONVERTSTRING` による再変換も
@@ -775,77 +482,15 @@ pub(crate) fn recovering_text_input(ctx: &egui::Context) -> Option<egui::Id> {
 /// 二重化する一方、本アプリの文字入力は folder path、tag、bookmark name 等の補助用途であるため
 /// 採用しない。ただし、このような focus / key routing の不具合は本アプリ側の責務であり、
 /// IMM32 の範囲で修正する。「完全な IME には TSF が必要」を未修正の理由にしてはならない。
-fn restore_focus_for_ime_key(
-    ctx: &egui::Context,
-    response: &egui::Response,
-    ime_active: bool,
-    mut focus_request: Option<&mut bool>,
-    diagnostic_key_policy: TextInputDiagnosticKeyPolicy,
-) -> bool {
-    let viewport_id = ctx.viewport_id();
-    let retry_id = focus_retry_id(viewport_id, response.id);
-    let retry_requested = match focus_request.as_deref_mut() {
-        Some(request) => std::mem::take(request),
-        None => ctx
-            .data_mut(|data| data.remove_temp::<bool>(retry_id))
-            .unwrap_or(false),
-    };
-    if retry_requested {
-        response.request_focus();
-    }
-
-    if ctx.memory(|memory| memory.has_focus(response.id)) {
-        ctx.memory_mut(|memory| {
-            memory.set_focus_lock_filter(
-                response.id,
-                egui::EventFilter {
-                    tab: ime_active,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    ..Default::default()
-                },
-            );
-        });
-    }
-
-    let restored = response.lost_focus() && ime_active && keyboard_focus_recovery_input(ctx);
-    if restored {
-        response.request_focus();
-        if let Some(request) = focus_request {
-            *request = true;
-        } else {
-            ctx.data_mut(|data| data.insert_temp(retry_id, true));
-        }
-        ctx.request_repaint();
-    }
-
-    observe_helper_widget(ctx, response.id);
-    if ctx.memory(|memory| memory.has_focus(response.id)) || restored {
-        remember_text_focus(ctx, response.id, diagnostic_key_policy);
-    } else if response.lost_focus() {
-        forget_text_focus(ctx, response.id);
-    }
-
-    restored
-}
-
 pub(crate) fn show_singleline<'text>(
     ui: &mut egui::Ui,
     text: &'text mut dyn egui::TextBuffer,
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::widgets::text_edit::TextEditOutput {
-    // `TextEdit` は focus 遷移と同じ pass の Ime event を内部で除去することがある。
-    // 必ず widget を描く前に、この viewport の event queue を共有 state へ取り込む。
-    let ime_active = ime_input_active(ui.ctx());
-    let output = configure(egui::TextEdit::singleline(text)).show(ui);
-    let _ = restore_focus_for_ime_key(
-        ui.ctx(),
-        &output.response,
-        ime_active,
-        focus_request,
-        TextInputDiagnosticKeyPolicy::Standard,
-    );
+    begin_pass_diagnostics(ui.ctx());
+    let output = egui_ime::show_singleline(ui, text, focus_request, configure);
+    observe_helper_widget(ui.ctx(), output.response.id);
     output
 }
 
@@ -855,48 +500,22 @@ pub(crate) fn add_singleline<'text>(
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::Response {
-    add_singleline_with_policy(
-        ui,
-        text,
-        focus_request,
-        TextInputDiagnosticKeyPolicy::Standard,
-        configure,
-    )
+    begin_pass_diagnostics(ui.ctx());
+    let response = egui_ime::add_singleline(ui, text, focus_request, configure);
+    observe_helper_widget(ui.ctx(), response.id);
+    response
 }
 
-/// Add a helper-managed single-line field whose per-key diagnostic details are
-/// fully redacted while focus and keyboard-ownership transitions remain logged.
+/// Keep password-field diagnostic details redacted while recording ownership.
 pub(crate) fn add_singleline_sensitive<'text>(
     ui: &mut egui::Ui,
     text: &'text mut dyn egui::TextBuffer,
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::Response {
-    add_singleline_with_policy(
-        ui,
-        text,
-        focus_request,
-        TextInputDiagnosticKeyPolicy::Sensitive,
-        configure,
-    )
-}
-
-fn add_singleline_with_policy<'text>(
-    ui: &mut egui::Ui,
-    text: &'text mut dyn egui::TextBuffer,
-    focus_request: Option<&mut bool>,
-    diagnostic_key_policy: TextInputDiagnosticKeyPolicy,
-    configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
-) -> egui::Response {
-    let ime_active = ime_input_active(ui.ctx());
-    let response = ui.add(configure(egui::TextEdit::singleline(text)));
-    let _ = restore_focus_for_ime_key(
-        ui.ctx(),
-        &response,
-        ime_active,
-        focus_request,
-        diagnostic_key_policy,
-    );
+    begin_pass_diagnostics(ui.ctx());
+    let response = egui_ime::add_singleline_sensitive(ui, text, focus_request, configure);
+    observe_helper_widget(ui.ctx(), response.id);
     response
 }
 
@@ -907,15 +526,9 @@ pub(crate) fn add_sized_singleline<'text>(
     focus_request: Option<&mut bool>,
     configure: impl FnOnce(egui::TextEdit<'text>) -> egui::TextEdit<'text>,
 ) -> egui::Response {
-    let ime_active = ime_input_active(ui.ctx());
-    let response = ui.add_sized(size, configure(egui::TextEdit::singleline(text)));
-    let _ = restore_focus_for_ime_key(
-        ui.ctx(),
-        &response,
-        ime_active,
-        focus_request,
-        TextInputDiagnosticKeyPolicy::Standard,
-    );
+    begin_pass_diagnostics(ui.ctx());
+    let response = egui_ime::add_sized_singleline(ui, size, text, focus_request, configure);
+    observe_helper_widget(ui.ctx(), response.id);
     response
 }
 
@@ -965,7 +578,7 @@ mod tests {
 
     #[test]
     fn key_diagnostic_reports_identity_focus_owner_and_close_site_per_press() {
-        let field_id = egui::Id::new("diagnostic-field");
+        let field_id = egui::Id::unique("diagnostic-field");
         let diagnostic = TextInputKeyDiagnostic {
             pass: 7,
             viewport: egui::ViewportId::ROOT,
@@ -1082,29 +695,34 @@ mod tests {
     #[test]
     fn sensitive_field_redacts_key_details_even_on_anomalous_focus_loss() {
         let ctx = egui::Context::default();
-        let field_id = egui::Id::new("sensitive-diagnostic-field");
+        let field_id = egui::Id::unique("sensitive-diagnostic-field");
         let mut password = String::new();
         let mut request_focus = true;
 
         ctx.begin_pass(Default::default());
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = add_singleline_sensitive(ui, &mut password, Some(&mut request_focus), |edit| {
-                edit.id(field_id).password(true)
-            });
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let _ =
+                    add_singleline_sensitive(ui, &mut password, Some(&mut request_focus), |edit| {
+                        edit.id(field_id).password(true)
+                    });
+            })
         });
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
         let modifiers = egui::Modifiers::SHIFT;
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::A),
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: Some(egui::Key::A),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
             ..Default::default()
         });
         begin_pass_diagnostics(&ctx);
@@ -1123,7 +741,7 @@ mod tests {
             ctx.data(|data| data.get_temp(diagnostic_id).unwrap_or_default());
         assert!(diagnostic_is_anomalous(&diagnostic, None));
         let lines = format_key_diagnostic(&diagnostic, None);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
@@ -1154,418 +772,15 @@ mod tests {
         assert_eq!(routine_diagnostic_bytes_after(usize::MAX, line_bytes), None);
     }
 
-    #[test]
-    fn explicit_viewport_ime_read_is_read_only_and_viewport_isolated() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("gamepad-ime-fullscreen");
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![
-                egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-            ],
-        ));
-        assert!(ime_input_active(&ctx));
-        let _ = ctx.end_pass();
-
-        let before = ctx
-            .with_plugin(|plugin: &mut ImeInputPlugin| {
-                plugin.viewports.get(&viewport_id).copied().unwrap()
-            })
-            .unwrap();
-        ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, Vec::new()));
-        assert!(ime_input_active_in_viewport(&ctx, viewport_id));
-        let after_read = ctx
-            .with_plugin(|plugin: &mut ImeInputPlugin| {
-                plugin.viewports.get(&viewport_id).copied().unwrap()
-            })
-            .unwrap();
-        assert_eq!(after_read, before);
-        assert!(!ime_input_active_in_viewport(&ctx, egui::ViewportId::ROOT));
-        assert!(!ime_input_active(&ctx));
-        let after_root_update = ctx
-            .with_plugin(|plugin: &mut ImeInputPlugin| {
-                plugin.viewports.get(&viewport_id).copied().unwrap()
-            })
-            .unwrap();
-        assert_eq!(after_root_update, before);
-        let _ = ctx.end_pass();
-    }
-
-    #[test]
-    fn current_viewport_ime_update_still_tracks_root_composition() {
-        let ctx = test_context();
-        ctx.begin_pass(viewport_raw_input(
-            egui::ViewportId::ROOT,
-            vec![
-                egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-            ],
-        ));
-        assert!(ime_input_active(&ctx));
-        assert!(ime_input_active_in_viewport(&ctx, egui::ViewportId::ROOT));
-        let _ = ctx.end_pass();
-    }
-
-    #[test]
-    fn pending_native_events_project_without_mutating_plugin_state() {
-        let ctx = test_context();
-        establish_composition(&ctx, egui::ViewportId::ROOT);
-        let before = ctx
-            .with_plugin(|plugin: &mut ImeInputPlugin| {
-                plugin
-                    .viewports
-                    .get(&egui::ViewportId::ROOT)
-                    .copied()
-                    .unwrap()
-            })
-            .unwrap();
-        let pending = vec![egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))];
-
-        assert!(!ime_composing_with_pending_events(
-            &ctx,
-            egui::ViewportId::ROOT,
-            &pending,
-        ));
-        assert!(ime_input_active_with_pending_events(
-            &ctx,
-            egui::ViewportId::ROOT,
-            &pending,
-        ));
-        let after = ctx
-            .with_plugin(|plugin: &mut ImeInputPlugin| {
-                plugin
-                    .viewports
-                    .get(&egui::ViewportId::ROOT)
-                    .copied()
-                    .unwrap()
-            })
-            .unwrap();
-        assert_eq!(after, before);
-    }
-
-    fn establish_composition(ctx: &egui::Context, viewport_id: egui::ViewportId) {
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![
-                egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-            ],
-        ));
-        assert!(ime_input_active(ctx));
-        let _ = ctx.end_pass();
-    }
-
-    fn empty_preedit_count(ctx: &egui::Context) -> usize {
-        ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter(|event| {
-                    matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit(text)) if text.is_empty())
-                })
-                .count()
-        })
-    }
-
-    #[test]
-    fn composing_escape_press_is_removed_but_release_is_preserved() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("ime-escape-filter");
-        establish_composition(&ctx, viewport_id);
-
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![
-                key_event_state(egui::Key::Escape, true),
-                key_event_state(egui::Key::Escape, false),
-            ],
-        ));
-        ctx.input(|input| {
-            assert_eq!(
-                input.events,
-                vec![key_event_state(egui::Key::Escape, false)]
-            );
-        });
-        assert_eq!(empty_preedit_count(&ctx), 0);
-        let _ = ctx.end_pass();
-    }
-
-    #[test]
-    fn noncomposing_and_ime_grace_escape_presses_are_preserved() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("ime-escape-grace");
-
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![key_event(egui::Key::Escape)],
-        ));
-        assert!(ctx.input(|input| input.events == vec![key_event(egui::Key::Escape)]));
-        assert_eq!(empty_preedit_count(&ctx), 0);
-        let _ = ctx.end_pass();
-
-        establish_composition(&ctx, viewport_id);
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
-        ));
-        assert_eq!(empty_preedit_count(&ctx), 1);
-        assert!(ime_input_active(&ctx), "Disabled starts the shortcut grace");
-        assert!(
-            !ctx.with_plugin(|plugin: &mut ImeInputPlugin| {
-                plugin.viewports.get(&viewport_id).unwrap().composing
-            })
-            .unwrap()
-        );
-        let mut grace_state = ctx
-            .with_plugin(|plugin: &mut ImeInputPlugin| *plugin.viewports.get(&viewport_id).unwrap())
-            .unwrap();
-        let _ = ctx.end_pass();
-
-        let mut events = vec![key_event(egui::Key::Escape)];
-        assert!(
-            grace_state.input_active_at(Instant::now()),
-            "the 300ms grace is still active"
-        );
-        normalize_ime_input(&mut events, &mut grace_state, Instant::now());
-        assert_eq!(events, vec![key_event(egui::Key::Escape)]);
-        assert!(!events.iter().any(
-            |event| matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit(text)) if text.is_empty())
-        ));
-    }
-
-    #[test]
-    fn composing_disabled_inserts_one_empty_preedit_before_disabled() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("ime-disabled-cancel");
-        establish_composition(&ctx, viewport_id);
-
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
-        ));
-        let _ = ime_input_active(&ctx);
-        assert_eq!(empty_preedit_count(&ctx), 1);
-        ctx.input(|input| {
-            assert!(matches!(
-                input.events.as_slice(),
-                [
-                    egui::Event::Ime(egui::ImeEvent::Preedit(text)),
-                    egui::Event::Ime(egui::ImeEvent::Disabled),
-                ] if text.is_empty()
-            ));
-        });
-
-        let _ = ime_input_active(&ctx);
-        assert_eq!(empty_preedit_count(&ctx), 1);
-        let _ = ctx.end_pass();
-    }
-
-    /// The sequence Windows actually delivers when Esc cancels a composition,
-    /// captured from `[ime-raw]` tracing on 2026-08-01:
-    /// `EscPress, Disabled, Disabled, Commit(""), Disabled, Disabled`.
-    ///
-    /// The empty commit is a cancellation, not a confirmation: egui's commit
-    /// handler skips `delete_selected` for an empty prediction, so without the
-    /// inserted cancel the preedit stays in the buffer as confirmed text.
-    #[test]
-    fn windows_escape_cancel_sequence_clears_the_preedit() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("ime-windows-escape-cancel");
-        establish_composition(&ctx, viewport_id);
-
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![
-                key_event(egui::Key::Escape),
-                egui::Event::Ime(egui::ImeEvent::Disabled),
-                egui::Event::Ime(egui::ImeEvent::Disabled),
-                egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
-                egui::Event::Ime(egui::ImeEvent::Disabled),
-                egui::Event::Ime(egui::ImeEvent::Disabled),
-            ],
-        ));
-        let _ = ime_input_active(&ctx);
-
-        assert_eq!(
-            empty_preedit_count(&ctx),
-            1,
-            "the empty commit must not be mistaken for a confirmation"
-        );
-        ctx.input(|input| {
-            assert!(
-                !input.events.iter().any(|event| matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Escape,
-                        pressed: true,
-                        ..
-                    }
-                )),
-                "the cancelling Esc must not reach egui focus handling"
-            );
-            let first_ime = input
-                .events
-                .iter()
-                .position(|event| matches!(event, egui::Event::Ime(_)))
-                .expect("the batch carries IME events");
-            assert!(
-                matches!(
-                    &input.events[first_ime],
-                    egui::Event::Ime(egui::ImeEvent::Preedit(text)) if text.is_empty()
-                ),
-                "the cancel must land while the preedit is still selected"
-            );
-        });
-        let _ = ctx.end_pass();
-    }
-
-    /// A non-empty commit is a real confirmation and must be left alone.
-    #[test]
-    fn non_empty_commit_with_disabled_does_not_insert_cancel_preedit() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("ime-real-commit");
-        establish_composition(&ctx, viewport_id);
-
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![
-                egui::Event::Ime(egui::ImeEvent::Commit("確定".to_owned())),
-                egui::Event::Ime(egui::ImeEvent::Disabled),
-            ],
-        ));
-        let _ = ime_input_active(&ctx);
-        assert_eq!(empty_preedit_count(&ctx), 0);
-        let _ = ctx.end_pass();
-    }
-
-    #[test]
-    fn commit_and_disabled_does_not_insert_cancel_preedit() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("ime-commit-disabled");
-        establish_composition(&ctx, viewport_id);
-
-        ctx.begin_pass(viewport_raw_input(
-            viewport_id,
-            vec![
-                egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
-                egui::Event::Ime(egui::ImeEvent::Disabled),
-            ],
-        ));
-        let _ = ime_input_active(&ctx);
-        assert_eq!(empty_preedit_count(&ctx), 0);
-        let _ = ctx.end_pass();
-    }
-
-    #[test]
-    fn disabled_without_local_composition_preserves_events_and_other_viewport() {
-        let ctx = test_context();
-        let composing_viewport = egui::ViewportId::from_hash_of("ime-isolated-composing");
-        establish_composition(&ctx, composing_viewport);
-
-        ctx.begin_pass(viewport_raw_input(
-            egui::ViewportId::ROOT,
-            vec![
-                key_event(egui::Key::Escape),
-                egui::Event::Ime(egui::ImeEvent::Disabled),
-            ],
-        ));
-        let _ = ime_input_active(&ctx);
-        assert_eq!(empty_preedit_count(&ctx), 0);
-        assert!(ctx.input(|input| input.events.contains(&key_event(egui::Key::Escape))));
-        assert!(crate::ime_focus::ime_input_active_in_viewport(
-            &ctx,
-            composing_viewport,
-        ));
-        let _ = ctx.end_pass();
-    }
-
-    #[test]
-    fn raw_multiline_text_edit_keeps_focus_and_cancels_preedit_across_delayed_disabled() {
-        let ctx = test_context();
-        let field_id = egui::Id::new("ime-escape-raw-multiline");
-        let mut body = String::new();
-        let mut request_focus = true;
-        let draw = |ctx: &egui::Context, body: &mut String, request_focus: &mut bool| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let response = ui.add(egui::TextEdit::multiline(body).id(field_id));
-                if std::mem::take(request_focus) {
-                    response.request_focus();
-                }
-            });
-        };
-
-        let _ = ctx.run(Default::default(), |ctx| {
-            draw(ctx, &mut body, &mut request_focus);
-        });
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
-
-        let _ = ctx.run(
-            viewport_raw_input(
-                egui::ViewportId::ROOT,
-                vec![
-                    egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-                ],
-            ),
-            |ctx| draw(ctx, &mut body, &mut request_focus),
-        );
-        assert_eq!(body, "あ");
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
-
-        let mut escape_press_seen = true;
-        let _ = ctx.run(
-            viewport_raw_input(
-                egui::ViewportId::ROOT,
-                vec![
-                    key_event_state(egui::Key::Escape, true),
-                    key_event_state(egui::Key::Escape, false),
-                ],
-            ),
-            |ctx| {
-                escape_press_seen = ctx.input(|input| {
-                    input.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Key {
-                                key: egui::Key::Escape,
-                                pressed: true,
-                                ..
-                            }
-                        )
-                    })
-                });
-                draw(ctx, &mut body, &mut request_focus);
-            },
-        );
-        assert!(!escape_press_seen);
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
-
-        let mut cancel_preedit_count = 0;
-        let _ = ctx.run(
-            viewport_raw_input(
-                egui::ViewportId::ROOT,
-                vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
-            ),
-            |ctx| {
-                cancel_preedit_count = empty_preedit_count(ctx);
-                draw(ctx, &mut body, &mut request_focus);
-            },
-        );
-        assert_eq!(cancel_preedit_count, 1);
-        assert!(body.is_empty());
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
-    }
-
     fn draw_text_fields(
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         first_id: egui::Id,
         second_id: egui::Id,
         first: &mut String,
         second: &mut String,
         first_focus_request: &mut bool,
     ) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let _ = show_singleline(ui, first, Some(first_focus_request), |edit| {
                 edit.id(first_id)
             });
@@ -1574,187 +789,46 @@ mod tests {
     }
 
     #[test]
-    fn ime_tab_restores_the_editing_field_focus() {
-        let ctx = test_context();
-        let first_id = egui::Id::new("ime_tab_first");
-        let second_id = egui::Id::new("ime_tab_second");
-        let mut first = String::new();
-        let mut second = String::new();
-        let mut focus_request = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            draw_text_fields(
-                ctx,
-                first_id,
-                second_id,
-                &mut first,
-                &mut second,
-                &mut focus_request,
-            );
-        });
-
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![
-                    egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                draw_text_fields(
-                    ctx,
-                    first_id,
-                    second_id,
-                    &mut first,
-                    &mut second,
-                    &mut focus_request,
-                );
-            },
-        );
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::Tab)],
-                ..Default::default()
-            },
-            |ctx| {
-                draw_text_fields(
-                    ctx,
-                    first_id,
-                    second_id,
-                    &mut first,
-                    &mut second,
-                    &mut focus_request,
-                );
-            },
-        );
-
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
-        assert!(ctx.wants_keyboard_input());
-    }
-
-    #[test]
-    fn ime_start_is_sampled_before_text_edit_consumes_events() {
-        let ctx = test_context();
-        let viewport_id = egui::ViewportId::from_hash_of("ime_focus_fullscreen_viewport");
-        let first_id = egui::Id::new("ime_start_focus_gain_first");
-        let second_id = egui::Id::new("ime_start_focus_gain_second");
-        let mut first = String::new();
-        let mut second = String::new();
-        let mut focus_request = true;
-        let raw_input = |events| {
-            let mut input = egui::RawInput {
-                viewport_id,
-                events,
-                ..Default::default()
-            };
-            input.viewports.insert(
-                viewport_id,
-                egui::ViewportInfo {
-                    parent: Some(egui::ViewportId::ROOT),
-                    ..Default::default()
-                },
-            );
-            input
-        };
-
-        let _ = ctx.run(raw_input(Vec::new()), |ctx| {
-            draw_text_fields(
-                ctx,
-                first_id,
-                second_id,
-                &mut first,
-                &mut second,
-                &mut focus_request,
-            );
-        });
-        let mut ime_events_remained_after_text_edit = true;
-        let _ = ctx.run(
-            raw_input(vec![
-                egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-            ]),
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let event_queue = ctx.clone();
-                    let _ = show_singleline(ui, &mut first, Some(&mut focus_request), |edit| {
-                        // egui TextEdit removes Ime events on a focus transition. Keep that
-                        // behavior explicit in this fixture so the helper's sampling order is
-                        // tested independently of egui's private focus-history timing.
-                        event_queue.input_mut(|input| {
-                            input
-                                .events
-                                .retain(|event| !matches!(event, egui::Event::Ime(_)));
-                        });
-                        edit.id(first_id)
-                    });
-                    let _ = show_singleline(ui, &mut second, None, |edit| edit.id(second_id));
-                });
-                ime_events_remained_after_text_edit = ctx.input(|input| {
-                    input
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, egui::Event::Ime(_)))
-                });
-            },
-        );
-
-        assert!(
-            !ime_events_remained_after_text_edit,
-            "fixture must reproduce TextEdit consuming the IME-start events"
-        );
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
-
-        let _ = ctx.run(raw_input(vec![key_event(egui::Key::Tab)]), |ctx| {
-            draw_text_fields(
-                ctx,
-                first_id,
-                second_id,
-                &mut first,
-                &mut second,
-                &mut focus_request,
-            );
-        });
-
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
-    }
-
-    #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn tab_without_ime_keeps_editing_field_focus_and_input_working() {
         let ctx = test_context();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
-        let first_id = egui::Id::new("plain_tab_first");
-        let second_id = egui::Id::new("plain_tab_second");
+        let first_id = egui::Id::unique("plain_tab_first");
+        let second_id = egui::Id::unique("plain_tab_second");
         let mut first = String::new();
         let mut second = String::new();
         let mut focus_request = true;
-        let _ = ctx.run(Default::default(), |ctx| {
+        crate::egui_output::discard_headless_output(ctx.run_ui(Default::default(), |ui| {
             draw_text_fields(
-                ctx,
+                ui,
                 first_id,
                 second_id,
                 &mut first,
                 &mut second,
                 &mut focus_request,
             );
-        });
-        let _ = ctx.run(Default::default(), |ctx| {
+        }));
+        crate::egui_output::discard_headless_output(ctx.run_ui(Default::default(), |ui| {
             draw_text_fields(
-                ctx,
+                ui,
                 first_id,
                 second_id,
                 &mut first,
                 &mut second,
                 &mut focus_request,
             );
-        });
-        let _ = ctx.run(
+        }));
+        crate::egui_output::discard_headless_output(ctx.run_ui(
             egui::RawInput {
                 events: vec![key_event(egui::Key::Tab)],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
                 draw_text_fields(
-                    ctx,
+                    ui,
                     first_id,
                     second_id,
                     &mut first,
@@ -1762,23 +836,26 @@ mod tests {
                     &mut focus_request,
                 );
             },
-        );
+        ));
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
-        let _ = ctx.run(
+        crate::egui_output::discard_headless_output(ctx.run_ui(
             egui::RawInput {
                 events: vec![
                     egui::Event::Text("x".to_owned()),
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "あ".to_owned(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
                 ],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
                 draw_text_fields(
-                    ctx,
+                    ui,
                     first_id,
                     second_id,
                     &mut first,
@@ -1786,151 +863,400 @@ mod tests {
                     &mut focus_request,
                 );
             },
-        );
+        ));
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
         assert_eq!(first, "xあ");
         assert!(second.is_empty());
     }
 
-    #[test]
-    fn text_cursor_arrow_keys_keep_the_editing_field_focus() {
-        let ctx = egui::Context::default();
-        let first_id = egui::Id::new("arrow_first");
-        let second_id = egui::Id::new("arrow_second");
-        let mut first = String::from("abc");
-        let mut second = String::new();
-        let mut focus_request = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            draw_text_fields(
-                ctx,
-                first_id,
-                second_id,
-                &mut first,
-                &mut second,
-                &mut focus_request,
-            );
-        });
-        let _ = ctx.run(Default::default(), |ctx| {
-            draw_text_fields(
-                ctx,
-                first_id,
-                second_id,
-                &mut first,
-                &mut second,
-                &mut focus_request,
-            );
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::ArrowDown)],
-                ..Default::default()
-            },
-            |ctx| {
-                draw_text_fields(
-                    ctx,
-                    first_id,
-                    second_id,
-                    &mut first,
-                    &mut second,
-                    &mut focus_request,
-                );
+    fn diagnostic_for_pass(ctx: &egui::Context) -> Option<TextInputKeyDiagnostic> {
+        ctx.data(|data| data.get_temp(text_input_key_diagnostic_id(ctx.viewport_id())))
+    }
+
+    fn record_text_owner(ctx: &egui::Context, widget_id: egui::Id) {
+        record_keyboard_owner(
+            ctx,
+            crate::keyboard_input::KeyboardOwner::TextInput {
+                viewport: ctx.viewport_id(),
+                widget_id,
+                phase: crate::keyboard_input::TextInputPhase::Focused,
             },
         );
-
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 
     #[test]
-    fn ime_activity_without_a_focus_key_does_not_undo_focus_change() {
-        let ctx = test_context();
-        let first_id = egui::Id::new("ime_click_first");
-        let second_id = egui::Id::new("ime_click_second");
-        let mut first = String::new();
-        let mut second = String::new();
-        let mut focus_request = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            draw_text_fields(
-                ctx,
-                first_id,
-                second_id,
-                &mut first,
-                &mut second,
-                &mut focus_request,
-            );
-        });
-        ctx.memory_mut(|memory| memory.request_focus(second_id));
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![
-                    egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                draw_text_fields(
-                    ctx,
-                    first_id,
-                    second_id,
-                    &mut first,
-                    &mut second,
-                    &mut focus_request,
-                );
-            },
-        );
-
-        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second_id));
-    }
-
-    #[test]
-    fn ime_enter_and_escape_restore_the_editing_field_focus() {
-        for key in [egui::Key::Enter, egui::Key::Escape] {
-            let ctx = test_context();
-            let first_id = egui::Id::new(("ime_focus_key_first", key));
-            let second_id = egui::Id::new(("ime_focus_key_second", key));
-            let mut first = String::new();
-            let mut second = String::new();
-            let mut focus_request = true;
-            let _ = ctx.run(Default::default(), |ctx| {
-                draw_text_fields(
-                    ctx,
-                    first_id,
-                    second_id,
-                    &mut first,
-                    &mut second,
-                    &mut focus_request,
-                );
-            });
-            let terminal_ime_event = if key == egui::Key::Enter {
-                egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))
+    fn facade_helpers_start_diagnostics_before_drawing_and_observe_the_shared_contract() {
+        for variant in 0..4 {
+            // Existing diagnostic-only Contexts do not install the input plugin.
+            let ctx = egui::Context::default();
+            let field_id = egui::Id::unique(("facade-helper", variant));
+            let mut text = "abc".to_owned();
+            let mut request_focus = true;
+            let policy = if variant == 2 {
+                TextInputDiagnosticKeyPolicy::Sensitive
             } else {
-                egui::Event::Ime(egui::ImeEvent::Disabled)
+                TextInputDiagnosticKeyPolicy::Standard
             };
-            let _ = ctx.run(
-                egui::RawInput {
-                    events: vec![
-                        egui::Event::Ime(egui::ImeEvent::Enabled),
-                        egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-                        key_event(key),
-                        terminal_ime_event,
-                    ],
-                    ..Default::default()
-                },
-                |ctx| {
-                    draw_text_fields(
-                        ctx,
-                        first_id,
-                        second_id,
-                        &mut first,
-                        &mut second,
-                        &mut focus_request,
-                    );
-                },
-            );
-
-            assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
+            for keyed_pass in [false, true] {
+                ctx.run_ui(
+                    viewport_raw_input(
+                        egui::ViewportId::ROOT,
+                        if keyed_pass {
+                            vec![key_event(egui::Key::ArrowRight)]
+                        } else {
+                            Vec::new()
+                        },
+                    ),
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            let assert_before_drawing = || {
+                                if keyed_pass {
+                                    let diagnostic = diagnostic_for_pass(ctx).unwrap();
+                                    assert_eq!(diagnostic.pass, ctx.cumulative_pass_nr());
+                                    assert_eq!(diagnostic.field_id_before, field_id);
+                                    assert_eq!(diagnostic.focused_before, Some(field_id));
+                                    assert!(!diagnostic.field_seen_after);
+                                    assert_eq!(diagnostic.field_id_after, None);
+                                }
+                            };
+                            let response = match variant {
+                                0 => {
+                                    show_singleline(
+                                        ui,
+                                        &mut text,
+                                        Some(&mut request_focus),
+                                        |edit| {
+                                            assert_before_drawing();
+                                            edit.id(field_id)
+                                        },
+                                    )
+                                    .response
+                                    .response
+                                }
+                                1 => add_singleline(
+                                    ui,
+                                    &mut text,
+                                    Some(&mut request_focus),
+                                    |edit| {
+                                        assert_before_drawing();
+                                        edit.id(field_id)
+                                    },
+                                ),
+                                2 => add_singleline_sensitive(
+                                    ui,
+                                    &mut text,
+                                    Some(&mut request_focus),
+                                    |edit| {
+                                        assert_before_drawing();
+                                        edit.id(field_id)
+                                    },
+                                ),
+                                3 => add_sized_singleline(
+                                    ui,
+                                    egui::vec2(120.0, 24.0),
+                                    &mut text,
+                                    Some(&mut request_focus),
+                                    |edit| {
+                                        assert_before_drawing();
+                                        edit.id(field_id)
+                                    },
+                                ),
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(response.id, field_id);
+                        });
+                        let contract = egui_ime::text_focus_contract_snapshot(ctx).unwrap();
+                        assert_eq!(contract.widget_id, field_id);
+                        assert_eq!(contract.focused_pass, ctx.cumulative_pass_nr());
+                        assert_eq!(contract.diagnostic_key_policy, policy);
+                        if keyed_pass {
+                            record_text_owner(ctx, field_id);
+                            let diagnostic = diagnostic_for_pass(ctx).unwrap();
+                            assert!(diagnostic.field_seen_after);
+                            assert_eq!(diagnostic.field_id_after, Some(field_id));
+                            assert!(!diagnostic_is_anomalous(&diagnostic, Some(field_id)));
+                            let before = format_key_diagnostic(&diagnostic, Some(field_id));
+                            assert!(!ime_input_active(ctx));
+                            assert_eq!(
+                                format_key_diagnostic(
+                                    &diagnostic_for_pass(ctx).unwrap(),
+                                    Some(field_id)
+                                ),
+                                before
+                            );
+                            if policy == TextInputDiagnosticKeyPolicy::Sensitive {
+                                assert!(before[0].contains("key=Redacted"));
+                            }
+                        }
+                    },
+                )
+                .drop_without_applying_deltas();
+            }
+            // Finalize the previous record once, after egui's end-pass validation.
+            ctx.begin_pass(Default::default());
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+            assert!(!ime_input_active(&ctx));
+            assert!(diagnostic_for_pass(&ctx).is_none());
+            ctx.end_pass().drop_without_applying_deltas();
         }
+    }
+
+    #[test]
+    fn facade_observes_the_field_even_after_the_shared_helper_forgets_its_contract() {
+        let ctx = test_context();
+        let field_id = egui::Id::unique("facade-forget-contract");
+        let mut text = "abc".to_owned();
+        let mut request_focus = true;
+        ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
+                    edit.id(field_id)
+                });
+            });
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
+            viewport_raw_input(egui::ViewportId::ROOT, vec![key_event(egui::Key::Escape)]),
+            |ui| {
+                let ctx = &ui.ctx().clone();
+                assert_eq!(ctx.memory(|memory| memory.focused()), None);
+                egui::CentralPanel::default().show(ui, |ui| {
+                    add_singleline(ui, &mut text, None, |edit| edit.id(field_id));
+                });
+                assert!(egui_ime::text_focus_contract_snapshot(ctx).is_none());
+                let diagnostic = diagnostic_for_pass(ctx).unwrap();
+                assert!(diagnostic.field_seen_after);
+                assert_eq!(diagnostic.field_id_after, Some(field_id));
+                assert!(diagnostic_is_anomalous(&diagnostic, None));
+            },
+        )
+        .drop_without_applying_deltas();
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            begin_pass_diagnostics(ctx);
+            assert!(diagnostic_for_pass(ctx).is_none());
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
+    fn facade_observes_ime_restoration_after_the_shared_contract_is_refreshed() {
+        for external_latch in [false, true] {
+            let ctx = test_context();
+            let field_id = egui::Id::unique(("facade-restored-contract", external_latch));
+            let mut text = String::new();
+            let mut request_focus = true;
+            ctx.run_ui(Default::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    show_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
+                        edit.id(field_id)
+                    });
+                });
+            })
+            .drop_without_applying_deltas();
+            ctx.run_ui(
+                viewport_raw_input(
+                    egui::ViewportId::ROOT,
+                    vec![
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "あ".to_owned(),
+                            active_range_chars: None,
+                        }),
+                        // An ordinary Enter while still composing exercises restoration.
+                        // IME-handled Process presses never reach this event queue.
+                        key_event(egui::Key::Enter),
+                    ],
+                ),
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let focus_request = external_latch.then_some(&mut request_focus);
+                        let output =
+                            show_singleline(ui, &mut text, focus_request, |edit| edit.id(field_id));
+                        // Response reads live egui memory: the helper has already restored focus.
+                        assert!(output.response.has_focus());
+                    });
+                    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+                    if external_latch {
+                        assert!(
+                            !request_focus,
+                            "helper retries never write the caller's latch"
+                        );
+                    }
+                    assert_eq!(
+                        egui_ime::text_focus_contract_snapshot(ctx)
+                            .unwrap()
+                            .focused_pass,
+                        ctx.cumulative_pass_nr()
+                    );
+                    record_text_owner(ctx, field_id);
+                    let diagnostic = diagnostic_for_pass(ctx).unwrap();
+                    assert!(diagnostic.field_seen_after);
+                    assert_eq!(diagnostic.field_id_after, Some(field_id));
+                    assert!(!diagnostic_is_anomalous(&diagnostic, Some(field_id)));
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
+    fn facade_explicit_viewport_and_pending_reads_do_not_start_diagnostics() {
+        let ctx = test_context();
+        ctx.set_embed_viewports(false);
+        let child = egui::ViewportId::from_hash_of("facade-child");
+        // RawInput metadata alone does not keep a child registered after root
+        // end-pass GC. Declare the native child before its first input pass and
+        // on every parent pass, as the real viewport owner does.
+        ctx.run_ui(Default::default(), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(child, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+        ctx.begin_pass(viewport_raw_input(
+            child,
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+        ));
+        ctx.end_pass().drop_without_applying_deltas();
+        let field_id = egui::Id::unique("facade-root-field");
+        let mut text = "abc".to_owned();
+        let mut request_focus = true;
+        let mut root_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
+        root_input.viewports.insert(child, Default::default());
+        ctx.run_ui(root_input, |ui| {
+            let ctx = &ui.ctx().clone();
+            ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
+            egui::CentralPanel::default().show(ui, |ui| {
+                add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
+                    edit.id(field_id)
+                });
+            });
+        })
+        .drop_without_applying_deltas();
+        let mut root_input = viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![key_event(egui::Key::ArrowLeft)],
+        );
+        root_input.viewports.insert(child, Default::default());
+        ctx.begin_pass(root_input);
+        ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
+        let pass = ctx.cumulative_pass_nr();
+        let events_before = ctx.input(|input| input.events.clone());
+        let contract_before = egui_ime::text_focus_contract_snapshot(&ctx);
+        assert!(ime_input_active_in_viewport(&ctx, child));
+        assert!(!ime_composing_with_pending_events(
+            &ctx,
+            child,
+            &[egui::Event::Ime(egui::ImeEvent::Disabled)]
+        ));
+        assert!(ime_composing_with_pending_events(&ctx, child, &[]));
+        assert!(!ime_input_active_in_viewport(&ctx, egui::ViewportId::ROOT));
+        for viewport in [egui::ViewportId::ROOT, child] {
+            assert_ne!(
+                ctx.data(
+                    |data| data.get_temp::<u64>(text_input_key_diagnostic_started_id(viewport))
+                ),
+                Some(pass)
+            );
+        }
+        assert!(diagnostic_for_pass(&ctx).is_none());
+        assert_eq!(ctx.input(|input| input.events.clone()), events_before);
+        assert_eq!(
+            egui_ime::text_focus_contract_snapshot(&ctx),
+            contract_before
+        );
+        assert!(!ime_input_active(&ctx));
+        assert_eq!(diagnostic_for_pass(&ctx).unwrap().field_id_before, field_id);
+        assert_ne!(
+            ctx.data(|data| data.get_temp::<u64>(text_input_key_diagnostic_started_id(child))),
+            Some(pass)
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+
+        // Stale metadata must not preserve policy once the actual registration
+        // ends. This is a different owner lifetime, not a visibility change.
+        let mut retired_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
+        retired_input.viewports.insert(child, Default::default());
+        ctx.run_ui(retired_input, |_| {})
+            .drop_without_applying_deltas();
+        assert!(!ime_input_active_in_viewport(&ctx, child));
+    }
+
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
+    fn facade_plugin_reregistration_preserves_composition_and_cancellation() {
+        let ctx = test_context();
+        let field_id = egui::Id::unique("facade-plugin-reregister");
+        let mut text = String::new();
+        let mut request_focus = true;
+        for events in [
+            Vec::new(),
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "あ".to_owned(),
+                    active_range_chars: None,
+                }),
+            ],
+        ] {
+            ctx.run_ui(viewport_raw_input(egui::ViewportId::ROOT, events), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
+                        edit.id(field_id)
+                    });
+                });
+            })
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(text, "あ");
+        install_ime_input_policy(&ctx);
+        assert!(ime_composing_with_pending_events(
+            &ctx,
+            egui::ViewportId::ROOT,
+            &[]
+        ));
+        ctx.run_ui(
+            viewport_raw_input(
+                egui::ViewportId::ROOT,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: Some(egui::Key::Escape),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    add_singleline(ui, &mut text, None, |edit| edit.id(field_id));
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(text.is_empty());
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+        assert!(!ime_composing_with_pending_events(
+            &ctx,
+            egui::ViewportId::ROOT,
+            &[]
+        ));
     }
 
     struct RawTextEditExemption {
@@ -1941,30 +1267,6 @@ mod tests {
     }
 
     const RAW_TEXT_EDIT_EXEMPTIONS: &[RawTextEditExemption] = &[
-        RawTextEditExemption {
-            path: "src/ime_focus.rs",
-            line_anchor: "let output = configure(",
-            expected_occurrences: 1,
-            reason: "共有 helper 自身が raw TextEdit を構築する境界",
-        },
-        RawTextEditExemption {
-            path: "src/ime_focus.rs",
-            line_anchor: "let response = ui.add(configure(",
-            expected_occurrences: 1,
-            reason: "共有 helper 自身が raw TextEdit を構築する境界",
-        },
-        RawTextEditExemption {
-            path: "src/ime_focus.rs",
-            line_anchor: "let response = ui.add_sized(size, configure(",
-            expected_occurrences: 1,
-            reason: "共有 helper 自身が raw TextEdit を構築する境界",
-        },
-        RawTextEditExemption {
-            path: "src/ime_focus.rs",
-            line_anchor: "multiline(body).id(field_id)",
-            expected_occurrences: 1,
-            reason: "pass 前 IME plugin を raw 複数行 editor で直接検証する test fixture",
-        },
         RawTextEditExemption {
             path: "src/egui_focus_policy.rs",
             line_anchor: "singleline(first)",
@@ -2042,6 +1344,30 @@ mod tests {
             line_anchor: "multiline(&mut state.textarea)",
             expected_occurrences: 1,
             reason: "時刻付き行の paste と独自 focus lifecycle を持つ複数行 editor",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_presenter/render_core.rs",
+            line_anchor: "singleline(&mut text).id(id)",
+            expected_occurrences: 4,
+            reason: "native_ime_interrupt の2つの低レベル headless fixture。実eguiのcaret移動・focus要求から生成されるIME出力を測り、アプリのfocus復元policyを介在させない",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut text).id(id)",
+            expected_occurrences: 2,
+            reason: "native_ime_interrupt のheadless fixture。実eguiの旧focus ownerが生成する出力をcontrol配送へ渡す",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut String::new()).id(destination)",
+            expected_occurrences: 1,
+            reason: "同じnative_ime_interrupt fixtureのfocus移譲先。実eguiのfocus変更によるinterrupt pulseを直接生成する",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut text).id(destination)",
+            expected_occurrences: 1,
+            reason: "同じnative_ime_interrupt fixtureの配送後pass。実eguiがinterrupt pulseを再発行しないことを直接観測する",
         },
     ];
 

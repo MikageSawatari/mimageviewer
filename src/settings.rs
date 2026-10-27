@@ -890,6 +890,8 @@ pub enum FullscreenOverflowItemId {
     SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
+    PageTurnAnimationToggle,
+    SlideshowSettings,
     ImageAnalysis,
     PixelGrid,
     LoupeLock,
@@ -902,6 +904,8 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
+            Self::PageTurnAnimationToggle,
+            Self::SlideshowSettings,
             Self::ImageAnalysis,
             Self::PixelGrid,
             Self::LoupeLock,
@@ -914,6 +918,8 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
+            Self::PageTurnAnimationToggle => "ページめくりアニメーション",
+            Self::SlideshowSettings => "スライドショー",
             Self::ImageAnalysis => "分析ツール",
             Self::PixelGrid => "ピクセルグリッド",
             Self::LoupeLock => "ルーペ固定",
@@ -1825,6 +1831,10 @@ pub enum ToolbarSectionId {
     SmartFolders,
     Tags,
     Folder,
+    SearchContainer,
+    SearchLocal,
+    SearchMetadata,
+    SearchEverything,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
     /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
@@ -1867,6 +1877,10 @@ impl ToolbarSectionId {
             Self::SmartFolders,
             Self::Tags,
             Self::Folder,
+            Self::SearchContainer,
+            Self::SearchLocal,
+            Self::SearchMetadata,
+            Self::SearchEverything,
         ]
     }
 
@@ -2810,6 +2824,28 @@ impl TextContrast {
         match self {
             Self::Unknown => Self::Standard,
             value => value,
+        }
+    }
+}
+
+/// 通常の一時通知の表示時間。旧設定の項目欠落は Standard に移行する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDuration {
+    Short,
+    #[default]
+    Standard,
+    Long,
+    #[serde(other)]
+    Unknown,
+}
+
+impl NotificationDuration {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "短い",
+            Self::Long => "長い",
+            Self::Standard | Self::Unknown => "標準",
         }
     }
 }
@@ -4361,6 +4397,7 @@ pub(crate) struct FavoriteViewOverlay {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(remote = "Settings")]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
     pub grid_cols: usize,
@@ -4833,6 +4870,14 @@ pub struct Settings {
     /// フォルダバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
+    #[serde(default)]
+    pub show_toolbar_search_container: bool,
+    #[serde(default)]
+    pub show_toolbar_search_local: bool,
+    #[serde(default)]
+    pub show_toolbar_search_metadata: bool,
+    #[serde(default)]
+    pub show_toolbar_search_everything: bool,
     /// ツールバーに「ツリー」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder_tree_button: bool,
@@ -4954,9 +4999,9 @@ pub struct Settings {
     /// 一覧生成前に適用する全体の種類設定。空の除外集合は全表示。
     #[serde(default)]
     pub file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
-    /// 同名の ZIP ファイルとフォルダがある場合、ZIP をスキップする
-    #[serde(default = "default_true")]
-    pub skip_zip_if_folder_exists: bool,
+    /// 同名の実フォルダと本を、本優先・フォルダ優先・両方表示から選ぶ。
+    #[serde(default)]
+    pub same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     /// 同名の ZIP/CBZ がある場合、RAR/7z/LZH 側をスキップする
     #[serde(default = "default_true")]
     pub skip_archive_if_zip_exists: bool,
@@ -5137,12 +5182,21 @@ pub struct Settings {
     /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// 通常フォルダでも未保存のページ構成に既定を使う。連結方式・本扱いは変えない。
+    #[serde(default)]
+    pub apply_default_spread_to_plain_folders: bool,
     /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
     #[serde(default)]
     pub follow_document_reading_direction: bool,
     /// 本ごとの見開き1ページずらしを記憶する。OFFでも保存済み調整は保持する。
     #[serde(default = "default_true")]
     pub remember_spread_shift_per_book: bool,
+    /// 単発のページ送りとスライドショーで紙めくり効果を使う。
+    #[serde(default)]
+    pub page_turn_animation_enabled: bool,
+    /// 動きを評価するための仮の演出時間 (ms)。100..=600 に制限する。
+    #[serde(default = "default_page_turn_animation_duration_ms")]
+    pub page_turn_animation_duration_ms: u32,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -5214,6 +5268,9 @@ pub struct Settings {
     /// Targets whose fixed display becomes automatic only on the current F11 surface.
     #[serde(default)]
     pub fullscreen_chrome_suppression: FullscreenChromeSuppression,
+    /// 手動の前後移動を現在の閲覧順の先頭 / 末尾で折り返す。
+    #[serde(default)]
+    pub fullscreen_manual_nav_wrap: bool,
     /// フルスクリーンで先頭 / 末尾に達したときの案内を表示する。
     #[serde(default = "default_true")]
     pub fullscreen_boundary_notice_visible: bool,
@@ -5357,6 +5414,10 @@ pub struct Settings {
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
+
+    /// 一時通知の全体設定。警告・エラーは短い設定でも標準時間を確保する。
+    #[serde(default)]
+    pub notification_duration: NotificationDuration,
 
     /// OS DPI とは独立したアプリ内 UI 表示倍率 (50%..=200%、10% 刻み)。
     #[serde(default = "default_ui_scale_factor")]
@@ -5899,6 +5960,9 @@ pub struct Settings {
     /// (位置復元マトリクス「音声 × 移動」。既定 = 最初から。誤って別曲へ行って戻っても頭から)
     #[serde(default = "default_resume_from_start")]
     pub music_nav_resume: ResumeMode,
+    /// Pitch-class palette selected from the music HUD.
+    #[serde(default)]
+    pub music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     /// ユーザーが開いた本 / 動画 / 音声を閲覧履歴に記録するか。
     #[serde(default = "default_true")]
     pub reading_history_enabled: bool,
@@ -5947,10 +6011,13 @@ pub struct Settings {
     /// (複数ウィンドウモードでは常にメディア窓なので、このフラグは見ない)。
     #[serde(default)]
     pub fullfeature_media_window: bool,
-    /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画
-    /// top-level window の両方で共有する。
+    /// 旧版の論理配置。物理配置への移行用に読み取り、以後は書き換えない。
     #[serde(default)]
     pub detached_viewer_window_placement: Option<DetachedViewerWindowPlacement>,
+    /// 別ウィンドウビューアの通常時の物理外枠配置。旧値より優先して読み込む。
+    #[serde(default)]
+    pub detached_viewer_window_physical_placement:
+        Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
 
     // ── VST3 プラグイン処理 (v0.9.0+) ──
     //
@@ -5986,6 +6053,9 @@ pub struct Settings {
     /// メイン最小化中も、表示していた音響調整の窓を残す。
     #[serde(default)]
     pub effetune_keep_visible_when_minimized: bool,
+    /// 音響調整の窓を Windows のタスクバーに表示する。確定時に controller へ公開する。
+    #[serde(default = "default_true")]
+    pub effetune_show_in_taskbar: bool,
     /// EffeTune GUI の最後の位置と外枠サイズ。
     #[serde(default)]
     pub effetune_gui_pos: Option<(i32, i32)>,
@@ -6025,6 +6095,10 @@ pub struct Settings {
     /// 新規 (= 過去に保存履歴なし) や旧コードで保存された JSON では None。
     #[serde(default)]
     pub last_seen_version: Option<String>,
+    /// 最後に利用者が「重要な変更点」を閉じた版。起動しただけでは進めない。
+    /// 旧設定の欠落値は load 時に前回起動版 (新規なら現行版) へ移行・保存する。
+    #[serde(default)]
+    pub whats_new_acknowledged_version: Option<String>,
 }
 
 /// VST3 プラグインチェーンの 1 エントリ。
@@ -7385,6 +7459,10 @@ fn default_slideshow_continuous_scroll_percent() -> u32 {
 fn default_spread_page_gap_px() -> u32 {
     4
 }
+
+fn default_page_turn_animation_duration_ms() -> u32 {
+    200
+}
 fn default_continuous_reading_gap_px() -> u32 {
     20
 }
@@ -7659,7 +7737,7 @@ impl Default for Settings {
             thumb_tooltip_show_reading_history_last_read: true,
             thumb_tooltip_show_reading_history_progress: true,
             exif_hidden_tags: default_exif_hidden_tags(),
-            skip_zip_if_folder_exists: true,
+            same_name_folder_book: Default::default(),
             skip_archive_if_zip_exists: true,
             skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
@@ -7685,8 +7763,11 @@ impl Default for Settings {
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
+            apply_default_spread_to_plain_folders: false,
             follow_document_reading_direction: false,
             remember_spread_shift_per_book: true,
+            page_turn_animation_enabled: false,
+            page_turn_animation_duration_ms: default_page_turn_animation_duration_ms(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -7710,6 +7791,7 @@ impl Default for Settings {
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_chrome_suppression: FullscreenChromeSuppression::default(),
+            fullscreen_manual_nav_wrap: false,
             fullscreen_boundary_notice_visible: true,
             fullscreen_processing_status_visible: true,
             fullscreen_prefetch_status_visible: true,
@@ -7750,6 +7832,7 @@ impl Default for Settings {
             ui_theme: UiTheme::default(),
             preferences_restore_position: true,
             text_contrast: TextContrast::default(),
+            notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),
             ui_font: UiFontSettings::default(),
             first_setup_completed: false,
@@ -7762,6 +7845,10 @@ impl Default for Settings {
             folder_tree_sort_order: FolderTreeSortOrder::default(),
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
+            show_toolbar_search_container: false,
+            show_toolbar_search_local: false,
+            show_toolbar_search_metadata: false,
+            show_toolbar_search_everything: false,
             show_toolbar_folder_tree_button: true,
             show_toolbar_effetune: true,
             show_toolbar_bookshelf: true,
@@ -7926,6 +8013,7 @@ impl Default for Settings {
             book_nav_resume: ResumeMode::FromStart,
             music_open_resume: ResumeMode::FromStart,
             music_nav_resume: ResumeMode::FromStart,
+            music_note_color_scheme: Default::default(),
             reading_history_enabled: true,
             reading_history_limit: default_reading_history_limit(),
             video_hw_decode: true,
@@ -7937,6 +8025,7 @@ impl Default for Settings {
             detached_viewer_open_images_in_window: false,
             fullfeature_media_window: false,
             detached_viewer_window_placement: None,
+            detached_viewer_window_physical_placement: None,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
             vst3_plugin_path: None,
@@ -7945,6 +8034,7 @@ impl Default for Settings {
             effetune_pre_limiter_enabled: true,
             effetune_auto_open_on_video: false,
             effetune_keep_visible_when_minimized: false,
+            effetune_show_in_taskbar: true,
             effetune_gui_pos: None,
             effetune_gui_size: None,
             vst3_video_compact: false,
@@ -7953,6 +8043,7 @@ impl Default for Settings {
             audio_normalize_enabled: false,
             audio_normalize_target_lufs_milli: default_audio_normalize_target_lufs_milli(),
             last_seen_version: None,
+            whats_new_acknowledged_version: None,
             // ── 隠蔽加工 (Phase 1) ────────────────────────────
             conceal_type: crate::conceal::ConcealType::default(),
             conceal_mosaic_tile_mode: crate::conceal::TileSizeMode::default(),
@@ -8994,6 +9085,20 @@ impl Settings {
 
     /// 位置復元マトリクス「動画 × 一覧から開く」セル。保存先は互換維持のため既存 bool
     /// `video_grid_open_starts_from_beginning`。FromStart = 先頭から開く。
+    /// Clear only saved media memory. Runtime playback continues to record normally.
+    /// Persistence follows the caller's existing settings-save boundary.
+    pub(crate) fn clear_video_media_memory(&mut self) -> (usize, usize, usize) {
+        let counts = (
+            self.video_resume_positions.len(),
+            self.video_watched_to_end.len(),
+            self.video_audio_track_choices.len(),
+        );
+        self.video_resume_positions.clear();
+        self.video_watched_to_end.clear();
+        self.video_audio_track_choices.clear();
+        counts
+    }
+
     pub fn video_open_resume(&self) -> ResumeMode {
         if self.video_grid_open_starts_from_beginning {
             ResumeMode::FromStart
@@ -9362,6 +9467,15 @@ impl Settings {
                 }
             }
         }
+        let whats_new_acknowledgement_migrated = settings.whats_new_acknowledged_version.is_none();
+        if whats_new_acknowledgement_migrated && db_loaded {
+            settings.whats_new_acknowledged_version = Some(
+                previous_last_seen_version
+                    .as_deref()
+                    .unwrap_or(current_version)
+                    .to_owned(),
+            );
+        }
         if version_marker_changed && db_loaded {
             // Clean install has no previous version to snapshot. Record the current marker through
             // the bootstrap save so later launches can distinguish a real version transition.
@@ -9401,7 +9515,8 @@ impl Settings {
             || toolbar_sort_rating_options_migrated
             || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
-            || version_marker_changed;
+            || version_marker_changed
+            || whats_new_acknowledgement_migrated;
         let bootstrap_saved = if bootstrap_save_needed {
             settings.save_internal_no_rotation()
         } else {
@@ -9817,6 +9932,9 @@ impl Settings {
         self.restore_toolbar_name_filter_after_load();
         self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
         self.text_contrast = self.text_contrast.normalized();
+        if self.notification_duration == NotificationDuration::Unknown {
+            self.notification_duration = NotificationDuration::Standard;
+        }
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
         self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
@@ -9987,6 +10105,7 @@ impl Settings {
                 FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS,
             );
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
+        self.page_turn_animation_duration_ms = self.page_turn_animation_duration_ms.clamp(100, 600);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
         self.fullscreen_fixed_bar_gap_px = self
             .fullscreen_fixed_bar_gap_px
@@ -10221,6 +10340,9 @@ impl Settings {
     /// `src` 側は Vec / String など大きいフィールドは `std::mem::take` で奪うので、
     /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
+        // 通知を閉じる前の環境設定 draft で既読を巻き戻さない。
+        self.whats_new_acknowledged_version
+            .clone_from(&src.whats_new_acknowledged_version);
         // ── グリッド / ツールバー runtime 状態 ──
         self.grid_cols = src.grid_cols;
         self.grid_view_mode = src.grid_view_mode;
@@ -10289,6 +10411,8 @@ impl Settings {
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
         self.ui_scale_factor = src.ui_scale_factor;
+        // Music HUD edits must survive an older preferences snapshot.
+        self.music_note_color_scheme = src.music_note_color_scheme;
         // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
         // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
         // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
@@ -10353,6 +10477,10 @@ impl Settings {
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
+        self.show_toolbar_search_container = src.show_toolbar_search_container;
+        self.show_toolbar_search_local = src.show_toolbar_search_local;
+        self.show_toolbar_search_metadata = src.show_toolbar_search_metadata;
+        self.show_toolbar_search_everything = src.show_toolbar_search_everything;
         self.show_address_bar_history_nav = src.show_address_bar_history_nav;
         self.show_address_bar_quick_folders = src.show_address_bar_quick_folders;
         self.show_toolbar_parent_button = src.show_toolbar_parent_button;
@@ -10413,6 +10541,8 @@ impl Settings {
         self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
+        self.detached_viewer_window_physical_placement =
+            src.detached_viewer_window_physical_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
         // が切り替わっても、古い snapshot の overlay へ巻き戻さない。
         self.favorite_view_overlay = src.favorite_view_overlay.clone();
@@ -10625,6 +10755,60 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_duration_defaults_and_sqlite_roundtrip() {
+        assert_eq!(
+            Settings::default().notification_duration,
+            NotificationDuration::Standard
+        );
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            missing.notification_duration,
+            NotificationDuration::Standard
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        for value in [
+            NotificationDuration::Short,
+            NotificationDuration::Standard,
+            NotificationDuration::Long,
+        ] {
+            let mut settings = Settings::default();
+            settings.notification_duration = value;
+            settings.grid_cols = 9;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().notification_duration,
+                value
+            );
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'notification_duration'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+        assert_eq!(
+            loaded.grid_cols, 9,
+            "old settings survive the additive migration"
+        );
+    }
+
+    #[test]
+    fn notification_duration_unknown_value_is_forward_compatible() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"notification_duration":"future"}"#).unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Unknown);
+        assert_eq!(loaded.notification_duration.label(), "標準");
+        loaded.sanitize();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+    }
+
     #[test]
     fn preferences_restore_position_defaults_on_and_sqlite_roundtrip() {
         assert!(Settings::default().preferences_restore_position);
@@ -10911,6 +11095,39 @@ mod tests {
             stored.image_ext_priority,
             loaded.settings.image_ext_priority
         );
+    }
+
+    #[test]
+    fn music_note_color_defaults_roundtrips_and_survives_preferences_merge() {
+        use crate::music_note_color::MusicNoteColorScheme;
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.music_note_color_scheme, MusicNoteColorScheme::Fifths);
+        assert_eq!(
+            Settings::default().music_note_color_scheme,
+            MusicNoteColorScheme::Fifths
+        );
+        for scheme in [
+            MusicNoteColorScheme::Fifths,
+            MusicNoteColorScheme::Chromatic,
+        ] {
+            let mut live = Settings {
+                music_note_color_scheme: scheme,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+            assert_eq!(restored.music_note_color_scheme, scheme);
+            let mut stale_draft = Settings {
+                music_note_color_scheme: if scheme == MusicNoteColorScheme::Fifths {
+                    MusicNoteColorScheme::Chromatic
+                } else {
+                    MusicNoteColorScheme::Fifths
+                },
+                ..Settings::default()
+            };
+            stale_draft.overwrite_non_preferences_from(&mut live);
+            assert_eq!(stale_draft.music_note_color_scheme, scheme);
+        }
     }
 
     #[test]
@@ -11861,7 +12078,7 @@ mod tests {
         let applied = apply_ui_scale_factor(&ctx, 1.46);
         assert_f32_close(applied, 1.5);
         ctx.begin_pass(egui::RawInput::default());
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
         assert_f32_close(ctx.zoom_factor(), 1.5);
     }
 
@@ -12209,6 +12426,125 @@ mod tests {
     }
 
     #[test]
+    fn whats_new_acknowledgement_migrates_missing_released_field_and_persists_before_dismissal() {
+        for current in ["3.9.0", "3.10.0"] {
+            let env = setup_backup_env();
+            let mut old = Settings::load_with_meta_for_version("3.9.0").settings;
+            old.whats_new_acknowledged_version = None;
+            old.save();
+            // Model a released DB that has no key, rather than just a JSON null value.
+            let conn = rusqlite::Connection::open(env._tmp.path().join("settings.db")).unwrap();
+            conn.execute(
+                "DELETE FROM settings_kv WHERE key = 'whats_new_acknowledged_version'",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            assert_eq!(loaded.settings.last_seen_version.as_deref(), Some(current));
+            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            assert_eq!(
+                stored.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            // No dialog dismissal/save: a second launch must retain the original range even
+            // though the startup/version marker has already advanced. Also covers same-version
+            // migration, where the acknowledgement alone must cause bootstrap writeback.
+            reset_backup_state_for_test();
+            let next = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                next.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            let versions = |previous| {
+                crate::version_highlights::highlights_to_show(
+                    previous,
+                    current,
+                    crate::version_highlights::table(),
+                )
+                .iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                versions(next.settings.whats_new_acknowledged_version.as_deref()),
+                versions(Some("3.9.0"))
+            );
+        }
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_clean_install_is_current_and_has_no_highlights() {
+        let _env = setup_backup_env();
+        let loaded = Settings::load_with_meta_for_version("3.10.0");
+        assert_eq!(loaded.meta.previous_last_seen_version, None);
+        assert_eq!(
+            loaded.settings.whats_new_acknowledged_version.as_deref(),
+            Some("3.10.0")
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.whats_new_acknowledged_version,
+            loaded.settings.whats_new_acknowledged_version
+        );
+        assert!(
+            crate::version_highlights::highlights_to_show(
+                stored.whats_new_acknowledged_version.as_deref(),
+                "3.10.0",
+                crate::version_highlights::table(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_stale_preferences_draft() {
+        let mut live = Settings::default();
+        live.whats_new_acknowledged_version = Some("3.9.0".to_owned());
+        let mut draft = live.clone();
+        live.whats_new_acknowledged_version = Some("3.11.0".to_owned());
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.whats_new_acknowledged_version.as_deref(),
+            Some("3.11.0")
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_undismissed_relaunch_and_skipped_upgrades() {
+        let _env = setup_backup_env();
+        let mut old = Settings::load_with_meta_for_version("3.8.0").settings;
+        old.whats_new_acknowledged_version = Some("3.8.0".to_owned());
+        old.save();
+        for current in ["3.9.0", "3.9.0", "3.10.0"] {
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.8.0")
+            );
+            let versions: Vec<_> = crate::version_highlights::highlights_to_show(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                current,
+                crate::version_highlights::table(),
+            )
+            .iter()
+            .map(|entry| entry.version)
+            .collect();
+            if current == "3.9.0" {
+                assert_eq!(versions, ["3.9.0"]);
+            } else {
+                assert_eq!(versions, ["3.9.0", "3.10.0"]);
+            }
+        }
+    }
+
+    #[test]
     fn grid_selection_upgrade_runs_only_once_after_user_restores_check_mode() {
         let mut settings = Settings::default();
         settings.grid_click_selection_mode = GridClickSelectionMode::Check;
@@ -12333,6 +12669,33 @@ mod tests {
         let mut loaded: Settings = serde_json::from_value(value).unwrap();
         loaded.sanitize();
         assert!(loaded.grid_cursor_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_defaults_off_and_survives_sanitize() {
+        assert!(!Settings::default().fullscreen_manual_nav_wrap);
+        let mut legacy: Settings = serde_json::from_str("{}").unwrap();
+        legacy.sanitize();
+        assert!(!legacy.fullscreen_manual_nav_wrap);
+        let mut enabled: Settings =
+            serde_json::from_str(r#"{"fullscreen_manual_nav_wrap":true}"#).unwrap();
+        enabled.sanitize();
+        assert!(enabled.fullscreen_manual_nav_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_roundtrips_json() {
+        for enabled in [false, true] {
+            let original = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&original).unwrap();
+            assert_eq!(value["fullscreen_manual_nav_wrap"], enabled);
+            let mut loaded: Settings = serde_json::from_value(value).unwrap();
+            loaded.sanitize();
+            assert_eq!(loaded.fullscreen_manual_nav_wrap, enabled);
+        }
     }
 
     #[test]
@@ -14505,6 +14868,24 @@ mod tests {
     }
 
     #[test]
+    fn effetune_taskbar_default_missing_and_false_roundtrip() {
+        assert!(Settings::default().effetune_show_in_taskbar);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.effetune_show_in_taskbar);
+        let configured = Settings {
+            effetune_show_in_taskbar: false,
+            ..missing
+        };
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert!(!restored.effetune_show_in_taskbar);
+
+        let mut draft = configured;
+        draft.overwrite_non_preferences_from(&mut Settings::default());
+        assert!(!draft.effetune_show_in_taskbar);
+    }
+
+    #[test]
     fn effetune_runtime_window_rect_survives_preference_apply() {
         let mut edited = Settings::default();
         let mut live = Settings::default();
@@ -14516,6 +14897,88 @@ mod tests {
         assert!(edited.show_toolbar_effetune);
         assert_eq!(edited.effetune_gui_pos, Some((120, 240)));
         assert_eq!(edited.effetune_gui_size, Some((900, 700)));
+    }
+
+    #[test]
+    fn detached_physical_placement_preserves_legacy_only_settings() {
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: true,
+        };
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("detached_viewer_window_physical_placement");
+        stored["detached_viewer_window_placement"] = serde_json::to_value(legacy).unwrap();
+
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(loaded.detached_viewer_window_physical_placement, None);
+    }
+
+    #[test]
+    fn detached_physical_placement_roundtrips_without_changing_legacy_value() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: -1920,
+                top: -200,
+                right: -720,
+                bottom: 700,
+            },
+            maximized: true,
+        };
+        let settings = Settings {
+            detached_viewer_window_placement: Some(legacy),
+            detached_viewer_window_physical_placement: Some(physical),
+            ..Settings::default()
+        };
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(
+            loaded.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+    }
+
+    #[test]
+    fn detached_physical_placement_live_copy_keeps_latest_physical_rect() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let mut draft = Settings::default();
+        let mut live = Settings::default();
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: 6000,
+                top: 2270,
+                right: 6960,
+                bottom: 2990,
+            },
+            maximized: false,
+        };
+        live.detached_viewer_window_physical_placement = Some(physical);
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+
+        live.detached_viewer_window_physical_placement = None;
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(draft.detached_viewer_window_physical_placement, None);
     }
 
     #[test]
@@ -14682,6 +15145,79 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(disabled).unwrap()).unwrap();
         assert!(!restored.remember_spread_shift_per_book);
+    }
+
+    #[test]
+    fn page_turn_animation_defaults_off_and_preserves_explicit_values() {
+        for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
+            assert!(!settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, 200);
+        }
+        let settings: Settings = serde_json::from_str(
+            r#"{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":350}"#,
+        )
+        .unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.page_turn_animation_enabled);
+        assert_eq!(restored.page_turn_animation_duration_ms, 350);
+        let snapshot = restored.preferences_snapshot();
+        assert!(snapshot.page_turn_animation_enabled);
+        assert_eq!(snapshot.page_turn_animation_duration_ms, 350);
+    }
+
+    #[test]
+    fn removed_single_page_turn_spine_is_ignored_and_not_saved() {
+        for legacy_value in [
+            serde_json::json!("OwnPage"),
+            serde_json::json!("Moving"),
+            serde_json::json!("FutureMode"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "page_turn_animation_enabled": true,
+                "page_turn_animation_duration_ms": 350,
+                "page_turn_single_spine": legacy_value,
+            }))
+            .unwrap();
+            assert!(settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, 350);
+            assert!(
+                serde_json::to_value(&settings)
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_value(settings.preferences_snapshot())
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn page_turn_animation_duration_sanitizes_to_provisional_range() {
+        for (input, expected) in [
+            (0, 100),
+            (99, 100),
+            (100, 100),
+            (350, 350),
+            (600, 600),
+            (601, 600),
+            (u32::MAX, 600),
+        ] {
+            let mut settings = Settings {
+                page_turn_animation_enabled: true,
+                page_turn_animation_duration_ms: input,
+                ..Settings::default()
+            };
+            settings.sanitize();
+            assert!(settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, expected);
+        }
     }
 
     #[test]
@@ -16995,7 +17531,10 @@ mod tests {
         assert!(!old.toolbar_folder_section_migrated);
         assert!(old.migrate_toolbar_folder_section());
         assert_eq!(&old.toolbar_section_order[..2], &[TS::Tags, TS::Cols]);
-        assert_eq!(old.toolbar_section_order.last(), Some(&TS::Folder));
+        assert_eq!(
+            old.toolbar_section_order.last(),
+            Some(&TS::SearchEverything)
+        );
         assert_eq!(
             old.toolbar_section_order
                 .iter()
@@ -17114,7 +17653,7 @@ mod tests {
         );
         assert_eq!(
             loaded.settings.toolbar_section_order.last(),
-            Some(&ToolbarSectionId::Folder)
+            Some(&ToolbarSectionId::SearchEverything)
         );
         assert_eq!(
             loaded.settings.toolbar_section_new_row,
@@ -19329,5 +19868,70 @@ impl Settings {
             indexer_speed_profile: self.indexer_speed_profile,
             ..Self::default()
         }
+    }
+}
+
+impl serde::Serialize for Settings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Settings::serialize(self, serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        if let Some(map) = value.as_object_mut() {
+            crate::same_name_folder_book::canonicalize(map).map_err(serde::de::Error::custom)?;
+        }
+        Settings::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod pinned_search_settings_tests {
+    use super::*;
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+    #[test]
+    fn section1409_settings_default_roundtrip_unknown_and_live_carry() {
+        let defaults = Settings::default();
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        for settings in [&defaults, &missing] {
+            assert!(Kind::ALL.into_iter().all(|kind| !kind.pinned(settings)));
+            assert!(
+                Kind::ALL
+                    .into_iter()
+                    .all(|kind| !settings.toolbar_section_new_row.contains(&kind.section()))
+            );
+        }
+        let order = ToolbarSectionId::default_order();
+        let folder = order
+            .iter()
+            .position(|id| *id == ToolbarSectionId::Folder)
+            .unwrap();
+        assert_eq!(&order[folder + 1..], &Kind::ALL.map(Kind::section));
+        let mut live = Settings::default();
+        live.show_toolbar_search_local = true;
+        live.show_toolbar_search_everything = true;
+        live.toolbar_section_order = Kind::ALL.map(Kind::section).into_iter().rev().collect();
+        live.toolbar_section_new_row = vec![ToolbarSectionId::SearchEverything];
+        let mut edited = defaults.preferences_snapshot();
+        edited.overwrite_non_preferences_from(&mut live);
+        let value = serde_json::to_value(&edited).unwrap();
+        let loaded: Settings = serde_json::from_value(value).unwrap();
+        assert!(loaded.show_toolbar_search_local && loaded.show_toolbar_search_everything);
+        assert!(!loaded.show_toolbar_search_container && !loaded.show_toolbar_search_metadata);
+        let future: Vec<ToolbarSectionId> = serde_json::from_str(
+            r#"["SearchLocal", "FutureSearch", "SearchEverything", "SearchLocal"]"#,
+        )
+        .unwrap();
+        assert_eq!(future[1], ToolbarSectionId::Unknown);
+        let complete = ToolbarSectionId::ordered_with_fallback(&future);
+        assert_eq!(
+            &complete[..2],
+            &[
+                ToolbarSectionId::SearchLocal,
+                ToolbarSectionId::SearchEverything
+            ]
+        );
+        assert_eq!(complete.len(), order.len());
     }
 }

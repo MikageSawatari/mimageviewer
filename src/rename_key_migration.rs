@@ -1,4 +1,4 @@
-//! リネーム時の path-keyed 永続データ移行 (rename transaction)。
+//! 改名・本の構造操作・削除で共有する path-keyed 永続データ移行。
 //!
 //! アプリ内リネーム (`ui_dialogs/rename_item.rs`) の成功後に、旧 path をキーにした
 //! ユーザーデータ (★ / タグ / 回転 / 補正 / マスク / 隠蔽 / ローカル調整 / テキスト注釈 /
@@ -6,6 +6,7 @@
 //! 閲覧履歴 / 編集プレビュー / PDF パスワード / 動画 .xmp サイドカー) を新 path キーへ引き継ぐ
 //! (docs/next-release-backlog.md §1.8 の段階 1+2、review-v2.3.0 角度④ (C))。
 //!
+//! ## 汎用改名
 //! 方式は [`crate::zip_key_migration`] と同じ:
 //! - **data_dir の DB ファイルを直接開いて移行する** (App の型付きハンドルを使わない)。
 //!   busy_timeout 付きなので本体側の接続と共存できる。
@@ -19,21 +20,41 @@
 //!   既に行がある (= リネーム後に先へ操作した) 場合は新データを優先して旧行を捨てる。
 //! - **exact + prefix の 3 面**: リネーム対象そのもの (`old` = `new`)、フォルダ配下
 //!   (`old/…` → `new/…`)、アーカイブ内エントリ / PDF ページ (`old::…` → `new::…`、
-//!   `adjustment_db::zip_entry_key` 形式)。prefix 照合は LIKE ではなく `substr` 等値
+//!   `adjustment_db::zip_entry_key` 形式)。prefix 照合は LIKE ではなく BINARY index range
 //!   (path に `%` / `_` が含まれても誤爆しない)。
+//!
+//! ## 本の構造操作
+//! `books` worker は FS 確定後、[`acquire_store_maintenance`] で両端の EPUB 範囲と
+//! shift/composition の保守 lease を取り、[`migrate_book_paths_at`] を一度呼ぶ。
+//! App は受理済み producer の完了・後続保存を FS 前に静止させ、結果採用まで新規入力を止める。
+//! - 対象と所有者は [`STORES`] の `book_policy` 一列で決める。`Follow` は本 worker、
+//!   編集プレビューはそのモジュール、shift/composition は既存 service FIFO が移行する。
+//!   bookmark journal と collection actor は従来の専用経路を使う。
+//! - 本の操作は **移行元優先**。全旧キーを一時キーへ退避し、移行先の 3 面を削除して戻す。
+//!   移行元に行が無ければ移行先も空にする。1 descriptor の値更新・移動・コピーは一つの
+//!   transaction 内で行い、コピーは移動後のキーを読む。汎用改名・内容同一性復元の先勝は変えない。
+//! - コピーは同じ表の `copies_with_book_page` に従い、従来の編集・★・タグの 8 種だけを写す。
+//!   写さないストアもコピー先を初期化する。本単位キーはページ mapping には一致しない。
+//! - resume の Image identity、pin の相対画像参照、ratings の source_path も更新する。
+//!   別本へ移した画像を指す pin は外す。preview はキーだけでなく所有ファイルの hash 配置も移す。
+//! - FS 確定後のストア失敗は結果へ集計してログ・通知へ返す。ストア完了印や再実行 journal は足さない。
+//!   本削除は既存の guarded purge と同じ [`STORES`] を使う。
+//! 詳細と検証状況は `docs/book-key-migration-plan.md` §8 を参照。
 //!
 //! ## 対象外 (許容する制限)
 //! - **フォルダ改名時の配下 PDF パスワード**: キーが SHA-256 ハッシュのため列挙不可。
 //!   単一 PDF の改名だけ平文を読み直して付け替える。
 //! - **閲覧履歴の配下 prefix**: 履歴は自己修復する (次に開いたとき新キーで upsert)
 //!   ため exact のみ移行し、title も次回オープンで更新されるのに任せる。
-//! - **代表サムネピンの親フォルダ側 `source_rel`**: 親ピンが改名した子を container 相対
+//! - **汎用改名の代表サムネピンの親フォルダ側 `source_rel`**: 親ピンが改名した子を container 相対
 //!   パスで指しているケース。大文字小文字を保った照合が SQL では難しく、壊れても
 //!   自動サムネへのフォールバック + 1 操作で付け直せるため見送り。
 //! - **通常のサムネイルカタログ / 検索索引 / 変換アーカイブ対応表など rebuildable なキャッシュ**:
 //!   再生成に任せる (フォルダ改名直後はサムネが再生成される)。通常サムネイルは mtime / size
 //!   を含む catalog identity なので移行しない。一方、フルスクリーン編集経路だけが生成できる
 //!   `edit_preview_cache.db/edit_previews.item_key` は再生成可能な通常キャッシュではないため移行する。
+//! - **汎用改名の編集プレビューのファイル配置**: 現行の汎用改名は item_key のみを移す。
+//!   cached_path/layer path の hash ディレクトリ追従は本操作の専用経路だけで、汎用改名の修正は別件。
 //! - **エクスプローラー等アプリ外でのリネーム**: このモジュールはアプリ内リネームの
 //!   成功ハンドラからしか呼ばれない (外部リネームの検知は将来課題)。
 
@@ -221,12 +242,14 @@ pub struct RenameMigrationReport {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreMutationEffects {
     content_identity_index_stale: bool,
+    book_composition_changed: bool,
 }
 
 impl StoreMutationEffects {
     pub(crate) fn for_content_identity_index_stale() -> Self {
         Self {
             content_identity_index_stale: true,
+            book_composition_changed: false,
         }
     }
 
@@ -239,8 +262,18 @@ impl StoreMutationEffects {
         }
     }
 
+    pub(crate) fn record_rows_changed(&mut self, descriptor: &StoreDescriptor, rows: usize) {
+        self.record_completed(descriptor);
+        self.book_composition_changed |= descriptor.file == "book_composition.db" && rows > 0;
+    }
+
+    pub(crate) fn book_composition_changed(self) -> bool {
+        self.book_composition_changed
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         self.content_identity_index_stale |= other.content_identity_index_stale;
+        self.book_composition_changed |= other.book_composition_changed;
     }
 
     pub(crate) fn content_identity_index_stale(self) -> bool {
@@ -872,6 +905,20 @@ fn restore_family_prefix(root: &str, family: StoreRestoreFamily) -> String {
 /// purge は全行を素の `DELETE` にする。
 /// `rename_generic=false` は raw `path` 列も同時更新する閲覧履歴だけで、rename 側は専用処理を
 /// 使うが purge 側は同じ記述子を使う。
+/// Collision rule selected by the operation owner, shared with service-owned stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathMigrationCollision {
+    DestinationWins,
+    SourceWins,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BookStorePolicy {
+    Follow,
+    OwnedByEditPreview,
+    ServiceOwned,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StoreDescriptor {
     pub(crate) file: &'static str,
@@ -880,18 +927,23 @@ pub(crate) struct StoreDescriptor {
     pub(crate) unique: bool,
     pub(crate) normalization: StoreKeyNormalization,
     pub(crate) rename_generic: bool,
+    pub(crate) book_policy: BookStorePolicy,
+    pub(crate) copies_with_book_page: bool,
     pub(crate) restore_family: StoreRestoreFamily,
     table_availability: StoreTableAvailability,
 }
 
 impl StoreDescriptor {
+    pub(crate) fn optional_legacy_table(self) -> bool {
+        self.table_availability == StoreTableAvailability::OptionalInLegacySchema
+    }
     const fn logical_book_family(mut self) -> Self {
         self.restore_family = StoreRestoreFamily::LogicalBookFamily;
         self
     }
     /// このストア自身が宣言する規則で物理 path を永続キーへ正規化する。
     /// copy / rename / purge の呼び出し側がキー方式を推測しないための単一境界。
-    fn normalize_path(self, path: &Path) -> String {
+    pub(crate) fn normalize_path(self, path: &Path) -> String {
         match self.normalization {
             StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
             StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),
@@ -905,6 +957,8 @@ const fn store(
     column: &'static str,
     unique: bool,
     normalization: StoreKeyNormalization,
+    book_policy: BookStorePolicy,
+    copies_with_book_page: bool,
 ) -> StoreDescriptor {
     StoreDescriptor {
         file,
@@ -913,6 +967,8 @@ const fn store(
         unique,
         normalization,
         rename_generic: true,
+        book_policy,
+        copies_with_book_page,
         restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::Required,
     }
@@ -924,6 +980,8 @@ const fn optional_legacy_store(
     column: &'static str,
     unique: bool,
     normalization: StoreKeyNormalization,
+    book_policy: BookStorePolicy,
+    copies_with_book_page: bool,
 ) -> StoreDescriptor {
     StoreDescriptor {
         file,
@@ -932,6 +990,8 @@ const fn optional_legacy_store(
         unique,
         normalization,
         rename_generic: true,
+        book_policy,
+        copies_with_book_page,
         restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::OptionalInLegacySchema,
     }
@@ -943,12 +1003,24 @@ const fn optional_legacy_store(
 /// hard purge も走査するため、rename と purge の対象が将来ずれない。PDF パスワードだけは
 /// JSON の SHA-256 キーなので、この表と並ぶ専用処理を両経路が共有する。
 pub(crate) const STORES: &[StoreDescriptor] = &[
+    store(
+        "book_composition.db",
+        "book_compositions",
+        "book_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::ServiceOwned,
+        false,
+    )
+    .logical_book_family(),
     optional_legacy_store(
         "spread_shift.db",
         "spread_shifts",
         "path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::ServiceOwned,
+        false,
     )
     .logical_book_family(),
     // Added after the original settings schema; an unopened legacy DB has no watched table yet.
@@ -958,6 +1030,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path_normalized",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "rating.db",
@@ -965,6 +1039,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "content_identity.db",
@@ -972,6 +1048,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "file_key",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "adjustment.db",
@@ -979,6 +1057,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "page_path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "adjustment.db",
@@ -986,6 +1066,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "folder_key",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "mask.db",
@@ -993,6 +1075,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "conceal.db",
@@ -1000,6 +1084,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "page_path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "local_adjust.db",
@@ -1007,6 +1093,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "page_path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "comic.db",
@@ -1014,6 +1102,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "page_path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "export_crop.db",
@@ -1021,6 +1111,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "page_path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "edit_preview_cache.db",
@@ -1028,6 +1120,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "item_key",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::OwnedByEditPreview,
+        false,
     ),
     store(
         "tags.db",
@@ -1035,6 +1129,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "item_key",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "tags.db",
@@ -1042,6 +1138,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "item_key",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
     ),
     store(
         "tags.db",
@@ -1049,6 +1147,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "folder_key",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "rotation.db",
@@ -1056,6 +1156,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "view_trim.db",
@@ -1063,6 +1165,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "page_path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "video_pins.db",
@@ -1070,6 +1174,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     // id が PK で path は非一意 (1 ファイル複数ブックマーク)。
     store(
@@ -1078,6 +1184,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         false,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "folder_thumb_pins.db",
@@ -1085,6 +1193,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "container_key",
         true,
         StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "book_resume.db",
@@ -1092,6 +1202,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::DriveStripped,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "spread.db",
@@ -1099,6 +1211,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::DriveStripped,
+        BookStorePolicy::Follow,
+        false,
     ),
     optional_legacy_store(
         "spread.db",
@@ -1106,6 +1220,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::DriveStripped,
+        BookStorePolicy::Follow,
+        false,
     ),
     optional_legacy_store(
         "spread.db",
@@ -1113,6 +1229,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::DriveStripped,
+        BookStorePolicy::Follow,
+        false,
     ),
     optional_legacy_store(
         "spread.db",
@@ -1120,6 +1238,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::DriveStripped,
+        BookStorePolicy::Follow,
+        false,
     ),
     optional_legacy_store(
         "spread.db",
@@ -1127,6 +1247,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "path",
         true,
         StoreKeyNormalization::DriveStripped,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "view_trim.db",
@@ -1134,6 +1256,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "book_key",
         true,
         StoreKeyNormalization::DriveStripped,
+        BookStorePolicy::Follow,
+        false,
     ),
     StoreDescriptor {
         file: "reading_history.db",
@@ -1142,6 +1266,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         unique: true,
         normalization: StoreKeyNormalization::KeepDrive,
         rename_generic: false,
+        book_policy: BookStorePolicy::Follow,
+        copies_with_book_page: false,
         restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::Required,
     },
@@ -1188,6 +1314,7 @@ pub(crate) struct StoreCopyReport {
     /// Only rows from successfully committed pin-store transactions.
     pub(crate) committed_thumbnail_pins: usize,
     pub(crate) database_opens: usize,
+    pub(crate) store_mutations: StoreMutationEffects,
     pub(crate) errors: Vec<String>,
 }
 
@@ -1312,7 +1439,7 @@ fn copy_stores_acquire_maintenance(
     let maintenance = match acquire_store_maintenance(data_dir, &coverage) {
         Ok(lease) => lease,
         Err(error) => {
-            report.errors.push(format!("spread_shift: {error}"));
+            report.errors.push(format!("store maintenance: {error}"));
             return report;
         }
     };
@@ -1483,6 +1610,10 @@ fn store_keys_with_rows(
     if descriptor.file == "spread_shift.db" {
         crate::spread_shift::validate_database_rows(&conn)?;
     }
+    if descriptor.file == "book_composition.db" {
+        crate::book_composition::validate_database_schema(&conn)?;
+        crate::book_composition::validate_database_rows(&conn)?;
+    }
     // Copy and probe use the same delimiter and BINARY half-open range, without LIKE.
     let sql = format!(
         "SELECT 1 FROM {table} WHERE {column} = ?1 OR ({column} >= ?2 AND {column} < ?3) LIMIT 1",
@@ -1526,6 +1657,9 @@ fn open_store_for_write(
             if present {
                 crate::spread_shift::validate_database_rows(&conn)?;
             }
+        }
+        if descriptor.file == "book_composition.db" {
+            crate::book_composition::validate_database_rows(&conn)?;
         }
         Ok(conn)
     }
@@ -1574,7 +1708,7 @@ fn run_at_with_epub_acquisition(
     let maintenance = match acquire_store_maintenance_with_epub(data_dir, acquire_epub) {
         Ok(lease) => lease,
         Err(error) => {
-            report.errors.push(format!("spread_shift: {error}"));
+            report.errors.push(format!("store maintenance: {error}"));
             return report;
         }
     };
@@ -1627,6 +1761,18 @@ fn run_at_with_epub_acquisition(
     // また missing 行を保持する仕様上、STORES と共有される delete hard purge の対象にも
     // してはならない。専用 transaction で case-only rename も含めて追従させる。
     migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
+    match crate::book_composition::migrate_page_paths_at(
+        data_dir,
+        &[(old_path.to_path_buf(), new_path.to_path_buf())],
+    ) {
+        Ok(rows) => {
+            report.rows += rows;
+            report.store_mutations.book_composition_changed |= rows > 0;
+        }
+        Err(error) => report
+            .errors
+            .push(format!("book_composition pages: {error}")),
+    }
     match crate::spread_shift::migrate_page_paths_at(
         data_dir,
         &[(old_path.to_path_buf(), new_path.to_path_buf())],
@@ -1645,6 +1791,300 @@ fn run_at_with_epub_acquisition(
     }
 
     report
+}
+
+/// Book workers call this after their filesystem commit, while all producers are quiescent.
+/// Moves are simultaneous; copies read the resulting (committed-name) keys after the moves.
+/// Each descriptor commits once. Service-owned stores keep their FIFO owner; no journal/retry
+/// is added here because replaying a permutation would move data to a different image.
+pub(crate) fn migrate_book_paths_at(
+    data_dir: &Path,
+    moves: &[(PathBuf, PathBuf)],
+    copies: &[(PathBuf, PathBuf)],
+    guard: &StoreMaintenanceLease,
+) -> RenameMigrationReport {
+    let mut report = RenameMigrationReport {
+        rows: 0,
+        errors: Vec::new(),
+        store_mutations: StoreMutationEffects::default(),
+        panicked: false,
+    };
+    for (old, new) in moves.iter().chain(copies) {
+        guard.maintenance.invalidate_root_family(old);
+        guard.maintenance.invalidate_root_family(new);
+    }
+    for descriptor in STORES {
+        if descriptor.book_policy == BookStorePolicy::ServiceOwned {
+            continue;
+        }
+        let db_path = data_dir.join(descriptor.file);
+        if !db_path.exists() {
+            continue;
+        }
+        let normalized = |pairs: &[(PathBuf, PathBuf)]| {
+            pairs
+                .iter()
+                .map(|(old, new)| {
+                    (
+                        descriptor.normalize_path(old),
+                        descriptor.normalize_path(new),
+                    )
+                })
+                .filter(|(old, new)| old != new)
+                .collect::<Vec<_>>()
+        };
+        let store_moves = if descriptor.rename_generic {
+            normalized(moves)
+        } else {
+            normalized(
+                &moves
+                    .iter()
+                    .filter(|(_, new)| new.is_dir())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let store_copies = if descriptor.rename_generic {
+            normalized(copies)
+        } else {
+            Vec::new()
+        };
+        let result = if descriptor.book_policy == BookStorePolicy::OwnedByEditPreview {
+            crate::edit_preview_cache::migrate_book_paths_at(data_dir, &store_moves, &store_copies)
+        } else {
+            migrate_book_store(&db_path, descriptor, &store_moves, &store_copies, moves)
+        };
+        match result {
+            Ok(rows) => {
+                report.rows += rows;
+                report.store_mutations.record_rows_changed(descriptor, rows);
+            }
+            Err(error) => report.errors.push(format!(
+                "{}: {}.{}: {error}",
+                descriptor.file, descriptor.table, descriptor.column
+            )),
+        }
+    }
+    report
+}
+
+static BOOK_MIGRATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn book_migration_temporary_key(index: usize) -> String {
+    let serial = BOOK_MIGRATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "__miv_book_migration_{}_{}_{}",
+        std::process::id(),
+        serial,
+        index
+    )
+}
+
+/// Rewrite once against the original mappings, including both descendant faces.
+pub(crate) fn rewrite_book_key(key: &str, mappings: &[(String, String)]) -> Option<String> {
+    mappings.iter().find_map(|(old, new)| {
+        if key == old {
+            return Some(new.clone());
+        }
+        let suffix = key.strip_prefix(old)?;
+        (suffix.starts_with('/') || suffix.starts_with("::")).then(|| format!("{new}{suffix}"))
+    })
+}
+
+fn migrate_book_store(
+    db_path: &Path,
+    descriptor: &StoreDescriptor,
+    moves: &[(String, String)],
+    copies: &[(String, String)],
+    raw_moves: &[(PathBuf, PathBuf)],
+) -> Result<usize, String> {
+    let mut conn = open_store_for_write(db_path, descriptor)?;
+    let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let _rating_write =
+        (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+    let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let action = || -> rusqlite::Result<usize> {
+        let columns = table_columns(&tx, descriptor.table)?;
+        if columns.is_empty() && descriptor.optional_legacy_table() {
+            return Ok(0);
+        }
+        if !columns.iter().any(|column| column == descriptor.column) {
+            return Err(rusqlite::Error::InvalidColumnName(descriptor.column.into()));
+        }
+        let mut changed = rewrite_book_store_values(&tx, descriptor, &columns, raw_moves)?;
+        let temporary = moves
+            .iter()
+            .enumerate()
+            .map(|(index, _)| book_migration_temporary_key(index))
+            .collect::<Vec<_>>();
+        // Evacuate every source before replacing any destination (A <-> B included).
+        for ((old, _), temp) in moves.iter().zip(&temporary) {
+            if descriptor.rename_generic {
+                changed += migrate_store_family(
+                    &tx,
+                    descriptor,
+                    old,
+                    temp,
+                    PathMigrationCollision::SourceWins,
+                )?;
+            } else {
+                changed += move_exact_with_collision(
+                    &tx,
+                    descriptor.table,
+                    descriptor.column,
+                    descriptor.unique,
+                    old,
+                    temp,
+                    PathMigrationCollision::SourceWins,
+                )?;
+            }
+        }
+        for ((_, new), temp) in moves.iter().zip(&temporary) {
+            if descriptor.rename_generic {
+                changed += migrate_store_family(
+                    &tx,
+                    descriptor,
+                    temp,
+                    new,
+                    PathMigrationCollision::SourceWins,
+                )?;
+            } else {
+                changed += move_exact_with_collision(
+                    &tx,
+                    descriptor.table,
+                    descriptor.column,
+                    descriptor.unique,
+                    temp,
+                    new,
+                    PathMigrationCollision::SourceWins,
+                )?;
+            }
+        }
+        for (old, new) in copies {
+            changed += delete_store_family(&tx, descriptor.table, descriptor.column, new)?;
+            if descriptor.copies_with_book_page {
+                changed +=
+                    copy_exact(&tx, descriptor.table, descriptor.column, &columns, old, new)?;
+                for delimiter in ["/", "::"] {
+                    changed += copy_prefix(
+                        &tx,
+                        descriptor.table,
+                        descriptor.column,
+                        &columns,
+                        &format!("{old}{delimiter}"),
+                        &format!("{new}{delimiter}"),
+                    )?
+                    .rows;
+                }
+            }
+        }
+        // Derived values must be updated after the temporary keys have disappeared.
+        if descriptor.table == "ratings" {
+            for (_, new) in moves.iter().chain(copies) {
+                tx.execute(
+                    &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
+                    [new],
+                )?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new}/"))?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new}::"))?;
+            }
+        }
+        if !descriptor.rename_generic {
+            for (_, new) in raw_moves.iter().filter(|(_, new)| new.is_dir()) {
+                tx.execute(
+                    "UPDATE reading_history SET path = ?1 WHERE key = ?2",
+                    rusqlite::params![new.to_string_lossy(), descriptor.normalize_path(new)],
+                )?;
+            }
+        }
+        Ok(changed)
+    };
+    let changed = action().map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+fn rewrite_book_store_values(
+    tx: &rusqlite::Transaction<'_>,
+    descriptor: &StoreDescriptor,
+    columns: &[String],
+    moves: &[(PathBuf, PathBuf)],
+) -> rusqlite::Result<usize> {
+    let mappings = moves
+        .iter()
+        .map(|(old, new)| {
+            (
+                crate::adjustment_db::normalize_path(old),
+                crate::adjustment_db::normalize_path(new),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut changed = 0;
+    if descriptor.table == "book_resume" && columns.iter().any(|c| c == "page_identity") {
+        let rows = {
+            let mut statement = tx.prepare(
+                "SELECT path, page_identity FROM book_resume WHERE page_identity IS NOT NULL",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (key, json) in rows {
+            if let Ok(crate::book_resume_db::PageIdentity::Image { path }) =
+                serde_json::from_str(&json)
+                && let Some(path) = rewrite_book_key(&path, &mappings)
+            {
+                let json =
+                    serde_json::to_string(&crate::book_resume_db::PageIdentity::Image { path })
+                        .expect("serializable image identity");
+                // Updating page even to itself would clear identity through the legacy trigger.
+                changed += tx.execute(
+                    "UPDATE book_resume SET page_identity = ?1 WHERE path = ?2",
+                    rusqlite::params![json, key],
+                )?;
+            }
+        }
+    }
+    if descriptor.table == "folder_thumb_pins" && columns.iter().any(|c| c == "source_rel") {
+        let rows = {
+            let mut statement =
+                tx.prepare("SELECT container_key, source_rel FROM folder_thumb_pins")?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (container, relative) in rows {
+            if relative.is_empty() {
+                continue;
+            }
+            let absolute =
+                crate::adjustment_db::normalize_path(&Path::new(&container).join(&relative));
+            let Some(destination) = rewrite_book_key(&absolute, &mappings) else {
+                continue;
+            };
+            let new_container =
+                rewrite_book_key(&container, &mappings).unwrap_or_else(|| container.clone());
+            if let Some(relative) = destination.strip_prefix(&format!("{new_container}/")) {
+                changed += tx.execute(
+                    "UPDATE folder_thumb_pins SET source_rel = ?1 WHERE container_key = ?2",
+                    rusqlite::params![relative, container],
+                )?;
+            } else {
+                changed += tx.execute(
+                    "DELETE FROM folder_thumb_pins WHERE container_key = ?1",
+                    [container],
+                )?;
+            }
+        }
+    }
+    Ok(changed)
 }
 
 fn migrate_book_bookmarks(
@@ -1711,9 +2151,11 @@ pub(crate) fn purge_removed_paths_guarded_at(
     purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
 }
 
-/// All maintenance takes EPUB protection before shift. Release shift first so
-/// its writer reload finishes while ledger/pin protection still belongs to us.
+/// Maintenance takes EPUB protection, shift, then composition. Reload the
+/// composition snapshot before releasing shift and the ledger/pin coverage.
 pub(crate) struct StoreMaintenanceLease {
+    // Fields drop in declaration order: reload composition before shift/EPUB release.
+    _composition: crate::book_composition::BookCompositionMaintenanceLease,
     maintenance: crate::spread_shift::SpreadShiftMaintenanceLease,
     epub: crate::pdf_loader::EpubRangeLease,
 }
@@ -1735,7 +2177,12 @@ fn acquire_store_maintenance_with_epub(
 ) -> Result<StoreMaintenanceLease, String> {
     let epub = acquire_epub();
     let maintenance = crate::spread_shift::maintenance_at(data_dir)?;
-    Ok(StoreMaintenanceLease { maintenance, epub })
+    let composition = crate::book_composition::maintenance_at(data_dir)?;
+    Ok(StoreMaintenanceLease {
+        _composition: composition,
+        maintenance,
+        epub,
+    })
 }
 
 /// Acquire EPUB coverage then shift, once before Shell. Borrow the same owner
@@ -1795,7 +2242,7 @@ fn purge_removed_scopes_acquire_maintenance(
     let maintenance = match acquire_delete_epub_guard(data_dir, scopes) {
         Ok(lease) => lease,
         Err(error) => {
-            report.errors.push(format!("spread_shift: {error}"));
+            report.errors.push(format!("store maintenance: {error}"));
             return report;
         }
     };
@@ -2080,7 +2527,7 @@ fn purge_store_with_before_sql(
     match result {
         Ok(rows) => {
             report.rows += rows;
-            report.store_mutations.record_completed(descriptor);
+            report.store_mutations.record_rows_changed(descriptor, rows);
         }
         Err(error) => report.errors.push(format!(
             "{}: {}.{}: {error}",
@@ -2145,30 +2592,12 @@ fn migrate_store(
         if !columns.iter().any(|column| column == descriptor.column) {
             return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into());
         }
-        let mut changed = 0usize;
-        changed += move_exact(
+        let changed = migrate_store_family(
             &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
+            descriptor,
             old_key,
             new_key,
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}/"),
-            &format!("{new_key}/"),
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}::"),
-            &format!("{new_key}::"),
+            PathMigrationCollision::DestinationWins,
         )?;
         // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
         // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
@@ -2188,7 +2617,7 @@ fn migrate_store(
     match result {
         Ok(n) => {
             report.rows += n;
-            report.store_mutations.record_completed(descriptor);
+            report.store_mutations.record_rows_changed(descriptor, n);
         }
         Err(e) => report.errors.push(format!(
             "{}: {}.{}: {e}",
@@ -2197,6 +2626,77 @@ fn migrate_store(
             descriptor.column,
         )),
     }
+}
+
+/// Shared three-face SQL boundary. Book replacements clear a complete destination scope.
+fn migrate_store_family(
+    tx: &rusqlite::Transaction<'_>,
+    descriptor: &StoreDescriptor,
+    old_key: &str,
+    new_key: &str,
+    collision: PathMigrationCollision,
+) -> rusqlite::Result<usize> {
+    if old_key == new_key {
+        return Ok(0);
+    }
+    let mut changed = 0;
+    if collision == PathMigrationCollision::SourceWins {
+        changed += delete_store_family(tx, descriptor.table, descriptor.column, new_key)?;
+    }
+    changed += move_exact_with_collision(
+        tx,
+        descriptor.table,
+        descriptor.column,
+        descriptor.unique,
+        old_key,
+        new_key,
+        collision,
+    )?;
+    for delimiter in ["/", "::"] {
+        let old_prefix = format!("{old_key}{delimiter}");
+        let new_prefix = format!("{new_key}{delimiter}");
+        if collision == PathMigrationCollision::DestinationWins {
+            changed += move_prefix(
+                tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &old_prefix,
+                &new_prefix,
+            )?;
+            continue;
+        }
+        for key in indexed_prefix_keys(tx, descriptor.table, descriptor.column, &old_prefix)? {
+            let destination = format!("{new_prefix}{}", &key[old_prefix.len()..]);
+            changed += move_exact_with_collision(
+                tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &key,
+                &destination,
+                collision,
+            )?;
+        }
+    }
+    Ok(changed)
+}
+
+fn delete_store_family(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    key: &str,
+) -> rusqlite::Result<usize> {
+    let mut changed = tx.execute(&format!("DELETE FROM {table} WHERE {column} = ?1"), [key])?;
+    for prefix in [format!("{key}/"), format!("{key}::")] {
+        let upper = prefix_upper_bound(&prefix).expect("ASCII delimiter");
+        changed += tx.execute(
+            &format!("DELETE FROM {table} WHERE {column} >= ?1 AND {column} < ?2"),
+            rusqlite::params![prefix, upper],
+        )?;
+    }
+    Ok(changed)
 }
 
 /// exact キーの移動。一意キーは `UPDATE OR IGNORE` + 旧行 `DELETE` (新キー優先)、
@@ -2209,6 +2709,38 @@ fn move_exact(
     old_key: &str,
     new_key: &str,
 ) -> Result<usize, rusqlite::Error> {
+    move_exact_with_collision(
+        tx,
+        table,
+        col,
+        unique,
+        old_key,
+        new_key,
+        PathMigrationCollision::DestinationWins,
+    )
+}
+
+fn move_exact_with_collision(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    col: &str,
+    unique: bool,
+    old_key: &str,
+    new_key: &str,
+    collision: PathMigrationCollision,
+) -> Result<usize, rusqlite::Error> {
+    if old_key == new_key {
+        return Ok(0);
+    }
+    if collision == PathMigrationCollision::SourceWins {
+        let removed = tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [new_key])?;
+        return tx
+            .execute(
+                &format!("UPDATE {table} SET {col} = ?1 WHERE {col} = ?2"),
+                rusqlite::params![new_key, old_key],
+            )
+            .map(|rows| rows + removed);
+    }
     // Resume and watched together own the destination's saved viewing state. A resume-only
     // destination must not acquire the source's watched marker while keys are migrated.
     if watched_destination_has_resume(tx, table, col, new_key)? {
@@ -2220,8 +2752,14 @@ fn move_exact(
             &format!("UPDATE OR IGNORE {table} SET {col} = ?1 WHERE {col} = ?2"),
             rusqlite::params![new_key, old_key],
         )?;
-        tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [old_key])?;
-        n
+        let deleted = tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [old_key])?;
+        // A composition source discarded in favor of an existing destination is
+        // still a real scope mutation; keep the other stores' historical counts.
+        n + if table == "book_compositions" {
+            deleted
+        } else {
+            0
+        }
     } else {
         tx.execute(
             &format!("UPDATE {table} SET {col} = ?1 WHERE {col} = ?2"),
@@ -2299,6 +2837,9 @@ fn copy_store(
     match result {
         Ok(rows) => {
             report.rows += rows;
+            report
+                .store_mutations
+                .record_rows_changed(&descriptor, rows);
             if matches!(descriptor.table, "folder_thumb_pins" | "video_pins") {
                 report.committed_thumbnail_pins += rows;
             }
@@ -2687,6 +3228,385 @@ mod tests {
     use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    #[test]
+    fn book_store_policies_and_copy_kinds_are_explicit() {
+        let services = STORES
+            .iter()
+            .filter(|s| s.book_policy == BookStorePolicy::ServiceOwned)
+            .map(|s| s.table)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            services,
+            BTreeSet::from(["book_compositions", "spread_shifts"])
+        );
+        assert_eq!(
+            STORES
+                .iter()
+                .filter(|s| s.book_policy == BookStorePolicy::OwnedByEditPreview)
+                .map(|s| s.table)
+                .collect::<Vec<_>>(),
+            ["edit_previews"]
+        );
+        assert_eq!(
+            STORES
+                .iter()
+                .filter(|s| s.copies_with_book_page)
+                .map(|s| s.table)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "ratings",
+                "page_params",
+                "masks",
+                "conceal_entries",
+                "local_adjust_pages",
+                "comic_entries",
+                "export_crop_pages",
+                "item_tags",
+                "tag_item_state"
+            ])
+        );
+    }
+
+    #[test]
+    fn book_follow_stores_swap_all_faces_replace_stale_and_initialize_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        for descriptor in STORES
+            .iter()
+            .filter(|s| s.book_policy == BookStorePolicy::Follow && s.rename_generic)
+        {
+            let path = dir.path().join(descriptor.file);
+            let conn = if descriptor.table == "edit_origin" {
+                let conn = crate::content_identity::open_ledger_connection_at(&path).unwrap();
+                conn.execute_batch("ALTER TABLE edit_origin ADD COLUMN payload TEXT")
+                    .unwrap();
+                conn
+            } else {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                let extra = if descriptor.table == "ratings" {
+                    ", source_path TEXT"
+                } else {
+                    ""
+                };
+                conn.execute_batch(&format!(
+                    "CREATE TABLE IF NOT EXISTS {} ({} TEXT{}, payload TEXT{extra})",
+                    descriptor.table,
+                    descriptor.column,
+                    if descriptor.unique {
+                        " PRIMARY KEY"
+                    } else {
+                        ""
+                    }
+                ))
+                .unwrap();
+                conn
+            };
+            for base in ["a", "b", "stale"] {
+                for suffix in ["", "/child.png", "::entry.png"] {
+                    let key = format!("c:/book/{base}{suffix}");
+                    let insert = if descriptor.table == "edit_origin" {
+                        "INSERT INTO edit_origin(file_key, payload, size, head_hash, hashed_mtime, kind, last_edit_at) VALUES (?1, ?2, 0, '', 0, 'image', 0)".into()
+                    } else {
+                        format!(
+                            "INSERT INTO {} ({}, payload) VALUES (?1, ?2)",
+                            descriptor.table, descriptor.column
+                        )
+                    };
+                    conn.execute(&insert, rusqlite::params![key, base]).unwrap();
+                }
+            }
+            drop(conn);
+            let moves = [
+                ("c:/book/a".into(), "c:/book/b".into()),
+                ("c:/book/b".into(), "c:/book/a".into()),
+                ("c:/book/missing".into(), "c:/book/stale".into()),
+            ];
+            migrate_book_store(&path, descriptor, &moves, &[], &[]).unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            for (base, expected) in [("a", "b"), ("b", "a")] {
+                for suffix in ["", "/child.png", "::entry.png"] {
+                    let key = format!("c:/book/{base}{suffix}");
+                    let payload: String = conn
+                        .query_row(
+                            &format!(
+                                "SELECT payload FROM {} WHERE {} = ?1",
+                                descriptor.table, descriptor.column
+                            ),
+                            [&key],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(payload, expected, "{} {key}", descriptor.table);
+                    if descriptor.table == "ratings" {
+                        let source: String = conn
+                            .query_row(
+                                "SELECT source_path FROM ratings WHERE path = ?1",
+                                [&key],
+                                |r| r.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(source, key.split("::").next().unwrap());
+                    }
+                }
+            }
+            let count: usize = conn.query_row(&format!("SELECT COUNT(*) FROM {} WHERE {} LIKE '__miv_book_migration_%' OR {} LIKE 'c:/book/stale%'",
+                descriptor.table, descriptor.column, descriptor.column), [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 0, "{}", descriptor.table);
+            drop(conn);
+            migrate_book_store(
+                &path,
+                descriptor,
+                &[],
+                &[("c:/book/a".into(), "c:/book/b".into())],
+                &[],
+            )
+            .unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let copied: usize = conn.query_row(&format!("SELECT COUNT(*) FROM {} WHERE {} = 'c:/book/b' OR {} LIKE 'c:/book/b/%' OR {} LIKE 'c:/book/b::%'",
+                descriptor.table, descriptor.column, descriptor.column, descriptor.column), [], |r| r.get(0)).unwrap();
+            assert_eq!(
+                copied,
+                if descriptor.copies_with_book_page {
+                    3
+                } else {
+                    0
+                },
+                "{}",
+                descriptor.table
+            );
+            if descriptor.copies_with_book_page {
+                let payload: String = conn
+                    .query_row(
+                        &format!(
+                            "SELECT payload FROM {} WHERE {} = 'c:/book/b'",
+                            descriptor.table, descriptor.column
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    payload, "b",
+                    "copy must read post-move source for {}",
+                    descriptor.table
+                );
+            }
+            drop(conn);
+            migrate_book_store(
+                &path,
+                descriptor,
+                &[],
+                &[("c:/book/missing".into(), "c:/book/b".into())],
+                &[],
+            )
+            .unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let remaining: usize = conn.query_row(&format!("SELECT COUNT(*) FROM {} WHERE {} = 'c:/book/b' OR {} LIKE 'c:/book/b/%' OR {} LIKE 'c:/book/b::%'",
+                descriptor.table, descriptor.column, descriptor.column, descriptor.column), [], |r| r.get(0)).unwrap();
+            assert_eq!(
+                remaining, 0,
+                "missing copy source must clear {}",
+                descriptor.table
+            );
+        }
+    }
+
+    #[test]
+    fn book_resume_identity_and_pin_values_follow_original_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("c:/books/one");
+        let a = root.join("0001_same.jpg");
+        let b = root.join("0002_same.jpg");
+        let other = PathBuf::from("c:/books/two/0001_same.jpg");
+        let resume = STORES.iter().find(|s| s.table == "book_resume").unwrap();
+        let pin = STORES
+            .iter()
+            .find(|s| s.table == "folder_thumb_pins")
+            .unwrap();
+        let resume_path = dir.path().join(resume.file);
+        let conn = rusqlite::Connection::open(&resume_path).unwrap();
+        conn.execute_batch("CREATE TABLE book_resume(path TEXT PRIMARY KEY, page INTEGER, page_identity TEXT);
+            CREATE TRIGGER invalidate AFTER UPDATE OF page ON book_resume BEGIN UPDATE book_resume SET page_identity=NULL WHERE path=NEW.path; END;").unwrap();
+        let identity = serde_json::to_string(&crate::book_resume_db::PageIdentity::Image {
+            path: crate::adjustment_db::normalize_path(&a),
+        })
+        .unwrap();
+        conn.execute(
+            "INSERT INTO book_resume VALUES (?1, 27, ?2)",
+            rusqlite::params![resume.normalize_path(&root), identity],
+        )
+        .unwrap();
+        drop(conn);
+        let pin_path = dir.path().join(pin.file);
+        let conn = rusqlite::Connection::open(&pin_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE folder_thumb_pins(container_key TEXT PRIMARY KEY, source_rel TEXT)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folder_thumb_pins VALUES (?1, '0001_same.jpg')",
+            [pin.normalize_path(&root)],
+        )
+        .unwrap();
+        drop(conn);
+        let raw = [(a.clone(), b.clone()), (b.clone(), a.clone())];
+        let normalized = raw
+            .iter()
+            .map(|(a, b)| {
+                (
+                    crate::adjustment_db::normalize_path(a),
+                    crate::adjustment_db::normalize_path(b),
+                )
+            })
+            .collect::<Vec<_>>();
+        for descriptor in [resume, pin] {
+            migrate_book_store(
+                &dir.path().join(descriptor.file),
+                descriptor,
+                &normalized,
+                &[],
+                &raw,
+            )
+            .unwrap();
+        }
+        let conn = rusqlite::Connection::open(&resume_path).unwrap();
+        let (page, json): (usize, String) = conn
+            .query_row("SELECT page, page_identity FROM book_resume", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(page, 27);
+        assert_eq!(
+            serde_json::from_str::<crate::book_resume_db::PageIdentity>(&json).unwrap(),
+            crate::book_resume_db::PageIdentity::Image {
+                path: crate::adjustment_db::normalize_path(&b)
+            }
+        );
+        drop(conn);
+        let conn = rusqlite::Connection::open(&pin_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT source_rel FROM folder_thumb_pins", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "0002_same.jpg"
+        );
+        drop(conn);
+        // Moving the pinned image to another book must unpin before source compaction reuses its name.
+        let raw = [(b.clone(), other), (a.clone(), b.clone())];
+        let normalized = raw
+            .iter()
+            .map(|(a, b)| {
+                (
+                    crate::adjustment_db::normalize_path(a),
+                    crate::adjustment_db::normalize_path(b),
+                )
+            })
+            .collect::<Vec<_>>();
+        migrate_book_store(&pin_path, pin, &normalized, &[], &raw).unwrap();
+        let conn = rusqlite::Connection::open(&pin_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM folder_thumb_pins", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        // Folder rename rewrites the resume identity prefix but still never writes page.
+        let renamed = PathBuf::from("c:/books/renamed");
+        let raw = [(root.clone(), renamed.clone())];
+        migrate_book_store(
+            &resume_path,
+            resume,
+            &[(
+                resume.normalize_path(&root),
+                resume.normalize_path(&renamed),
+            )],
+            &[],
+            &raw,
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&resume_path).unwrap();
+        let (page, json): (usize, String) = conn
+            .query_row(
+                "SELECT page,page_identity FROM book_resume WHERE path = ?1",
+                [resume.normalize_path(&renamed)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(page, 27);
+        assert_eq!(
+            serde_json::from_str::<crate::book_resume_db::PageIdentity>(&json).unwrap(),
+            crate::book_resume_db::PageIdentity::Image {
+                path: crate::adjustment_db::normalize_path(&renamed.join("0002_same.jpg"))
+            }
+        );
+    }
+
+    #[test]
+    fn book_history_replaces_stale_destination_while_generic_rename_keeps_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let new = dir.path().join("new");
+        std::fs::create_dir(&new).unwrap();
+        let descriptor = STORES
+            .iter()
+            .find(|s| s.table == "reading_history")
+            .unwrap();
+        let path = dir.path().join(descriptor.file);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE reading_history(key TEXT PRIMARY KEY, path TEXT, title TEXT)",
+        )
+        .unwrap();
+        let old_key = descriptor.normalize_path(&old);
+        let new_key = descriptor.normalize_path(&new);
+        for (key, title) in [(&old_key, "source"), (&new_key, "stale")] {
+            conn.execute(
+                "INSERT INTO reading_history VALUES (?1, ?1, ?2)",
+                rusqlite::params![key, title],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let mut report = RenameMigrationReport {
+            rows: 0,
+            errors: vec![],
+            store_mutations: StoreMutationEffects::default(),
+            panicked: false,
+        };
+        migrate_reading_history(dir.path(), &new, &old_key, &new_key, &mut report);
+        assert!(report.errors.is_empty());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT title FROM reading_history", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "stale"
+        );
+        conn.execute(
+            "INSERT INTO reading_history VALUES (?1, ?1, 'source')",
+            [&old_key],
+        )
+        .unwrap();
+        drop(conn);
+        migrate_book_store(
+            &path,
+            descriptor,
+            &[(old_key, new_key.clone())],
+            &[],
+            &[(old, new.clone())],
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (title, raw): (String, String) = conn
+            .query_row(
+                "SELECT title,path FROM reading_history WHERE key=?1",
+                [new_key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "source");
+        assert_eq!(raw, new.to_string_lossy());
+    }
 
     #[test]
     fn rename_waiting_for_epub_does_not_block_sibling_save_metadata_copy() {
@@ -3118,8 +4038,36 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_composition_fixture(connection: &rusqlite::Connection, key: &str, payload: &str) {
+        use crate::book_composition::{
+            BookComposition, CompositionPageRef, PageDomain, ReadingDirection,
+        };
+        let page_num = if payload == "prefix" { 1 } else { 0 };
+        let composition = BookComposition::new(
+            ReadingDirection::Ltr,
+            vec![CompositionPageRef::PdfPage { page_num }],
+        );
+        crate::book_composition::store::replace_row_in(
+            connection,
+            "book_compositions",
+            key,
+            &PageDomain::Document,
+            &composition,
+        )
+        .unwrap();
+    }
+
     fn setup_copy_store_rows(dir: &Path, old: &Path) {
         for descriptor in STORES {
+            if descriptor.file == "book_composition.db" {
+                crate::book_composition::initialize_database_at(&dir.join(descriptor.file))
+                    .unwrap();
+                let connection = open(dir, descriptor.file);
+                let key = descriptor.normalize_path(old);
+                insert_composition_fixture(&connection, &key, "exact");
+                insert_composition_fixture(&connection, &format!("{key}/ページ/001.jpg"), "prefix");
+                continue;
+            }
             if descriptor.file == "spread_shift.db" {
                 crate::spread_shift::initialize_database_at(&dir.join(descriptor.file)).unwrap();
                 let connection = open(dir, descriptor.file);
@@ -3270,10 +4218,10 @@ mod tests {
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
         assert_eq!(
             STORES.len(),
-            28,
+            29,
             "watched、endpoint / page-alone preference と logical shift を含む現行 descriptor 数"
         );
-        assert_eq!(covered, 27);
+        assert_eq!(covered, 28);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
 
@@ -3292,7 +4240,9 @@ mod tests {
                         "prefix",
                     ),
                 ] {
-                    let payload_column = if descriptor.file == "spread_shift.db" {
+                    let payload_column = if descriptor.file == "book_composition.db" {
+                        "composition_json"
+                    } else if descriptor.file == "spread_shift.db" {
                         "anchor_ref"
                     } else {
                         "payload"
@@ -3307,7 +4257,14 @@ mod tests {
                             |row| row.get(0),
                         )
                         .unwrap();
-                    let copied = if descriptor.file == "spread_shift.db" {
+                    let copied = if descriptor.file == "book_composition.db" {
+                        let value: serde_json::Value = serde_json::from_str(&copied).unwrap();
+                        if value["composition"]["page_order"][0]["page_num"] == 1 {
+                            "prefix".to_owned()
+                        } else {
+                            "exact".to_owned()
+                        }
+                    } else if descriptor.file == "spread_shift.db" {
                         let crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(value) =
                             serde_json::from_str(&copied).unwrap()
                         else {
@@ -4038,6 +4995,8 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            book_policy: BookStorePolicy::Follow,
+            copies_with_book_page: false,
             restore_family: StoreRestoreFamily::VirtualPages,
             table_availability: StoreTableAvailability::Required,
         };
@@ -4110,6 +5069,8 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            book_policy: BookStorePolicy::Follow,
+            copies_with_book_page: false,
             restore_family: StoreRestoreFamily::VirtualPages,
             table_availability: StoreTableAvailability::Required,
         };
@@ -4149,7 +5110,12 @@ mod tests {
         for descriptor in STORES {
             let identity = descriptor.file == crate::content_identity::LEDGER_DB_FILE;
             let shift = descriptor.file == "spread_shift.db";
-            let conn = if shift {
+            let composition = descriptor.file == "book_composition.db";
+            let conn = if composition {
+                crate::book_composition::initialize_database_at(&dir.path().join(descriptor.file))
+                    .unwrap();
+                open(dir.path(), descriptor.file)
+            } else if shift {
                 crate::spread_shift::initialize_database_at(&dir.path().join(descriptor.file))
                     .unwrap();
                 open(dir.path(), descriptor.file)
@@ -4174,14 +5140,16 @@ mod tests {
             for key in [
                 base.clone(),
                 format!("{base}/child.jpg"),
-                if shift {
+                if shift || composition {
                     format!("{base}/chapter/page_1")
                 } else {
                     format!("{base}::page_1")
                 },
                 format!("{base}2/keep.jpg"),
             ] {
-                if shift {
+                if composition {
+                    insert_composition_fixture(&conn, &key, "exact");
+                } else if shift {
                     insert_shift_fixture(&conn, &key, "fixture.jpg");
                 } else if identity {
                     conn.execute(
@@ -5866,5 +6834,120 @@ mod tests {
             backed.contains(&key),
             "読めない store があるときは安全側に倒す"
         );
+    }
+    #[test]
+    fn composition_lifecycle_keeps_relative_payload_drive_and_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::book_composition::initialize_database_at(&dir.path().join("book_composition.db"))
+            .unwrap();
+        let connection = open(dir.path(), "book_composition.db");
+        let old = Path::new(r"C:\Books\source.zip");
+        let new = Path::new(r"D:\Books\source.zip");
+        let old_key = crate::book_scope::BookScopeKey::new(old, "")
+            .unwrap()
+            .storage_key();
+        let new_key = crate::book_scope::BookScopeKey::new(new, "")
+            .unwrap()
+            .storage_key();
+        insert_composition_fixture(&connection, &old_key, "exact");
+        insert_composition_fixture(&connection, &format!("{old_key}/chapter"), "prefix");
+        insert_composition_fixture(&connection, &new_key, "prefix");
+        let original = crate::book_composition::store::load_rows(&connection).unwrap();
+        let probe = ledger_keys_with_restorable_rows_at(dir.path(), std::slice::from_ref(&old_key));
+        assert!(
+            probe.contains(&old_key),
+            "composition-only data is restorable"
+        );
+        let copied = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(old, new),
+                StoreCopyPathMapping::virtual_prefix(old, new),
+            ],
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        assert_eq!(copied.rows, 1);
+        assert!(copied.store_mutations.book_composition_changed());
+        let rows = crate::book_composition::store::load_rows(&connection).unwrap();
+        assert_eq!(rows[&new_key], original[&new_key], "destination wins");
+        assert_eq!(
+            rows[&format!("{new_key}/chapter")],
+            original[&format!("{old_key}/chapter")]
+        );
+        assert_eq!(rows[&old_key], original[&old_key], "copy keeps source");
+        let renamed = run_at(dir.path(), old, Path::new(r"E:\Moved\source.zip"));
+        assert!(renamed.errors.is_empty(), "{:?}", renamed.errors);
+        assert!(renamed.store_mutations.book_composition_changed());
+        let moved_key = crate::path_key::normalize_keep_drive(Path::new(r"E:\Moved\source.zip"));
+        let rows = crate::book_composition::store::load_rows(&connection).unwrap();
+        assert!(!rows.contains_key(&old_key));
+        assert_eq!(rows[&moved_key], original[&old_key]);
+        assert_eq!(
+            rows[&format!("{moved_key}/chapter")],
+            original[&format!("{old_key}/chapter")]
+        );
+    }
+
+    #[test]
+    fn composition_page_delete_keeps_parent_and_book_delete_purges_family() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::book_composition::initialize_database_at(&dir.path().join("book_composition.db"))
+            .unwrap();
+        let connection = open(dir.path(), "book_composition.db");
+        let book = PathBuf::from(r"C:\Books\book.zip");
+        let key = crate::path_key::normalize_keep_drive(&book);
+        insert_composition_fixture(&connection, &key, "exact");
+        insert_composition_fixture(&connection, &format!("{key}/chapter"), "prefix");
+        insert_composition_fixture(&connection, &format!("{key}2"), "exact");
+        let before = crate::book_composition::store::load_rows(&connection).unwrap();
+        let page =
+            purge_removed_paths_at(dir.path(), &[PathBuf::from(format!("{key}::001.jpg"))], &[]);
+        assert!(page.errors.is_empty(), "{:?}", page.errors);
+        assert!(!page.store_mutations.book_composition_changed());
+        assert_eq!(
+            crate::book_composition::store::load_rows(&connection).unwrap(),
+            before
+        );
+        let purged = purge_removed_paths_at(dir.path(), &[book], &[]);
+        assert!(purged.errors.is_empty(), "{:?}", purged.errors);
+        assert_eq!(purged.rows, 2);
+        assert!(purged.store_mutations.book_composition_changed());
+        let rows = crate::book_composition::store::load_rows(&connection).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.contains_key(&format!("{key}2")));
+    }
+
+    #[test]
+    fn composition_corrupt_payload_blocks_rename_copy_and_purge_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::book_composition::initialize_database_at(&dir.path().join("book_composition.db"))
+            .unwrap();
+        let connection = open(dir.path(), "book_composition.db");
+        let old = Path::new(r"C:\Books\bad.pdf");
+        let key = crate::path_key::normalize_keep_drive(old);
+        insert_composition_fixture(&connection, &key, "exact");
+        connection
+            .execute(
+                "UPDATE book_compositions SET composition_json='not-json'",
+                [],
+            )
+            .unwrap();
+        let copied = copy_stores_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(old, r"D:\Books\bad.pdf")],
+        );
+        assert!(!copied.errors.is_empty());
+        let renamed = run_at(dir.path(), old, Path::new(r"D:\Books\bad.pdf"));
+        assert!(!renamed.errors.is_empty());
+        let purged = purge_removed_paths_at(dir.path(), &[old.to_path_buf()], &[]);
+        assert!(!purged.errors.is_empty());
+        let raw: (String, String) = connection
+            .query_row(
+                "SELECT book_key,composition_json FROM book_compositions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(raw, (key, "not-json".into()));
     }
 }

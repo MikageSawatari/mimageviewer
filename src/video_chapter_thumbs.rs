@@ -164,16 +164,12 @@ mod tests {
     #[test]
     fn set_then_list_uses_file_identity() {
         let db = open_in_memory();
-        let path = std::env::temp_dir().join(format!(
-            "mimageviewer_chapter_thumb_test_{}_{}.mp4",
-            std::process::id(),
-            chapter_start_key(12.345)
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("video.mp4");
         std::fs::write(&path, b"video").expect("write temp video");
 
         db.set(&path, 12.345, &[1, 2, 3]).unwrap();
         let got = db.list(&path);
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(got.len(), 1);
         assert!((got[0].start_secs - 12.345).abs() < 1e-9);

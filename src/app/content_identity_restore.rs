@@ -273,7 +273,8 @@ impl App {
     /// 背面入力を止める述語と描画側が共有する唯一の可視性判定。
     /// 先行 batch の完了待ち中に次フォルダの候補が届いた場合も、候補を保持して順番に出す。
     pub(crate) fn content_restore_window_visible(&self) -> bool {
-        self.fullscreen_idx.is_none()
+        self.book_structural_op.is_none()
+            && self.fullscreen_idx.is_none()
             && self.content_identity_restore_pending.is_none()
             && self.content_restore_prompt.is_some()
     }
@@ -283,6 +284,19 @@ impl App {
         ctx: &egui::Context,
         action: ContentRestorePromptAction,
     ) {
+        // Detection may finish after structural admission. Keep its prompt and
+        // choices until the operation finishes; only new input is blocked here.
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        if self.content_restore_prompt.as_ref().is_some_and(|prompt| {
+            action == ContentRestorePromptAction::Restore
+                || (prompt.dont_ask_again && self.settings.edit_restore_prompt_enabled)
+        }) && self.book_append_undo_in_progress()
+        {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
         let Some(prompt) = self.content_restore_prompt.take() else {
             return;
         };
@@ -308,6 +322,12 @@ impl App {
     }
 
     fn apply_content_restore_disable_choice_to_runtime(&mut self, disable: bool) -> bool {
+        if disable
+            && self.settings.edit_restore_prompt_enabled
+            && !self.admit_book_append_followup_mutation()
+        {
+            return false;
+        }
         let old_enabled = self.settings.edit_restore_prompt_enabled;
         if !apply_disable_choice_to_settings(&mut self.settings, disable) {
             return false;
@@ -322,6 +342,9 @@ impl App {
         selected: Vec<crate::content_identity::SelectedRestore>,
         declined: Vec<crate::content_identity::DeclinedRestore>,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         if selected.is_empty() && declined.is_empty() {
             return;
         }
@@ -330,6 +353,9 @@ impl App {
                 "content_identity: restore request ignored while another restore is active"
                     .to_string(),
             );
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         if crate::perf::is_enabled() {
@@ -358,7 +384,7 @@ impl App {
                 crate::logger::log(format!(
                     "content_identity: restore thread spawn failed: {error}"
                 ));
-                self.show_feedback_toast("編集内容の復元を開始できませんでした".to_string());
+                self.show_feedback_warning("編集内容の復元を開始できませんでした".to_string());
             }
         }
     }
@@ -377,7 +403,7 @@ impl App {
                         for_content_identity_index_stale(),
                 );
                 crate::logger::log("content_identity: restore thread disconnected".to_string());
-                self.show_feedback_toast("編集内容の復元が中断されました".to_string());
+                self.show_feedback_warning("編集内容の復元が中断されました".to_string());
                 return;
             }
             Some(Err(mpsc::TryRecvError::Empty)) => {
@@ -420,7 +446,7 @@ impl App {
         if report.requested_restores > 0 {
             self.finish_content_identity_restore(report.errors);
         } else if !report.errors.is_empty() {
-            self.show_feedback_toast(format!(
+            self.show_feedback_error(format!(
                 "確認結果の保存に失敗しました ({} 件)",
                 report.errors.len()
             ));
@@ -526,6 +552,43 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn section1373_content_restore_job_admits_before_spawn_and_undo_keeps_prompt() {
+        use crate::app::book_append_producer_tests::{
+            FOLLOWUP_PHASES, assert_followup_terminal, followup_fixture,
+        };
+        for phase in FOLLOWUP_PHASES {
+            let (mut app, append, worker) = followup_fixture(phase);
+            let ctx = egui::Context::default();
+            app.start_content_identity_restore(
+                &ctx,
+                vec![],
+                vec![crate::content_identity::DeclinedRestore {
+                    full_hash: "hash".into(),
+                    target_key: "target".into(),
+                }],
+            );
+            assert_eq!(
+                app.content_identity_restore_pending.is_some(),
+                phase != "undo"
+            );
+            assert_followup_terminal(&mut app, &append, worker, phase);
+        }
+        let (mut app, append, _worker) = followup_fixture("undo");
+        app.content_restore_prompt = Some(super::ContentRestorePrompt {
+            candidates: vec![],
+            ui_rows: vec![],
+            dont_ask_again: true,
+        });
+        app.handle_content_restore_prompt_action(
+            &egui::Context::default(),
+            super::ContentRestorePromptAction::Restore,
+        );
+        assert!(app.content_restore_prompt.is_some());
+        assert!(app.settings.edit_restore_prompt_enabled);
+        assert_eq!(app.book_append_undo_revision, append.accepted_revision);
+    }
+
     use super::*;
     use std::path::{Path, PathBuf};
 
@@ -592,6 +655,78 @@ mod tests {
                 last_edit_at: 10,
                 source_exists: true,
             }],
+        }
+    }
+
+    #[test]
+    fn book_structure_requested_and_running_keep_restore_prompt_and_reject_new_restore() {
+        for running in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            app.settings.edit_restore_prompt_enabled = true;
+            app.rename_migration_journal_admission =
+                crate::app::RenameMigrationJournalAdmission::Durable;
+            let _worker = if running {
+                let (tx, rx) = mpsc::channel();
+                app.book_structural_op = Some(
+                    crate::app::book_structural_op::BookStructuralOp::running_for_test(
+                        rx,
+                        crate::books::BookOpIntent::SourceMutation,
+                        crate::app::book_structural_op::Completion::Manager,
+                    ),
+                );
+                Some(tx)
+            } else {
+                assert!(app.request_book_structural_op(
+                    &ctx,
+                    "restore-prompt-structure-test",
+                    crate::books::BookOpIntent::SourceMutation,
+                    crate::app::book_structural_op::Completion::Manager,
+                    || unreachable!("Requested is not polled in this input test"),
+                ));
+                None
+            };
+            // Model a detection reply published after structural admission.
+            let target = app.tmp.path().join("copied").join("target.png");
+            let (key, crop) = seed_restored_idx_page_edits(&mut app, &target);
+            let layers_before = app.local_adjust_db.as_ref().unwrap().get_layers(&key);
+            let mut found = candidate("target");
+            found.target_path = target;
+            found.target_key = key.clone();
+            app.set_content_restore_candidates(vec![found]);
+            let prompt = app.content_restore_prompt.as_mut().unwrap();
+            prompt.dont_ask_again = true;
+            prompt.ui_rows[0].selected = false;
+            let rows = prompt.ui_rows.clone();
+            let candidate_key = prompt.candidates[0].target_key.clone();
+            let revision = app.book_append_undo_revision;
+            assert!(!app.content_restore_window_visible());
+            app.handle_content_restore_prompt_action(&ctx, ContentRestorePromptAction::Restore);
+            let retained = app.content_restore_prompt.as_ref().unwrap();
+            assert_eq!(retained.ui_rows, rows);
+            assert_eq!(retained.candidates[0].target_key, candidate_key);
+            assert!(retained.dont_ask_again);
+            assert!(app.settings.edit_restore_prompt_enabled);
+            assert_eq!(app.book_append_undo_revision, revision);
+            assert!(app.content_identity_restore_pending.is_none());
+            // The lower request seam also refuses direct new restore batches.
+            app.start_content_identity_restore(
+                &ctx,
+                vec![],
+                vec![crate::content_identity::DeclinedRestore {
+                    full_hash: "must-not-record-decline".into(),
+                    target_key: key.clone(),
+                }],
+            );
+            assert!(app.content_identity_restore_pending.is_none());
+            assert_eq!(
+                app.local_adjust_db.as_ref().unwrap().get_layers(&key),
+                layers_before
+            );
+            assert_eq!(app.export_crop_db.as_ref().unwrap().get(&key), Some(crop));
+            app.book_structural_op = None;
+            assert!(app.content_restore_window_visible());
+            assert_eq!(app.content_restore_prompt.as_ref().unwrap().ui_rows, rows);
         }
     }
 

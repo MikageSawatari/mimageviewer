@@ -1668,6 +1668,12 @@ pub(crate) fn probe_image_dims_from_bytes(bytes: &[u8], hint: &str) -> Option<(u
             .developed_dims;
         return Some((dims[0], dims[1]));
     }
+    if let Some(result) = crate::image_decode::avif_dimensions(
+        crate::image_decode::Source::Bytes { bytes, hint },
+        crate::avif_decoder::Workload::Background,
+    ) {
+        return result.ok();
+    }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -2562,6 +2568,43 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_f_keeps_short_terms_and_phrase_matching_without_global_length_policy() {
+        let items = [
+            GridItem::Folder(PathBuf::from("C:/EOS R5 sd ai 夕海")),
+            GridItem::Folder(PathBuf::from("C:/R5 separate EOS")),
+            GridItem::Folder(PathBuf::from("C:/EOS only")),
+        ];
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        for (query, mode, expected) in [
+            ("EOS R5", crate::search_query::MatchMode::And, vec![0, 1]),
+            (r#""EOS R5""#, crate::search_query::MatchMode::And, vec![0]),
+            ("r5", crate::search_query::MatchMode::And, vec![0, 1]),
+            ("sd ai", crate::search_query::MatchMode::And, vec![0]),
+            ("夕 海", crate::search_query::MatchMode::And, vec![0]),
+            ("e", crate::search_query::MatchMode::And, vec![0, 1, 2]),
+            ("EOS R5", crate::search_query::MatchMode::Or, vec![0, 1, 2]),
+        ] {
+            let SearchThreadResult::Done { matches, .. } = run_metadata_search(
+                &crate::search_query::parse(query),
+                &items,
+                None,
+                &std::collections::HashMap::new(),
+                None,
+                &passwords,
+                &crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]),
+                mode,
+                &AtomicBool::new(false),
+                None,
+            );
+            assert_eq!(
+                matches,
+                expected.into_iter().collect(),
+                "{query:?} / {mode:?}"
+            );
+        }
+    }
 
     #[test]
     fn current_folder_filter_searches_epub_name_but_not_generated_pdf_info() {
@@ -3989,6 +4032,18 @@ mod tests {
         assert_eq!(
             facet_kind_for_item(&audio),
             crate::settings::FacetItemKind::Audio
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod avif_dimension_tests {
+    #[test]
+    fn avif_details_probe_uses_applied_crop_rotation_dimensions() {
+        let bytes = crate::avif_decoder::tests::with_clap_and_mirror(true);
+        assert_eq!(
+            super::probe_image_dims_from_bytes(&bytes, "page.avif"),
+            Some((64, 32))
         );
     }
 }
