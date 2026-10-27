@@ -2,7 +2,7 @@
 use super::page_turn_submission_tests::{draw_current, frame, ready_app, seed_leaf};
 use super::*;
 
-fn overview_app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+fn ready_overview_app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
     crate::key_input::install_operation_input_plugin(ctx);
     let mut app = ready_app(ctx, SpreadMode::Single);
     app.settings.video_in_window_mode = true;
@@ -19,6 +19,11 @@ fn overview_app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
         app.rotation_cache
             .insert(idx, crate::rotation_db::Rotation::None);
     }
+    app
+}
+
+fn overview_app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+    let mut app = ready_overview_app(ctx);
     seed_leaf(ctx, &mut app);
     app
 }
@@ -191,4 +196,98 @@ fn assert_overview_admission_after_flat(with_continuation: bool) {
             "Enter must not close the viewer"
         );
     });
+}
+
+#[test]
+fn overview_real_viewer_o_during_unpresented_navigation_is_rejected_then_selects() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    page_turn::install(&ctx);
+    install_fs_navigator_input_tracking(&ctx);
+    ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
+    let mut app = ready_overview_app(&ctx);
+    app.settings.page_turn_animation_enabled = false;
+    app.settings.prefetch_back = 0;
+    app.settings.prefetch_forward = 0;
+    app.settings.ai_upscale_prefetch_back = 0;
+    app.settings.ai_upscale_prefetch_forward = 0;
+    let root = app.tmp.path().to_path_buf();
+    app.items = (0..4)
+        .map(|idx| {
+            let path = root.join(format!("page-{idx}.png"));
+            image::RgbaImage::from_pixel(80, 120, image::Rgba([40 + idx * 40, 100, 160, 255]))
+                .save(&path)
+                .unwrap();
+            GridItem::Image(path)
+        })
+        .collect();
+    app.current_folder = Some(root);
+    app.thumbnails = vec![ThumbnailState::Pending; 4];
+    app.page_identity_index = Arc::new(
+        crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+            &app.items,
+            None,
+            app.settings.file_type_visibility.clone(),
+        ),
+    );
+    let render = |app: &mut App, key: Option<egui::Key>| {
+        let events = key
+            .into_iter()
+            .flat_map(|key| {
+                [true, false].map(move |pressed| egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+            })
+            .collect();
+        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 720.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |root_ui| app.render_fullscreen_viewport(root_ui),
+        ));
+    };
+    let completed_target = app.fs_cache.remove(&1).unwrap();
+    render(&mut app, None);
+    assert!(!app.fs_cache.contains_key(&1));
+    render(&mut app, Some(egui::Key::ArrowRight));
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(!app.fs_cache.contains_key(&1), "accepted uncached target");
+    assert!(app.fs_navigation_sequence_blocks_new_target());
+    assert!(!app.page_turn_barrier_active(), "animation is OFF");
+    assert!(matches!(
+        app.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| &sequence.target),
+        Some(FsNavigationSequenceTarget::Display(_))
+    ));
+
+    render(&mut app, Some(egui::Key::O));
+    assert!(app.page_overview.session().is_none());
+    assert_eq!(app.fullscreen_idx, Some(1));
+    // Supply the ready raster at the normal cache-consumer boundary. All
+    // navigation, output adoption and input dispatch still use the real renderer.
+    app.fs_cache.insert(1, completed_target);
+    for _ in 0..3 {
+        render(&mut app, None);
+        assert!(app.page_overview.session().is_none(), "no deferred O");
+    }
+    assert!(!app.fs_navigation_sequence_blocks_new_target());
+    render(&mut app, Some(egui::Key::O));
+    assert!(app.page_overview.session().is_some());
+    render(&mut app, Some(egui::Key::End));
+    assert_eq!(app.page_overview_view().unwrap().cursor, 3);
+    render(&mut app, Some(egui::Key::Enter));
+    assert!(app.page_overview.session().is_none());
+    assert_eq!(app.fullscreen_idx, Some(3));
 }

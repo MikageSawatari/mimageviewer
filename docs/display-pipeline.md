@@ -621,18 +621,30 @@ RotationDb read-only open / SELECT 回数が増えないこと、未確定セル
 向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
 `still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
 
-### 1.6.1 閲覧中のページ一覧 (§1.340、2026-10-27 master統合・指定自動検証済み)
+### 1.6.1 閲覧中のページ一覧 (§1.340、2026-10-27 独立レビューP2追補・指定自動検証済み)
 
 通常 fullscreen／メイン内閲覧／F12連動窓／独立窓は既存surface内で
 `ui_page_overview::draw_page_overview` を使う。現在の可視実ページ列を仮想行として描き、
 未生成／回転未確定／失敗セルも番号とidentityを持つ選択可能なplaceholderにする。
 列数・scroll・cursorはviewer内のセッション値で、入場／取消は読書位置とmain Gridを変更しない。
-新規入場のavailability／openは既存`page_turn_barrier_active()`のTurning／Completing中だけ拒否し、
-通常flat採用と受理済みcontinuationを保持する。O／HUD／ring／padは共通受付を使い、
+新規入場とSelectは既存`page_overview_available()`へ集約したnavigation-sequence／page-turnの
+両admissionを共用し、animationのON／OFFにかかわらず未提示の受理済み移動があれば拒否する。
+通常出力の採用と受理済みcontinuationを保持する。O／HUD／ring／padは共通受付を使い、
 完了後にもう一度操作する。入場要求の保留・replay・新しい取消処理は作らない。
 Oの既存operation観測が通常flat完了を始める場合も、入場受付自体はpage-turn ownerを変更しない
 （2026-10-27の新coordinator手順2、一覧設計書§25.4）。旧選択肢2の即退役は採用しない。
-現行gateの指定自動検証は成功し、件数・条件とcoordinatorへの残工程は同§25.6へ記録する。
+独立レビューP2-1の通常表示待ちへの拡張とP2-2の前面キー／共通chrome終了の指定自動検証は同§25.7で成功。
+新しいpredicate・pending・replay・取消は作らず、HUDのenabledはavailability、理由は既存optional reasonを使う。
+受理した共通入場だけが`dismiss_fs_transient_menu_state()`でspread／fit／panoramaのApp boolと
+overflowを終了し、通常`close_fullscreen`も同helperを使う。keyboard次キー／HUD Close／HUD Overviewの
+overflow-only終了は`dismiss_fs_overflow_panel()`へ揃える。rotation／seek等のegui Popupは
+表示／keepされなくなった所有viewportの`Memory::end_pass`で自然に退役するため、明示popup closeや
+兄弟viewportも消す`Popup::close_all`は加えない。keyboard seekの既存優先、context／modal／edit／pickerの
+入場拒否、physical stream、info lock、拒否されたring入場の旧chromeは維持する。
+front pointer captureは`fs_front_menu_presented`とoverflow rectだけを読む。通常adjustment／metadata／
+infoはその集合外で、非focused adjustmentは入場可能な場合もある。focused TextEdit／IMEは既存ownerで止める。
+tag pickerは既存common modal、overlay編集は既存availabilityの拒否を使う。hover tooltipは
+PopupKind::Tooltip／Sense::hoverと既定inactiveのArea／描画寿命であり、durable panelとともに一括resetしない。
 Selectはstamp／binding／items・projection revision／incarnation／stable identity／active資格の
 既存照合を全通過したら一覧をClosedにし、`land_still_page_navigation_target`の`LatestSeek`を
 ちょうど一度呼ぶ。即時着地・Checking後許可・後着拒否・同期拒否は通常navigation ownerが扱い、
@@ -679,8 +691,8 @@ resize／DPI変更後の新セルもmetadataからtargetを解決する。full-i
 PDFは§1.377の既存viewer ticket付き要求・owner-scoped昇格へ接続済み。
 2026-10-27のmaster統合では構成採用後の可視実items順とhiddenを反映する。
 白紙補助annotationは`None`のまま未接続で、fixtureの補助表示を製品接続済みとは扱わない。
-2026-10-12〜13のfull補完・独立ACCEPTは過去の履歴。今回統合後の指定自動検証は§25.6で成功、
-未merge。独立レビュー・full-lib・build-dev・実機確認はcoordinatorへ引き継ぐ。
+2026-10-12〜13のfull補完・独立ACCEPTと§25.6の統合commit `1c134703b`までの指定自動検証は履歴。
+独立レビューP2追補後の検証は§25.7で別に扱い、再レビュー・残工程はcoordinatorへ引き継ぐ。
 [所有・入力・統合の正本§25](detached-book-page-overview-plan.md#25-2026-10-27-master統合記録)を参照する。
 
 ### 1.7 サムネイル画質ダイアログのプレビュー寸法

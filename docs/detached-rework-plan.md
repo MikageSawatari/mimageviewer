@@ -1455,6 +1455,36 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-27 §1.340 統合commitの独立レビューP2追補（実装・指定自動検証済み）
+
+統合commit `1c134703b`に対する利用者提示の独立レビューはACCEPT WITH CHANGES、P2-1／P2-2。
+coordinatorは、curl中の入場拒否を受理済み移動が未提示の間すべてへ拡張する方針を採択した。
+既存`fs_navigation_sequence_blocks_new_target()`と`page_turn_barrier_active()`を既存
+`page_overview_available()`へまとめ、OpenとSelectで共用する。Selectの重複checkは除き、
+新しいpredicate・pending・replay・取消は加えず、受理済み移動と既存出力採用を保持する。
+一般のnavigation lock用の新案内は作らず、旧curl限定の理由文は外す。HUDはavailabilityと
+既存optional reasonでenabled／理由を分ける。
+
+P2-2ではOを既存のfocused Slideshow／overflowの次キーdismissより後へ揃える。
+`dismiss_fs_transient_menu_state()`でspread／fit／panoramaのApp boolとoverflowを閉じ、
+通常closeの既存4代入と受理した`open_page_overview_for_viewer`が共用する。
+次キーdismiss／HUD Close／HUD Overviewはoverflowだけの`dismiss_fs_overflow_panel()`を共用し、
+既存意味を維持する。全受理入場を共通化し、physical stream・info lock・拒否ring入場のchromeは残す。
+rotation／seek等のegui Popupは所有viewportの`Memory::end_pass`による自然退役であり、
+`Popup::close_all`やroot ctxの明示popup close、新lookup／guard／stateは追加しない。
+新しいdetached述語・viewport・HWND／placement ownerは追加しない。
+
+追加棚卸しではfront captureは`fs_front_menu_presented`＋overflow rectに限られ、通常adjustment／
+metadata／infoは含まれないことを確認した。tag pickerは既存common modal、overlay編集は既存拒否を使う。
+非focused adjustmentの入場可能性とfocused TextEdit／IME ownerを維持し、durable panelとhover tooltipは一括resetしない。
+新規5回帰のfocusedはr4で5 passed／0 failed、通常／test-script check、audit 69件・違反0、
+UI snapshot 211件（PNG変更なし）、glyph 0も成功。最終関連libは1379件すべて成功、最終fmt checkも成功で、
+新差分の独立再レビュー受入は未取得。詳しい条件・fixture根因は一覧設計書§25.7へ集約する。
+
+追補後の指定自動検証は完了し、独立再レビュー受入は未取得。animation OFFの未提示移動と実O入力を通す回帰、
+前面キーと各入場経路の棚卸しを[一覧設計書§25.7](detached-book-page-overview-plan.md#257-独立レビューp2追補の実装と検証)へ集約する。
+同§25.6と以下の同日統合記録はcommit `1c134703b`までの履歴として保持し、この追補後の成功を主張しない。
+
 ### 2026-10-27 §1.340 master取込みの衝突解消・指定自動検証済み、未merge
 
 **現在地**: 作業ファイルの機械的合流は完了し、SelectのClose→既存landing一回は

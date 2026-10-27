@@ -2,12 +2,28 @@
 
 ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
 動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
-進行中のページめくりと通常flat完了待ち（既存`page_turn_barrier_active()`のTurning／Completing）では
-Oによる新規入場を受け付けない。受理済み移動を保持し、完了後にもう一度Oを押す。
+受理済み移動が未提示の間はanimationのON／OFFにかかわらずOによる新規入場を受け付けない。
+既存`fs_navigation_sequence_blocks_new_target()`と`page_turn_barrier_active()`を
+既存`page_overview_available()`へ集約し、OpenとSelectで共用する。受理済み移動を保持し、
+完了後にもう一度Oを押す。新しいpredicate・pending・replay・取消や一般lockの新案内は加えない。
 HUD／リング／パッドも`open_page_overview_for_viewer`→`open_page_overview`の同じ受付へ通す。
 入場要求の保留・自動再実行・新しい取消処理は作らない。Oの既存operation観測が通常flat完了へ
 進める場合と、一覧入場の受付がownerを変更することは区別する（2026-10-27の新coordinator手順2、
-一覧設計書§25.4）。旧選択肢2の即退役を採択した意味ではない。現行gateの指定自動検証は同§25.6へ記録する。
+一覧設計書§25.4）。旧選択肢2の即退役を採択した意味ではない。独立レビューP2追補の指定自動検証は同§25.7で成功し、
+同§25.6の統合時の成功と区別する。
+
+Oは既存のfocused Slideshow／overflowの「次のキーで閉じる」処理より後に判定する。
+受理した共通一覧入場ではkeyboard／HUD／ring／gesture／padとも`dismiss_fs_transient_menu_state()`で
+spread／fit／panoramaのboolとoverflowを終了し、physical streamを維持する。
+keyboard次キーdismiss／HUD Close／HUD Overviewが共用するのはoverflowだけの`dismiss_fs_overflow_panel()`。
+拒否されたring入場はchromeを残し、ring全体の一括resetと通常キーのdismiss規則の変更は行わない。
+rotation／seek等のegui Popupは表示／keepされなければ所有viewportの`Memory::end_pass`で自然に退役する。
+keyboardのseek ownerは従来どおりOを拒否し、非keyのring入場後はowner pass終端で自然に閉じる。
+兄弟viewportへ影響する`Popup::close_all`やroot ctxへの明示popup closeは加えない。
+context menu／modal／overlay編集／pickerの既存入場拒否と、info panelの永続lockは維持する。
+fullscreen tag pickerも既存common modalに含む。通常adjustment panelは非focusedなら入場できる場合があるが、
+front-menu captureには含まれず、focused TextEdit／IMEは既存keyboard ownerがOを止める。
+metadata／infoのlock・明示表示・hoverと、非永続のhover tooltipは旧menu captureとして一括resetしない。
 一覧中の scope は Global + FsCommon + FsPageOverview とし、FsImage／Rating は同時 active にしない。
 一覧確定は `FsPageOverviewConfirm`（Enter）、画面送りは `FsPageOverviewPagePrev`／
 `FsPageOverviewPageNext`（PageUp／PageDown）、先頭末尾は `FsPageOverviewFirst`／

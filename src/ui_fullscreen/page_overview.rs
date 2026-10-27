@@ -685,6 +685,7 @@ impl App {
         if !self.open_page_overview(surface, direction) {
             return false;
         }
+        self.dismiss_fs_transient_menu_state();
         let view = self
             .page_overview_view()
             .expect("successful open retains view");

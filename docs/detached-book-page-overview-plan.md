@@ -1,6 +1,6 @@
 # 画像閲覧中の本のページ一覧（§1.340）設計
 
-2026-10-27 master取込み追補: **master取り込みの作業ファイルの衝突解消・指定自動検証は完了、未merge。現行gateの新規O回帰2件、通常／test-script check、audit、全UI snapshot 211件、関連lib 1374件と最終整形検査は成功（§25.6）。未決の設計選択はない。進行中curl／通常flat完了待ちの一覧入場は既存barrierで拒否し、受理済み移動を保持する（§25.4）。Select照合後のClosed→既存landing一回は維持。独立レビュー・full-lib・build-dev・実機確認とGitのstage／merge commitはcoordinatorへ引き継ぐ。**
+2026-10-27独立レビュー追補: **統合commit `1c134703b`に対する独立レビューはACCEPT WITH CHANGES（P2-1／P2-2）。受理済み移動の未提示中すべてに既存の共通入場拒否を適用し、前面操作のキー優先順と入場時のchrome終了を揃えた。新規5回帰を含む関連lib 1379件、通常／test-script check、audit、全UI snapshot 211件、glyph・整形検査は成功（§25.7）。新差分の独立再レビュー受入は未取得。統合時の成功記録は§25.6の履歴として保持する。Select照合後のClosed→既存landing一回は維持。独立再レビューと残工程はcoordinatorへ引き継ぐ。**
 
 作成: 2026-10-12 / Codex、基準: `next-tile` / `ea060b66e`。
 状態（2026-10-12〜13の履歴）: **R5 `a3bb1775b` は双方の構造合意済み。T1 `588fe1d76`、非PDF `f3d5cbe22` は実装・検証・独立ACCEPT。当時のmaster取込みの作業ファイルで競合を解消し、§1.377のowner-scoped API上にPDF／EPUBを接続、独立完了レビューACCEPT。最終検証・確認buildの記録は§20。今回の状態は冒頭追補と§25を参照。Gitのstage／merge commitはcoordinatorが行う。**
@@ -116,10 +116,13 @@ R3 の非アクティブ context への Select 破棄・一覧維持の契約は
 既定は **O（Overview、利用者決定2026-10-12）**。S は `FsSlideshow`、動画 S は `VideoTileMode` を維持し、
 今回のために再割当しない。コマンド設定・適格なリング／ジェスチャ候補・ヘルプにも同じ入口を出す。
 
-新規入場は既存`page_turn_barrier_active()`が示す`Turning`／`Completing`の間だけ受け付けない。
-Oを押しても一覧は開かず、通常flatの採用と受理済みcontinuationが完了してからもう一度押す。
+新規入場は既存`fs_navigation_sequence_blocks_new_target()`または`page_turn_barrier_active()`が
+示す受理済み移動の未提示中には受け付けない。animationのON／OFFは条件にしない。
+Oを押しても一覧は開かず、通常出力の採用と受理済みcontinuationの完了後にもう一度押す。
 HUD／リング／パッドも`open_page_overview_for_viewer`→`open_page_overview`の同じavailability／open受付を使う。
-入場要求を保留・自動再生せず、受付側からpage-turn ownerを取消・変更しない（§25.4）。
+入場とSelectは既存`page_overview_available()`を共有する。新しいpredicate・pending・replay・取消は追加しない。
+一般のnavigation lockにcurl限定の案内を流用せず、HUDのenabled判定はavailabilityを使い、
+理由は既存のoptional reasonだけとする（§25.7）。
 
 一覧用のローカル `KeyContext::FsPageOverview`（仮称）を設け、一覧の scope 集合を
 `[Global, FsCommon, FsPageOverview]` とする。FsImage / Rating は同時 active にしない。
@@ -342,7 +345,7 @@ keepalive tick を足さず、既存の window_id と表示先を使う。これ
 
 | 入口／終了 | 一覧 owner と副作用 |
 | --- | --- |
-| Open | 既存barrierがTurning／Completingなら入場せず、利用者が完了後に新しく押し直す。入場要求の待機・保留・replay・owner取消はしない。その他の適格性も通れば現在viewerのcanonical projectionを参照し、現在ページへcursor、可視需要をpublish。items再列挙／履歴writeはしない |
+| Open | 既存navigation-sequence／page-turn barrierが受理済み移動の未提示を示す間は入場せず、利用者が完了後に新しく押し直す。入場とSelectは同じpage_overview_availableを使用。入場要求の待機・保留・replay・owner取消はしない。その他の適格性も通れば現在viewerのcanonical projectionを参照し、現在ページへcursor、可視需要をpublish。items再列挙／履歴writeはしない |
 | Cancel / toggle | Closed へ。overview の需要だけを解除し、元のページと strip 設定へ戻す |
 | Select | stamp／binding／items・projection revision／incarnation／stable identity／処理時の実際のactive資格を既存経路で照合。全通過を受理とし、Closedにしてから既存landingをちょうど一度呼ぶ。照合不成立ならlandingも再activationもせず破棄し、Openを維持。landingの即時／Checking後許可／後着拒否／同期拒否は通常navigation ownerが扱い、一覧を再openしない |
 | Scroll / resize / columns | 同じ Open の表示範囲と bounded demand を更新。実ページの位置とグローバル grid サイズを変更しない |
@@ -1600,6 +1603,8 @@ coordinatorは「受理済みの移動を保持し、追加pendingを作らな�
 本記録の「case 2」は**新coordinator手順2（同期完了なし→入場拒否）**を指す。
 調査時の旧選択肢2（即退役・未提示flat／continuation取消）ではなく、その旧案は明示的に不採用とした。
 
+**独立レビュー後のcoordinator拡張判断（2026-10-27、P2-1）**: 入場拒否はcurlに限定せず、受理済み移動が未提示の間すべてへ適用する。既存`fs_navigation_sequence_blocks_new_target()`と`page_turn_barrier_active()`を既存`page_overview_available()`へまとめ、OpenとSelectが同じavailabilityを使う。Select側の重複navigation checkは除き、新しいpredicate・pending・replay・取消は作らない。一般のnavigation lockへ適合する新案内は追加せず、旧curl限定の理由文を外し、HUDはavailabilityと既存optional reasonでenabled／理由を分ける。この追補後の検証は§25.7へ集約する。
+
 - `page_turn_take_continuation`はaccepted receiptのframeが現在のctx frameより前であることを要求する。
   `SubmissionPlugin::output_hook`が描画後に出力を採用し、productionのcontinuation commitは
   次frameの`begin_page_turn_viewer_frame`で行われる。同frameで一覧に置き換えて同期完了する入口はない。
@@ -1676,6 +1681,8 @@ rendererが直接呼ぶ実`IsWindow`はfake hostを無効化するため、こ�
 
 ### 25.6 現行gate導入後の検証記録
 
+本節は統合commit `1c134703b`までの指定自動検証履歴。独立レビュー後のP2追補の結果は§25.7で別に扱う。
+
 対象の製品変更は`app/page_overview.rs`の既存`page_overview_unavailable_reason`へ加えた
 6行のbarrier gate。以下は新coordinator手順2の実装後に親担当が確定した結果で、§25.5以前の履歴と区別する。
 
@@ -1701,3 +1708,79 @@ rendererが直接呼ぶ実`IsWindow`はfake hostを無効化するため、こ�
 独立レビュー・full-lib・build-dev・実機確認はcoordinatorへ引き継ぐ。full-libとbuild-devは
 利用者の指示により今回の実行範囲から除外し、製品バイナリの起動も行っていない。
 指定範囲の自動検証完了をこれらの受入まで完了したとは扱わない。
+
+### 25.7 独立レビューP2追補の実装と検証
+
+統合commit `1c134703b`の独立レビューはACCEPT WITH CHANGES、指摘はP2-1／P2-2。
+以下はcoordinatorが採択した修正範囲。部分検証は成功し、最終関連libと整形検査の結果はまだ未確定。
+
+**P2-1: animationに依存しない、未提示の受理済み移動と一覧入場の境界**。
+curlだけの拒否ではanimation OFFの通常移動の表示待ちを保護できないため、§25.4追補の
+既存navigation-sequence／page-turn admissionを既存`page_overview_available()`へ集約する。
+OpenとSelectが同じ判定を使い、Selectの重複checkは除く。受理済み移動はそのまま保持し、
+入場要求を保留・replayせず、新しい取消・predicate・pendingを追加しない。
+実rendererでanimation OFF・uncachedのArrowRight→Display待ち→O拒否→raster到着→通常出力で
+既存owner退役→新しいO→End／Enter選択を通す回帰を親担当が追加した。
+
+**P2-2: 既存の前面キー優先順と、受理した一覧入場のchrome終了**。
+Oの処理を既存のfocused Slideshow／overflowの「次のキーで閉じる」処理の後へ揃える。
+棚卸しでは非focusedのspread／fitのApp bool panelも同じ旧hit領域を残すことを確認した。
+`dismiss_fs_transient_menu_state()`がspread／fit／panoramaのboolと、
+`dismiss_fs_overflow_panel()`経由のoverflowを終了する。通常`close_fullscreen`の既存4代入と、
+成功した`open_page_overview_for_viewer`だけがこの共通helperを使う。
+keyboardの次キーdismiss、HUD Close、HUD Overviewはoverflowだけを閉じる既存意味を
+`dismiss_fs_overflow_panel()`で共有する。受理したO／HUD／ring／gesture／padの共通入場は
+transient menu stateを終了するが、physical streamを維持する。ring全体を一括resetしない。
+拒否されたring入場は旧chromeを残し、通常キーのdismiss規則も従来のまま。
+
+| chromeの所有形態 | 入場時の扱いと保持する境界 |
+| --- | --- |
+| App boolのspread／fit／panoramaとoverflow | 上の既存終了helperを共用。受理入場だけで終了し、取消後に旧menuのhit領域を復活させない |
+| rotation／seek等のegui Popup | viewport所有の`Memory::end_pass`が、表示・keepされなくなったpopupを自然に退役させる。明示的popup closeは追加しない |
+| keyboardのseek popup | 既存ownerのキー優先順を維持し、Oを入場へ渡さない。非keyのring入場後は実viewerのowner pass終端で自然に閉じる |
+| right-click context／modal／overlay編集／picker | 既存availabilityが入場を拒否する。fullscreen tag pickerは既存common modalからany_dialog_openへ接続し、erase／local adjust／conceal／crop／SNS／textはis_overlay_edit_mode_activeの既存拒否を使う |
+| 通常のadjustment panel | 非focusedなら入場できる場合があるが、旧rectをfront-menu captureへ加えない。focused TextEdit／IMEでは既存keyboard ownerがOを止める |
+| metadata／info panelのlock・明示表示・hover | front-menu captureへ入らない。永続的なlockを維持し、旧menu captureとは扱わない。通常canvasのside-panel回避処理はoverview経路では使わない |
+| hover tooltip | vendorのPopupKind::Tooltip／Sense::hover、既定inactiveのArea／描画寿命を使う。永続的なopen-menu stateではなく、一括resetの対象にしない |
+
+`capture_fs_front_pointer_input`が読むのは`fs_front_menu_presented`とoverflow rectだけであり、
+adjustment mode／info／tag pickerはその集合に含まれない。durable side panelの一括resetはしない。
+
+`Popup::close_all`は兄弟viewportまで消すため使わず、root ctxへの明示popup close、
+新lookup・guard・stateは追加しない。Popupの自然退役を明示closeと表現しない。
+
+新規回帰は計5件。P2-1は`overview_real_viewer_o_during_unpresented_navigation_is_rejected_then_selects`。
+P2-2は`gamepad_input`の次の4件で、いずれも通常fullscreen／メイン内閲覧／active detachedを通す。
+
+- `overview_real_viewer_o_dismisses_overflow_before_tile_input_or_cancel`: 8ページ専用fixtureで旧overflow矩形へのclick／取消を検査。
+- `overview_real_viewer_o_finishes_nonfocused_top_menu_and_retains_info_lock`: spread／fit→O／取消とinfo lock保持を検査。
+- `overview_real_viewer_popup_lifecycle_keeps_seek_keys_then_retires_in_own_pass`: rotation／seek Popupを通常2frame keep後、Oまたはseekへの非key ring入場→owner pass終端→click／取消を検査。
+- `overview_real_viewer_gamepad_ring_entry_finishes_only_accepted_chrome_transition`: 実gamepad X ringの受理／拒否入場を検査。
+
+**追補後の検証（実装担当の確定結果）**:
+
+すべてのCargo runnerは`MSBUILDDISABLENODEREUSE=1`で実行し、最終結果JSON／ログにも同環境値を記録する。
+
+| 確認対象 | P2追補後の結果 |
+| --- | --- |
+| 新規5回帰のfocused（r4） | 5 passed／0 failed。コンパイル込みwall 125.51秒、テスト実行2.796秒 |
+| 通常core check | exit 0、133.89秒（lock待ちを含む） |
+| test-script core check | exit 0、30.59秒 |
+| audit | tool tests 69 passed、source監査違反0、run 82.49秒 |
+| UI snapshot全件 | 211 passed／0 failed／0 ignored、wall 166.88秒・テスト実行33.55秒。PNG変更なし |
+| UI glyph | 危険glyph 0 |
+| 整形 | 引数なしcargo fmtと最終cargo fmt --check成功。git diff --checkも成功 |
+| review-p2-related-final | exit 0、前回と同じ指定regexで1379 run／1379 passed／0 failed（1374＋新規5）。特定test除外なし、指定範囲外filter-skipped 13210件。wall 88.13秒、テスト実行86.267秒 |
+
+focused初回の5件中2失敗は、menu stateがClosedになった後のtile clickに関するfixtureだった。
+実装不備や旧layer残存を原因とせず、既存`advance_viewer_primary_pointer_frame`が最初のprimary downで
+focus復帰300msの抑止をarmする一方、通常warm fixtureが約0.27秒しか経ていなかったことを特定した。
+fixtureは既存focus timestampをnow−1秒へ設定し、`fs_prev_focused`をassertする。
+最初のdownで既存guard自身がtimestampを消費し、suppressionがinactiveであることをassertして、
+同じ最初のpress／releaseで選択する。sleep、製品guardの変更・迂回は行わない。
+既に要求済みのrepaintも反映し、Popup検査中は実Windowを描き続け、seek bar lockedをfixtureで設定する。
+focused r1以降の製品コード変更はなく、修正はこれらのfixture条件だけ。
+
+§25.6は統合時の履歴として保持する。P2追補の実装と指定自動検証は完了し、追加判断待ちはない。
+新しい差分の独立再レビュー受入はまだ得ていない。新たなfull-lib／build-dev／製品バイナリ起動は
+行っておらず、coordinator担当の残工程と区別する。

@@ -79714,16 +79714,13 @@ impl App {
         self.cancel_media_navigation_pending_for_current_context("close_fullscreen");
         // 表示モード / フィットのポップアップを開いたまま抜けると、次回フルスクリーンで
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
-        self.spread_popup_open = false;
-        self.fit_popup_open = false;
-        self.panorama_projection_popup_open = false;
         // The top bar's overflow panel belongs to this list for the same reason and was missing
         // from it: it is drawn only in fullscreen, and it holds the keyboard while it is open -
         // including the Esc that would close it. Leaving fullscreen by any other route (the
         // right-click close, the window's own close) strands it, with nothing on screen to show
         // why the application stopped responding. It survived until now only because changing
         // file clears it, which is luck rather than a rule.
-        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        self.dismiss_fs_transient_menu_state();
         self.cancel_mouse_ring_flick();
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();

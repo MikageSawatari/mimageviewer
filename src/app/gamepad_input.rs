@@ -51,12 +51,22 @@ mod overview_viewer_chrome_tests {
     }
 
     fn configure(app: &mut App, ctx: &egui::Context, root: &std::path::Path, mode: Mode) {
+        configure_page_count(app, ctx, root, mode, 4);
+    }
+
+    fn configure_page_count(
+        app: &mut App,
+        ctx: &egui::Context,
+        root: &std::path::Path,
+        mode: Mode,
+        page_count: usize,
+    ) {
         use crate::fs_animation::{FsCacheEntry, StaticAnimationState};
-        app.items = (0..4)
+        app.items = (0..page_count)
             .map(|idx| GridItem::Image(root.join(format!("page-{idx}.png"))))
             .collect();
-        app.image_metas = vec![Some((1, 1)); 4];
-        app.visible_indices = (0..4).collect();
+        app.image_metas = vec![Some((1, 1)); page_count];
+        app.visible_indices = (0..page_count).collect();
         app.current_folder = Some(root.to_path_buf());
         app.fullscreen_idx = Some(0);
         app.selected = Some(0);
@@ -72,7 +82,7 @@ mod overview_viewer_chrome_tests {
             (*pixels).clone(),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails = (0..4)
+        app.thumbnails = (0..page_count)
             .map(|idx| {
                 crate::grid_item::ThumbnailState::loaded_raster(
                     if idx == 0 {
@@ -107,7 +117,7 @@ mod overview_viewer_chrome_tests {
                 animation: StaticAnimationState::Still,
             },
         );
-        for idx in 0..4 {
+        for idx in 0..page_count {
             app.rotation_cache
                 .insert(idx, crate::rotation_db::Rotation::None);
         }
@@ -220,6 +230,40 @@ mod overview_viewer_chrome_tests {
         }
     }
 
+    fn key_press(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn white_canvas_rect(output: &egui::FullOutput) -> egui::Rect {
+        fn collect(shape: &egui::epaint::Shape, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == egui::Color32::WHITE => {
+                    rects.push(rect.rect);
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut rects);
+        }
+        rects
+            .into_iter()
+            .max_by(|left, right| left.area().total_cmp(&right.area()))
+            .expect("the configured WHITE CentralPanel must identify the actual viewer canvas")
+    }
+
     fn has_text(output: &egui::FullOutput, expected: &str) -> bool {
         fn contains(shape: &egui::epaint::Shape, expected: &str) -> bool {
             match shape {
@@ -298,6 +342,300 @@ mod overview_viewer_chrome_tests {
                 .all(|fill| fill.r() == 0 && fill.g() == 0 && fill.b() == 0),
             "later full-canvas shades must composite to black: canvas={canvas:?} fills={fills:?}"
         );
+    }
+
+    #[test]
+    fn overview_real_viewer_o_dismisses_overflow_before_tile_input_or_cancel() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for cancel in [false, true] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    // Fill the default columns so a real tile reaches the right-side
+                    // menu even in the widest fixture. Other tests keep four pages.
+                    let root = app.current_folder.clone().unwrap();
+                    configure_page_count(app, ctx, &root, mode, 8);
+                    app.viewer_navigation_caches.invalidate();
+                    app.settings.fullscreen_image_margin_color = [255; 3];
+                    frame(app, ctx, vec![]);
+                    app.apply_fs_overflow_open_request_for_test();
+                    let output = frame(app, ctx, vec![]);
+                    let old_menu = app
+                        .fullscreen_overflow_panel_rect_for_test(white_canvas_rect(&output))
+                        .unwrap();
+                    frame(app, ctx, vec![key_press(egui::Key::O)]);
+                    assert!(app.page_overview.session().is_some(), "{mode:?}");
+                    assert_eq!(
+                        app.fs_overflow_panel_state,
+                        crate::app::FsOverflowPanelState::Closed,
+                        "{mode:?}: O must finish the previous chrome before returning"
+                    );
+                    // Service the accepted action's existing repaint before measuring
+                    // the click target in the displayed overview.
+                    frame(app, ctx, vec![]);
+                    if cancel {
+                        frame(app, ctx, vec![key_press(egui::Key::Escape)]);
+                        assert!(app.page_overview.session().is_none());
+                        frame(app, ctx, vec![]);
+                        assert_eq!(
+                            app.fs_overflow_panel_state,
+                            crate::app::FsOverflowPanelState::Closed,
+                            "{mode:?}: cancelling overview must not resurrect the old menu"
+                        );
+                        assert_eq!(app.fullscreen_idx, Some(0));
+                    } else {
+                        let view = app.page_overview_view().unwrap();
+                        let layout = App::page_overview_cached_layout(ctx, &view).unwrap();
+                        let (ordinal, pos) = (1..view.projection.len())
+                            .find_map(|ordinal| {
+                                let overlap = layout
+                                    .cell_rect(ordinal, view.scroll_anchor)?
+                                    .intersect(old_menu)
+                                    .shrink(2.0);
+                                overlap.is_positive().then_some((ordinal, overlap.center()))
+                            })
+                            .expect("a non-current tile must overlap the old menu rectangle");
+                        assert!(old_menu.contains(pos));
+                        assert!(app.fs_prev_focused);
+                        // This is an already-focused viewer, not the first click used
+                        // to restore focus. Let the existing 300ms guard expire itself.
+                        app.fs_focus_regained_at = Some(Instant::now() - Duration::from_secs(1));
+                        frame(
+                            app,
+                            ctx,
+                            vec![
+                                egui::Event::PointerMoved(pos),
+                                pointer(pos, egui::PointerButton::Primary, true),
+                            ],
+                        );
+                        assert!(app.fs_focus_regained_at.is_none());
+                        assert!(!app.fs_primary_suppression.is_active());
+                        frame(
+                            app,
+                            ctx,
+                            vec![pointer(pos, egui::PointerButton::Primary, false)],
+                        );
+                        assert!(
+                            app.page_overview.session().is_none(),
+                            "{mode:?} ordinal={ordinal} pos={pos:?} old_menu={old_menu:?} layout={:?}",
+                            layout.viewport()
+                        );
+                        assert_eq!(app.fullscreen_idx, Some(ordinal), "{mode:?}");
+                        assert_eq!(
+                            app.fs_overflow_panel_state,
+                            crate::app::FsOverflowPanelState::Closed
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_o_finishes_nonfocused_top_menu_and_retains_info_lock() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for spread in [false, true] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    app.fs_info_panel.locked = true;
+                    frame(app, ctx, vec![]);
+                    app.spread_popup_open = spread;
+                    app.fit_popup_open = !spread;
+                    frame(app, ctx, vec![]);
+                    frame(app, ctx, vec![key_press(egui::Key::O)]);
+                    assert!(
+                        app.page_overview.session().is_some(),
+                        "{mode:?} spread={spread}"
+                    );
+                    assert!(!app.spread_popup_open && !app.fit_popup_open);
+                    assert!(app.fs_info_panel.locked);
+                    frame(app, ctx, vec![key_press(egui::Key::Escape)]);
+                    frame(app, ctx, vec![]);
+                    assert!(app.page_overview.session().is_none());
+                    assert!(!app.spread_popup_open && !app.fit_popup_open);
+                    assert!(
+                        app.fs_info_panel.locked,
+                        "{mode:?}: saved info lock must survive"
+                    );
+                    assert_eq!(app.fullscreen_idx, Some(0));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_popup_lifecycle_keeps_seek_keys_then_retires_in_own_pass() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for seek in [false, true] {
+                for cancel in [false, true] {
+                    fixture(mode, |app, ctx| {
+                        app.close_page_overview_with_ctx(ctx);
+                        app.settings.fullscreen_top_bar_locked = true;
+                        app.settings.fullscreen_seek_bar_locked = true;
+                        frame(app, ctx, vec![]);
+                        let popup = egui::Id::unique(if seek {
+                            "fullscreen_still_seek_strip"
+                        } else {
+                            "fs_rotation_btn"
+                        })
+                        .with("popup");
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            egui::Popup::open_id(ui.ctx(), popup);
+                            app.render_fullscreen_viewport(ui);
+                        }));
+                        // A second ordinary frame must keep the real popup alive;
+                        // merely seeding popup memory is not presentation evidence.
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            app.render_fullscreen_viewport(ui);
+                            assert!(
+                                egui::Popup::is_id_open(ui.ctx(), popup),
+                                "{mode:?} seek={seek}"
+                            );
+                        }));
+                        let input = viewer_input(app, vec![key_press(egui::Key::O)]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            assert!(egui::Popup::is_id_open(ui.ctx(), popup));
+                            app.render_fullscreen_viewport(ui);
+                        }));
+                        if seek {
+                            assert!(app.page_overview.session().is_none(), "seek popup owns O");
+                            // Non-key saved commands still use the common accepted
+                            // transition; popup retirement belongs to its renderer pass.
+                            let input = viewer_input(app, vec![]);
+                            let _ =
+                                crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                                    let _ = app.apply_ring_action(
+                                        ui.ctx(),
+                                        RingShortcutContext::ImageFullscreen,
+                                        RingActionId::ImagePageOverview,
+                                        "overview-popup-fixture",
+                                    );
+                                    app.render_fullscreen_viewport(ui);
+                                }));
+                        }
+                        assert!(
+                            app.page_overview.session().is_some(),
+                            "{mode:?} seek={seek}"
+                        );
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                            // Service the action's requested repaint while inspecting:
+                            // a no-render pass would abandon the embedded viewer Area.
+                            app.render_fullscreen_viewport(ui);
+                            assert!(
+                                !egui::Popup::is_id_open(ui.ctx(), popup),
+                                "{mode:?} seek={seek}: the abandoned owner popup must retire at end_pass"
+                            );
+                        }));
+                        if cancel {
+                            frame(app, ctx, vec![key_press(egui::Key::Escape)]);
+                            frame(app, ctx, vec![]);
+                            let input = viewer_input(app, vec![]);
+                            let _ =
+                                crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+                                    app.render_fullscreen_viewport(ui);
+                                    assert!(!egui::Popup::is_id_open(ui.ctx(), popup));
+                                }));
+                            assert!(app.page_overview.session().is_none());
+                            assert_eq!(app.fullscreen_idx, Some(0));
+                        } else {
+                            let view = app.page_overview_view().unwrap();
+                            let pos = App::page_overview_cached_layout(ctx, &view)
+                                .unwrap()
+                                .cell_rect(1, view.scroll_anchor)
+                                .unwrap()
+                                .center();
+                            assert!(app.fs_prev_focused);
+                            // Age the existing focus-restoration observation rather
+                            // than disabling its physical pointer-stream guard.
+                            app.fs_focus_regained_at =
+                                Some(Instant::now() - Duration::from_secs(1));
+                            frame(
+                                app,
+                                ctx,
+                                vec![
+                                    egui::Event::PointerMoved(pos),
+                                    pointer(pos, egui::PointerButton::Primary, true),
+                                ],
+                            );
+                            assert!(app.fs_focus_regained_at.is_none());
+                            assert!(!app.fs_primary_suppression.is_active());
+                            frame(
+                                app,
+                                ctx,
+                                vec![pointer(pos, egui::PointerButton::Primary, false)],
+                            );
+                            assert!(
+                                app.page_overview.session().is_none(),
+                                "{mode:?} seek={seek} pos={pos:?}"
+                            );
+                            assert_eq!(app.fullscreen_idx, Some(1));
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_real_viewer_gamepad_ring_entry_finishes_only_accepted_chrome_transition() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for accepted in [false, true] {
+                fixture(mode, |app, ctx| {
+                    app.close_page_overview_with_ctx(ctx);
+                    app.settings.gamepad_enabled = true;
+                    app.note_input_surface(crate::app::ActionSurface::Viewer);
+                    app.settings.ring_shortcuts.image.slots[RingDirection::Up.slot_index()] =
+                        RingActionId::ImagePageOverview;
+                    frame(app, ctx, vec![]);
+                    app.apply_fs_overflow_open_request_for_test();
+                    frame(app, ctx, vec![]);
+                    // An actual saved command is refused by the common availability
+                    // gate without dismissing the previous menu on that path.
+                    app.show_preferences = !accepted;
+                    if !accepted {
+                        let input = viewer_input(app, vec![]);
+                        let _ = crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
+                            assert!(
+                                app.apply_ring_action(
+                                    ctx,
+                                    RingShortcutContext::ImageFullscreen,
+                                    RingActionId::ImagePageOverview,
+                                    "overview-overflow-fixture",
+                                )
+                                .is_none()
+                            );
+                        }));
+                        assert!(app.page_overview.session().is_none());
+                        assert_eq!(
+                            app.fs_overflow_panel_state,
+                            crate::app::FsOverflowPanelState::Root
+                        );
+                    }
+                    gamepad_frame(
+                        app,
+                        ctx,
+                        &[
+                            PadEvent::ButtonPressed(PadButton::West),
+                            PadEvent::ButtonPressed(PadButton::DPadUp),
+                        ],
+                    );
+                    gamepad_frame(app, ctx, &[PadEvent::ButtonReleased(PadButton::West)]);
+                    assert_eq!(app.page_overview.session().is_some(), accepted, "{mode:?}");
+                    assert_eq!(
+                        app.fs_overflow_panel_state,
+                        if accepted {
+                            crate::app::FsOverflowPanelState::Closed
+                        } else {
+                            crate::app::FsOverflowPanelState::Root
+                        },
+                        "{mode:?} accepted={accepted}"
+                    );
+                });
+            }
+        }
     }
 
     #[test]

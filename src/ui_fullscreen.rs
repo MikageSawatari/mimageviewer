@@ -34443,17 +34443,6 @@ impl App {
             action.page_transition = self.fs_page_transition_after_overview_input(fs_idx);
             return action;
         }
-        if !self.ime_input_active(ctx)
-            && !owner.blocks_legacy_keymap_shortcuts()
-            && self.page_overview_available()
-            && self
-                .keymap
-                .consume_action_no_repeat(ctx, KeyAction::FsPageOverviewToggle)
-        {
-            self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
-            return action;
-        }
-
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::mark_action_pass_eligible(ctx);
 
@@ -34476,7 +34465,18 @@ impl App {
                     .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
             })
         {
-            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            self.dismiss_fs_overflow_panel();
+        }
+
+        if !self.ime_input_active(ctx)
+            && !owner.blocks_legacy_keymap_shortcuts()
+            && self.page_overview_available()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::FsPageOverviewToggle)
+        {
+            self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
+            return action;
         }
 
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
@@ -37107,13 +37107,14 @@ impl App {
             let (label, status, enabled, disabled_reason) = match item {
                 FullscreenOverflowItemId::PageOverview => {
                     let reason = self.page_overview_unavailable_reason();
+                    let enabled = self.page_overview_available();
                     (
                         self.keymap.first_chord_bracket_label(
                             item.label(),
                             KeyAction::FsPageOverviewToggle,
                         ),
                         String::new(),
-                        reason.is_none(),
+                        enabled,
                         reason,
                     )
                 }
@@ -37486,6 +37487,17 @@ impl App {
         self.apply_fs_overflow_panel_action(ctx, &view, is_spread_double, action);
     }
 
+    pub(crate) fn dismiss_fs_overflow_panel(&mut self) {
+        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+    }
+
+    pub(crate) fn dismiss_fs_transient_menu_state(&mut self) {
+        self.spread_popup_open = false;
+        self.fit_popup_open = false;
+        self.panorama_projection_popup_open = false;
+        self.dismiss_fs_overflow_panel();
+    }
+
     fn apply_fs_overflow_panel_action(
         &mut self,
         ctx: &egui::Context,
@@ -37500,7 +37512,7 @@ impl App {
                 self.start_local_composition_editor(ctx);
             }
             FsOverflowPanelAction::Close => {
-                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                self.dismiss_fs_overflow_panel();
             }
             FsOverflowPanelAction::Back => {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
@@ -37510,7 +37522,7 @@ impl App {
                     self.fs_overflow_panel_state = FsOverflowPanelState::SpreadAdjustment;
                 }
                 FullscreenOverflowItemId::PageOverview => {
-                    self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                    self.dismiss_fs_overflow_panel();
                     self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
                 }
                 FullscreenOverflowItemId::NavigatorToggle => {
@@ -37639,6 +37651,14 @@ impl App {
         } else {
             FsOverflowPanelState::Root
         };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fullscreen_overflow_panel_rect_for_test(
+        &self,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
     }
 
     pub(crate) fn fs_touch_tap_zones_enabled(&self) -> bool {

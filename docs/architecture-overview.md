@@ -163,7 +163,7 @@ volatileを反映する。非resident ownerも対象とし、同keyの未確定d
 
 ---
 
-### 閲覧中のページ一覧 (§1.340、2026-10-27 master統合・指定自動検証済み)
+### 閲覧中のページ一覧 (§1.340、2026-10-27 独立レビューP2追補・指定自動検証済み)
 
 `PageOverviewState::Closed | Open(PageOverviewSession)` は `ViewerContextBundle` が所有し、
 mount / deposit で状態と incarnation を移譲する。独立 fork は Closed で開始し、
@@ -173,16 +173,28 @@ immutable metadata を作り、`ViewerNavigationCaches` が現在の実ページ
 通常 fullscreen、メイン内閲覧、F12連動窓、独立窓は同じ描画・入力・ページ着地の境界を使う。
 passive は `StillImage | PageOverview` の投影を持ち、全実ページ metadata の Arc と
 可視近傍の bounded texture だけを保持する。全ページ画像の生成や別の navigation owner は作らない。
-新規入場は既存のavailability／open受付で`page_turn_barrier_active()`のTurning／Completingを拒否する。
-同期的なflat完了経路が無いため、受理済み移動と既存continuationの完了を維持し、利用者が完了後に
+新規入場とSelectは既存`page_overview_available()`にまとめた
+`fs_navigation_sequence_blocks_new_target()`／`page_turn_barrier_active()`を共用する。
+animationのON／OFFに依存せず、受理済み移動が未提示の間は入場を拒否する。
+受理済み移動と既存continuationの完了を維持し、利用者が完了後に
 O／HUD／ring／padをもう一度操作する。全入口は`open_page_overview_for_viewer`→`open_page_overview`へ
 通し、保留・replay・新しい取消ownerを追加しない。2026-10-27の新coordinator手順2
-（同期完了なし→入場拒否）で、旧選択肢2の即退役は不採用。指定自動検証は同§25.6で成功した。
+（同期完了なし→入場拒否）を独立レビューP2-1で通常の表示待ちにも拡張し、旧選択肢2の即退役は不採用。
+新しいpredicate・pending・replay・取消は作らない。既存前面操作のキー優先順と、共通入場受理時の
+chrome終了はP2-2で揃える。`dismiss_fs_transient_menu_state()`はApp boolのspread／fit／panoramaと
+overflowを終了し、通常closeと受理入場が共用する。次キー／HUDのoverflow-only終了は
+`dismiss_fs_overflow_panel()`で維持する。egui Popupは所有viewportの`Memory::end_pass`で自然に退役し、
+明示的な全viewport closeを足さない。physical streamとinfo lock、拒否入場のchromeを保持する。
+front captureは`fs_front_menu_presented`とoverflow rectに限り、通常adjustment／metadata／infoは含めない。
+tag pickerとoverlay編集の既存入場拒否、TextEdit／IMEのkeyboard ownerは維持し、durable panelや
+hover tooltipの寿命を一括resetで置き換えない。
+追補後の指定自動検証は同§25.7で成功。新差分の独立再レビューはcoordinatorへ引き継ぐ。
 
 PDF／EPUBの要求・昇格も、master取込み後に§1.377の既存 `PdfRenderEpochOwner`／ticket、
 `promote_viewer_pdf_keys`／`PdfVisiblePromotionState` へ接続済み。別の要求ownerは作らない。
 接続・最終修正の独立レビューはACCEPT。full 1回で見つかった環境／fixture／回帰を補完済みで、実機受入は未完了。
-これは2026-10-12〜13の検証履歴。今回統合後の指定自動検証は§25.6で成功し、未merge。
+これは2026-10-12〜13の検証履歴。§25.6の指定自動検証は統合commit `1c134703b`までの履歴で、
+独立レビューP2追補後の成功証拠とはしない。
 独立レビュー・full-lib・build-dev・実機確認はcoordinatorへ引き継ぐ。
 2026-10-27のmaster統合では構成採用後の可視実items順とhiddenを反映し、
 白紙補助annotationは`None`のまま未接続とする。

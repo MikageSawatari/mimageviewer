@@ -159,12 +159,6 @@ impl App {
         ) {
             return Some("動画・音声ではページ一覧を開けません");
         }
-        // The existing owner must adopt its canonical flat and commit any
-        // accepted navigation before the overview can replace the page canvas.
-        // Refuse this entrance; never queue an overview or retire presentation.
-        if self.page_turn_barrier_active() {
-            return Some("ページめくりが終わってからページ一覧を開いてください");
-        }
         if self.ring_picker.is_some()
             || self.gamepad_favorite_picker.is_some()
             || self.gamepad_location_picker.is_some()
@@ -205,7 +199,12 @@ impl App {
     }
 
     pub(crate) fn page_overview_available(&mut self) -> bool {
-        self.page_overview_unavailable_reason().is_none()
+        // Replacing the page canvas would strand either owner's unpresented
+        // target. Use the same navigation admission as Select, without queuing
+        // an overview or cancelling the accepted move.
+        !self.fs_navigation_sequence_blocks_new_target()
+            && !self.page_turn_barrier_active()
+            && self.page_overview_unavailable_reason().is_none()
     }
 
     /// Actual active ownership is distinct from a temporary registry projection.
@@ -377,9 +376,7 @@ impl App {
                 ) else {
                     return false;
                 };
-                if !self.page_overview_available()
-                    || self.fs_navigation_sequence_blocks_new_target()
-                {
+                if !self.page_overview_available() {
                     return false;
                 }
                 let Some(current_idx) = self.fullscreen_idx else {
