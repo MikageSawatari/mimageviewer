@@ -417,12 +417,17 @@ vendor/egui-wgpu/src/startup_diagnostics.rs
 状態: 実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)。
 現行§1.448の `native_adapter_candidates` は既に `is_surface_supported` で候補を除外し、
 対応候補なしはAdapterSelectionのErrにしているため、候補選択・APIの試行順は変更しない。
-残る `get_default_config(...).expect(...)` を `UnsupportedSurface` Errへ変え、
-初期surface設置から `run_native` へ返す。GPU名/backendと失敗段階SurfaceCapabilitiesを
-既存§1.428/§1.448の失敗ダイアログ・ログへ渡す。ゼロ寸法でも対応確認だけ行い、configureはしない。
-runtimeのresize/再設定は同じhelperで失敗を記録してその操作を終える。多段の回復は追加しない。
-初期installが失敗した場合は、対象surfaceとdepth/MSAAだけを既存のremove helperで除去する。
-set_windowのErrをlogして続行するvendorのviewport呼出元へ、未設定surfaceを公開したまま残さない。兄弟viewportは変更しない。
+残る `get_default_config(...).expect(...)` のErr化は、最初のroot surface設置に限る。
+GPU名/backendと失敗段階SurfaceCapabilitiesを既存§1.428/§1.448の失敗ダイアログ・保存ログへ渡す。
+初回rootがゼロ寸法の場合も対応確認だけ行い、configure自体はしない。
+
+独立レビューP2へのcoordinator判断により、実行中の新規/immediate/detached viewport、root再設置、
+resize/再設定/モニター移動等は変更前のexpectによるpanicへ戻す。起動観測がpendingでも、
+それだけではErr化しない。rootかつrender stateを初めて生成するinstall入口でのみ失敗方針を選び、
+runtime入口は常にpanicとする。新しい永続flag・viewport stateは持たない。
+失敗surface/depth/MSAAを除去して描画を続ける仕組みと、そのためのhelper/testは撤去する。
+起動後の資源寿命は変更前と同じなので、detached計画§11の追加記録は不要 (coordinator判断)。
+初回rootのErrは既存のrun_native終了処理でPainterごと終了し、続行や再試行はしない。
 
 coordinator判断: 既定uncaptured-error handlerのpanicは今回は変えず、起動中止の伝播経路を追加しない (§1.448と同じ)。
 単にloggerへ送るhandlerへの置換は、不正なGPU状態で処理が続くため採らない。
@@ -442,12 +447,13 @@ Err/GPU名/段階と成功値・startup通知の範囲をvendorテストで検�
   押下中/ドラッグ中/取消済みと開始button・開始値・最新値は `OverlaySliderDrag` が所有する。実releaseはreceiptの位置で確定し、取消は開始値へ戻す。
 - 音楽seekのwidget所有がEscapeで先に消えても、取消receiptの処理前に開始値を捨てない。取消後のmove/releaseから再取得しない。
   音楽のfocusを保った未通知capture喪失は現状維持、上位Escapeの配送/終了規則は変更しない (coordinator判断)。
-- 新規テストは10関数: native実overlay/batchでrelease→後続moveとcapture喪失/Escape、音楽実HUD行でrelease→後続move/別buttonとEscape、
+- 前回8cbf9e38eで加えたテストは10関数: native実overlay/batchでrelease→後続moveとcapture喪失/Escape、音楽実HUD行でrelease→後続move/別buttonとEscape、
   音楽seek handlerでrelease/Escape (HUD計5関数)。Primary/Secondaryのdragを維持し、Secondaryのクリックだけでは値変更しないことも同じfixtureで検査する。
   製品失敗通知のGPU名/SurfaceCapabilitiesが1関数、vendorのNone注入/成功値・通知範囲とinstall失敗時の自context除去/成功時の資源保持が4関数。
   §1.192の既存pass境界・省略/非対話HUD・§1.448/§1.428の既存回帰も維持する。
+  このうちruntimeの失敗資源除去に関する2関数は、独立レビューP2の方針変更に従い撤去した (§12.4)。
 
-### 12.2 旧動作でのREDと最終自動検証
+### 12.2 旧動作でのREDと自動検証 (8cbf9e38e時点の履歴)
 
 HEAD `7a8a25b06`、ブランチ `hud-gpu-1440-1441-1429` の未コミット差分を検証。全build/testで `MSBUILDDISABLENODEREUSE=1`。
 初回native依存を直列で用意した後、最終検証は `CARGO_BUILD_JOBS=24`。
@@ -487,7 +493,7 @@ HEAD `7a8a25b06`、ブランチ `hud-gpu-1440-1441-1429` の未コミット差�
 製品バイナリは起動せず、通常profileの設定DBなどをテスト準備で操作していない。依頼どおり本体lib全件とbuild-devは未実施。
 uncaptured-error handlerの既定panicと音楽の未通知capture喪失は、追加判断待ちではなくcoordinator採択済みの維持範囲。
 
-### 12.3 変更ファイル (16ファイル)
+### 12.3 前回実装8cbf9e38eの変更ファイル (16ファイル)
 
 ```text
 docs/README.md
@@ -505,5 +511,63 @@ src/video/native_presenter/slider_terminal_tests.rs
 src/video/native_touch.rs
 vendor/egui-wgpu/PATCHES.md
 vendor/egui-wgpu/src/lib.rs
+vendor/egui-wgpu/src/winit.rs
+```
+
+### 12.4 独立レビューの修正 (8cbf9e38e後)
+
+- P2: Err化を初回root installだけへ限定。runtimeの「logだけで戻る」「失敗資源を外して続行」を撤去し、
+  従来のexpect panicへ戻した。既存の製品panic.log経路とuncaptured-error handlerは変更しない。
+- root初回/既存render stateのroot/childそれぞれの方針と、起動観測pending中のruntime panicをGPU不要のNone注入で検査する。
+  runtimeのconfigure/resize入口は従来と同じvoid契約を維持し、Errを握り潰すcall siteは残さない。
+- 起動失敗の保存証明: 一時data-dirのlogsへ製品loggerの実writerを設定し、実NativeExit.recordと実finish_logsを通す。
+  run_nativeのUnsupportedSurface Errを注入し、GPU名・SurfaceCapabilities・終了ログがファイルに保存された後に
+  同じGPU名/段階/ログフォルダーを含む通知本文が届くことを検査する。scripted_runでも保存し、通知だけを抑止する。
+  OnceLockを隔離する単体テスト子processを用い、製品exe・HWND・実MessageBox・通常profileは使わない。
+  logger.rsのdependency target filterを広げず、製品の直接logger::log経路で保存されることを確認する。
+- P3 (タッチ): 音楽HUDのMove=A/End=BでAが採用される残件は§1.441へ明記した。native動画側はBを使う。
+  全eguiタッチへの影響を避けるcoordinator判断に従い、v4.9.0ではegui-winitのTouch End処理を変更しない。
+- P3 (detached記録): 起動後のviewport資源寿命の変更を撤去したため、§11への追加記録は行わない。
+
+§12.2は前回の検証履歴。今回の最終結果は以下 (HEAD 8cbf9e38eからの未コミット差分)。
+全build/testでMSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=24。
+実引数・exit・所要時間はtarget/hud-gpu-validation/review-*.json、stdout/stderrは同名logへ保存。
+初回vendor checkは既存test fixtureがconfigure_surfaceの旧引数形を使うためE0061。
+runtime入口を元のvoid契約/引数形へ戻して再検査した (test fixture側の変更なし)。
+
+| 検証 | exit | 結果 |
+| --- | ---: | --- |
+| cargo fmt (引数なし) | 0 | 成功。`review-fmt.log` |
+| 通常core check | 0 | 成功。`review-check.log` |
+| test-script core check | 0 | 成功。`review-check-script.log` |
+| 関連nextest (前回範囲 + 製品logger target filterの既存検査) | 0 | 728件、728 passed, 13890 skipped。`review-focused.log` |
+| 関連nextest (test-script、前回範囲) | 0 | 36件、36 passed, 14728 skipped。`review-focused-script.log` |
+| cargo test -p mimageviewer --test ui_snapshot | 0 | 213成功 / 0失敗。`review-snapshot.log` |
+| egui-wgpu nextest (winit / lib、全件) | 0 | 48件、48 passed, 0 skipped。`review-vendor.log` |
+| viewer context audit | 0 | 指摘0件。`review-audit.log` |
+| cargo fmt --check | 0 | 成功。`review-fmt-check.log` |
+| 変更vendorのrustfmt --check | 0 | 成功。`review-vendor-fmt.log` |
+| UI glyph check | 0 | 危険グリフ0件。`review-glyphs.log` |
+| git diff --check | 0 | 成功。`review-whitespace.log` |
+
+保存ログの検査は一時data-dirのlogs/mimageviewer.logを実writerで作り、実record/finish_logsを経由する。
+子processは同じlib test exeのexactなignored helperだけを起動する (parentは通常nextest対象)。
+MessageBoxのOS呼出だけをcaptureへ置換し、保存済みのファイルとGPU名・段階・API案内・ログフォルダーを含む通知本文を照合した。
+通常/feature付きの両方でdialog/scriptモードを検査し、scriptはログ保存を保って通知だけを出さない。
+vendorはNone注入で初回root Err、child/root再設置のpanic、起動観測pending中でもruntimeはpanicであることを検査した。
+以前の資源除去/保持に関する2件を撤去し、限定方針の検査1件を追加したためvendor全件は49→48件。
+
+HUDコードとegui-winitのタッチ処理は変更していない。起動後の資源寿命を戻したためdetached計画§11の追加記録なし。
+製品は起動せず、通常profileをテスト準備で操作していない。本体lib全件/build-devは前回同様ClaudeCodeへ引き継ぐ。
+実GPUでの非対応surfaceと実MessageBoxの表示は未実施。既定uncaptured-error handlerは変更しない。
+
+今回の変更ファイルは6件:
+
+```text
+docs/README.md
+docs/gpu-init-fallback-plan.md
+docs/next-release-backlog.md
+src/run_native_failure.rs
+vendor/egui-wgpu/PATCHES.md
 vendor/egui-wgpu/src/winit.rs
 ```

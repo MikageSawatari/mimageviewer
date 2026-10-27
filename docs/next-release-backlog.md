@@ -241,6 +241,9 @@
 - §1.448 で候補の surface 対応確認済みと確認。残る vendor の default configuration の `expect` を Err に変え、GPU名・SurfaceCapabilities段階を既存の失敗通知へ渡す。
   uncaptured-error handler の既定panicは維持する (coordinator判断)。実装・検証は `gpu-init-fallback-plan.md` §12。
 
+- 独立レビューP2対応: Err化は起動時rootの初回installに限定。起動後のviewport作成/resize/再設定は従来のexpect panicへ戻し、
+  失敗資源を外して続行する処理を撤去する。root起動Errの実logger保存・通知への接続を一時ログで検査する。
+
 ### 1.423 画像を WIC が開いている最中にごみ箱へ送ると、削除が一時的に失敗し得る — テスト基盤の作業中のコード調査 (2026-10-23)
 
 - 出どころ: テスト基盤 (§1.420 / §1.389) のセッションのコード調査。実際の失敗は観測されていない (未確認)。
@@ -1763,6 +1766,10 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
 
 - 音楽seekも音量と同じ終端helperで実release座標を採用し、届いたEscapeでは開始位置へ戻す。
   既存のfullscreen側Escape配送・終了規則は変更しない。
+
+- 残り: タッチの終端座標 (egui-winit の Touch End が終端座標でポインターを更新しない)、v4.9.0 では未対応。
+  コード上、Move=A / End=B のとき音楽HUDはAを採用する (native動画側はB) と独立レビューで指摘。
+  全eguiのタッチ操作への影響を避けるcoordinator判断により、今回は変更しない。
 
 ### 1.442 HUD の減光中に終わったドラッグに、終わりが届かない (2026-10-24)
 

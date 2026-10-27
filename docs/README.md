@@ -12,7 +12,7 @@
 | [section445-stepped-slider-input.md](section445-stepped-slider-input.md) | §1.445、GPUメモリ上限などの手入力。eguiの編集状態とstep丸めの原因、共通修正、兄弟欄とheadless回帰・検証記録 |
 | [section443-font-color-fix.md](section443-font-color-fix.md) | §1.443、単色 EBDT 字形のカラー誤判定。epaint 0.37 の vendor 差分、実フォント・mesh 回帰と検証記録 |
 | [gpu-init-fallback-plan.md](gpu-init-fallback-plan.md) | §1.448 GPU 初期化と§12の§1.429 surface設定失敗。`--gpu-backend`、DX12 の FXC 固定、初回 device 作成だけの DX12 → Vulkan 有限選択、試行別診断と起動中だけの Error 保存。報告環境の原因や改善は未確認 |
-| [render-init-failure-report-plan.md](render-init-failure-report-plan.md) | §1.428 run_nativeのErr終了。watchdog休止・原因連鎖の記録・cleanup・終了flush後のnative通知、script自動実行時の表示抑止と検証記録。surface設定失敗は§1.429でErrへ接続し、uncaptured-error handlerのpanicは対象外 |
+| [render-init-failure-report-plan.md](render-init-failure-report-plan.md) | §1.428 run_nativeのErr終了。watchdog休止・原因連鎖の記録・cleanup・終了flush後のnative通知、script自動実行時の表示抑止と検証記録。初回rootのsurface設定失敗は§1.429でErrへ接続し、起動後のsurface失敗とuncaptured-error handlerは従来のpanicを維持 |
 | [detached-snapshot-reader-plan.md](detached-snapshot-reader-plan.md) | 2026-10-15利用者採択はC1だけ。独立reader／promote後の受動更新を停止、能動Operation／BookAppend系の由来は要求・保留・完了・restartまで既存cause型で保持。整理完了もOperationへ接続。関連970件成功、fmt・通常／portable check成功。full一回は音声pumpの1件失敗・単独では成功、vendor gate未実施。実装・検証記録は§9。linked中は変更なし。案Aは履歴・source／main-owner境界だけ参照、C2／C3は今回対象外 |
 | [coding-conventions.md](coding-conventions.md) | CLAUDE.md から分けたコーディング規約の全文。UI・ダイアログ・パネル・IME・スクロール・配色・並行処理・UI スレッドの I/O・グリフ・外部ツール向けテキストを触るとき |
 | [native-dependencies.md](native-dependencies.md) | CLAUDE.md から分けたネイティブ依存物の管理。vendor/ の復旧、PDFium・ONNX Runtime・Susie・FFmpeg・LibRaw・VST3 bridge の更新やビルド |
