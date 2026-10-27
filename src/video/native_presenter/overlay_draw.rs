@@ -7457,6 +7457,14 @@ pub(crate) fn overlay_slider_value(
     value_at: impl Fn(egui::Pos2) -> f64,
 ) -> Option<(f64, bool)> {
     use crate::video::native_touch::NativePointerTermination;
+    let owner = crate::video::native_touch::OverlaySliderOwner::new(&response.ctx, response.id);
+    // Retire the previous presentation before interpreting any input. The last
+    // preview value stays applied, just as when the view was closed in master.
+    if let Some(owned) = drag
+        && !owned.renew(owner)
+    {
+        *drag = None;
+    }
     let button = drag.map(|drag| drag.button()).unwrap_or_else(|| {
         response
             .ctx
@@ -7488,6 +7496,11 @@ pub(crate) fn overlay_slider_value(
             .unwrap_or(egui::PointerButton::Primary)
     });
     let termination = termination.and_then(|end| end.for_button(button));
+    let fresh_press = response.ctx.input(|i| {
+        i.events.iter().any(|event| matches!(event,
+            egui::Event::PointerButton { button: pressed, pressed: true, .. } if *pressed == button
+        ))
+    });
     if matches!(drag, Some(OverlaySliderDrag::Cancelled { .. })) {
         if matches!(termination, Some(NativePointerTermination::Released { .. }))
             || !response.ctx.input(|i| i.pointer.button_down(button))
@@ -7496,11 +7509,9 @@ pub(crate) fn overlay_slider_value(
         }
         return None;
     }
-    if drag.is_none()
-        && response.is_pointer_button_down_on()
-        && response.ctx.input(|i| i.pointer.button_down(button))
-    {
+    if drag.is_none() && response.is_pointer_button_down_on() && fresh_press {
         *drag = Some(OverlaySliderDrag::Pressed {
+            owner,
             button,
             original: current,
         });
@@ -7516,7 +7527,7 @@ pub(crate) fn overlay_slider_value(
                 *drag = response
                     .ctx
                     .input(|i| i.pointer.button_down(button))
-                    .then_some(OverlaySliderDrag::Cancelled { button });
+                    .then_some(OverlaySliderDrag::Cancelled { owner, button });
                 Some((original, true))
             }
             (
@@ -7527,10 +7538,20 @@ pub(crate) fn overlay_slider_value(
                 *drag = response
                     .ctx
                     .input(|i| i.pointer.button_down(button))
-                    .then_some(OverlaySliderDrag::Cancelled { button });
+                    .then_some(OverlaySliderDrag::Cancelled { owner, button });
                 None
             }
-            (_, NativePointerTermination::Released { pos, .. }) => Some((value_at(pos), true)),
+            // The owner was created by this Response's drag_started and renewed
+            // above. egui drag_stopped is not button-specific: another button's
+            // release may have stopped it while our button remains held.
+            (OverlaySliderDrag::Active { .. }, NativePointerTermination::Released { pos, .. }) => {
+                Some((value_at(pos), true))
+            }
+            (OverlaySliderDrag::Pressed { .. }, NativePointerTermination::Released { pos, .. })
+                if response.clicked() =>
+            {
+                Some((value_at(pos), true))
+            }
             _ => None,
         };
     }
@@ -7541,26 +7562,35 @@ pub(crate) fn overlay_slider_value(
         return None;
     }
     if response.clicked()
+        && fresh_press
         && let Some(NativePointerTermination::Released { pos, .. }) = termination
     {
         return Some((value_at(pos), true));
     }
-    if (response.clicked() || response.dragged_by(button))
+    if ((response.clicked() && fresh_press) || response.dragged_by(button))
         && let Some(pos) = response.interact_pointer_pos()
     {
         let value = value_at(pos);
-        if let Some(
-            OverlaySliderDrag::Pressed { original, .. }
-            | OverlaySliderDrag::Active { original, .. },
-        ) = *drag
-        {
+        let original = match *drag {
+            Some(OverlaySliderDrag::Pressed { original, .. })
+                if response.drag_started_by(button) =>
+            {
+                Some(original)
+            }
+            Some(OverlaySliderDrag::Active { original, .. }) => Some(original),
+            _ => None,
+        };
+        if let Some(original) = original {
             *drag = Some(OverlaySliderDrag::Active {
+                owner,
                 button,
                 original,
                 last: value,
             });
+            return Some((value, response.clicked()));
         }
-        return Some((value, response.clicked()));
+        // A still-held button after an omitted pass is not a fresh gesture.
+        return (response.clicked() && fresh_press).then_some((value, true));
     }
     None
 }
@@ -7667,6 +7697,7 @@ pub(crate) fn draw_overlay_volume_slider(
     });
     // Keep the existing primary double-click reset, except in a cancelled gesture.
     if vol_resp.double_clicked()
+        && result.is_some()
         && !was_cancelled
         && !matches!(
             termination,

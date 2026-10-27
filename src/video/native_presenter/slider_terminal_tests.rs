@@ -56,3 +56,97 @@ fn hud_slider_native_capture_loss_and_escape_restore_original_once() {
         assert!(target.state.last_volume_target.is_none());
     }
 }
+
+#[test]
+fn hud_slider_native_source_or_mode_reset_retires_volume_and_seek() {
+    for seek in [false, true] {
+        let mut target = target(false);
+        let name = if seek {
+            "native_video_seek_hit"
+        } else {
+            "native_video_volume"
+        };
+        let start = press_focused_hud_control(&mut target, name);
+        pointer(&mut target.state, start + egui::vec2(20.0, 0.0));
+        frame(&mut target.state);
+        assert!(if seek {
+            target.state.seek_row_gesture.is_some()
+        } else {
+            target.state.last_volume_target.is_some()
+        });
+        // Both source replacement and video/audio mode changes call this owner.
+        target.state.reset_side_panel_session();
+        assert!(target.state.last_volume_target.is_none());
+        assert!(target.state.seek_row_gesture.is_none());
+        let other = target
+            .state
+            .egui_ctx
+            .read_response(egui::Id::unique("native_video_play"))
+            .unwrap()
+            .rect
+            .center();
+        let run = run_native_event_batch(&mut target, &[up(other), moved(other)]).unwrap();
+        assert!(!run.commands.iter().any(|c| matches!(
+            c,
+            NativeOverlayCommand::SetVolume { .. } | NativeOverlayCommand::Seek { .. }
+        )));
+        let run = run_native_event_batch(
+            &mut target,
+            &[
+                mouse(other, true, NativeVideoMouseButton::Left, false),
+                up(other),
+            ],
+        )
+        .unwrap();
+        assert!(
+            run.commands
+                .iter()
+                .any(|c| matches!(c, NativeOverlayCommand::TogglePlay))
+        );
+        assert!(!run.commands.iter().any(|c| matches!(
+            c,
+            NativeOverlayCommand::SetVolume { .. } | NativeOverlayCommand::Seek { .. }
+        )));
+    }
+}
+
+#[test]
+fn hud_slider_native_hidden_hud_ends_volume_before_redisplay() {
+    let mut target = target(false);
+    let start = press_focused_hud_control(&mut target, "native_video_volume");
+    pointer(&mut target.state, start + egui::vec2(20.0, 0.0));
+    frame(&mut target.state);
+    assert!(target.state.last_volume_target.is_some());
+    target
+        .state
+        .set_bar_lock_state(crate::video::NativeBarLockState::default());
+    pointer(&mut target.state, egui::pos2(640.0, 360.0));
+    let hidden = frame(&mut target.state);
+    assert!(!hidden.hud_visible);
+    assert!(target.state.last_volume_target.is_none());
+    let run = run_native_event_batch(&mut target, &[up(egui::pos2(0.0, 360.0))]).unwrap();
+    assert!(
+        !run.commands
+            .iter()
+            .any(|c| matches!(c, NativeOverlayCommand::SetVolume { .. }))
+    );
+    target
+        .state
+        .set_bar_lock_state(crate::video::NativeBarLockState {
+            bottom_lock: BottomBarLock::BarAndStrip,
+            ..Default::default()
+        });
+    frame(&mut target.state);
+    let other = press_focused_hud_control(&mut target, "native_video_play");
+    let run = run_native_event_batch(&mut target, &[up(other)]).unwrap();
+    assert!(
+        run.commands
+            .iter()
+            .any(|c| matches!(c, NativeOverlayCommand::TogglePlay))
+    );
+    assert!(
+        !run.commands
+            .iter()
+            .any(|c| matches!(c, NativeOverlayCommand::SetVolume { .. }))
+    );
+}

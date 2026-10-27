@@ -16,6 +16,15 @@ native overlayは必須のGPU資源 `NativeEguiOverlayGpu` とCPU側の入力・
 configure / submissionは製品rendererの既存境界に残る。検証範囲は
 [locked chrome抑制の実装追補](fullscreen-locked-chrome-suppression-plan.md#13-実装レビュー追補2026-10-08)を参照。
 
+動画/音楽HUDの音量と音楽seekの `OverlaySliderDrag` は、同じResponse Id・viewport・連続logical passを
+所有範囲にする。押下からdrag_startedを経た同Responseの所有と開始buttonの実releaseで座標を採用し、
+一度でも描かれなかった表示のownerは失効する。古いeguiのdragged Idだけでは新しい操作を開始しない。
+表示中のEscape/capture取消は従来の開始値復元、ビューの閉鎖/非表示による中断は最後の適用値を保持する。
+音楽の既存teardownは音量ownerを破棄し、nativeのsource/モード切替も音量とseek rowを終了する。
+native HUDのhidden cleanupで音量ownerも破棄し、window close時はoverlay自身のdropで終了する。
+detached述語・viewport配送・入力通知は変更しない。§1.440実機退行の検証記録は
+[GPU/HUD作業記録 §12.5](gpu-init-fallback-plan.md#125-1440-表示を閉じた後の古いドラッグ所有2026-10-27)を参照。
+
 §1.387 I1（2026-10-16、v4.7.1の次のリリース向け、実装・自動検証済み）では、CPU logical passの
 中間hiddenによるDComp detachを外し、既存batchの最終visibilityをGPU finalizerへ渡す。
 最終表示・非表示とも既存のclear/submit/Present後にattach/detachを一回だけ適用し、

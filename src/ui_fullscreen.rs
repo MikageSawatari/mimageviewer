@@ -57931,6 +57931,64 @@ mod music_full_width_hud_tests {
     use super::*;
 
     #[test]
+    fn hud_slider_music_close_reopen_play_keeps_last_applied_volume() {
+        let (mut app, ctx) = fixture();
+        let size = egui::vec2(1200.0, 360.0);
+        let probe = frame(&mut app, &ctx, size, vec![]);
+        let pos = probe.volume.center();
+        frame(&mut app, &ctx, size, button(pos, true, false));
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![egui::Event::PointerMoved(pos + egui::vec2(18.0, 0.0))],
+        );
+        let last = app.settings.video_volume;
+        assert!(app.music_hud_last_volume_target.is_some());
+        // Keep only the fake, disconnected player to reuse when reopening. The
+        // production close performs real music teardown, with no app/decoder run.
+        let player = app.fs_cache.remove(&0).unwrap();
+        app.close_fullscreen();
+        ctx.run_pass(
+            egui::RawInput {
+                events: button(probe.play.center(), false, false),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .drop_without_applying_deltas();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.fs_cache.insert(0, player);
+        let reopened = frame(&mut app, &ctx, size, vec![]);
+        assert_eq!(app.settings.video_volume, last);
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![egui::Event::PointerMoved(reopened.play.center())],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            button(reopened.play.center(), true, false),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            button(reopened.play.center(), false, false),
+        );
+        assert_eq!(app.settings.video_volume, last);
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) else {
+            panic!("reopened player");
+        };
+        assert_eq!(player.volume(), last);
+        assert!(app.music_hud_last_volume_target.is_none());
+    }
+
+    #[test]
     fn music_hud_layout_normal_real_time_does_not_overlap_controls() {
         for width in [300.0, 383.0, 575.0, 860.0, 1000.0] {
             let (mut app, ctx) = fixture();

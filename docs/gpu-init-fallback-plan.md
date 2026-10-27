@@ -571,3 +571,78 @@ src/run_native_failure.rs
 vendor/egui-wgpu/PATCHES.md
 vendor/egui-wgpu/src/winit.rs
 ```
+
+
+### 12.5 §1.440 表示を閉じた後の古いドラッグ所有 (2026-10-27)
+
+ClaudeCodeが隔離data-dirのbuild-dev (`ce2e15760`) で、音量ドラッグ中にEscで音楽ビューを閉じ、
+一覧でreleaseして再び開くと、再生ボタンのclickで音量が最小になる退行を2回観測した。
+修正前master (`3dbd94a6e`) では再現しなかった。Codexによる製品起動・実機確認ではない。
+原因はAppの音量ドラッグ状態が表示終了後も残り、共通helperが別Responseのreleaseを確定値にしたこと。
+音楽seekにも、eguiが保持するdragged Idによって非表示後の操作を再開する同型があった。
+
+修正の所有規則:
+
+- `OverlaySliderOwner` はResponse Id / viewport / logical passを持つ。連続した描画だけが同じ操作を継続し、
+  省略されたpassで表示寿命が終わる。失効した保管値は入力処理より先に退役し、releaseにも移動にも使わない。
+  非表示を逐一通知するcallback・新しいApp flagは追加せず、所有ticket自身の有効範囲で終了を表す。
+- 実際のpressでPressedを作り、そのResponseのdrag開始から継続したActiveだけが開始buttonの実releaseで
+  release座標を採用する。eguiの古いdragged Idや、HUDの別ボタンのreleaseでは再開/確定しない。
+  音量と音楽seekで同じhelperを使い、seek側にあった別の失効判定は撤去した。
+  eguiのdrag_stoppedは別buttonのreleaseでも立つため、終了の正本はResponse所有ticketとtyped receiptにする。
+  別buttonを途中で押して離しても、開始buttonのreleaseまで所有を保持する回帰も追加した。
+- ビュー終了はmasterに合わせ最後に適用した値を保持する。音楽teardownで音量ownerを破棄し、
+  nativeのsource/モード切替で音量・seek rowの所有を終了、hidden cleanupで音量も破棄する。
+  window closeはoverlayのdropで終了する。native seekの既存hidden cleanupとstrip取消規則は維持する。
+- 表示中に届いたEscape/capture取消の開始値復元、音楽の未通知capture喪失、音楽Touch End未対応は前回どおり。
+  keymap、detached述語、viewport配送、GPU surface、永続データ形式は変更しない。
+
+回帰テストはheadlessの実Responseとnative CPU logical passを使用する。
+最初のREDでは追加した音量/seekの2件が `ce2e15760` の製品コードで失敗した (compile成功、2 failed)。
+記録: `target/hud-gpu-validation/lifecycle-red.{json,log}`。
+
+最終REDは、実装5ファイルだけを `git show ce2e15760:<path>` の内容へ一時差し替え、
+追加した6テストすべてが失敗した (compile成功、0 passed / 6 failed)。App close→reopen→再生clickも
+保持値 `0.8058421877614819` が `0.0` になることを検出した。
+`lifecycle-red-final.{json,log}` が実行記録、`lifecycle-red-restored.json` が実装5ファイルの
+byte単位の復元SHA-256証跡。復元後、press-onlyの中断と同一passの新規clickの分岐も追加してGREEN側で検査した。
+
+最終検証は全段で `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=24`。
+command/実exit/所要秒は `target/hud-gpu-validation/lifecycle-*.json`、出力は同名logへ保存した。
+本体lib全件/build-dev/実アプリ再確認はClaudeCodeの担当。製品起動・gitの書き込みは行っていない。
+viewer context auditは既存の同一tool sourceからビルド済みのexeで現在の作業ツリーを検査した。
+
+| 検査 (log/json basename) | exit | 結果 |
+| --- | --- | --- |
+| lifecycle-fmt-final | 0 | 成功 |
+| lifecycle-check | 0 | PASS (cargo check) |
+| lifecycle-check-script | 0 | PASS (cargo check --features test-script) |
+| lifecycle-nextest | 0 | Summary [  16.401s] 747 tests run: 747 passed, 13877 skipped |
+| lifecycle-nextest-script | 0 | Summary [   2.743s] 54 tests run: 54 passed, 14716 skipped |
+| lifecycle-snapshot | 0 | test result: ok. 213 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.69s |
+| lifecycle-audit-final | 0 | 成功 (audit/glyphは0件) |
+| lifecycle-fmt-check | 0 | 成功 |
+| lifecycle-include-fmt-check | 0 | 成功 |
+| lifecycle-glyphs-final | 0 | 成功 (audit/glyphは0件) |
+| lifecycle-diff-check | 0 | 成功 |
+
+関連nextestは既存§1.192/§1.428/§1.448の範囲に今回のHUD表示寿命・音楽full-width HUD・既存music teardownテストを追加した。
+normal/test-scriptで共通helper、実release最終座標、Escape/capture取消、右drag、中断/reopen、source/モード切替を検査した。
+UI snapshotは見た目の変更を伴わず全件成功。vendorコードは変更していないため前回のegui-wgpu結果をそのまま保持する。
+実機再確認は未実施。音楽Touch Endの既知制限と未通知capture喪失の割り切りは今回も変更していない。
+
+今回の変更ファイル (11件):
+
+```text
+docs/gpu-init-fallback-plan.md
+docs/next-release-backlog.md
+docs/video-architecture.md
+src/app.rs
+src/ui_fullscreen.rs
+src/ui_music_panels.rs
+src/ui_music_panels/slider_tests.rs
+src/video/native_presenter/overlay_draw.rs
+src/video/native_presenter/render_core.rs
+src/video/native_presenter/slider_terminal_tests.rs
+src/video/native_touch.rs
+```

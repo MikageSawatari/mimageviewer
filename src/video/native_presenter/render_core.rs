@@ -11119,13 +11119,19 @@ impl NativeEguiOverlayState {
     }
 
     fn reset_side_panel_session(&mut self) {
+        // Source/mode changes end the old display's gestures. Keep the last
+        // applied value; a later release belongs to neither old slider nor seek.
+        let slider_changed =
+            self.last_volume_target.take().is_some() | self.seek_row_gesture.take().is_some();
+        self.last_seek_target_secs = None;
         let touch_reset = self.native_touch.reset_for_source_swap();
         let touch_changed = touch_reset.changed;
         self.enqueue_native_pointer_events(touch_reset.egui_events, touch_reset.termination);
         let changed = self.left_panel_open.is_open()
             || self.right_panel_hover_latched
             || self.jump_panel_hover_latched
-            || touch_changed;
+            || touch_changed
+            || slider_changed;
         self.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.right_panel_hover_latched = false;
         self.jump_panel_hover_latched = false;
@@ -14335,6 +14341,7 @@ impl NativeEguiOverlayState {
         self.video_speed_popup_open = video_speed_popup_open;
         // HUD が引っ込んだフレームではボタンごと消えるので、メニューも閉じる。
         if !bottom_hud_visible {
+            self.last_volume_target = None;
             seek_strip_menu_open = false;
             seek_strip_menu_rect = None;
             audio_track_menu_open = false;

@@ -77175,6 +77175,9 @@ impl App {
     }
 
     pub(crate) fn clear_music_view_state(&mut self) {
+        // Closing/replacing this display ends its slider gesture, retaining the
+        // last volume already applied to settings/player rather than rolling back.
+        self.music_hud_last_volume_target = None;
         if self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor {
             self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
         }

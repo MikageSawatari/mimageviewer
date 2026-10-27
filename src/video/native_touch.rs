@@ -424,29 +424,69 @@ impl Default for NativeTouchAdapter {
     }
 }
 
+/// A slider gesture belongs to one Response in consecutive logical passes.
+/// A missed pass ends the presentation; reappearing with egui's old dragged Id
+/// does not constitute a new press. No later receipt can revive that owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OverlaySliderOwner {
+    id: egui::Id,
+    viewport: egui::ViewportId,
+    pass: u64,
+}
+
+impl OverlaySliderOwner {
+    pub(crate) fn new(ctx: &egui::Context, id: egui::Id) -> Self {
+        Self {
+            id,
+            viewport: ctx.viewport_id(),
+            pass: ctx.cumulative_pass_nr(),
+        }
+    }
+
+    pub(crate) fn continues(self, next: Self) -> bool {
+        self.id == next.id
+            && self.viewport == next.viewport
+            && (self.pass == next.pass || self.pass.checked_add(1) == Some(next.pass))
+    }
+}
+
 /// One owner for a slider gesture, including retirement until the held button is released.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum OverlaySliderDrag {
     Pressed {
+        owner: OverlaySliderOwner,
         button: egui::PointerButton,
         original: f64,
     },
     Active {
+        owner: OverlaySliderOwner,
         button: egui::PointerButton,
         original: f64,
         last: f64,
     },
     Cancelled {
+        owner: OverlaySliderOwner,
         button: egui::PointerButton,
     },
 }
 
 impl OverlaySliderDrag {
+    pub(crate) fn renew(&mut self, next: OverlaySliderOwner) -> bool {
+        let (Self::Pressed { owner, .. }
+        | Self::Active { owner, .. }
+        | Self::Cancelled { owner, .. }) = self;
+        if !owner.continues(next) {
+            return false;
+        }
+        *owner = next;
+        true
+    }
+
     pub(crate) fn button(self) -> egui::PointerButton {
         match self {
             Self::Pressed { button, .. }
             | Self::Active { button, .. }
-            | Self::Cancelled { button } => button,
+            | Self::Cancelled { button, .. } => button,
         }
     }
 

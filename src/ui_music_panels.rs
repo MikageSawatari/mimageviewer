@@ -1900,20 +1900,7 @@ fn music_seek_slider_value(
         &response.ctx,
         Some(button),
     );
-    // A temporary seek owner cannot survive the widget being hidden/replaced.
-    // egui-winit supplies real releases only; native cancellation receipts take
-    // their separate producer-owned route into the shared helper.
-    if !response.is_pointer_button_down_on()
-        && !response.drag_stopped_by(button)
-        && !response.clicked()
-        && !matches!(
-            termination,
-            Some(crate::video::native_touch::NativePointerTermination::Cancelled { .. })
-        )
-        && !matches!(drag, Some(OverlaySliderDrag::Cancelled { .. }))
-    {
-        drag = None;
-    }
+    // Response ownership and presentation lifetime are shared with volume.
     let result = overlay_slider_value(response, termination, position, &mut drag, |p| {
         ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64 * duration
     });
@@ -3249,6 +3236,10 @@ mod tests {
         crate::ui_fonts::configure_fonts(&ctx);
         let mut last_volume = Some(
             crate::video::native_presenter::overlay_draw::OverlaySliderDrag::Active {
+                owner: crate::video::native_touch::OverlaySliderOwner::new(
+                    &ctx,
+                    egui::Id::unique("omitted-volume"),
+                ),
                 button: egui::PointerButton::Primary,
                 original: 1.0,
                 last: 0.5,
