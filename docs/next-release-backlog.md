@@ -246,12 +246,15 @@
 ### 1.429 描画先 (surface) に対応しない GPU を選ぶと、エラーではなく panic で終わる経路がある — §1.428 の設計レビューで発見 (2026-10-25)
 
 - **v4.9.0 に入れる (利用者 2026-10-27)**。
-- 状態: **未着手**。コード調査 (Codex 独立設計レビュー、§1.428 第 1 版への指摘)。実行時の観測は無い。
-- 内容: `src/lib.rs` の adapter selector は DX12、なければ Vulkan の adapter を選ぶが、描画先 (surface) との相性を確かめない。
-  選んだ adapter が surface に対応しないと、`vendor/egui-wgpu/src/winit.rs:165` 付近の `expect` で panic する (Err にならないので §1.428 の報告にも乗らない)。
-  ほかに wgpu の既定 uncaptured-error handler も panic で終わる。selector は v4.7.1 から同じだが、wgpu 30 で adapter の列挙や対応範囲が変わった可能性がある。
-- 対応の方向: selector で surface との相性を確かめてから選ぶ (対応する adapter が無ければ Err を返して §1.428 の報告に乗せる)。panic で終わる起動中の経路を、Err へ変えるか、最初の表示前の panic にも同じ通知を出すかを比べる。vendor の変更は PATCHES.md に記録する。
-- 規模 / 優先度: Small〜Medium / P2 (環境によっては起動しない原因になり得る)。
+- 状態: **実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)**。コード調査による指摘で、実環境での失敗の観測は無い。
+- 実機確認 (ClaudeCode、2026-10-27、`1b6879010` の build-dev・隔離 data-dir): 通常起動で窓が開き、ログに `gpu attempt=1 backend=DX12 adapter=NVIDIA GeForce RTX 4090 … result=ok` と `gpu selected backend=DX12 request=auto`。surface 非対応の失敗は実機で起こせないため、vendor の失敗注入テストと保存ログ・通知のテストだけで確認。
+- 確認結果: §1.448のadapter候補選択は既にsurface対応を確認している。残るvendorのdefault configuration取得のexpectを、
+  起動時rootの初回installだけErrへ変え、GPU名・SurfaceCapabilities段階を§1.428/§1.448の保存ログと失敗通知へ渡す。
+- 起動後のviewport作成/resize/再設定は従来のexpect panicを維持し、失敗資源を外して続行する状態は作らない。
+  uncaptured-error handlerの既定panicも維持する (coordinator判断)。
+- 検証: root起動Errの実logger保存・flush後の通知を一時ログで検査し、vendorのNone注入で初回root Err/runtime panicの範囲を確認する。
+  vendor変更はPATCHES.md、共有入口の変更範囲と合意はdetached計画§11 (`ce2e15760`) に記録済み。
+- 規模 / 優先度: Small〜Medium / P2。実装・検証記録は [GPU初期化計画 §12](gpu-init-fallback-plan.md#12-1429-surface-非対応の-err-終了-2026-10-27v490)。
 
 ### 1.423 画像を WIC が開いている最中にごみ箱へ送ると、削除が一時的に失敗し得る — テスト基盤の作業中のコード調査 (2026-10-23)
 
@@ -1754,19 +1757,45 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
 
 ### 1.440 動画・音楽 HUD の音量スライダーが、離すフレームの位置を使わない (2026-10-24)
 
-- **v4.9.0 に入れる (利用者 2026-10-27)**。
-- 出典: §1.192 の調査で見つけた同型 (コード読み、実機未確認)。`draw_overlay_volume_slider` (`src/overlay_draw.rs`、動画 HUD と
-  音楽 HUD で共有) は release のパスで最後のドラッグ値を保存し、離した位置を使わない。
-- 直すなら §1.192 の終わり方の型 (`Released` / `Cancelled`) が要る (capture 喪失の合成 release (0,0) をそのまま使うと音量 0 になる)。
-  音楽 HUD は egui-winit 側の入力なので、動画 HUD とは別経路として扱う。
-- 規模 / 優先度: Small / P3。
+- 状態: **未着手 (v4.9.0 で試作して撤回、2026-10-27)**。
+- 出典: §1.192の調査で見つけた同型 (コード読み、当初は実機未確認)。共有の `draw_overlay_volume_slider` は
+  最後のドラッグ値で終了し、releaseフレームの位置を採用しない。nativeの合成release座標と実releaseを区別する必要もある。
+- 規模 / 優先度: Small / P3 (再着手時は所有の設計・レビューを先行する)。
+
+経緯と撤回:
+
+1. releaseフレームの位置を採用する修正を実装した。
+2. ClaudeCodeが隔離data-dirの実アプリで退行を発見。音楽HUDの音量をクリックして-0.8dBにし、再生/一時停止クリックでは変わらないことを確認する。
+   続いてドラッグで+9dB付近へ動かしたままEscでビューを閉じ、一覧でボタンを離す。
+   開き直すと+9dBだが、最初にHUDの再生ボタンをクリックすると音量が最小になる。
+   2回再現し、修正前masterでは同じ手順で起きなかった。
+3. 所有をdrag開始Id・viewport・連続描画へ限定したが、独立レビューP2で速い短ドラッグの取りこぼしと、
+   nativeシークの押下のみの状態がsource/モードreset後も残る経路を指摘された。
+4. press〜releaseの単一所有 `OverlayPress` に統一したが、3回目の独立レビューP2で、音量ドラッグ中にNormスキャンで操作不能になっても
+   所有が残り `SetVolume` を出し続ける経路を指摘された。
+5. 3回連続で「ドラッグの終わらせ忘れ」に関するP2が続いたため、利用者判断で§1.440/§1.441をv4.9.0から外し、
+   製品コードをmaster `7a8a25b06` の内容へ差し戻した。§1.429は残す。
+
+学び / 再着手条件:
+
+- 「離した位置を採用する」には、所有が必ず正しく終わることが前提。実装前にドラッグの所有者と終了条件を設計書へ列挙し、
+  独立レビューを通してから実装する。
+- 終了条件の棚卸し: release / Escape / ビューを閉じる / source・モード切替 / 非表示・自動非表示 /
+  操作不能化 (disabled、Normスキャンを含む) / capture喪失 / タッチ終端。動画nativeと音楽egui-winitの別入口も確認する。
+- 上の隔離実アプリの再現手順を回帰テストにする。表示だけでなく再生側の値と、取消/閉鎖/disabled後に値変更を出さないことを検査する。
+- 残件: 音楽HUDのタッチ終端座標。egui-winitのTouch Endがポインターを終端座標へ更新せず、Move=A / End=Bで音楽側はAを採用する
+  (native動画側はB)。全eguiタッチへの影響を検討する必要があり、v4.9.0では未対応。
+- 試作: ブランチ `hud-1440-1441-trial` (`f65cc515c`) に最終形 (`Option<OverlayPress<T>>`、`overlay_press_update`、
+  動画音量/音楽音量/音楽seek/native seek rowの4経路) を保存済み。未解決P2を含む試作であり、そのまま再投入しない。
 
 ### 1.441 音楽 HUD のシークが、離すフレームの最後の移動を取りこぼす (2026-10-24)
 
-- **v4.9.0 に入れる (利用者 2026-10-27)**。
-- 出典: §1.192 の調査で見つけた同型 (コード読み、実機未確認)。音楽 HUD のシーク (`src/ui_music_panels.rs` の seek 行) は
-  `clicked || dragged` のときだけ Seek を出し、release のフレームの位置を使わない。
+- 状態: **未着手 (v4.9.0 で試作して撤回、2026-10-27)**。
+- 出典: §1.192の調査で見つけた同型 (コード読み、実機未確認)。音楽HUDのseek行は `clicked || dragged` のときだけSeekを出し、
+  releaseフレームの最後の移動を採用しない。
 - 規模 / 優先度: Small / P3。
+- §1.440と同時にv4.9.0向けの試作を撤回し、master `7a8a25b06` の内容へ差し戻した。
+  経緯、再着手前の所有/終了条件の設計・独立レビュー、実機回帰、タッチ終端座標の残件、保存した試作は§1.440を参照。
 
 ### 1.442 HUD の減光中に終わったドラッグに、終わりが届かない (2026-10-24)
 
