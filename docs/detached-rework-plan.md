@@ -1455,6 +1455,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-27 §1.429 描画先の設定取得の失敗を、初回 root だけ起動失敗として扱う (実装・自動検証済み)
+
+vendor `egui-wgpu` の `get_default_config(...).expect(...)` (描画先 surface の設定取得) を、**初回の root 初期化に限って** Err にし、
+§1.428 / §1.448 の起動失敗ダイアログと保存ログへ渡す。共有 viewport 経路の `add_surface` / `recreate_surface` / configure / resize には、
+失敗の扱い (初回 root は Err、それ以外は従来の panic) を引き渡す引数と共通関数の抽出が入るが、起動後 (immediate / detached viewport の作成、
+resize・再設定・モニター移動) の挙動と viewport の資源寿命は master `7a8a25b06` と同じ (expect の panic、資源を外して続行する状態は作らない)。
+新しい detached 述語・viewport owner・HWND / placement owner は追加しない。
+一度は起動後も資源を外して続行する形を実装したが、独立レビュー P2 (通知も保存ログも無いまま描画停止の窓が残る) を受けて撤回した (`7af9f3a48`)。
+**構造的修正であることの合意**: 独立レビュー (Sol / xhigh、2026-10-27) が「症状パッチではなく、初期化と実行中の失敗の契約を明示する構造変更」と判定し、
+ClaudeCode も同じ判断。詳細は [GPU 初期化の計画](gpu-init-fallback-plan.md) の §1.429 の節。
+
 ### 2026-10-27 §1.340 統合commitの独立レビューP2追補（実装・指定自動検証済み）
 
 統合commit `1c134703b`に対する利用者提示の独立レビューはACCEPT WITH CHANGES、P2-1／P2-2。
