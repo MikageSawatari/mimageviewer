@@ -3279,8 +3279,8 @@ impl App {
         }
         prepared.collection_id == request.origin.collection_id
             && prepared.entries.iter().any(|entry| {
-                entry.entry_id == owner.anchor.entry_id
-                    && entry.source_key == owner.anchor.source_key
+                entry.entry_id == owner.physical.anchor.entry_id
+                    && entry.source_key == owner.physical.anchor.source_key
             })
     }
 
@@ -3330,8 +3330,8 @@ impl App {
         }
         prepared.collection_id == request.origin.collection_id
             && prepared.entries.iter().any(|entry| {
-                entry.entry_id == owner.anchor.entry_id
-                    && entry.source_key == owner.anchor.source_key
+                entry.entry_id == owner.physical.anchor.entry_id
+                    && entry.source_key == owner.physical.anchor.source_key
             })
     }
 
@@ -3641,16 +3641,24 @@ impl App {
         let mut native_request = request.clone();
         native_request.navigation = None;
         Some(super::top_level_grid_view::CollectionGridSourceOpenOwner {
-            stamp: super::top_level_grid_view::CollectionGridRequestStamp {
-                context_id: request.origin.context_id,
-                surface_generation: request.origin.surface_generation,
-                collection_id: request.origin.collection_id,
-            },
-            accepted_revision: session.accepted_revision,
-            wanted_revision: session.wanted_revision,
-            anchor: CollectionGridViewportAnchor {
-                entry_id: target.entry_id,
-                source_key: target.source_key.clone(),
+            physical: super::top_level_grid_view::CollectionGridPhysicalLoadOwner {
+                stamp: super::top_level_grid_view::CollectionGridRequestStamp {
+                    context_id: request.origin.context_id,
+                    surface_generation: request.origin.surface_generation,
+                    collection_id: request.origin.collection_id,
+                },
+                accepted_revision: session.accepted_revision,
+                wanted_revision: session.wanted_revision,
+                anchor: CollectionGridViewportAnchor {
+                    entry_id: target.entry_id,
+                    source_key: target.source_key.clone(),
+                },
+                root_source_path: target.source_path.clone(),
+                target_path: target.source_path.clone(),
+                origin: super::top_level_grid_view::CollectionGridPhysicalLoadOrigin::Root {
+                    items_generation: self.items_generation,
+                },
+                intent: super::top_level_grid_view::CollectionGridPhysicalLoadIntent::Playback,
             },
             navigation_prepared: Some(prepared),
             navigation_origin: request.origin.anchor.as_ref().map(|anchor| {
@@ -4821,16 +4829,25 @@ mod tests {
         .source_key()
         .clone();
         let owner = CollectionGridSourceOpenOwner {
-            stamp: CollectionGridRequestStamp {
-                context_id: request.origin.context_id,
-                surface_generation: request.origin.surface_generation,
-                collection_id: request.origin.collection_id,
-            },
-            accepted_revision: 1,
-            wanted_revision: 1,
-            anchor: CollectionGridViewportAnchor {
-                entry_id: CollectionEntryId::new(),
-                source_key,
+            physical: super::super::top_level_grid_view::CollectionGridPhysicalLoadOwner {
+                stamp: CollectionGridRequestStamp {
+                    context_id: request.origin.context_id,
+                    surface_generation: request.origin.surface_generation,
+                    collection_id: request.origin.collection_id,
+                },
+                accepted_revision: 1,
+                wanted_revision: 1,
+                anchor: CollectionGridViewportAnchor {
+                    entry_id: CollectionEntryId::new(),
+                    source_key,
+                },
+                root_source_path: path.clone(),
+                target_path: path.clone(),
+                origin: super::super::top_level_grid_view::CollectionGridPhysicalLoadOrigin::Root {
+                    items_generation: app.items_generation,
+                },
+                intent:
+                    super::super::top_level_grid_view::CollectionGridPhysicalLoadIntent::Playback,
             },
             navigation_prepared: None,
             navigation_origin: None,

@@ -24305,7 +24305,10 @@ impl App {
     }
 
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
-        if let Some(nav) = self.collection_grid_parent_nav() {
+        if let Some((nav, selection)) = self.collection_grid_parent_navigation() {
+            if selection.is_some() {
+                self.select_after_load = selection;
+            }
             return Some(nav);
         }
         if let Some(nav) = self.bookmark_view_back_nav() {
@@ -36553,16 +36556,10 @@ impl App {
         {
             FolderNavHistoryTarget::CollectionPhysical(
                 top_level_grid_view::CollectionGridPhysicalRestore {
-                    root: top_level_grid_view::CollectionGridRestore {
-                        identity: top_level_grid_view::CollectionGridIdentity {
-                            collection_id: collection.stamp.collection_id,
-                        },
-                        revision_at_open: collection
-                            .accepted_revision
-                            .max(collection.wanted_revision),
-                        viewport_anchor: Some(collection.anchor.clone()),
-                    },
-                    root_source_path: owner.source_path.clone(),
+                    root: collection
+                        .physical
+                        .restore(collection.physical.wanted_revision),
+                    root_source_path: collection.physical.root_source_path.clone(),
                     visible_path: request.path.clone(),
                 },
             )
@@ -36902,16 +36899,10 @@ impl App {
                 let collection = archive.collection_grid_owner.as_ref().unwrap();
                 FolderNavHistoryTarget::CollectionPhysical(
                     top_level_grid_view::CollectionGridPhysicalRestore {
-                        root: top_level_grid_view::CollectionGridRestore {
-                            identity: top_level_grid_view::CollectionGridIdentity {
-                                collection_id: collection.stamp.collection_id,
-                            },
-                            revision_at_open: collection
-                                .accepted_revision
-                                .max(collection.wanted_revision),
-                            viewport_anchor: Some(collection.anchor.clone()),
-                        },
-                        root_source_path: archive.source_path.clone(),
+                        root: collection
+                            .physical
+                            .restore(collection.physical.wanted_revision),
+                        root_source_path: collection.physical.root_source_path.clone(),
                         visible_path: path.to_path_buf(),
                     },
                 )
