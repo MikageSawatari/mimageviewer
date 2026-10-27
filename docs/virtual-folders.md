@@ -607,6 +607,11 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
 
 #### 親一覧の位置保存と履歴復帰 (§1.328)
 
+スマートフォルダの結果から直接開いたZIP / PDFの最上位では、BS・「上へ」・設定に従う全画面の
+親一覧への直帰が同じSmart root復元を使い、開いた本を選択する。合成pathは通常open dispatcherで
+復元ownerへ配送し、実directoryとして走査しない。ZIP内の子階層は従来どおりZIP navで一段ずつ戻る。
+実Folder entry配下の本はそのFolderへ戻ってからSmart rootへ戻る。←の型付き履歴復元も維持する。
+
 通常 item install と ZIP の先出し表示は `folder_history` (scroll / selected) の保存処理を
 `save_leaving_folder_grid_position` に集約する。通常 install は `start_loading_items_inner` から呼び、
 ZIP / 直接閲覧 RAR / 変換キャッシュ ZIP は、列挙待ち表示のために旧 items・選択・scroll・

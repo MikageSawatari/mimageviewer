@@ -33,6 +33,8 @@ impl FolderThumbnailResources {
 
 #[derive(Clone, Default)]
 pub(crate) struct SearchMetadataResources {
+    /// Missing-pool admission captured on the UI, opened only on the existing Search worker.
+    pub(crate) thumbnail_init: Option<super::super::SearchThumbnailInitRequest>,
     pub(crate) pin_db: Option<Arc<FolderThumbPinDb>>,
     pub(crate) tags_db_path: Option<PathBuf>,
     pub(crate) video_pins: Option<crate::video_pins::VideoPinReadSource>,

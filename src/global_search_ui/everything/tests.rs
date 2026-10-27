@@ -146,6 +146,149 @@ fn stalled_prepare() -> (
 }
 
 #[test]
+fn section1431_drive_list_search_initializes_thumbnail_owner_and_restores_icons() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.folder_pin_map.clear();
+    app.enter_drive_list(None);
+    let drives = app.items.clone();
+    assert!(app.reload_queue.is_none());
+    assert!(app.current_color_cache_map.is_none());
+    assert!(
+        app.thumbnails
+            .iter()
+            .all(|state| matches!(state, ThumbnailState::Failed))
+    );
+    let root = app.tmp.path().join("results");
+    std::fs::create_dir_all(root.join("folder")).unwrap();
+    let result = dataset(vec![
+        GridItem::Image(root.join("image.jpg")),
+        GridItem::ZipFile(root.join("book.zip")),
+        GridItem::Folder(root.join("folder")),
+    ]);
+    #[cfg(windows)]
+    let sibling = app.build_window_context_for_test(1431, |mounted| {
+        mounted.load_folder(root.clone());
+        mounted.finish_page_identity_preparation_for_test();
+    });
+    #[cfg(windows)]
+    let (sibling_cancel, sibling_queue, sibling_generation, sibling_ticket) = app
+        .with_window_context_for_test(sibling, |mounted| {
+            (
+                Arc::clone(&mounted.cancel_token),
+                Arc::clone(mounted.reload_queue.as_ref().unwrap()),
+                mounted.items_generation,
+                mounted.pdf_render_epoch.snapshot(),
+            )
+        });
+    adopt(&mut app, &ctx, "images and books", result);
+    assert!(
+        app.reload_queue.is_some(),
+        "accepted search needs regular workers"
+    );
+    assert!(app.heavy_io_queue.is_some());
+    assert!(app.current_color_cache_map.is_some());
+    assert!(app.current_color_catalog.is_some());
+    let pages = (0..app.items.len()).collect::<Vec<_>>();
+    app.ensure_navigation_target_thumbnail_requests(&ctx, &pages);
+    assert!(pages.iter().all(|index| app.requested.contains_key(index)));
+    let cancel = Arc::clone(&app.cancel_token);
+    app.close_global_search();
+    app.finish_history_restore_preparation_for_test();
+    assert!(!app.global_search.active);
+    assert!(app.items_are_drive_list);
+    assert_eq!(app.items, drives);
+    assert!(app.folder_pin_map.is_empty());
+    assert!(
+        app.thumbnails
+            .iter()
+            .all(|state| matches!(state, ThumbnailState::Failed))
+    );
+    assert!(app.reload_queue.is_none());
+    assert!(app.heavy_io_queue.is_none());
+    assert!(cancel.load(Ordering::Relaxed));
+    #[cfg(windows)]
+    app.with_window_context_for_test(sibling, |mounted| {
+        assert!(Arc::ptr_eq(&mounted.cancel_token, &sibling_cancel));
+        assert!(!sibling_cancel.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(
+            mounted.reload_queue.as_ref().unwrap(),
+            &sibling_queue
+        ));
+        assert_eq!(mounted.items_generation, sibling_generation);
+        assert!(sibling_ticket.is_current());
+    });
+}
+
+#[test]
+fn section1431_metadata_search_from_drive_list_initializes_once_and_restores_icons() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.folder_pin_map.clear();
+    app.enter_drive_list(None);
+    let drives = app.items.clone();
+    let image = app.tmp.path().join("metadata.jpg");
+    std::fs::write(&image, b"image").unwrap();
+    crate::global_search_ui::tests::g1_publish_search_hits(&mut app, &ctx, &[image]);
+    let queue = Arc::clone(
+        app.reload_queue
+            .as_ref()
+            .expect("Ctrl+G needs regular workers"),
+    );
+    let cancel = Arc::clone(&app.cancel_token);
+    app.ensure_navigation_target_thumbnail_requests(&ctx, &[0]);
+    assert!(app.requested.contains_key(&0));
+    app.rebuild_items_from_global_search();
+    poll_until(
+        &mut app,
+        &ctx,
+        "metadata reprojection did not settle",
+        |app| {
+            let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+            prepare.in_flight.is_none() && prepare.desired.is_none()
+        },
+    );
+    assert!(Arc::ptr_eq(app.reload_queue.as_ref().unwrap(), &queue));
+    assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+    assert!(!cancel.load(Ordering::Relaxed));
+    app.close_global_search();
+    app.finish_history_restore_preparation_for_test();
+    assert!(app.items_are_drive_list);
+    assert_eq!(app.items, drives);
+    assert!(
+        app.thumbnails
+            .iter()
+            .all(|state| matches!(state, ThumbnailState::Failed))
+    );
+    assert!(app.reload_queue.is_none());
+    assert!(cancel.load(Ordering::Relaxed));
+}
+
+#[test]
+fn section1431_cancelled_prepare_does_not_install_thumbnail_workers() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.folder_pin_map.clear();
+    app.enter_drive_list(None);
+    let drives = app.items.clone();
+    start_fake_run(&mut app, &ctx, "image");
+    app.hold_next_search_ready_for_test();
+    let image = GridItem::Image(app.tmp.path().join("not-adopted.jpg"));
+    queue(&mut app, dataset(vec![image]));
+    poll_until(&mut app, &ctx, "prepared result was not held", |app| {
+        app.search_ready_is_held_for_test()
+    });
+    assert!(app.reload_queue.is_none());
+    assert!(app.current_color_cache_map.is_none());
+    app.close_global_search();
+    app.finish_history_restore_preparation_for_test();
+    assert!(app.items_are_drive_list);
+    assert_eq!(app.items, drives);
+    assert!(app.reload_queue.is_none());
+    assert!(app.current_color_cache_map.is_none());
+}
+
+#[test]
 fn completed_dataset_publishes_rows_stamps_identity_and_source_at_one_ready_boundary() {
     let mut app = crate::app::setup_app_for_test();
     let ctx = egui::Context::default();

@@ -98477,6 +98477,104 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn section1453_smart_books_parent_dispatch_restores_root_and_opened_selection() {
+        for kind in ["flat.zip", "tree.zip", "book.pdf"] {
+            for exit in ["backspace", "up", "escape", "history"] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                let source = app.tmp.path().join("library");
+                let shelf = source.join("shelf");
+                std::fs::create_dir_all(&shelf).unwrap();
+                let book = shelf.join(kind);
+                if kind.ends_with(".pdf") {
+                    std::fs::write(&book, b"%PDF-1.4\n").unwrap();
+                } else {
+                    let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+                    let names = if kind == "tree.zip" {
+                        vec!["vol1/page.jpg", "vol2/page.jpg"]
+                    } else {
+                        vec!["page.jpg"]
+                    };
+                    for name in names {
+                        zip.start_file(name, zip::write::SimpleFileOptions::default())
+                            .unwrap();
+                        std::io::Write::write_all(&mut zip, b"page").unwrap();
+                    }
+                    zip.finish().unwrap();
+                }
+                let definition = definition("Parent dispatch", source);
+                let id = definition.id;
+                app.settings.smart_folders = vec![definition];
+                let ctx = egui::Context::default();
+                app.open_smart_folder(id, false);
+                wait_for_smart_folder_idle(&mut app, &ctx, id);
+                // Return must select the opened book even when the parked selection differs.
+                select_real_path(&mut app, &shelf);
+                assert!(app.begin_staged_smart_drill(&book));
+                if kind.ends_with(".pdf") {
+                    finish_smart_pdf_enumeration(&mut app, &book);
+                } else {
+                    wait_for_staged_smart_terminal(&mut app, &ctx);
+                }
+                if kind == "tree.zip" {
+                    app.zip_nav_enter("vol1/");
+                    assert!(app.handle_grid_parent_folder_action().is_none());
+                    assert!(!app.items_are_smart_folder_view);
+                    assert!(app.zip_nav.as_ref().unwrap().at_root());
+                }
+                if exit == "history" {
+                    app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+                } else {
+                    let nav = match exit {
+                        "backspace" => app.handle_grid_parent_folder_action().unwrap(),
+                        "up" => {
+                            let target = app.grid_parent_nav_target().unwrap();
+                            let nav = app.resolve_grid_parent_nav().unwrap();
+                            assert_eq!(format!("{target:?}"), format!("{nav:?}"));
+                            nav
+                        }
+                        "escape" => {
+                            app.settings.auto_fullscreen_zip_pdf = true;
+                            app.fullscreen_idx = Some(0);
+                            app.pending_return_to_parent.clear();
+                            app.handle_fullscreen_close_request();
+                            assert!(app.pending_return_to_parent.is_pending());
+                            app.take_pending_return_to_parent_nav().unwrap()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
+                        panic!("unexpected parent: {nav:?}");
+                    };
+                    if exit == "escape" {
+                        assert!(app.apply_fullscreen_close_nav_immediate(
+                            crate::ui_main::AddressBarNav::Direct(path, intent)
+                        ));
+                    } else {
+                        // The main-frame dispatcher enters here, bypassing the upper loader.
+                        app.open_direct_navigation_target(
+                            path,
+                            None,
+                            OpenRequestOwner::Navigation,
+                            None,
+                            None,
+                            intent,
+                        );
+                    }
+                }
+                wait_for_smart_folder_idle(&mut app, &ctx, id);
+                assert_eq!(
+                    selected_real_path(&app),
+                    Some(book.as_path()),
+                    "{kind} {exit}"
+                );
+                assert!(app.zip_nav.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn smart_folder_pdf_open_then_parent_handler_restores_root_offset() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;

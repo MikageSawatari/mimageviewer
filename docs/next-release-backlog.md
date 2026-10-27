@@ -85,17 +85,18 @@
 ### 1.453 スマートフォルダから開いた ZIP の一番上で、BS と「上へ」が効かない — X の報告の調査中に観測 (2026-10-27)
 
 - **v4.9.0 に入れる (利用者 2026-10-27)**。
-- 状態: **未着手**。原因の経路は未確定 (下の見立て)。
+- 状態: **実装済み (ブランチ nav-1453-1431、未 merge)**。
+  共通open dispatcherがSmart合成pathを既存のroot復元へ配送し、BS・「上へ」・全画面closeで開いた本を選択する。
+  ZIP内の階層戻りと型付き履歴復元は維持。旧コードでdispatcher経由の回帰テストが失敗することを確認済み。
 - 観測 (ClaudeCode、2026-10-27、master `3caa9c1a9` の build-dev・隔離 data-dir): `library` (子フォルダ `shelf` に ZIP が 4 つ) を
   「サブフォルダを含む」条件でスマートフォルダにし、一覧から `book_multi.zip` (中にフォルダ `vol1` / `vol2`) を開いた。
   ZIP の一番上 (vol1 / vol2 の一覧) で <kbd>BS</kbd> を 2 回、ツールバーの「上へ」を 1 回押しても、表示が変わらなかった。
   そのたびにログへ `load_folder scan failed path=<data_dir>\__smart_folder__\<ID> error=指定されたパスが見つかりません。 (os error 3)` が出た。
   <kbd>←</kbd> (履歴で戻る) では、スマートフォルダの一覧へ戻り、`book_multi.zip` が選ばれた。
   通常フォルダ・サブフォルダ展開・閲覧履歴・Ctrl+S・Everything から開いた ZIP では、BS で元の一覧へ戻ることを同じ日に確認済み。
-- 見立て (コード読みのみ、未検証): スマートフォルダの合成パス (`smart_folder::smart_folder_synthetic_path`) は、
-  `restore_smart_folder_for_synthetic_path_with_navigation` で一覧を復元する作り (BS/親は Direct とコメントにある)。
-  ZIP の一番上からの親移動では、この復元ではなく、合成パスを実フォルダとして `load_folder` に渡す経路を通っているとみられる。
-  どの入口 (BS・「上へ」・`AddressBarNav`) で合成パスが実パス扱いになるかを特定する。
+- 原因確認 (実装担当、コードとheadless回帰テスト): Smart合成pathの復元は上位loaderだけにあり、通常入力の
+  `open_direct_navigation_target` が分類済みdispatcherへ直行すると迂回していた。共通dispatcherへ配送を移し、
+  `restore_smart_folder_for_synthetic_path_with_navigation` に受付済みnavigationを渡す形に揃えた。
 - 未確認: v4.8.3 でも起きるか (この日の master と v4.8.3 の間で、スマートフォルダの親移動に関わる変更は見当たらない)、
   中にフォルダの無い ZIP (開くとページ一覧になる) や、全画面から Esc / BS で閉じた後の BS でも起きるか、PDF・変換書庫でも起きるか。
 - 直し方の方針: 親移動の入口で合成パスを実フォルダとして開かず、既存のスマートフォルダ復元へ渡す。
@@ -214,7 +215,9 @@
 ### 1.431 代表画像を設定していないドライブ一覧から Everything 検索すると、画像・ZIP・フォルダの結果にサムネイルが出ない — §1.410 の独立レビューで判明 (2026-10-25)
 
 - **v4.9.0 に入れる (利用者 2026-10-27)**。
-- 状態: **未着手・起票 (2026-10-25)**。§1.410 (Everything の結果にフォルダを含める) より前からある問題で、§1.410 では直していない。
+- 状態: **実装済み (ブランチ nav-1453-1431、未 merge)**。
+  Everything / Ctrl+Gの既存prepare workerで不足するcatalog・cacheを準備し、結果採用時だけ通常thumbnail workerを作る。
+  ドライブ一覧へ戻ると代表画像なしの固定アイコン表示を維持。旧コードで検索採用後のqueue欠落を回帰テストで確認済み。
 - 根拠 (コード読みのみ。実機では未確認。独立レビュー担当が親コミット `8f4fdf02c~1` で確認): ドライブの代表画像を設定していないドライブ一覧は、catalog・cache を初期化せず通常のサムネイル queue を `None` にする (`src/app.rs` 28474・28539 行付近)。Everything の結果を採用しても通常の worker を作らず (`src/global_search_ui.rs` 2328 行付近)、要求処理は queue が無いと終わる (`src/app.rs` 55400 行付近)。動画は `respawn_search_video_thread` の別経路があるため影響しない。
 - 直し方の方向: 検索結果の採用時に、通常のサムネイル所有者 (catalog・cache・worker) が無ければ既存の初期化経路で作る。UI スレッドで DB を cold open しない (`docs/ui-responsiveness.md` §4)。Ctrl+G など他の検索の採用も同じ形か確認する。
 - 検証: 代表画像なしのドライブ一覧から Everything 検索 → 画像・ZIP・フォルダの結果にサムネイルが出る。検索を閉じたあとのドライブ一覧が変わらない。
