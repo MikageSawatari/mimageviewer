@@ -7569,10 +7569,19 @@ impl App {
             self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, forward, native_toast);
             return;
         }
-        self.handle_gamepad_grid_folder_nav(forward);
+        self.handle_gamepad_grid_folder_nav(ctx, forward);
     }
 
-    fn handle_gamepad_grid_folder_nav(&mut self, forward: bool) {
+    #[cfg(test)]
+    pub(crate) fn handle_gamepad_folder_nav_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+    ) {
+        self.handle_gamepad_folder_nav(ctx, forward);
+    }
+
+    fn handle_gamepad_grid_folder_nav(&mut self, ctx: &egui::Context, forward: bool) {
         if self.block_gamepad_grid_folder_nav_for_detached_foreground(
             "gamepad_grid_folder_nav",
             if forward { "forward" } else { "backward" },
@@ -7601,6 +7610,7 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
             // ネスト ZIP 内: ツリーを DFS で前後のノードへ (#4 改)。端では false → 下で ZIP を抜ける。
+        } else if self.start_collection_outer_grid_navigation(ctx, forward) {
         } else if self.start_smart_folder_scope_nav(forward, false) {
         } else if let Some(cur) = self.effective_folder() {
             self.start_folder_nav(cur, forward, FolderNavMode::Grid);
@@ -7659,20 +7669,14 @@ impl App {
                 ) {
                     return None;
                 }
-                if crate::folder_tree::is_virtual_folder(&p) {
-                    Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
-                } else {
-                    self.capture_main_folder_list_order(idx);
+                if !crate::folder_tree::is_virtual_folder(&p) {
                     self.note_reading_history_open(idx);
+                    self.maybe_suppress_rating_filter_for_opened_container(idx);
                     if auto_fullscreen {
                         self.pending_auto_fs_open = true;
                     }
-                    self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    Some(AddressBarNav::Direct(
-                        p,
-                        crate::app::StartupListIntent::container_open(auto_fullscreen),
-                    ))
                 }
+                Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
             }
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })

@@ -187,6 +187,11 @@ wanted revision進行や定義削除だけでは現在の子表示を置き換�
 ZIP / PDF非同期開始などvisible loadの採用境界でだけsurfaceを`Folder`へ切り替えてsessionを破棄する。
 scan失敗、scope拒否、stale async result、変換dialog取消ではcollection rootのsurfaceとitemsを分裂させない。
 
+変換書庫の `CollectionGridSourceOpenOwner` も同じ `CollectionGridPhysicalLoadOwner` を所有し、
+Root／PhysicalSource の受理・採用・論理元パスと登録項目の帰路を ZIP/PDF と共有する。
+Ask の確認、変換、キャッシュ採用、RAR 直読みをまたいでも cache path を登録元に置き換えない。
+ゲームパッドのフォルダ open／前後移動もキーボードと同じ collection owner／navigation 入口を使う。
+
 collection root installはviewer bundle所有の通常thumbnail poolを新items generationへ作り直し、画像・Folder・
 ZIP・PDFの既存producerを起動する。collection専用video workerだけをsessionがcancelし、bundleの共有pool tokenを
 session dropで止めない。複数の物理folderを横断するrootではcache keyと同名画像sidecarを正規化full pathで扱い、

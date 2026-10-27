@@ -443,10 +443,8 @@ pub(crate) struct CollectionGridRequestStamp {
 /// the currently installed immutable binding still has `accepted_revision`.
 #[derive(Clone)]
 pub(crate) struct CollectionGridSourceOpenOwner {
-    pub(crate) stamp: CollectionGridRequestStamp,
-    pub(crate) accepted_revision: u64,
-    pub(crate) wanted_revision: u64,
-    pub(crate) anchor: CollectionGridViewportAnchor,
+    /// The same root/descendant load owner used by ordinary ZIP/PDF/folder opens.
+    pub(crate) physical: CollectionGridPhysicalLoadOwner,
     /// Exact immutable root selected by collection playback navigation. Ordinary grid opens leave
     /// this empty; delayed archive conversion carries it until the physical-source commit.
     pub(crate) navigation_prepared:
@@ -507,10 +505,7 @@ impl std::fmt::Debug for CollectionGridSourceOpenOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CollectionGridSourceOpenOwner")
-            .field("stamp", &self.stamp)
-            .field("accepted_revision", &self.accepted_revision)
-            .field("wanted_revision", &self.wanted_revision)
-            .field("anchor", &self.anchor)
+            .field("physical", &self.physical)
             .field(
                 "navigation_revision",
                 &self
@@ -527,10 +522,7 @@ impl std::fmt::Debug for CollectionGridSourceOpenOwner {
 
 impl PartialEq for CollectionGridSourceOpenOwner {
     fn eq(&self, other: &Self) -> bool {
-        self.stamp == other.stamp
-            && self.accepted_revision == other.accepted_revision
-            && self.wanted_revision == other.wanted_revision
-            && self.anchor == other.anchor
+        self.physical == other.physical
             && self.navigation_origin == other.navigation_origin
             && self.navigation_request == other.navigation_request
             && self.navigation_watch.is_some() == other.navigation_watch.is_some()
