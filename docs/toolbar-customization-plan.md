@@ -228,6 +228,11 @@ Phase 3 (右クリックカスタマイズ + ドラッグ並べ替え + 環境�
 
 ### 2.5 検索欄の個別固定 (§1.409)
 
+§1.450 (2026-10-27): 検索ラベルと、同じ直接sense方式だった「フォルダ:」ラベルは
+`Label::selectable(false)` で文字選択を無効にする。他の通常セクションの別Idのinteract方式は変更しない。
+既存のLabel自身のId・click/click_and_dragのsenseと、共通の並べ替え・右クリック処理は維持する。
+他セクションの別Idのinteract方式へ置換する必要はなく、TextEditの選択・フォーカスも変更しない。
+
 - `SearchContainer / SearchLocal / SearchMetadata / SearchEverything` を Folder の後へ追加する。
   表示 flag は4つとも既定 OFF、行頭も既定 OFF。既存の可視順・ドラッグ・行頭・リセット・
   Preferences OK の live carry を使う。右クリックの表示名は「コンテナ検索欄」

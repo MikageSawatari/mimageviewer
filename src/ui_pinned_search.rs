@@ -251,11 +251,17 @@ pub fn draw_pinned_search(
                             output
                         };
                     let header = |ui: &mut egui::Ui| {
-                        label = Some(ui.add(egui::Label::new(kind.label()).sense(if drag {
-                            egui::Sense::click_and_drag()
-                        } else {
-                            egui::Sense::click()
-                        })));
+                        // The label owns section gestures, never text selection. Keep the
+                        // TextEdit's independent focus and drag selection unchanged.
+                        label = Some(
+                            ui.add(egui::Label::new(kind.label()).selectable(false).sense(
+                                if drag {
+                                    egui::Sense::click_and_drag()
+                                } else {
+                                    egui::Sense::click()
+                                },
+                            )),
+                        );
                         if !width.stacked {
                             input = Some(draw_input(ui, &mut actions));
                         }
@@ -347,6 +353,123 @@ pub fn draw_pinned_search_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1450_label_drag_does_not_select_text_and_preserves_gestures() {
+        use std::{cell::RefCell, rc::Rc};
+        for kind in PinnedSearchKind::ALL {
+            for drag in [false, true] {
+                let observed = Rc::new(RefCell::new((
+                    egui::Rect::NOTHING,
+                    false,
+                    false,
+                    false,
+                    egui::Rect::NOTHING,
+                )));
+                let render = observed.clone();
+                let mut draft = "search text".to_owned();
+                let fonts = std::cell::Cell::new(false);
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(600.0, 160.0))
+                    .build_ui(move |ui| {
+                        if !fonts.replace(true) {
+                            crate::ui_fonts::configure_fonts(ui.ctx());
+                            ui.ctx().request_repaint();
+                            return;
+                        }
+                        let field = draw_pinned_search(
+                            ui,
+                            kind,
+                            &mut draft,
+                            PinnedSearchState::Inactive,
+                            Ok(()),
+                            false,
+                            false,
+                            drag,
+                        )
+                        .inner;
+                        let mut seen = render.borrow_mut();
+                        seen.0 = field.label.rect;
+                        seen.1 |= field.label.drag_started();
+                        seen.2 |= field.label.clicked();
+                        seen.3 |= field.label.secondary_clicked();
+                        seen.4 = field.input.rect;
+                    });
+                harness.run();
+                let rect = observed.borrow().0;
+                let start = egui::pos2(rect.left() + 2.0, rect.center().y);
+                let end = egui::pos2(rect.right() - 2.0, rect.center().y);
+                harness.event(egui::Event::PointerMoved(start));
+                harness.event(egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.event(egui::Event::PointerMoved(end));
+                harness.event(egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.run();
+                assert!(
+                    !harness
+                        .ctx
+                        .plugin::<egui::text_selection::LabelSelectionState>()
+                        .lock()
+                        .has_selection(),
+                    "{kind:?}, drag={drag}"
+                );
+                assert_eq!(observed.borrow().1, drag, "{kind:?}");
+                for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+                    harness.event(egui::Event::PointerMoved(start));
+                    for pressed in [true, false] {
+                        harness.event(egui::Event::PointerButton {
+                            pos: start,
+                            button,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    }
+                }
+                harness.run();
+                {
+                    let seen = observed.borrow();
+                    assert!(
+                        seen.2 && seen.3,
+                        "click and context menu gestures: {kind:?}"
+                    );
+                }
+                let input_rect = observed.borrow().4;
+                let start = input_rect.left_center() + egui::vec2(5.0, 0.0);
+                let end = start + egui::vec2(45.0, 0.0);
+                harness.event(egui::Event::PointerMoved(start));
+                harness.event(egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.event(egui::Event::PointerMoved(end));
+                harness.event(egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.run();
+                let state =
+                    egui::text_edit::TextEditState::load(&harness.ctx, kind.input_id()).unwrap();
+                assert!(
+                    !state.cursor.char_range().unwrap().is_empty(),
+                    "input drag selection: {kind:?}"
+                );
+                assert!(harness.ctx.memory(|m| m.has_focus(kind.input_id())));
+            }
+        }
+    }
     #[test]
     fn section1409_width_wraps_whole_section_then_stacks_on_full_row() {
         for full in [1120.0, 720.0, 360.0] {

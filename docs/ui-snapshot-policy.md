@@ -4,6 +4,13 @@ v0.7.0 で導入した `egui_kittest` ベースの UI 回帰テストの運用�
 
 ## 目的
 
+フォルダツリーの現在地 (§1.451) は `folder_pane_location_light` / `folder_pane_location_dark`
+の2枚 (420×380) で、本体と共通の行描画を使う。「現在地のみ・フォーカスなし」、
+「操作カーソルと現在地が別行・フォーカスあり」、「同じ行・フォーカスあり」を各画像にまとめる。
+背景判定の全8状態は純関数のunit testで検査し、現在地同期やworkerをsnapshot fixtureへ持ち込まない。
+2枚は計64,747 bytes。生成後に両方を目視し、現在地の薄い背景と操作カーソルの選択背景が
+明暗とも区別でき、文字・展開矢印・最下行が切れないことを確認した。既存PNGは変更しない。
+
 Ctrl+G の短い語の拒否 (§1.229) は `global_search_short_term_reject_light` /
 `global_search_short_term_reject_dark` の2枚で、単語1つと複数語の表示を保持する。
 製品と共通の幅制限付きバッジを hover し、省略されたメッセージの全文も確認する。

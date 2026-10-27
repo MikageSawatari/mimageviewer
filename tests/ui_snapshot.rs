@@ -50,6 +50,28 @@ fn toolbar_pinned_search_narrow_dark() {
     );
 }
 
+#[test]
+fn folder_pane_location_light() {
+    snapshot_with_theme_at_size(
+        "folder_pane_location_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(420.0, 380.0),
+        None,
+        mimageviewer::draw_folder_pane_location_snapshot_fixture,
+    );
+}
+
+#[test]
+fn folder_pane_location_dark() {
+    snapshot_with_theme_at_size(
+        "folder_pane_location_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(420.0, 380.0),
+        None,
+        mimageviewer::draw_folder_pane_location_snapshot_fixture,
+    );
+}
+
 // Physical pixels above/below the hotspot. Never sample the desktop cursor in a fixture.
 const SNAPSHOT_CURSOR_EXTENT_PHYSICAL: (f32, f32) = (0.0, 34.0);
 
