@@ -232,6 +232,7 @@
 
 - **v4.9.0 に入れる (利用者 2026-10-27)**。
 - 状態: **実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)**。コード調査による指摘で、実環境での失敗の観測は無い。
+- 実機確認 (ClaudeCode、2026-10-27、`1b6879010` の build-dev・隔離 data-dir): 通常起動で窓が開き、ログに `gpu attempt=1 backend=DX12 adapter=NVIDIA GeForce RTX 4090 … result=ok` と `gpu selected backend=DX12 request=auto`。surface 非対応の失敗は実機で起こせないため、vendor の失敗注入テストと保存ログ・通知のテストだけで確認。
 - 確認結果: §1.448のadapter候補選択は既にsurface対応を確認している。残るvendorのdefault configuration取得のexpectを、
   起動時rootの初回installだけErrへ変え、GPU名・SurfaceCapabilities段階を§1.428/§1.448の保存ログと失敗通知へ渡す。
 - 起動後のviewport作成/resize/再設定は従来のexpect panicを維持し、失敗資源を外して続行する状態は作らない。
