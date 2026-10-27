@@ -43,6 +43,7 @@
 - 状態: **master 取り込み (2026-10-27) の衝突解消・検証済み、未 merge**。次の版 (v4.9.0) に入れる (利用者 2026-10-27)。保留バックログから番号を保って移動。
   ブランチ `next-tile` (worktree `G:\home\mimageviewer-nexttile`)。設計 R5 は双方の構造合意済み、実装 (T1・非 PDF・PDF / EPUB) は独立完了レビュー ACCEPT、
   利用者の意見 (2026-10-12: 暗い背景・既定 8 列・最大 20 列) を反映済み。既定キーは O。正本は [画像窓内のページ一覧設計](detached-book-page-overview-plan.md)。
+- 実機確認 (ClaudeCode、2026-10-27、next-tile 93d01b88f の build-dev・隔離 data-dir、12 ページの ZIP): 通常 fullscreen で O → 一覧 (暗い背景・8 列・現在ページに枠) → 10 ページ目をクリックで着地し一覧が閉じた。O → Esc で元のページのまま閉じた。「…」メニューを開いたまま O → メニューは消え、旧メニュー位置のタイル (8 ページ目) をクリックで着地。ページめくり ON で → の直後に O → 一覧は開かずめくった先に着地、その後の O で一覧が開いた (めくり中に O が届いたかは画面からは区別できない)。F12 の別ウィンドウで O → 一覧、3 ページ目を選ぶと別ウィンドウが 3 ページ目へ移りメイン一覧も追従。メイン内閲覧・独立画像窓・PDF / EPUB・ゲームパッドは未確認。
 - 残り: 取り込み後の独立再レビュー・本体lib全件 (`test-lib-full.ps1`)・確認用ビルド (`build-dev.ps1`)・実アプリ確認。今回指定された自動検証は完了（設計§25.6）。全libとbuild-devはcoordinator担当。下記のブランチ側の過去の結果を今回の統合後の成功証拠として扱わない。
 - 保持する契約: 通常fullscreen／メイン内閲覧／連動・独立detachedの同じsurface内で一覧を開く。閲覧中／取消はGridの位置・選択・履歴を保持し、選択後は既存ページ移動と同じGrid同期（独立窓はmain非干渉）へ渡す。非active Selectは破棄して元一覧を保つ。Sのslideshowは維持し、一覧中だけ当該viewerの自動送りを休止する。
 - 今回の統合契約: Selectの既存照合を全通過したらClosed→既存landing一回とし、Checking後の許可・後着拒否・同期拒否は通常navigation ownerが扱う。一覧の再open・待機・追加pending・三値の受付証明は作らない（設計§25.1追補）。構成採用後の可視実items順とhiddenを反映し、白紙補助annotationは`None`のまま未接続。関連lib 1,374件・全UI snapshot 211件成功、通常／test-script check・audit違反0・glyph 0を確認（§25.6）。
