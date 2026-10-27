@@ -29696,12 +29696,6 @@ impl App {
             self.show_snapshot_out_of_scope_open_feedback();
             return FolderOpenOutcome::Ignored;
         }
-        if matches!(owner, OpenRequestOwner::Navigation)
-            && self.main_folder_history_available()
-            && self.restore_smart_folder_for_synthetic_path(&path)
-        {
-            return FolderOpenOutcome::Loaded;
-        }
         if Self::path_needs_open_classification(&path) {
             return match self.start_open_path_classification_at_stage(
                 path.clone(),
@@ -29841,6 +29835,20 @@ impl App {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
+        }
+        // Direct input and immediate fullscreen close share this dispatcher. A Smart root
+        // is a view identity, never a directory to scan (including failed restoration).
+        if matches!(owner, OpenRequestOwner::Navigation)
+            && self.main_folder_history_available()
+            && smart_folder::is_smart_folder_synthetic_path(&path)
+        {
+            return if self
+                .restore_smart_folder_for_synthetic_path_with_navigation(&path, navigation)
+            {
+                FolderOpenOutcome::Loaded
+            } else {
+                FolderOpenOutcome::Ignored
+            };
         }
         if classified_kind != Some(OpenPathKind::Directory)
             && let Some(reason) = self.pdf_open_refusal(&path)
@@ -54089,6 +54097,44 @@ impl App {
             let (_, ref cvar) = **q;
             cvar.notify_all();
         }
+    }
+
+    /// Install worker-prepared resources only for a Search whose mounted context has no pool.
+    /// The ordinary context token/channel own the pool and the existing load/exit cancels it.
+    pub(crate) fn install_missing_search_thumbnail_workers(
+        &mut self,
+        cache_map: Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
+        catalog: Option<Arc<crate::catalog::CatalogDb>>,
+    ) {
+        if self.reload_queue.is_some() {
+            return;
+        }
+        debug_assert!(self.heavy_io_queue.is_none());
+        self.cache_gen_total = 0;
+        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
+        if let Some(catalog) = catalog.as_ref()
+            && self
+                .current_color_catalog
+                .as_ref()
+                .is_none_or(|existing| !Arc::ptr_eq(existing, catalog))
+        {
+            self.cache_preopened_catalog(&search_results_synthetic_path(), Arc::clone(catalog));
+        }
+        self.current_color_cache_map = Some(Arc::clone(&cache_map));
+        self.current_color_catalog = catalog.clone();
+        let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        self.spawn_thumbnail_workers(
+            &self.tx,
+            Arc::clone(&self.cancel_token),
+            reload_queue,
+            heavy_io_queue,
+            cache_map,
+            catalog,
+            self.folder_thumb_pin_db.clone(),
+        );
     }
 
     /// 永続サムネイルワーカープールを `parallelism.thread_count()` 個 spawn する。

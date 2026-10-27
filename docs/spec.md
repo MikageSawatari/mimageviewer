@@ -558,6 +558,8 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   `スマートフォルダ名 > フォルダ名 > 子フォルダ名` の scoped drill とし、中身へ保存条件を
   再適用しない。Backspace / 親移動は entry root より外へ出ず、entry root からは再走査なしで
   保持 root snapshot へ戻る
+- 結果行から直接開いた ZIP / PDF は、本の最上位からの Backspace / 親移動・設定に従う全画面の
+  親一覧への直帰でスマートフォルダへ戻り、その本を選択する。ZIP 内の階層戻りは一段ずつ行う
 - scoped drill 中の Ctrl+↑/↓ は現在 entry 内だけを DFS し、端では root snapshot の表示順で
   前後の実フォルダ entry へ移る。キーボード、リング、ゲームパッド、画像フルスクリーン、
   native 動画は同じ判定を使う。検索、★固定、戻る / 進む履歴、別スマートフォルダとの往復では

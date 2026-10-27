@@ -8778,7 +8778,7 @@ impl App {
         self.restore_smart_folder_for_synthetic_path_with_navigation(path, None)
     }
 
-    fn restore_smart_folder_for_synthetic_path_with_navigation(
+    pub(super) fn restore_smart_folder_for_synthetic_path_with_navigation(
         &mut self,
         path: &Path,
         navigation: Option<super::MainListNavigation>,

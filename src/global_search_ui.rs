@@ -40,6 +40,14 @@ use everything::{SearchMetadataInstall, SearchMetadataResources};
 impl SearchMetadataResources {
     fn for_app(app: &App) -> Self {
         Self {
+            thumbnail_init: app
+                .reload_queue
+                .is_none()
+                .then(|| SearchThumbnailInitRequest {
+                    catalog_work: crate::catalog::CatalogWork::default(),
+                    sort: app.settings.folder_thumb_sort,
+                    depth: app.settings.folder_thumb_depth,
+                }),
             pin_db: app.folder_thumb_pin_db.clone(),
             tags_db_path: app.tags_db.as_ref().map(|db| db.read_path().to_path_buf()),
             video_pins: app.video_pin_db.as_ref().and_then(|db| db.read_source()),
@@ -56,6 +64,79 @@ impl SearchMetadataResources {
                     },
                 ),
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SearchThumbnailInitRequest {
+    catalog_work: crate::catalog::CatalogWork,
+    sort: crate::settings::SortOrder,
+    depth: u32,
+}
+
+struct PreparedSearchThumbnails {
+    cache: Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
+    catalog: Option<Arc<crate::catalog::CatalogDb>>,
+}
+
+impl SearchThumbnailInitRequest {
+    fn prepare(
+        &self,
+        existing: Option<&everything::metadata::FolderThumbnailResources>,
+    ) -> PreparedSearchThumbnails {
+        if let Some(existing) = existing {
+            return PreparedSearchThumbnails {
+                cache: Arc::clone(&existing.cache),
+                catalog: Some(Arc::clone(&existing.catalog)),
+            };
+        }
+        // Use the same admitted catalog open / load as other aggregate preparations.
+        // A failed cache open still permits ordinary in-memory thumbnail generation.
+        let catalog = match self
+            .catalog_work
+            .open(&crate::app::search_results_synthetic_path())
+        {
+            Ok(db) => Some(Arc::new(db)),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "search: catalog open failed in prepare worker: {error}"
+                ));
+                None
+            }
+        };
+        let entries = catalog
+            .as_ref()
+            .and_then(|db| {
+                db.load_all()
+                    .map_err(|error| {
+                        crate::logger::log(format!(
+                            "search: catalog load failed in prepare worker: {error}"
+                        ));
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
+        PreparedSearchThumbnails {
+            cache: Arc::new(std::sync::RwLock::new(entries)),
+            catalog,
+        }
+    }
+}
+
+impl PreparedSearchThumbnails {
+    fn folder_resources(
+        &self,
+        sort: crate::settings::SortOrder,
+        depth: u32,
+    ) -> Option<everything::metadata::FolderThumbnailResources> {
+        self.catalog
+            .as_ref()
+            .map(|catalog| everything::metadata::FolderThumbnailResources {
+                cache: Arc::clone(&self.cache),
+                catalog: Arc::clone(catalog),
+                sort,
+                depth,
+            })
     }
 }
 pub(crate) use everything::SearchOpenOrigin;
@@ -356,6 +437,7 @@ enum SearchPrepareOutput {
 }
 
 struct SearchPreparedItems {
+    thumbnail_init: Option<PreparedSearchThumbnails>,
     metadata: SearchMetadataInstall,
     rating_provenance: SearchRatingProvenance,
     page_identity_index: Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
@@ -2143,13 +2225,24 @@ fn search_prepare_worker(
                             wish.visibility.clone(),
                         ),
                     );
+                    let thumbnail_init = resources
+                        .thumbnail_init
+                        .as_ref()
+                        .map(|request| request.prepare(resources.folder_thumbnails.as_ref()));
+                    let mut metadata_resources = resources.clone();
+                    if let (Some(request), Some(prepared)) =
+                        (resources.thumbnail_init.as_ref(), thumbnail_init.as_ref())
+                    {
+                        metadata_resources.folder_thumbnails =
+                            prepared.folder_resources(request.sort, request.depth);
+                    }
                     let metadata = match &wish.source {
                         SearchProjection::Metadata => SearchMetadataInstall::Existing,
                         SearchProjection::Everything { .. } => {
                             match everything::prepare_everything_metadata(
                                 &items,
                                 &image_metas,
-                                &resources,
+                                &metadata_resources,
                                 &cancel,
                                 &wish.visibility,
                             ) {
@@ -2177,6 +2270,7 @@ fn search_prepare_worker(
                     let _ = tx.send(SearchPrepareOutput::Ready(
                         wish,
                         SearchPreparedItems {
+                            thumbnail_init,
                             metadata,
                             rating_provenance,
                             page_identity_index,
@@ -3258,9 +3352,17 @@ impl App {
                         && wish.rating_filter == self.effective_rating_filter()
                         && wish.rating_preview == self.rating_preview_recipe()
                         && wish.done == self.global_search.done;
-                    same_surface &= prepared
-                        .metadata
-                        .is_current(&SearchMetadataResources::for_app(self));
+                    let mut resources = SearchMetadataResources::for_app(self);
+                    if resources.thumbnail_init.is_some()
+                        && resources.folder_thumbnails.is_none()
+                        && let Some(thumbnails) = prepared.thumbnail_init.as_ref()
+                    {
+                        resources.folder_thumbnails = thumbnails.folder_resources(
+                            self.settings.folder_thumb_sort,
+                            self.settings.folder_thumb_depth,
+                        );
+                    }
+                    same_surface &= prepared.metadata.is_current(&resources);
                     if latest && same_surface {
                         if matches!(wish.source, SearchProjection::Everything { .. }) {
                             self.finish_everything_edit_boundary();
@@ -3353,6 +3455,12 @@ impl App {
                             }
                             app.video_thumb_overrides = prepared.video_thumb_overrides;
                             app.search_drilled_folder_counts = prepared.drilled_counts;
+                            if let Some(thumbnails) = prepared.thumbnail_init {
+                                app.install_missing_search_thumbnail_workers(
+                                    thumbnails.cache,
+                                    thumbnails.catalog,
+                                );
+                            }
                             if matches!(wish.source, SearchProjection::Everything { .. }) {
                                 // This accepted producer is complete. The shared video loader
                                 // must use its completed-list path from the first install.
@@ -3386,9 +3494,9 @@ impl App {
                         }) {
                             if matches!(wish.source, SearchProjection::Everything { .. }) {
                                 self.global_search.pending = None;
-                                self.retire_smart_folder_payloads([Box::new((wish, payload))
-                                    as crate::app::smart_folder::RetiredSmartFolderPayload]);
                             }
+                            self.retire_smart_folder_payloads([Box::new((wish, payload))
+                                as crate::app::smart_folder::RetiredSmartFolderPayload]);
                             prepare.desired = None;
                             continue;
                         }
@@ -3413,6 +3521,11 @@ impl App {
                             prepare.metrics.ui_accept_ms =
                                 accept_started.elapsed().as_secs_f64() * 1000.0;
                         }
+                        // Future projections reuse the adopted pool. No second Search pool or
+                        // persistent bootstrap state is kept by the prepare worker.
+                        let _ = prepare.tx.send(SearchPrepareCommand::MetadataResources(
+                            SearchMetadataResources::for_app(self),
+                        ));
                         prepare.desired = None;
                     } else if !self.global_search.active
                         || !self.items_are_global_search_view
@@ -3422,10 +3535,8 @@ impl App {
                         if latest && matches!(wish.source, SearchProjection::Everything { .. }) {
                             self.global_search.pending = None;
                         }
-                        if matches!(wish.source, SearchProjection::Everything { .. }) {
-                            self.retire_smart_folder_payloads([Box::new((wish, prepared))
-                                as crate::app::smart_folder::RetiredSmartFolderPayload]);
-                        }
+                        self.retire_smart_folder_payloads([Box::new((wish, prepared))
+                            as crate::app::smart_folder::RetiredSmartFolderPayload]);
                     } else {
                         crate::logger::log(format!(
                             "[RATING] stale search prepare context={:?} sequence={} latest={} surface={} facts={:?} current_facts={:?} prepared_session={} wish_session={} current_session={}",
@@ -3443,10 +3554,8 @@ impl App {
                         {
                             prepare.metrics.stale_rejections += 1;
                         }
-                        if matches!(wish.source, SearchProjection::Everything { .. }) {
-                            self.retire_smart_folder_payloads([Box::new((wish, prepared))
-                                as crate::app::smart_folder::RetiredSmartFolderPayload]);
-                        }
+                        self.retire_smart_folder_payloads([Box::new((wish, prepared))
+                            as crate::app::smart_folder::RetiredSmartFolderPayload]);
                     }
                 }
                 SearchPrepareOutput::Retry(wish) => {
