@@ -231,12 +231,15 @@
 ### 1.429 描画先 (surface) に対応しない GPU を選ぶと、エラーではなく panic で終わる経路がある — §1.428 の設計レビューで発見 (2026-10-25)
 
 - **v4.9.0 に入れる (利用者 2026-10-27)**。
-- 状態: **未着手**。コード調査 (Codex 独立設計レビュー、§1.428 第 1 版への指摘)。実行時の観測は無い。
+- 状態: **実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)**。コード調査 (Codex 独立設計レビュー、§1.428 第 1 版への指摘)。実行時の観測は無い。
 - 内容: `src/lib.rs` の adapter selector は DX12、なければ Vulkan の adapter を選ぶが、描画先 (surface) との相性を確かめない。
   選んだ adapter が surface に対応しないと、`vendor/egui-wgpu/src/winit.rs:165` 付近の `expect` で panic する (Err にならないので §1.428 の報告にも乗らない)。
   ほかに wgpu の既定 uncaptured-error handler も panic で終わる。selector は v4.7.1 から同じだが、wgpu 30 で adapter の列挙や対応範囲が変わった可能性がある。
 - 対応の方向: selector で surface との相性を確かめてから選ぶ (対応する adapter が無ければ Err を返して §1.428 の報告に乗せる)。panic で終わる起動中の経路を、Err へ変えるか、最初の表示前の panic にも同じ通知を出すかを比べる。vendor の変更は PATCHES.md に記録する。
 - 規模 / 優先度: Small〜Medium / P2 (環境によっては起動しない原因になり得る)。
+
+- §1.448 で候補の surface 対応確認済みと確認。残る vendor の default configuration の `expect` を Err に変え、GPU名・SurfaceCapabilities段階を既存の失敗通知へ渡す。
+  uncaptured-error handler の既定panicは維持する (coordinator判断)。実装・検証は `gpu-init-fallback-plan.md` §12。
 
 ### 1.423 画像を WIC が開いている最中にごみ箱へ送ると、削除が一時的に失敗し得る — テスト基盤の作業中のコード調査 (2026-10-23)
 
@@ -1740,18 +1743,26 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
 ### 1.440 動画・音楽 HUD の音量スライダーが、離すフレームの位置を使わない (2026-10-24)
 
 - **v4.9.0 に入れる (利用者 2026-10-27)**。
-- 出典: §1.192 の調査で見つけた同型 (コード読み、実機未確認)。`draw_overlay_volume_slider` (`src/overlay_draw.rs`、動画 HUD と
+- 状態: **実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)**。
+- 出典: §1.192 の調査で見つけた同型 (コード読み、実機未確認)。`draw_overlay_volume_slider` (`src/video/native_presenter/overlay_draw.rs`、動画 HUD と
   音楽 HUD で共有) は release のパスで最後のドラッグ値を保存し、離した位置を使わない。
 - 直すなら §1.192 の終わり方の型 (`Released` / `Cancelled`) が要る (capture 喪失の合成 release (0,0) をそのまま使うと音量 0 になる)。
   音楽 HUD は egui-winit 側の入力なので、動画 HUD とは別経路として扱う。
 - 規模 / 優先度: Small / P3。
 
+- 動画/音楽を共通slider helperへ接続し、実release座標で確定する。動画の合成release取消と届いたEscapeは開始値へ戻す。
+  音楽の未通知capture喪失は現状維持 (coordinator判断)、新しい入力境界は追加しない。
+
 ### 1.441 音楽 HUD のシークが、離すフレームの最後の移動を取りこぼす (2026-10-24)
 
 - **v4.9.0 に入れる (利用者 2026-10-27)**。
+- 状態: **実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)**。
 - 出典: §1.192 の調査で見つけた同型 (コード読み、実機未確認)。音楽 HUD のシーク (`src/ui_music_panels.rs` の seek 行) は
   `clicked || dragged` のときだけ Seek を出し、release のフレームの位置を使わない。
 - 規模 / 優先度: Small / P3。
+
+- 音楽seekも音量と同じ終端helperで実release座標を採用し、届いたEscapeでは開始位置へ戻す。
+  既存のfullscreen側Escape配送・終了規則は変更しない。
 
 ### 1.442 HUD の減光中に終わったドラッグに、終わりが届かない (2026-10-24)
 

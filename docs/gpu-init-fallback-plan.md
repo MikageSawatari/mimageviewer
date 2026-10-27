@@ -411,3 +411,99 @@ vendor/egui-wgpu/src/lib.rs
 vendor/egui-wgpu/src/setup.rs
 vendor/egui-wgpu/src/startup_diagnostics.rs
 ```
+
+## 12. §1.429 surface 非対応の Err 終了 (2026-10-27、v4.9.0)
+
+状態: 実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)。
+現行§1.448の `native_adapter_candidates` は既に `is_surface_supported` で候補を除外し、
+対応候補なしはAdapterSelectionのErrにしているため、候補選択・APIの試行順は変更しない。
+残る `get_default_config(...).expect(...)` を `UnsupportedSurface` Errへ変え、
+初期surface設置から `run_native` へ返す。GPU名/backendと失敗段階SurfaceCapabilitiesを
+既存§1.428/§1.448の失敗ダイアログ・ログへ渡す。ゼロ寸法でも対応確認だけ行い、configureはしない。
+runtimeのresize/再設定は同じhelperで失敗を記録してその操作を終える。多段の回復は追加しない。
+初期installが失敗した場合は、対象surfaceとdepth/MSAAだけを既存のremove helperで除去する。
+set_windowのErrをlogして続行するvendorのviewport呼出元へ、未設定surfaceを公開したまま残さない。兄弟viewportは変更しない。
+
+coordinator判断: 既定uncaptured-error handlerのpanicは今回は変えず、起動中止の伝播経路を追加しない (§1.448と同じ)。
+単にloggerへ送るhandlerへの置換は、不正なGPU状態で処理が続くため採らない。
+まれな失敗は既定の割り切り (ログ + 通知)。永続データやdetached述語は変更しない。
+
+GPU不要のfailure injectionは `require_surface_configuration(None, ...)` で実際の失敗分岐を通す。
+Err/GPU名/段階と成功値・startup通知の範囲をvendorテストで検査し、製品側では通知本文・ログへの接続を検査する。
+実HWNDによるsurface失敗注入flagは追加せず、製品は起動しない。
+
+検証結果と同時実装のHUD回帰は以下。本体lib全件・build-dev・独立レビューはClaudeCodeへ引き継ぐ。
+
+### 12.1 同時実装の§1.440/§1.441
+
+- 確認した原因: 共有音量sliderは `drag_stopped` で最後のMove値を保存し、音楽seekは `clicked || dragged` だけで更新していた。
+  双方ともreleaseフレームだけ位置が変わる場合に最終値を取りこぼす。音量は `src/video/native_presenter/overlay_draw.rs`、音楽seekは `src/ui_music_panels.rs`。
+- `NativePointerTermination` と既存§1.192のreceipt判定を共通入口へ寄せ、動画のproducer receiptと音楽のegui実releaseを同じ `overlay_slider_value` へ渡す。
+  押下中/ドラッグ中/取消済みと開始button・開始値・最新値は `OverlaySliderDrag` が所有する。実releaseはreceiptの位置で確定し、取消は開始値へ戻す。
+- 音楽seekのwidget所有がEscapeで先に消えても、取消receiptの処理前に開始値を捨てない。取消後のmove/releaseから再取得しない。
+  音楽のfocusを保った未通知capture喪失は現状維持、上位Escapeの配送/終了規則は変更しない (coordinator判断)。
+- 新規テストは10関数: native実overlay/batchでrelease→後続moveとcapture喪失/Escape、音楽実HUD行でrelease→後続move/別buttonとEscape、
+  音楽seek handlerでrelease/Escape (HUD計5関数)。Primary/Secondaryのdragを維持し、Secondaryのクリックだけでは値変更しないことも同じfixtureで検査する。
+  製品失敗通知のGPU名/SurfaceCapabilitiesが1関数、vendorのNone注入/成功値・通知範囲とinstall失敗時の自context除去/成功時の資源保持が4関数。
+  §1.192の既存pass境界・省略/非対話HUD・§1.448/§1.428の既存回帰も維持する。
+
+### 12.2 旧動作でのREDと最終自動検証
+
+HEAD `7a8a25b06`、ブランチ `hud-gpu-1440-1441-1429` の未コミット差分を検証。全build/testで `MSBUILDDISABLENODEREUSE=1`。
+初回native依存を直列で用意した後、最終検証は `CARGO_BUILD_JOBS=24`。
+コマンド全文・exit・所要時間は `target/hud-gpu-validation/*.json`、stdout/stderrは対応する `.log` に保存。
+
+`red.py` はHEADの旧音量関数を原文のまま同じmoduleへ置き、新しいstate引数だけ互換shimで接続した。
+音楽seek handlerも旧 `clicked || dragged` の判定/位置計算へ差し替えた (抽出後の引数名だけ対応)。
+全checkoutを旧版へ戻した試験ではない。コンパイル成功後、同じHUD新規5件が全てassertionで失敗 (nextest exit 100)。
+現在の実装へ戻した2ファイルは前後のSHA-256が一致 (`red_restore.json`)。現実装では5件成功し、さらに関連nextestへ含めて検査した。
+
+| 検証 | exit | 結果 |
+| --- | ---: | --- |
+| cargo fmt (引数なし) | 0 | exit 0。`fmt-complete.log` |
+| 通常core check | 0 | exit 0。`check-complete.log` |
+| test-script core check | 0 | exit 0。`check-script-complete.log` |
+| 関連nextest (通常、§1.192/§1.448/§1.428を含む) | 0 | 726件、726 passed, 13890 skipped。`focused-complete.log` |
+| 関連nextest (test-script) | 0 | 35件、35 passed, 14727 skipped。`focused-script.log` |
+| cargo test -p mimageviewer --test ui_snapshot | 0 | 213成功 / 0失敗。`snapshot.log` |
+| egui-wgpu nextest (winit / lib、全件) | 0 | 49件、49 passed, 0 skipped。`vendor-complete.log` |
+| 変更vendorのrustfmt --check | 0 | exit 0。`vendor-fmt.log` |
+| viewer context audit (再ビルド済みtoolを最新ソースへ実行) | 0 | 指摘0件。`audit-complete.log` |
+| cargo fmt --check | 0 | exit 0。`fmt-check.log` |
+| UI glyph check | 0 | 危険グリフ0件。`glyphs-complete.log` |
+| git diff --check | 0 | exit 0。`whitespace.log` |
+
+途中の非ゼロ結果も成功扱いにしない:
+
+- 最初の通常check / lib testビルドはturbojpeg-sysのCMake `--parallel 24` がexit 1。Cargo並列数1でnative前提を構築した後に再検査した。
+- 実装途中の通常checkに `insert_temp` の戻り型とunitの不一致が1件あり修正済み。
+- 新規HUDの初回は4成功/1失敗。音楽seekテストのf32丸めに対する期待値を、正確に表せる50/75秒の座標へ修正した。
+  次の実行でEscape時の開始値破棄を検出し、receipt優先の所有解除順へ修正した。最終結果は上表。
+- 最初のRED準備scriptはCRLFの境界検索で停止 (テスト未実行)。newlineを正規化し、finallyで原本bytesを復元する形で再実行した。
+- ボタン所有を追加した途中のcompileで、別helperのPrimary参照へ置換が及んだE0425が1件あり、その行を原状へ戻した。
+  その置換によるoverlay_draw.rsの差分はslider領域だけと確認し、開始buttonを保持したPrimary/Secondary両方の回帰を追加して再検査した。
+
+全てheadless unit / fake-input / offscreen検証。実HWND配送・実環境での非対応surface・最初の失敗ダイアログの実表示は未確認。
+製品バイナリは起動せず、通常profileの設定DBなどをテスト準備で操作していない。依頼どおり本体lib全件とbuild-devは未実施。
+uncaptured-error handlerの既定panicと音楽の未通知capture喪失は、追加判断待ちではなくcoordinator採択済みの維持範囲。
+
+### 12.3 変更ファイル (16ファイル)
+
+```text
+docs/README.md
+docs/gpu-init-fallback-plan.md
+docs/keymap-spec.md
+docs/next-release-backlog.md
+docs/video-architecture.md
+src/app.rs
+src/run_native_failure.rs
+src/ui_music_panels.rs
+src/ui_music_panels/slider_tests.rs
+src/video/native_presenter/overlay_draw.rs
+src/video/native_presenter/render_core.rs
+src/video/native_presenter/slider_terminal_tests.rs
+src/video/native_touch.rs
+vendor/egui-wgpu/PATCHES.md
+vendor/egui-wgpu/src/lib.rs
+vendor/egui-wgpu/src/winit.rs
+```

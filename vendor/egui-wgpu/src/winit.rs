@@ -46,6 +46,127 @@ pub struct Painter {
     surfaces: ViewportIdMap<SurfaceState>,
 }
 
+fn require_surface_configuration<T>(
+    value: Option<T>,
+    adapter: &wgpu::AdapterInfo,
+    config: &WgpuConfiguration,
+    observe: bool,
+) -> Result<T, crate::WgpuError> {
+    if observe {
+        config.startup_end(StartupGpuStage::SurfaceCapabilities, value.is_some());
+    }
+    value.ok_or_else(|| crate::WgpuError::UnsupportedSurface {
+        adapter: adapter.name.clone(),
+        backend: adapter.backend,
+    })
+}
+
+#[cfg(test)]
+mod surface_configuration_tests {
+    use super::*;
+    use crate::StartupDiagnosticEvent;
+    use std::sync::Mutex;
+
+    #[test]
+    fn unsupported_surface_is_an_error_with_gpu_and_failed_capabilities_stage() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let config = WgpuConfiguration {
+            startup_diagnostics: Some(Arc::new(move |event| observed.lock().unwrap().push(event))),
+            ..Default::default()
+        };
+        let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12);
+        info.name = "injected GPU".into();
+        config.startup_begin(StartupGpuStage::SurfaceCapabilities);
+        let error = require_surface_configuration::<()>(None, &info, &config, true).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::WgpuError::UnsupportedSurface {
+                backend: wgpu::Backend::Dx12,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("injected GPU"));
+        let events = events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StartupDiagnosticEvent::Begin(StartupGpuStage::SurfaceCapabilities),
+                StartupDiagnosticEvent::End {
+                    stage: StartupGpuStage::SurfaceCapabilities,
+                    success: false
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn supported_surface_preserves_configuration_and_runtime_has_no_startup_events() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let config = WgpuConfiguration {
+            startup_diagnostics: Some(Arc::new(move |event| observed.lock().unwrap().push(event))),
+            ..Default::default()
+        };
+        let info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12);
+        assert_eq!(
+            require_surface_configuration(Some(42), &info, &config, true).unwrap(),
+            42
+        );
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [StartupDiagnosticEvent::End {
+                stage: StartupGpuStage::SurfaceCapabilities,
+                success: true
+            }]
+        ));
+        events.lock().unwrap().clear();
+        assert!(require_surface_configuration::<()>(None, &info, &config, false).is_err());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_surface_install_removes_only_its_own_resources_and_preserves_error() {
+        let root = ViewportId::ROOT;
+        let child = ViewportId(egui::Id::unique("surface-install-child"));
+        for failed in [root, child] {
+            let mut surfaces: ViewportIdMap<_> =
+                [(root, "root"), (child, "child")].into_iter().collect();
+            let mut depth = surfaces.clone();
+            let mut msaa = surfaces.clone();
+            let error = crate::WgpuError::UnsupportedSurface {
+                adapter: "injected GPU".into(),
+                backend: wgpu::Backend::Dx12,
+            };
+            let result =
+                finish_surface_install(Err(error), failed, &mut surfaces, &mut depth, &mut msaa);
+            assert!(
+                matches!(result, Err(crate::WgpuError::UnsupportedSurface { adapter, .. }) if adapter == "injected GPU")
+            );
+            let sibling = if failed == root { child } else { root };
+            for resources in [&surfaces, &depth, &msaa] {
+                assert_eq!(resources.len(), 1);
+                assert!(resources.contains_key(&sibling));
+                assert!(!resources.contains_key(&failed));
+            }
+        }
+    }
+
+    #[test]
+    fn successful_surface_install_keeps_all_resources() {
+        let root = ViewportId::ROOT;
+        let child = ViewportId(egui::Id::unique("surface-install-child"));
+        let mut surfaces: ViewportIdMap<_> =
+            [(root, "root"), (child, "child")].into_iter().collect();
+        let mut depth = surfaces.clone();
+        let mut msaa = surfaces.clone();
+        finish_surface_install(Ok(()), child, &mut surfaces, &mut depth, &mut msaa).unwrap();
+        for resources in [&surfaces, &depth, &msaa] {
+            assert_eq!(resources.len(), 2);
+        }
+    }
+}
+
 impl Painter {
     /// Manages [`wgpu`] state, including surface state, required to render egui.
     ///
@@ -122,7 +243,7 @@ impl Painter {
         config: &WgpuConfiguration,
         viewport_id: ViewportId,
         observe_startup: bool,
-    ) {
+    ) -> Result<(), crate::WgpuError> {
         profiling::function_scope!();
 
         let SurfaceConfig {
@@ -150,19 +271,19 @@ impl Painter {
             surface_state
                 .surface
                 .get_default_config(&render_state.adapter, width, height);
-        if observe {
-            config.startup_end(
-                StartupGpuStage::SurfaceCapabilities,
-                default_config.is_some(),
-            );
-        }
+        let default_config = require_surface_configuration(
+            default_config,
+            &render_state.adapter.get_info(),
+            config,
+            observe,
+        )?;
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: render_state.target_format,
             present_mode,
             alpha_mode: surface_state.alpha_mode,
             view_formats: vec![render_state.target_format],
-            ..default_config.expect("The surface isn't supported by this adapter")
+            ..default_config
         };
 
         if let Some(desired_maximum_frame_latency) = desired_maximum_frame_latency {
@@ -178,6 +299,7 @@ impl Painter {
         if observe {
             config.startup_end(StartupGpuStage::SurfaceConfigure, true);
         }
+        Ok(())
     }
 
     /// Drop the existing [`wgpu::Surface`] for `viewport_id` and create a fresh one for the
@@ -213,7 +335,7 @@ impl Painter {
             resizing,
             #[cfg(windows)]
             hwnd,
-        );
+        )?;
         Ok(())
     }
 
@@ -358,7 +480,7 @@ impl Painter {
             false,
             #[cfg(windows)]
             hwnd,
-        );
+        )?;
         Ok(())
     }
 
@@ -374,7 +496,24 @@ impl Painter {
         height: u32,
         resizing: bool,
         #[cfg(windows)] hwnd: isize,
-    ) {
+    ) -> Result<(), crate::WgpuError> {
+        if width == 0 || height == 0 {
+            let render_state = self
+                .render_state
+                .as_ref()
+                .expect("render state initialized before surface installation");
+            let observe = viewport_id == ViewportId::ROOT && self.startup_present.pending();
+            if observe {
+                self.config
+                    .startup_begin(StartupGpuStage::SurfaceCapabilities);
+            }
+            require_surface_configuration(
+                surface.get_default_config(&render_state.adapter, width.max(1), height.max(1)),
+                &render_state.adapter.get_info(),
+                &self.config,
+                observe,
+            )?;
+        }
         let alpha_mode = {
             // Panic: We use the same failure mode as `resize_and_generate_depth_texture_view_and_msaa_view`
             let render_state = self
@@ -425,13 +564,21 @@ impl Painter {
         );
         let Some(width) = NonZeroU32::new(width) else {
             log::debug!("The window width was zero; skipping generate textures");
-            return;
+            return Ok(());
         };
         let Some(height) = NonZeroU32::new(height) else {
             log::debug!("The window height was zero; skipping generate textures");
-            return;
+            return Ok(());
         };
-        self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
+        let result =
+            self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
+        finish_surface_install(
+            result,
+            viewport_id,
+            &mut self.surfaces,
+            &mut self.depth_texture_view,
+            &mut self.msaa_texture_view,
+        )
     }
 
     /// Returns the maximum texture dimension supported if known
@@ -450,7 +597,7 @@ impl Painter {
         viewport_id: ViewportId,
         width_in_pixels: NonZeroU32,
         height_in_pixels: NonZeroU32,
-    ) {
+    ) -> Result<(), crate::WgpuError> {
         profiling::function_scope!();
 
         let width = width_in_pixels.get();
@@ -471,7 +618,7 @@ impl Painter {
                             "Failed to constrain surface window for {viewport_id:?}: {error}"
                         );
                         self.remove_viewport(viewport_id);
-                        return;
+                        return Ok(());
                     }
                 }
             } else {
@@ -487,7 +634,7 @@ impl Painter {
         // reconfigure paths use only these validated dimensions, including Lost recreation.
         #[cfg(windows)]
         if width == 0 || height == 0 {
-            return;
+            return Ok(());
         }
 
         Self::configure_surface(
@@ -496,7 +643,7 @@ impl Painter {
             &self.config,
             viewport_id,
             self.startup_present.pending(),
-        );
+        )?;
 
         if let Some(depth_format) = self.options.depth_stencil_format {
             self.depth_texture_view.insert(
@@ -548,6 +695,7 @@ impl Painter {
                     .create_view(&wgpu::TextureViewDescriptor::default()),
             );
         }
+        Ok(())
     }
 
     /// Handles changes of the resizing state.
@@ -596,13 +744,15 @@ impl Painter {
                         .lock()
                         .setPresentsWithTransaction(resizing);
 
-                    Self::configure_surface(
+                    if let Err(error) = Self::configure_surface(
                         state,
                         render_state,
                         &self.config,
                         viewport_id,
                         self.startup_present.pending(),
-                    );
+                    ) {
+                        log::error!("Failed to configure resized surface: {error}");
+                    }
                 }
             }
         }
@@ -617,11 +767,13 @@ impl Painter {
         profiling::function_scope!();
 
         if self.surfaces.contains_key(&viewport_id) {
-            self.resize_and_generate_depth_texture_view_and_msaa_view(
+            if let Err(error) = self.resize_and_generate_depth_texture_view_and_msaa_view(
                 viewport_id,
                 width_in_pixels,
                 height_in_pixels,
-            );
+            ) {
+                log::error!("Failed to resize surface: {error}");
+            }
         } else {
             log::warn!(
                 "Ignoring window resize notification with no surface created via Painter::set_window()"
@@ -816,13 +968,16 @@ impl Painter {
             self.config.startup_end(StartupGpuStage::Buffers, true);
         }
         if surface_state.needs_reconfigure {
-            Self::configure_surface(
+            if let Err(error) = Self::configure_surface(
                 surface_state,
                 render_state,
                 &self.config,
                 viewport_id,
                 self.startup_present.pending(),
-            );
+            ) {
+                log::error!("Failed to reconfigure surface: {error}");
+                return vsync_sec;
+            }
             surface_state.needs_reconfigure = false;
         }
 
@@ -861,13 +1016,16 @@ impl Painter {
                 match (*self.config.on_surface_status)(&other) {
                     SurfaceErrorAction::Reconfigure => {
                         probe.outcome = PaintOutcome::SurfaceReconfigured;
-                        Self::configure_surface(
+                        if let Err(error) = Self::configure_surface(
                             surface_state,
                             render_state,
                             &self.config,
                             viewport_id,
                             self.startup_present.pending(),
-                        );
+                        ) {
+                            log::error!("Failed to reconfigure surface: {error}");
+                            return vsync_sec;
+                        }
                         self.context.request_repaint_of(viewport_id);
                     }
                     SurfaceErrorAction::RecreateSurface => {
@@ -1237,6 +1395,21 @@ std::thread_local! {
 #[cfg(test)]
 fn submission_counts() -> SubmissionCounts {
     SUBMISSION_COUNTS.with(std::cell::Cell::get)
+}
+
+// A failed constructor must not leave an unconfigured surface available to a
+// later paint. Runtime viewport callers can log set_window errors and continue.
+fn finish_surface_install<S, D, M>(
+    result: Result<(), crate::WgpuError>,
+    viewport_id: ViewportId,
+    surfaces: &mut ViewportIdMap<S>,
+    depth_views: &mut ViewportIdMap<D>,
+    msaa_views: &mut ViewportIdMap<M>,
+) -> Result<(), crate::WgpuError> {
+    if result.is_err() {
+        remove_viewport_resources(viewport_id, surfaces, depth_views, msaa_views);
+    }
+    result
 }
 
 fn remove_viewport_resources<S, D, M>(

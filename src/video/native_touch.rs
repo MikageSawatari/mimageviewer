@@ -424,6 +424,40 @@ impl Default for NativeTouchAdapter {
     }
 }
 
+/// One owner for a slider gesture, including retirement until the held button is released.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum OverlaySliderDrag {
+    Pressed {
+        button: egui::PointerButton,
+        original: f64,
+    },
+    Active {
+        button: egui::PointerButton,
+        original: f64,
+        last: f64,
+    },
+    Cancelled {
+        button: egui::PointerButton,
+    },
+}
+
+impl OverlaySliderDrag {
+    pub(crate) fn button(self) -> egui::PointerButton {
+        match self {
+            Self::Pressed { button, .. }
+            | Self::Active { button, .. }
+            | Self::Cancelled { button } => button,
+        }
+    }
+
+    pub(crate) fn last(self) -> Option<f64> {
+        match self {
+            Self::Active { last, .. } => Some(last),
+            Self::Pressed { .. } | Self::Cancelled { .. } => None,
+        }
+    }
+}
+
 /// Terminal fact for one overlay logical pass, recorded where a release is emitted.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum NativePointerTermination {
@@ -433,6 +467,42 @@ pub(crate) enum NativePointerTermination {
     },
     /// Synthetic release, or Escape delivered to egui (no button).
     Cancelled { button: Option<egui::PointerButton> },
+}
+
+impl NativePointerTermination {
+    pub(crate) fn from_egui(
+        ctx: &egui::Context,
+        owned_button: Option<egui::PointerButton>,
+    ) -> Option<Self> {
+        let escape_allowed = !crate::ime_focus::ime_input_active(ctx);
+        ctx.input(|input| {
+            if escape_allowed && input.key_pressed(egui::Key::Escape) {
+                return Some(Self::Cancelled { button: None });
+            }
+            input.events.iter().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    button,
+                    pos,
+                    pressed: false,
+                    ..
+                } if owned_button.is_none_or(|owned| owned == *button) => Some(Self::Released {
+                    button: *button,
+                    pos: *pos,
+                }),
+                _ => None,
+            })
+        })
+    }
+
+    pub(crate) fn for_button(self, owned: egui::PointerButton) -> Option<Self> {
+        match self {
+            Self::Released { button, .. }
+            | Self::Cancelled {
+                button: Some(button),
+            } if button != owned => None,
+            _ => Some(self),
+        }
+    }
 }
 
 pub(crate) struct NativeTouchAdapterOutput {

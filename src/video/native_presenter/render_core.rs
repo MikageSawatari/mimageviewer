@@ -1044,23 +1044,7 @@ fn consume_seek_strip_wheel(
 
 #[cfg(test)]
 fn test_pointer_termination(ctx: &egui::Context) -> Option<NativePointerTermination> {
-    ctx.input(|input| {
-        if input.key_pressed(egui::Key::Escape) {
-            return Some(NativePointerTermination::Cancelled { button: None });
-        }
-        input.events.iter().find_map(|event| match event {
-            egui::Event::PointerButton {
-                button,
-                pos,
-                pressed: false,
-                ..
-            } => Some(NativePointerTermination::Released {
-                button: *button,
-                pos: *pos,
-            }),
-            _ => None,
-        })
-    })
+    NativePointerTermination::from_egui(ctx, None)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3045,7 +3029,7 @@ struct NativeEguiOverlayState {
     /// cursor ownership 判定専用。
     raw_hover_pos: Option<egui::Pos2>,
     pending_overlay_commands: Vec<NativeOverlayCommand>,
-    last_volume_target: Option<f64>,
+    last_volume_target: Option<super::overlay_draw::OverlaySliderDrag>,
     /// main egui Context の zoom_factor をミラーするアプリ内倍率。
     ui_scale: f32,
     pixels_per_point: f32,
@@ -13742,6 +13726,7 @@ impl NativeEguiOverlayState {
                             painter,
                             &row_layout,
                             NativeBottomControls {
+                                pointer_termination,
                                 hud_rect,
                                 is_playing,
                                 loop_mode,
@@ -15291,6 +15276,7 @@ fn native_bottom_chrome_interaction_visible(
 }
 
 struct NativeBottomControls<'a> {
+    pointer_termination: Option<NativePointerTermination>,
     hud_rect: egui::Rect,
     is_playing: bool,
     loop_mode: crate::settings::VideoLoopMode,
@@ -15311,7 +15297,7 @@ struct NativeBottomControls<'a> {
 struct NativeBottomControlOwners<'a> {
     text_cache: &'a mut super::bottom_hud::TextCache,
     frame_step_hold: &'a mut Option<NativeFrameStepHold>,
-    last_volume_target: &'a mut Option<f64>,
+    last_volume_target: &'a mut Option<super::overlay_draw::OverlaySliderDrag>,
     video_speed_popup_open: &'a mut bool,
     last_drawn_speed_popup_rect: &'a mut Option<egui::Rect>,
     audio_track_menu_open: &'a mut bool,
@@ -15333,6 +15319,7 @@ fn draw_native_bottom_controls(
 ) -> (Option<egui::Rect>, Option<egui::Rect>) {
     use super::bottom_hud::Item as HudItem;
     let NativeBottomControls {
+        pointer_termination,
         hud_rect,
         is_playing,
         loop_mode,
@@ -15861,6 +15848,7 @@ fn draw_native_bottom_controls(
                 egui::Id::unique("native_video_volume"),
                 Some(vol_tooltip),
                 last_volume_target,
+                pointer_termination,
             ) {
                 commands.push(NativeOverlayCommand::SetVolume {
                     volume: value,
@@ -15868,7 +15856,7 @@ fn draw_native_bottom_controls(
                 });
             }
         } else if !normalize_scanning {
-            if let Some(volume) = last_volume_target.take() {
+            if let Some(volume) = last_volume_target.take().and_then(|drag| drag.last()) {
                 commands.push(NativeOverlayCommand::SetVolume {
                     volume,
                     persist: true,
@@ -16060,6 +16048,7 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
         &painter,
         &layout,
         NativeBottomControls {
+            pointer_termination: NativePointerTermination::from_egui(ui.ctx(), None),
             hud_rect: hud,
             is_playing: false,
             loop_mode: crate::settings::VideoLoopMode::Off,
@@ -16116,6 +16105,7 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
 #[cfg(test)]
 mod chrome_suppression_interaction_tests {
     mod seek_terminal_tests {
+        include!("slider_terminal_tests.rs");
         // GPU-free regressions using the production overlay and logical batch driver.
         use super::*;
 
@@ -16571,6 +16561,7 @@ mod chrome_suppression_interaction_tests {
                 let last = target
                     .state
                     .last_volume_target
+                    .and_then(|drag| drag.last())
                     .expect("real slider drag sent a value");
                 let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let observed = passes.clone();
@@ -16600,8 +16591,8 @@ mod chrome_suppression_interaction_tests {
                         ));
                     }
                 }));
-                // Keep the release at the last Move: volume's separate release-position
-                // limitation is outside ?1.192, and this test preserves its existing result.
+                // Keep release at the last Move to isolate logical-pass scheduling.
+                // hud_slider_native_release covers movement on the release frame.
                 let run =
                     run_native_event_batch(&mut target, &[up(pos), visibility_wheel(360)]).unwrap();
                 assert!(matches!(run.commands.as_slice(), [

@@ -53,6 +53,9 @@ fn report_with_gpu(
                 egui_wgpu::WgpuError::NoSurfaceFormatsAvailable => {
                     ("Wgpu.NoSurfaceFormatsAvailable", None)
                 }
+                egui_wgpu::WgpuError::UnsupportedSurface { .. } => {
+                    ("Wgpu.UnsupportedSurface", None)
+                }
                 egui_wgpu::WgpuError::RequestDeviceError(cause) => {
                     ("Wgpu.RequestDeviceError", Some(cause))
                 }
@@ -111,6 +114,9 @@ fn report_with_gpu(
             ) => Some(Stage::AdapterSelection),
             eframe::Error::Wgpu(egui_wgpu::WgpuError::NoSurfaceFormatsAvailable) => {
                 Some(Stage::PipelineCreate)
+            }
+            eframe::Error::Wgpu(egui_wgpu::WgpuError::UnsupportedSurface { .. }) => {
+                Some(Stage::SurfaceCapabilities)
             }
             eframe::Error::Wgpu(egui_wgpu::WgpuError::CreateSurfaceError(_)) => {
                 Some(Stage::SurfaceCreate)
@@ -201,6 +207,20 @@ pub(crate) fn finish_run_native(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn unsupported_surface_reports_gpu_and_capabilities_stage() {
+        let error = eframe::Error::Wgpu(egui_wgpu::WgpuError::UnsupportedSurface {
+            adapter: "injected GPU".into(),
+            backend: wgpu::Backend::Dx12,
+        });
+        let report = report_with_gpu(&error, "logs", &Default::default());
+        assert_eq!(report.kind, "Wgpu.UnsupportedSurface");
+        assert!(report.log_detail.contains("injected GPU"));
+        assert!(report.dialog_body.contains("injected GPU"));
+        assert!(report.dialog_body.contains("段階: SurfaceCapabilities"));
+        assert!(report.dialog_body.contains("ドライバー"));
+    }
 
     #[test]
     fn gpu_startup_diagnostics_only_extend_graphics_failure_and_resolve_fatal_stage() {

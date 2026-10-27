@@ -178,3 +178,14 @@ failures before a later success. AdapterSelection Begin/End still enclose the
 single candidate/selector callback. The generic injected-request helper has
 GPU-free tests for stopping, fallback, last-error preservation, empty candidates,
 event order/history, selector compatibility, and callback Clone/Debug behavior.
+
+## §1.429 surface の default configuration 失敗 (2026-10-27)
+
+`winit.rs` の `get_default_config` の None を `UnsupportedSurface` Err に変え、
+GPU名/backendと `SurfaceCapabilities` の失敗を保持する。初期install→add_surface→set_windowへ伝播し、
+既存eframe Err終了の通知・ログを使う。ゼロ寸法の初期surfaceも対応確認し、configure自体は従来どおり省略する。
+resize / 再設定は同じfallible helperを通して失敗をlogへ残し、その操作を終える。再試行・別GPUの再初期化は追加しない。
+GPU不要のNone注入でErrと失敗stage、Someの保持とruntimeのstartup通知抑止を検査する。
+初期install失敗では対象surface/depth/MSAAだけを既存のremove helperで除去し、未設定surfaceを後のpaintへ残さない。
+成功時と失敗時、root/child双方を対象にしたGPU不要のmap回帰で兄弟viewportの資源を保持することを検査する。
+既定uncaptured-error handlerのpanicは今回は変更しない (coordinator判断、§1.448と同じ)。

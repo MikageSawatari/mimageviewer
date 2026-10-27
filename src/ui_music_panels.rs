@@ -1656,12 +1656,8 @@ impl App {
             ui.scope_id().with(("music_hud_seek", fs_idx)),
             seek_sense,
         );
-        if (seek_resp.clicked() || seek_resp.dragged())
-            && dur > 0.0
-            && let Some(p) = seek_resp.interact_pointer_pos()
-        {
-            let f = ((p.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
-            seek_to = Some(f * dur);
+        if dur > 0.0 && interactive {
+            seek_to = music_seek_slider_value(&seek_resp, bar_rect, pos, dur);
         }
         // ホバー表現も動画 native HUD に揃える (実機 FB 2026-07-30): 左右矢印カーソルと、
         // シーク行内に閉じた赤い縦線。色・太さ・上下 4.0 の余白は render_core.rs の動画
@@ -1758,9 +1754,8 @@ impl App {
         if let Some(v) = set_vol {
             self.settings.video_volume = v;
         }
-        // 確定時 (drag_stopped / click) のみ save する (毎フレーム save を回避)。release frame は
-        // set_vol=None だが settings.video_volume は直前 frame までに更新済みなので、ここで
-        // save すればドラッグ確定分も永続化される (Codex P3)。
+        // 実 release の最終値 / click / 取消の開始値を適用してから保存する。
+        // ドラッグ中は毎フレーム save しない。
         if vol_persist {
             self.settings.save();
         }
@@ -1889,6 +1884,51 @@ impl App {
 }
 
 #[cfg(windows)]
+fn music_seek_slider_value(
+    response: &egui::Response,
+    bar: egui::Rect,
+    position: f64,
+    duration: f64,
+) -> Option<f64> {
+    use crate::video::native_presenter::overlay_draw::{OverlaySliderDrag, overlay_slider_value};
+    let id = response.id.with("slider_drag");
+    let mut drag = response
+        .ctx
+        .data_mut(|data| data.get_temp::<OverlaySliderDrag>(id));
+    let button = drag.map_or(egui::PointerButton::Primary, |drag| drag.button());
+    let termination = crate::video::native_touch::NativePointerTermination::from_egui(
+        &response.ctx,
+        Some(button),
+    );
+    // A temporary seek owner cannot survive the widget being hidden/replaced.
+    // egui-winit supplies real releases only; native cancellation receipts take
+    // their separate producer-owned route into the shared helper.
+    if !response.is_pointer_button_down_on()
+        && !response.drag_stopped_by(button)
+        && !response.clicked()
+        && !matches!(
+            termination,
+            Some(crate::video::native_touch::NativePointerTermination::Cancelled { .. })
+        )
+        && !matches!(drag, Some(OverlaySliderDrag::Cancelled { .. }))
+    {
+        drag = None;
+    }
+    let result = overlay_slider_value(response, termination, position, &mut drag, |p| {
+        ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64 * duration
+    });
+    response.ctx.data_mut(|data| match drag {
+        Some(drag) => {
+            data.insert_temp(id, drag);
+        }
+        None => {
+            data.remove::<OverlaySliderDrag>(id);
+        }
+    });
+    result.map(|(value, _)| value)
+}
+
+#[cfg(windows)]
 #[derive(Default)]
 struct MusicHudRowActions {
     seek_to: Option<f64>,
@@ -1920,7 +1960,9 @@ fn draw_music_playback_row(
     limiter_visible: bool,
     presentation: MusicHudPresentation,
     keymap: &crate::keymap::Keymap,
-    last_volume_target: &mut Option<f64>,
+    last_volume_target: &mut Option<
+        crate::video::native_presenter::overlay_draw::OverlaySliderDrag,
+    >,
     speed_popup_state: &mut bool,
 ) -> MusicHudRowActions {
     let interactive = presentation == MusicHudPresentation::Interactive;
@@ -2261,6 +2303,10 @@ fn draw_music_playback_row(
         } else {
             &mut dummy_vol_target
         };
+        let termination = crate::video::native_touch::NativePointerTermination::from_egui(
+            ui.ctx(),
+            Some(vol_target.map_or(egui::PointerButton::Primary, |drag| drag.button())),
+        );
         let volume_id = ui.scope_id().with(("music_hud_vol", fs_idx));
         let volume_change = ui
             .add_enabled_ui(interactive, |ui| {
@@ -2272,6 +2318,7 @@ fn draw_music_playback_row(
                     volume_id,
                     Some(vol_tooltip),
                     vol_target,
+                    termination,
                 )
             })
             .inner;
@@ -2279,7 +2326,9 @@ fn draw_music_playback_row(
             set_vol = Some(crate::settings::clamp_video_volume(v));
             vol_persist = persist;
         }
-    } else if interactive && let Some(value) = last_volume_target.take() {
+    } else if interactive
+        && let Some(value) = last_volume_target.take().and_then(|drag| drag.last())
+    {
         set_vol = Some(value);
         vol_persist = true;
     }
@@ -2443,9 +2492,6 @@ fn draw_music_playback_row(
             crate::ui_fonts::hud_text_font(14.0),
             egui::Color32::from_rgb(238, 238, 238),
         );
-    }
-    if interactive && vol_persist {
-        *last_volume_target = None;
     }
     MusicHudRowActions {
         seek_to,
@@ -3201,7 +3247,13 @@ mod tests {
     fn music_hud_layout_omitted_controls_finish_only_interactive_state() {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
-        let mut last_volume = Some(0.5);
+        let mut last_volume = Some(
+            crate::video::native_presenter::overlay_draw::OverlaySliderDrag::Active {
+                button: egui::PointerButton::Primary,
+                original: 1.0,
+                last: 0.5,
+            },
+        );
         let mut speed_open = true;
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
@@ -3229,7 +3281,7 @@ mod tests {
                             &mut speed_open,
                         );
                         assert!(passive.set_vol.is_none());
-                        assert_eq!(last_volume, Some(0.5));
+                        assert_eq!(last_volume.and_then(|drag| drag.last()), Some(0.5));
                         assert!(
                             speed_open,
                             "passive chrome cannot close the active context's popup"
@@ -3884,3 +3936,7 @@ mod tests {
         assert!(open, "the visible track menu survives width restoration");
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "ui_music_panels/slider_tests.rs"]
+mod slider_tests;

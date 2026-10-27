@@ -2205,8 +2205,8 @@ Seekには0.10秒の間引きを適用せず、最後に送った値と同値な
 drag開始時の原点と鍵ボタンの除外判定は `pointer - total_drag_delta` で押下点を復元して使う。
 HUD hiddenの片付けは従来どおり所有を捨てるだけで、Cancel時のCommit規則を適用しない。
 
-音量slider、音楽HUD seek、減光HUDがbutton入力を捨てる既存経路、最初のbatch内で完結するgestureは
-本修正の対象外。GPU不要の実overlay fixtureとbatch targetで自動検証し、実HWND配送は別の実機確認とする。
+§1.192では音量slider、音楽HUD seek、減光HUDがbutton入力を捨てる既存経路、最初のbatch内で完結するgestureは
+対象外だった。音量/音楽seekは後述の§1.440/§1.441で対応する。GPU不要の実overlay fixtureとbatch targetで自動検証し、実HWND配送は別の実機確認とする。
 
 2026-10-25の未コミット§1.192差分での検証（通常feature、nextest default）:
 
@@ -2217,6 +2217,23 @@ HUD hiddenの片付けは従来どおり所有を捨てるだけで、Cancel時�
   ログ `target/nextest-1192-focused.log`。full lib / test-fullは実行していない。
 - `.\scripts\build-dev.ps1 -PreserveRuntime`: exit 0、core / remote service / EPUB worker生成成功。
   PE検査はruntime=4 / pe=3で成功。通常profileの成果物は起動しておらず、実機確認は未実施。
+
+#### 音量sliderと音楽seekの終端 (§1.440 / §1.441、2026-10-27)
+
+共有 `overlay_slider_value` が実releaseのreceipt座標から最後の値を求める。
+音量のframe跨ぎstateは `OverlaySliderDrag` (押下中/ドラッグ中/取消済み) の単一ownerへまとめ、開始button・開始値・最新値を保持する。
+動画は既存 `NativePointerTermination` をproducerから渡し、音楽はeguiの実releaseとIME非変換中の
+Escapeから同じ型へ変換する。capture喪失等の動画の合成releaseは座標を使わず開始値へ戻す。
+届いたEscapeも開始値へ戻し、その後buttonを離すまではgestureを再取得しない。
+音楽は開始buttonのreleaseだけを選び、同じpassの別buttonや後続moveを値に使わない。
+既存のPrimary以外のdragも保持し、Secondaryのクリックだけでは値変更も0dBリセットもしない。
+eguiがEscapeでResponseのdrag所有を先に外しても、取消のreceiptを処理するまで開始値を保持する。
+音楽seekのstateは実widgetのIdに対応するegui一時データとして保持する。
+既存の上位Escape配送/終了規則は変更せず、HUDへ届いた場合だけ取り消す。
+
+音楽のfocusを保ったcapture喪失はwinit 0.30.13が通知しないため現状維持とする (coordinator判断)。
+新しい取消通知・HWND入力境界やdetached経路は追加しない。
+release後のmove、取消後のrelease、HUDの非対話表示/省略、および§1.192の論理pass境界を回帰検査する。
 
 #### `native_touch.rs` (`NativeTouchAdapter`)
 
