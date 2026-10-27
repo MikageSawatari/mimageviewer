@@ -450,52 +450,192 @@ impl OverlaySliderOwner {
     }
 }
 
-/// One owner for a slider gesture, including retirement until the held button is released.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum OverlaySliderDrag {
-    Pressed {
-        owner: OverlaySliderOwner,
-        button: egui::PointerButton,
-        original: f64,
-    },
-    Active {
-        owner: OverlaySliderOwner,
-        button: egui::PointerButton,
-        original: f64,
-        last: f64,
-    },
-    Cancelled {
-        owner: OverlaySliderOwner,
-        button: egui::PointerButton,
-    },
+/// Movement classification belongs to the press, not egui's per-pass flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayPressMotion {
+    Pressed,
+    Dragging,
 }
 
+/// One actual press owns all click/drag/release paths until it ends or expires.
+/// The payload belongs to that same display and is dropped on reset/hide.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverlayPress<T> {
+    owner: OverlaySliderOwner,
+    button: egui::PointerButton,
+    origin: egui::Pos2,
+    started_at: f64,
+    pub(crate) motion: OverlayPressMotion,
+    pub(crate) data: T,
+}
+
+impl<T> OverlayPress<T> {
+    pub(crate) fn new(
+        ctx: &egui::Context,
+        id: egui::Id,
+        button: egui::PointerButton,
+        origin: egui::Pos2,
+        data: T,
+    ) -> Self {
+        Self {
+            owner: OverlaySliderOwner::new(ctx, id),
+            button,
+            origin,
+            started_at: ctx.input(|i| i.time),
+            motion: OverlayPressMotion::Pressed,
+            data,
+        }
+    }
+
+    pub(crate) fn button(&self) -> egui::PointerButton {
+        self.button
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverlaySliderValue {
+    pub(crate) original: f64,
+    pub(crate) last: f64,
+}
+
+pub(crate) type OverlaySliderDrag = OverlayPress<OverlaySliderValue>;
+
 impl OverlaySliderDrag {
-    pub(crate) fn renew(&mut self, next: OverlaySliderOwner) -> bool {
-        let (Self::Pressed { owner, .. }
-        | Self::Active { owner, .. }
-        | Self::Cancelled { owner, .. }) = self;
-        if !owner.continues(next) {
-            return false;
-        }
-        *owner = next;
-        true
-    }
-
-    pub(crate) fn button(self) -> egui::PointerButton {
-        match self {
-            Self::Pressed { button, .. }
-            | Self::Active { button, .. }
-            | Self::Cancelled { button, .. } => button,
-        }
-    }
-
     pub(crate) fn last(self) -> Option<f64> {
+        (self.motion == OverlayPressMotion::Dragging).then_some(self.data.last)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayPressPhase {
+    Held,
+    Released,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverlayPressUpdate<T> {
+    pub(crate) phase: OverlayPressPhase,
+    pub(crate) press: OverlayPress<T>,
+    pub(crate) pos: egui::Pos2,
+}
+
+/// Keep producer cancellation receipts separate from egui-winit's real events.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum OverlayPressInput {
+    Native(Option<NativePointerTermination>),
+    Egui,
+}
+
+impl OverlayPressInput {
+    pub(crate) fn termination(
+        self,
+        ctx: &egui::Context,
+        button: Option<egui::PointerButton>,
+    ) -> Option<NativePointerTermination> {
         match self {
-            Self::Active { last, .. } => Some(last),
-            Self::Pressed { .. } | Self::Cancelled { .. } => None,
+            Self::Native(end) => end.and_then(|end| match button {
+                Some(button) => end.for_button(button),
+                None => Some(end),
+            }),
+            Self::Egui => NativePointerTermination::from_egui(ctx, button),
         }
     }
+}
+
+/// Shared input boundary for native/music volume and seek. Only an actual press
+/// associated with this Response can acquire ownership. Once acquired, neither
+/// clicked nor drag_started/drag_stopped decides movement, completion or reset.
+pub(crate) fn overlay_press_update<T: Copy>(
+    response: &egui::Response,
+    input: OverlayPressInput,
+    state: &mut Option<OverlayPress<T>>,
+    initial: impl FnOnce(egui::Pos2) -> T,
+) -> Option<OverlayPressUpdate<T>> {
+    let owner = OverlaySliderOwner::new(&response.ctx, response.id);
+    if state
+        .as_ref()
+        .is_some_and(|press| !press.owner.continues(owner))
+    {
+        *state = None;
+    }
+    if state.is_none()
+        && response.enabled()
+        && (response.is_pointer_button_down_on() || response.interact_pointer_pos().is_some())
+    {
+        // egui's Response supplies the hit-test association, including a click
+        // whose real press and release are both in this pass. Never acquire from
+        // a held button or a resurrected potential_drag_id alone.
+        let hit = response.rect.expand(
+            response
+                .ctx
+                .style_of(response.ctx.theme())
+                .interaction
+                .interact_radius,
+        );
+        if let Some((button, pos)) = response.ctx.input(|i| {
+            i.events.iter().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    button,
+                    pos,
+                    pressed: true,
+                    ..
+                } if hit.contains(*pos) => Some((*button, *pos)),
+                _ => None,
+            })
+        }) {
+            *state = Some(OverlayPress::new(
+                &response.ctx,
+                response.id,
+                button,
+                pos,
+                initial(pos),
+            ));
+        }
+    }
+    let mut press = (*state)?;
+    press.owner = owner;
+    let end = input.termination(&response.ctx, Some(press.button));
+    if matches!(end, Some(NativePointerTermination::Cancelled { .. })) {
+        *state = None;
+        return Some(OverlayPressUpdate {
+            phase: OverlayPressPhase::Cancelled,
+            pos: press.origin,
+            press,
+        });
+    }
+    let (phase, pos) = if let Some(NativePointerTermination::Released { pos, .. }) = end {
+        (OverlayPressPhase::Released, pos)
+    } else if let Some(pos) = response.ctx.input(|i| i.pointer.interact_pos()) {
+        (OverlayPressPhase::Held, pos)
+    } else {
+        *state = Some(press);
+        return None;
+    };
+    let options = response.ctx.options(|o| o.input_options);
+    let elapsed = response.ctx.input(|i| i.time) - press.started_at;
+    let previous_motion = press.motion;
+    if press.origin.distance(pos) > options.max_click_dist || elapsed > options.max_click_duration {
+        press.motion = OverlayPressMotion::Dragging;
+    }
+    *state = (phase == OverlayPressPhase::Held).then_some(press);
+    // Idle passes renew the owner without manufacturing another movement.
+    if phase == OverlayPressPhase::Held
+        && press.motion == previous_motion
+        && response
+            .ctx
+            .input(|i| i.pointer.delta() == egui::Vec2::ZERO)
+    {
+        return None;
+    }
+    // A secondary click is not a slider activation, but its owner still ends.
+    if phase == OverlayPressPhase::Released
+        && press.button != egui::PointerButton::Primary
+        && press.motion == OverlayPressMotion::Pressed
+    {
+        return None;
+    }
+    Some(OverlayPressUpdate { phase, press, pos })
 }
 
 /// Terminal fact for one overlay logical pass, recorded where a release is emitted.

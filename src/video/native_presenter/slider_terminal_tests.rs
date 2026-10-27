@@ -1,5 +1,76 @@
 // Included in the existing GPU-free native overlay/batch fixture module.
 #[test]
+fn hud_press_native_first_move_and_release_in_one_pass() {
+    for seek in [false, true] {
+        let mut target = target(false);
+        let name = if seek {
+            "native_video_seek_hit"
+        } else {
+            "native_video_volume"
+        };
+        let start = press_focused_hud_control(&mut target, name);
+        let end = (start + egui::vec2(22.0, 0.0)).round();
+        let rect = target
+            .state
+            .egui_ctx
+            .read_response(egui::Id::unique(name))
+            .unwrap()
+            .rect;
+        let expected = if seek {
+            seek_target(&target.state, end)
+        } else {
+            crate::settings::video_volume_fader_pos_to_linear(
+                ((end.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64,
+            )
+        };
+        let run = run_native_event_batch(&mut target, &[up(end)]).unwrap();
+        if seek {
+            assert_seek(&run.commands, expected);
+        } else {
+            assert!(
+                matches!(run.commands.as_slice(), [NativeOverlayCommand::SetVolume { volume, persist: true }] if *volume == expected),
+                "{:?}",
+                run.commands
+            );
+        }
+    }
+}
+
+#[test]
+fn hud_press_native_seek_reset_retires_press_before_any_drag() {
+    for move_after_reset in [false, true] {
+        let mut target = target(false);
+        let start = press_focused_hud_control(&mut target, "native_video_seek_hit");
+        target.state.reset_side_panel_session();
+        let end = if move_after_reset {
+            start + egui::vec2(40.0, 0.0)
+        } else {
+            start
+        };
+        if move_after_reset {
+            pointer(&mut target.state, end);
+            let output = frame(&mut target.state);
+            assert!(!output.commands.iter().any(|c| matches!(
+                c,
+                NativeOverlayCommand::Seek { .. } | NativeOverlayCommand::OpenSeekStrip
+            )));
+        }
+        let run = run_native_event_batch(&mut target, &[up(end)]).unwrap();
+        assert!(
+            !run.commands.iter().any(|c| matches!(
+                c,
+                NativeOverlayCommand::Seek { .. } | NativeOverlayCommand::OpenSeekStrip
+            )),
+            "{:?}",
+            run.commands
+        );
+        let next = press_focused_hud_control(&mut target, "native_video_seek_hit");
+        let run = run_native_event_batch(&mut target, &[up(next)]).unwrap();
+        assert_seek(&run.commands, seek_target(&target.state, next));
+    }
+}
+
+#[test]
 fn hud_slider_native_release_uses_receipt_before_later_move() {
     let mut target = target(false);
     let start = press_focused_hud_control(&mut target, "native_video_volume");

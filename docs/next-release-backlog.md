@@ -1758,6 +1758,8 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
 - 実機退行追補: ビューを閉じた後の古いドラッグが別ボタンのreleaseを採用する問題を修正。
   同じResponse Id・連続した表示だけがドラッグを所有し、中断時は最後の適用値を保持して終了する。
   nativeの非表示/source・モード切替も終了境界を揃えた (未merge)。
+- 独立レビューP2追補: 音量・音楽seek・native seek rowを実pressからreleaseまでの共通所有へ統合。
+  Pressedのまま移動+releaseが届く短い操作も確定し、native seekの押下だけの状態もsource/モード切替で退役する。
 
 ### 1.441 音楽 HUD のシークが、離すフレームの最後の移動を取りこぼす (2026-10-24)
 
@@ -1771,6 +1773,7 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   既存のfullscreen側Escape配送・終了規則は変更しない。
 - 音量の実機退行に伴う横断確認で、非表示中も押し続けたseekが再表示時に再開する同型を確認。
   音量と共通のResponse/表示寿命へ接続し、中断後の移動・別の場所のclickではseekしない (未merge)。
+- clicked/drag_startedを確定条件から撤去し、実pressの所有と実releaseで最終位置を採用する。
 
 - 残り: タッチの終端座標 (egui-winit の Touch End が終端座標でポインターを更新しない)、v4.9.0 では未対応。
   コード上、Move=A / End=B のとき音楽HUDはAを採用する (native動画側はB) と独立レビューで指摘。

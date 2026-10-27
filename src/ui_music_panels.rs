@@ -1895,11 +1895,7 @@ fn music_seek_slider_value(
     let mut drag = response
         .ctx
         .data_mut(|data| data.get_temp::<OverlaySliderDrag>(id));
-    let button = drag.map_or(egui::PointerButton::Primary, |drag| drag.button());
-    let termination = crate::video::native_touch::NativePointerTermination::from_egui(
-        &response.ctx,
-        Some(button),
-    );
+    let termination = crate::video::native_touch::OverlayPressInput::Egui;
     // Response ownership and presentation lifetime are shared with volume.
     let result = overlay_slider_value(response, termination, position, &mut drag, |p| {
         ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64 * duration
@@ -2290,10 +2286,7 @@ fn draw_music_playback_row(
         } else {
             &mut dummy_vol_target
         };
-        let termination = crate::video::native_touch::NativePointerTermination::from_egui(
-            ui.ctx(),
-            Some(vol_target.map_or(egui::PointerButton::Primary, |drag| drag.button())),
-        );
+        let termination = crate::video::native_touch::OverlayPressInput::Egui;
         let volume_id = ui.scope_id().with(("music_hud_vol", fs_idx));
         let volume_change = ui
             .add_enabled_ui(interactive, |ui| {
@@ -3234,17 +3227,18 @@ mod tests {
     fn music_hud_layout_omitted_controls_finish_only_interactive_state() {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
-        let mut last_volume = Some(
-            crate::video::native_presenter::overlay_draw::OverlaySliderDrag::Active {
-                owner: crate::video::native_touch::OverlaySliderOwner::new(
-                    &ctx,
-                    egui::Id::unique("omitted-volume"),
-                ),
-                button: egui::PointerButton::Primary,
+        let mut last_volume = Some(crate::video::native_touch::OverlayPress::new(
+            &ctx,
+            egui::Id::unique("omitted-volume"),
+            egui::PointerButton::Primary,
+            egui::Pos2::ZERO,
+            crate::video::native_touch::OverlaySliderValue {
                 original: 1.0,
                 last: 0.5,
             },
-        );
+        ));
+        last_volume.as_mut().unwrap().motion =
+            crate::video::native_touch::OverlayPressMotion::Dragging;
         let mut speed_open = true;
         let _ = ctx
             .run_pass(Default::default(), |ctx| {

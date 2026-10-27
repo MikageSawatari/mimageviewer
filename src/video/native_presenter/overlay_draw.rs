@@ -7451,148 +7451,31 @@ pub(crate) use crate::video::native_touch::OverlaySliderDrag;
 /// restores the pre-gesture value and ignores synthetic release coordinates.
 pub(crate) fn overlay_slider_value(
     response: &egui::Response,
-    termination: Option<crate::video::native_touch::NativePointerTermination>,
+    input: crate::video::native_touch::OverlayPressInput,
     current: f64,
     drag: &mut Option<OverlaySliderDrag>,
     value_at: impl Fn(egui::Pos2) -> f64,
 ) -> Option<(f64, bool)> {
-    use crate::video::native_touch::NativePointerTermination;
-    let owner = crate::video::native_touch::OverlaySliderOwner::new(&response.ctx, response.id);
-    // Retire the previous presentation before interpreting any input. The last
-    // preview value stays applied, just as when the view was closed in master.
-    if let Some(owned) = drag
-        && !owned.renew(owner)
-    {
-        *drag = None;
-    }
-    let button = drag.map(|drag| drag.button()).unwrap_or_else(|| {
-        response
-            .ctx
-            .input(|input| {
-                let pressed_here = input.events.iter().find_map(|event| match event {
-                    egui::Event::PointerButton {
-                        button,
-                        pos,
-                        pressed: true,
-                        ..
-                    } if response.rect.contains(*pos) && input.pointer.button_down(*button) => {
-                        Some(*button)
-                    }
-                    _ => None,
-                });
-                if pressed_here.is_some() {
-                    return pressed_here;
-                }
-                [
-                    egui::PointerButton::Primary,
-                    egui::PointerButton::Secondary,
-                    egui::PointerButton::Middle,
-                    egui::PointerButton::Extra1,
-                    egui::PointerButton::Extra2,
-                ]
-                .into_iter()
-                .find(|button| input.pointer.button_down(*button))
-            })
-            .unwrap_or(egui::PointerButton::Primary)
-    });
-    let termination = termination.and_then(|end| end.for_button(button));
-    let fresh_press = response.ctx.input(|i| {
-        i.events.iter().any(|event| matches!(event,
-            egui::Event::PointerButton { button: pressed, pressed: true, .. } if *pressed == button
-        ))
-    });
-    if matches!(drag, Some(OverlaySliderDrag::Cancelled { .. })) {
-        if matches!(termination, Some(NativePointerTermination::Released { .. }))
-            || !response.ctx.input(|i| i.pointer.button_down(button))
-        {
-            *drag = None;
+    use crate::video::native_touch::{
+        OverlayPressMotion, OverlayPressPhase, OverlaySliderValue, overlay_press_update,
+    };
+    let update = overlay_press_update(response, input, drag, |_| OverlaySliderValue {
+        original: current,
+        last: current,
+    })?;
+    let moved = update.press.motion == OverlayPressMotion::Dragging;
+    match update.phase {
+        OverlayPressPhase::Cancelled => moved.then_some((update.press.data.original, true)),
+        OverlayPressPhase::Released => Some((value_at(update.pos), true)),
+        OverlayPressPhase::Held if moved => {
+            let value = value_at(update.pos);
+            if let Some(press) = drag {
+                press.data.last = value;
+            }
+            Some((value, false))
         }
-        return None;
+        OverlayPressPhase::Held => None,
     }
-    if drag.is_none() && response.is_pointer_button_down_on() && fresh_press {
-        *drag = Some(OverlaySliderDrag::Pressed {
-            owner,
-            button,
-            original: current,
-        });
-    }
-    if let Some(end) = termination
-        && let Some(owned) = drag.take()
-    {
-        return match (owned, end) {
-            (
-                OverlaySliderDrag::Active { original, .. },
-                NativePointerTermination::Cancelled { .. },
-            ) => {
-                *drag = response
-                    .ctx
-                    .input(|i| i.pointer.button_down(button))
-                    .then_some(OverlaySliderDrag::Cancelled { owner, button });
-                Some((original, true))
-            }
-            (
-                OverlaySliderDrag::Pressed { .. },
-                NativePointerTermination::Released { button, .. },
-            ) if button != egui::PointerButton::Primary => None,
-            (OverlaySliderDrag::Pressed { .. }, NativePointerTermination::Cancelled { .. }) => {
-                *drag = response
-                    .ctx
-                    .input(|i| i.pointer.button_down(button))
-                    .then_some(OverlaySliderDrag::Cancelled { owner, button });
-                None
-            }
-            // The owner was created by this Response's drag_started and renewed
-            // above. egui drag_stopped is not button-specific: another button's
-            // release may have stopped it while our button remains held.
-            (OverlaySliderDrag::Active { .. }, NativePointerTermination::Released { pos, .. }) => {
-                Some((value_at(pos), true))
-            }
-            (OverlaySliderDrag::Pressed { .. }, NativePointerTermination::Released { pos, .. })
-                if response.clicked() =>
-            {
-                Some((value_at(pos), true))
-            }
-            _ => None,
-        };
-    }
-    if matches!(
-        termination,
-        Some(NativePointerTermination::Cancelled { .. })
-    ) {
-        return None;
-    }
-    if response.clicked()
-        && fresh_press
-        && let Some(NativePointerTermination::Released { pos, .. }) = termination
-    {
-        return Some((value_at(pos), true));
-    }
-    if ((response.clicked() && fresh_press) || response.dragged_by(button))
-        && let Some(pos) = response.interact_pointer_pos()
-    {
-        let value = value_at(pos);
-        let original = match *drag {
-            Some(OverlaySliderDrag::Pressed { original, .. })
-                if response.drag_started_by(button) =>
-            {
-                Some(original)
-            }
-            Some(OverlaySliderDrag::Active { original, .. }) => Some(original),
-            _ => None,
-        };
-        if let Some(original) = original {
-            *drag = Some(OverlaySliderDrag::Active {
-                owner,
-                button,
-                original,
-                last: value,
-            });
-            return Some((value, response.clicked()));
-        }
-        // A still-held button after an omitted pass is not a fresh gesture.
-        return (response.clicked() && fresh_press).then_some((value, true));
-    }
-    None
 }
 
 /// 音量 dB フェーダースライダー (動画 HUD / 音楽 HUD 共有、Inc 5c-B1)。
@@ -7608,7 +7491,7 @@ pub(crate) fn overlay_slider_value(
 /// ドラッグ中は false)。動画は `NativeOverlayCommand::SetVolume` へ、音楽は
 /// `settings.video_volume` + `player.set_volume` へ翻訳する。
 ///
-/// `last_volume_target` は開始値・最新値・取消後の所有を持つ frame 跨ぎ state。
+/// `last_volume_target` は開始値・最新値・実pressの所有を持つ frame 跨ぎ state。
 /// 実 release の位置で確定し、取消では開始値へ戻す。App / overlay が所有する。
 /// `tooltip` が `Some` ならダーク配色のホバーチップを付ける (`None` = 付けない)。
 pub(crate) fn draw_overlay_volume_slider(
@@ -7619,7 +7502,7 @@ pub(crate) fn draw_overlay_volume_slider(
     id: egui::Id,
     tooltip: Option<String>,
     last_volume_target: &mut Option<OverlaySliderDrag>,
-    termination: Option<crate::video::native_touch::NativePointerTermination>,
+    input: crate::video::native_touch::OverlayPressInput,
 ) -> Option<(f64, bool)> {
     painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
     let volume = finite_video_volume(volume);
@@ -7686,11 +7569,7 @@ pub(crate) fn draw_overlay_volume_slider(
         Some(text) => vol_resp.hover_tip_dark(text),
         None => vol_resp,
     };
-    let was_cancelled = matches!(
-        last_volume_target,
-        Some(OverlaySliderDrag::Cancelled { .. })
-    );
-    let result = overlay_slider_value(&vol_resp, termination, volume, last_volume_target, |pos| {
+    let result = overlay_slider_value(&vol_resp, input, volume, last_volume_target, |pos| {
         crate::settings::video_volume_fader_pos_to_linear(
             ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0) as f64,
         )
@@ -7698,14 +7577,9 @@ pub(crate) fn draw_overlay_volume_slider(
     // Keep the existing primary double-click reset, except in a cancelled gesture.
     if vol_resp.double_clicked()
         && result.is_some()
-        && !was_cancelled
         && !matches!(
-            termination,
+            input.termination(ui.ctx(), None),
             Some(crate::video::native_touch::NativePointerTermination::Cancelled { .. })
-        )
-        && !matches!(
-            last_volume_target,
-            Some(OverlaySliderDrag::Cancelled { .. })
         )
     {
         *last_volume_target = None;

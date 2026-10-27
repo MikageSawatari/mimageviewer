@@ -2963,7 +2963,8 @@ struct NativeEguiOverlayState {
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     seek_strip_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     seek_strip_wave_texture: Option<(u64, egui::TextureHandle)>,
-    seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
+    seek_row_gesture:
+        Option<crate::video::native_touch::OverlayPress<crate::video::seek_strip::SeekRowGesture>>,
     seek_strip_drag: Option<NativeSeekStripDrag>,
     last_seek_strip_window_request: Option<SeekStripWindowRequestKey>,
     seek_strip_committed_inventory: crate::video::seek_strip::SeekStripPresentedInventory,
@@ -13854,65 +13855,70 @@ impl NativeEguiOverlayState {
                                     ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
                                 duration_secs * frac as f64
                             };
-                            if seek_resp.drag_started()
-                                && let Some(pointer) = seek_resp.interact_pointer_pos()
-                                && let origin =
-                                    pointer - seek_resp.total_drag_delta().unwrap_or_default()
-                            {
-                                seek_row_gesture =
-                                    Some(crate::video::seek_strip::SeekRowGesture::new(origin));
-                            }
-                            if let Some(termination) = pointer_termination
-                                && let Some(gesture) = seek_row_gesture.take()
-                            {
-                                commands.extend(finish_native_seek_row(
-                                    gesture,
-                                    termination,
-                                    target_at,
-                                    last_seek_target_secs,
-                                    seek_strip_material_available && !seek_strip_visible,
-                                ));
-                                last_seek_target_secs = None;
-                            } else if seek_resp.clicked()
-                                && !matches!(
+                            use crate::video::native_touch::{
+                                OverlayPressMotion, OverlayPressPhase, overlay_press_update,
+                            };
+                            if let Some(update) = overlay_press_update(
+                                &seek_resp,
+                                crate::video::native_touch::OverlayPressInput::Native(
                                     pointer_termination,
-                                    Some(NativePointerTermination::Cancelled { .. })
-                                )
-                                && let Some(pos) = seek_resp.interact_pointer_pos()
-                            {
-                                let target_secs = target_at(pos);
-                                last_seek_target_secs = Some(target_secs);
-                                commands.push(NativeOverlayCommand::Seek { target_secs });
-                            } else if seek_resp.dragged()
-                                && let Some(pos) = seek_resp.interact_pointer_pos()
-                                && let Some(gesture) = seek_row_gesture.as_mut()
-                            {
-                                let was_open = matches!(
-                                    gesture,
-                                    crate::video::seek_strip::SeekRowGesture::OpenStrip { .. }
-                                );
-                                match gesture.update(pos) {
-                                    crate::video::seek_strip::SeekRowDecision::OpenStrip => {
-                                        if seek_strip_material_available
-                                            && !seek_strip_visible
-                                            && !was_open
-                                        {
-                                            last_seek_target_secs = None;
-                                            commands.push(NativeOverlayCommand::OpenSeekStrip);
+                                ),
+                                &mut seek_row_gesture,
+                                crate::video::seek_strip::SeekRowGesture::new,
+                            ) {
+                                let mut gesture = update.press.data;
+                                let pos = update.pos;
+                                match update.phase {
+                                    OverlayPressPhase::Cancelled => {
+                                        last_seek_target_secs = None;
+                                    }
+                                    OverlayPressPhase::Released => {
+                                        commands.extend(finish_native_seek_row(
+                                            gesture,
+                                            NativePointerTermination::Released {
+                                                button: update.press.button(),
+                                                pos,
+                                            },
+                                            target_at,
+                                            last_seek_target_secs,
+                                            seek_strip_material_available && !seek_strip_visible,
+                                        ));
+                                        last_seek_target_secs = None;
+                                    }
+                                    OverlayPressPhase::Held
+                                        if update.press.motion == OverlayPressMotion::Dragging =>
+                                    {
+                                        let was_open = matches!(
+                                            gesture,
+                                            crate::video::seek_strip::SeekRowGesture::OpenStrip { .. }
+                                        );
+                                        match gesture.update(pos) {
+                                            crate::video::seek_strip::SeekRowDecision::OpenStrip => {
+                                                if seek_strip_material_available
+                                                    && !seek_strip_visible
+                                                    && !was_open
+                                                {
+                                                    last_seek_target_secs = None;
+                                                    commands.push(NativeOverlayCommand::OpenSeekStrip);
+                                                }
+                                            }
+                                            crate::video::seek_strip::SeekRowDecision::Scrub => {
+                                                let target_secs = target_at(pos);
+                                                if last_seek_target_secs
+                                                    .map(|previous| (previous - target_secs).abs() >= 0.10)
+                                                    .unwrap_or(true)
+                                                {
+                                                    last_seek_target_secs = Some(target_secs);
+                                                    commands.push(NativeOverlayCommand::Seek { target_secs });
+                                                }
+                                            }
+                                            crate::video::seek_strip::SeekRowDecision::Undecided => {}
+                                        }
+                                        if let Some(press) = seek_row_gesture.as_mut() {
+                                            press.data = gesture;
                                         }
                                     }
-                                    crate::video::seek_strip::SeekRowDecision::Scrub => {
-                                        let target_secs = target_at(pos);
-                                        let should_emit = last_seek_target_secs
-                                            .map(|previous| (previous - target_secs).abs() >= 0.10)
-                                            .unwrap_or(true);
-                                        if should_emit {
-                                            last_seek_target_secs = Some(target_secs);
-                                            commands
-                                                .push(NativeOverlayCommand::Seek { target_secs });
-                                        }
-                                    }
-                                    crate::video::seek_strip::SeekRowDecision::Undecided => {}
+                                    OverlayPressPhase::Held => {}
                                 }
                             }
                         } else {
@@ -15855,7 +15861,7 @@ fn draw_native_bottom_controls(
                 egui::Id::unique("native_video_volume"),
                 Some(vol_tooltip),
                 last_volume_target,
-                pointer_termination,
+                crate::video::native_touch::OverlayPressInput::Native(pointer_termination),
             ) {
                 commands.push(NativeOverlayCommand::SetVolume {
                     volume: value,
@@ -16817,7 +16823,7 @@ mod chrome_suppression_interaction_tests {
             pointer(state, origin - egui::vec2(0.0, 8.0));
             frame(state);
             assert_eq!(
-                state.seek_row_gesture,
+                state.seek_row_gesture.map(|press| press.data),
                 Some(crate::video::seek_strip::SeekRowGesture::Undecided { origin })
             );
             origin

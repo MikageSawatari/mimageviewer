@@ -248,6 +248,78 @@ fn button_for(pos: egui::Pos2, pressed: bool, button: egui::PointerButton) -> eg
 }
 
 #[test]
+fn hud_press_music_volume_first_move_and_release_in_one_pass() {
+    for kind in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+        let mut f = Fixture::new();
+        let start = f.volume_rect.center();
+        f.frame(vec![egui::Event::PointerMoved(start)]);
+        let click = f.frame(vec![
+            button_for(start, true, kind),
+            button_for(start, false, kind),
+        ]);
+        assert_eq!(
+            click.set_vol.is_some(),
+            kind == egui::PointerButton::Primary
+        );
+        assert!(
+            f.drag.is_none(),
+            "a same-pass click must also retire its press"
+        );
+        f.frame(vec![button_for(start, true, kind)]);
+        let end = start + egui::vec2(22.0, 0.0);
+        let expected = crate::settings::video_volume_fader_pos_to_linear(
+            ((end.x - f.volume_rect.left()) / f.volume_rect.width()).clamp(0.0, 1.0) as f64,
+        );
+        let result = f.frame(vec![
+            egui::Event::PointerMoved(end),
+            button_for(end, false, kind),
+        ]);
+        assert_eq!(result.set_vol, Some(expected), "{kind:?}");
+        assert!(result.vol_persist);
+        assert!(f.drag.is_none());
+    }
+}
+
+#[test]
+fn hud_press_music_seek_first_move_and_release_in_one_pass() {
+    let ctx = egui::Context::default();
+    let bar = egui::Rect::from_min_size(egui::pos2(30.0, 30.0), egui::vec2(200.0, 8.0));
+    let frame = |events| {
+        let mut result = None;
+        ctx.run_pass(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        let response = ui.interact(
+                            bar.expand(7.0),
+                            egui::Id::unique("quick-seek"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        result = music_seek_slider_value(&response, bar, 5.0, 100.0);
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        result
+    };
+    let start = egui::pos2(70.0, 34.0);
+    let end = egui::pos2(180.0, 34.0);
+    frame(vec![]);
+    frame(vec![]);
+    frame(vec![egui::Event::PointerMoved(start)]);
+    frame(vec![button(start, true)]);
+    assert_eq!(
+        frame(vec![egui::Event::PointerMoved(end), button(end, false)]),
+        Some(75.0)
+    );
+}
+
+#[test]
 fn hud_slider_music_volume_release_uses_last_frame_position() {
     for kind in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
         let mut f = Fixture::new();

@@ -646,3 +646,86 @@ src/video/native_presenter/render_core.rs
 src/video/native_presenter/slider_terminal_tests.rs
 src/video/native_touch.rs
 ```
+
+
+### 12.6 実pressから終端までの共通所有 (2026-10-27)
+
+`5bb71527b` の独立レビューP2-1/P2-2をcoordinatorの最終方針に従って修正する。
+前回はPressedのreleaseにclickedを要求し、native seekはdrag_started前の押下を所有しなかった。
+そのため初回Move+releaseが同じpassに入ると音量/seekを落とし、native seekのreset後に古い押下からSeekできた。
+追加した4テストは同commitの製品コードでcompile成功後、4件すべて失敗した。
+記録: `target/hud-gpu-validation/press-red.{json,log}`。
+
+#### 所有の型と入口
+
+`Option<OverlayPress<T>>` だけがpressの有無を表す。pressにはResponse Id/viewport/pass、開始button/座標/時刻、
+Pressed/Draggingの移動分類、payloadを保持する。取消済みを別stateで保持せず、release/取消でNoneへ終端する。
+既存の `OverlaySliderDrag` は `OverlayPress<OverlaySliderValue>` のaliasへ置き換えた。
+移動分類は所有pressの距離/経過時間とegui設定のclickしきい値で一度Draggingへ進み、eguiのframe別フラグで再判定しない。
+primaryの実releaseはPressedのままでも採用し、右クリック単独はno-op、右dragは最終座標を採用する。
+
+全経路の生成・更新・終端は `native_touch::overlay_press_update` を通す。
+生成時だけResponseのhit-test associationと実PointerButton pressを使う。
+終端時はその所有と開始buttonのtyped receiptだけを使い、clicked/drag_started/drag_stoppedを条件にしない。
+release位置を後続PointerMovedで置き換えず、Cancelledの合成座標も使用しない。
+`OverlayPressInput::Egui` は開始buttonを確定してから既存 `NativePointerTermination::from_egui` を呼び、
+`Native(receipt)` はnative producerが決めたReleased/Cancelledを維持する。新しいwinit通知は足さない。
+
+| 経路 | 所有payload | 入力・処理の経路 |
+| --- | --- | --- |
+| 動画HUD音量 | OverlaySliderValue (開始値/最新値) | draw_overlay_volume_slider → overlay_slider_value → overlay_press_update(Native) |
+| 音楽HUD音量 | OverlaySliderValue | draw_music_playback_row → 同じ音量描画/value helper → overlay_press_update(Egui) |
+| 音楽HUDseek | OverlaySliderValue | music_seek_slider_value → overlay_slider_value → overlay_press_update(Egui) |
+| native seek row | SeekRowGesture | row描画 → overlay_press_update(Native) → 既存縦strip/横scrub判定、releaseはfinish_native_seek_row |
+
+native seekのclickだけの独立分岐を撤去した。押下直後からownerが存在するので、既存source/モードresetとhidden cleanupで
+押下のみ/Draggingの両方を終了し、残ったegui候補からrelease/移動が来ても新しいpressなしでは再開しない。
+native seek strip本体の§1.192の所有・軸・取消規則は変更しない。
+音量/音楽seekのpreview取消は開始値復元、native seek取消は新しいSeekなし、閉鎖/非表示は最後の適用値保持を継続する。
+永続データ、detached述語、viewport経路、既知の音楽Touch End制限、未通知capture喪失の割り切りは変更しない。
+
+複数のeguiフラグを組み合わせて例外を補う案は採らず、実press一件のownerへ統合してclick/dragの所有を分けない。
+初回compileでvendor egui 0.37のContext::style呼び出しがE0599になり、現行style_of(theme)へ修正した。
+移行途中のfocusedは39件中38成功/1失敗で、別buttonのrelease時に静止したHeld更新を余分に返す点を検出した。
+共通helperで静止passはownerの更新だけにし、右click単独の非activation判定も共通helperへ置いた。
+修正後の全関連テストは以下のとおり成功した。
+
+全段で `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=24`。
+command/実exit/所要秒は `target/hud-gpu-validation/press-*.json`、出力は同名log。
+
+| 検査 | exit | 結果 | log/json basename |
+| --- | --- | --- | --- |
+| cargo fmt (no arguments) | 0 | PASS | `press-fmt` |
+| cargo check -p mimageviewer --bin mimageviewer-core | 0 | PASS | `press-check` |
+| cargo check -p mimageviewer --bin mimageviewer-core --features test-script | 0 | PASS | `press-check-script` |
+| related nextest (normal) | 0 | Summary [  16.690s] 751 tests run: 751 passed, 13877 skipped | `press-nextest` |
+| related nextest (--features test-script) | 0 | Summary [   2.808s] 58 tests run: 58 passed, 14716 skipped | `press-nextest-script` |
+| cargo test -p mimageviewer --test ui_snapshot | 0 | test result: ok. 213 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.50s | `press-snapshot` |
+| viewer_context_audit | 0 | PASS (0 findings) | `press-audit-final` |
+| cargo fmt --check | 0 | PASS | `press-fmt-check` |
+| included native test rustfmt --check | 0 | PASS | `press-include-fmt-check` |
+| UI glyph check | 0 | PASS (0 findings) | `press-glyphs-final` |
+| git diff --check | 0 | PASS | `press-diff-check` |
+
+通常関連filterは前回範囲にhud_press_の4件を追加し、既存§1.192/§1.428/§1.448、close/reopen、
+Esc/capture取消、右drag、別buttonのrelease、source/モード切替、音楽HUDレイアウトを検査した。
+UI snapshotは変更なしで全件成功。auditは同一tool sourceのビルド済みexeで現在の作業ツリーを検査し0件。
+最終Rust source hashは `press-final-source.json`、照合は `press-source-verified.json`。
+native UIの大きいclosure内のレイアウト/任意末尾commaだけを整形し、式・文が変わっていないことも照合した (`press-layout-only.json`)。
+それ以外の実装/回帰sourceは最終gate開始後に変更していない。
+製品起動・gitの書き込みは実施していない。本体lib全件/build-dev/実機再確認はClaudeCode担当。
+
+変更ファイル (10件):
+
+```text
+docs/gpu-init-fallback-plan.md
+docs/next-release-backlog.md
+docs/video-architecture.md
+src/app.rs
+src/ui_music_panels.rs
+src/ui_music_panels/slider_tests.rs
+src/video/native_presenter/overlay_draw.rs
+src/video/native_presenter/render_core.rs
+src/video/native_presenter/slider_terminal_tests.rs
+src/video/native_touch.rs
+```
