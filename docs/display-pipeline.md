@@ -2225,6 +2225,17 @@ fullscreen の close はその context の状態を Idle にし、retire は bun
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、
 `FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
+キーの段階ズーム（`FsZoomIn` / `FsZoomOut`、既定 `+` / `;`（US は `=`）/ テンキー `+` と
+`-` / テンキー `-`）は表示領域中央を固定して ×1.25 / ÷1.25。
+`fs_zoom_owner()` に従い、通常画像（単ページ / 見開き / 縦横連結）は `fs_zoom` / `fs_pan`、
+分析は `analysis_zoom` / `analysis_pan`、360 は FOV、Z 照準 / 確定中は `fs_zoom_factor` を変更する。
+通常 / 分析はピンチの倍率・pivot 関数、360 はピンチの FOV 関数、Z はホイール刻みを共用し、
+通常 / 分析の変化時だけ各倍率で PDF 再描画を要求する。既存の clamp / pan 制約を維持する。
+Image / Analysis は pivot と中心に同じ点を渡して pan を倍率比で拡縮するため、キー段で
+表示矩形 / seek geometry を計算しない。中央固定の計算はキー段で完結し、viewer 配送や pending は増やさない。
+動画 / 音声 / 編集モード / ページ一覧は対象外。比較では通常の画像キーと同様に有効。
+長押しリピートは同一フレームで各操作1回にまとめる。入力所有と詳細は [キー仕様](keymap-spec.md#キーによる段階ズーム1470)。
+
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
 **解決後の `DisplayedImageTransform` と描画は共用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
 keymap カスタマイズ可) のホールドで動き、

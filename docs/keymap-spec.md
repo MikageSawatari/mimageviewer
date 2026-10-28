@@ -749,6 +749,53 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>Y</kbd>+方向パッド左右 (動画) | J / K キーと同じ前 / 次のチャプター・ブックマーク・ピン移動 |
 | <kbd>Start</kbd> | お気に入り／スマートフォルダ一覧を開く。左右でタブを切り替え、上下で選んで <kbd>A</kbd> で移動する。現在スマートフォルダを表示中ならそのタブから開き、件数が多い場合はスクロールバーで続きが分かる |
 
+## キーによる段階ズーム（§1.470）
+
+`FsZoomIn`（画像を拡大する）/ `FsZoomOut`（画像を縮小する）は `FsImage` / `Press`。
+既定の拡大は `Shift+Semicolon`、`Semicolon`、`NumpadAdd`、縮小は `Minus`、`NumpadSubtract`。
+物理 KeySlot / Win32 VK が正本で、JIS / US とも VK_OEM_PLUS（0xBB、`Semicolon`）の
+Shift 押しを `+` とする。修飾なしは JIS の `;` / US の `=`。下段テンキーの +/- も使える。
+VK_OEM_MINUS（0xBD、`Minus`）は修飾なし。表示専用の `display_name` は
+`Shift+Semicolon` → `+`、`Ctrl+Shift+Semicolon` → `Ctrl++` とする。
+settings.db / JSON の `settings_name` は既存の `Shift+;`（Ctrl 付きは `Ctrl+Shift+;`）を維持する。
+chord 解析は既存の `Shift+;` / `Shift+Semicolon` をともに受理する。
+ini テンプレート / 参照ファイルの生成だけは、`;` / `#` を含む表記をコメント記号と衝突しない
+KeySlot の別名へ置き換える。拡大は `Shift+Semicolon` / `Semicolon` と書き、旧 ini 取り込みでも
+その別名を読む。現行キーでこの変換が必要なのは `Semicolon` だけで、`#` を出すキーはない。
+修飾なしの JSON 保存表記も既存の `;` / `-` を維持し、`+` 自体は区切り文字なので parse alias にしない。
+修飾なし `Semicolon` の表示は従来の `;` を維持する。
+
+1 回につき ×1.25 / ÷1.25。OS リピートを受け付け、同一フレームは各操作1回
+（`SinglePerFrame`）へまとめる。マウス位置を使わず、表示領域の中央を固定する。
+書き先は既存 `fs_zoom_owner()` に従う。
+
+| owner | 適用 |
+| --- | --- |
+| Image | `apply_touch_zoom_factor_about_pivot(factor, center, center)` で `fs_zoom` / `fs_pan`。`ZOOM_MIN`〜`ZOOM_MAX` と `set_fs_pan_from_input` の制約を共有。単ページ / 見開き / 縦横連結に適用 |
+| Analysis | 同じ関数で `analysis_zoom` / `analysis_pan`。分析画像の表示中央を固定 |
+| Panorama | `apply_panorama_touch_zoom` で FOV を変更 |
+| ZoomMode | 照準中 / 確定中とも `adjust_fs_zoom_factor(±1.0)` で専用倍率だけを変更 |
+
+Image / Analysis で変化したらそれぞれの倍率を `maybe_rerender_pdf` へ渡す。
+上下限で変化しなければ何もしない。変化時だけ repaint を要求する。
+Image / Analysis とも中心・pivot に同じ点（原点）を渡すと pan は倍率比で拡縮される。
+これで表示中央が固定され、矩形の位置 / 寸法は計算に不要となる。
+キー段では表示矩形・seek geometry を計算せず、root から配送された入力でも同じ結果となる。
+設計の簡素化: キー段で完結させ、フレーム間 pending や専用の viewport 配送を増やさない。
+
+動画 / 音声 / 音楽ビューでは consume しない。消しゴム / 隠蔽 / 切り取り / SNS 分割 /
+テキスト注釈 / 補正レイヤーでは既存 `FsFitModeCycle` と同じ early return に従い実行しない。
+比較表示は `FsFitModeCycle` と同様に通常キー段へ到達するので適用する。
+ページ一覧中は実行可能集合に含めない。TextEdit / IME / modal / popup / 非アクティブ窓は
+既存 helper の入力所有に従い、F12 / 複数窓も既存 viewer context の状態だけを変更する。
+修飾キー長押しのルーペは Shift のレベルを別に読むため、`+` 中も既存の `Shift+S` 等と同様に反応する。
+
+今回はキーボード専用。ヘルプと操作カスタマイズは全 Action の一覧から自動表示し、リング /
+ジェスチャ / マウスボタン / ゲームパッド、HUD / フィット popup ボタンは追加しない。
+保存済み設定で新 Action の override がなければ既定が有効になる（`FsPageOverviewToggle` と同じ）。
+他操作の保存済み割当を移動・削除せず、重複は既存の競合表示と handler の消費順に従う。
+移行処理は追加しない。明示的な再割当 / `none` による解除は通常の置換規則を使う。
+
 ## 画像 フルスクリーン
 
 | キー | 動作 |

@@ -488,6 +488,16 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
 
+§1.470: `FsZoomIn` / `FsZoomOut` は `FsImage` / `Press` のキーボード専用操作。
+既定は拡大 `Shift+Semicolon` / `Semicolon` / `NumpadAdd`、縮小 `Minus` / `NumpadSubtract`。
+表示の `+` は settings.db / JSON 保存時には既存の `Shift+;` を維持する。chord 解析は既存の
+`Shift+;` / `Shift+Semicolon` の両方を受理し、`+` の parse alias は追加しない。
+ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`Shift+Semicolon` /
+`Semicolon` と書く。旧 ini 取り込みでもコメントに切られず、その別名を受理する。
+既存の全 Action 列挙でヘルプ / キーカスタマイズへ表示し、リング系の対応表は増やさない。
+欠けた override は通常の既定へ解決するため、新しい移行処理は不要。
+詳細は [キー仕様](keymap-spec.md#キーによる段階ズーム1470) を参照。
+
 2026-10-07 §1.349 / §1.343: 操作カスタマイズの対応表は
 `GridOrganizeFiles` → `RingActionId::GridOrganizeFiles` (Grid)、
 `FsFitModeCycle` → `RingActionId::ImageFitModeCycle` (ImageFullscreen)。

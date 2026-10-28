@@ -90,6 +90,10 @@ RingActionId や新しい固定キー操作を増やすものではない。
 
 ## ⚪ ring/パッド専用
 
+逆方向の意図的な対象外: `FsZoomIn` / `FsZoomOut` は段階ズームのキーボード専用操作。
+今回の採用範囲に従い RingActionId を増やさず、リング / ジェスチャ / マウスボタン / パッドへは対応させない。
+恒久テストは RingActionId → KeyAction の分類を検査するため、この2操作の除外登録は不要。
+
 `CycleFavorite` / `GridToggleSnapshotLock` / `ImageOpenFolder`。
 
 `OpenFavorite1..20` / `OpenDriveC..Z` /

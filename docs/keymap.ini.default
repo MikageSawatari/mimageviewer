@@ -26,7 +26,7 @@
 # - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
 # - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,
 #   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,
-#   [, ], ;, :, ,, ., \, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter
+#   [, ], Semicolon, :, ,, ., \, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter
 # - テンキー数字は通常の数字キーとは別キーとして扱われます。
 #   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。
 # - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、
@@ -456,6 +456,11 @@
 # FsReadingDirectionToggle.2 = Numpad7 ; 横方向の読み進み方向を切り替える
 # FsFitModeCycle.1 = 0 ; ズーム/フィット方式を切り替える
 # FsFitModeCycle.2 = Numpad0 ; ズーム/フィット方式を切り替える
+# FsZoomIn.1 = Shift+Semicolon ; 画像を拡大する
+# FsZoomIn.2 = Semicolon ; 画像を拡大する
+# FsZoomIn.3 = NumpadAdd ; 画像を拡大する
+# FsZoomOut.1 = - ; 画像を縮小する
+# FsZoomOut.2 = NumpadSubtract ; 画像を縮小する
 # FsAiModelNext = U ; AIモデルを次へ切り替える
 # FsAiModelPrev = Shift+U ; AIモデルを前へ切り替える
 # FsAiModelReset = Alt+U ; AIモデルを標準に戻す

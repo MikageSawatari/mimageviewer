@@ -12285,6 +12285,9 @@ mod tests {
 
     #[test]
     fn settings_dialog_key_actions_map_to_grid_ring_actions() {
+        for action in [KeyAction::FsZoomIn, KeyAction::FsZoomOut] {
+            assert!(ring_bindings_for_key_action(action).is_empty());
+        }
         assert_eq!(
             ring_bindings_for_key_action(KeyAction::FsPageOverviewToggle),
             vec![(

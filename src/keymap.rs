@@ -1306,6 +1306,21 @@ impl Chord {
         self.format_name(true)
     }
 
+    /// INI comment markers cannot be used as literal key names. Keep the
+    /// settings/JSON spelling intact and use the parsed KeySlot alias in INI.
+    fn ini_name(self) -> String {
+        let settings = self.settings_name();
+        if let Self::Key { key, .. } = self
+            && (settings.contains(';') || settings.contains('#'))
+        {
+            return match settings.rsplit_once('+') {
+                Some((modifiers, _)) => format!("{modifiers}+{key:?}"),
+                None => format!("{key:?}"),
+            };
+        }
+        settings
+    }
+
     fn format_name(self, settings: bool) -> String {
         let Self::Key {
             ctrl,
@@ -1325,11 +1340,12 @@ impl Chord {
             .to_string();
         };
         let question_mark = shift && key == KeyName::Slash;
+        let plus = !settings && shift && key == KeyName::Semicolon;
         let mut parts = Vec::new();
         if ctrl {
             parts.push("Ctrl".to_string());
         }
-        if shift && !question_mark {
+        if shift && !question_mark && !plus {
             parts.push("Shift".to_string());
         }
         if alt {
@@ -1337,6 +1353,10 @@ impl Chord {
         }
         if question_mark {
             parts.push("?".to_string());
+            return parts.join("+");
+        }
+        if plus {
+            parts.push("+".to_string());
             return parts.join("+");
         }
         parts.push(if settings {
@@ -1765,6 +1785,8 @@ pub enum KeyAction {
     FsReadingFlowCycle,
     FsReadingDirectionToggle,
     FsFitModeCycle,
+    FsZoomIn,
+    FsZoomOut,
     FsAiModelNext,
     FsAiModelPrev,
     FsAiModelReset,
@@ -2355,6 +2377,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsReadingFlowCycle,
     KeyAction::FsReadingDirectionToggle,
     KeyAction::FsFitModeCycle,
+    KeyAction::FsZoomIn,
+    KeyAction::FsZoomOut,
     KeyAction::FsAiModelNext,
     KeyAction::FsAiModelPrev,
     KeyAction::FsAiModelReset,
@@ -4422,6 +4446,8 @@ impl KeyAction {
             FsReadingFlowCycle => "FsReadingFlowCycle",
             FsReadingDirectionToggle => "FsReadingDirectionToggle",
             FsFitModeCycle => "FsFitModeCycle",
+            FsZoomIn => "FsZoomIn",
+            FsZoomOut => "FsZoomOut",
             FsAiModelNext => "FsAiModelNext",
             FsAiModelPrev => "FsAiModelPrev",
             FsAiModelReset => "FsAiModelReset",
@@ -5177,6 +5203,8 @@ impl KeyAction {
             FsReadingFlowCycle => "ページ単位/縦連結/横連結を切り替える",
             FsReadingDirectionToggle => "横方向の読み進み方向を切り替える",
             FsFitModeCycle => "ズーム/フィット方式を切り替える",
+            FsZoomIn => "画像を拡大する",
+            FsZoomOut => "画像を縮小する",
             FsAiModelNext => "AIモデルを次へ切り替える",
             FsAiModelPrev => "AIモデルを前へ切り替える",
             FsAiModelReset => "AIモデルを標準に戻す",
@@ -5741,6 +5769,8 @@ impl KeyAction {
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
+            | FsZoomIn
+            | FsZoomOut
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -6274,6 +6304,8 @@ impl KeyAction {
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
+            | FsZoomIn
+            | FsZoomOut
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -6838,6 +6870,12 @@ impl KeyAction {
             FsReadingFlowCycle => digit_pair(Num6, Numpad6),
             FsReadingDirectionToggle => digit_pair(Num7, Numpad7),
             FsFitModeCycle => digit_pair(Num0, Numpad0),
+            FsZoomIn => ChordList::three(
+                Chord::shift(Semicolon),
+                Chord::key(Semicolon),
+                Chord::key(NumpadAdd),
+            ),
+            FsZoomOut => ChordList::two(Chord::key(Minus), Chord::key(NumpadSubtract)),
             FsAiModelNext => ChordList::one(Chord::key(U)),
             FsAiModelPrev => ChordList::one(Chord::shift(U)),
             FsAiModelReset => ChordList::one(Chord::alt(U)),
@@ -8803,7 +8841,7 @@ impl Keymap {
             "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,\n",
         );
         out.push_str(
-            "#   [, ], ;, :, ,, ., \\, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter\n",
+            "#   [, ], Semicolon, :, ,, ., \\, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter\n",
         );
         out.push_str("# - テンキー数字は通常の数字キーとは別キーとして扱われます。\n");
         out.push_str("#   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。\n");
@@ -8867,7 +8905,7 @@ impl Keymap {
                 let defaults: Vec<String> = action
                     .default_chords()
                     .iter()
-                    .map(Chord::settings_name)
+                    .map(Chord::ini_name)
                     .collect();
                 if defaults.len() <= 1 {
                     let default = defaults
@@ -15572,6 +15610,263 @@ mod tests {
             keymap.warnings()
         );
         assert!(keymap.overrides.is_empty());
+    }
+
+    #[test]
+    fn key_zoom_defaults_display_and_context_are_complete_and_nonconflicting() {
+        for (action, expected) in [
+            (
+                KeyAction::FsZoomIn,
+                vec![
+                    Chord::shift(KeySlot::Semicolon),
+                    Chord::key(KeySlot::Semicolon),
+                    Chord::key(KeySlot::NumpadAdd),
+                ],
+            ),
+            (
+                KeyAction::FsZoomOut,
+                vec![
+                    Chord::key(KeySlot::Minus),
+                    Chord::key(KeySlot::NumpadSubtract),
+                ],
+            ),
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.press_multiplicity(),
+                PressMultiplicity::SinglePerFrame
+            );
+            assert!(action.is_user_facing());
+            assert_eq!(action.default_chords().iter().collect::<Vec<_>>(), expected);
+            assert!(!page_overview_action_allowed(action));
+            assert!(
+                Keymap::empty()
+                    .command_display_rows_for_active_scopes(FS_IMAGE_ACTIVE_SCOPES, false)
+                    .iter()
+                    .any(|row| row.spec.action == action)
+            );
+            assert!(
+                !Keymap::empty()
+                    .command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, false)
+                    .iter()
+                    .any(|row| row.spec.action == action)
+            );
+            for chord in expected {
+                assert_eq!(
+                    parse_chord_for_action(action, &chord.settings_name()).unwrap(),
+                    Some(chord)
+                );
+                for other in KeyAction::all()
+                    .iter()
+                    .copied()
+                    .filter(|other| *other != action && actions_can_overlap(action, *other))
+                {
+                    assert!(
+                        !other
+                            .default_chords()
+                            .iter()
+                            .any(|candidate| candidate == chord),
+                        "{action:?}: {chord:?} conflicts with {other:?}"
+                    );
+                }
+            }
+        }
+        let plus = Chord::shift(KeySlot::Semicolon);
+        assert_eq!(plus.display_name(), "+");
+        assert_eq!(plus.settings_name(), "Shift+;");
+        for spelling in ["Shift+;", "Shift+Semicolon"] {
+            assert_eq!(
+                parse_chord_for_action(KeyAction::FsZoomIn, spelling).unwrap(),
+                Some(plus)
+            );
+        }
+        assert!(plus.matches_vk_parts(0xBB, false, true, false));
+        assert!(Chord::key(KeySlot::Minus).matches_vk_parts(0xBD, false, false, false));
+        assert_eq!(
+            Chord::ctrl_shift(KeySlot::Semicolon).display_name(),
+            "Ctrl++"
+        );
+        assert_eq!(
+            Chord::ctrl_shift(KeySlot::Semicolon).settings_name(),
+            "Ctrl+Shift+;"
+        );
+        assert_eq!(Chord::key(KeySlot::Semicolon).display_name(), ";");
+        assert!(parse_chord_for_action(KeyAction::FsZoomIn, "+").is_err());
+    }
+
+    #[test]
+    fn key_zoom_missing_saved_overrides_inherit_defaults_like_page_overview() {
+        let keymap = Keymap::from_ini_str(
+            "[FsImage]\nFsCapture = Semicolon\nFsRotateCw = Minus\nFsZoomOut = none\n[FsCommon]\nFsClose = O\n",
+        );
+        let restored = Keymap::from_settings(&KeymapSettings::from_keymap(&keymap));
+        assert_eq!(
+            restored.effective_chords(KeyAction::FsZoomIn),
+            KeyAction::FsZoomIn
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(restored.effective_chords(KeyAction::FsZoomOut).is_empty());
+        assert_eq!(
+            restored.effective_chords(KeyAction::FsPageOverviewToggle),
+            KeyAction::FsPageOverviewToggle
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            restored
+                .binding_conflicts()
+                .iter()
+                .any(|conflict| conflict.action == KeyAction::FsZoomIn
+                    && conflict.other_action == Some(KeyAction::FsCapture)
+                    || conflict.action == KeyAction::FsCapture
+                        && conflict.other_action == Some(KeyAction::FsZoomIn))
+        );
+        assert_eq!(
+            restored.effective_chords(KeyAction::FsCapture),
+            vec![Chord::key(KeySlot::Semicolon)]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_zoom_native_repeats_are_single_per_frame_and_keep_repeating() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        for repeat in [false, true] {
+            ctx.begin_pass(Default::default());
+            cache_test_keyboard_owner(&ctx);
+            let mut edge = ctrl_down_edge(repeat);
+            edge.virtual_key = 0xBB;
+            edge.ctrl = false;
+            edge.shift = true;
+            crate::key_input::set_test_frame(vec![edge, edge, edge]);
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsZoomIn),
+                1
+            );
+            crate::key_input::clear_test_frame();
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn ini_chord_names_roundtrip_every_key_slot_without_comment_markers() {
+        let mut escaped_slots = Vec::new();
+        for name in enum_variant_names_from_source("KeySlot") {
+            let key = KeySlot::parse(&name).expect("KeySlot variant has a parsed alias");
+            let settings = key.settings_name();
+            if settings.contains(';') || settings.contains('#') {
+                escaped_slots.push(name.clone());
+            }
+            for bits in 0..8 {
+                let chord = Chord::Key {
+                    ctrl: bits & 1 != 0,
+                    shift: bits & 2 != 0,
+                    alt: bits & 4 != 0,
+                    key,
+                };
+                let ini_name = chord.ini_name();
+                assert!(
+                    !ini_name.contains(';') && !ini_name.contains('#'),
+                    "{chord:?}"
+                );
+                let parsed = Keymap::from_ini_str(&format!(
+                    "[FsImage]\nFsZoomIn = {ini_name} ; description # comment\n"
+                ));
+                assert_eq!(
+                    parsed.override_chords(KeyAction::FsZoomIn),
+                    Some(&[chord][..]),
+                    "{chord:?}"
+                );
+                if !chord.settings_name().contains(';') && !chord.settings_name().contains('#') {
+                    assert_eq!(ini_name, chord.settings_name());
+                }
+            }
+        }
+        // No current KeySlot emits '#'; ';' is the only spelling needing an alias.
+        assert_eq!(escaped_slots, vec!["Semicolon"]);
+        for kind in ModKind::ALL {
+            let chord = Chord::modifier(kind);
+            assert_eq!(chord.ini_name(), chord.settings_name());
+        }
+    }
+
+    #[test]
+    fn ini_zoom_template_lines_can_be_uncommented_and_loaded() {
+        for template in [Keymap::user_ini_template(), Keymap::default_reference_ini()] {
+            let lines = template
+                .lines()
+                .filter_map(|line| {
+                    let line = line.strip_prefix("# ")?;
+                    (line.starts_with("FsZoomIn.") || line.starts_with("FsZoomOut."))
+                        .then_some(line)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lines.len(), 5);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("FsZoomIn.1 = Shift+Semicolon ;"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("FsZoomIn.2 = Semicolon ;"))
+            );
+            let parsed = Keymap::from_ini_str(&format!("[FsImage]\n{}\n", lines.join("\n")));
+            assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+            for action in [KeyAction::FsZoomIn, KeyAction::FsZoomOut] {
+                assert_eq!(
+                    parsed.override_chords(action),
+                    Some(
+                        action
+                            .default_chords()
+                            .iter()
+                            .collect::<Vec<_>>()
+                            .as_slice()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ini_zoom_legacy_import_preserves_json_semicolon_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(
+            &path,
+            "[FsImage]\nFsZoomIn.1 = Shift+Semicolon ; zoom in\nFsZoomIn.2 = Semicolon # alias\n",
+        )
+        .unwrap();
+        let mut settings = KeymapSettings::default();
+        let imported = settings.import_legacy_ini_if_needed(&path);
+        assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+        let binding = settings
+            .overrides
+            .iter()
+            .find(|binding| binding.action == "FsZoomIn")
+            .unwrap();
+        assert_eq!(binding.chords, vec!["Shift+;", ";"]);
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&json).unwrap());
+        assert_eq!(
+            restored.override_chords(KeyAction::FsZoomIn),
+            Some(
+                &[
+                    Chord::shift(KeySlot::Semicolon),
+                    Chord::key(KeySlot::Semicolon)
+                ][..]
+            )
+        );
     }
 
     /// `docs/keymap.ini.default` は生成物と一致していなければならない。

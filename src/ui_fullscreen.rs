@@ -15011,6 +15011,9 @@ impl App {
         let Some(fov_y) = panorama_touch_zoom_fov(pano.fov_y, factor, pano.projection) else {
             return false;
         };
+        if (fov_y - pano.fov_y).abs() <= f32::EPSILON {
+            return false;
+        }
         pano.fov_y = fov_y;
         pano.sanitize();
         true
@@ -15074,6 +15077,30 @@ impl App {
             self.set_fs_pan_from_input(new_zoom, proposed_pan);
         }
         true
+    }
+
+    /// Keyboard zoom shares the current viewer's zoom owner and existing clamps.
+    /// Keep the display center fixed: equal pivot/center points scale pan by
+    /// the zoom ratio for both Image and Analysis. No viewport geometry is needed.
+    fn apply_fs_key_zoom_step(&mut self, ctx: &egui::Context, zoom_in: bool) -> bool {
+        let factor = if zoom_in { 1.25 } else { 1.0 / 1.25 };
+        let owner = self.fs_zoom_owner();
+        let changed = match owner {
+            FsZoomOwner::ZoomMode => self.adjust_fs_zoom_factor(if zoom_in { 1.0 } else { -1.0 }),
+            FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
+            FsZoomOwner::Image | FsZoomOwner::Analysis => {
+                self.apply_touch_zoom_factor_about_pivot(factor, egui::Pos2::ZERO, egui::Pos2::ZERO)
+            }
+        };
+        if changed {
+            match owner {
+                FsZoomOwner::Image => self.maybe_rerender_pdf(self.fs_zoom),
+                FsZoomOwner::Analysis => self.maybe_rerender_pdf(self.analysis_zoom),
+                FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => {}
+            }
+            ctx.request_repaint();
+        }
+        changed
     }
 
     /// ピンチ中の 2 本指平行移動を、いまの持ち主の pan へ流す。
@@ -35899,6 +35926,21 @@ impl App {
                 .consume_action(ctx, KeyAction::FsReadingDirectionToggle);
         let key_0 =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsFitModeCycle);
+
+        // Keep media edges for FsVideo, and inherit the ordinary FsImage gates
+        // above (edit modes, overview, text/IME, modal and popup ownership).
+        if !self.fs_video_key_context_active(fs_idx) && !fs_music_view_active {
+            let zoom_in = self.keymap.consume_action(ctx, KeyAction::FsZoomIn);
+            let zoom_out = self.keymap.consume_action(ctx, KeyAction::FsZoomOut);
+            if zoom_in || zoom_out {
+                if zoom_in {
+                    self.apply_fs_key_zoom_step(ctx, true);
+                }
+                if zoom_out {
+                    self.apply_fs_key_zoom_step(ctx, false);
+                }
+            }
+        }
 
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
@@ -69730,6 +69772,236 @@ mod tests {
         assert!(!fs_navigator_visibility_requested(
             false, true, false, false
         ));
+    }
+
+    #[test]
+    fn key_zoom_image_and_analysis_keep_center_and_other_owner_unchanged() {
+        for analysis in [false, true] {
+            let (mut app, _, _) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            app.analysis_mode = analysis;
+            app.fs_zoom = 2.0;
+            app.analysis_zoom = 2.0;
+            app.fs_pan = egui::vec2(20.0, -15.0);
+            app.analysis_pan = egui::vec2(-30.0, 40.0);
+            let before = (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan);
+            assert!(app.apply_fs_key_zoom_step(&ctx, true));
+            if analysis {
+                assert_eq!((app.fs_zoom, app.fs_pan), (before.0, before.1));
+                assert_eq!(app.analysis_zoom, 2.5);
+                assert_eq!(app.analysis_pan, before.3 * 1.25);
+            } else {
+                assert_eq!((app.analysis_zoom, app.analysis_pan), (before.2, before.3));
+                assert_eq!(app.fs_zoom, 2.5);
+                assert_eq!(app.fs_pan, before.1 * 1.25);
+            }
+            assert!(app.apply_fs_key_zoom_step(&ctx, false));
+            assert_eq!(
+                (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+                before
+            );
+            for (limit, zoom_in) in [(ZOOM_MIN, false), (ZOOM_MAX, true)] {
+                if analysis {
+                    app.analysis_zoom = limit;
+                } else {
+                    app.fs_zoom = limit;
+                }
+                let before = (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan);
+                assert!(!app.apply_fs_key_zoom_step(&ctx, zoom_in));
+                assert_eq!(
+                    (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_zoom_panorama_and_z_only_change_their_visible_owner() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = setup_panorama_navigator_input_test(&ctx);
+        app.analysis_zoom = 3.0;
+        app.analysis_pan = egui::vec2(30.0, 40.0);
+        let unchanged = (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan);
+        let fov = app.panorama_state.as_ref().unwrap().fov_y;
+        assert!(app.apply_fs_key_zoom_step(&ctx, true));
+        assert!((app.panorama_state.as_ref().unwrap().fov_y - fov / 1.25).abs() < 1e-6);
+        assert!(app.apply_fs_key_zoom_step(&ctx, false));
+        assert!((app.panorama_state.as_ref().unwrap().fov_y - fov).abs() < 1e-6);
+        // Repeated steps eventually reach each projection's existing FOV clamp.
+        for zoom_in in [true, false] {
+            for _ in 0..100 {
+                app.apply_fs_key_zoom_step(&ctx, zoom_in);
+            }
+            assert!(!app.apply_fs_key_zoom_step(&ctx, zoom_in));
+        }
+        assert_eq!(
+            (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+            unchanged
+        );
+        app.panorama_state = None;
+        for aiming in [true, false] {
+            app.fs_zoom_aiming = aiming;
+            app.fs_zoom_active = !aiming;
+            app.fs_zoom_factor = 2.0;
+            assert_eq!(app.fs_zoom_owner(), FsZoomOwner::ZoomMode);
+            assert!(app.apply_fs_key_zoom_step(&ctx, true));
+            assert_eq!(app.fs_zoom_factor, 2.5);
+            assert!(app.apply_fs_key_zoom_step(&ctx, false));
+            assert_eq!(app.fs_zoom_factor, 2.0);
+            for (limit, zoom_in) in [(0.05, false), (16.0, true)] {
+                app.fs_zoom_factor = limit;
+                assert!(!app.apply_fs_key_zoom_step(&ctx, zoom_in));
+                assert_eq!(app.fs_zoom_factor, limit);
+            }
+            assert_eq!(
+                (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+                unchanged
+            );
+        }
+    }
+
+    #[test]
+    fn key_zoom_pdf_requests_follow_image_and_analysis_owner_only() {
+        let ctx = egui::Context::default();
+        for analysis in [false, true] {
+            let mut app = super::specified_scale_consumer_tests::pdf_app(&ctx, 1);
+            app.analysis_mode = analysis;
+            let probe = crate::app::PdfRerenderRequestProbe::start();
+            assert!(app.apply_fs_key_zoom_step(&ctx, true));
+            let requests = probe.take_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].0, 0);
+            assert_eq!(
+                requests[0].1,
+                crate::pdf_loader::zoom_render_long_edge(4096, 1.25, None)
+            );
+        }
+        let (mut app, _, _) = setup_flat_navigator_input_test();
+        let probe = crate::app::PdfRerenderRequestProbe::start();
+        assert!(app.apply_fs_key_zoom_step(&ctx, true));
+        assert!(probe.take_requests().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_zoom_handler_coalesces_frame_repeats_and_accepts_next_frame() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for (virtual_key, shift, factor) in [(0xBB, true, 1.25), (0xBD, false, 1.0 / 1.25)] {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            let mut expected_zoom = app.fs_zoom;
+            // Initial press plus two repeats, then three repeats in a new frame,
+            // then no edge. Each frame must apply at most one zoom step.
+            for frame in 0..3 {
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            focused: true,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            let edges = if frame < 2 {
+                                (0..3)
+                                    .map(|event| crate::key_input::KeyEdge {
+                                        operation_id: crate::key_input::KeyOperationId::unassigned(
+                                        ),
+                                        source_hwnd: 1,
+                                        source_viewport: ctx.viewport_id(),
+                                        virtual_key,
+                                        scan_code: 0,
+                                        extended: false,
+                                        pressed: true,
+                                        repeat: frame > 0 || event > 0,
+                                        ctrl: false,
+                                        shift,
+                                        alt: false,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            crate::key_input::set_test_frame(edges);
+                            app.handle_fs_key_input(ctx, idx, false);
+                            if frame < 2 {
+                                expected_zoom *= factor;
+                            }
+                            assert!(
+                                (app.fs_zoom - expected_zoom).abs() < 1e-6,
+                                "frame={frame}, vk={virtual_key:#x}"
+                            );
+                            // Finish this physical input frame, including redundant edges.
+                            crate::key_input::clear_test_frame();
+                        },
+                    )
+                    .drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_zoom_handler_preserves_media_edges_and_obeys_image_mode_gates() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for mode in 0..13 {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            // Use a customized key so the handler gate is also tested independently
+            // of JIS/US punctuation translation and of existing edit shortcuts.
+            app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsZoomIn = F24\n");
+            match mode {
+                1 => app.items[idx] = GridItem::Video(PathBuf::from("keyzoom.mp4")),
+                2 => app.items[idx] = GridItem::Audio(PathBuf::from("keyzoom.mp3")),
+                3 => app.erase_mode = true,
+                4 => app.conceal_mode = true,
+                5 => app.export_crop_mode = true,
+                6 => app.text_mode = true,
+                7 => app.local_adjust_mode = true,
+                8 => app.reading_flow = ReadingFlow::Vertical,
+                9 => app.reading_flow = ReadingFlow::Horizontal,
+                10 => app.compare_view_mode = crate::app::CompareViewMode::wipe(0.5),
+                12 => {
+                    app.sns_split = Some(crate::sns_split::SnsSplitLayout::centered_max(
+                        crate::sns_split::SnsTarget::X,
+                        2,
+                        [800, 1200],
+                    ))
+                }
+                _ => {}
+            }
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        focused: true,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                            operation_id: crate::key_input::KeyOperationId::unassigned(),
+                            source_hwnd: 1,
+                            source_viewport: ctx.viewport_id(),
+                            virtual_key: 0x87,
+                            scan_code: 0,
+                            extended: false,
+                            pressed: true,
+                            repeat: false,
+                            ctrl: false,
+                            shift: false,
+                            alt: false,
+                        }]);
+                        app.handle_fs_key_input(ctx, idx, mode == 11);
+                        let allowed = matches!(mode, 0 | 8..=11);
+                        assert_eq!(app.fs_zoom, if allowed { 2.5 } else { 2.0 }, "mode={mode}");
+                        assert_eq!(
+                            app.keymap.consume_action(ctx, KeyAction::FsZoomIn),
+                            !allowed,
+                            "mode={mode}"
+                        );
+                        crate::key_input::clear_test_frame();
+                    },
+                )
+                .drop_without_applying_deltas();
+        }
     }
 
     fn setup_flat_navigator_input_test() -> (crate::app::AppTestEnvForTest, egui::Rect, usize) {
