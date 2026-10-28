@@ -886,6 +886,19 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 
 ## 消しゴムモード
 
+結果プレビューは `ErasePreviewHold`（Erase / KeyHold、既定 Tab）と目のボタンを OR で合成し、
+既存の false → true 遷移で保存なし補完を 1 回だけ投入する。両方押しても再投入せず、両方離すと終了する。
+キーの保持判定はパネル描画の外、キャンバスのドラッグ解放処理より前に行い、
+`focused_key_state_permit` / keymap の TextEdit・IME・modal・非アクティブ窓の入力所有に従う。
+legacy keymap helper は Modal を呼出元で止める契約なので、このキャンバス側のキー受付も
+cached `KeyboardOwner::Modal` では保持・解放を観測しない。
+筆・囲み・多角形・線・図形作成・ハンドル編集の進行中に押したキーは保持受付を拒否し、
+描画終了後も押したままなら開始しない。Shift 等の修飾変更や入力所有の喪失を解放とみなさず、
+permit のあるフレームで割当キー自体の解放を確認してから押し直す。既存のボタン中のキャンバス操作は変更しない。
+保持受付は Released / Held / BlockedUntilRelease の一つの状態とし、入場・退出で初期化する。
+設計の簡素化: キーとボタンに別々の補完要求や worker を設けず、既存のプレビュー遷移を共用する。
+目のボタンの hover、`?` ヘルプ、操作カスタマイズは実割り当てを表示する。隠蔽加工には追加しない。
+
 | 入力 | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | 消しゴムモードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いの操作は別枠で表示する |
@@ -893,6 +906,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>S</kbd> / <kbd>B</kbd> / <kbd>K</kbd> / <kbd>L</kbd> / <kbd>P</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd> | 選択 / 筆 / バケツ / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円ツール |
 | <kbd>D</kbd> / <kbd>F</kbd> | 描画 / 消去モード切替 |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
+| <kbd>Tab</kbd>（押している間） | 消しゴム適用後の結果プレビュー（モザイクは除外）。Action: `ErasePreviewHold`。操作カスタマイズで変更・解除できる。描画ドラッグ中の押下は無効なので、終了後に押し直す |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | マウスホイール | 画像上ではズーム。ツールパネル上ではパネルスクロール |
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | マスクまたは選択オブジェクトを 1px / 10px 移動 |

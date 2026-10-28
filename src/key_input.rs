@@ -111,6 +111,8 @@ pub enum SyntheticNavigationKey {
     F12,
     #[cfg(any(test, feature = "test-script"))]
     G,
+    #[cfg(test)]
+    Tab,
 }
 
 impl SyntheticNavigationKey {
@@ -131,6 +133,8 @@ impl SyntheticNavigationKey {
             Self::F12 => "F12",
             #[cfg(any(test, feature = "test-script"))]
             Self::G => "G",
+            #[cfg(test)]
+            Self::Tab => "Tab",
         }
     }
 
@@ -150,6 +154,8 @@ impl SyntheticNavigationKey {
             Self::F12 => PhysicalKeySlot::new(0x7B, false),
             #[cfg(any(test, feature = "test-script"))]
             Self::G => PhysicalKeySlot::new(0x47, false),
+            #[cfg(test)]
+            Self::Tab => PhysicalKeySlot::new(0x09, false),
         }
     }
 
@@ -169,6 +175,8 @@ impl SyntheticNavigationKey {
             Self::F12 => 0x58,
             #[cfg(any(test, feature = "test-script"))]
             Self::G => 0x22,
+            #[cfg(test)]
+            Self::Tab => 0x0F,
         }
     }
 
@@ -188,6 +196,8 @@ impl SyntheticNavigationKey {
             Self::F12 => egui::Key::F12,
             #[cfg(any(test, feature = "test-script"))]
             Self::G => egui::Key::G,
+            #[cfg(test)]
+            Self::Tab => egui::Key::Tab,
         }
     }
 }

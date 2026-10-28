@@ -692,6 +692,7 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
   Line `I` / Rect `R` / Ellipse `O`
 - ErasePaintMode `D` / EraseEraseMode `F`
 - EraseSpacePan `Space` (KH, Ph6) / EraseNudge 矢印 (固定候補) / EraseRotate `[`,`]`
+- ErasePreviewHold `Tab` (KH): 目のボタンと同じ保存なし結果プレビュー。保持中だけ表示し、描画中の押下は離すまで拒否する。入力所有・実割り当て表示は既存 helper を使う。
 - EraseSwallowNumbers `0`..`9` は旧スロット誤動作防止の no-op 消費なので固定。
 
 ### Conceal (Ph3) ★

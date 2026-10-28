@@ -1945,6 +1945,7 @@ pub enum KeyAction {
     ErasePaintMode,
     EraseEraseMode,
     EraseSpacePan,
+    ErasePreviewHold,
     ConcealExit,
     ConcealConfirmPolygon,
     ConcealRedo,
@@ -2535,6 +2536,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ErasePaintMode,
     KeyAction::EraseEraseMode,
     KeyAction::EraseSpacePan,
+    KeyAction::ErasePreviewHold,
     KeyAction::ConcealExit,
     KeyAction::ConcealConfirmPolygon,
     KeyAction::ConcealRedo,
@@ -4604,6 +4606,7 @@ impl KeyAction {
             ErasePaintMode => "ErasePaintMode",
             EraseEraseMode => "EraseEraseMode",
             EraseSpacePan => "EraseSpacePan",
+            ErasePreviewHold => "ErasePreviewHold",
             ConcealExit => "ConcealExit",
             ConcealConfirmPolygon => "ConcealConfirmPolygon",
             ConcealRedo => "ConcealRedo",
@@ -5369,6 +5372,7 @@ impl KeyAction {
             ErasePaintMode => "描画モードに切り替える",
             EraseEraseMode => "消去モードに切り替える",
             EraseSpacePan => "押している間だけ画像をパン操作する",
+            ErasePreviewHold => "押している間だけ消しゴムの結果をプレビューする",
             ConcealExit => "隠蔽加工モードを終了する",
             ConcealConfirmPolygon => "隠蔽加工の多角形を確定する",
             ConcealRedo => "隠蔽加工編集をやり直す",
@@ -5913,7 +5917,7 @@ impl KeyAction {
             | EraseToolSelect | EraseToolBrush | EraseToolBucket | EraseToolLasso
             | EraseToolPolygon | EraseToolVLine | EraseToolHLine | EraseToolLine
             | EraseToolRect | EraseToolEllipse | ErasePaintMode | EraseEraseMode
-            | EraseSpacePan => KeyContext::Erase,
+            | EraseSpacePan | ErasePreviewHold => KeyContext::Erase,
             ConcealExit
             | ConcealConfirmPolygon
             | ConcealRedo
@@ -5954,8 +5958,8 @@ impl KeyAction {
             FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold | CropForceCreateHold => {
                 KeyTrigger::ModifierHold
             }
-            EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan
-            | FsZoomMode => KeyTrigger::KeyHold,
+            EraseSpacePan | ErasePreviewHold | ConcealSpacePan | CropSpacePan | TextSpacePan
+            | LaSpacePan | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
             | GlobalFavSearch
             | GlobalMetadataSearch
@@ -7034,6 +7038,7 @@ impl KeyAction {
             ErasePaintMode => ChordList::one(Chord::key(D)),
             EraseEraseMode => ChordList::one(Chord::key(F)),
             EraseSpacePan => ChordList::one(Chord::key(Space)),
+            ErasePreviewHold => ChordList::one(Chord::key(Tab)),
             ConcealExit => ChordList::one(Chord::ctrl(M)),
             ConcealConfirmPolygon => ChordList::one(Chord::key(Enter)),
             ConcealRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
@@ -8466,6 +8471,45 @@ impl Keymap {
             .default_chords()
             .iter()
             .any(|chord| self.key_held_chord(ctx, permit, chord))
+    }
+
+    /// Physical release evidence for rejecting a KeyHold during drawing. Modifier changes and loss of
+    /// keyboard ownership must not masquerade as releasing the binding's key.
+    /// This can reject or retire a blocked hold; activation still uses key_held_action.
+    /// None means that this pass has no authority to observe the key's level.
+    pub(crate) fn key_hold_binding_released(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        action: KeyAction,
+    ) -> Option<bool> {
+        debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        if !permit.allows(ctx) || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+            return None;
+        }
+        Some(self.effective_chords(action).into_iter().all(|chord| {
+            let Some(key) = chord.key_name() else {
+                return false;
+            };
+            #[cfg(windows)]
+            {
+                // An absent viewport latch (notably Enter after focus loss) is
+                // not release evidence. For the shared Return VK, require both
+                // slots up; the real OS level cannot distinguish them.
+                let up = !crate::key_input::physical_key_down(
+                    crate::key_input::PhysicalKeySlot::new(key.to_vk(), false),
+                );
+                up && (key.routed_hold_extended().is_none()
+                    || !crate::key_input::physical_key_down(
+                        crate::key_input::PhysicalKeySlot::new(key.to_vk(), true),
+                    ))
+            }
+            #[cfg(not(windows))]
+            {
+                key.to_egui()
+                    .is_some_and(|key| ctx.input(|i| !i.key_down(key)))
+            }
+        }))
     }
 
     /// Resolve the crop mode's temporary pan without weakening the generic
@@ -13130,6 +13174,108 @@ mod tests {
             KeyAction::FsImageAnalysis.default_chords().iter().next(),
             Some(Chord::shift(KeyName::Z))
         );
+    }
+
+    #[test]
+    fn erase_preview_hold_defaults_display_and_policy_are_complete_and_nonconflicting() {
+        let action = KeyAction::ErasePreviewHold;
+        let keymap = Keymap::empty();
+        let chord = Chord::key(KeyName::Tab);
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::Erase);
+        assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        assert_eq!(
+            CommandSpec::from_action(action).binding_policy,
+            BindingPolicy::SinglePlainKey
+        );
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            vec![chord]
+        );
+        assert!(action.is_user_facing());
+        assert!(
+            keymap
+                .command_display_rows_for_active_scopes(&[KeyContext::Erase], false)
+                .iter()
+                .any(|row| row.spec.action == action)
+        );
+        assert_eq!(
+            keymap.chord_list_bracket_label("preview", action),
+            "preview [Tab]"
+        );
+        for other in KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|other| *other != action && actions_can_overlap(action, *other))
+        {
+            assert!(
+                !other
+                    .default_chords()
+                    .iter()
+                    .any(|candidate| candidate == chord),
+                "{other:?}"
+            );
+        }
+        assert!(!actions_can_overlap(action, KeyAction::FsToggleMetadata));
+        let rebound = Keymap::from_ini_str("[Erase]\nErasePreviewHold = G\n");
+        assert!(rebound.warnings().is_empty());
+        assert_eq!(
+            rebound.chord_list_bracket_label("preview", action),
+            "preview [G]"
+        );
+        let disabled = Keymap::from_ini_str("[Erase]\nErasePreviewHold = none\n");
+        assert_eq!(
+            disabled.chord_list_bracket_label("preview", action),
+            "preview"
+        );
+        assert!(parse_chord_for_action(action, "Ctrl").is_err());
+        assert!(parse_chord_for_action(action, "Ctrl+Tab").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_release_evidence_does_not_treat_missing_return_latch_as_key_up() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticNavigationKey};
+        let _input = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        crate::key_input::arm_test_synthetic_input(0xE005, egui::ViewportId::ROOT);
+        let now = std::time::Instant::now();
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            now,
+            SyntheticNavigationKey::Enter,
+            Default::default(),
+        ));
+        crate::key_input::advance_test_synthetic_input(now);
+        crate::key_input::set_test_return_key_state(egui::ViewportId::ROOT, false, false);
+        begin_key_pass(&ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        let permit = crate::keyboard_input::focused_key_state_permit(&ctx).unwrap();
+        for binding in ["Enter", "NumpadEnter"] {
+            let keymap = Keymap::from_ini_str(&format!("[Erase]\nErasePreviewHold = {binding}\n"));
+            assert!(!keymap.key_held_action(&ctx, permit, KeyAction::ErasePreviewHold));
+            assert_eq!(
+                keymap.key_hold_binding_released(&ctx, permit, KeyAction::ErasePreviewHold),
+                Some(false)
+            );
+            let released_at = now + std::time::Duration::from_millis(1);
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+                released_at,
+                SyntheticNavigationKey::Enter,
+            ));
+            crate::key_input::advance_test_synthetic_input(released_at);
+            assert_eq!(
+                keymap.key_hold_binding_released(&ctx, permit, KeyAction::ErasePreviewHold),
+                Some(true)
+            );
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                released_at,
+                SyntheticNavigationKey::Enter,
+                Default::default(),
+            ));
+            crate::key_input::advance_test_synthetic_input(released_at);
+            crate::key_input::set_test_return_key_state(egui::ViewportId::ROOT, false, false);
+        }
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]

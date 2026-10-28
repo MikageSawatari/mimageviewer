@@ -648,6 +648,7 @@
 # ErasePaintMode = D ; 描画モードに切り替える
 # EraseEraseMode = F ; 消去モードに切り替える
 # EraseSpacePan = Space ; 押している間だけ画像をパン操作する
+# ErasePreviewHold = Tab ; 押している間だけ消しゴムの結果をプレビューする
 
 [Conceal] ; 隠蔽加工モード
 # ConcealExit = Ctrl+M ; 隠蔽加工モードを終了する
