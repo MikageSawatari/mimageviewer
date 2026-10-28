@@ -46,6 +46,11 @@ CF_DIB でクリップボードへ置く。
   1 フレーム目を置く挙動で出荷済みなので、そちらに揃える。
 - 一覧から未表示のページを選んでもよい。編集 snapshot は一括書き出しと同じく DB から引く
   (`book_baked_edit_snapshot(&key, Some(idx), …)`)。
+- **結果の一致の範囲**: 表示済みのページ (フルスクリーンで開いているページ) は単枚 Ctrl+E と同じ結果、
+  一覧の未表示ページは一括書き出しと同じ結果。未表示ページでは表示側の canonical 寸法が無いため、
+  注釈の基準寸法と旧形式の切り取りの基準寸法が decode 後の寸法になる (一括書き出し・製本と同じ)。
+  この既存の差 (旧形式 crop + AI 拡大、PDF ページの注釈) はコピー固有ではないので、本件では直さず
+  backlog §1.462 として起票する。
 
 ### 拒否する条件 (Ctrl+E と同じ文言の系統で通知)
 
@@ -58,6 +63,11 @@ CF_DIB でクリップボードへ置く。
 
 ## 4. 出力の中身
 
+- **永続データへは書かない**: `book_baked_edit_snapshot` が返す `crop_legacy_writeback` は、コピー用には
+  `None` にして worker から DB・sidecar へ書き戻さない (遅れて終わる worker が、その間に利用者が変えた
+  切り取りを古い矩形で上書きするのを防ぐ)。producer が UI スレッドで行う旧形式 crop の寸法補完
+  (`ensure_export_crop_source_size`) は、表示時に同じページで行われる移行と同じもので、矩形の意味は
+  変えない。こちらはそのまま使う。
 - 段: `Settings::bake_stage_clipboard`。合成は `compose_export_entry(image, &edits, None, None, cancel)`、
   つまり Ctrl+E の `_0` (現在の設定) と同じ。隠蔽プリセット出力 (`_1`〜`_4`) と SNS 分割は対象外。
 - 拡大縮小: **しない (原寸)**。Ctrl+E ダイアログの「倍率」は書き出し先ごとの選択で、
@@ -77,21 +87,37 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
   を固定 (Ctrl+E / 一括書き出しと同じ producer)  →   compose_export_entry (段まで)
   mIV 世代 my_seq = reserve_clipboard_write_sequence   見開きは結合
   OS 世代 os_seq = GetClipboardSequenceNumber         matte で平らにする → DIB
-  前の job の cancel を立てて置き換える               CLIPBOARD_WRITE_MUTEX 内で
-                                                        mIV 世代 == my_seq かつ OS 世代 == os_seq
-  毎フレーム poll → 結果を通知                  ←     のときだけ書く → 結果を送る
+  前の job の cancel を立てて置き換える               書き込み (下の「書き込みの順序」)
+                                                        結果を送る → ROOT の repaint を要求
+  update で poll → 結果を通知                   ←
 ```
 
 - **job は App に 1 本だけ** (`edited_clipboard_copy: Option<EditedClipboardCopyPending>`)。
   新しい要求は前の job の cancel を立てて置き換える。結果の channel も置き換わるので、古い
   job の結果は届かない。組み合わせを「最後の 1 本だけが生きている」に減らす。
-- **後から行ったコピーを上書きしない**: 書き込み直前に 2 つの世代を確かめる。
+- **後から行ったコピーを上書きしない**: 規則は「要求した後にクリップボードが誰かに変えられたら、
+  遅れて届いた画像は古い」の 1 つ。2 つの世代で判定する。
   - mIV 内の画像コピー同士 (既存コピー・動画フレーム等): 既存の `CLIPBOARD_SEQ` を予約して共有する。
   - それ以外 (パスやファイル名のテキストコピー、Ctrl+C のファイルコピー、他のアプリ): 要求時に
-    `GetClipboardSequenceNumber` を記録し、書く直前に変わっていたら書かない。
-    「要求した後にクリップボードが誰かに変えられたら、遅れて届いた画像は古い」という 1 つの規則で、
-    テキストコピーなど `CLIPBOARD_SEQ` を通らない経路も含めて閉じる。
-- AI 段を含むときは、worker 終端まで `local_ai_activity_lease` を持つ (Ctrl+E と同じ)。
+    `GetClipboardSequenceNumber` を baseline として記録する。
+- **書き込みの順序** (共通 writer `write_image_clipboard_if_latest` に定義し、fake API で固定する):
+  1. `CLIPBOARD_WRITE_MUTEX` を取り、DIB のメモリを用意する (重い DIB 構築は lock の外で済ませる)。
+  2. `OpenClipboard` に成功してから判定する。ここから Close まで他のプロセスは書けないので、
+     判定と書き込みの間に割り込まれない。
+  3. 判定: `CLIPBOARD_SEQ == my_seq` かつ「OS 世代 == baseline、または OS 世代 == 直前の mIV 画像書き込みの
+     直後の OS 世代 (`LAST_MIV_IMAGE_WRITE_OS_SEQ`)」。後者は、要求の時点で判定を済ませていた古い mIV の
+     画像書き込みが、要求の後に書き終えた場合を「他人の変更」と誤認しないため (古い書き込みは
+     mIV 世代で既に負けているので、上書きしてよい)。
+  4. 通れば Empty → DIB → origin marker (同じ open 区間、既存の契約どおり) → Close。
+  5. Close の後、mutex を持ったまま `LAST_MIV_IMAGE_WRITE_OS_SEQ` に現在の OS 世代を記録する。
+     これは既存の画像コピーの書き込みでも記録する (記録するだけで、既存コピーの判定は変えない)。
+  - 既存コピーの判定 (mIV 世代のみ・open 前) は変えない。OS 世代の判定は新項目だけが渡す。
+  - UI スレッドを待たせる lock は増やさない (UI スレッドは予約と baseline 採取だけ)。
+- **AI 利用中の印**: コピー worker は段に関係なく、終端まで `local_ai_activity_lease` を持つ。
+  「編集まで」でも消しゴム補完 (MI-GAN) が worker 内で走るので、段で条件を分けない。
+  置き換えで取り消された worker も、実際に終わるまで持つ (lease は worker が所有する)。
+- **完了の wake**: worker は結果を送った後に ROOT の repaint を要求する。成功・失敗・取消を同じ終端で
+  扱い、常時 polling の timer は置かない。
 - RAW は `RawDecodeContext` (Ctrl+E と同じ `raw_develop_executor` + `raw_brightness`)。
 - `perf::event` で要求・完了 (所要時間・寸法・段) を記録する。
 
@@ -145,6 +171,13 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
 - matte: 透過画素が `JpegMatte` の色に平らになる。
 - 世代: mIV 世代が進んだら書かない / OS 世代が変わったら書かない / どちらも同じなら書く
   (書き込み API を fake にした既存の `ClipboardImageApi` テストの形に乗せる)。
+- 書き込みの順序: OS 世代の判定が `OpenClipboard` 成功後・`EmptyClipboard` 前に行われる。
+  「古い A が判定済み → B が要求 (baseline 採取) → A が書き終える」の後でも B は書く。
+  「B が要求 → テキストコピー」の後では B は書かない。DIB と origin marker は同じ open 区間。
+- 永続データ: 旧形式 crop のページでコピーしても、worker が crop DB・sidecar へ書かない
+  (`crop_legacy_writeback` が `None`)。コピー中に切り取りを変えても巻き戻らない。
+- lease: 「編集まで」でもコピー worker が終わるまで AI 利用中に見える。
+- wake: 失敗で終わったときも repaint 要求が出る。
 - job の置き換え: 2 本目の要求で 1 本目の cancel が立ち、1 本目の結果は通知されない。
 - 対象決定: 一覧の `Image` / `ZipImage` / `PdfPage` は 1 ページ、フルスクリーン見開きは左右、
   `Stack` 等はメニューに出ない。

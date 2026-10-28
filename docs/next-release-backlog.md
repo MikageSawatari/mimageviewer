@@ -50,6 +50,15 @@
 - 進め方: 手順は [native-dependencies.md](native-dependencies.md) と [release-checklist.md](release-checklist.md) Phase 2 に従う。切り分けやすいように、塊ごとにコミットする (crate / ORT+ort / PDFium・FFmpeg・LibRaw / EffeTune・VST3 / Rust)。それぞれの PATCHES.md を更新する。最後に `test-full.ps1` と `test-lib-full.ps1 -Features test-script`、ReleaseChecks を通す。
 - 規模 / 優先度: Medium / P1 (次の版の最初の作業)。
 
+### 1.462 一覧で未表示のページを焼き込むと、旧形式の切り取りと PDF ページの注釈の基準寸法が表示時とずれることがある — §1.261 の設計レビューで判明 (2026-10-28)
+
+- 出典: §1.261 (編集を反映した画像のコピー) の設計を Codex Sol がレビューした際の指摘。コードで確認した。実機での観測は未確認。
+- 内容: 一括書き出し・製本・(§1.261 の) 一覧からのコピーは、未表示のページでは表示側の canonical 寸法 (`canonical_source_dimensions`) を持たないため、焼き込みの基準寸法を decode 後の寸法から決める。
+  - 旧形式 (基準寸法なし) の切り取りは、合成の最後に AI 拡大後の寸法を基準として採用する (`books.rs` の `compose_book_page_with_cancel`、`with_legacy_source_size(image.size)`)。表示済みページの Ctrl+E は AI 前の寸法で補完するので、AI 拡大を使うと切り出す範囲が変わる。さらに worker がその値を `crop_legacy_writeback` で DB へ書き戻す。
+  - 注釈は `comic_source_dims` が無いと decode 後・AI 前の寸法を基準にする。PDF ページは表示時の描画寸法と書き出しの長辺 4096 が違い得るため、注釈の位置・大きさが表示とずれる可能性がある。
+- 直し方の候補: 旧形式 crop の基準は AI 前の寸法で解決する。PDF 注釈は作成時の基準寸法を保存・復元する。表示キャッシュなし / ありの producer を通した比較テストを足す。
+- 規模 / 優先度: Small〜Medium / P3 (旧形式データ + AI 拡大、または PDF への注釈 + 一覧からの書き出しの組み合わせに限る)。
+
 ### 1.461 通常フォルダの画像でもページめくりアニメーションを使えるようにする — 5ch の要望 (2026-10-28)
 
 - 状態: **未着手・要調査**。利用者が次の版に入れると決めた (2026-10-28)。**§1.457 (めくり中に消しゴムなどの編集が反映されない) と一緒に進める** (利用者の指示)。
