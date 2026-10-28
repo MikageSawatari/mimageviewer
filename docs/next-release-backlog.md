@@ -53,7 +53,7 @@
 - 完了条件: 本別優先順位と再起動後の保存、全体変更への追従、既存データ移行を回帰検証。
   通常フォルダ・ZIP/PDF・連結読み・別窓・リモートで同じ解決を使い、既存の手動トリムを壊さない。
   独立レビュー、必要な自動検証、確認用ビルドまで実施。実機操作は別途了承された検証枠で行う。
-- 進行: 2026-10-28 に現行 master と照合し、出荷済みの「末尾に表紙を添える」の本別設定と同じ経路に揃えて設計を改訂 ([設計書](auto-trim-global-default-plan.md) §0)。Codex xhigh の独立設計レビューは ACCEPT with changes (§0.9)。実装は Codex gpt-6.1-sol high。
+- 進行: 2026-10-28 に現行 master と照合し、出荷済みの「末尾に表紙を添える」の本別設定と同じ経路に揃えて設計を改訂 ([設計書](auto-trim-global-default-plan.md) §0)。Codex xhigh の独立設計レビューは ACCEPT with changes (§0.9)。実装は Codex gpt-6.1-sol high (7c40410bb・b372f6589)、独立実装レビューは修正後 ACCEPT (§0.10)。本体 lib 全件・UI snapshot・Remote・Web のテストは成功。実機確認待ち。マニュアル tut-reading-3.webp (3 択のまま) の撮り直しが残り。
 
 ### 1.462 開いておいた環境設定の OK と mIV Remote の接続が同じ frame に重なると、全体設定の変更が Remote session の境界をまたがない — §1.216 の独立設計レビューで判明 (2026-10-28)
 

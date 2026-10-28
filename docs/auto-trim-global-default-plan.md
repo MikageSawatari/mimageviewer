@@ -163,6 +163,20 @@ Remote container の `remote_view_trim_plan_timed`、Remote の get / set handle
 - passive F12 窓は、再 active 化で snapshot が取り除かれ保持 context のライブ描画へ戻る
   (`app.rs` の snapshot 除去)。受動描画中は snapshot の bbox だけを読む。
 
+### 0.10 実装と独立レビュー (2026-10-28)
+
+実装は Codex gpt-6.1-sol high (コミット 7c40410bb、b372f6589)。別の Codex gpt-6.1-sol xhigh の独立レビューは
+ACCEPT with changes → 修正後 ACCEPT。検収で決めた点:
+
+- **手動設定を選ぶと `book_settings.enabled = true`** (出荷済み動作。本体 panel・Remote Web とも)。実装の途中で
+  この暗黙の ON が外れ、検収 (本体) と独立レビュー P2 (Web) で戻した。他の選択肢へ切り替えても手動の値と
+  enabled はそのまま残す。
+- 手動設定の適用範囲で「本全体」を選んでページ個別行を解除する出荷済み動作は維持。モード切替と全体設定の
+  変更ではページ個別行を消さない。
+- Remote の JPEG worker 単独の経路で設定が読めない場合は、ログとトリムなし表示だけにする (通知なし)。
+  Remote でトリムのパネルを開くと既存の通知が出る。まれな失敗の既定の割り切り。
+- Remote Web の「全体設定に従う」の括弧表示は、その選択中だけサーバ応答の現在値を出す。
+
 ## 1. 目的と範囲
 
 環境設定の「表示 > 閲覧表示」に、既定 OFF の次の項目を追加する。
