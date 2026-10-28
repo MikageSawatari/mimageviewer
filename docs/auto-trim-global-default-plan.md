@@ -62,8 +62,8 @@
   Remote・画像フォルダ ZIP 化・メタ情報転送の各 caller は同じ操作を呼ぶ。caller ごとに
   `is_removable` 相当を判定しない。
 - `ViewTrimWriteBatch.book` は fallback の有無を運ぶ (nested marker の判定に必要)。
-- メタ情報転送・名前変更の key 移行・画像フォルダ ZIP 化は `state_json` を SQL でそのまま写すので、
-  新形式の行もそのまま運ばれる。読み替えは読取側 (`ViewTrimDb` の decoder) だけが行う。
+- 名前変更の key 移行・画像フォルダ ZIP 化・内容の復元は `state_json` を SQL でそのまま写すので、
+  新形式の行もそのまま運ばれる。メタ情報転送は型として読み書きするので、DB と同じ codec を通す (§0.9 の 2)。
 
 ### 0.3 保存形式の確定
 
@@ -128,6 +128,40 @@ Remote container の `remote_view_trim_plan_timed`、Remote の get / set handle
 - 旧版への写し: `version: 2` 行を旧 `ViewTrimBookState` の serde で読むと、明示 Auto / Manual が
   `auto` / `book` として読める。
 - `metadata_import_refresh` の再読込が root fallback を含め通常の読込と同じ結果になる。
+
+### 0.9 2026-10-28 独立設計レビュー (Codex gpt-6.1-sol xhigh) の結果と決定
+
+判定は ACCEPT with changes。指摘と決定は次のとおり。
+
+1. **[P2] Preferences の OK と Remote の取得が同じ frame で重なると、設定確定が session 境界を
+   またがない経路がある** (Remote modal の登録が Preferences 描画より後)。末尾表紙など既存の
+   全体設定にも同じ穴がある。→ **本機能では閉じない**。Preferences の確定全体と Remote 取得の排他は
+   全体設定すべてに共通する問題で、本機能だけ別経路にすると前例と食い違う。起こるのは、開いておいた
+   Preferences の OK と Remote 端末の接続がたまたま同じ frame になったときだけで、結果も「その session で
+   取得済みのページが旧トリムのまま見える」(データは失われない、次の session で直る) に留まる。
+   別項目としてバックログへ起票する。
+2. **[P2] メタ情報転送は `state_json` を型として読み書きしている** (`PortableContainerState.view_trim`、
+   export で deserialize・import で serialize)。§0.2 の「そのまま写す」はメタ情報転送には当たらない。
+   → DB・portable 形式の両方が**同じ codec** (旧形式と version 2 を読み、version 2 を書く) を通す。
+   旧 package の import、version 2 の 4 値と手動値の往復、nested marker、旧版の reader での写しを回帰に足す。
+   import は利用者の明示操作で宛先の設定を置き換えるものなので、宛先の行が invalid でも既存どおり置き換える。
+   package 側の値が invalid なら既存どおり import を中止して報告する。
+   名前変更の key 移行・画像フォルダ ZIP 化・内容の復元は JSON を解釈せずに行ごと写すので、codec は不要
+   (bytes が保たれる回帰だけ足す)。
+3. **[P2] parked の無効化を末尾表紙と同じ範囲にすると、pan・自由回転まで 0 に戻る**。mounted 側
+   (トリム panel と同じ再 anchor) は保持するので差が出る。→ parked 側は layout・連結読みの keep set・
+   遷移・slideshow の範囲 cache だけを無効化し、連結読みは panel と同じ再 anchor 状態にする。
+   pan と自由回転は保持する (回帰を足す)。
+4. **[P3] invalid / error のとき利用者への通知が無い**。→ 既存の通知経路で
+   「表示トリムの設定を読み込めないため、トリムなしで表示しています」を出す (再試行や復旧の仕組みは足さない)。
+
+補足 (レビューで確認された点):
+- 読取の失敗経路は 1 本にし、`Missing` だけが fallback へ進む (`ViewTrimBookLoad` の中の Error と外側の
+  `Result` を併存させない)。
+- 未保存の panel 値を転送する batch (`take_pending_view_trim_transfer`) も fallback 付き key で書く。
+- `canonical_demand.rs` の見開き側の直接読取も resolver へ置き換える。
+- passive F12 窓は、再 active 化で snapshot が取り除かれ保持 context のライブ描画へ戻る
+  (`app.rs` の snapshot 除去)。受動描画中は snapshot の bbox だけを読む。
 
 ## 1. 目的と範囲
 
