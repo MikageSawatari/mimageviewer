@@ -100,26 +100,34 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
   遅れて届いた画像は古い」の 1 つ。2 つの世代で判定する。
   - mIV 内の画像コピー同士 (既存コピー・動画フレーム等): 既存の `CLIPBOARD_SEQ` を予約して共有する。
   - それ以外 (パスやファイル名のテキストコピー、Ctrl+C のファイルコピー、他のアプリ): 要求時に
-    `GetClipboardSequenceNumber` を baseline として記録する。
+    `GetClipboardSequenceNumber` を baseline として記録する (割り切りは §5.1)。
 - **要求と書き込みの順序** (共通 writer `write_image_clipboard_if_latest` に定義し、fake API で固定する):
-  1. 要求 (UI スレッド): `CLIPBOARD_WRITE_MUTEX` を取り、その中で `CLIPBOARD_SEQ` を進めて `my_seq` を得て、
-     `GetClipboardSequenceNumber` を baseline として読む。すぐ離す。
-     mutex を持つのは下の 3〜5 の open 区間だけ (OS の呼び出し数回、ms 単位) なので、UI スレッドの待ちは短い。
-     `OpenClipboard` は他のプロセスが持っていても待たずに失敗するので、待ちが延びない。
-  2. 書き込み (worker): DIB 構築とクリップボード用メモリの確保・複写は lock の外で済ませる
-     (既存 writer で lock 内にあった確保・複写も外へ出す)。
-  3. `CLIPBOARD_WRITE_MUTEX` を取り、`OpenClipboard` に成功してから判定する。
-     開いている間は他のプロセスが書けず、mutex の間は mIV の他の画像 writer も書けない。
-  4. 判定: すべての mIV 画像 writer で `CLIPBOARD_SEQ == my_seq` (既存の open 前の判定は早期終了として残す)。
-     新項目だけは加えて「OS 世代 == baseline」。
-  5. 通れば Empty → DIB → origin marker (同じ open 区間、既存の契約どおり) → Close。
-  - これで閉じる理由: baseline は mutex の中で取るので、mIV の画像書き込みは baseline より完全に前
-    (その結果は baseline に含まれる) か、完全に後 (`my_seq` の予約を見て止まる) のどちらかになる。
-    したがって baseline の後に OS 世代が変わっていれば、それは mIV の画像 writer 以外 (テキストコピー・
-    Ctrl+C・他のアプリ) による変更で、後から行われた操作なので書かない。
-    直前の書き込みの世代を覚えて例外にする規則は持たない。
+  1. 要求 (UI スレッド): `CLIPBOARD_SEQ` を進めて `my_seq` を得て、`GetClipboardSequenceNumber` を
+     baseline として読む。**UI スレッドは lock を取らない** (§5.1)。
+  2. 書き込み (worker): DIB を lock の外で作り、`CLIPBOARD_WRITE_MUTEX` を取って `OpenClipboard` に成功してから判定する。
+  3. 判定: すべての mIV 画像 writer で `CLIPBOARD_SEQ == my_seq` (既存の open 前の判定は早期終了として残し、
+     open 後にもう一度見る)。新項目だけは加えて「OS 世代 == baseline」。
+  4. 通れば Empty → DIB → origin marker (同じ open 区間、既存の契約どおり) → Close。
+  - mIV 世代で負けた (後から mIV で別の画像コピーをした) ときは黙って書かない。
+  - OS 世代が変わっていたときは書かずに、**「コピーの準備中にクリップボードが変わったため、
+    クリップボードを書き換えませんでした」と通知する** (§5.1 の取りこぼしを利用者に見せる)。
   - 既存コピーへの影響: open 後の mIV 世代の再判定が加わる (古い書き込みが後の予約を見て止まる)。
     出力や通常時の挙動は変わらない。既存コピーは OS 世代の判定をしない。
+
+### 5.1 この規則の割り切り
+
+「OS 世代が baseline から変わった = 要求の後に誰かがクリップボードを変えた」とみなす。
+正確に「後から行われたコピー」だけを見分けるのはやめた (設計レビュー 3 回で次の 2 点が残ったため)。
+
+- **UI スレッドに lock を待たせない**: 書き込み側は mutex を持ったまま `EmptyClipboard` を呼び、OS は
+  前の持ち主 (Ctrl+C のファイルコピーでは mIV の UI スレッド側の窓) へ通知を送って処理を待つ。UI スレッドが
+  同じ mutex を待つと互いに待って止まる。要求時の予約と baseline の採取を mutex の中で行う案はこれで捨てた。
+- **その代わり、次のときは要求を取りやめる** (後から別のコピーをしていなくても):
+  - 要求したまさにその数 ms に、前の mIV の画像コピーがクリップボードを開いて書いていた。
+  - 遅延レンダリングのデータ (他のアプリが「貼り付け時に作る」形で置いた内容) が、要求の後に
+    誰か (mIV のクリップボード監視を含む) に読まれて実体化された。
+  どちらもまれで、起きても**通知が出るので、利用者はもう一度コピーすればよい** (既定の割り切り方針)。
+  見分けるための仕組み (直前の書き込み世代の記録、所有者の判定など) は足さない。
 - **AI 利用中の印**: コピー worker は段に関係なく、終端まで `local_ai_activity_lease` を持つ。
   「編集まで」でも消しゴム補完 (MI-GAN) が worker 内で走るので、段で条件を分けない。
   置き換えで取り消された worker も、実際に終わるまで持つ (lease は worker が所有する)。
@@ -135,7 +143,8 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
 | 要求を受けたとき、段が AI まで進み AI が動く見込み | 「編集を反映した画像を準備しています…」(時間がかかるため) |
 | 書けた | 「編集を反映した画像をコピーしました」 |
 | 失敗 (decode・合成・メモリ確保・OpenClipboard など) | エラー通知 (理由つき) |
-| 後のコピーに追い越された / 置き換えで取り消された | 何も出さない (利用者が後から行った操作が勝っただけ) |
+| mIV の後の画像コピーに追い越された / 置き換えで取り消された | 何も出さない (利用者が後から行った操作が勝っただけ) |
+| OS のクリップボード世代が変わっていた (§5.1) | 「コピーの準備中にクリップボードが変わったため、クリップボードを書き換えませんでした」 |
 
 既存コピーは失敗しても何も出さないが、そちらは変えない。
 
@@ -180,8 +189,10 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
   (書き込み API を fake にした既存の `ClipboardImageApi` テストの形に乗せる)。
 - 書き込みの順序: mIV 世代と OS 世代の判定が `OpenClipboard` 成功後・`EmptyClipboard` 前に行われる。
   「既存コピー A が open 前の判定を通過 → B が要求 → A が open」では A は書かない (open 後の再判定)。
-  「A が書き終える → B が要求」の後、B は書く。「B が要求 → テキストコピー」「B が要求 → 他アプリのコピー」
-  の後では B は書かない。要求の予約と baseline 採取は mutex の中。DIB と origin marker は同じ open 区間。
+  「A が書き終える → B が要求」の後、B は書く。「B が要求 → テキストコピー / 他アプリのコピー」の後では
+  B は書かず、通知の結果を返す。UI スレッド側の要求 helper は `CLIPBOARD_WRITE_MUTEX` に触れない
+  (`empty()` が待たされる fake の最中に新しい要求を出しても、要求が返ることを確かめる)。
+  DIB と origin marker は同じ open 区間。
 - 永続データ: 旧形式 crop のページでコピーしても、worker が crop DB・sidecar へ書かない
   (`crop_legacy_writeback` が `None`)。コピー中に切り取りを変えても巻き戻らない。
 - lease: 「編集まで」でもコピー worker が終わるまで AI 利用中に見える。
