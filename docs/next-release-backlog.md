@@ -50,7 +50,7 @@
 - 進め方: 手順は [native-dependencies.md](native-dependencies.md) と [release-checklist.md](release-checklist.md) Phase 2 に従う。切り分けやすいように、塊ごとにコミットする (crate / ORT+ort / PDFium・FFmpeg・LibRaw / EffeTune・VST3 / Rust)。それぞれの PATCHES.md を更新する。最後に `test-full.ps1` と `test-lib-full.ps1 -Features test-script`、ReleaseChecks を通す。
 - 規模 / 優先度: Medium / P1 (次の版の最初の作業)。
 
-### 1.462 一覧で未表示のページを焼き込むと、旧形式の切り取りと PDF ページの注釈の基準寸法が表示時とずれることがある — §1.261 の設計レビューで判明 (2026-10-28)
+### 1.510 一覧で未表示のページを焼き込むと、旧形式の切り取りと PDF ページの注釈の基準寸法が表示時とずれることがある — §1.261 の設計レビューで判明 (2026-10-28)
 
 - 出典: §1.261 (編集を反映した画像のコピー) の設計を Codex Sol がレビューした際の指摘。コードで確認した。実機での観測は未確認。
 - 内容: 一括書き出し・製本・(§1.261 の) 一覧からのコピーは、未表示のページでは表示側の canonical 寸法 (`canonical_source_dimensions`) を持たないため、焼き込みの基準寸法を decode 後の寸法から決める。
