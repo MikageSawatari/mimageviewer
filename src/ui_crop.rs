@@ -789,17 +789,16 @@ impl App {
             );
         }
 
-        let drag_in_progress =
-            self.export_crop_drag.is_some() || self.export_crop_create_drag.is_some();
-        if !crop_overlay_keeps_the_pointer(
-            pointer_allowed && !front.owns(egui::PointerButton::Primary),
-            drag_in_progress,
-            ui.input(|i| i.pointer.primary_down()),
-        ) {
-            return false;
-        }
-
-        self.handle_export_crop_pointer(ui, transform, fs_idx, image_size, settings, handles, front)
+        self.handle_export_crop_pointer(
+            ui,
+            transform,
+            fs_idx,
+            image_size,
+            settings,
+            handles,
+            pointer_allowed,
+            front,
+        )
     }
 
     fn handle_export_crop_pointer(
@@ -810,6 +809,7 @@ impl App {
         image_size: [usize; 2],
         settings: CropSettings,
         handles: [(CropHandle, egui::Pos2); 8],
+        pointer_allowed: bool,
         front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let (space_pan_held, force_create_held) = crate::keyboard_input::focused_key_state_permit(
@@ -831,6 +831,7 @@ impl App {
             handles,
             space_pan_held,
             force_create_held,
+            pointer_allowed,
             front,
         )
     }
@@ -857,6 +858,7 @@ impl App {
             handles,
             space_pan_held,
             force_create_held,
+            true,
             Default::default(),
         )
     }
@@ -872,6 +874,7 @@ impl App {
         handles: [(CropHandle, egui::Pos2); 8],
         space_pan_held: bool,
         force_create_held: bool,
+        pointer_allowed: bool,
         front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         if self.book_structural_op.is_some() {
@@ -932,7 +935,7 @@ impl App {
                         .key_held_action(ui.ctx(), permit, KeyAction::CropScrubZoomHold)
                 }),
                 transform.viewport_rect.center(),
-                pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
+                pointer_allowed && pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
                 primary_pressed,
                 primary_down,
                 primary_released,
@@ -940,6 +943,16 @@ impl App {
             )
         {
             return true;
+        }
+
+        // The shared navigation owner has already continued or retired Space
+        // pan/scrub even over a panel. This gate only admits crop-frame input.
+        if !crop_overlay_keeps_the_pointer(
+            pointer_allowed && !front.owns(egui::PointerButton::Primary),
+            crop_drag_in_progress,
+            primary_down,
+        ) {
+            return false;
         }
 
         if !crop_drag_in_progress && let Some(origin) = press_origin {

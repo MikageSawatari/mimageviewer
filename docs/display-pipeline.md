@@ -2234,6 +2234,8 @@ Z は既存の0.05～16に制限する。360は入力のみ消費する。終了
 閲覧処理は編集で開始した scrubby に触れず、編集 helper も閲覧で開始した状態に触れない。
 scrubby は分析モードでは開始せず、ガイド入力と組み合わせない。従来の分析ホイール／中ボタンは維持する。
 編集5モードは既存の Space パン helper を共用し、通常閲覧では touch／gesture／click／pan より先に primary を所有する。
+編集側はパネル上の開始拒否より先に共通 helper を駆動する。切り取りの `pointer_allowed` も開始許可として渡し、
+crop 枠の入力受付はその後で判定する。パネルを横切った Space パン／scrubby の継続と解放は共通 owner が処理する。
 chord 解放後は倍率変更を終了し、primary 解放まで同じ typed state に保持して他の操作へ流さない。
 入力所有・対象 context の詳細は [キー仕様](keymap-spec.md#左右ドラッグによる連続ズーム)。
 

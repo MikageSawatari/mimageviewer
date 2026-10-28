@@ -27,6 +27,8 @@ mod front_popup_input_tests;
 mod native_focus_tests;
 #[cfg(test)]
 mod overflow_input_tests;
+#[cfg(all(test, windows))]
+mod overlay_navigation_tests;
 #[cfg(test)]
 mod overview_page_turn_tests;
 mod page_turn;
@@ -15306,8 +15308,10 @@ impl App {
     }
 
     /// Overlay editing tools share Photoshop-style temporary pan: hold Space and
-    /// drag with the primary button. `can_start` should be false over tool panels,
-    /// but an already-started pan continues if the pointer crosses a panel.
+    /// drag with the primary button, or hold the scrub chord to zoom horizontally.
+    /// `can_start` controls admission only: callers must service this owner before
+    /// rejecting panel input, including on the release frame. An owned pan/scrub
+    /// continues and ends even when `can_start` is false over a tool panel.
     pub(crate) fn handle_overlay_space_pan_drag(
         &mut self,
         ctx: &egui::Context,
