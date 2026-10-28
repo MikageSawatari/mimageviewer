@@ -434,6 +434,7 @@ preferences_policy! {
         details_column_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_column_widths => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_rated_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_applied_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_page_count_column_index_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_page_count_column_width_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_place_column_index_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -443,6 +444,7 @@ preferences_policy! {
         details_show_preview => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_rating => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_rated_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_show_applied_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_tags => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_kind => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_page_count => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -461,9 +463,11 @@ preferences_policy! {
         details_selection_bar_column_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_column_widths => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_rated_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_selection_bar_applied_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_preview => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_rating => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_rated_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_selection_bar_show_applied_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_tags => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_kind => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_page_count => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -505,6 +509,7 @@ preferences_policy! {
         prefetch_forward => "CPU/GPU/メモリ/ドライバ/速度の tuning";
         sort_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         rating_view_sort => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        tag_view_sort => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         subfolder_expansion_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         subfolder_expansion_max_depth => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         subfolder_expansion_filter_kinds => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1935,7 +1940,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 472);
+        assert_eq!(entries.len(), 477);
         assert_eq!(
             entries
                 .iter()
@@ -1948,7 +1953,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            321
+            326
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2301,6 +2306,40 @@ mod tests {
                 .iter()
                 .all(|label| label.chars().any(|c| !c.is_ascii()))
         );
+    }
+
+    #[test]
+    fn tag_sort_and_applied_at_columns_remain_local_view_settings() {
+        let mut destination = Settings {
+            tag_view_sort: crate::tag_view::TagViewSort::AppliedAtAsc,
+            details_show_applied_at: false,
+            details_applied_at_width: Some(177.0),
+            details_selection_bar_show_applied_at: false,
+            details_selection_bar_applied_at_width: Some(233.0),
+            ..Settings::default()
+        };
+        let exported = export_preferences(&destination).unwrap();
+        let preferences: Value = serde_json::from_str(&exported.json).unwrap();
+        for key in [
+            "tag_view_sort",
+            "details_show_applied_at",
+            "details_applied_at_width",
+            "details_selection_bar_show_applied_at",
+            "details_selection_bar_applied_at_width",
+        ] {
+            assert!(preferences["preferences"].get(key).is_none(), "{key}");
+        }
+        let before = destination.clone();
+        parse_preferences(&document(json!({
+            "tag_view_sort": "PathOrder",
+            "details_show_applied_at": true,
+            "details_applied_at_width": 300.0,
+            "details_selection_bar_show_applied_at": true,
+            "details_selection_bar_applied_at_width": 400.0
+        })))
+        .unwrap()
+        .apply_to(&mut destination);
+        assert_excluded_unchanged(&before, &destination);
     }
 
     fn private_destination() -> Settings {

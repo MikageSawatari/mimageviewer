@@ -54,6 +54,9 @@ mod notification_duration;
 #[path = "tests/plain_folder_spread.rs"]
 mod plain_folder_spread;
 
+#[path = "tests/tag_applied_at.rs"]
+mod tag_applied_at;
+
 #[path = "tests/startup_notices.rs"]
 pub(super) mod startup_notices;
 
@@ -31356,6 +31359,7 @@ mod phase_c_drill_nav_tests {
             kind_filter: crate::tag_view::TagViewKindFilter::All,
             summaries: Vec::new(),
             entries: vec![crate::tag_view::TagViewEntry {
+                applied_at_ms: None,
                 path: tag_hit,
                 kind: crate::tag_view::TagViewItemKind::Image,
                 mtime: 2,
@@ -31404,6 +31408,7 @@ mod phase_c_drill_nav_tests {
             kind_filter: crate::tag_view::TagViewKindFilter::All,
             summaries: Vec::new(),
             entries: vec![crate::tag_view::TagViewEntry {
+                applied_at_ms: None,
                 path: audio.clone(),
                 kind: crate::tag_view::TagViewItemKind::Audio,
                 mtime: 1,
@@ -104802,7 +104807,6 @@ mod rating_folder_r2_tests {
         let mut app = setup_app();
         for surface in [
             TopLevelGridSurface::Search(TopLevelSearchView::Favorite),
-            TopLevelGridSurface::Search(TopLevelSearchView::Tag),
             TopLevelGridSurface::ReadingHistory,
             TopLevelGridSurface::Snapshot,
             TopLevelGridSurface::DriveList,

@@ -37,6 +37,32 @@ pub struct TagSummary {
     pub last_applied_at: i64,
 }
 
+/// Query-scoped timestamp: unrelated tags on the item are excluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TagViewMatch {
+    pub item_key: String,
+    /// Unix seconds, the storage unit of `item_tags.applied_at`.
+    pub applied_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TagViewQueryOrder {
+    Path,
+    AppliedAtDesc,
+    AppliedAtAsc,
+}
+
+const TAG_PATH_PREFIX_SQL: &str = "SELECT DISTINCT item_key
+             FROM item_tags
+             WHERE tag_key LIKE ?1 ESCAPE '\\'
+             ORDER BY item_key COLLATE NOCASE ASC
+             LIMIT ?2";
+const TAG_PATH_EXACT_SQL: &str = "SELECT DISTINCT item_key
+             FROM item_tags
+             WHERE tag_key = ?1
+             ORDER BY item_key COLLATE NOCASE ASC
+             LIMIT ?2";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RetagReport {
     pub old_key: String,
@@ -792,13 +818,7 @@ impl TagsDb {
         }
         let escaped = escape_like_pattern(&key);
         let pattern = format!("{escaped}%");
-        let mut stmt = match self.conn.prepare(
-            "SELECT DISTINCT item_key
-             FROM item_tags
-             WHERE tag_key LIKE ?1 ESCAPE '\\'
-             ORDER BY item_key COLLATE NOCASE ASC
-             LIMIT ?2",
-        ) {
+        let mut stmt = match self.conn.prepare(TAG_PATH_PREFIX_SQL) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -816,13 +836,7 @@ impl TagsDb {
         if key.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let mut stmt = match self.conn.prepare(
-            "SELECT DISTINCT item_key
-             FROM item_tags
-             WHERE tag_key = ?1
-             ORDER BY item_key COLLATE NOCASE ASC
-             LIMIT ?2",
-        ) {
+        let mut stmt = match self.conn.prepare(TAG_PATH_EXACT_SQL) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -869,19 +883,7 @@ impl TagsDb {
             TagQueryMatchKind::Prefix => 1,
         });
 
-        let mut sql = String::from("SELECT DISTINCT base.item_key FROM item_tags base WHERE ");
-        let mut values = Vec::new();
-        append_tag_match_sql(&mut sql, "base", &matches[0], &mut values);
-        for (idx, tag_match) in matches.iter().enumerate().skip(1) {
-            let alias = format!("t{idx}");
-            sql.push_str(" AND EXISTS (SELECT 1 FROM item_tags ");
-            sql.push_str(&alias);
-            sql.push_str(" WHERE ");
-            sql.push_str(&alias);
-            sql.push_str(".item_key = base.item_key AND ");
-            append_tag_match_sql(&mut sql, &alias, tag_match, &mut values);
-            sql.push(')');
-        }
+        let (mut sql, mut values) = tag_candidate_sql(&matches);
         sql.push_str(" ORDER BY base.item_key COLLATE NOCASE ASC LIMIT ?");
         values.push(Value::Integer(limit as i64));
 
@@ -891,6 +893,146 @@ impl TagsDb {
         };
         let rows = match stmt.query_map(rusqlite::params_from_iter(values), |row| row.get(0)) {
             Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten().collect()
+    }
+
+    pub(crate) fn tag_view_matches_exact(
+        &self,
+        tag: &str,
+        order: TagViewQueryOrder,
+        limit: usize,
+    ) -> Vec<TagViewMatch> {
+        if order == TagViewQueryOrder::Path {
+            let keys = self.item_keys_by_tag_exact(tag, limit);
+            return self.tag_view_matches_for_keys(
+                &[TagQueryMatch {
+                    key: normalize_tag_key(tag),
+                    kind: TagQueryMatchKind::Exact,
+                }],
+                &keys,
+            );
+        }
+        self.tag_view_matches(
+            &[TagQueryMatch {
+                key: normalize_tag_key(tag),
+                kind: TagQueryMatchKind::Exact,
+            }],
+            order,
+            limit,
+        )
+    }
+
+    pub(crate) fn tag_view_matches_prefix(
+        &self,
+        prefix: &str,
+        order: TagViewQueryOrder,
+        limit: usize,
+    ) -> Vec<TagViewMatch> {
+        if order == TagViewQueryOrder::Path {
+            let keys = self.item_keys_by_tag_prefix(prefix, limit);
+            return self.tag_view_matches_for_keys(
+                &[TagQueryMatch {
+                    key: normalize_tag_key(prefix),
+                    kind: TagQueryMatchKind::Prefix,
+                }],
+                &keys,
+            );
+        }
+        self.tag_view_matches(
+            &[TagQueryMatch {
+                key: normalize_tag_key(prefix),
+                kind: TagQueryMatchKind::Prefix,
+            }],
+            order,
+            limit,
+        )
+    }
+
+    pub(crate) fn tag_view_matches_terms_and(
+        &self,
+        terms: &[String],
+        order: TagViewQueryOrder,
+        limit: usize,
+    ) -> Vec<TagViewMatch> {
+        let mut matches = Vec::new();
+        for term in terms {
+            let key = normalize_tag_key(term);
+            if key.is_empty() || matches.iter().any(|m: &TagQueryMatch| m.key == key) {
+                continue;
+            }
+            let kind = if self.find_exact(&key).is_some() {
+                TagQueryMatchKind::Exact
+            } else {
+                TagQueryMatchKind::Prefix
+            };
+            matches.push(TagQueryMatch { key, kind });
+        }
+        if order == TagViewQueryOrder::Path {
+            let keys = self.item_keys_by_tag_terms_and(terms, limit);
+            return self.tag_view_matches_for_keys(&matches, &keys);
+        }
+        self.tag_view_matches(&matches, order, limit)
+    }
+
+    fn tag_view_matches_for_keys(
+        &self,
+        matches: &[TagQueryMatch],
+        item_keys: &[String],
+    ) -> Vec<TagViewMatch> {
+        // The established path query owns candidate selection and its LIMIT.
+        // Fetch timestamps only for those keys, using the item_key index.
+        let mut timestamps = HashMap::new();
+        for keys in item_keys.chunks(500) {
+            let (sql, values) = tag_selected_timestamps_sql(matches, keys);
+            let mut stmt = match self.conn.prepare(&sql) {
+                Ok(stmt) => stmt,
+                Err(_) => return Vec::new(),
+            };
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            });
+            let Ok(rows) = rows else {
+                return Vec::new();
+            };
+            timestamps.extend(rows.flatten());
+        }
+        item_keys
+            .iter()
+            .filter_map(|key| {
+                timestamps.remove(key).map(|applied_at| TagViewMatch {
+                    item_key: key.clone(),
+                    applied_at,
+                })
+            })
+            .collect()
+    }
+
+    fn tag_view_matches(
+        &self,
+        matches: &[TagQueryMatch],
+        order: TagViewQueryOrder,
+        limit: usize,
+    ) -> Vec<TagViewMatch> {
+        #[cfg(test)]
+        count_read_for_test();
+        if matches.is_empty() || matches.iter().any(|m| m.key.is_empty()) || limit == 0 {
+            return Vec::new();
+        }
+
+        let (sql, values) = tag_time_order_sql(matches, order, limit);
+        let mut stmt = match self.conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok(TagViewMatch {
+                item_key: row.get(0)?,
+                applied_at: row.get(1)?,
+            })
+        }) {
+            Ok(rows) => rows,
             Err(_) => return Vec::new(),
         };
         rows.flatten().collect()
@@ -995,6 +1137,87 @@ struct TagQueryMatch {
 enum TagQueryMatchKind {
     Exact,
     Prefix,
+}
+
+/// The caller puts exact terms first so candidate selection can use tag_key.
+/// Keep this WHERE structure shared with the established path-order query.
+fn tag_candidate_sql(matches: &[TagQueryMatch]) -> (String, Vec<Value>) {
+    let mut sql = String::from("SELECT DISTINCT base.item_key FROM item_tags base WHERE ");
+    let mut values = Vec::new();
+    append_tag_match_sql(&mut sql, "base", &matches[0], &mut values);
+    for (idx, tag_match) in matches.iter().enumerate().skip(1) {
+        let alias = format!("t{idx}");
+        sql.push_str(" AND EXISTS (SELECT 1 FROM item_tags ");
+        sql.push_str(&alias);
+        sql.push_str(" WHERE ");
+        sql.push_str(&alias);
+        sql.push_str(".item_key = base.item_key AND ");
+        append_tag_match_sql(&mut sql, &alias, tag_match, &mut values);
+        sql.push(')');
+    }
+    (sql, values)
+}
+
+fn append_matching_tags_sql(sql: &mut String, matches: &[TagQueryMatch], values: &mut Vec<Value>) {
+    sql.push('(');
+    for (idx, tag_match) in matches.iter().enumerate() {
+        if idx > 0 {
+            sql.push_str(" OR ");
+        }
+        append_tag_match_sql(sql, "matched", tag_match, values);
+    }
+    sql.push(')');
+}
+
+fn tag_selected_timestamps_sql(
+    matches: &[TagQueryMatch],
+    item_keys: &[String],
+) -> (String, Vec<Value>) {
+    let placeholders = vec!["(?)"; item_keys.len()].join(",");
+    let mut sql = format!(
+        "WITH selected(item_key) AS (VALUES {placeholders}) \
+         SELECT selected.item_key, (SELECT MAX(matched.applied_at) FROM item_tags matched \
+         WHERE matched.item_key = selected.item_key AND "
+    );
+    let mut values = item_keys.iter().cloned().map(Value::Text).collect();
+    append_matching_tags_sql(&mut sql, matches, &mut values);
+    sql.push_str(") FROM selected");
+    (sql, values)
+}
+
+fn tag_time_order_sql(
+    matches: &[TagQueryMatch],
+    order: TagViewQueryOrder,
+    limit: usize,
+) -> (String, Vec<Value>) {
+    let mut candidates = matches.to_vec();
+    candidates.sort_by_key(|m| match m.kind {
+        TagQueryMatchKind::Exact => 0,
+        TagQueryMatchKind::Prefix => 1,
+    });
+    let (candidate_sql, candidate_values) = tag_candidate_sql(&candidates);
+    // The OR belongs under an item_key lookup, never at the candidate root.
+    // In particular, exact + prefix AND must start at the exact tag's index.
+    // DISTINCT keeps the candidate subquery from flattening into matching rows.
+    let mut sql = String::from(
+        "SELECT candidate.item_key, (SELECT MAX(matched.applied_at) \
+         FROM item_tags matched WHERE matched.item_key = candidate.item_key AND ",
+    );
+    let mut values = Vec::new();
+    append_matching_tags_sql(&mut sql, matches, &mut values);
+    sql.push_str(") AS applied_at FROM (");
+    sql.push_str(&candidate_sql);
+    values.extend(candidate_values);
+    sql.push_str(") candidate ORDER BY applied_at ");
+    sql.push_str(match order {
+        TagViewQueryOrder::AppliedAtDesc => "DESC",
+        TagViewQueryOrder::AppliedAtAsc => "ASC",
+        TagViewQueryOrder::Path => unreachable!("path queries use existing key selection"),
+    });
+    // No candidate LIMIT: all timestamps must participate before the final cap.
+    sql.push_str(", candidate.item_key ASC LIMIT ?");
+    values.push(Value::Integer(limit as i64));
+    (sql, values)
 }
 
 fn append_tag_match_sql(
@@ -1349,6 +1572,247 @@ mod tests {
                 "c:/cat-dog.jpg".to_string(),
                 "c:/cat-dognap.jpg".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn tag_view_timestamps_include_only_exact_and_prefix_matching_rows() {
+        let db = memory_db();
+        for (item, tag, at) in [
+            ("a", "cat", 10),
+            ("a", "dog", 30),
+            ("a", "dognap", 999),
+            ("a", "unrelated", 9000),
+            ("b", "cat", 20),
+            ("b", "dog", 25),
+            ("b", "unrelated", 5000),
+            ("c", "catnap", 100),
+            ("c", "catneko", 150),
+            ("c", "unrelated", 9000),
+            ("d", "dog", 40),
+        ] {
+            db.conn.execute(
+                "INSERT INTO item_tags (item_key, tag, tag_key, applied_at) VALUES (?1, ?2, ?2, ?3)",
+                params![item, tag, at],
+            ).unwrap();
+        }
+        let rows = |rows: Vec<TagViewMatch>| {
+            rows.into_iter()
+                .map(|row| (row.item_key, row.applied_at))
+                .collect::<Vec<_>>()
+        };
+        let desc = TagViewQueryOrder::AppliedAtDesc;
+        assert_eq!(
+            rows(db.tag_view_matches_exact("#cat", desc, 20)),
+            [("b".into(), 20), ("a".into(), 10)]
+        );
+        assert_eq!(
+            rows(db.tag_view_matches_terms_and(&["cat".into(), "dog".into()], desc, 20)),
+            [("a".into(), 30), ("b".into(), 25)]
+        );
+        assert_eq!(
+            rows(db.tag_view_matches_terms_and(&["cat".into(), "do".into()], desc, 20)),
+            [("a".into(), 999), ("b".into(), 25)]
+        );
+        assert_eq!(
+            rows(db.tag_view_matches_prefix("ca", desc, 20)),
+            [("c".into(), 150), ("b".into(), 20), ("a".into(), 10)]
+        );
+        assert_eq!(
+            rows(db.tag_view_matches_prefix("ca", TagViewQueryOrder::AppliedAtAsc, 1)),
+            [("a".into(), 10)]
+        );
+    }
+
+    #[test]
+    fn tag_view_timestamp_order_precedes_sql_limit_and_ties_use_path() {
+        let mut db = memory_db();
+        let tx = db.conn.transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO item_tags (item_key, tag, tag_key, applied_at) VALUES (?1, 'cat', 'cat', ?2)",
+            ).unwrap();
+            for idx in 0..10_002 {
+                insert
+                    .execute(params![format!("item-{idx:05}"), idx / 2])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let rows = db.tag_view_matches_exact("cat", TagViewQueryOrder::AppliedAtDesc, 2);
+        assert_eq!(
+            rows.iter().map(|r| r.item_key.as_str()).collect::<Vec<_>>(),
+            ["item-10000", "item-10001"]
+        );
+        assert_eq!(rows[0].applied_at, 5000);
+        let rows = db.tag_view_matches_exact("cat", TagViewQueryOrder::AppliedAtAsc, 1);
+        assert_eq!(rows[0].item_key, "item-00000");
+        assert!(
+            db.tag_view_matches_exact("cat", TagViewQueryOrder::AppliedAtDesc, 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tag_view_query_plans_preserve_candidates_and_key_scoped_timestamps() {
+        let db = memory_db();
+        let explain = |sql: &str, values: Vec<Value>| {
+            db.conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(values), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let exact = |key: &str| TagQueryMatch {
+            key: key.into(),
+            kind: TagQueryMatchKind::Exact,
+        };
+        let prefix = |key: &str| TagQueryMatch {
+            key: key.into(),
+            kind: TagQueryMatchKind::Prefix,
+        };
+        for matches in [
+            vec![exact("cat")],
+            vec![prefix("ca")],
+            vec![exact("cat"), exact("dog")],
+            // Input order must not make the prefix the candidate root.
+            vec![prefix("do"), exact("cat")],
+            vec![prefix("ca"), prefix("do")],
+        ] {
+            let mut candidates = matches.clone();
+            candidates.sort_by_key(|m| match m.kind {
+                TagQueryMatchKind::Exact => 0,
+                TagQueryMatchKind::Prefix => 1,
+            });
+            let (path_sql, path_values, path_alias) = if candidates.len() == 1 {
+                let (sql, key) = match candidates[0].kind {
+                    TagQueryMatchKind::Exact => (TAG_PATH_EXACT_SQL, candidates[0].key.clone()),
+                    TagQueryMatchKind::Prefix => (
+                        TAG_PATH_PREFIX_SQL,
+                        format!("{}%", escape_like_pattern(&candidates[0].key)),
+                    ),
+                };
+                (
+                    sql.to_string(),
+                    vec![Value::Text(key), Value::Integer(2)],
+                    "item_tags",
+                )
+            } else {
+                let (mut sql, mut values) = tag_candidate_sql(&candidates);
+                sql.push_str(" ORDER BY base.item_key COLLATE NOCASE ASC LIMIT ?");
+                values.push(Value::Integer(2));
+                (sql, values, "base")
+            };
+            let path_plan = explain(&path_sql, path_values);
+            let path_access = path_plan
+                .iter()
+                .find_map(|line| {
+                    line.strip_prefix(&format!("SEARCH {path_alias} "))
+                        .or_else(|| line.strip_prefix(&format!("SCAN {path_alias} ")))
+                })
+                .unwrap();
+            let has_exact = candidates[0].kind == TagQueryMatchKind::Exact;
+            if has_exact {
+                assert!(path_access.contains("idx_item_tags_tagkey (tag_key=?)"));
+            }
+            for order in [
+                TagViewQueryOrder::AppliedAtDesc,
+                TagViewQueryOrder::AppliedAtAsc,
+            ] {
+                let (sql, values) = tag_time_order_sql(&matches, order, 2);
+                assert_eq!(sql.matches("LIMIT").count(), 1, "{sql}");
+                assert!(sql.find("ORDER BY").unwrap() < sql.find("LIMIT").unwrap());
+                let plan = explain(&sql, values);
+                let candidate_access = plan
+                    .iter()
+                    .find_map(|line| {
+                        line.strip_prefix("SEARCH base ")
+                            .or_else(|| line.strip_prefix("SCAN base "))
+                    })
+                    .unwrap();
+                assert_eq!(candidate_access, path_access, "{matches:?}: {plan:?}");
+                assert!(
+                    plan.iter().any(|line| {
+                        line.starts_with("SEARCH matched ") && line.contains("(item_key=?")
+                    }),
+                    "{matches:?}: {plan:?}"
+                );
+                assert!(!plan.iter().any(|line| line.starts_with("SCAN matched ")));
+                if has_exact {
+                    assert!(!plan.iter().any(|line| line.starts_with("SCAN base ")));
+                }
+            }
+            let (sql, values) = tag_selected_timestamps_sql(&matches, &["a".into(), "b".into()]);
+            let plan = explain(&sql, values);
+            assert!(
+                plan.iter().any(|line| {
+                    line.starts_with("SEARCH matched ") && line.contains("(item_key=?")
+                }),
+                "{matches:?}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_view_path_order_limits_existing_candidates_before_timestamp_lookup() {
+        let db = memory_db();
+        for (item, tag, at) in [
+            ("a", "cat", 10),
+            ("a", "dog", 20),
+            ("a", "unrelated", 999),
+            ("b", "cat", 200),
+            ("b", "dog", 300),
+        ] {
+            db.conn.execute(
+                "INSERT INTO item_tags (item_key, tag, tag_key, applied_at) VALUES (?1, ?2, ?2, ?3)",
+                params![item, tag, at],
+            ).unwrap();
+        }
+        let terms = ["cat".into(), "do".into()];
+        for (rows, keys, at) in [
+            (
+                db.tag_view_matches_exact("cat", TagViewQueryOrder::Path, 1),
+                db.item_keys_by_tag_exact("cat", 1),
+                10,
+            ),
+            (
+                db.tag_view_matches_prefix("ca", TagViewQueryOrder::Path, 1),
+                db.item_keys_by_tag_prefix("ca", 1),
+                10,
+            ),
+            (
+                db.tag_view_matches_terms_and(&terms, TagViewQueryOrder::Path, 1),
+                db.item_keys_by_tag_terms_and(&terms, 1),
+                20,
+            ),
+        ] {
+            assert_eq!(
+                rows.iter().map(|row| &row.item_key).collect::<Vec<_>>(),
+                keys.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].item_key, "a");
+            assert_eq!(rows[0].applied_at, at);
+        }
+        assert_eq!(
+            db.tag_view_matches_terms_and(&terms, TagViewQueryOrder::AppliedAtDesc, 1)[0].item_key,
+            "b"
+        );
+    }
+
+    #[test]
+    fn tag_view_timestamp_prefix_escapes_like_wildcards() {
+        let mut db = memory_db();
+        db.set_item_tags("literal", ["a_b"], source::EDIT).unwrap();
+        db.set_item_tags("wildcard", ["axb"], source::EDIT).unwrap();
+        let rows = db.tag_view_matches_prefix("a_", TagViewQueryOrder::AppliedAtDesc, 10);
+        assert_eq!(
+            rows.iter().map(|r| r.item_key.as_str()).collect::<Vec<_>>(),
+            ["literal"]
         );
     }
 
