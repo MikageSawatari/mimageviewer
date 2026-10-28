@@ -10687,6 +10687,9 @@ export class ViewerViewTrimPanel {
     this.modeSelect.addEventListener("change", () => {
       if (!this.serverState) return;
       this.serverState.preference = this.modeSelect.value;
+      if (this.serverState.preference === "manual") {
+        this.serverState.book_settings.enabled = true;
+      }
       this.renderState(false);
       this.commit().catch((error) => this.showError(error));
     });

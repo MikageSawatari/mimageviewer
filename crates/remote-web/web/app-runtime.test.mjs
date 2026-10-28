@@ -884,11 +884,19 @@ test("view trim mode changes retain manual values and wait for the server global
     panel.modeSelect.value = preference;
     panel.modeSelect.dispatchEvent({ type: "change" });
     assert.equal(panel.serverState.preference, preference);
-    assert.deepEqual(panel.serverState.book_settings, before);
+    const expected = preference === "manual" ? { ...before, enabled: true } : before;
+    assert.deepEqual(panel.serverState.book_settings, expected);
+    assert.equal(panel.enabledInput.checked, expected.enabled);
     assert.equal(panel.modeSelect.children[0].textContent, "全体設定に従う");
     assert.equal(panel.controls.hidden, preference !== "manual");
   }
   assert.equal(commits, 4);
+  for (const preference of ["follow_global", "none", "auto"]) {
+    panel.modeSelect.value = preference;
+    panel.modeSelect.dispatchEvent({ type: "change" });
+    assert.deepEqual(panel.serverState.book_settings, { ...before, enabled: true });
+  }
+  assert.equal(commits, 7);
   for (const [effective_apply_mode, label] of [
     ["auto", "全体設定に従う（現在: 自動余白カット）"],
     ["none", "全体設定に従う（現在: トリムなし）"],
