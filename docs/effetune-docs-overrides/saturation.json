@@ -1,0 +1,14 @@
+[
+  {
+    "operation": "replace_html",
+    "anchor": "<!-- spectrum-overlay -->",
+    "replacement": "",
+    "reason": "Upstream marker precedes shared category guidance, not a plugin-list item."
+  },
+  {
+    "operation": "move_section_before_heading",
+    "heading_id": "スペクトラムオーバーレイ",
+    "before_heading_id": "プラグイン一覧",
+    "reason": "Preserve shared spectrum instructions at category level before splitting plugin sections, including the existing heading id."
+  }
+]

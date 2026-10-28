@@ -828,6 +828,95 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   試験前の退避分に戻し、どちらも退避分と完全一致 (試験後の状態は `target/hw-0140/after-test`)。
   `%APPDATA%\effetune` は試験の前後で差が無い。
 
+### 10.7 同梱版更新 (2026-10-28、backlog §1.460 段D)
+
+ClaudeCodeの指示により Mixwright v0.15.0 と VST3 SDK 3.8.1を取り込む。
+mIVのUI・DSP実装・bridge protocolは変更せず、latency/transportの新対応も追加しない。
+旧snapshot・承認資料・HarmNetの `effetune_dsp_0.13.0`・旧state fixtureを維持する。
+
+#### 承認原本・通知・path gate
+
+- 原本は `C:/home/miv-tools/effetune-mixwright-0.15.0/EffeTune-Mixwright-windows-x64.zip`。
+  SHA-256 `3e57a92a4cd3842a59ad612a8be13b0737d272200f32f5cfe46545dde4a9499b`。
+  release commit `8c9a0a561d2ee88d2eef6b06bab138bbd639b3c1`。
+  実装時にもZIP全469ファイルとvendorをbyte照合し、7追加・削除0を確認。
+  `VERSION` は `v0.15.0` + LF。新承認manifestは全470行を相対名ordinal順に固定する。
+  launcherのraw/stage gate、配布PowerShell、aboutの通知参照を新版へ更新した。
+- 3通知はv0.14.0とbyte同一。2本のTHIRD-PARTY-NOTICESは各10,995 bytes、
+  SHA-256 `d09824d7dbce1891cb932278732e51f9179ea72f0625f94bc2877210fbae4077`。
+  DSP NOTICEは13,848 bytes、`3a606e53db5edc9ef0727fc2e1a7e465270a04a6351e8dfe4d54c4f792d3f897`。
+  Counter用woff2は上流の `scripts/generate-numeric-fonts.py` により第三者glyphを使わず生成した
+  project MITの数字fontで、追加の第三者通知を必要とする成分は見つからなかった。
+- 最長相対名は104 UTF-16単位のまま（§10.6と同じ `channel-selection.js`）。
+  ユーザー名40・generation45・現在のmIV版 `4.9.0` ではprefix148、合計252、最大259に対し余裕7。
+  任意のAPPDATA長を保証せず、実絶対pathのgateを維持する。
+
+#### 通信・保存の静的確認
+
+上流比較は `G:/home/effetune-mixwright-v015` のv0.14.0/v0.15.0 tag間で実施した。
+別materialツリーの改変済みHEADは旧版原本と扱わない。以下は実行観測ではない。
+
+- plugin PEの通常import DLL集合は同一で、WS2_32/WinHTTP/WinINet/URLMonは無し、delay-importは0。
+  COMや動的ロード、WebView自身の通信を否定する証明ではない。
+- 同梱Remoteは `js/app.js` からimportされるが、`remote-control.js:45–46` は
+  `electronAPI.remoteV1` が無ければ起動しない。VST APIにremoteV1追加なし。
+  `vst-bootstrap.js` の差分はauto-column/HDR sectionの表示追加2行だけ。
+- 新 `js/audio/browser-input-controller.js:43` に `getDisplayMedia` はあるが、
+  bundle全体にファイルのimport/参照・class利用が無い。VST appは従来の `vst-audio-manager.js` を読む。
+- SFZの登録先は `config.json` と同じ `%APPDATA%/Frieve/EffeTunePlugin/sfz-references.json`。
+  上流 `sfz_library.cpp` は旧新byte同一。登録はpath/root/bankPaths/importedAt、元ファイルは直接read、
+  削除は登録だけ。コピー・元ファイル削除を足していない。
+- `docs/host-now-playing.md` と `state_codec.cpp` は旧新byte同一。Now Playing version 1と
+  `PluginStateDocument.formatVersion=1` は不変。appVersionだけを新版にする。
+- 数字fontは同梱相対URL、Color Adjust/MapはローカルSVG data URL、追加変調は既存の解析値を使用。
+  Visualizerは既存IndexedDBの `effetune-visualizer` v1/current/layoutへ保存する。
+  HDRは既存WebView localStorageの新key `effetune_visualizer_hdr`、auto-columnは既存config/save経路。
+  新通信・別保存先の追加を示す根拠はなく、privacy日英と製品「安心して使えます」は本文変更不要と判断。
+  新版の実通信・listen・HDR出力・状態互換性は実機未確認。
+
+#### SFZ動的latencyとCounter（調査のみ）
+
+- SFZ Classic/Eventはnative DSPで報告遅延を約90/230msへ変更する。
+  上流processorはblock境界で準備済みwet/dry補償と報告値を適用し、atomic報告値を更新する。
+  control serviceはmutex解放後に `restartComponent(kLatencyChanged)` を通知する。
+  250ms debounceがあり、音声変更と通知は完全同時ではない。
+- bridgeは `host_app.cpp:229–233` で通知をatomic latchへ保存し、main loopからGUI threadへ
+  再取得を依頼して `latency_changed` を送る。処理停止・再activateはしない。
+  新Mixwrightの `getLatencySamples()` はatomic loadなので並行取得にデータ競合は見つからない。
+  通知flagは問い合わせ前にconsumeされ、同じ通知を毎pollで再queryする仕組みではない。
+  既存コメントの「次回poll」「実害は数十ms」は保証と扱わない。
+- Rustはslot cache→total latencyへ反映し、EffeTuneはReportOnly。
+  ローカル成功音へlimiter分と合算し、`audible_pts=input_pts-latency*speed` で動画clockを補正する。
+  100ms超差ではclock jumpとなるため、1倍速で140msの変更はこの条件に入る。
+  Remoteは増加分trim/減少分無音挿入。EOSは保持音声を排出するが、排出中latency変更では
+  EffeTune tailを継続せず最終limiterだけ排出する。seek/stopは破棄する。
+- 音声blockと通知cacheに共通の境界IDはなく、切替瞬間の補正値一致までは保証できない。
+  静的調査でcrash/永久待機を新たに作る変更は見つからないが、実音の連続性・映像同期は未確認。
+- 既知の制約（ClaudeCode決定）: SFZ検出方式切替直後は上流の250ms通知抑制による一時的な音ずれを許容し、その後は既存PDCへ反映されるため今回は対応を追加しない。
+- Counter用ProcessContextは常にkPlaying/120 BPM、project/continuousは処理サンプル累積値。
+  実曲のPTS・速度・pause/seek先は送らない。resetで0になるが直後の無音flushも加算する。
+  曲変更のたび必ずresetするわけではなく、先読み/EOSも含む。
+  VST表示側はその値/sampleRate、trackIndex=0、external=false、speed=1を使う。
+  曲の再生位置とは説明せず、番号00・外部入力用クリックreset不可と訂正した。
+
+#### 説明書・検証・引継ぎ
+
+`c506bbab8a3dcd75bc5049ebb9b92572b526c557` の原文snapshotを使用し、133 HTML + 4画像を生成。
+独立版の計測・music-player・OpenHomeの新3ページをselectionで除外する。
+README共通操作、Counter/HDR/Color Map/変調、SFZ Detectionは残し、Video/Lyricsの追加不可や
+Counterの意味を訂正。共通節の配置変更には本文とIDを保つ移動overrideを使い、strictな分割検査は維持した。
+旧公開 `v0.14.0/` を明示削除し、入口2本と `.htaccess` を更新。sitemapはコミット後ClaudeCode担当。
+詳細は [override更新記録](effetune-docs-overrides/README.md#現在の同梱版と訂正-2026-10-28)。
+
+core check、焦点lib141件（native起動3件を除外）、launcher単独rustc4件、配布PowerShell回帰、
+生成器30件、非製品C++4件、identity回帰・実artifact marker・PE gateが成功。
+追補の許可済みnative Rust3件・C++ handshake1件も成功。lib全件は14,552成功/1失敗/65 skippedで、
+既存§1.447と同名のページめくりtestが別assertで失敗した。単独1回は成功したが全件成功とは扱わない。
+SDK差分、全コマンド・件数・未実施項目・成果物hashは
+[依存物更新の段D](dependency-update-20261028.md#stage-d) に集約する。
+利用者の設定を使うmIV本体の起動・コミット・bench・test-fullは行わない。
+テスト経由のbridge/plugin起動はClaudeCodeの明示許可による。結果は段Dの追補へ記録する。
+
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
 - 独立コードレビュー (実装者と別の Sol、5 回) の最終判定: SHIP-FOR-USER-TEST。

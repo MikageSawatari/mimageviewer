@@ -7,44 +7,38 @@
   },
   {
     "operation": "replace_paragraph",
-    "anchor": "**全体操作**では、エフェクトではなくアプリと音楽プレイヤーを操作します。選べる操作は、**マスターバイパス**、**A/B切替**、**再生/一時停止**、**停止**、**次/前のトラック**、**10秒送り/戻し**、**再生速度**、**ピッチ固定**、**リピート**、**シャッフル**、**次/前のプリセット**です。",
+    "anchor": "**全体操作**では、エフェクトではなくアプリと音楽プレーヤーを操作します。**マスターバイパス**、**A/B切替**、**再生/一時停止**、**停止**、**次/前のトラック**、**10秒送り/戻し**、**再生速度**、**ピッチ固定**、**リピート**、**シャッフル**、**次/前のプリセット**を選べます。",
     "replacement": "**全体操作**では、EffeTune の **マスターバイパス**、**A/B切替**、**次/前のプリセット**を操作できます。再生/一時停止、停止、トラック移動、10秒送り/戻し、再生速度、ピッチ固定、リピート、シャッフルは独立版 EffeTune のプレーヤー用で、mImageViewer の再生には働きません。",
     "reason": "app-targets.js playerAction requires uiManager.audioPlayer, absent in VST; master bypass, A/B and preset step operate without it."
   },
   {
-    "operation": "replace_paragraph",
-    "anchor": "音楽プレイヤーを開いていない間は、プレイヤーの操作を割り当てても何も起きません。ブラウザーが音声の開始を許可しない場合は、コントローラーから再生を始められません。そのときはプレイヤーの再生ボタンで開始してください。",
+    "operation": "replace_inline",
+    "anchor": "プレーヤーの操作には、音楽プレーヤーを開いておく必要があります。ブラウザーの自動再生の制限で音声を開始できない場合は、先にプレーヤーの画面で再生を押してください。",
     "replacement": "mImageViewer の再生操作は、mImageViewer 側のボタンや操作カスタマイズを使用してください。",
     "reason": "Remove standalone browser autoplay/open-player instructions."
   },
   {
     "operation": "replace_html",
-    "anchor": "<li><p><strong>再生速度</strong>はフェーダーやノブで連続して変わり、中央が1xです。ボタンやキーでは、方向に従って次の標準の速度へ1段ずつ移ります。</p></li>",
+    "anchor": "<li><p><strong>再生速度</strong>は、フェーダーやノブでは連続して変わり（中央で<code>1x</code>）、ボタンやキーに割り当てると標準の速度を1段ずつ切り替えます。</p></li>",
     "replacement": "",
     "reason": "Standalone player speed mapping does not operate mIV playback."
   },
   {
-    "operation": "replace_paragraph",
-    "anchor": "次/前のトラック、10秒送り/戻し、次/前のプリセットでは、**方向**で向きを決めます。**+**で先へ進み、**−**で戻ります。エンドレスエンコーダーやジョグホイールでは、回した向きに進みます。",
+    "operation": "replace_inline",
+    "anchor": "**次/前のトラック**、**10秒送り/戻し**、**次/前のプリセット**では、**方向**で**増加（+）**（先へ）または**減少（−）**（前へ）を選びます。エンドレスエンコーダーやジョグホイールでは、回した向きに従います。",
     "replacement": "次/前のプリセットでは、**方向**で向きを決めます。**+**で先へ進み、**−**で戻ります。エンドレスエンコーダーやジョグホイールでは、回した向きに進みます。",
     "reason": "Keep supported preset stepping without standalone transport claims."
   },
   {
     "operation": "replace_paragraph",
-    "anchor": "Web MIDI経由でMIDI CC、ノート、ピッチベンドに対応します。汎用デバイスのCCは絶対値が初期設定です。エンドレスエンコーダーが相対値を送る場合は、対応する相対モードを選びます。MIDIの利用時はブラウザーまたはデスクトップアプリの権限が必要です。",
-    "replacement": "MIDI CC、ノート、ピッチベンドに対応します。汎用デバイスのCCは絶対値が初期設定です。エンドレスエンコーダーが相対値を送る場合は、対応する相対モードを選びます。MIDIの利用にはアクセス許可が必要です。",
+    "anchor": "EffeTuneは、Web MIDIを通じてMIDI CC、ノート、ピッチベンドに対応します（Chromium系ブラウザー、Firefox、デスクトップアプリで利用でき、Safariには対応していません）。汎用デバイスでは絶対値のCC入力が既定です。エンドレスエンコーダーには相対モードを選んでください。BLE-MIDIやネットワークMIDIは、OSのMIDIポートとして認識されていれば使えます。",
+    "replacement": "MIDI CC、ノート、ピッチベンドに対応します。汎用デバイスのCCは絶対値が初期設定です。エンドレスエンコーダーが相対値を送る場合は、対応する相対モードを選びます。MIDIの利用にはアクセス許可が必要です。BLE-MIDIやネットワークMIDIは、OSがMIDIポートとして提供していて、EffeTune から利用できる場合に使用できます。",
     "reason": "Keep controller capabilities and permission requirement; remove standalone browser/desktop wording."
   },
   {
     "operation": "replace_paragraph",
-    "anchor": "Web MIDIはChromium系ブラウザーとFirefoxで利用できますが、Safariでは利用できません。BLE-MIDIやネットワークMIDIは、OSがMIDIポートとして提供していれば利用できます。",
-    "replacement": "BLE-MIDIやネットワークMIDIは、OSがMIDIポートとして提供していて、EffeTune から利用できる場合に使用できます。",
-    "reason": "mIV uses WebView; do not advertise unrelated browser support."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "MIDIデバイスが表示されない場合は、EffeTuneへのMIDIアクセスを許可して**コントローラーマッピング...**を開き直してください。Safariでもキーボードとゲームパッドは利用できます。",
-    "replacement": "MIDIデバイスが表示されない場合は、MIDIアクセスの許可とOS上の接続を確認して **コントローラーマッピング...** を開き直してください。実行環境でMIDIを利用できない場合も、キーボードとゲームパッドの割り当ては使用できます。",
+    "anchor": "各MIDIデバイスの名前の下には、**接続中**または**切断状態**と表示されます。コントローラーを外してもマッピングは保存されたままで、同じMIDIポート名またはゲームパッド名のデバイスが戻ると自動的に再接続します。ドライバーやOSの更新でデバイス名が変わった場合は、該当するマッピングをLearnし直してください。同じ名前のゲームパッドはマッピングを共有し、同じ名前のMIDIポートは接続した順番でのみ区別されます。MIDIデバイスが表示されない場合は、MIDIの権限を許可してから**コントローラーマッピング...**を開き直してください。Safariでも、キーボードとゲームパッドのマッピングは使えます。",
+    "replacement": "各MIDIデバイスの名前の下には、**接続中**または**切断状態**と表示されます。コントローラーを外してもマッピングは保存されたままで、同じMIDIポート名またはゲームパッド名のデバイスが戻ると自動的に再接続します。ドライバーやOSの更新でデバイス名が変わった場合は、該当するマッピングをLearnし直してください。同じ名前のゲームパッドはマッピングを共有し、同じ名前のMIDIポートは接続した順番でのみ区別されます。MIDIデバイスが表示されない場合は、MIDIアクセスの許可とOS上の接続を確認して **コントローラーマッピング...** を開き直してください。実行環境でMIDIを利用できない場合も、キーボードとゲームパッドの割り当ては使用できます。",
     "reason": "Remove Safari guidance; retain local manager unsupported-MIDI behavior."
   }
 ]

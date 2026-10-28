@@ -973,3 +973,243 @@ Start-Process -FilePath .\target\core-sym\release\mimageviewer-core.exe
 root lock・baseline・保存した改変前benchのhashも一致し、vendor Cargo.lockは存在しない。
 追補のUTF-8も確認した（final-audit.json、fmt.log / fmt-check.log / diff-check.log）。
 ブランチはdeps-update-1460、HEADは5acf4c310のまま。コミット・push・製品起動は行っていない。
+
+<a id="stage-d"></a>
+
+## 段D — EffeTune Mixwright v0.15.0 / VST3 SDK 3.8.1 (2026-10-28)
+
+開始点は `deps-update-1460` / `2dbfdd7a6402d3d763edd25ea9398b81dd189a02`。
+ClaudeCodeが配置済みのvendorと原文snapshotを使用した。別worktreeは編集せず、ネットワーク、
+利用者の設定を使うmIV本体の起動、コミット、bench、test-fullは実行しない。
+テスト経由のbridge/plugin起動は末尾追補のClaudeCode明示許可による。
+全build/testに `MSBUILDDISABLENODEREUSE=1`、Cargoにはoffline/lockedを指定する。
+証跡の基点は `target/dependency-update-20261028/stage-d/`。
+
+### 変更ファイルと承認原本
+
+| 対象 | 変更理由 |
+| --- | --- |
+| `third_party/effetune-mixwright/v0.15.0/` | VERSION、3通知、470行の承認manifest。過去版の資料を維持 |
+| `crates/launcher/build_effetune{,_source}.rs` | 同梱版の復旧案内・承認manifest参照・実vendor470件の回帰を新版へ |
+| `scripts/effetune-distribution.ps1` / `test-effetune-distribution.ps1` | raw/署名stageの承認を新版へ。旧v0.14.0拒否も検査 |
+| `src/ui_dialogs/about.rs` | 新版の3通知pathと実vendor照合期待値へ。通知本文・UIは不変 |
+| `third_party/effetune-docs/c506bbab/` | ClaudeCode取得済みの上流原文・画像・LICENSE・出典。原文を改変しない |
+| `docs/effetune-docs-overrides/` | 新原文のアンカー、節選別、Counter/Video/HDR/SFZ・独立版との差を訂正 |
+| `scripts/gen-effetune-docs.py` / `test_gen_effetune_docs.py` | snapshot更新、共通節を一覧前へ移す操作、旧snapshot付替拒否・新版回帰 |
+| `htdocs/mimageviewer/manual/effetune/v0.15.0/` | 133 HTML + 4画像。旧v0.14.0の137生成ファイルは削除 |
+| `manual/effetune/index.html` / `manual/effetune.html` / `.htaccess` | 入口2本・印付き転送ブロックを新版へ。sitemapはClaudeCodeがコミット後再生成 |
+| `crates/vst3-host/CMakeLists.txt` / `src/sdk/{README.md,module_win32.cpp}` | 検証したSDK版と維持コピーの出典を更新。機能実装は不変 |
+| `scripts/setup-vst3-sdk.sh` | 採用確認版3.8.1と最低互換条件3.8.0を区別するコメント |
+| `docs/native-dependencies.md` / `docs/vst3-integration.md` / `docs/effetune-integration-plan.md` | 同梱版、SDK版、SDK更新時の明示再buildと§10.7の調査・検証記録 |
+| `vendor/vst3-host/`（非追跡） | CMake成果物と公式CRT4本。既存 `.v2-signed.bak` は変更しない |
+
+新ZIP SHA-256は `3e57a92a4cd3842a59ad612a8be13b0737d272200f32f5cfe46545dde4a9499b`。
+ZIPの469ファイルとvendor全469ファイルはbyte一致、旧462から追加7・削除0。
+VERSIONを含む470入力の集合・hashをmanifestと再照合した（`audit.py` / `static-audit.json`）。
+追加は数字font3本、browser-input-controller、pipeline-availability、visualizer-counter、visualizer-hdr。
+snapshot commitは `c506bbab8a3dcd75bc5049ebb9b92572b526c557`、Mixwright releaseは
+`8c9a0a561d2ee88d2eef6b06bab138bbd639b3c1`。取得tarball SHAはClaudeCodeの記録
+`9b54983254f245cfb2a7e9cd4cb4ed5796b62a0bf903d3a368da656309baf156`による。
+HarmNet重みと旧state fixtureは変更していない。
+
+### 静的照合の結果と限界
+
+通知3本はv0.14.0とbyte同一。THIRD-PARTY-NOTICES2本は各10,995 bytes / SHA-256
+`d09824d7dbce1891cb932278732e51f9179ea72f0625f94bc2877210fbae4077`、DSP NOTICEは
+13,848 bytes / `3a606e53db5edc9ef0727fc2e1a7e465270a04a6351e8dfe4d54c4f792d3f897`。
+上流の数字font生成器は第三者glyph不使用・project MITを明記し、fontにもLICENSEを埋込む。
+新たな第三者通知が必要となる成分は見つからなかった。
+
+最深pathは相対104 UTF-16単位（`features/measurement/audio-utils/channel-selection.js`）。
+ユーザー名40・generation45・mIV `4.9.0` の通常profile例ではprefix148、合計252、gate最大259に余裕7。
+実絶対pathのgateはそのままで、任意のAPPDATA長を許容する保証にはしない。
+
+以下の `WEB` はbundle内 `Contents/Resources/webview`、`UP` は読み取り専用の
+`G:/home/effetune-mixwright-v015`。UPのv0.14.0/v0.15.0 tag間を比較した。
+
+| 確認対象 | 根拠・結果 |
+| --- | --- |
+| plugin PE | import DLL集合は旧新同一。WS2_32/WinHTTP/WinINet/URLMon無し、delay-import directoryは0。`static-audit.json` |
+| 同梱Remote | `WEB/js/remote/remote-control.js:45–46` はremoteV1不在でreturn。VST APIにはremoteV1無し |
+| bootstrap差 | `WEB/vst-bootstrap.js:35–36` のauto-column/HDR設定section表示追加2行だけ |
+| browser capture | 新 `WEB/js/audio/browser-input-controller.js:43` にgetDisplayMedia。bundle全体にそのimport/参照/class利用無し。VSTは従来のvst-audio-managerを読む |
+| SFZ登録 | `UP/src/plugin/plugin_processor.h:556` がconfigと同じdirectoryにsfz-references.json。`sfz_library.cpp:429–434` がpath/root/bankPaths/importedAtを保存、:273–274はGENERIC_READ、:365–368は登録だけ削除。旧新source byte同一 |
+| Now Playing / state | `docs/host-now-playing.md` / `state_codec.cpp` は旧新byte同一。Now Playing version 1、PluginStateDocument.formatVersion=1のまま。appVersionだけ更新 |
+| 数字font | `WEB/css/effetune.css:5,12,19` は相対URL。外部font配信を足していない |
+| HDR | `WEB/js/electron/configIntegration.js:1419–1430` は既存localStorageへ新key effetune_visualizer_hdrを保存 |
+| Color Map /変調 | `visualizer-effects.js:198–236` はローカルSVG data URL、sourcesは既存解析値を使用 |
+| 保存範囲 | Visualizer保存器は旧新byte同一のIndexedDB effetune-visualizer v1/current/layout。auto-columnは既存config/save経路 |
+
+privacy日英の保存場所・WebView通信の説明と製品ページ「安心して使えます」を照合し、
+今回による本文修正は不要と判断した。新通信・別保存先・SFZ元データのコピー/削除を加えた根拠はない。
+これは静的確認であり、COM/動的ロード/WebView自身の通信、実listen、HDR実出力を否定/実証した記録ではない。
+過去版の実機結果も新版の観測として転用しない。
+
+### SFZ latency / transport の調査（実装変更なし）
+
+Classic/Eventはnative SFZ kernelで約90/230msの報告値を切り替える。
+上流processorはblock先頭で準備済みwet/dry補償と報告値を適用し、atomic値の変更でpendingを立て、
+control serviceがmutex解放後 `restartComponent(kLatencyChanged)` を通知する。
+通知には250ms debounceがある（`UP/src/plugin/plugin_processor.cpp:3105–3109,3205–3217,3358–3373,3736`）。
+`getLatencySamples()` はatomic load（:3834–3839）で、今回pluginの処理中再取得自体にデータ競合は見つからない。
+
+bridgeは通知を無視せず、`host_app.cpp:229–233` のatomic latch→main loop→GUI threadで再取得→
+`latency_changed` IPCへ渡す（`plugin_loader.cpp:2261–2297` / `main.cpp:634–647`）。
+取得時に音声停止/再activateはしない。flagは先にconsumeするため、再通知無しで同じ変更を再queryしない。
+既存コメントの「次回poll」「数十ms」は今回の保証としない。
+
+Rustはslot cacheへ反映しtotal latencyへ合算。EffeTuneはReportOnlyで、通常VSTの2秒超auto-bypassとは別。
+ローカルは加工前cacheを読み、成功音のchunkへ `audible_pts=input_pts-latency*speed` を保存し動画clock補正へ使う。
+100ms超差はclock jump（`src/video/audio.rs:2689–2717,2783–2810,3953–3980`）。
+Remoteは遅延増加分の先頭trim/減少分の無音挿入で補正し、seek世代で差分状態をresetする。
+通常EOSの排出中にlatencyが変わる場合、EffeTune tailは継続せず最終limiterだけ排出する。
+seek/stopは排出せず破棄する。全ユーザーVSTのtail一般を保証する機構ではない。
+
+音声blockと遅延通知には共通の境界IDがなく、plugin側250ms抑制もあるため、切替瞬間の補正値一致は保証できない。
+静的に今回の更新が新たなcrash/永久待機経路を作る根拠は見つからないが、実音/動画同期/切替中EOSは未測定。
+この範囲は報告だけとし、新対応の要否はClaudeCodeが判断する。
+
+CounterへのProcessContextは `plugin_loader.cpp:1289–1303` の常時kPlaying・120BPM・処理sample累積値。
+実曲PTS/速度/pause状態を送らない。resetで0になるが、その後のlatency分無音flushも加算する。
+新pumpの最初のframeではEffeTune resetをskipするので、曲切替で毎回0にもならない。
+VST表示側はこの値/sampleRate、番号0、external=false、speed1を使用する。
+したがって処理累積時間、番号00、seek先の曲時刻/実動画フレームではない、外部入力用クリックreset不可と訂正した。
+
+### SDK差分と再ビルド
+
+| 対象 | 旧→新commit |
+| --- | --- |
+| SDK | `9fad9770f2ae8542ab1a548a68c1ad1ac690abe0` → `3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96` |
+| pluginterfaces | `31d6eeba6daaa3e2a8bfbe3e7a90ca0b7fbfbc1c` → `4f547e8e102b47de4a8b8aaf343c73b700786372` |
+| public.sdk | `a3911a4615dabbfdfd9d181ee26b05c70c289a95` → `586dc5e6c8012c3e4b01c79389375cbe96bdb1da` |
+
+ProcessContext差分はkCycleValid説明のbarPositionMusic→cycleEndMusicのみで、構造体のmember/順序/型/alignmentは不変。
+vsttypes.hは版定義とkStepCountContinuous/kStepCountToggle追加で、host使用型の変更はない。
+pluginterfacesupport.cppのITransportControl追加はコメント内なので、hostが未実装IFを広告する変更もない。
+plugprovider.cppはcontroller initialize失敗でreturn falseを追加するが、mIVはPlugProviderを使わず自前loader。
+自前loaderの既存initialize戻り値無視はこのSDK更新で修正されたものとは扱わず、今回は変更しない。
+Midi2Controllerのbitfield変更はhost未使用。新IID定義とthreadcheckerのinclude追加は互換修正を要しない。
+
+module_win32.cppの上流旧新blobはともに `7616bd8566141c8f63413869ebe46d2938b67b28`。
+原文SHA-256 `951e0a0b824c8e1b0c43c757203f8f85dceb9b237dac6f2ec1d9cade61178b37` も不変。
+mIV維持コピーは出典行だけ更新し、Windows path処理を維持する。
+3.8.1専用APIに依存しないので `MIN_VERSION=3.8.0` は維持。SDKはsource identityの対象外なので、
+SDK更新時の明示再buildを文書化した。marker一致だけで採用SDK版を証明しない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cmake -S crates/vst3-host -B crates/vst3-host/build -G 'Visual Studio 18 2026' -A x64
+cmake --build crates/vst3-host/build --config Release -- /m:1 /nr:false
+```
+
+初回build成功。CMakeの最低版説明を正確にした後、再configure/buildも成功。
+現hostは1,199,616 bytes / SHA-256 `9f7bf8bc2043d4a16942ab7a662290db2109787806c607ec1d0aad424ad1453d`。
+source marker `2a68a0fbd473a3349bef2b5b038ab7d880286677507475d8122efb8aaa7b9c10` と一致した。
+vcrt4本も公式正本と完全一致。既存 `.v2-signed.bak` は変更せず、SHA-256は
+`d650444ccbe1b4133ee137c7d93b112425b1b53f9b3a48997565577f21b0a2bf`。
+
+### 検証結果と未実施項目
+
+| コマンド（Cargoはlocked/offline、build jobs=1） | 件数・結果・ログ |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core --locked --offline` | exit0、36.80秒、core-check.log |
+| `cargo nextest run -p mimageviewer --lib --locked --offline --retries 0 -E 'test(/vst3\|effetune\|about/) & !test(/effetune_host_handler_tests/)'` | 141成功 / 14477 skipped、4.449秒、compile2分12秒、focused-lib.log |
+| `ctest --test-dir crates/vst3-host/build -C Release --output-on-failure -E '^vst3-protocol-handshake$'` | 非製品C++4成功、40.42秒。ctest.log。GUIは非入力desktopのinert HWND、Now Playingもinert receiver |
+| `scripts/test-effetune-distribution.ps1` | PASS。欠落/追加/hash/偽署名/reparse/旧版拒否を維持。distribution-tests.log |
+| `rustc --test crates/launcher/build_effetune_source.rs`（下記詳細） | 4成功、0失敗/ignored、0.52秒、launcher-source-tests.log |
+| `scripts/test-vst3-host-identity.ps1` / `-ValidateRepo .` | 回帰PASS、実artifact marker一致。identity-tests.log |
+| `check-vcrt-pe-dependencies.ps1 -InputPaths @(bundle,bridge)` | runtime4 / PE2成功。pe-gate.log / pe-report.json |
+| 実vendor `Assert-MivEffetuneSource` / static-audit | 470入力完全一致、通知3本一致、CRT4本一致 |
+| `python scripts/test_gen_effetune_docs.py` | 30成功、docs-tests.log。完全一致・転送・旧snapshot拒否・共通節移動・新機能訂正 |
+| `python scripts/gen-effetune-docs.py --check` | 137ファイル＋入口＋転送一致。公開旧版残存なし |
+| `python scripts/check_ui_glyphs.py` | 危険文字0 |
+| `cargo fmt`（引数なし）/ `cargo fmt --check` / `git diff --check` | 成功。最終fmt-check-exit.txtは0 |
+
+standalone launcher testは `CARGO_MANIFEST_DIR=<repo>/crates/launcher`、edition2024、
+`-L dependency=target/debug/deps`、既存sha2/tempfile rlibの両 `--extern`、
+`-C target-feature=+crt-static` を指定し、証跡directoryの専用test exeを起動した。
+初回は実装者がtempfileのextern引数を付け忘れcompile失敗し、追加後に成功。
+通常launcher testはrelease exe前提のため今回使わない。
+PE gateも初回はPowerShell別processへのarray渡しが単一文字列になって入力無しで失敗し、同shellのarray引数へ訂正後成功。
+文書回帰の初回失敗は新原文のアンカー/期待値と実装者の版置換による転送fixtureの誤り。
+完全一致gateを緩めず訂正した。これらは製品故障や間欠失敗として扱わない。
+初回引渡しまでの検証ではrustc/clの異常終了、C1041、既知の時間依存test失敗は発生していない。
+
+lib全件の既存3件 `video::dsp::bridge::effetune_host_handler_tests::*` はvendor bridgeを起動し、
+うちstrict_open/strict_addは本物pluginもロードする。C++のvst3-protocol-handshakeも製品bridgeを起動する。
+初回引渡し時は起動禁止との両立を確認するため、この4件と `scripts/test-lib-full.ps1` を保留した。
+その後ClaudeCodeがテスト経由の起動を明示許可し、下記追補の順序で実行した。
+test-full/bench/sitemap再生成・最終配布署名は指定どおりClaudeCodeへ引き継ぐ。
+
+別contextのGPT-6.1 Sol / xhighが、全採用ページの旧新差分・override・manifest・SDK記述を独立レビュー。
+Visualizer導入の「動画も表示」の新記述を代表画像へ訂正し、Counterのフレーム計算を処理累積時間へ揃え、
+空のモバイル専用見出しも除いた。関連生成回帰30件を再実行して成功。
+再確認はACCEPT、未解決の重要指摘なし。独立レビューは既存テストを再実行していない。
+最終HEADは開始時の `2dbfdd7a6` のままで、commit/pushしていない。
+段Dのbundleを埋め込んだ製品release exeは未作成。既存段C成果物を段Dの検証用とは案内しない。
+
+### 実機確認案とClaudeCodeへの判断点
+
+- 新規起動/保存済み状態の復元、tour、Now Playingの文字/代表画像、従来チェーンとプリセットの保持。
+- SFZファイル/フォルダ登録・参照だけの削除、Classic→Event→Classicを再生中と一時停止中に切替。
+  初回反映までの時間、表示latency、実音/動画同期、click/pop、EOS近傍を確認する。
+- Counterの処理累積時間・番号00・seek/reset/曲切替、Color Map/新変調、列の自動配置、HDR対応画面で表示。
+- 新版の実listen/外向き通信と保存先、旧版状態の互換性。過去版の実機結果では代替しない。
+
+既知の制約（ClaudeCode決定）: SFZ検出方式切替直後は上流の250ms通知抑制による一時的な音ずれを許容し、その後は既存PDCへ反映されるため今回は対応を追加しない。
+通常の使用制限・再起動要求・guard/fallbackは追加していない。
+承認manifest完成後の `C:/home/mimageviewer_vendor_backup/effetune-mixwright-v0.15.0/approval/` へのコピーも
+指示どおりClaudeCode担当であり、この作業ではツリー外へ書き込んでいない。
+
+### 追補 — テスト経由のbridge/plugin起動許可後の確認
+
+ClaudeCodeは通常libテストの一部としてbridge/pluginを起動することを明示許可した。
+禁止対象は利用者の設定を使ってmIV本体を起動することであり、この追補でも本体は起動していない。
+指定どおり、native Rust 3件とC++ handshake 1件を先に実行し、全4件成功後にlib全件を実行した。
+環境は全て `MSBUILDDISABLENODEREUSE=1`、Cargoは `CARGO_NET_OFFLINE=true` / build jobs=1。
+
+| 追補コマンド | 件数・結果・証跡 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib --locked --offline --retries 0 --no-tests fail -E 'test(/effetune_host_handler_tests/)'` | **3成功 / 0失敗 / 14615 skipped**、実行0.308秒、compile1分29秒、wall92.438秒。native-lib.log / native-lib-result.json |
+| `ctest --test-dir crates/vst3-host/build -C Release --output-on-failure -R '^vst3-protocol-handshake$'` | **1成功 / 0失敗**、0.51秒、wall0.605秒。ctest-handshake.log / ctest-handshake-result.json |
+| `.\scripts\test-lib-full.ps1` | **14,552成功 / 1失敗 / 65 skipped**、14,553実行、555.657秒、wall565.223秒、**exit100**。lib-full.log / lib-full-result.json |
+| 失敗したページめくり1件の完全名filterによる単独確認（下記） | **1成功 / 0失敗 / 14617 skipped**、2.858秒、wall5.509秒、exit0。page-turn-isolated.log / page-turn-isolated-result.json |
+
+全件は台帳HITではなく新規実行。source IDは
+`ab1c76c5b3fae5df1bac2b3bbe5d5eee1ca9797caa189e42c8434567a3f08fd6`、
+nextest run IDは `02fe97d5-ea2e-4f1b-9987-f7c7d6498adb`。
+完全ログとJUnitは `target/test-lib-full/runs/20261028T123903243Z-caa6ce3f/`。
+JUnitでも14,618総件 / skipped65 / failures1 / errors0と照合し、native Rust 3件の非skip成功も確認した。
+失敗した全件runの成功receiptは作成されていない。
+wrapperは `--locked` を渡す実装ではないがofflineで実行し、Cargo.lockのSHA-256は前後とも
+`a8e9298560d97ce90779f6aaa5717691db9bc887cc3f06d2a70a9844d135925e` で不変。
+
+唯一の失敗は
+`ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`。
+`draw_submit_tests.rs:421`、`one visible curved page10 at 0.25` に対し期待1 / 実際0（nextest2.997秒、harness2.74秒）。
+runner timeoutやcompiler異常終了ではなく、通常のassert失敗だった。
+同名testはbacklog §1.447に全件時の間欠失敗・単独5回成功が既記録で、本記録の段Aでも別assertで失敗している。
+過去はold9の可視性やStarted/Finishedのassertなので、今回と失敗箇所が同一とは扱わない。
+このtestは `Instant::now() - duration * progress` を設定して実描画後に形状を検査する。
+実時計の経過と負荷の影響を受け得るが、失敗フレームの実経過を測っておらず、今回の根因は未確定。
+関連UI/testソースは段Dで変更していない。
+
+失敗1件だけを同じsource/lock・通常featureで、root nextest設定を使い1回確認した。
+元の全件JUnitを上書きせず、全件も再実行していない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib --locked --offline --config-file .config/nextest.toml --profile default --ignore-default-filter --run-ignored default --retries 0 --no-tests fail -E 'test(=ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions)'
+```
+
+単独成功を全件成功へ読み替えず、既存§1.447との関連調査・受入判断をClaudeCodeへ引き継ぐ。
+期待値・待ち・retry・ignoreの変更や、症状を隠す製品修正は加えていない。
+全件summaryには成功の3 slow / 1 leakyも記録された。slowは音楽解析190.466秒、RAW284.040秒、
+大規模走査329.484秒で、全て既存上限内に完了した。
+leaky 1件はsummaryに集計されるが、保存ログ/JUnitにはそのtest名が残っていないため特定していない。
+コンパイラの `0xc0000005`、C1041、テストのtimeoutは今回発生していない。
+
+SFZの判断は上記の既知制約1行と§10.7へ反映済み。切替直後の一時的な音ずれへの対応は追加しない。
+製品UI・bridge protocol・latency/transport実装は不変。コミット・bench・test-full・製品本体起動は行っていない。
+追補後の `cargo fmt`（引数なし）/ `cargo fmt --check` / `git diff --check` も成功。
+追跡Rustソース1,503ファイルはfmt前後でSHA-256不変。集約証跡は `followup-verification.json`、
+fmtのexitは `fmt-followup-result.json`。ブランチ/HEADは `deps-update-1460` / `2dbfdd7a6` のまま。

@@ -26,6 +26,7 @@ set -euo pipefail
 REPO_URL="https://github.com/steinbergmedia/vst3sdk.git"
 TARGET_DIR="vendor/vst3sdk"
 # 最低要求バージョン (これ以降が MIT)。実際は master を取って最新を使う。
+# mIV verified SDK: v3.8.1_build_84; no 3.8.1-only API is required.
 MIN_VERSION="3.8.0"
 
 cd "$(dirname "$0")/.."

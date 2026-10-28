@@ -223,7 +223,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
-│   ├── effetune/EffeTune Mixwright.vst3/ (全462ファイル、v0.14.0。入力は別の VERSION と計463ファイル)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全469ファイル、v0.15.0。入力は別の VERSION と計470ファイル)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
@@ -274,7 +274,7 @@ release link 時に未解決になることがあるため、配布ビルドは�
 ランチャー側 build.rs が `target/release` の core / remote / EPUB worker の存在をチェックし、
 無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
 `EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
-承認済み入力は `third_party/effetune-mixwright/v0.14.0/manifest.sha256` の全463エントリと照合する。
+承認済み入力は `third_party/effetune-mixwright/v0.15.0/manifest.sha256` の全470エントリと照合する。
 配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
 (vendor 原本は変更しない)。
 
@@ -468,7 +468,9 @@ cmake --build crates/vst3-host/build --config Release
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
-  - 一度ビルドしたら、identity対象のソース・RC・共有iconを変更しない限り再ビルド不要
+  - 採用 SDK は `v3.8.1_build_84`。最低互換条件は MIT 化された 3.8.0 のまま。
+  - identity対象のソース・RC・共有iconの変更時、およびSDK更新時に再ビルドする。
+    SDK自体はsource identityに含まれないため、marker一致だけでSDK版を判別しない
 - CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
   `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
   hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。

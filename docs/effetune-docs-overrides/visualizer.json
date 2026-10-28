@@ -1,104 +1,134 @@
 [
   {
-    "operation": "replace_inline",
-    "anchor": "細かく配置したいときは、キャンバスのツールバーの **−**・**+** で拡大・縮小できます。Ctrl（MacではCmd）を押しながらスクロールすると、ポインターの位置を中心に拡大・縮小します。",
-    "replacement": "細かく配置したいときは、キャンバスのツールバーの **−**・**+** で拡大・縮小できます。Ctrlを押しながらスクロールすると、ポインターの位置を中心に拡大・縮小します。",
-    "reason": "v0.14.0 visualizer-editor.js supports Ctrl canvas zoom; mIV is Windows-only."
+    "operation": "insert_note",
+    "heading_id": "visualizer",
+    "note": "mImageViewer の音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像をこの表示へ自動で渡します。曲名が無ければ拡張子を除いたファイル名を使い、ほかの情報が無ければ空欄になります。画像は長辺1024ピクセルまでで、動く画像は最初の一枚を使います。先に文字を渡し、画像の準備ができたら表示します。音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使います。一時停止やシークでは情報を残し、PCでの停止・閉じる・再生終了では消します。リモートは最後の曲が終わっても情報を残し、次曲への切替中は空になることがあります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像も使用できます。",
+    "reason": "v0.15.0 visualizer-view.js metadata() uses the unchanged Now Playing contract; mIV sends neither lyrics nor video."
   },
   {
-    "operation": "replace_paragraph",
-    "anchor": "PCではヘッダーの **Effect Pipeline**、**Music Library** の隣にある **Visualizer** を選びます。モバイルでは右上のメニューボタンの左にある **Visualizer** アイコンを選びます。デスクトップアプリでは **表示 > Visualizer** からも開けます。[ブラウザ拡張版](browser-extension.md)では、Pipeline Editor のヘッダーにある **Visualizer** を選びます。**設定 > 環境設定...** で起動時の表示にも指定できます。",
+    "operation": "replace_inline",
+    "anchor": "PCでは、**Effect Pipeline**と**Music Library**の隣にある**Visualizer**を選びます。モバイルでは、右上の**Visualizer**アイコンをタップします。デスクトップアプリでは**表示 > Visualizer**を選びます。[ブラウザ拡張版](browser-extension.md)では、Pipeline Editorのヘッダーにある**Visualizer**を選びます。**設定 > 環境設定...**で、Visualizerを起動時の表示にすることもできます。",
     "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンを選びます。**設定 > 環境設定...** で起動時の表示にも指定できます。mImageViewer には、デスクトップ版 EffeTune の「表示」メニューやミニプレーヤーはありません。",
     "reason": "Bundled effetune.html visualizerButton; standalone menu absent."
   },
   {
-    "operation": "replace_paragraph",
-    "anchor": "表示領域にポインターを重ねるかタップすると **⛶** が現れます。押すと、指定した縦横比を保ったままアプリの表示領域いっぱいに拡大します。端が切り取られることがあります。再度 **⛶** を押すか、**Esc** またはモバイルの戻る操作で元に戻ります。デスクトップアプリでVisualizerの表示中にミニプレーヤーへ切り替えると、再生操作の上に表示が付きます。",
+    "operation": "replace_inline",
+    "anchor": "表示にポインターを重ねるかタップすると**⛶**が現れます。選ぶと、指定した比率を保ったままアプリのウィンドウいっぱいに表示します（端が切れることがあります）。元に戻すには、もう一度**⛶**を選ぶか、**Esc**を押すか、モバイルの戻る操作を使います。デスクトップアプリでVisualizerを開いたままミニプレーヤーに切り替えると、再生操作の上に表示が置かれます。",
     "replacement": "表示領域にポインターを重ねると **⛶** が現れます。押すと、指定した縦横比を保ったまま EffeTune の表示領域いっぱいに拡大します。端が切り取られることがあります。再度 **⛶** を押すか、**Esc** で元に戻ります。",
     "reason": "Remove mobile back/mini player instructions; this expands inside EffeTune, not mIV fullscreen."
   },
   {
-    "operation": "insert_note",
-    "heading_id": "visualizer",
-    "note": "mImageViewer の音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像をこの表示へ自動で渡します。曲名が無ければ拡張子を除いたファイル名を使い、ほかの情報が無ければ空欄になります。画像は長辺1024ピクセルまでで、動く画像は最初の一枚を使います。先に文字を渡し、画像の準備ができたら表示します。音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使います。一時停止やシークでは情報を残し、PCでの停止・閉じる・再生終了では消します。リモートは最後の曲が終わっても情報を残し、次曲への切替中は空になることがあります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像も使用できます。",
-    "reason": "v0.14.0 visualizer-view.js metadata() still uses getNowPlayingMetadata; unchanged EffeTune.NowPlaying contract, lifecycle and artwork limits in effetune-now-playing-plan.md. No lyrics sent by mIV."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "ツールバーの **共有** を選ぶと、現在のレイアウトのリンクをコピーできます。リンクには背景色は含まれますが、背景画像は含まれません。画像ごと渡したいときは **バックアップ / 復元** を使ってください。Web版では、リンクを開くとVisualizerが開いてレイアウトが適用されます。デスクトップ版やブラウザ拡張版で共有したリンクもWeb版で開きます。デスクトップ版やブラウザ拡張版の場合、またはリンクからEffeTuneが開かない場合は、リンクをコピーしてツールバーの **リンクを読み込む** を選ぶか、Visualizerの表示中にCtrl+V（Macでは⌘V）を押してください。Effect Pipelineの表示中に貼り付けても、Visualizerが開いて適用されます。読み込んだレイアウトは確認なしで現在のレイアウトを置き換えます。元のレイアウトに戻すには、**Edit** を開いて **元に戻す** を選んでください。",
+    "operation": "replace_inline",
+    "anchor": "ツールバーの**共有**を選ぶと、現在のレイアウトへのリンクをコピーできます（リンクに背景画像は含まれません。画像は**バックアップ / 復元**で渡してください）。デスクトップアプリやブラウザ拡張版では、共有リンクをコピーしてから、Visualizerで**リンクを読み込む**を選ぶか**Ctrl+V**（Macでは**⌘V**）を押します。読み込んだレイアウトは、確認なしで現在のレイアウトを置き換えます。元に戻すには、**Edit**を開いて**元に戻す**を選びます。",
     "replacement": "ツールバーの **共有** を選ぶと、現在のレイアウトのリンクをコピーできます。リンクには背景色は含まれますが、背景画像は含まれません。画像ごと渡したいときは **バックアップ / 復元** を使ってください。共有したリンクは EffeTune Web アプリで開きます。mImageViewer の EffeTune へ取り込むには、リンクをコピーしてツールバーの **リンクを読み込む** を選ぶか、Visualizerの表示中にCtrl+Vを押してください。Effect Pipelineの表示中に貼り付けても、Visualizerが開いて適用されます。読み込んだレイアウトは確認なしで現在のレイアウトを置き換えます。元のレイアウトに戻すには、**Edit** を開いて **元に戻す** を選んでください。",
     "reason": "Keep bundled Visualizer sharing/import and undo; remove desktop/extension and Mac instructions."
   },
   {
-    "operation": "replace_html",
-    "anchor": "<p>デスクトップアプリでディスプレイが2台以上あるときは、<strong>表示 &gt; Visualizer クリーンフィード</strong> で選んだディスプレイにVisualizerを全画面表示できます。ウインドウ枠や操作ボタンは表示されません。レイアウトの縦横比は保たれ、余白は黒で埋まります。ほかのアプリを操作している間（同じメニューの <strong>非アクティブ時も表示</strong> がオンのときを除く）、メインウインドウやミニプレーヤーでVisualizerを表示している間、メインウインドウがそのディスプレイに重なっている間、ブラインドテスト中は非表示になります。やめるときは <strong>オフ</strong> を選ぶか、フィード画面をクリックして Esc キーを押します。ディスプレイが1台だけのときは選べません。</p>",
-    "replacement": "",
-    "reason": "Clean Feed uses the standalone application menu; no VST entry exists."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "**設定** で **表示を音声に同期** を有効にすると、表示を聞こえる音に合わせるため、音声が遅延することがあります。グラフが表示できない場合は、**オーディオ設定** で **WebAssembly 音声処理を使用する** が有効か、EffeTuneを通して音声が再生されているかを確認してください。",
+    "operation": "replace_inline",
+    "anchor": "**設定 > 環境設定...**で**表示を音声に同期**を有効にすると、表示をスピーカーからの音に合わせます。同期のために音声が遅延することがあります。グラフが動かない場合は、**オーディオ設定**で**WebAssembly 音声処理を使用する**が有効になっていること、EffeTuneを通して音声が再生されていることを確認してください。",
     "replacement": "mImageViewer の EffeTune 画面には、デスクトップ版のオーディオ設定はありません。音声グラフは EffeTune に渡された音を表示します。リモート配信中は EffeTune の窓が非表示になり、配信を終えると元の表示状態に戻ります。",
     "reason": "Native telemetry replaces standalone WASM/audio-device settings; Remote suppression is the current mIV contract."
   },
   {
+    "operation": "replace_paragraph",
+    "anchor": "デスクトップアプリでディスプレイが2台以上あるときは、**表示 > Visualizer クリーンフィード**で、選んだディスプレイにVisualizerをウィンドウ枠や操作ボタンなしで全画面表示できます。レイアウトの比率は保たれ、余った部分は黒で埋まります。クリーンフィードの使用中は、アプリ内のVisualizerのプレビューもフィードと同じ解像度で描画され、両者が一致します。クリーンフィードは、ほかのアプリを操作している間（同じメニューの**非アクティブ時も表示**がオンのときを除く）、メインウィンドウがそのディスプレイに重なっている間、ブラインドテスト中は自動的に非表示になります。止めるには**オフ**を選ぶか、フィードをクリックして**Esc**を押します。ディスプレイが1台だけのときは、このメニュー項目は使えません。",
+    "replacement": "",
+    "reason": "Clean Feed is a standalone menu and has no VST entry."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "このほかの8種類は、それぞれが最も映える比率に用意されています。",
+    "replacement": "このほかの7種類は、それぞれが最も映える比率に用意されています。",
+    "reason": "Bundled presets omit Lyric Stage; Counter Gallery is bundled."
+  },
+  {
     "operation": "replace_html",
-    "anchor": "<p>デスクトップ版では、<strong>ハードウェア アクセラレーションを使用</strong> が初期状態でオンです。画面がちらつく、または更新されなくなる場合は、<strong>設定 &gt; 環境設定...</strong> でオフにしてEffeTuneを再起動してください。表示の問題が繰り返されると、自動的にオフにして再起動します。再度試すときは、同じ設定をオンにして再起動してください。</p>",
+    "anchor": "<li><p><strong>Lyric Stage</strong>（16:9、9:16）: 低音に反応するアートワークの光の上に同期歌詞を表示し、現在の行を単語ごとに塗り進めます（歌詞がないときは落ち着いたアートワーク画面になります）。</p></li>",
     "replacement": "",
-    "reason": "Standalone Electron hardware-acceleration preference is absent in bundled WebView."
+    "reason": "Lyric Stage is not bundled and mIV supplies no lyrics."
   },
   {
     "operation": "replace_inline",
-    "anchor": "Ctrl+D（MacではCmd+D）",
-    "replacement": "Ctrl+D",
-    "reason": "mIV is Windows-only."
+    "anchor": "**Cinema Strip**（21:9）: 画面幅いっぱいのスペクトログラム、10秒分の波形、流れる歌詞の行を並べます。",
+    "replacement": "**Cinema Strip**（21:9）: 画面幅いっぱいのスペクトログラムと10秒分の波形を並べます。",
+    "reason": "Imported Lyrics items remain editable but receive no live lyrics."
   },
   {
     "operation": "replace_inline",
-    "anchor": "（Ctrl+Z・Ctrl+Y、MacではCmd）",
-    "replacement": "（Ctrl+Z・Ctrl+Y）",
-    "reason": "mIV is Windows-only."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "複数のアイテムを選ぶには、キャンバスかアイテム一覧でShift+クリックします。選択中のアイテムをShift+クリックすると選択が外れます。アイテム一覧ではCtrl+クリック（MacではCmd+クリック）でも同じように選べます。キャンバスの空いている所からドラッグすると枠内に完全に収まるアイテムを選べ、Shiftを押しながらドラッグすると選択に追加できます。アイテムが重なっている所では、キャンバス上でCtrl+クリック（MacではCmd+クリック）すると背面のアイテムを選べます。Ctrl+クリックするたびに1つずつ奥のアイテムへ移り、最背面の次は最前面に戻ります。選んだアイテムはそのままドラッグできます。Ctrl+A（MacではCmd+A）ですべて選択し、Escで選択を解除します。移動・削除・複製・切り取り・コピー・貼り付けは選択中のすべてのアイテムにまとめて働きます。大きさの変更は1つずつ行います。同じ種類のアイテムだけを選んでいるときは、右側に先頭のアイテムの設定が表示され、変更は選択中のすべてのアイテムに反映されます。右側には並べ替えのボタンのほか、左端・左右中央・右端・上端・上下中央・下端に揃えるボタンも表示されます。",
-    "replacement": "複数のアイテムを選ぶには、キャンバスかアイテム一覧でShift+クリックします。選択中のアイテムをShift+クリックすると選択が外れます。アイテム一覧ではCtrl+クリックでも同じように選べます。キャンバスの空いている所からドラッグすると枠内に完全に収まるアイテムを選べ、Shiftを押しながらドラッグすると選択に追加できます。アイテムが重なっている所では、キャンバス上でCtrl+クリックすると背面のアイテムを選べます。Ctrl+クリックするたびに1つずつ奥のアイテムへ移り、最背面の次は最前面に戻ります。選んだアイテムはそのままドラッグできます。Ctrl+Aですべて選択し、Escで選択を解除します。移動・削除・複製・切り取り・コピー・貼り付けは選択中のすべてのアイテムにまとめて働きます。大きさの変更は1つずつ行います。同じ種類のアイテムだけを選んでいるときは、右側に先頭のアイテムの設定が表示され、変更は選択中のすべてのアイテムに反映されます。右側には並べ替えのボタンのほか、左端・左右中央・右端・上端・上下中央・下端に揃えるボタンも表示されます。",
-    "reason": "mIV is Windows-only; preserve multi-selection and cycling through overlapping items."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "このほかの7種類は、それぞれが最も映える比率にだけ用意しています。**Fretboard**（21:9、9:16）は検出した音をギターのネック上に示し、ビート表示を添えます。21:9ではネックの上にピアノロール表示も加わります。**Power Amp**（21:9、16:9）は、黒いアンプのフロントパネルに青く光るVUメーターを並べます。**Round Dials**（1:1、9:16）は、真鍮の縁に収めた丸型のVUメーターです。**Beat Stage**（16:9、9:16）は、低音に合わせて膨らむ大きなビートサークルの中に検出したテンポを表示し、ネオン調のスペクトラムバーと組み合わせます。**Lyric Stage**（16:9、9:16）は、低音に合わせて膨らむアルバムアートワークのやわらかな光の上に同期歌詞を表示し、現在の行を単語ごとに塗りつぶしていきます。歌詞のない曲では、落ち着いたアートワーク画面として表示されます。**Cinema Strip**（21:9）は、スペクトログラム、10秒分の波形、横に流れる歌詞を画面の横幅いっぱいに並べます。**Meter Bridge**（21:9、4:3）は、True Peak、VU、ゆっくり応答するRMS、ラウドネスの各メーターを並べ、同じ音楽に対する指示の違いを見比べられるようにします。下段にはレベルメーターと波形も表示します。",
-    "replacement": "このほかの6種類は、それぞれが最も映える比率にだけ用意しています。**Fretboard**（21:9、9:16）は検出した音をギターのネック上に示し、ビート表示を添えます。21:9ではネックの上にピアノロール表示も加わります。**Power Amp**（21:9、16:9）は、黒いアンプのフロントパネルに青く光るVUメーターを並べます。**Round Dials**（1:1、9:16）は、真鍮の縁に収めた丸型のVUメーターです。**Beat Stage**（16:9、9:16）は、低音に合わせて膨らむ大きなビートサークルの中に検出したテンポを表示し、ネオン調のスペクトラムバーと組み合わせます。**Cinema Strip**（21:9）は、スペクトログラムと10秒分の波形を画面の横幅いっぱいに並べます。**Meter Bridge**（21:9、4:3）は、True Peak、VU、ゆっくり応答するRMS、ラウドネスの各メーターを並べ、同じ音楽に対する指示の違いを見比べられるようにします。下段にはレベルメーターと波形も表示します。",
-    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+    "anchor": "**Counter**を追加すると、内蔵プレーヤーの現在の再生位置を表示し、一時停止やシークにも追従します。外部入力では、Counterを追加した時点、または現在のセッションでレイアウトを読み込んだ時点からの経過時間を表示し、Visualizerを隠している間も進みます。**Edit**以外でクリックまたはタップすると、そのCounterの外部入力用の経過時間だけが0に戻ります。プレーヤーの再生には影響しません。",
+    "replacement": "**Counter**を追加すると、音響調整が処理した音声の累積時間を表示します。mImageViewer の曲の再生位置とは一致せず、シーク先の時刻にも移りません。音声処理が止まると進まず、曲の切り替えでも必ず0に戻るわけではありません。クリックして0へ戻す外部入力用の操作は使えません。",
+    "reason": "VST visualizer-view.js uses hostTransport project samples; mIV supplies a process-block sample counter, not media PTS, and external=false."
   },
   {
     "operation": "replace_inline",
-    "anchor": "**Lyrics**, **Artwork**",
-    "replacement": "**Artwork**",
-    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+    "anchor": "**プレイリスト番号**、**時**、**分**、**秒**、**秒未満**の表示を個別に切り替えられます。既定の表示は`hh:mm:ss.mmm`で、番号は非表示です。番号はプレーヤーのプレイリストの1曲目を1とし、外部入力では00になります。表示する最上位の単位には合計時間を表示します。時を隠すと合計分、時と分を隠すと合計秒になります。",
+    "replacement": "**プレイリスト番号**、**時**、**分**、**秒**、**秒未満**の表示を個別に切り替えられます。既定の表示は`hh:mm:ss.mmm`で、番号は非表示です。mImageViewer では番号は00になります。表示する最上位の単位には合計時間を表示します。時を隠すと合計分、時と分を隠すと合計秒になります。",
+    "reason": "VST Counter metadata uses trackIndex=0; mIV has no playlist transport metadata."
   },
   {
-    "operation": "replace_paragraph",
-    "anchor": "**Lyrics** を追加すると、内蔵プレーヤーで再生している曲の歌詞を表示できます。Clean Feed にも表示されます。音楽ファイルに埋め込まれた歌詞、または同じフォルダーにある同じ名前の `.lrc` ファイルを使い、ファイル名の大文字・小文字は区別しません。時刻付きの歌詞を優先し、同じ条件なら `.lrc` を使います。デスクトップアプリとブラウザーのライブラリフォルダーでは自動で見つかります。ブラウザーで音楽ファイルを直接開くかドロップする場合は、`.lrc` も一緒に選択またはドロップしてください。CUE の曲では `Artist - Title.lrc` や `Title.lrc` など曲名に対応するファイルを優先し、なければアルバムファイルの時刻付き歌詞からその曲の部分を表示します。ストリームの歌詞は表示されません。",
+    "operation": "replace_inline",
+    "anchor": "**Lyrics**を追加すると、内蔵プレーヤーで再生中の曲の同期歌詞または通常の歌詞を表示できます（クリーンフィードにも表示されます）。歌詞は、埋め込みタグか、同じフォルダーにある同じ名前の`.lrc`ファイルから読み込みます（CUEシートでは、アルバム単位の時刻付き歌詞よりも`Artist - Title.lrc`または`Title.lrc`を優先します）。ブラウザーで音楽ファイルを直接開くかドロップする場合は、`.lrc`ファイルも一緒に選択またはドロップしてください。ストリームには歌詞がありません。**Edit**の外では、時刻付き歌詞の行をクリックまたはタップすると、その行へ再生位置が移動します。",
     "replacement": "mImageViewer の EffeTune は歌詞を表示しません。**Lyrics** は追加メニューにありません。既存または読み込んだレイアウトにある Lyrics アイテムは編集できますが、再生中の歌詞は渡されません。",
-    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+    "reason": "visualizer-editor.js:575 excludes lyrics; native host sends no lyrics."
   },
   {
     "operation": "replace_inline",
-    "anchor": "Clean Feedにも反映され、",
-    "replacement": "",
-    "reason": "Edge Fade is bundled; standalone Clean Feed is unavailable in the VST."
+    "anchor": "**一覧**または**1行**を選びます（1行では**次の行を表示**も選べます）。一覧表示では、**スクロール（縦）**、**ステップ（縦）**、**スクロール（横）**、**ステップ（横）**を選べ、**ステップ遷移時間**（0～2秒、既定値0.18秒）と**現在行の位置**（0～100%、既定値50%）を調整できます。**単語のハイライト**は、単語ごとの時刻がある場合に現在の行を徐々に塗り進めます。**オフセット**（−10～+10秒）で同期を微調整します。正の値にすると歌詞が遅れて表示されます。時刻のない歌詞は常に一覧で表示され、曲の進行に合わせてスクロールします。ハイライトはしません。",
+    "replacement": "既存または読み込んだ Lyrics アイテムを編集する場合、**一覧**または**1行**を選びます（1行では**次の行を表示**も選べます）。一覧表示では、**スクロール（縦）**、**ステップ（縦）**、**スクロール（横）**、**ステップ（横）**を選べ、**ステップ遷移時間**（0～2秒、既定値0.18秒）と**現在行の位置**（0～100%、既定値50%）を調整できます。**単語のハイライト**は、単語ごとの時刻がある場合に現在の行を徐々に塗り進めます。**オフセット**（−10～+10秒）で同期を微調整します。正の値にすると歌詞が遅れて表示されます。時刻のない歌詞は常に一覧で表示され、曲の進行に合わせてスクロールします。ハイライトはしません。",
+    "reason": "Retain existing/imported item editing controls."
   },
   {
     "operation": "replace_inline",
-    "anchor": "**表示** は **一覧** または **1行** を選べます。",
-    "replacement": "既存または読み込んだ Lyrics アイテムを編集する場合、**表示** は **一覧** または **1行** を選べます。",
-    "reason": "v0.14.0 visualizer-editor.js:575 excludes lyrics from Add; renderer/model/editor retain imported Lyrics items. visualizer-view.js:339-347 requires standalone player trackLyrics. Bundled visualizer presets exclude Lyric Stage; Cinema Strip retains a Lyrics item, but has no live lyrics in mIV."
+    "anchor": "**Video**を追加すると、内蔵プレーヤーで再生中のファイルの映像を表示できます（ブラウザーやOSが対応するMP4、M4V、MOV、MKV、WebM、3GP）。**表示方法**では、**全体を表示**（既定）、**切り抜いて埋める**、**引き伸ばす**を選びます。**映像がないときはアートワークを表示**（既定でオン）は、音声だけの曲ではアルバムアートを表示します。CUEシートから再生した曲では映像を表示しません。",
+    "replacement": "**Video** は追加メニューにありません。既存または読み込んだ Video アイテムは編集できますが、mImageViewer の映像は渡されません。**映像がないときはアートワークを表示**を有効にすると、渡された代表画像を表示できます。",
+    "reason": "visualizer-editor.js:575 excludes video; VST metadata has no videoSource and provides only artwork."
   },
   {
     "operation": "replace_inline",
-    "anchor": "サイズ変更中にShiftを押すと縦横比を、Ctrl（MacではCmd）を押すと中心位置を維持します。",
-    "replacement": "サイズ変更中にShiftを押すと縦横比を、Ctrlを押すと中心位置を維持します。",
-    "reason": "Windows VST modifier; retain new proportional and centered resizing."
+    "anchor": "**設定 > 環境設定... > 表示**の**Visualizer HDR**は、既定では無効です。HDR対応ディスプレイで明るい部分の輝きをより強く表現するには、OSの設定でHDRを有効にし、この項目を有効にします。ブラウザまたはデスクトップアプリとグラフィックス機能も、HDR出力に対応している必要があります。HDR出力を利用できないディスプレイでは、自動的にSDRで表示します。この設定はVisualizer全体とクリーンフィードに共通で、この端末に記憶されます。プリセットや共有リンクには含まれません。",
+    "replacement": "**設定 > 環境設定... > 表示**の**Visualizer HDR**は、既定では無効です。HDR対応ディスプレイで明るい部分の輝きをより強く表現するには、OSの設定でHDRを有効にし、この項目を有効にします。表示に使う環境もHDR出力に対応している必要があります。HDR出力を利用できない場合はSDRで表示します。この設定はこの端末に記憶され、プリセットや共有リンクには含まれません。",
+    "reason": "vst-bootstrap.js:36 exposes HDR configuration; configIntegration.js stores effetune_visualizer_hdr in existing localStorage. Native HDR output is unmeasured."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "細かく配置するには、キャンバスのツールバーの**−**と**+**、または**Ctrl+スクロール**（Macでは**Cmd+スクロール**）で、ポインターを中心に拡大します（10～400%）。**全体表示**は表示枠全体を中央に収めます。表示位置の移動は、マウスホイールまたはトラックパッドで行うか（**Shift**を押すと横スクロール）、マウスの中ボタンでドラッグするか、**Space+左ドラッグ**で行います。キャンバスにフォーカスがあるときは、**+**と**−**で中央を基準に拡大・縮小し、**0**で全体表示にします。表示位置の移動や拡大・縮小は**元に戻す**の履歴に入りません。",
+    "replacement": "細かく配置するには、キャンバスのツールバーの**−**と**+**、または**Ctrl+スクロール**で、ポインターを中心に拡大します（10～400%）。**全体表示**は表示枠全体を中央に収めます。表示位置の移動は、マウスホイールまたはトラックパッドで行うか（**Shift**を押すと横スクロール）、マウスの中ボタンでドラッグするか、**Space+左ドラッグ**で行います。キャンバスにフォーカスがあるときは、**+**と**−**で中央を基準に拡大・縮小し、**0**で全体表示にします。表示位置の移動や拡大・縮小は**元に戻す**の履歴に入りません。",
+    "reason": "Windows VST modifiers; retain editing operations and omit unavailable Add items."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Video**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**/**Cmd**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**（Macでは**Cmd+D**）を押すか、**Altを押しながらドラッグ**します。",
+    "replacement": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Artwork**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**を押すか、**Altを押しながらドラッグ**します。",
+    "reason": "Windows VST modifiers; retain editing operations and omit unavailable Add items."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "複数のアイテムを選ぶには、キャンバスまたは一覧で**Shift+クリック**します（一覧では**Ctrl/Cmd+クリック**も使えます）。キャンバスの空いた所で選択範囲をドラッグして選ぶこともできます（**Shift+ドラッグ**で選択に追加）。アイテムが重なっている所では、**Ctrl+クリック**（Macでは**Cmd+クリック**）で、ポインターの下にあるアイテムを順に選べます。**Ctrl+A**（**Cmd+A**）ですべて選択し、**Esc**で選択を解除します。移動、削除、複製、切り取り、コピー、貼り付けは、選択中のすべてのアイテムに適用されます。選択中のアイテムがすべて同じ種類のときは、右側での変更がすべてのアイテムに反映され、端揃えや中央揃えのボタンも使えます。",
+    "replacement": "複数のアイテムを選ぶには、キャンバスまたは一覧で**Shift+クリック**します（一覧では**Ctrl+クリック**も使えます）。キャンバスの空いた所で選択範囲をドラッグして選ぶこともできます（**Shift+ドラッグ**で選択に追加）。アイテムが重なっている所では、**Ctrl+クリック**で、ポインターの下にあるアイテムを順に選べます。**Ctrl+A**ですべて選択し、**Esc**で選択を解除します。移動、削除、複製、切り取り、コピー、貼り付けは、選択中のすべてのアイテムに適用されます。選択中のアイテムがすべて同じ種類のときは、右側での変更がすべてのアイテムに反映され、端揃えや中央揃えのボタンも使えます。",
+    "reason": "Windows VST modifiers; retain editing operations and omit unavailable Add items."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**元に戻す**と**やり直す**（**Ctrl+Z** / **Ctrl+Y**、Macでは**Cmd**）で、現在のセッション中のレイアウト編集、プリセットの読み込み、リンクの読み込みを取り消したりやり直したりできます。**アイテムを切り取り**、**アイテムをコピー**、**アイテムを貼り付け**（**Ctrl+X**、**Ctrl+C**、**Ctrl+V**）では、クリップボードを通してアイテムを移せます。**アイテムを貼り付け**では、クリップボードにあるVisualizerの共有リンクも読み込めます。選択中のアイテムを削除するには**Delete**を押します。キャンバスを右クリック（または長押し）すると、これらのコマンドをすぐに使えます。",
+    "replacement": "**元に戻す**と**やり直す**（**Ctrl+Z** / **Ctrl+Y**）で、現在のセッション中のレイアウト編集、プリセットの読み込み、リンクの読み込みを取り消したりやり直したりできます。**アイテムを切り取り**、**アイテムをコピー**、**アイテムを貼り付け**（**Ctrl+X**、**Ctrl+C**、**Ctrl+V**）では、クリップボードを通してアイテムを移せます。**アイテムを貼り付け**では、クリップボードにあるVisualizerの共有リンクも読み込めます。選択中のアイテムを削除するには**Delete**を押します。キャンバスを右クリック（または長押し）すると、これらのコマンドをすぐに使えます。",
+    "reason": "Windows VST modifiers; retain editing operations and omit unavailable Add items."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "Visualizerは、EffeTuneで処理した音声を自由にカスタマイズできる画面に表示します。波形、スペクトラム、流れるスペクトログラム、ステレオイメージ、音符のスペクトログラムを、アートワーク、動画、曲情報と並べて表示できます。表示を変えても音は変わりません。",
+    "replacement": "Visualizerは、EffeTuneで処理した音声を自由にカスタマイズできる画面に表示します。波形、スペクトラム、流れるスペクトログラム、ステレオイメージ、音符のスペクトログラムを、代表画像や曲情報と並べて表示できます。表示を変えても音は変わりません。",
+    "reason": "Independent review P2: mIV sends artwork and metadata, not video; align introduction with unavailable Video item."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**秒未満の形式**は**小数**または**フレーム**から選びます。小数桁数は小数表示に適用されます。フレームは再生時間と**フレームレート**（1～120、既定値30）から計算し、0から設定値の1つ手前までを表示します。必要に応じて動画に合わせて設定してください。ファイル内の実際のフレームを正確に読み出す表示ではありません。",
+    "replacement": "**秒未満の形式**は**小数**または**フレーム**から選びます。小数桁数は小数表示に適用されます。フレームは音声の処理累積時間と**フレームレート**（1～120、既定値30）から計算し、0から設定値の1つ手前までを表示します。mImageViewerで再生中の動画の時刻や実際のフレームを読み出す表示ではありません。",
+    "reason": "Counter derives frames from VST process samples, not media playback time."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "歌詞の背後に落ち着いた背景を作るなら",
+    "replacement": "曲情報の背後に落ち着いた背景を作るなら",
+    "reason": "mIV sends no lyrics (see the note at the top of this page), so the colour example targets the track text instead."
   }
 ]
