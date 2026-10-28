@@ -144,14 +144,16 @@ portable / 開発 build は exe 隣へ loose 配置する。利用者による�
 
 GUI process の ORT constructor は process 共通 `AiRuntimeInitOwner` だけが worker 上で一度実行する。
 App / Remote / materializer は同じ Ready / Failed terminal snapshot を使い、UI thread は待たない。
-`ort` 2.0.0-rc.12 は upstream `17ed727` を `crates/ort-patched` へ backport し、dynamic load / export /
-C API version の初期化失敗を ORT API に再入せず `LoadDynamicError` として返す。
+`ort` 2.0.0-rc.15 は upstream `17ed727` 相当の修正を含むため、ローカルforkは使用しない。
+dynamic load / export / C API version の初期化失敗を ORT API に再入せず
+`LoadDynamicError` として返す。環境は `build()` で生成し、同じprocess共通の初期化結果に
+保持して各 `Session::builder(&environment)` へ渡す。
 
 ### セットアップ
 
 ```bash
-bash scripts/setup-ort.sh           # 既定バージョン (1.24.2) をダウンロード
-bash scripts/setup-ort.sh 1.24.5    # バージョン指定
+bash scripts/setup-ort.sh           # 既定バージョン (1.24.4) をダウンロード
+bash scripts/setup-ort.sh 1.24.4     # バージョン指定
 ```
 
 - **ソース**: NuGet `Microsoft.ML.OnnxRuntime.DirectML` (Microsoft 公式ビルド)
@@ -160,12 +162,16 @@ bash scripts/setup-ort.sh 1.24.5    # バージョン指定
 
 ### バージョン互換性
 
-`ort` クレートの C API バージョンと一致する ONNX Runtime DLL を使う必要がある。
-`ort-sys` の `build/download/dist.txt` に `ms@X.Y.Z` というタグが入っており、これが
-対応する ONNX Runtime バージョン。ort クレートをアップデートしたら、このバージョンを
-確認して `setup-ort.sh` のデフォルトバージョン (`VERSION` 変数) を揃えること。
+`ort-sys::ORT_API_VERSION`（`ort::MINOR_VERSION`）は選択した `api-*` featureで決まる。
+`load-dynamic` は DLL のminor版がこの値より小さいと `BadVersion` で拒否する。
+ort更新時は既定featureだけで判断せず、workspace全体のfeature統合とDLLのAPI互換性を確認する。
 
-- ort 2.0.0-rc.12 ↔ onnxruntime 1.24.2
+- ort 2.0.0-rc.15: 全consumerで `default-features = false` と `api-24` を指定。
+  DirectML 1.24.4 と TensorRT pack の GPU 1.24.2 はともに API 24 を満たす。
+- rc.15既定の `api-31` は入れない。`api-25` 以上と `download-binaries` が
+  `cargo tree -e features -i ort --workspace --locked --offline` に入らないことを確認する。
+- `download-binaries` / `tls-native` / `copy-dylibs` は使用せず、DLLは既存のvendor管理を続ける。
+  2026-10-28 の入力hash・検証結果は [依存物更新記録の段B](dependency-update-20261028.md#dependency-stage-b) を参照。
 
 ### DirectML.dll について
 

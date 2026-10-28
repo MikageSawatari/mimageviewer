@@ -1,6 +1,6 @@
-# 依存物の更新 段A — 2026-10-28
+# 依存物の更新 — 2026-10-28
 
-backlog §1.460 の段A（Rust・通常crate・PDFium・LibRaw）の記録。
+backlog §1.460 の段A（Rust・通常crate・PDFium・LibRaw）と段B（ort / ONNX Runtime）の記録。
 版、入力資産の同一性、非対話検証を扱い、公開・配布の完了記録ではない。
 設計・検収は ClaudeCode、実装・テストは Codex が担当する。
 
@@ -14,7 +14,8 @@ backlog §1.460 の段A（Rust・通常crate・PDFium・LibRaw）の記録。
 | LibRaw | 0.22.2 | 0.22.3。zlib 1.3.1、turbojpeg-sys 1.2.0 は維持 |
 | FFmpeg | `n7.1.5-16-g9a4bb2c579` | 据え置き |
 
-段B（ort / ONNX Runtime）、段C（tantivy）、段D（EffeTune Mixwright / VST3 SDK）はこれから行う。
+段Aの結果は以下、段Bは[末尾の記録](#dependency-stage-b)を参照。
+段C（tantivy）、段D（EffeTune Mixwright / VST3 SDK）はこれから行う。
 
 初回に阻害されたLibRawのアクセス権とbench基準の欠落は、ClaudeCodeが修復・配置した。
 LibRaw全225ファイルを照合済み。独立レビューでzip 2.6.1の追加退行2件が確認され、
@@ -388,3 +389,150 @@ toolchainは1.99.1から変えず、bench / dumpbinは再実行しない。
 | `docs/README.md` | 本記録への索引を追加 |
 | `docs/dependency-update-20261028.md` | 本記録 |
 | `tests/snapshots/raw_license_information_light.png` / `raw_license_information_dark.png` / `raw_license_information_expanded_dark.png` | 同梱版とlicense先頭行の0.22.3表示を反映。3枚を目視・差分範囲で確認 |
+
+<a id="dependency-stage-b"></a>
+
+## 段B: ort / ONNX Runtime
+
+作業基準は `deps-update-1460` の `e16e323da`。本体manifestのrc.15指定とpatch解除、
+vendor DLL更新はClaudeCodeが事前実施し、本段でworkspace統合・API追従・fork撤去を行う。
+他worktree、TensorRT pack、通常profileのデータは変更せず、コミット・製品起動・ネットワーク取得は行わない。
+
+| 対象 | 更新前 | 段B |
+| --- | --- | --- |
+| ort / ort-sys | 2.0.0-rc.12（ortはローカルbackport） | registry 2.0.0-rc.15、C API 24 |
+| ONNX Runtime DirectML | 1.24.2 | 1.24.4 |
+| TensorRT packのONNX Runtime GPU | 1.24.2 | 据え置き。pack再生成なし |
+
+### 入力資産とfeature
+
+取得済み `Microsoft.ML.OnnxRuntime.DirectML` 1.24.4 nupkg のSHA-256は
+`57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681`。
+ローカル資産を読み、次の2本がnupkg内 `runtimes/win-x64/native/` とバイト一致することを確認した。
+`vendor/ort/VERSION` は1.24.4。nuspecの依存は `Microsoft.AI.DirectML` 1.15.4で、
+`DirectML.dll` は従来どおり同梱しない。結果は `target/dependency-update-20261028/stage-b/assets-and-lock.json`。
+
+| DLL | bytes | SHA-256 |
+| --- | ---: | --- |
+| `onnxruntime.dll` | 17,328,152 | `e7eedec6a6f26dc39dc948276a75ef6d2bee3fff944d874ceed0bbd3b97bff40` |
+| `onnxruntime_providers_shared.dll` | 22,040 | `265c8daf29637cb259cac8be9f08f2cd45f3883f0f0e4949cbfddd5b4cbec3b6` |
+
+rc.15の既定featureは `api-31`。`load_dynamic::init` はDLLのminor版が
+`MINOR_VERSION = ort_sys::ORT_API_VERSION` 未満なら `BadVersion` を返すため、
+DirectML 1.24.4と既存GPU 1.24.2を使う本workspaceでは `api-24` を明示する。
+`tools/local_adjust_lab` も `=2.0.0-rc.15` / `default-features = false` とし、
+`std` / `ndarray` / `tracing` / `api-24` / `load-dynamic` を指定した。
+本体の `directml` / `cuda` / `tensorrt` は維持する。
+
+`cargo tree -e features -i ort --workspace --offline` とort-sys側の同検査で、
+API featureは17〜24の累積だけとなる。`api-25` 以上、`download-binaries`、
+`tls-native`、`copy-dylibs` は入らない。`preload-dylibs` はrc.15の
+`load-dynamic`が有効にするローカルDLL preload helperで、ネットワーク取得ではない。
+lockは不要となったTLS/download依存等22 packageを削除し、新しいpackageや他crateの版変更はない。
+依存名の曖昧さが消えたことによるversion suffixの省略も含まれる。
+
+### API差分と§1.241の維持
+
+旧forkとローカルregistryソースを比較した。rc.15の `load_dynamic::LoadError` は
+公開別名 `ort::LoadDynamicError` を維持し、`Dlopen` / `MissingApi` / `BadVersion`
+と追加の `InvalidVersionString` を直接構築する。構築・Display・DropでORT APIを呼ばず、
+失敗中の `G_ORT_LIB` へ再入しない。upstream `17ed727` の修正目的を満たすため、
+`crates/ort-patched/` 全84 fileとworkspace excludeを撤去した。
+§1.241調査・当時の検収記録とTensorRT packの過去リリース記録は変更しない。
+
+| 差分・確認対象 | 対応・維持する挙動 |
+| --- | --- |
+| `EnvironmentBuilder::commit() -> bool` → `build() -> Result<Environment>`、暗黙のglobal強参照廃止 | 既存 `ORT_INIT` の成功型を `InitializedOrt { backend, environment }` にする。process lifetimeの強参照を保持し、labも既存OnceLockで環境を保持する |
+| `Session::builder()` → `Session::builder(&Environment)` | constructorで確定した同じ環境を渡す。SessionBuilder/Session自身も環境cloneを保持する。AiRuntimeにOption等の別状態を足さない |
+| 環境生成のエラー | workerで生成し既存Failed terminalへ返す。TRT DLLの `init_from` 成功後はDLL選択が固定済みなので、build失敗をDirectMLへ再初期化しない。init_from自体のErrに対する既存fallbackは維持 |
+| DirectML / CUDA / TensorRT EP登録 | DMLのdevice filter/preference、TRT→CUDAの順、cache/FP16/workspace/builder level/hardware compatibilityのoptionsと値は維持。`Error<SessionBuilder>::recover()` と既定のEP登録失敗時CPU fallbackも維持。rc.15内部のRegisterError統合はアプリ側で新しい分岐を要しない |
+| tensor / dtype | owned ndarray f32とTensorRef入力、dtype検査付き抽出を維持。変換・コピー・精度設定の追加なし |
+| ログ | `tracing`を明示維持。`ORT_LOG`とseverity→tracing levelの対応は同一。環境buildエラーには段階を付す。ORT内部EPログにsource等の変更はあるが、アプリ側の通知・原因伝播は維持 |
+| process共通AI owner / typed failure | Dormant→Initializing→Ready/Failed、constructor一度、cancel/wake、RuntimeInit→親の非retry分類は変更しない。環境の所有だけを同じ初期化結果へ追加する |
+
+rc.12も環境の実生成は最初のSession等まで遅延していた。rc.15では明示build時となるため、
+この失敗は初期化worker内で早く確定する。GUI threadで待たず、追加retryやguardは導入しない。
+独立GPT-6.1 Sol / xhighレビューは、この環境寿命の設計に着手前合意し、
+製品差分とprobe修正の限定再確認でもblocking / should-fixなし。テストの実施は実装担当が所有し、
+レビュー担当は再実行していない。
+
+### 段Bの検証
+
+全build/testは `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`、
+`CARGO_NET_OFFLINE=true` で実行。直接Cargoコマンドには `--locked --offline` を指定する。
+ログは `target/dependency-update-20261028/stage-b/`。製品バイナリは起動しない。
+
+| コマンド | 件数・結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core --locked --offline` | 初回はcommit削除・builder引数追加の3 compile error。API追従後成功、283 warnings（段Aと同数）。`core-check.log` / `core-check-fixed.log` |
+| `cargo check --workspace --all-targets --locked --offline` | exit 101。launcherが埋め込むrelease版core / remote / EPUB workerの3 exeが無く、既存build.rsの前提検査で停止。ORTのAPIエラーや取得資産の欠落ではない。`workspace-check.log` |
+| `cargo check --workspace --all-targets --exclude mimageviewer-launcher --locked --offline` | 成功。上記の制約を分ける補足検査で、元のworkspace全体コマンドの成功とは扱わない。`workspace-check-without-launcher.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ai::/)' --locked --offline` | 初回64件中63成功 / 1失敗。追加probeがbuild情報に版番号を含むと誤想定していたため。DLLロード・環境生成は成功しており、不安定testではない。想定修正後は64件全成功、0失敗（実行1.134秒）。`ai-tests.log` / `ai-tests-fixed.log` |
+| `.\scripts\test-lib-full.ps1` | **14,553成功 / 0失敗 / 65 skipped**、実行495.566秒、exit 0。今回は§1.447のページめくりを含め失敗なし、単独再確認なし。`lib-full.log` と下記台帳 |
+| `python scripts/check_ui_glyphs.py` | 危険なUI glyph 0件。`ui-glyphs.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 成功、exit 0。core 11分40秒、remote 0.33秒、EPUB worker 12.25秒。通常feature / dev-runtime、portable無効。内部CRT/PE gateはruntime 4 / PE 3成功。`build-dev.log`、成果物hashは `verification-build.json` |
+| `cargo fmt`（引数なし）、`git diff --check` | 最終実施でともに成功。fmt前後で変更対象Rust 2 fileのSHA-256は不変。`fmt.log` / `diff-check.log` |
+
+既存のロード失敗testは別processで欠落DLLとexport不足DLLを渡し、
+`Dlopen` / `MissingApi` が5秒以内に返ることを確認する。
+追加した `vendor_ort_loads_api24_environment_session_and_f32_tensor` も別processを使い、
+vendor DLLの実ロード、API 24、build情報取得、環境生成、session builder、
+owned ndarray f32の値・shape・不正dtype拒否を確認する。通常data_dirを使わず、
+このprobeだけtelemetryを無効にする。BadVersion/InvalidVersionStringの動的fixtureはなく、
+これらのAPI非依存エラー構築は上流ソース比較で確認する。
+
+`GetBuildInfoString` の実際の値は
+`ORT Build Info: git-branch=HEAD, git-commit-id=2d924974ef, build type=RelWithDebInfo`。
+版番号を含む契約は無いため、testはAPI呼出しで非空文字列を取得できることを検査する。
+DLLの版・同一性は上記nupkg / hash照合で確認する。
+
+lib全件の成功台帳は
+`target/test-lib-full/f301d8ea71a7968575ae0a95cf15d76e8b0164704fffe1cd5e0f2f1b5d9c29fe.json`、
+run directoryは `target/test-lib-full/runs/20261028T073601174Z-c129d6a8/`。
+検証source IDは `5970a776e8a3cfbb78ee5ead01ecebd9e4ea424f278acf1f3e4555f3debe5333`。
+全件後の編集はこの記録と索引 `docs/README.md` だけで、製品・testソースとlockは維持する。
+
+workspace全体checkの残りはrelease埋込素材3 exeを用意した後の再実行。
+別profileのexeやダミーを置いてlauncherの前提検査を通すことはしない。
+このreleaseビルド前提を次段へ引き継ぐか、段Bの検収前に用意するかはClaudeCodeへ委ねる。
+本段で `test-full.ps1` / bench / 単独dumpbin検査は追加しない。
+
+### 利用者の実機確認（未実施）
+
+通常profileの確認用coreを用意した。coreのSHA-256は
+`d1515357fbcf65750ba16a790c64d0368a72ba939858cb3c2978e3e55cdb80b8`、337,954,816 bytes。
+remote / EPUB workerも同じ作業ツリーから更新済み。3 exeのhashは
+`target/dependency-update-20261028/stage-b/verification-build.json`。
+
+インストール版・常駐tray版を終了してから、repository rootで利用者が実行する。
+single-instance mutexを共有し、引数なしでは通常の `%APPDATA%\mimageviewer` を使うため、
+実際の設定・データを更新し得る。エージェントはこのbinaryを起動していない。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+1. DirectMLで既存モデルのアップスケール・デノイズ・MI-GAN消しゴム・editing pack被写体分離を実行し、結果とエラー通知が従来どおりか確認する。
+2. 既存TensorRT pack（GPU ORT 1.24.2）で既存engineを読み、推論・DirectML非対応モデルの既存経路・backend切替を確認する。pack再生成やキャッシュ削除は本段で行わない。
+3. Remote AIと動画upscaleで初期化後の処理を確認する。初期化失敗があれば原因が通知され、45秒timeoutの反復やUI停止にならないことを確認する。
+
+製品の実GPU推論・画質・速度・配布形態は上の非対話検査だけでは検収していない。
+
+### 段Bの変更ファイル
+
+| ファイル | 理由 |
+| --- | --- |
+| `Cargo.toml` / `Cargo.lock` | fork exclude撤去、API 24の理由コメント、不要なdownload/TLS依存のlock整理。本体のrc.15指定・patch解除は事前反映済み |
+| `tools/local_adjust_lab/Cargo.toml` | 本体とrc.15 / default無効 / API 24を揃え、workspace統合でAPI 31が混入するのを防ぐ |
+| `src/ai/runtime.rs` | process共通の環境所有と明示session builder、環境生成エラーの既存terminal伝播、vendor実ロード回帰を追加 |
+| `tools/local_adjust_lab/src/main.rs` | 既存OnceLockで環境を保持し、session builderへ渡す |
+| `crates/ort-patched/**` | 上流に修正が入ったローカルfork全84 fileを撤去 |
+| `scripts/setup-ort.sh` | DirectML既定1.24.4とAPI 24選択の根拠を更新 |
+| `scripts/setup-tensorrt-pack.sh` / `.ps1` | GPU ORT 1.24.2のpinを維持し、rc.15 + API 24との互換をコメント |
+| `scripts/test-test-tools.ps1` | workspace外patchを未対応pathとして扱う既存fixture名を、撤去したfork名から一般名へ変更。検査内容は同じ |
+| `CLAUDE.md` / `docs/native-dependencies.md` / `docs/project-reference.md` | 現行版・feature契約・環境所有・fork不使用へ更新 |
+| `docs/dependency-update-20261028.md` | 本段の入力同一性、差分、検証、実機未確認を記録 |
+| `docs/README.md` | 更新記録の索引を段A/Bへ合わせる |
+
+第三者ライセンス表示・追跡noticeにはort / ONNX Runtimeの旧版番号は無く、
+`src/ui_dialogs/about.rs` のONNX Runtime / MIT表示は変更不要だった。

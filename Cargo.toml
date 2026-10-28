@@ -23,7 +23,6 @@ members = [
     "tools/viewer_context_audit",
 ]
 exclude = [
-    "crates/ort-patched",
     "crates/unrar-patched",
     "vendor/eframe",
     "vendor/egui",
@@ -424,6 +423,7 @@ turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"
 base64 = "0.22"
+# API 24 matches bundled DirectML 1.24.4 and TensorRT pack GPU 1.24.2; rc.15 defaults to API 31.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "directml", "cuda", "tensorrt", "load-dynamic"] }
 ndarray = "0.17"
 # mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
