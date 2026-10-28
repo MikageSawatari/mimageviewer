@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-28 §1.79 比較元画像版の worker 所有（実装・独立レビュー済み）
+
+ClaudeCode の `target/fsview-work/design-1079.md` 第3版（独立設計レビュー2回済み）に従い、
+比較の元画像 worker を `PreparingOriginal { pair, pending }` が所有する。Codex の前提確認でも、
+これは症状の guard / delay ではなく、加工版と元画像版の単一 worker 所有を型で表す構造修正と判断した。
+park の既存 `reset_detached_pause_foreground_modes` → `deactivate_compare_view` 経路は維持し、
+比較 owner の共通 `invalidate()` で pending を Draining へ移して回収する。
+detached の述語・viewport / HWND / placement の所有・park / mount 機構は変更しない。
+キーの focus 条件も既存の判定を共有し、比較状態を passive snapshot へ複製しない。
+§2 (憲法) を読んだうえで、実装後の独立レビュー (Codex gpt-6.1-sol xhigh、2026-10-28) と ClaudeCode (Opus 5.5) の検収の双方が、
+「共通 owner の失効境界を正す構造的修正であり、症状パッチではない」ことに合意した。新しい detached 用フラグ・placement の保存先・時間窓は足していない。
+
 ### 2026-10-27 §1.429 描画先の設定取得の失敗を、初回 root だけ起動失敗として扱う (実装・自動検証済み)
 
 vendor `egui-wgpu` の `get_default_config(...).expect(...)` (描画先 surface の設定取得) を、**初回の root 初期化に限って** Err にし、

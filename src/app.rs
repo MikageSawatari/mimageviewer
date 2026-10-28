@@ -5594,7 +5594,42 @@ impl CompareViewMode {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum PinnedOriginalSource {
+    Raw {
+        pixels: Arc<egui::ColorImage>,
+        processed_source_size: [usize; 2],
+        crop: Option<crate::export_crop::CropRect>,
+        rotation: crate::rotation_db::Rotation,
+    },
+    SameAsProcessed,
+    Unavailable,
+}
+
+#[cfg(all(test, windows))]
+#[path = "app/compare_original_lifecycle_tests.rs"]
+mod compare_original_lifecycle_tests;
+
+/// 加工版を受理した時点の幾何。元画像ホールド時の設定から再構築しない。
+#[derive(Clone, Copy)]
+pub(crate) struct CompareSourceGeometry {
+    pub(crate) processed_source_size: [usize; 2],
+    pub(crate) crop: Option<crate::export_crop::CropRect>,
+    pub(crate) rotation: crate::rotation_db::Rotation,
+}
+
+impl CompareSourceGeometry {
+    pub(crate) fn from_job(job: &crate::capture::CapturePixelJob) -> Self {
+        Self {
+            processed_source_size: job.source.size,
+            crop: job.crop,
+            rotation: job.rotation,
+        }
+    }
+}
+
 pub(crate) struct PinnedCompareSlot {
+    pub(crate) original_source: PinnedOriginalSource,
     pub(crate) pixels: Arc<egui::ColorImage>,
     /// 右下インジケーター専用の小型画像。フル解像度textureを72x54表示のためだけに
     /// uploadしないよう、compare-pin workerで事前縮小する。
@@ -5619,6 +5654,7 @@ pub(crate) struct ComparePinResult {
 }
 
 pub(crate) struct ComparePinPending {
+    pub(crate) original_source: PinnedOriginalSource,
     pub(crate) source_idx: usize,
     pub(crate) external_item_key: Option<String>,
     pub(crate) rx: mpsc::Receiver<Result<ComparePinResult, String>>,
@@ -6425,12 +6461,28 @@ pub(crate) struct ComparePinLoadPending {
 }
 
 pub(crate) struct ComparePreparedPair {
+    pub(crate) current_geometry: CompareSourceGeometry,
+    pub(crate) original: CompareOriginalVariant,
     pub(crate) key: u64,
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
     pub(crate) current_input_size: [usize; 2],
     pub(crate) pinned_input_size: [usize; 2],
     pub(crate) target_size: [usize; 2],
+    pub(crate) pixels: ComparePreparedPixels,
+    pub(crate) pinned_texture: Option<egui::TextureHandle>,
+    pub(crate) current_texture: Option<egui::TextureHandle>,
+    pub(crate) diff_texture: Option<egui::TextureHandle>,
+}
+
+pub(crate) enum CompareOriginalVariant {
+    Absent,
+    Ready(CompareOriginalPixels),
+    Failed,
+}
+
+pub(crate) struct CompareOriginalPixels {
+    pub(crate) key: u64,
     pub(crate) pixels: ComparePreparedPixels,
     pub(crate) pinned_texture: Option<egui::TextureHandle>,
     pub(crate) current_texture: Option<egui::TextureHandle>,
@@ -6537,8 +6589,58 @@ impl ComparePreparedPixels {
 }
 
 impl ComparePreparedPair {
+    pub(crate) fn managed_gpu_texture_count(&self) -> usize {
+        let count = |pinned: &Option<egui::TextureHandle>,
+                     current: &Option<egui::TextureHandle>,
+                     diff: &Option<egui::TextureHandle>| {
+            usize::from(pinned.is_some())
+                + usize::from(current.is_some())
+                + usize::from(diff.is_some())
+        };
+        count(
+            &self.pinned_texture,
+            &self.current_texture,
+            &self.diff_texture,
+        ) + match &self.original {
+            CompareOriginalVariant::Ready(original) => count(
+                &original.pinned_texture,
+                &original.current_texture,
+                &original.diff_texture,
+            ),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn allocated_cpu_buffers(&self) -> usize {
+        self.pixels.buffer_count()
+            + match &self.original {
+                CompareOriginalVariant::Ready(original) => original.pixels.buffer_count(),
+                _ => 0,
+            }
+    }
+
     pub(crate) fn allocated_cpu_bytes(&self) -> u64 {
         self.pixels.allocated_bytes()
+            + match &self.original {
+                CompareOriginalVariant::Ready(original) => original.pixels.allocated_bytes(),
+                _ => 0,
+            }
+    }
+
+    pub(crate) fn draw_pixels(&self, original: bool) -> &ComparePreparedPixels {
+        if original && let CompareOriginalVariant::Ready(original) = &self.original {
+            &original.pixels
+        } else {
+            &self.pixels
+        }
+    }
+
+    pub(crate) fn draw_key(&self, original: bool) -> u64 {
+        if original && let CompareOriginalVariant::Ready(original) = &self.original {
+            original.key
+        } else {
+            self.key
+        }
     }
 }
 
@@ -6550,6 +6652,7 @@ pub(crate) struct ComparePrepareRequest {
 }
 
 pub(crate) struct ComparePrepareResult {
+    pub(crate) key: u64,
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
     pub(crate) width: u32,
@@ -6571,6 +6674,8 @@ impl ComparePrepareScope {
 }
 
 pub(crate) struct ComparePreparePending {
+    pub(crate) key: u64,
+    pub(crate) current_geometry: CompareSourceGeometry,
     pub(crate) request: ComparePrepareRequest,
     pub(crate) scope: ComparePrepareScope,
     pub(crate) source_indices: Vec<usize>,
@@ -6592,6 +6697,10 @@ pub(crate) enum ComparePreparationState {
     Unprepared,
     WaitingForSource(ComparePrepareRequest),
     Preparing(ComparePreparePending),
+    PreparingOriginal {
+        pair: ComparePreparedPair,
+        pending: ComparePreparePending,
+    },
     /// 入力が失効したが、途中cancel不能なworkerの完了を回収するまで次を直列化する状態。
     Draining(ComparePreparePending),
     Ready(ComparePreparedPair),
@@ -6601,7 +6710,9 @@ impl ComparePreparationState {
     pub(crate) fn request(&self) -> Option<ComparePrepareRequest> {
         match self {
             Self::WaitingForSource(request) => Some(*request),
-            Self::Preparing(pending) | Self::Draining(pending) => Some(pending.request),
+            Self::Preparing(pending)
+            | Self::Draining(pending)
+            | Self::PreparingOriginal { pending, .. } => Some(pending.request),
             Self::Ready(pair) => Some(ComparePrepareRequest {
                 current_idx: pair.current_idx,
                 pinned_source_idx: pair.pinned_source_idx,
@@ -6613,14 +6724,14 @@ impl ComparePreparationState {
 
     pub(crate) fn prepared_pair(&self) -> Option<&ComparePreparedPair> {
         match self {
-            Self::Ready(pair) => Some(pair),
+            Self::Ready(pair) | Self::PreparingOriginal { pair, .. } => Some(pair),
             _ => None,
         }
     }
 
     pub(crate) fn prepared_pair_mut(&mut self) -> Option<&mut ComparePreparedPair> {
         match self {
-            Self::Ready(pair) => Some(pair),
+            Self::Ready(pair) | Self::PreparingOriginal { pair, .. } => Some(pair),
             _ => None,
         }
     }
@@ -6628,14 +6739,19 @@ impl ComparePreparationState {
     pub(crate) fn is_pending(&self) -> bool {
         matches!(
             self,
-            Self::WaitingForSource(_) | Self::Preparing(_) | Self::Draining(_)
+            Self::WaitingForSource(_)
+                | Self::Preparing(_)
+                | Self::Draining(_)
+                | Self::PreparingOriginal { .. }
         )
     }
 
     pub(crate) fn invalidate(&mut self) {
         let old = std::mem::take(self);
         *self = match old {
-            Self::Preparing(pending) | Self::Draining(pending) => Self::Draining(pending),
+            Self::Preparing(pending)
+            | Self::Draining(pending)
+            | Self::PreparingOriginal { pending, .. } => Self::Draining(pending),
             _ => Self::Unprepared,
         };
     }
@@ -50551,6 +50667,7 @@ impl App {
         };
         let source_idx = pending.source_idx;
         let external_item_key = pending.external_item_key.clone();
+        let original_source = pending.original_source.clone();
         self.compare_pin_pending = None;
         self.compare_pin_load_pending = None;
         match result {
@@ -50579,6 +50696,7 @@ impl App {
                     &result.indicator_rgba,
                 );
                 self.pinned_compare_slot = Some(PinnedCompareSlot {
+                    original_source,
                     source_size: pixels.size,
                     pixels: Arc::new(pixels),
                     indicator_pixels: Arc::new(indicator_pixels),
@@ -50662,6 +50780,7 @@ impl App {
     pub(crate) fn poll_compare_prepare_pending(&mut self, ctx: &egui::Context) {
         let (pending, draining) = match &self.compare_preparation {
             ComparePreparationState::Preparing(pending) => (pending, false),
+            ComparePreparationState::PreparingOriginal { pending, .. } => (pending, false),
             ComparePreparationState::Draining(pending) => (pending, true),
             _ => return,
         };
@@ -50674,12 +50793,11 @@ impl App {
                 Err("比較表示の準備が中断されました".to_string())
             }
         };
-        let pending = match std::mem::replace(
-            &mut self.compare_preparation,
-            ComparePreparationState::Unprepared,
-        ) {
+        // 完了を受信済みなので、この take は実行中 worker の所有を落とさない。
+        let (pending, original_pair) = match std::mem::take(&mut self.compare_preparation) {
             ComparePreparationState::Preparing(pending)
-            | ComparePreparationState::Draining(pending) => pending,
+            | ComparePreparationState::Draining(pending) => (pending, None),
+            ComparePreparationState::PreparingOriginal { pair, pending } => (pending, Some(pair)),
             _ => unreachable!(),
         };
         let request = pending.request;
@@ -50689,6 +50807,48 @@ impl App {
             crate::logger::log(
                 "[compare-memory] stage=worker-result-drained reason=source-invalidated old_pair_release=before_next_worker",
             );
+            ctx.request_repaint();
+            return;
+        }
+
+        // PinnedNormal を非表示にした場合も結果を保持する。active_output の検査より先に回収。
+        // pair を捨てる操作は全て invalidate() で Draining へ移している。
+        if let Some(mut pair) = original_pair {
+            let result = result.and_then(|result| {
+                if pending.key != pair.key
+                    || result.key != pair.key
+                    || result.current_idx != request.current_idx
+                    || result.pinned_source_idx != request.pinned_source_idx
+                    || pair.current_idx != request.current_idx
+                    || pair.pinned_source_idx != request.pinned_source_idx
+                    || pair.pixels.output() != request.output
+                    || [result.width as usize, result.height as usize] != pair.target_size
+                    || pending.expected_target_size != pair.target_size
+                    || result.pixels.output() != request.output
+                    || !result.pixels.valid_for_size(pair.target_size)
+                {
+                    return Err("比較元画像の結果が要求と一致しません".to_string());
+                }
+                Ok(result.pixels)
+            });
+            pair.original = match result {
+                Ok(pixels) => {
+                    let key = self.next_compare_prepared_key();
+                    CompareOriginalVariant::Ready(CompareOriginalPixels {
+                        key,
+                        pixels,
+                        pinned_texture: None,
+                        current_texture: None,
+                        diff_texture: None,
+                    })
+                }
+                Err(err) => {
+                    crate::logger::log(format!("compare original prepare failed: {err}"));
+                    self.show_feedback_warning(format!("比較元画像を準備できません: {err}"));
+                    CompareOriginalVariant::Failed
+                }
+            };
+            self.compare_preparation = ComparePreparationState::Ready(pair);
             ctx.request_repaint();
             return;
         }
@@ -50712,7 +50872,8 @@ impl App {
 
         match result {
             Ok(result) => {
-                if result.current_idx != request.current_idx
+                if result.key != pending.key
+                    || result.current_idx != request.current_idx
                     || result.pinned_source_idx != request.pinned_source_idx
                 {
                     return;
@@ -50772,11 +50933,10 @@ impl App {
                     result.pixels.allocated_bytes(),
                     result.pixels.buffer_count(),
                 ));
-                let key = self.compare_prepared_next_key;
-                self.compare_prepared_next_key =
-                    self.compare_prepared_next_key.wrapping_add(1).max(1);
                 self.compare_preparation = ComparePreparationState::Ready(ComparePreparedPair {
-                    key,
+                    key: pending.key,
+                    current_geometry: pending.current_geometry,
+                    original: CompareOriginalVariant::Absent,
                     current_idx: result.current_idx,
                     pinned_source_idx: result.pinned_source_idx,
                     current_input_size: pending.current_input_size,
@@ -91812,7 +91972,7 @@ impl App {
                 pair.pinned_input_size[0],
                 pair.pinned_input_size[1],
                 pair.allocated_cpu_bytes(),
-                usize::from(pair.pinned_texture.is_some()),
+                pair.managed_gpu_texture_count(),
             ));
         }
     }
@@ -91824,14 +91984,7 @@ impl App {
             .prepared_pair()
             .map_or(0, ComparePreparedPair::allocated_cpu_bytes);
         self.compare_view_mode = CompareViewMode::Off;
-        // 実行中workerはrun_pixel_workの途中で止められない。receiverを捨てると再開時に
-        // 次workerを起動できて並走するため、Preparingだけはpollして捨てるまで所有を保つ。
-        if !matches!(
-            self.compare_preparation,
-            ComparePreparationState::Preparing(_) | ComparePreparationState::Draining(_)
-        ) {
-            self.compare_preparation = ComparePreparationState::Unprepared;
-        }
+        self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         if released_cpu_bytes > 0 {
             crate::logger::log(format!(

@@ -280,6 +280,7 @@ fn prepare_wipe(app: &mut App) {
         egui::Color32::LIGHT_RED,
     ));
     app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+        original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
         pixels: Arc::clone(&pixels),
         indicator_pixels: Arc::clone(&pixels),
         indicator_texture: None,
@@ -290,6 +291,12 @@ fn prepare_wipe(app: &mut App) {
     });
     app.compare_preparation =
         crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+            original: crate::app::CompareOriginalVariant::Absent,
+            current_geometry: crate::app::CompareSourceGeometry {
+                processed_source_size: [1, 1],
+                crop: None,
+                rotation: crate::rotation_db::Rotation::None,
+            },
             key: 1,
             current_idx: 1,
             pinned_source_idx: 42,
