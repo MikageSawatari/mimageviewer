@@ -1,7 +1,133 @@
 # 自動余白カットの全体既定と本別継承
 
-対象: v3.8.0 公開後の次リリース  
-状態: 設計のみ。製品コード、DB、Remote protocol、UI は未変更・未検証。
+対象: v4.9.0 公開後の次リリース (当初は v3.8.0 の次。2026-09-11 に延期)  
+状態: 2026-09-11 設計・独立レビュー済み。2026-10-28 に現行 master (c6951fafb) と照合して §0 の
+改訂を加え、実装に着手 (branch `autotrim-1216`)。§0 と本文が食い違う箇所は §0 が優先する。
+
+## 0. 2026-10-28 改訂 (現行 master との照合)
+
+設計から 1 か月半の間に、同じ「本別の値 + 全体既定 + FollowGlobal」の形をした機能
+(末尾表紙 `FinalCoverSpreadPreference`、単ページ端の配置 `SingletonSpreadPlacementPreference`、
+表紙の次・最終ページの単独表示 `PageAlonePreference`) が実装・出荷された。本機能はこの前例と
+**同じ経路・同じタイミング**に揃え、前例に無い独自の仕組みは足さない (CLAUDE.md「設計の簡素化」)。
+
+### 0.1 前例に揃えるもの
+
+- **保存と fallback**: `spread_db::set_final_cover_spread_preference` と同じく、root key の
+  `FollowGlobal` は行を持たず、nested key (fallback がある本) の `FollowGlobal` は root fallback を
+  遮る marker 行として保存する。§5 の削除規則はこの形で実装する。
+- **解決の時点**: App / `ViewerContextBundle` が持つのは本別 preference (`ViewTrimBookPreference`) だけで、
+  解決済み mode を state に持たない。表示側は描画のたびに `preference.resolve(全体設定)` を引く
+  (`final_cover_spread_enabled_for_current_book()` と同じ)。全体設定を変えても state を書き換える
+  必要がなく、古い解決結果が残る中間状態ができない。
+- **全体設定の変更**: Preferences の OK で `install_preferences_settings` 後に新旧の bool を比べ、
+  変わったときだけ (1) parked context のうち preference が `FollowGlobal` のものを
+  `invalidate_final_cover_spread_display_in_parked_contexts` と同じ範囲で無効化し、
+  (2) mounted context が `FollowGlobal` なら、トリム panel のモード変更と同じ
+  `reanchor_continuous_reading_after_view_trim_change` + 再描画を行う。余白検出 cache
+  (`fs_margin_bbox_cache` / detached の検出結果) は mode 非依存なので消さない。
+- **passive な F12 窓の frozen snapshot**: 旧 §7 の「`DetachedImageWindowSnapshot` /
+  `DeferredDetachedImageWindowView` に trim dependency generation を stamp する」は**採らない**。
+  前例の末尾表紙・単ページ配置も passive 窓の frozen 表示を作り直さず、その窓の context が
+  次に mount されたときに通常経路で作り直る。同じ割り切りに揃える (状態の組み合わせを増やさない)。
+  passive 窓は全体設定を変えた時点では旧トリムのまま見え、クリック等で active になった時点で
+  新しい解決結果になる。
+- **Remote の全体設定**: `settings_db::RemoteReadingSettings` (末尾表紙等と同じ live snapshot) に
+  bool を足し、Remote の解決もこの値を使う。client から bool を受け取らない。
+
+### 0.1a Remote のキャッシュ (旧 §7 末尾の generation 追加は採らない)
+
+2026-10-28 の調査で、現行の Remote は次のとおりと確認した (コード参照)。
+
+- 本体プロセス側の Remote container は、ページ要求のたびに `remote_view_trim_plan_timed` で
+  `view_trim.db` を読み直し、JPEG 化の直前に crop する。crop 結果は cache していない
+  (`RemoteCompositeCacheKey` は crop 前の画素、`RemoteAutoTrimCacheKey` は検出結果だけ)。
+- remote-web 側の generation は `view_trim.db` / `rotation.db` の `PRAGMA data_version` と
+  favorites / sort_order で進む。末尾表紙などの settings_kv の値は generation に入れておらず、
+  `crates/remote-web/src/store.rs` のテストが「関係ない設定の書込でページ資源を捨てない」ことを固定している。
+- 本体と Remote は排他で使うため、本体側で設定を変える操作は Remote session の切り替わりをまたぐ。
+  session が変わると Web 側は `invalidatePageResources(SESSION_INVALIDATED)` でページ資源を捨て、
+  HTTP cache も `Vary: X-mIV-Remote-Session` で分かれる。
+
+したがって全体設定は末尾表紙と同じく `RemoteReadingSettings` の live 読取だけで扱い、
+`LibrarySnapshot` / generation の比較対象には**足さない** (旧 §7 の該当段落と §10 の
+「Remote generation が進む」回帰は取り下げ)。1 ページ要求の中では settings を 1 回だけ読み、
+見開きの相手ページの Auto 判定にも同じ値を使う。
+
+### 0.2 書込経路の現状 (設計時から変わった点)
+
+- 本別トリムの保存は `book_composition::service` の `Command::ViewTrimBook` と
+  `save_view_trim(ViewTrimWriteBatch)` (本の構成編集・本への追加と同じ worker) を通る。
+  §5 の削除規則・旧形式変換・invalid row の保護は `ViewTrimDb` の操作に置き、service・App・
+  Remote・画像フォルダ ZIP 化・メタ情報転送の各 caller は同じ操作を呼ぶ。caller ごとに
+  `is_removable` 相当を判定しない。
+- `ViewTrimWriteBatch.book` は fallback の有無を運ぶ (nested marker の判定に必要)。
+- メタ情報転送・名前変更の key 移行・画像フォルダ ZIP 化は `state_json` を SQL でそのまま写すので、
+  新形式の行もそのまま運ばれる。読み替えは読取側 (`ViewTrimDb` の decoder) だけが行う。
+
+### 0.3 保存形式の確定
+
+```json
+{"version":2,"preference":"follow_global","apply_mode":"none","book_settings":{...}}
+```
+
+- `preference`: `follow_global / none / auto / manual`。
+- `apply_mode`: **旧版へ戻したときのための写し**。`None→none / Auto→auto / Manual→book /
+  FollowGlobal→none`。新版の reader は `version: 2` の行ではこの値を読まない。旧版は未知 field を
+  無視して `apply_mode` と `book_settings` を読むので、明示の自動・手動はダウングレード後も効く。
+- `version` が無い object は旧形式 (§3 の表で変換)。`version` が 2 以外・型違い・`preference` 欠落は
+  `Invalid`。
+
+### 0.4 invalid / DB error の扱い (まれな失敗の割り切り)
+
+`Invalid` / `Error` は ログを残し、その本は**トリムなしで表示**する。root fallback へ進まず、
+旧 margin-fit の移行書込もしない。行は書き換えず、利用者がその本で新しい値を選んだときだけ
+上書きする。旧 §2・§4 にある「commit 済みの表示 state を保持する」ための追加の仕組みは作らない
+(既定の割り切り方針。データは残るので失われるものはない)。
+
+### 0.5 旧 margin-fit
+
+旧 flag は、行が `Missing` (= FollowGlobal) か旧形式の `none` のときだけその本を `Auto` へ移行する
+(現行の「保存値が None なら Auto」と同じ範囲)。新形式の明示値 (`FollowGlobal` marker を含む) は
+上書きしない。旧 flag を新しい全体設定へ読み替えることはしない (§2 の方針どおり)。
+
+### 0.6 読取口を 1 つにする
+
+本別トリムを読む箇所は現在 6 か所ある (`App::apply_view_trim_for_key_with_fallback`、
+`metadata_import_refresh` の再読込、`book_composition::service` の `ViewTrimBook`、
+Remote container の `remote_view_trim_plan_timed`、Remote の get / set handler (`remote_ipc/ui.rs`))。
+このうち `metadata_import_refresh` だけが root fallback を見ていない。すべて
+`ViewTrimDb::load_book_preference_with_fallback(exact, fallback) -> Result<ViewTrimBookLoad, _>`
+(exact → `Missing` のときだけ fallback) と、純関数の resolver を通す。
+
+### 0.7 実装の範囲 (旧 §9 の置き換え)
+
+旧 §9 の「§1.209 作業中の共有 file」は解消済み。並行作業 (ページめくり・一覧表示・全画面比較・
+編集反映コピー・依存物更新) と共有する大きな file (`src/app.rs`、`src/ui_fullscreen.rs`) は、
+本機能では field の型と読取口の差し替えに留め、構造を書き換えない。
+
+1. `view_trim.rs` / `view_trim_db.rs`: `ViewTrimBookPreference`、versioned JSON、
+   `ViewTrimBookLoad`、fallback 付き読取、fallback を知る書込 (`set_book_state(exact, fallback, state)`、
+   `ViewTrimWriteBatch.book` に fallback 有無)、旧 margin-fit の判定関数、純 resolver。
+2. 設定: `Settings::auto_view_trim_default_enabled` (既定 false)、settings_db の KV、
+   `settings_transfer`、Preferences の「閲覧表示」ページ (末尾表紙の隣、検索 anchor `spread/auto-view-trim`)、
+   未保存比較、OK 時の無効化 (§0.1)、`RemoteReadingSettings`。
+3. 本体: App / `ViewerContextBundle` の `view_trim_apply_mode` を `view_trim_book_preference` に置き換え、
+   表示側は resolver 経由で解決。panel は 4 ラジオ。
+4. Remote: container の解決、get / set handler、`normalize_remote_view_trim_state`、Web panel の 4 値、
+   `PROTOCOL_VERSION` 更新 (本体・service・Web asset)。
+5. 文書: display-pipeline、web-remote-plan、マニュアル (fullscreen / tut-reading)、製品ページの該当箇所、
+   backlog。
+
+### 0.8 回帰 (§10 への追加・変更)
+
+- §10 の「Remote generation が進む」は取り下げ。代わりに「1 ページ要求の解決と見開き相手の Auto 判定が
+  同じ live settings 値を使う」「全体 ON で行なしの本の Remote ページが Auto で crop される」。
+- passive F12 snapshot の generation 回帰は取り下げ。代わりに「parked context は FollowGlobal だけ
+  layout を無効化し、明示値の context と余白検出 cache は変えない」。
+- 旧版への写し: `version: 2` 行を旧 `ViewTrimBookState` の serde で読むと、明示 Auto / Manual が
+  `auto` / `book` として読める。
+- `metadata_import_refresh` の再読込が root fallback を含め通常の読込と同じ結果になる。
 
 ## 1. 目的と範囲
 
