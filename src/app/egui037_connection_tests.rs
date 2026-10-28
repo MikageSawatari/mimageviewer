@@ -77,6 +77,10 @@ fn prepared() -> AppTestEnvForTest {
     env.settings.minimize_to_tray_on_close = false;
     env.indexer_init = IndexerInit::Unavailable;
     env.last_main_focused = true;
+    // Keep both sides of the LUT owner's signature empty. Replacing only the
+    // library would restart the default built-in batch on the next Full pass.
+    env.settings.creative_luts.clear();
+    env.creative_lut_library = crate::creative_lut::CreativeLutLibrary::default();
     env
 }
 
@@ -121,6 +125,7 @@ fn full(backend: &mut eframe::HeadlessEpiIntegration, app: &mut App, events: Vec
 #[test]
 #[cfg(windows)]
 fn prepared_edit_full_update_takes_ready_b_before_the_first_local_producer_call() {
+    let trace = prepared_edit::rejection::PreparedEditEvents::start();
     let mut env = prepared();
     let ctx = context();
     for idx in 0..4 {
@@ -147,10 +152,11 @@ fn prepared_edit_full_update_takes_ready_b_before_the_first_local_producer_call(
     let expected = env.prepared_edit_test_local_pixels(key);
     env.fullscreen_idx = Some(1);
     full(&mut backend, &mut env, Vec::new());
+    let events = trace.take();
     assert!(env.final_effect_pending.is_empty());
     assert!(
         !cancel.load(Ordering::Relaxed),
-        "requested={:?} current={:?}, local pending={:?}",
+        "requested={:?} current={:?}, local pending={:?}, dispositions={events:?}",
         key.edit_key,
         env.current_edit_result_key(1),
         env.local_adjust_pending.keys().collect::<Vec<_>>()
@@ -161,6 +167,57 @@ fn prepared_edit_full_update_takes_ready_b_before_the_first_local_producer_call(
     );
     assert!(env.local_adjust_pending.is_empty());
     assert!(env.final_composite_cache.contains_key(&key));
+    assert!(events.is_empty(), "successful B takeover: {events:?}");
+}
+
+#[test]
+#[cfg(windows)]
+fn prepared_edit_lut_service_cancels_b_when_controlled_completion_arrives() {
+    use prepared_edit::{FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition};
+    let trace = prepared_edit::rejection::PreparedEditEvents::start();
+    let mut env = prepared();
+    let ctx = context();
+    for idx in 0..4 {
+        let path = env.tmp.path().join(format!("b-lut-{idx}.png"));
+        image(&mut env, &ctx, path);
+    }
+    env.fullscreen_idx = Some(0);
+    env.viewer_presentation = ViewerPresentation::MainWindow;
+    env.native_video_in_window_active = true;
+    env.reading_flow = crate::settings::ReadingFlow::Paged;
+    env.spread_mode = crate::settings::SpreadMode::Single;
+    env.settings.page_turn_animation_enabled = true;
+    let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    full(&mut backend, &mut env, Vec::new());
+    let (library, tx) = crate::creative_lut::CreativeLutLibrary::controlled_load_for_test(
+        &env.settings.creative_luts,
+    );
+    env.creative_lut_library = library;
+    let _ = env.page_turn_prefetch_targets(0, 2, 2);
+    let (key, cancel) = env.seed_prepared_edit_entry_test(&ctx, 1, false);
+    let edit_key = env.current_edit_result_key(1);
+    env.service_creative_luts(&ctx);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert!(env.final_effect_pending.contains_key(&key));
+    tx.send(Vec::new()).unwrap();
+    env.service_creative_luts(&ctx);
+    let events = trace.take();
+    assert_eq!(
+        env.current_edit_result_key(1),
+        edit_key,
+        "LUT completion need not change EditResultKey: {events:?}"
+    );
+    assert!(cancel.load(Ordering::Relaxed), "{events:?}");
+    assert!(!env.final_effect_pending.contains_key(&key), "{events:?}");
+    assert!(!env.final_composite_cache.contains_key(&key), "{events:?}");
+    assert!(
+        events.iter().any(|event| event.key == key
+            && event.reason
+                == PreparedEditDisposition::Cancelled(PreparedEditCancel::PipelineInvalidation(
+                    FinalPipelineInvalidation::CreativeLutLoaded
+                ))),
+        "{events:?}"
+    );
 }
 
 fn image(app: &mut App, ctx: &egui::Context, path: PathBuf) -> usize {

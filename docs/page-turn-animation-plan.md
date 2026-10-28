@@ -6525,5 +6525,35 @@ Previous の先回り。これらは段階 A と同じく、resident な最上�
   Bと従来D3でrequest ID採番を共有し、CPU開始／ready／実終了と各final・comic登録を同IDへ接続する。
   private登録は`published=false`、表示引取りは`display_takeover`で区別し、残GPU登録時間と段表示ensureのupload時間を既存perfへ記録する。
 
+#### 独立実装レビューへの修正（2026-10-29、843f24c2a後）
+
+- 入力照合は`validate_prepared_edit_input`、外側は`validate_final_prepare_pending`の
+  `Result<(), PreparedEditReject>`を正本にした。既存bool述語は同じ結果の`is_ok()`だけを使う。
+  理由は取消済み・items世代・item identity・編集世代・composite key・context・page identity・params・
+  producer競合・層変更・正規化不足・final下地変更・source欠落・source Arc変更を区別する。
+  注釈の世代／doc／font集合／loaded keyの変更は`ComicExclusion`とし、段・finalの全破棄と分ける。
+- 照合外の取消は`PreparedEditCancel`で、編集入場、Computing表示引取り、需要消滅、keep-set退去、
+  CPU圧力、Next優先、full-resolution作業延期、新要求による置換、worker切断／失敗、context退役を記録する。
+  pipeline失効は`PipelineInvalidation(FinalPipelineInvalidation)`で原因を保持し、
+  `clear_all_final_pipeline_caches`の呼出元もLUTロード完了／LUT設定変更／items変更／段・補正・AI世代変更等を明示する。
+  `CreativeLutLoaded`はkeyが一致していても正当な取消であり、照合拒否とは異なる。
+  pendingを除去する前、既存の要求・資源・状態が残る境界で記録する。新しいpending ownerは追加しない。
+- 製品perfイベントは`fs / prepared_edit_disposition`。既存`request_id`、要求の`context`、path `key`、
+  `idx`、`edit_key`、`composite_key`（bgを含む完全key）、`params_hash`、`state`、`frame`、`pass`、`entry`（caller file:line）、
+  `disposition`（`cancelled`／`comic_excluded`）、型付き`reason`、`proof`を出す。
+  `proof`はsource allocation identity・有無・寸法とmemory層の一致結果だけで、巨大なmask hashや文書全文を作らない。
+  activeなframe／passがないat-rest破棄では該当値をnullにする。perf無効時はJSON・Arc診断・pass取得を行わない。
+  テストだけのopt-in thread-local collectorで、perf無効時にも同じ型付きeventをassertできる。
+- 全update fixtureは設定のLUT署名とlibraryを揃え、起動LUT処理を完了済み／仕事なしへ固定してからBを投入する。
+  別の制御channelで投入後のLUT完了を配送し、`PipelineInvalidation(CreativeLutLoaded)`の取消を直接検査する。
+  過去の1失敗がこの原因だったとの断定はしない。sleep・期待値の削除・製品条件の緩和は行わない。
+- 非一様画像・実効果local・空間maskから、通常CPU経路で独立に作った累積期待値を比較する。
+  concealのみ、成功する注釈のみのraw／完成final入力、font一部不足、comic実走行枠満杯、
+  Computing中の変更、detached実表示、編集切替／ResumeのB固有回帰も補う。
+- `ComicCacheEntry`に採用時の`texture_options`を保持する。B・通常同期producer・通常worker採用の全てが
+  実optionsを保存し、公開後も同じmip有無でVRAMへ計上する。Nearestの架空mipを加算しない。
+
+検証コマンド・件数・独立レビュー結果は上記の実装報告へ追記する。今回の修正では確認用exeを再ビルドしない。
+
 Bの不足を理由とする新しい待機・演出省略は加えない。受理済み素材、held resource、canonical receiptを品質公開で差し替えない。
 表示引取り時に残るGPU登録コストを含む性能確認と利用者実機確認は未完了である。

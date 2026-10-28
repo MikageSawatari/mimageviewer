@@ -1279,7 +1279,7 @@ fn actual_b_perf_events_share_legacy_request_ids_and_record_takeover_and_cancel_
         app.cancel_final_effects_for_idx(2);
         (b_id, legacy_id)
     };
-    let cancelled_id = {
+    let (cancelled_id, cancelled_key) = {
         let mut app = app(&ctx);
         local(&mut app, 1, true);
         annotation(&mut app, 1);
@@ -1290,6 +1290,7 @@ fn actual_b_perf_events_share_legacy_request_ids_and_record_takeover_and_cancel_
         let hold = WorkerHold::new();
         assert!(app.spawn_prepared_edit_job(&ctx, 1, unit, &mut false));
         hold.entered();
+        let key = *app.final_effect_pending.keys().next().unwrap();
         let id = app
             .final_effect_pending
             .values()
@@ -1302,7 +1303,7 @@ fn actual_b_perf_events_share_legacy_request_ids_and_record_takeover_and_cancel_
         app.cancel_previous_computing_for_next();
         hold.release();
         wait_idle(&app);
-        id
+        (id, key)
     };
     assert!(b_id > 0 && legacy_id > b_id && cancelled_id > legacy_id);
     // Permit return precedes the final trace just as in the legacy worker.
@@ -1385,6 +1386,38 @@ fn actual_b_perf_events_share_legacy_request_ids_and_record_takeover_and_cancel_
     assert!(events.iter().any(|row| row["cat"] == "edit_materialize"
         && row["kind"] == "upload"
         && row["stage"] == "local"));
+    let disposition = events
+        .iter()
+        .find(|row| row["kind"] == "prepared_edit_disposition" && row["request_id"] == cancelled_id)
+        .expect("typed cancellation reached the real perf writer");
+    assert_eq!(disposition["reason"], "Cancelled(NextPriority)");
+    assert_eq!(disposition["disposition"], "cancelled");
+    assert_eq!(disposition["state"], "computing");
+    assert_eq!(disposition["composite_key"], format!("{cancelled_key:?}"));
+    let started = events
+        .iter()
+        .find(|row| row["kind"] == "final_prepare_cpu_started" && row["request_id"] == cancelled_id)
+        .unwrap();
+    assert!(disposition["context"].is_u64());
+    assert_eq!(
+        disposition["context"], started["context"],
+        "main context serial zero is valid"
+    );
+    assert!(
+        disposition["edit_key"]
+            .as_str()
+            .unwrap()
+            .contains("EditResultKey")
+    );
+    assert!(
+        disposition["entry"]
+            .as_str()
+            .unwrap()
+            .contains("final_prepare.rs")
+    );
+    assert!(disposition["frame"].is_number());
+    assert!(disposition.get("pass").is_some());
+    assert!(disposition["proof"]["expected_allocation"].is_number());
 }
 
 #[test]

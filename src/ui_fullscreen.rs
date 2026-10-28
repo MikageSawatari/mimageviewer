@@ -52983,6 +52983,7 @@ impl App {
             let composed = std::sync::Arc::new(pixels);
             let t_up = std::time::Instant::now();
             let upload = crate::app::clamp_for_gpu(&composed).into_owned();
+            let texture_options = self.display_texture_options(i);
             let texture = ctx.load_texture(
                 format!(
                     "comic_{i}_{}_{}_{}",
@@ -52994,7 +52995,7 @@ impl App {
                 // 注釈の焼き込みは同期経路 (`ensure_comic_composite_texture`) と
                 // この worker 完了経路の**2 つ**が上げる。片方だけ直したせいで、
                 // ニアレストが効かない症状が残った (利用者報告 2026-08-13)。
-                self.display_texture_options(i),
+                texture_options,
             );
             let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
@@ -53034,6 +53035,7 @@ impl App {
                     ),
                     pixels: composed,
                     texture,
+                    texture_options,
                     base: p.base,
                     comic_gen: p.comic_gen,
                     dims: p.dims,

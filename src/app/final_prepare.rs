@@ -244,26 +244,63 @@ impl App {
         key: FinalCompositeKey,
         pending: &FinalEffectPending,
     ) -> bool {
-        !pending.cancel.load(Ordering::Relaxed)
-            && pending.items_generation == self.items_generation
-            && self.edit_key_describes_current_page(&key.edit_key, key.edit_key.idx)
-            && key
-                == self.final_composite_key_for_pixels(
-                    self.current_edit_result_key(key.edit_key.idx),
-                    pending.source_size,
-                    self.effective_params(key.edit_key.idx),
-                )
-            && pending.origin.unit().is_none_or(|unit| {
-                // Binding is the payload identity, not its temporary host/viewport.
-                // F12 transfers this owner; fork creates an empty pending map.
-                unit.context == self.projected_viewer_context_id()
-                    && unit.items_generation == self.items_generation
-                    && unit.pages.iter().any(|page| page.idx == key.edit_key.idx)
-            })
-            && pending
-                .state
-                .edit_input()
-                .is_none_or(|input| self.prepared_edit_input_is_current(input))
+        self.validate_final_prepare_pending(key, pending).is_ok()
+    }
+
+    pub(super) fn validate_final_prepare_identity(
+        &self,
+        key: EditResultKey,
+    ) -> Result<(), PreparedEditReject> {
+        if key.items_generation != self.items_generation {
+            return Err(PreparedEditReject::ItemsGeneration);
+        }
+        if !self.edit_key_describes_current_page(&key, key.idx) {
+            return Err(PreparedEditReject::ItemIdentity);
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_final_prepare_pending(
+        &self,
+        key: FinalCompositeKey,
+        pending: &FinalEffectPending,
+    ) -> Result<(), PreparedEditReject> {
+        if pending.cancel.load(Ordering::Relaxed) {
+            return Err(PreparedEditReject::Cancelled);
+        }
+        if pending.items_generation != self.items_generation {
+            return Err(PreparedEditReject::ItemsGeneration);
+        }
+        if let Some(unit) = pending.origin.unit() {
+            // Binding is payload identity, independent of F12's temporary host.
+            if unit.context != self.projected_viewer_context_id() {
+                return Err(PreparedEditReject::Context);
+            }
+            if unit.items_generation != self.items_generation {
+                return Err(PreparedEditReject::ItemsGeneration);
+            }
+            if !unit.pages.iter().any(|page| page.idx == key.edit_key.idx) {
+                return Err(PreparedEditReject::ItemIdentity);
+            }
+        }
+        if let Some(input) = pending.state.edit_input() {
+            self.validate_prepared_edit_input(input)?;
+            if key != input.key {
+                return Err(PreparedEditReject::CompositeKey);
+            }
+        } else {
+            self.validate_final_prepare_identity(key.edit_key)?;
+        }
+        if key
+            != self.final_composite_key_for_pixels(
+                self.current_edit_result_key(key.edit_key.idx),
+                pending.source_size,
+                self.effective_params(key.edit_key.idx),
+            )
+        {
+            return Err(PreparedEditReject::CompositeKey);
+        }
+        Ok(())
     }
 
     /// No materialization, I/O, texture allocation, mask loading or AI start.
@@ -402,9 +439,7 @@ impl App {
             })
             .collect();
         for key in obsolete {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, PreparedEditCancel::DemandObsolete);
         }
         let Some(unit) = demand else {
             return;
@@ -625,9 +660,7 @@ impl App {
                         continue;
                     }
                     // Drop channel, temporary result and pending before retry.
-                    let pending = app.final_effect_pending.remove(&key).unwrap();
-                    pending.cancel.store(true, Ordering::Relaxed);
-                    drop(pending);
+                    app.cancel_final_effect_key(key, PreparedEditCancel::Pressure);
                     app.record_final_cpu_pressure(key, "reclaimed", location, request);
                 }
             });
@@ -695,7 +728,7 @@ impl App {
                     .receive(),
                 Err(mpsc::TryRecvError::Empty)
             ) {
-                if let Some(pending) = self.final_effect_pending.remove(&key) {
+                if let Some(pending) = self.final_effect_pending.get(&key) {
                     let request = (
                         pending.gpu_diagnostics.request_id(),
                         pending.gpu_diagnostics.requested_position(),
@@ -703,9 +736,8 @@ impl App {
                     // Publish the cancellation marker before the worker can
                     // observe it and publish actual completion.
                     self.record_final_cpu_pressure(key, "cancelled_for_next", "computing", request);
-                    pending.cancel.store(true, Ordering::Relaxed);
-                    drop(pending); // worker retains permit and its reservation
                 }
+                self.cancel_final_effect_key(key, PreparedEditCancel::NextPriority);
             }
         }
     }
@@ -1104,10 +1136,10 @@ impl App {
                     .get(&key)
                     .map(|entry| entry.texture.clone()),
             );
-        } else if let Some(pending) = self.final_effect_pending.remove(&key) {
+        } else {
             // Receiver removal revokes publication; the worker still owns permit
             // and reservation until it really finishes. Never join on the UI.
-            pending.cancel.store(true, Ordering::Relaxed);
+            self.cancel_final_effect_key(key, PreparedEditCancel::DisplayComputing);
         }
         PreparedFinalDisplay::Continue
     }

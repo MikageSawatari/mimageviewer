@@ -196,7 +196,11 @@ impl ViewerTextureCaches<'_> {
         }
         for (&idx, entry) in self.comic_cache {
             if includes_idx(indices, idx) {
-                accountant.add_texture(VramSubsystem::ComicCache, &entry.texture, true);
+                accountant.add_texture(
+                    VramSubsystem::ComicCache,
+                    &entry.texture,
+                    entry.texture_options.mipmap_mode.is_some(),
+                );
             }
         }
         for (key, entry) in self.edit_result_cache {

@@ -6649,3 +6649,12 @@ modal化やreaderの閉じ直しは、頁送り・F12の既存機能を維持す
 既存のcontext所有と有限なpermit・予約・一括公開で組合せを減らす。品質公開から受理済み素材・held resource・canonical receiptを差し替えない。
 実装差分の独立レビュー・自動検証・性能・実機確認の結果は`target/pageturn-1461/implementation-report-b.md`を参照する。
 この記録は検証成功の宣言ではなく、表示引取り時の残GPU登録コストも計測対象に残す。
+
+#### 段階B独立レビュー後の診断・回帰追補（2026-10-29）
+
+pending除去前の型付き取消／拒否記録を、mounted contextだけでなくat-restの補正採用失効と
+bundle退役にも接続した。記録するcontextは要求に捕捉したownerであり、診断のためのmountや
+兄弟contextの失効を行わない。frame／passを持たない破棄の記録はnullとする。
+`prepared_edit_disposition`の項目と理由型はpage-turn計画§28.5.1に記録した。
+detachedの実表示入口と、通常mounted状態での既存の編集切替・Resumeを、Bの各未公開状態で直接通すheadless回帰を追加した。
+採否やpresentation述語は変更せず、既存所有境界の観測と回帰を足す修正であり、症状パッチではない。

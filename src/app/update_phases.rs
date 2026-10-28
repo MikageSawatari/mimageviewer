@@ -188,7 +188,9 @@ impl App {
             .creative_lut_library
             .poll(&self.settings.creative_luts, ctx)
         {
-            self.clear_all_final_pipeline_caches();
+            self.clear_all_final_pipeline_caches(
+                crate::app::FinalPipelineInvalidation::CreativeLutLoaded,
+            );
             #[cfg(windows)]
             self.sync_native_video_grade();
         }

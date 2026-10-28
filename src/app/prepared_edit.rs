@@ -11,6 +11,17 @@ use super::final_prepare_cpu::{
 };
 use super::*;
 
+pub(crate) mod rejection;
+pub(crate) use rejection::{
+    ComicExclusion, FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition,
+    PreparedEditReject,
+};
+
+#[cfg(test)]
+mod review_lifecycle_tests;
+#[cfg(test)]
+mod review_pixel_tests;
+
 #[derive(Clone, Copy)]
 enum InputStage {
     Raw,
@@ -48,7 +59,7 @@ fn identity_plan(plan: &FinalCompositePlan) -> bool {
 }
 
 pub(super) struct PreparedEditInput {
-    key: FinalCompositeKey,
+    pub(super) key: FinalCompositeKey,
     local_key: LocalAdjustResultKey,
     page_key: String,
     source: Arc<egui::ColorImage>,
@@ -464,14 +475,15 @@ impl App {
             ],
         );
     }
-    fn cancel_prepared_edit_key(&mut self, key: FinalCompositeKey) {
-        if let Some(pending) = self.final_effect_pending.remove(&key) {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-    }
     /// An editing request always revokes B's publication before handing control
     /// to the existing Enter/Switch/Resume owner. Never merge a continuation.
+    #[track_caller]
     pub(crate) fn cancel_prepared_edit_for_entry(&mut self, idx: usize) {
+        self.cancel_prepared_edit_for_idx(idx, PreparedEditCancel::EditingEntry);
+    }
+
+    #[track_caller]
+    fn cancel_prepared_edit_for_idx(&mut self, idx: usize, reason: PreparedEditCancel) {
         let keys: Vec<_> = self
             .final_effect_pending
             .iter()
@@ -480,12 +492,13 @@ impl App {
             })
             .collect();
         for key in keys {
-            self.cancel_prepared_edit_key(key);
+            self.cancel_final_effect_key(key, reason);
         }
     }
 
     /// Receive before classifying: a result already in the channel is ready,
     /// even when no ordinary polling pass has run since worker completion.
+    #[track_caller]
     pub(crate) fn resolve_prepared_edit_for_display(&mut self, ctx: &egui::Context, idx: usize) {
         let keys: Vec<_> = self
             .final_effect_pending
@@ -502,32 +515,53 @@ impl App {
                 .state
                 .receive();
             if received.is_err() {
-                self.cancel_prepared_edit_key(key);
+                self.cancel_final_effect_key(
+                    key,
+                    match received {
+                        Err(mpsc::TryRecvError::Empty) => PreparedEditCancel::DisplayComputing,
+                        _ => PreparedEditCancel::WorkerDisconnected,
+                    },
+                );
                 continue;
             }
             self.adopt_prepared_edit(ctx, key, FinalPrepareAdoption::BeforeLookup, true);
         }
     }
 
-    fn prepared_comic_is_current(&self, input: &PreparedEditInput, out: &EditOutput) -> bool {
+    fn validate_prepared_comic(
+        &self,
+        input: &PreparedEditInput,
+        out: &EditOutput,
+    ) -> Result<(), ComicExclusion> {
         let Some(comic) = &input.comic else {
-            return false;
+            return Ok(());
         };
-        comic.generation == self.comic_generation
-            && self
-                .comic_docs
-                .get(&input.page_key)
-                .is_none_or(|doc| Some(doc) == out.doc.as_ref())
-            && match (&comic.fonts, &self.comic_fonts) {
-                (Some(old), Some(current)) => Arc::ptr_eq(old, current),
-                (None, None) => true,
-                _ => false,
-            }
-            && comic.loaded_keys == self.comic_loaded_font_keys
+        if comic.generation != self.comic_generation {
+            return Err(ComicExclusion::Generation);
+        }
+        if !self
+            .comic_docs
+            .get(&input.page_key)
+            .is_none_or(|doc| Some(doc) == out.doc.as_ref())
+        {
+            return Err(ComicExclusion::DocumentChanged);
+        }
+        if !match (&comic.fonts, &self.comic_fonts) {
+            (Some(old), Some(current)) => Arc::ptr_eq(old, current),
+            (None, None) => true,
+            _ => false,
+        } {
+            return Err(ComicExclusion::FontSetChanged);
+        }
+        if comic.loaded_keys != self.comic_loaded_font_keys {
+            return Err(ComicExclusion::FontKeysChanged);
+        }
+        Ok(())
     }
 
     /// Returns true for B-owned states (including deferred registration). The
     /// legacy adoption path must never destructure or partially publish them.
+    #[track_caller]
     pub(super) fn adopt_prepared_edit(
         &mut self,
         ctx: &egui::Context,
@@ -541,14 +575,17 @@ impl App {
         if pending.state.edit_input().is_none() {
             return false;
         }
-        if !self.final_prepare_pending_is_current(key, pending)
-            || (!display
-                && pending
-                    .origin
-                    .unit()
-                    .is_some_and(|unit| !self.speculative_final_unit_is_needed(unit)))
+        if let Err(reason) = self.validate_final_prepare_pending(key, pending) {
+            self.cancel_final_effect_key(key, PreparedEditCancel::Rejected(reason));
+            return true;
+        }
+        if !display
+            && pending
+                .origin
+                .unit()
+                .is_some_and(|unit| !self.speculative_final_unit_is_needed(unit))
         {
-            self.cancel_prepared_edit_key(key);
+            self.cancel_final_effect_key(key, PreparedEditCancel::DemandObsolete);
             return true;
         }
         let (input, out, elapsed_ms) = match &pending.state {
@@ -566,7 +603,7 @@ impl App {
             Ok(out) => out,
             Err(error) => {
                 crate::logger::log(format!("[edit-prepare] idx={}: {error}", key.edit_key.idx));
-                self.cancel_prepared_edit_key(key);
+                self.cancel_final_effect_key(key, PreparedEditCancel::WorkerFailed);
                 self.show_feedback_toast("編集画像の先読みを完了できませんでした".to_owned());
                 return true;
             }
@@ -580,10 +617,20 @@ impl App {
                 .get(&key.edit_key.idx)
                 .is_some_and(|layers| *layers != local.layers)
         {
-            self.cancel_prepared_edit_key(key);
+            self.cancel_final_effect_key(
+                key,
+                PreparedEditCancel::Rejected(PreparedEditReject::LayersChanged),
+            );
             return true;
         }
-        let comic_current = self.prepared_comic_is_current(input, out);
+        let comic_verdict = self.validate_prepared_comic(input, out);
+        if let Err(reason) = comic_verdict {
+            self.record_prepared_edit_disposition(
+                key,
+                PreparedEditDisposition::ComicExcluded(reason),
+            );
+        }
+        let comic_current = input.comic.is_some() && comic_verdict.is_ok();
         let has_images = out.final_pixels.is_some() || (comic_current && out.comic.is_some());
         if !has_images {
             self.record_edit_texture_registration(
@@ -905,6 +952,7 @@ impl App {
                         ),
                         pixels: comic.pixels,
                         texture,
+                        texture_options: options,
                         base: base.clone(),
                         comic_gen: self.comic_generation,
                         dims: base.size,
@@ -1230,24 +1278,37 @@ impl App {
     }
 
     pub(super) fn prepared_edit_input_is_current(&self, input: &PreparedEditInput) -> bool {
+        self.validate_prepared_edit_input(input).is_ok()
+    }
+
+    pub(super) fn validate_prepared_edit_input(
+        &self,
+        input: &PreparedEditInput,
+    ) -> Result<(), PreparedEditReject> {
         let idx = input.key.edit_key.idx;
-        if input.key.edit_key != self.current_edit_result_key(idx)
-            || input.params != *self.effective_params(idx)
-            || self.page_path_key(idx).as_ref() != Some(&input.page_key)
-            || self.prepared_edit_conflict(idx, &input.page_key)
-        {
-            return false;
+        self.validate_final_prepare_identity(input.key.edit_key)?;
+        if input.key.edit_key != self.current_edit_result_key(idx) {
+            return Err(PreparedEditReject::EditGeneration);
+        }
+        if input.params != *self.effective_params(idx) {
+            return Err(PreparedEditReject::Params);
+        }
+        if self.page_path_key(idx).as_ref() != Some(&input.page_key) {
+            return Err(PreparedEditReject::PageIdentity);
+        }
+        if self.prepared_edit_conflict(idx, &input.page_key) {
+            return Err(PreparedEditReject::ProducerConflict);
         }
         if let Some(LocalMaterializeLayers::Memory(layers)) = &input.local
             && self.local_adjust_page_layers.get(&idx) != Some(layers)
         {
-            return false;
+            return Err(PreparedEditReject::LayersChanged);
         }
         if input.local.is_none()
             && !self.local_adjust_is_materialized(idx)
             && self.current_local_adjust_source_pixels(idx).is_some()
         {
-            return false;
+            return Err(PreparedEditReject::NormalizationRequired);
         }
         let final_current = match &input.final_input {
             PreparedFinalInput::Edit => true,
@@ -1268,9 +1329,23 @@ impl App {
             }
         };
         if !final_current {
-            return false;
+            return Err(PreparedEditReject::FinalBaseChanged);
         }
-        let current = match input.stage {
+        let current = self
+            .current_prepared_edit_source(input)
+            .ok_or(PreparedEditReject::SourceMissing)?;
+        if !Arc::ptr_eq(&current, &input.source) {
+            return Err(PreparedEditReject::SourceArcChanged);
+        }
+        Ok(())
+    }
+
+    fn current_prepared_edit_source(
+        &self,
+        input: &PreparedEditInput,
+    ) -> Option<Arc<egui::ColorImage>> {
+        let idx = input.key.edit_key.idx;
+        match input.stage {
             InputStage::Raw => self.current_raw_source_pixels(idx),
             InputStage::Erase => self.current_erase_result_pixels(idx),
             InputStage::Local => self.current_local_adjust_pixels(idx),
@@ -1291,8 +1366,7 @@ impl App {
             InputStage::Final => self
                 .exact_complete_final_composite_entry(idx)
                 .map(|(_, e)| e.pixels.clone()),
-        };
-        current.is_some_and(|pixels| Arc::ptr_eq(&pixels, &input.source))
+        }
     }
 
     pub(super) fn spawn_prepared_edit_job(
@@ -1415,7 +1489,7 @@ impl App {
         }
         // A new page request supersedes an older generation of B at this
         // existing ownership boundary; its worker keeps any execution leases.
-        self.cancel_prepared_edit_for_entry(idx);
+        self.cancel_prepared_edit_for_idx(idx, PreparedEditCancel::RequestSuperseded);
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "fs",

@@ -713,6 +713,9 @@ mod final_prepare_budget;
 mod final_prepare_cpu;
 mod prepared_edit;
 use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, FinalEffectState};
+pub(crate) use prepared_edit::{
+    FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
+};
 #[cfg(test)]
 pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
@@ -10214,6 +10217,8 @@ pub(crate) struct ComicCacheEntry {
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
+    /// Actual sampler/mipmap options used when this annotation was registered.
+    pub texture_options: egui::TextureOptions,
     /// 下地 final composite pixels の Arc 自体を保持する。`Arc::ptr_eq` で同一性を判定する
     /// ことで、下地が作り直されたら (= 別アロケーション) 再ベイクし、かつ Arc を生かして
     /// おくのでアドレス再利用による ABA を原理的に防ぐ (Codex P2)。下地が変わるのは
@@ -28651,7 +28656,7 @@ impl App {
         self.fs_upload_backlog.clear();
         self.fs_pending.clear();
         self.input_generation.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.clear_color_filter_for_new_items();
         self.current_color_cache_map = None;
         self.current_color_catalog = None;
@@ -42722,7 +42727,7 @@ impl App {
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.cancel_all_local_adjust_pending();
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
@@ -42736,7 +42741,7 @@ impl App {
         self.erase_result_cache.clear();
         self.input_generation.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.cancel_all_erase_inpaint_pending();
         // 360 度パノラマビュー: フォルダ変更で cache 全体が変わったので世代を一斉 bump
         // (§3.6.2.2)。adjustment_generation / ai_upscale_generation の HashMap
@@ -45701,7 +45706,7 @@ impl App {
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::PageEditsReplaced);
         self.export_crop_mode = false;
         self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.export_crop_spread_ctx = None;
@@ -48439,7 +48444,7 @@ impl App {
             self.cancel_all_local_adjust_pending();
             self.cancel_all_erase_inpaint_pending();
             self.bump_all_adjustment_generations();
-            self.clear_all_final_pipeline_caches();
+            self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::VirtualPagesReprepared);
         }
         if virtual_page_reprepare {
             self.reprepare_page_edits_for_existing_virtual_order();
@@ -83381,24 +83386,29 @@ impl App {
         }
     }
 
+    #[track_caller]
     fn clear_edit_result_caches_for_idx(&mut self, idx: usize) {
         self.edit_result_cache.retain(|key, _| key.idx != idx);
         self.clear_final_pipeline_caches_for_idx(idx);
     }
 
+    #[track_caller]
     fn clear_edit_result_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
         self.edit_result_cache.retain(|key, _| key.idx != idx);
         self.clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(idx);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize) {
         self.clear_final_pipeline_caches_for_idx_inner(idx, true);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
         self.clear_final_pipeline_caches_for_idx_inner(idx, false);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx_inner(&mut self, idx: usize, clear_retained: bool) {
         self.cancel_final_ai_for_idx(idx);
         self.cancel_final_effects_for_idx(idx);
@@ -83415,14 +83425,15 @@ impl App {
         self.cancel_comic_bake_for_idx(idx);
     }
 
-    pub(crate) fn clear_all_final_pipeline_caches(&mut self) {
+    #[track_caller]
+    pub(crate) fn clear_all_final_pipeline_caches(&mut self, reason: FinalPipelineInvalidation) {
         for pending in self.final_ai_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.final_ai_pending.clear();
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::PipelineInvalidation(reason));
         self.final_composite_cache
             .clear_with_drop_reason("pipeline_invalidate_all");
         self.comic_cache.clear();
@@ -83436,7 +83447,9 @@ impl App {
         }
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::PipelineInvalidation(
+            FinalPipelineInvalidation::SessionClosed,
+        ));
         self.final_composite_cache
             .clear_with_drop_reason("session_close");
         self.comic_cache.clear();
@@ -84702,7 +84715,7 @@ impl App {
         self.conceal_cache.clear();
         self.comic_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::EraseGenerationChanged);
     }
 
     /// 消しゴムマスクが変わったことを idx 単位の世代で表す。
@@ -84943,7 +84956,7 @@ impl App {
         // job が完了して旧結果を再挿入することもない。
         self.clear_retained_final_ai_cache("conceal_generation_change");
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ConcealGenerationChanged);
     }
 
     /// 表示パイプライン用: 該当 idx に隠蔽マスクが保存されていれば、現在の
@@ -86771,7 +86784,7 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.final_ai_pending.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::FullResolutionDeferred);
     }
 
     #[cfg(test)]
@@ -87453,7 +87466,16 @@ impl App {
         true
     }
 
+    #[track_caller]
     fn cancel_final_effects_for_idx(&mut self, idx: usize) {
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::EditStagesChanged),
+        );
+    }
+
+    #[track_caller]
+    fn cancel_final_effects_for_idx_with_reason(&mut self, idx: usize, reason: PreparedEditCancel) {
         let keys: Vec<FinalCompositeKey> = self
             .final_effect_pending
             .keys()
@@ -87461,15 +87483,15 @@ impl App {
             .filter(|key| key.edit_key.idx == idx)
             .collect();
         for key in keys {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, reason);
         }
     }
 
-    fn cancel_all_final_effects(&mut self) {
-        for (_, pending) in self.final_effect_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
+    #[track_caller]
+    fn cancel_all_final_effects(&mut self, reason: PreparedEditCancel) {
+        let keys: Vec<_> = self.final_effect_pending.keys().copied().collect();
+        for key in keys {
+            self.cancel_final_effect_key(key, reason);
         }
     }
 
@@ -87533,6 +87555,10 @@ impl App {
             }
         }
         for key in disconnected {
+            self.record_prepared_edit_disposition(
+                key,
+                PreparedEditDisposition::Cancelled(PreparedEditCancel::WorkerDisconnected),
+            );
             let edited = self
                 .final_effect_pending
                 .remove(&key)
@@ -87997,7 +88023,12 @@ impl App {
         // 再合成中もその texture を返し、完成結果の同一 key insert で原子的に差し替える。
         self.cancel_prefetch_final_effects_except(reuse_prefetch.then_some(key));
         if !reuse_prefetch {
-            self.cancel_final_effects_for_idx(key.edit_key.idx);
+            self.cancel_final_effects_for_idx_with_reason(
+                key.edit_key.idx,
+                PreparedEditCancel::PipelineInvalidation(
+                    FinalPipelineInvalidation::DisplayEffectReplaced,
+                ),
+            );
         }
         if reuse_prefetch {
             if let Some(pending) = self.final_effect_pending.get_mut(&key) {
@@ -89224,13 +89255,14 @@ impl App {
                 &bake_base, &layers,
             ));
             let upload = clamp_for_gpu(&composed).into_owned();
+            let texture_options = self.display_texture_options(idx);
             let texture = ctx.load_texture(
                 format!(
                     "comic_{idx}_{}_{comic_gen}_{preview_scale}",
                     Arc::as_ptr(&base) as usize
                 ),
                 upload,
-                self.display_texture_options(idx),
+                texture_options,
             );
             self.comic_cache.insert(
                 idx,
@@ -89241,6 +89273,7 @@ impl App {
                     ),
                     pixels: composed,
                     texture: texture.clone(),
+                    texture_options,
                     base: Arc::clone(&base),
                     comic_gen,
                     dims: [w, h],
@@ -89533,7 +89566,12 @@ impl App {
                     };
                     if live_pending {
                         self.final_ai_cache.insert(key, entry);
-                        self.cancel_final_effects_for_idx(key.edit_key.idx);
+                        self.cancel_final_effects_for_idx_with_reason(
+                            key.edit_key.idx,
+                            PreparedEditCancel::PipelineInvalidation(
+                                FinalPipelineInvalidation::FinalAiCompleted,
+                            ),
+                        );
                         repaint = true;
                     } else if retained_stored {
                         crate::logger::log(format!(
@@ -89623,9 +89661,7 @@ impl App {
             .filter(|key| !keep_set.contains(&key.edit_key.idx))
             .collect();
         for key in final_effect_evict {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, PreparedEditCancel::KeepSetEviction);
         }
         // comic は final composite を下地にするので keep_set に追従させる (Codex P2:
         // フル解像度 comic を eviction で生き残らせない + 下地と整合)。
@@ -92135,7 +92171,10 @@ impl App {
     pub(crate) fn clear_final_stage_only_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
-        self.cancel_final_effects_for_idx(idx);
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::AdjustmentChanged),
+        );
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
         self.final_composite_cache
@@ -92203,7 +92242,7 @@ impl App {
         self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         self.compare_view_mode.cancel_wipe_drag();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AdjustmentChanged);
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
     }
@@ -92410,7 +92449,12 @@ impl App {
         // 毎回 AI を待たされる退行があった (= 「先読み表示は出ているのに次画像で
         // 一瞬アップスケール前が見えて、AI 処理から再表示」のユーザー報告)。
         let Some(key) = self.metadata_cache_key(idx) else {
-            self.cancel_final_effects_for_idx(idx);
+            self.cancel_final_effects_for_idx_with_reason(
+                idx,
+                PreparedEditCancel::PipelineInvalidation(
+                    FinalPipelineInvalidation::AdjustmentChanged,
+                ),
+            );
             self.final_composite_cache
                 .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
                     cache_key.edit_key.idx != idx
@@ -92420,7 +92464,10 @@ impl App {
         };
         let slot = self.adjustment_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
-        self.cancel_final_effects_for_idx(idx);
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::AdjustmentChanged),
+        );
         self.final_composite_cache
             .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
                 cache_key.edit_key.idx != idx
@@ -92437,7 +92484,7 @@ impl App {
         for v in self.ai_upscale_generation.values_mut() {
             *v = v.saturating_add(1);
         }
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AiGenerationChanged);
     }
 
     /// `adjustment_generation` の全 entry を +1 する (saturating)。
@@ -92447,7 +92494,7 @@ impl App {
         for v in self.adjustment_generation.values_mut() {
             *v = v.saturating_add(1);
         }
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AdjustmentChanged);
     }
 
     /// 指定 source_key の `ai_upscale_generation` を +1 する (saturating)。

@@ -2903,7 +2903,9 @@ impl App {
                 }
                 self.creative_lut_library
                     .reload(&self.settings.creative_luts);
-                self.clear_all_final_pipeline_caches();
+                self.clear_all_final_pipeline_caches(
+                    crate::app::FinalPipelineInvalidation::CreativeLutSettingsChanged,
+                );
                 #[cfg(windows)]
                 self.sync_native_video_grade();
             }

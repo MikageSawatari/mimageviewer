@@ -1819,7 +1819,9 @@ fn display_basis_prepared_frame_keeps_selected_thumbnail_or_passthrough_after_al
             app.passthrough_rendition_cache = Default::default();
             app.fs_cache.clear();
             app.edit_result_cache.clear();
-            app.clear_all_final_pipeline_caches();
+            app.clear_all_final_pipeline_caches(
+                crate::app::FinalPipelineInvalidation::AdjustmentChanged,
+            );
             let ordinary_after = draw_prepared_single_frame(&mut app, &ctx, viewport, &ordinary);
             let throughput_after =
                 draw_prepared_single_frame(&mut app, &ctx, viewport, &throughput);
@@ -1899,7 +1901,9 @@ fn display_basis_pdf_noninteger_page_box_keeps_accepted_sampler_reference_after_
                 app.page_dims_cache.clear();
                 app.fs_cache.clear();
                 app.passthrough_rendition_cache = Default::default();
-                app.clear_all_final_pipeline_caches();
+                app.clear_all_final_pipeline_caches(
+                    crate::app::FinalPipelineInvalidation::AdjustmentChanged,
+                );
                 let after = draw_prepared_single_frame(&mut app, &ctx, viewport, &state);
                 assert_eq!(after.fit_input, before.fit_input);
                 same_frame_and_common_pixel(before, after, ppp);
@@ -2140,7 +2144,9 @@ fn display_basis_worker_thumbnail_without_source_dimensions_retains_specified_sa
         app.thumb_pixels.clear();
         app.page_dims_cache.clear();
         app.fs_cache.clear();
-        app.clear_all_final_pipeline_caches();
+        app.clear_all_final_pipeline_caches(
+            crate::app::FinalPipelineInvalidation::AdjustmentChanged,
+        );
         assert_eq!(captured.display_basis(), accepted.display_basis());
         app.spread_mode = SpreadMode::Single;
         app.reading_flow = ReadingFlow::Paged;
