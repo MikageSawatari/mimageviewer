@@ -40,7 +40,6 @@ egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
 epaint = { path = "vendor/epaint" }
 tantivy = { path = "vendor/tantivy" }
-ort = { path = "crates/ort-patched" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
 # launcher = `mimageviewer.exe`) の
@@ -425,7 +424,7 @@ turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"
 base64 = "0.22"
-ort = { version = "2.0.0-rc.12", features = ["directml", "cuda", "tensorrt", "load-dynamic"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "directml", "cuda", "tensorrt", "load-dynamic"] }
 ndarray = "0.17"
 # mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
 # JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。
