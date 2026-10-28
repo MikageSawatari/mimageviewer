@@ -86,7 +86,7 @@ CF_DIB でクリップボードへ置く。
 UI スレッド (メニュー dispatch)                     worker "clipboard-edited-copy"
   対象決定 → CompositeSource + BakedEditSnapshot      decode (ZIP 読み出し・PDF 描画を含む)
   を固定 (Ctrl+E / 一括書き出しと同じ producer)  →   compose_export_entry (段まで)
-  mutex 内で mIV 世代 my_seq を予約し               見開きは結合
+  mIV 世代 my_seq を予約し (lock なし)             見開きは結合
   OS 世代 baseline を読む                           matte で平らにする → DIB
   前の job の cancel を立てて置き換える               書き込み (下の「書き込みの順序」)
                                                         結果を送る → ROOT の repaint を要求
