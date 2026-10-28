@@ -1,6 +1,6 @@
 # 編集を反映した画像をクリップボードへコピー (§1.261)
 
-**状態**: 実装済み・独立レビュー ACCEPT (2026-10-28)。利用者の実機確认待ち。実装は `clip-edited-1261` ブランチ。
+**状態**: 実装済み・独立レビュー ACCEPT (2026-10-28)。実機確認は一部済み (§12)。PDF・段の切り替え・準備中のクリップボード変更は未確認。実装は `clip-edited-1261` ブランチ。
 **出典**: 利用者要望 2026-09-21 / 焼き込み段の設定 2026-09-23 ([next-release-backlog.md](next-release-backlog.md) §1.261)。
 **関連**: [bake-stage-unification-plan.md](bake-stage-unification-plan.md) (段 `BakeStage` と共通 worker 合成)、
 [ui-responsiveness.md](ui-responsiveness.md) §4、[virtual-folders.md](virtual-folders.md)、
@@ -229,7 +229,7 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
 実装 + 独立レビュー + 修正で **1〜1.5 日**。次の版に全部入れる前提で進める。
 外すなら §7 の KeyAction だけを後回しにできる (約 50 行)。
 
-## 11. 実装記録 (2026-10-28、レビュー前)
+## 11. 実装記録 (2026-10-28)
 
 - `App::composite_source_for_idx` に単ページ source の対応付けを集約し、一括書き出し・
   Ctrl+E・新しいコピーから使う。コピー用 snapshot は `crop_legacy_writeback = None` にする。
@@ -288,3 +288,22 @@ detached 述語・viewport 経路には変更を加えていない。新しい�
   ビルド完了後の照合不一致は 0 件。`Cargo.toml`・`Cargo.lock`・`rust-toolchain.toml`・vendor の差分はない。
 - 全件 lib / full gate と独立実装レビューは ClaudeCode 側の後続確認。実クリップボードへの貼り付け等の
   対話確認は未実施。未表示ページの旧 crop／注釈基準寸法の既存差は §3・backlog §1.510 のまま。
+
+## 12. 独立レビュー・全件テスト・実機確認 (2026-10-28)
+
+- 独立実装レビュー (Codex gpt-6.1-sol / xhigh / read-only、実装者とは別の会話): ACCEPT。
+  指摘 1 件 (snapshot の固定で注釈フォント・補正レイヤー・マスクの読み込みが UI スレッドで同期に走る) は、
+  Ctrl+E・一括書き出しと共通の producer の性質なので backlog §1.511 で 4 つの入口をまとめて直すことで合意した (§5)。
+- 本体 lib 全件 (`test-lib-full.ps1`): 14586 件中 14585 件成功。失敗 1 件は
+  `preferences_context_menu_layout_snapshot` で、新しいメニュー行が既存の「画像をクリップボードにコピー」の直後に
+  増えたことによる差分だった。画像を目視して更新し、再実行で成功。`test-full.ps1` は、この作業ツリーに release の
+  exe 3 本が無いため実行していない。
+- 実機確認 (観測者: 親セッションの ClaudeCode。利用者の許可を得て `--data-dir` で隔離したデータを使い、
+  dev-runtime ビルドを computer-use で操作):
+  - 一覧から、消しゴムで編集した PNG (1200×900) をコピー → 元と同じ寸法で、元との違いは消しゴムの範囲だけ。
+    同じ画像を Ctrl+E で書き出した PNG (そのまま) とピクセル単位で一致。
+  - ZIP 内の未編集ページ → 元の 800×1200 と一致。
+  - フルスクリーンの左開き見開き → 1600×1200 の 1 枚になり、左が 1 ページ目・右が 2 ページ目とそれぞれ一致。
+    右クリック短押しは既定で「閉じる」のため、操作カスタマイズで「右クリックメニューを表示」に変えて試した。
+    マニュアル (fullscreen.html・export.html) に、既定では長押しのメニューから使うことと短押しの設定先を書き足した。
+  - 未確認: PDF のページ、焼き込みの段を変えたときの結果、準備中に他のアプリがクリップボードを変えたときの通知。
