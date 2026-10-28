@@ -10177,6 +10177,7 @@ pub(crate) struct LocalAdjustPrefixPreviewKey {
 
 /// 補正レイヤー合成結果の cache entry。
 pub(crate) struct LocalAdjustCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
@@ -10189,6 +10190,7 @@ pub(crate) struct LocalAdjustCacheEntry {
 /// `generation` は `App::conceal_generation` のスナップショットで、グローバル
 /// パラメータが変わったあと最初に lookup が走った時点で stale 判定される。
 pub(crate) struct ConcealCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 合成済み RGBA。Phase 5 の `Ctrl+E` エクスポートでこの pixels を JPEG/PNG/WebP に
     /// 書き出すので、現状は描画パスでは未使用だが将来使う前提でフィールドを保持。
@@ -10417,6 +10419,7 @@ pub(crate) struct EraseResultKey {
 
 /// 消しゴム確定結果 (= MI-GAN inpaint 出力) の cache entry。
 pub(crate) struct EraseResultCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
@@ -11890,6 +11893,7 @@ impl LocalAdjustCacheEntry {
     pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
             texture,
             display_basis,
@@ -11905,6 +11909,7 @@ impl ConcealCacheEntry {
     ) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
             texture,
             generation,
@@ -11917,6 +11922,7 @@ impl EraseResultCacheEntry {
     pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
             texture,
             display_basis,
@@ -12190,6 +12196,8 @@ pub(crate) struct CapturedPagedDisplayUnit {
 
 #[derive(Clone)]
 pub(crate) struct FsDisplayUnitHoldoverPage {
+    /// Capture-time crop; the occurrence index may be reused by a new folder.
+    pub(crate) crop: Option<crate::export_crop::CropSettings>,
     /// Capture-time occurrence retained for tracing and `fullscreen_page_layout` identity only.
     /// Geometry must never be re-derived from it because folder navigation can replace items
     /// while the holdover remains visible.
@@ -67184,7 +67192,7 @@ impl App {
         let paged_display_unit = self
             .reading_flow
             .is_paged()
-            .then(|| self.capture_paged_display_unit_for_snapshot(idx))
+            .then(|| self.capture_paged_display_unit_for_snapshot(ctx, idx))
             .flatten();
         let last_painted_is_holdover = paged_display_unit.as_ref().is_some_and(|captured| {
             matches!(
@@ -83099,6 +83107,26 @@ impl App {
         Some(adopted)
     }
 
+    /// Immutable document crop binding. Unlike export_crop_for_idx, this does
+    /// not adopt legacy dimensions, hydrate metadata, or persist anything.
+    pub(crate) fn resident_export_crop_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let settings = self.export_crop_page_settings.get(&idx).copied()?;
+        if settings.valid_source_size().is_some() {
+            return Some(settings);
+        }
+        // The ordinary frame uses the original raster dimensions as its legacy
+        // basis. Resolve that same memory-only basis for acceptance, without
+        // committing it. Its later adoption is not a document crop edit.
+        let size = self
+            .canonical_source_dimensions(idx)
+            .map(|dims| dims.as_size())
+            .or_else(|| self.fs_early_dims.get(&idx).copied());
+        Some(size.map_or(settings, |size| settings.with_legacy_source_size(size)))
+    }
+
     pub(crate) fn export_crop_for_idx(
         &mut self,
         idx: usize,
@@ -83873,6 +83901,31 @@ impl App {
         }
     }
 
+    /// Adoption and resident preparation use the same current-input predicate.
+    /// A received result still belongs to the producer until it is adopted.
+    fn current_edit_materialize_request_matches(
+        &self,
+        idx: usize,
+        request: EditMaterializeRequest,
+    ) -> bool {
+        request.items_generation == self.items_generation
+            && match request.kind {
+                EditMaterializeKind::Local { key, .. } => {
+                    key.idx == idx && key == self.current_local_adjust_key(idx)
+                }
+                EditMaterializeKind::Conceal { key, .. } => {
+                    key.idx == idx && key == self.current_edit_result_key(idx)
+                }
+            }
+    }
+
+    fn current_edit_stage_producer_pending(&self, idx: usize) -> bool {
+        self.local_adjust_pending.get(&idx).is_some_and(|pending| {
+            !pending.cancel.load(Ordering::Relaxed)
+                && self.current_edit_materialize_request_matches(idx, pending.request)
+        })
+    }
+
     fn apply_edit_materialize_result(
         &mut self,
         ctx: &egui::Context,
@@ -83880,18 +83933,7 @@ impl App {
         result: EditMaterializeResult,
         request: EditMaterializeRequest,
     ) -> bool {
-        if request.items_generation != self.items_generation {
-            return false;
-        }
-        let request_is_current = match request.kind {
-            EditMaterializeKind::Local { key, .. } => {
-                key.idx == idx && key == self.current_local_adjust_key(idx)
-            }
-            EditMaterializeKind::Conceal { key, .. } => {
-                key.idx == idx && key == self.current_edit_result_key(idx)
-            }
-        };
-        if !request_is_current {
+        if !self.current_edit_materialize_request_matches(idx, request) {
             return false;
         }
 
@@ -83926,6 +83968,7 @@ impl App {
                     self.local_adjust_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: Self::resident_texture_options(ctx, &texture),
                             display_basis: self.accept_current_producer_display_basis(
                                 key.idx,
                                 texture.size(),
@@ -84025,6 +84068,7 @@ impl App {
                     self.conceal_cache.insert(
                         idx,
                         ConcealCacheEntry {
+                            texture_options: Self::resident_texture_options(ctx, &texture),
                             display_basis: self.accept_current_producer_display_basis(
                                 idx,
                                 texture.size(),
@@ -84176,6 +84220,7 @@ impl App {
                 self.local_adjust_layer_bypass_cache.insert(
                     pending.key,
                     LocalAdjustCacheEntry {
+                        texture_options: Self::resident_texture_options(ctx, &texture),
                         display_basis: self.accept_current_producer_display_basis(
                             key.idx,
                             texture.size(),
@@ -84257,6 +84302,7 @@ impl App {
                 self.local_adjust_prefix_preview_cache.insert(
                     pending.key,
                     LocalAdjustCacheEntry {
+                        texture_options: Self::resident_texture_options(ctx, &texture),
                         display_basis: self.accept_current_producer_display_basis(
                             key.idx,
                             texture.size(),
@@ -85030,35 +85076,105 @@ impl App {
         })
     }
 
-    /// Borrow only the current context's immutable, canonical still raster. Sharing
-    /// a handle does not materialize an upload and says nothing about final completeness.
-    fn shared_source_texture_for_edit(
+    pub(crate) fn resident_texture_options(
+        ctx: &egui::Context,
+        texture: &egui::TextureHandle,
+    ) -> egui::TextureOptions {
+        // Copy the immutable metadata before any handle clone can take a write lock.
+        ctx.tex_manager()
+            .read()
+            .meta(texture.id())
+            .expect("owned texture")
+            .options
+    }
+
+    /// Select the highest exact resident cumulative edit stage without starting work.
+    /// This display fallback does not prove that every active edit is complete.
+    pub(crate) fn exact_resident_edit_stage(
+        &self,
+        idx: usize,
+    ) -> Option<(
+        crate::gpu_lanczos::FullscreenPaintResource,
+        Arc<egui::ColorImage>,
+        &'static str,
+    )> {
+        if let Some(material) = self.current_conceal_material(idx) {
+            return Some((
+                material,
+                self.conceal_cache.get(&idx)?.pixels.clone(),
+                "conceal",
+            ));
+        }
+        if let Some(material) = self.current_local_adjust_material(idx) {
+            return Some((
+                material,
+                self.local_adjust_cache
+                    .get(&self.current_local_adjust_key(idx))?
+                    .pixels
+                    .clone(),
+                "local_adjust",
+            ));
+        }
+        self.current_erase_result_material(idx).map(|material| {
+            (
+                material,
+                self.erase_result_cache[&self.current_erase_result_key(idx)]
+                    .pixels
+                    .clone(),
+                "erase",
+            )
+        })
+    }
+
+    /// Borrow this context's actual immutable edit input allocation. The LINEAR
+    /// edit contract must survive changes to the final sampler (including Nearest).
+    fn shared_resident_texture_for_edit(
         &self,
         ctx: &egui::Context,
         key: &EditResultKey,
         edit_pixels: &Arc<egui::ColorImage>,
-    ) -> Option<egui::TextureHandle> {
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if *key != self.current_edit_result_key(key.idx) {
             return None;
         }
-        let FsCacheEntry::Static {
-            tex,
-            pixels,
-            animation: StaticAnimationState::Still,
-            ..
-        } = self.fs_cache.get(&key.idx)?
-        else {
-            return None;
-        };
-        if !Arc::ptr_eq(pixels, edit_pixels) {
-            return None;
-        }
-        // Display allocations never change sampler options in place. Release the
-        // manager read lock before cloning the handle (retain takes a write lock).
+        let candidate = self
+            .exact_resident_edit_stage(key.idx)
+            .filter(|(_, pixels, _)| Arc::ptr_eq(pixels, edit_pixels))
+            .map(|(material, _, _)| material)
+            .or_else(|| {
+                let FsCacheEntry::Static {
+                    pixels,
+                    animation: StaticAnimationState::Still,
+                    ..
+                } = self.fs_cache.get(&key.idx)?
+                else {
+                    return None;
+                };
+                Arc::ptr_eq(pixels, edit_pixels)
+                    .then(|| self.source_material_for_idx(key.idx))
+                    .flatten()
+            })?;
+        let tex = candidate.source_texture();
+        // Release the manager read lock before retaining the allocation.
         let matches = ctx.tex_manager().read().meta(tex.id()).is_some_and(|meta| {
             meta.size == edit_pixels.size && meta.options == DISPLAY_IMAGE_TEXTURE_OPTIONS
         });
-        (matches && self.display_texture_matches_page(tex, key.idx)).then(|| tex.clone())
+        if matches && self.display_texture_matches_page(tex, key.idx) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn shared_source_texture_for_edit(
+        &self,
+        ctx: &egui::Context,
+        key: &EditResultKey,
+        pixels: &Arc<egui::ColorImage>,
+    ) -> Option<egui::TextureHandle> {
+        self.shared_resident_texture_for_edit(ctx, key, pixels)
+            .map(|material| material.source_texture().clone())
     }
 
     /// 表示パイプライン用: 編集結果ピクセル + 表示テクスチャを確保する。先読みで
@@ -85079,8 +85195,10 @@ impl App {
                 return Some((key, Arc::clone(&entry.pixels)));
             }
             let pixels = Arc::clone(&entry.pixels);
-            if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels) {
-                self.edit_result_cache.get_mut(&key)?.texture = Some(texture);
+            if let Some(material) = self.shared_resident_texture_for_edit(ctx, &key, &pixels) {
+                let entry = self.edit_result_cache.get_mut(&key)?;
+                entry.display_basis = material.display_basis();
+                entry.texture = Some(material.source_texture().clone());
             } else if self.last_edit_materialize_upload_frame != self.frame_counter {
                 self.last_edit_materialize_upload_frame = self.frame_counter;
                 self.speculative_gpu_frame.note_ordinary_upload();
@@ -85102,9 +85220,25 @@ impl App {
         }
 
         let pixels = self.assemble_edit_result_pixels(ctx, idx)?;
-        let texture = if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels)
-        {
-            Some(texture)
+        let shared = self.shared_resident_texture_for_edit(ctx, &key, &pixels);
+        let display_basis = shared
+            .as_ref()
+            .map(|material| material.display_basis())
+            .or_else(|| {
+                self.exact_resident_edit_stage(idx)
+                    .filter(|(_, stage, _)| Arc::ptr_eq(stage, &pixels))
+                    .map(|(material, _, _)| material.display_basis())
+            })
+            .unwrap_or_else(|| {
+                self.accept_current_producer_display_basis(
+                    idx,
+                    material_sampler_size(pixels.size),
+                    pixels.size,
+                    false,
+                )
+            });
+        let texture = if let Some(material) = shared {
+            Some(material.source_texture().clone())
         } else if self.last_edit_materialize_upload_frame != self.frame_counter {
             self.last_edit_materialize_upload_frame = self.frame_counter;
             self.speculative_gpu_frame.note_ordinary_upload();
@@ -85125,12 +85259,7 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
-                display_basis: self.accept_current_producer_display_basis(
-                    idx,
-                    material_sampler_size(pixels.size),
-                    pixels.size,
-                    false,
-                ),
+                display_basis,
                 pixels: Arc::clone(&pixels),
                 texture,
             },
@@ -85159,12 +85288,18 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
-                display_basis: self.accept_current_producer_display_basis(
-                    idx,
-                    material_sampler_size(pixels.size),
-                    pixels.size,
-                    false,
-                ),
+                display_basis: self
+                    .exact_resident_edit_stage(idx)
+                    .filter(|(_, stage, _)| Arc::ptr_eq(stage, &pixels))
+                    .map(|(material, _, _)| material.display_basis())
+                    .unwrap_or_else(|| {
+                        self.accept_current_producer_display_basis(
+                            idx,
+                            material_sampler_size(pixels.size),
+                            pixels.size,
+                            false,
+                        )
+                    }),
                 pixels: Arc::clone(&pixels),
                 texture: None,
             },
@@ -103380,6 +103515,7 @@ mod material_display_owner_tests {
                     app.local_adjust_layer_bypass_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
                             texture: texture.clone(),
                             display_basis: expected,
@@ -103391,6 +103527,7 @@ mod material_display_owner_tests {
                     app.local_adjust_prefix_preview_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
                             texture: texture.clone(),
                             display_basis: expected,

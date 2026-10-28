@@ -285,6 +285,7 @@ fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage
                     )
             );
             PreparedPagedPage {
+                crop: None,
                 resource: resource.into(),
                 ..page.clone()
             }

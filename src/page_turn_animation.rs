@@ -41,6 +41,42 @@ pub(crate) struct CanonicalPage {
     pub clip_rect: Rect,
     pub material: PageMaterial,
     pub underlay: Option<PageMaterial>,
+    pub crop: Option<PageCropPaint>,
+}
+
+/// Crop paint in the immutable page's display basis, independent of texture
+/// quality, source resolution and sampler UV. Full source corners can extend
+/// beyond the displayed page when display trim is active.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageCropPaint {
+    pub full: [Pos2; 4],
+    pub corners: [Pos2; 4],
+}
+impl PageCropPaint {
+    pub(crate) fn from_screen_corners(
+        full: [Pos2; 4],
+        corners: [Pos2; 4],
+        page_rect: Rect,
+    ) -> Self {
+        let normalize = |p: Pos2| {
+            pos2(
+                (p.x - page_rect.left()) / page_rect.width(),
+                (p.y - page_rect.top()) / page_rect.height(),
+            )
+        };
+        Self {
+            full: full.map(normalize),
+            corners: corners.map(normalize),
+        }
+    }
+
+    fn half(self, right: bool) -> Self {
+        let half = |p: Pos2| pos2(p.x * 2.0 - if right { 1.0 } else { 0.0 }, p.y);
+        Self {
+            full: self.full.map(half),
+            corners: self.corners.map(half),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub(crate) struct CanonicalUnit {
@@ -87,6 +123,8 @@ pub(crate) fn normalize_spread_window(
             right.material = half_material(&right.material, true);
             actual.underlay = actual.underlay.as_ref().map(|m| half_material(m, false));
             right.underlay = right.underlay.as_ref().map(|m| half_material(m, true));
+            actual.crop = actual.crop.map(|crop| crop.half(false));
+            right.crop = right.crop.map(|crop| crop.half(true));
             unit.spine_x = Some(h);
             unit.gutter_width = 0.0;
             unit.pages = vec![actual, right];
@@ -111,6 +149,7 @@ pub(crate) fn normalize_spread_window(
                 clip_rect: actual.clip_rect,
                 material: PageMaterial::Vacant,
                 underlay: None,
+                crop: None,
             };
             actual.occurrence = Some(0);
             unit.spine_x = Some(h);
@@ -1145,6 +1184,114 @@ fn flat_surface(meshes: &mut Vec<ProjectedMesh>, surface: &Surface<'_>) {
             clip_rect: surface.page.clip_rect,
         });
     }
+    if let Some(crop) = surface.page.crop {
+        append_flat_crop(
+            meshes,
+            surface.rect,
+            surface.page.clip_rect,
+            &surface.polygon,
+            crop,
+            surface.alpha,
+        );
+    }
+}
+
+/// Ordinary prepared paint uses the same crop primitives as projected flat
+/// surfaces. The caller has already selected the immutable crop binding.
+pub(crate) fn project_flat_crop(
+    page_rect: Rect,
+    clip_rect: Rect,
+    visible: &[Pos2],
+    crop: PageCropPaint,
+) -> Vec<ProjectedMesh> {
+    let mut meshes = Vec::new();
+    append_flat_crop(&mut meshes, page_rect, clip_rect, visible, crop, 1.0);
+    meshes
+}
+
+/// Separate polygons retain alpha blending against the already painted face.
+/// Border widths are measured in canonical points before leaf projection.
+fn crop_polygons(crop: PageCropPaint, size: egui::Vec2) -> Vec<(Vec<Pos2>, Color32)> {
+    let orient = |mut points: Vec<Pos2>| {
+        if signed_area(&points) < 0.0 {
+            points.reverse();
+        }
+        points
+    };
+    let scale = |p: Pos2| pos2(p.x * size.x, p.y * size.y);
+    let normalize = |p: Pos2| pos2(p.x / size.x, p.y / size.y);
+    let full = orient(crop.full.map(scale).to_vec());
+    let corners = orient(crop.corners.map(scale).to_vec());
+    let mut polygons: Vec<_> = subtract_polygon(&full, &corners)
+        .into_iter()
+        .map(|poly| {
+            (
+                poly.into_iter().map(normalize).collect(),
+                Color32::from_black_alpha(145),
+            )
+        })
+        .collect();
+    // Each closed mitered ring is four non-overlapping convex strips, so
+    // translucent dimming is applied exactly once at every interior point.
+    for (width, color) in [
+        (3.0, Color32::BLACK),
+        (2.0, Color32::from_rgb(255, 230, 100)),
+    ] {
+        let screen = &corners;
+        let normals: Vec<_> = edges(&screen)
+            .map(|(a, b)| {
+                let edge = (b - a).normalized();
+                egui::vec2(edge.y, -edge.x)
+            })
+            .collect();
+        let mut outer = Vec::with_capacity(4);
+        let mut inner = Vec::with_capacity(4);
+        for i in 0..4 {
+            let before = normals[(i + 3) % 4];
+            let after = normals[i];
+            let offset = (before + after) * (width * 0.5 / (1.0 + before.dot(after)));
+            outer.push(normalize(screen[i] + offset));
+            inner.push(normalize(screen[i] - offset));
+        }
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            polygons.push((orient(vec![outer[i], outer[j], inner[j], inner[i]]), color));
+        }
+    }
+    polygons
+}
+
+fn append_flat_crop(
+    meshes: &mut Vec<ProjectedMesh>,
+    rect: Rect,
+    clip: Rect,
+    visible: &[Pos2],
+    crop: PageCropPaint,
+    alpha: f32,
+) {
+    if !valid_rect(rect) || visible.len() < 3 {
+        return;
+    }
+    let mut mesh = Mesh::default();
+    for (poly, color) in crop_polygons(crop, rect.size()) {
+        let screen: Vec<_> = poly
+            .iter()
+            .map(|p| {
+                pos2(
+                    rect.left() + p.x * rect.width(),
+                    rect.top() + p.y * rect.height(),
+                )
+            })
+            .collect();
+        let clipped = clip_polygon(&screen, visible);
+        append_solid_polygon(&mut mesh, &clipped, color.gamma_multiply(alpha));
+    }
+    if !mesh.indices.is_empty() {
+        meshes.push(ProjectedMesh {
+            mesh,
+            clip_rect: clip,
+        });
+    }
 }
 fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, grid_v: usize) {
     // Preserve the existing neutral thickness/edge and printed-face shading.
@@ -1264,6 +1411,105 @@ fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, 
                 mesh.indices.extend_from_slice(&[a, b, c + 1, a, c + 1, c]);
             }
         }
+        meshes.push(ProjectedMesh {
+            mesh,
+            clip_rect: leaf.clip,
+        });
+    }
+    if leaf.theta.cos().abs() >= 0.00001
+        && !vacant(leaf.page)
+        && let Some(crop) = leaf.page.crop
+    {
+        append_leaf_crop(meshes, leaf, crop, grid_u, grid_v);
+    }
+}
+
+fn append_leaf_crop(
+    meshes: &mut Vec<ProjectedMesh>,
+    leaf: &Leaf<'_>,
+    crop: PageCropPaint,
+    grid_u: usize,
+    grid_v: usize,
+) {
+    let image = leaf.image_parameters();
+    let mirror = (leaf.sign < 0.0) != leaf.back;
+    let mut mesh = Mesh::default();
+    for (poly, color) in crop_polygons(crop, leaf.page.rect.size()) {
+        let parameters: Vec<_> = poly
+            .iter()
+            .map(|p| {
+                pos2(
+                    image.left() + (if mirror { 1.0 - p.x } else { p.x }) * image.width(),
+                    image.top() + p.y * image.height(),
+                )
+            })
+            .collect();
+        let mut parameters = parameters;
+        if signed_area(&parameters) < 0.0 {
+            parameters.reverse();
+        }
+        let bounds = Rect::from_points(&parameters).intersect(image);
+        if !valid_rect(bounds) {
+            continue;
+        }
+        let cells = |min: f32, max: f32, start: f32, extent: f32, count: usize| {
+            let first = (((min - start) / extent) * count as f32).floor().max(0.0) as usize;
+            let last = (((max - start) / extent) * count as f32)
+                .ceil()
+                .min(count as f32) as usize;
+            first..last
+        };
+        let columns = cells(
+            bounds.left(),
+            bounds.right(),
+            image.left(),
+            image.width(),
+            grid_u,
+        );
+        let rows = cells(
+            bounds.top(),
+            bounds.bottom(),
+            image.top(),
+            image.height(),
+            grid_v,
+        );
+        // Use exactly the face's image subdivision and its triangle diagonals.
+        // Mapping the clipped vertices through that affine triangle keeps the
+        // overlay on the face, including at crop edges inside a mesh cell.
+        for y in rows {
+            for x in columns.clone() {
+                let u0 = image.left() + image.width() * x as f32 / grid_u as f32;
+                let u1 = image.left() + image.width() * (x + 1) as f32 / grid_u as f32;
+                let v0 = image.top() + image.height() * y as f32 / grid_v as f32;
+                let v1 = image.top() + image.height() * (y + 1) as f32 / grid_v as f32;
+                let a = pos2(u0, v0);
+                let b = pos2(u1, v0);
+                let c = pos2(u0, v1);
+                let d = pos2(u1, v1);
+                for triangle in [[a, b, d], [a, d, c]] {
+                    let poly = clip_polygon(&parameters, &triangle);
+                    if poly.len() < 3 || polygon_area(&poly) == 0.0 {
+                        continue;
+                    }
+                    let positions = triangle.map(|p| leaf.position(p.x, p.y));
+                    let mapped: Vec<_> = poly
+                        .iter()
+                        .map(|p| {
+                            let [a, b, c] = triangle;
+                            let denominator = cross(b - a, c - a);
+                            let wb = cross(*p - a, c - a) / denominator;
+                            let wc = cross(b - a, *p - a) / denominator;
+                            positions[0]
+                                + (positions[1] - positions[0]) * wb
+                                + (positions[2] - positions[0]) * wc
+                        })
+                        .collect();
+                    append_solid_polygon(&mut mesh, &mapped, color);
+                }
+            }
+        }
+    }
+    if !mesh.indices.is_empty() {
         meshes.push(ProjectedMesh {
             mesh,
             clip_rect: leaf.clip,
@@ -1512,6 +1758,180 @@ mod snapshot_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn crop_fixture() -> PageCropPaint {
+        PageCropPaint {
+            full: rectangle(unit_uv()).try_into().unwrap(),
+            corners: rectangle(Rect::from_min_max(pos2(0.17, 0.23), pos2(0.81, 0.76)))
+                .try_into()
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn crop_flat_clips_dim_and_border_to_actual_visible_polygon_once() {
+        let rect = Rect::from_min_max(pos2(100.0, 40.0), pos2(600.0, 840.0));
+        let visible = [pos2(100.0, 40.0), pos2(600.0, 40.0), pos2(350.0, 840.0)];
+        let crop = crop_fixture();
+        let meshes = project_flat_crop(rect, rect, &visible, crop);
+        assert_eq!(meshes.len(), 1);
+        let mut dim_area = 0.0;
+        for triangle in meshes[0].mesh.indices.chunks_exact(3) {
+            let points: Vec<_> = triangle
+                .iter()
+                .map(|i| meshes[0].mesh.vertices[*i as usize].pos)
+                .collect();
+            for (a, b) in edges(&visible) {
+                for p in &points {
+                    assert!(cross(b - a, *p - a) >= -0.1);
+                }
+            }
+            if meshes[0].mesh.vertices[triangle[0] as usize].color == Color32::from_black_alpha(145)
+            {
+                dim_area += polygon_area(&points);
+            }
+        }
+        let crop_screen: Vec<_> = crop
+            .corners
+            .iter()
+            .map(|p| {
+                pos2(
+                    rect.left() + p.x * rect.width(),
+                    rect.top() + p.y * rect.height(),
+                )
+            })
+            .collect();
+        let expected = polygon_area(&visible) - polygon_area(&clip_polygon(&visible, &crop_screen));
+        assert!(
+            (dim_area - expected).abs() < 0.1,
+            "dim must cover the visible outside exactly once"
+        );
+    }
+
+    #[test]
+    fn crop_geometry_follows_front_back_split_and_canonical_without_affecting_receipts() {
+        for pair in [false, true] {
+            for rtl in [false, true] {
+                for forward in [false, true] {
+                    let (mut old, mut new) = fixture(pair);
+                    let direction = TurnDirection {
+                        reading_rtl: rtl,
+                        forward,
+                    };
+                    let baseline_recipe = prepare_turn(&old, &new, direction).unwrap();
+                    for unit in [&mut old, &mut new] {
+                        for page in &mut unit.pages {
+                            page.crop = Some(crop_fixture());
+                        }
+                    }
+                    for p in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                        let scene = scene(&old, &new, direction, p, baseline_recipe.lift);
+                        let result =
+                            project_prepared(&old, &new, direction, baseline_recipe, p, false)
+                                .unwrap();
+                        assert!(
+                            result
+                                .meshes
+                                .iter()
+                                .flat_map(|m| &m.mesh.vertices)
+                                .all(|v| v.pos.x.is_finite() && v.pos.y.is_finite())
+                        );
+                        if let Some(leaf) = scene.leaf {
+                            let mut projected = Vec::new();
+                            append_leaf_crop(
+                                &mut projected,
+                                &leaf,
+                                crop_fixture(),
+                                baseline_recipe.grid_u,
+                                baseline_recipe.grid_v,
+                            );
+                            // Crop paint immediately follows this same printed face.
+                            assert_eq!(projected.len(), 1);
+                            let shape = leaf.image_silhouette();
+                            for vertex in &projected[0].mesh.vertices {
+                                if leaf.clip.contains(vertex.pos) {
+                                    for (a, b) in edges(&shape) {
+                                        assert!(cross(b - a, vertex.pos - a) >= -0.2);
+                                    }
+                                }
+                            }
+                        }
+                        let mut no_crop_old = old.clone();
+                        let mut no_crop_new = new.clone();
+                        for unit in [&mut no_crop_old, &mut no_crop_new] {
+                            for page in &mut unit.pages {
+                                page.crop = None;
+                            }
+                        }
+                        let baseline = project_prepared(
+                            &no_crop_old,
+                            &no_crop_new,
+                            direction,
+                            baseline_recipe,
+                            p,
+                            false,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            result
+                                .visibility
+                                .incoming
+                                .iter()
+                                .map(|r| r.visible_area)
+                                .collect::<Vec<_>>(),
+                            baseline
+                                .visibility
+                                .incoming
+                                .iter()
+                                .map(|r| r.visible_area)
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+        let (mut old, _) = fixture(false);
+        old.pages[0].crop = Some(crop_fixture());
+        let split = normalize_spread_window(old.clone(), SpreadWindow::Landscape).unwrap();
+        for (i, page) in split.pages.iter().enumerate() {
+            let crop = page.crop.unwrap();
+            for (original, split_corner) in
+                old.pages[0].crop.unwrap().corners.iter().zip(crop.corners)
+            {
+                assert!(
+                    (page.rect.left() + split_corner.x * page.rect.width()
+                        - (old.pages[0].rect.left() + original.x * old.pages[0].rect.width()))
+                    .abs()
+                        < 0.001
+                );
+            }
+            assert_eq!(page.crop, Some(crop_fixture().half(i == 1)));
+        }
+    }
+
+    #[test]
+    fn crop_projection_stays_within_mesh_budget_at_pdf_dpi() {
+        for pair in [false, true] {
+            let (mut old, mut new) = portrait_pdf_fixture(pair);
+            for unit in [&mut old, &mut new] {
+                for page in &mut unit.pages {
+                    page.crop = Some(crop_fixture());
+                }
+            }
+            for reading_rtl in [false, true] {
+                for forward in [false, true] {
+                    let direction = TurnDirection {
+                        reading_rtl,
+                        forward,
+                    };
+                    let recipe = prepare_turn(&old, &new, direction).unwrap();
+                    for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                        project_prepared(&old, &new, direction, recipe, progress, false).unwrap();
+                    }
+                }
+            }
+        }
+    }
     fn page(id: u64, rect: Rect) -> CanonicalPage {
         CanonicalPage {
             occurrence: Some(id),
@@ -1530,6 +1950,7 @@ mod tests {
             underlay: Some(PageMaterial::Blank {
                 color: Color32::WHITE,
             }),
+            crop: None,
         }
     }
     fn fixture(pair: bool) -> (CanonicalUnit, CanonicalUnit) {
@@ -3059,6 +3480,7 @@ mod tests {
                 clip_rect: pair.pages[0].clip_rect,
                 material: PageMaterial::Vacant,
                 underlay: None,
+                crop: None,
             };
             for forward in [false, true] {
                 let (old, new) = if forward {

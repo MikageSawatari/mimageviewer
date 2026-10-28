@@ -11667,6 +11667,53 @@ impl App {
             .map(|material| material.source_texture().clone())
     }
 
+    fn prepare_single_crop_from_frame_state(
+        &mut self,
+        idx: usize,
+        state: &FsFrameState,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let (w, h) = state.image_dims?;
+        let size = [w as usize, h as usize];
+        let _ = self.export_crop_for_idx(idx, size);
+        self.prepared_single_page_crop(idx, size, state.original_preview_active)
+    }
+
+    fn prepared_single_page_crop(
+        &self,
+        idx: usize,
+        image_size: [usize; 2],
+        original_preview_active: bool,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let earlier_tool = self.erase_mode
+            || self.local_adjust_mode
+            || self.conceal_mode
+            || self.sns_split.is_some()
+            || self.adjustment_mode.is_open()
+            || self.analysis_mode;
+        if original_preview_active || (!self.export_crop_mode && earlier_tool) {
+            return None;
+        }
+        self.resident_export_crop_for_idx(idx)
+            .map(|settings| {
+                // An oversized legacy rectangle cannot adopt this preview's basis.
+                // Clamp only the paint value in the ordinary frame's coordinates.
+                if settings.valid_source_size().is_some() {
+                    settings
+                } else {
+                    settings.scaled_to(image_size)
+                }
+            })
+            .or_else(|| {
+                self.export_crop_mode.then(|| {
+                    crate::export_crop::CropSettings::authored(
+                        crate::export_crop::CropRect::full(image_size[0], image_size[1]),
+                        self.export_crop_aspect_mode,
+                        image_size,
+                    )
+                })
+            })
+    }
+
     fn resolve_fs_display_material_from_caches(
         &self,
         idx: usize,
@@ -11701,14 +11748,8 @@ impl App {
         if let Some(tex) = self.current_edit_result_material(idx) {
             return Some(tex);
         }
-        if let Some(material) = self.current_conceal_material(idx) {
+        if let Some((material, _, _)) = self.exact_resident_edit_stage(idx) {
             return Some(material);
-        }
-        if let Some(tex) = self.current_local_adjust_material(idx) {
-            return Some(tex);
-        }
-        if let Some(tex) = self.current_erase_result_material(idx) {
-            return Some(tex);
         }
         if let Some(material) = self.source_material_for_idx(idx) {
             return Some(material);
@@ -12448,6 +12489,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn capture_paged_display_unit_for_snapshot(
         &mut self,
+        ctx: Option<&egui::Context>,
         idx: usize,
     ) -> Option<CapturedPagedDisplayUnit> {
         if let Some(mut unit) = self
@@ -12466,11 +12508,19 @@ impl App {
                 presentation: CapturedPagedDisplayPresentation::Holdover,
             });
         }
-        self.capture_fs_display_unit(idx)
-            .map(|unit| CapturedPagedDisplayUnit {
+        let original_preview =
+            ctx.is_some_and(|ctx| self.original_preview_active_for_frame(ctx, idx));
+        self.capture_fs_display_unit(idx).map(|mut unit| {
+            if original_preview {
+                for page in &mut unit.pages {
+                    page.crop = None;
+                }
+            }
+            CapturedPagedDisplayUnit {
                 unit,
                 presentation: CapturedPagedDisplayPresentation::Live,
-            })
+            }
+        })
     }
 
     /// Resolve the last unit painted by this mounted viewer context. Paged rendering clears and
@@ -12811,6 +12861,13 @@ impl App {
             .map(|entry| entry.load_seq())
             .unwrap_or(0);
         Some(FsDisplayUnitHoldoverPage {
+            crop: self.prepared_single_page_crop(
+                idx,
+                source_size
+                    .map(|v| [v.x.max(1.0) as usize, v.y.max(1.0) as usize])
+                    .unwrap_or(texture.size()),
+                rendition_ctx.is_some_and(|ctx| self.original_preview_active_for_frame(ctx, idx)),
+            ),
             occurrence,
             texture,
             rotation,
@@ -14751,6 +14808,7 @@ impl App {
         seek_geometry: StillSeekGeometry,
         submitted: Option<&mut FsNavigatorTextureSources>,
     ) -> Option<DisplayedImageTransform> {
+        let crop = self.prepare_single_crop_from_frame_state(fs_idx, state);
         let rotation = self.get_rotation(fs_idx);
         let paint_resource = self.fullscreen_paint_payload_for_page(
             fs_idx,
@@ -14803,6 +14861,7 @@ impl App {
                 None,
                 submitted,
                 false,
+                crop,
             );
         };
         // 表示トリムが有効ならズーム対象をトリム後 bbox に絞る (切り落とした余白を見せない)。
@@ -14909,6 +14968,7 @@ impl App {
             trim_bbox,
             submitted,
             false,
+            crop,
         );
         if active {
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
@@ -28368,6 +28428,7 @@ impl App {
                                                 } else {
                                                     self.view_trim_single_content_bbox(paint_idx)
                                                 };
+                                                let crop = self.prepare_single_crop_from_frame_state(paint_idx, &state);
                                                 let paint_resource =
                                                     self.fullscreen_paint_payload_for_page(
                                                         paint_idx, state.tex.clone(), state.original_preview_active,
@@ -28413,6 +28474,7 @@ impl App {
                                                     content_bbox,
                                                     selected_display_unit.is_current().then_some(&mut navigator_texture_sources),
                                                     self.settings.page_turn_animation_enabled && !state.original_preview_active && self.page_turn_view_eligible(fs_idx),
+                                                    crop,
                                                 );
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 if painted.is_some() {
@@ -30608,7 +30670,7 @@ impl App {
         self.service_final_prepare_before_lookup(ctx);
         let demand = self.book_target_presentation_demand(fs_idx);
         if !matches!(
-            self.book_presentation_allowed(&demand),
+            self.book_presentation_target_allowed(&demand),
             crate::book_composition::PresentationDecision::Allowed(_)
         ) {
             return FsPageTurnDecision::normal();
@@ -33860,7 +33922,7 @@ impl App {
             .presentation_demand(self.spread_mode, self.fullscreen_page_slice);
         let target_load_allowed = self.page_overview.session().is_none()
             && !self.continuous_reading_active_for_idx(fs_idx)
-            && matches!(self.book_presentation_allowed(&initial_demand),
+            && matches!(self.book_presentation_target_allowed(&initial_demand),
                 crate::book_composition::PresentationDecision::Allowed(ref allowed)
                     if initial_demand.iter().zip(allowed).any(|(occurrence, allowed)|
                         occurrence.item_index == fs_idx && *allowed));
@@ -43847,6 +43909,7 @@ impl App {
             content_bbox,
             None,
             false,
+            None,
         )
     }
 
@@ -43880,6 +43943,7 @@ impl App {
         content_bbox: Option<egui::Rect>,
         submitted: Option<&mut FsNavigatorTextureSources>,
         live_eligible: bool,
+        crop: Option<crate::export_crop::CropSettings>,
     ) -> Option<DisplayedImageTransform> {
         // Current items resolve the active split here. A captured holdover keeps
         // its capture-time crop even if the replacement item or mode changes.
@@ -44000,6 +44064,7 @@ impl App {
                 self.observe_raw_presentation(page_idx);
             }
             let page = PreparedPagedPage {
+                crop,
                 occurrence: SpreadPageOccurrence {
                     idx: page_idx,
                     role: SpreadPageRole::Navigation,
@@ -45139,7 +45204,7 @@ impl App {
         self.fullscreen_page_layout.begin(previous.layout_kind);
         let bg_style = self.fs_bg_style(ctx);
         for (page, captured) in previous.previous.pages.iter().zip(&previous.transforms) {
-            if let Some(transform) = self.draw_fs_image(
+            if let Some(transform) = self.draw_fs_image_with_receipt(
                 ui,
                 image_rect,
                 page.idx(),
@@ -45152,7 +45217,7 @@ impl App {
                 Some(*captured),
                 None,
                 previous.previous.singleton_placement,
-                Some(&page.texture),
+                Some(&page.texture.clone().into()),
                 None,
                 false,
                 false,
@@ -45166,6 +45231,11 @@ impl App {
                 captured.fit_mode,
                 captured.fit_scale_limits,
                 page.content_bbox,
+                None,
+                false,
+                (previous.previous.pages.len() == 1)
+                    .then_some(page.crop)
+                    .flatten(),
             ) {
                 self.fullscreen_page_layout
                     .push_occurrence(transform, page.occurrence);
@@ -49424,6 +49494,7 @@ impl App {
                         page.content_bbox,
                         Some(&mut sources),
                         false,
+                        page.crop,
                     )
                 };
                 if let Some(transform) = transform {
@@ -50531,6 +50602,7 @@ impl App {
                 self.observe_raw_presentation(idx);
             }
             return Some(PreparedPagedPage {
+                crop: None,
                 occurrence: SpreadPageOccurrence {
                     idx,
                     role: SpreadPageRole::Navigation,
@@ -65849,6 +65921,7 @@ mod tests {
         texture: egui::TextureHandle,
     ) -> FsDisplayUnitHoldoverPage {
         FsDisplayUnitHoldoverPage {
+            crop: None,
             fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             occurrence: SpreadPageOccurrence::navigation(idx, idx),
@@ -68020,6 +68093,7 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
                 fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -68587,6 +68661,7 @@ mod tests {
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
         let page = PreparedPagedPage {
+            crop: None,
             occurrence: SpreadPageOccurrence::navigation(0, 0),
             transform,
             resource: native.into(),
@@ -68662,6 +68737,7 @@ mod tests {
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
         let page = PreparedPagedPage {
+            crop: None,
             occurrence: SpreadPageOccurrence::navigation(0, 0),
             transform,
             resource: native.into(),
@@ -68733,6 +68809,7 @@ mod tests {
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75)),
                 );
                 Some(PreparedPagedPage {
+                    crop: None,
                     occurrence: SpreadPageOccurrence::navigation(idx, 0),
                     transform: navigator_test_transform(
                         idx,
@@ -68956,6 +69033,7 @@ mod tests {
                                     content_bbox,
                                     None,
                                     true,
+                                    None,
                                 )
                                 .is_some()
                             );
@@ -69136,6 +69214,7 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
                 fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(4, 4),
@@ -74147,6 +74226,7 @@ mod tests {
                     singleton_placement: SingletonSpreadPlacement::Center,
                     layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                     pages: vec![FsDisplayUnitHoldoverPage {
+                        crop: None,
                         fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                         fit_scale_limits: FullscreenFitScaleLimits::default(),
                         occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -74179,6 +74259,7 @@ mod tests {
                 singleton_placement: SingletonSpreadPlacement::Center,
                 layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![FsDisplayUnitHoldoverPage {
+                    crop: None,
                     fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                     fit_scale_limits: FullscreenFitScaleLimits::default(),
                     occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -92609,6 +92690,7 @@ pub(crate) mod page_turn_submission_tests {
                         None,
                         Some(&mut sources),
                         app.settings.page_turn_animation_enabled,
+                        app.prepared_single_page_crop(page.idx, [80, 120], false),
                     )
                     .unwrap();
                 app.fullscreen_page_layout.push_occurrence(transform, *page);
@@ -93396,6 +93478,7 @@ pub(crate) mod page_turn_submission_tests {
                             [40, 60],
                         );
                         PreparedPagedPage {
+                            crop: None,
                             occurrence: displayed.occurrence(),
                             transform: displayed.transform,
                             resource: native.into(),
@@ -93571,6 +93654,7 @@ pub(crate) mod page_turn_submission_tests {
                                 )
                                 .unwrap();
                                 let page = PreparedPagedPage {
+                                    crop: None,
                                     occurrence: SpreadPageOccurrence::navigation(1, 1),
                                     transform,
                                     resource: native.clone().into(),
@@ -93859,6 +93943,7 @@ pub(crate) mod page_turn_submission_tests {
                                                 );
                                                 let idx = slot + if incoming { 2 } else { 0 };
                                                 CanonicalPage {
+                                                    crop: None,
                                                     occurrence: Some(slot as u64),
                                                     rect,
                                                     clip_rect: ui.max_rect(),

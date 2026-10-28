@@ -136,7 +136,11 @@ impl ViewerTextureCaches<'_> {
         }
         for (key, entry) in self.erase_result_cache {
             if includes_idx(indices, key.idx) {
-                accountant.add_texture(VramSubsystem::EraseResultCache, &entry.texture, true);
+                accountant.add_texture(
+                    VramSubsystem::EraseResultCache,
+                    &entry.texture,
+                    entry.texture_options.mipmap_mode.is_some(),
+                );
             }
         }
         if indices.is_none() {
@@ -154,12 +158,20 @@ impl ViewerTextureCaches<'_> {
         }
         for (key, entry) in self.local_adjust_cache {
             if includes_idx(indices, key.idx) {
-                accountant.add_texture(VramSubsystem::LocalAdjustCache, &entry.texture, true);
+                accountant.add_texture(
+                    VramSubsystem::LocalAdjustCache,
+                    &entry.texture,
+                    entry.texture_options.mipmap_mode.is_some(),
+                );
             }
         }
         for (&idx, entry) in self.conceal_cache {
             if includes_idx(indices, idx) {
-                accountant.add_texture(VramSubsystem::ConcealCache, &entry.texture, true);
+                accountant.add_texture(
+                    VramSubsystem::ConcealCache,
+                    &entry.texture,
+                    entry.texture_options.mipmap_mode.is_some(),
+                );
             }
         }
         for (&idx, entry) in self.comic_cache {
@@ -350,12 +362,20 @@ impl App {
         }
         for (key, entry) in &self.local_adjust_layer_bypass_cache {
             if includes_idx(indices, key.result_key.idx) {
-                accountant.add_texture(VramSubsystem::LocalAdjustCache, &entry.texture, true);
+                accountant.add_texture(
+                    VramSubsystem::LocalAdjustCache,
+                    &entry.texture,
+                    entry.texture_options.mipmap_mode.is_some(),
+                );
             }
         }
         for (key, entry) in &self.local_adjust_prefix_preview_cache {
             if includes_idx(indices, key.result_key.idx) {
-                accountant.add_texture(VramSubsystem::LocalAdjustCache, &entry.texture, true);
+                accountant.add_texture(
+                    VramSubsystem::LocalAdjustCache,
+                    &entry.texture,
+                    entry.texture_options.mipmap_mode.is_some(),
+                );
             }
         }
     }

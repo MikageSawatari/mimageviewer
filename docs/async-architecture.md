@@ -89,6 +89,14 @@ D3-2 は同じ pending を `Computing | CpuReady` に拡張する。新 D3 の w
 CPU-ready の採用は selector を呼ばず、要求時 identity と世代を照合して既存 final cache へ move する。
 既存 legacy 表示/先読みの要求範囲と通常登録は維持し、これらを含む全 CPU 仕事が1件になるとは主張しない。
 park は開始済み final-effect を保持し、新しい D3 開始を止める。詳細は [D3計画](page-turn-animation-plan.md) §27.17.13。
+
+§28 段階 A（2026-10-28）は既存 D3 owner の入力を `AfterAi / ResidentEdited / Unedited` に分ける。
+ResidentEdited は必要な全編集を反映済みの exact な最上位累積段だけを受け付け、下位 cache の
+再生成を要求しない。全開始経路で現在入力の erase/local/conceal producer（受信済み未採用の
+ready を含む）が無いことを確認し、待つ頁は continue して相方の準備を進める。
+local/conceal の現在入力判定は採用側と共有する純粋 helper を使う。Next/Previous は同じ解決を使い、
+要求 key と source_size は開始時に固定する。新しい stage producer・queue・pending は追加しない。
+後発の local 寸法正規化が同じ key の D3 を失効させる既存経路は残り、段階 B で扱う。
 入力・permission の再開・実表示復帰は selector 非依存の共通 service を通るが、単なる context mount は通さない。
 app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
 通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。

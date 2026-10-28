@@ -6367,6 +6367,36 @@ binding は基準寸法付きの crop 値で、受付はメモリだけを読む
 **detached。** 既存 D3 owner の拡張、受付素材選択の共通化、crop 描画 owner の統一は、症状パッチではなく構造的修正として設計担当と独立レビュー担当が合意。
 F12 移譲、park 中の新規開始停止と既存 job 保持、fork の空 owner、兄弟 context 不変を維持し、[detached-rework-plan.md §11](detached-rework-plan.md) に記録する。
 
+### 28.3.1 段階 A の実装記録（2026-10-28、実装済・検証結果は別記・実機未確認）
+
+- F1/F2: `presentation_permission_candidate` と target 専用 query に集約。
+  未登録だけを補完し、通常の可視 demand／連結 admission は変更しない。service 付き実フォルダの
+  handler 回帰で単頁／LTR／RTL・本として扱う ON/OFF と、演出 ON/OFF の target 処理を検証する。
+- E1/E2: `exact_resident_edit_stage` を通常表示と受付が共有する。edit-result の通常 holdover は維持し、
+  受付は exact key のみ。共有は `shared_resident_texture_for_edit` が段の実 material を返し、
+  LINEAR・Arc・寸法・identity を照合する。段の `texture_options` を採用時に固定して会計する。
+- E3: `ResidentFinalPrepareInput` で入力を排他的に表し、全経路で開始済み producer と未採用 ready を待つ。
+  key／入力寸法・既存 D3 owner／予約／投機登録境界は維持する。
+- E6: `PreparedPagedPage.crop` と `PageTurnContent.crop`、保持表示の capture-time crop が内容を所有し、
+  `PageCropPaint` が共通 leaf 投影へ渡す。overlay は編集入力とハンドルだけを描く。
+  legacy は純粋 lookup で resident 原寸から暫定基準を求めるが、DB／sidecar への採用は通常表示に残す。
+  小さすぎる preview では永続採用せず、その frame の基準で paint だけを clamp する。
+
+**隠蔽 exact の失効監査。** `clear_conceal_caches(idx)` の全呼出元を調べた。
+`app.rs` はスロット一括／閲覧適用、erase/conceal マスク削除（閲覧／選択）、
+`bump_local_adjust_generation`、local ready／inactive 採用、active conceal 寸法追従、
+`bump_input_generation`、`bump_erase_mask_generation`、`bump_conceal_mask_generation`。
+`ui_erase.rs` はパネルのマスク取消／削除、preview→commit 昇格、commit worker 採用。
+`ui_conceal.rs` は編集終了、Undo/Redo 復元、スロット読込、全削除、キーでのベクタ削除、nudge、
+brush／polygon、morph、bucket、drag/handle、select、shape commit。
+加えて source 再読込は `bump_input_generation_for_fs_cache_reload` が直接当該 entry を除去し、
+global input／folder／context 置換は cache を除去、全体隠蔽設定は `conceal_generation` を進める。
+この組が入力・局所編集・マスク・全体設定の変更を覆うため、隠蔽 entry に重複 key は追加しなかった。
+後発 local 正規化による同 key 失効は §28.3 の既知残差どおり維持する。
+
+検証コマンド・件数・F2 の修正前 skip 証拠は `target/pageturn-1461/implementation-report.md` に記録する。
+製品起動と commit は実施しない。
+
 ### 28.4 段階 B (局所補正・隠蔽・注釈の先回り、§1.401 の残り) — 設計前の論点
 
 利用者の判断で今回の版に入れる (2026-10-28)。段階 A の実装後に別に設計し、独立レビューを受ける。第 1・2 版レビューで次が分かっている。

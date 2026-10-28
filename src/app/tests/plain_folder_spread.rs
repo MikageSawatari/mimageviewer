@@ -57,7 +57,7 @@ fn plain_folder_spread_resolver_table() {
     }
 }
 
-fn configure(app: &mut App, enabled: bool, book: bool) {
+pub(crate) fn configure(app: &mut App, enabled: bool, book: bool) {
     app.settings.apply_default_spread_to_plain_folders = enabled;
     app.settings.auto_fullscreen_zip_pdf = book;
     app.settings.auto_fullscreen_image_folders = book;
@@ -67,7 +67,7 @@ fn configure(app: &mut App, enabled: bool, book: bool) {
     app.settings.default_reading_direction = Direction::Ltr;
 }
 
-fn make_folder(root: &Path, name: &str) -> PathBuf {
+pub(crate) fn make_folder(root: &Path, name: &str) -> PathBuf {
     let folder = root.join(name);
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("001.jpg"), b"page").unwrap();

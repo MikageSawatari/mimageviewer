@@ -6600,3 +6600,15 @@ per-viewport opt-out、detached述語・状態・placement保存先・同期経�
 egui viewportの影だけで説明できない。v4.7.1..masterのowner・前面移譲と§1.387 A1〜A3も照合し、動画の原因は未特定として残す。
 presenter/host/HUDと点滅対策は変更しない。調査の詳細は backlog §1.426 に記録した (v4.8.1 で出荷後に削除。全文は commit `94017f82e` の `docs/next-release-backlog.md`)。
 利用者が確認用ビルドで、静止画・動画・F12 の有無・複数ウィンドウとも解消を確認した (2026-10-24)。動画で効いた仕組みは未解明。
+
+### 2026-10-28: 紙めくり §28 段階 A の編集素材・crop owner
+
+設計担当 ClaudeCode と独立設計レビュー（Sol/xhigh、第3版 ACCEPT）は、既存 D3 owner の
+入力拡張・受付素材選択共通化・prepared paint への crop 所有移動を構造的修正として合意した。
+実装は `AfterAi / ResidentEdited / Unedited` の排他的入力を既存 final-effect owner へ渡し、
+current producer（未採用 ready を含む）との開始競合を共通採用述語で防ぐ。
+新 queue／pending／detached bool は追加せず、F12 移譲・park 中の既存 job 保持と新規開始停止・
+fork の空 owner・兄弟 context の失効隔離を維持する。閲覧用 crop は prepared page／内容 binding／
+capture-time holdover page が所有し、移譲先や idx 再利用先から crop を引き直さない。
+自動検証の結果は `target/pageturn-1461/implementation-report.md` と紙めくり計画 §28.3.1 に記録する。
+アプリは起動しない。後発 local 正規化による同 key 失効は段階 B の既知残差として残す。

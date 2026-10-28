@@ -570,6 +570,7 @@ fn draw_specified_current(
                     content_bbox,
                     Some(&mut sources),
                     true,
+                    None,
                 )
                 .expect("accepted partial page remains drawable");
             app.fullscreen_page_layout.push_occurrence(transform, *page);

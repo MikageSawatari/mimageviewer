@@ -67,6 +67,25 @@ pub(super) enum PreparedFinalDisplay {
     Handled(Option<egui::TextureHandle>),
 }
 
+/// Mutually exclusive, complete resident inputs. Stage display fallback is not
+/// evidence that all edits have completed, and must never become a final input.
+enum ResidentFinalPrepareInput {
+    AfterAi {
+        key: EditResultKey,
+        pixels: Arc<egui::ColorImage>,
+        source_size: [usize; 2],
+        used_upscale: bool,
+    },
+    ResidentEdited {
+        key: EditResultKey,
+        pixels: Arc<egui::ColorImage>,
+    },
+    Unedited {
+        key: EditResultKey,
+        pixels: Arc<egui::ColorImage>,
+    },
+}
+
 impl FinalEffectState {
     /// Receipt changes only the existing owner. It never selects a display source.
     pub(super) fn receive(&mut self) -> Result<(), mpsc::TryRecvError> {
@@ -145,7 +164,11 @@ impl App {
         if self.comic_pages.contains(&idx) || self.comic_demo_enabled {
             return None;
         }
-        let (edit_key, pixels) = self.resident_final_prepare_input(idx)?;
+        let (edit_key, pixels) = match self.resident_final_prepare_input(idx)? {
+            ResidentFinalPrepareInput::ResidentEdited { key, pixels }
+            | ResidentFinalPrepareInput::Unedited { key, pixels } => (key, pixels),
+            ResidentFinalPrepareInput::AfterAi { .. } => return None,
+        };
         let params = self.effective_params(idx);
         if !params.is_color_identity()
             || params.effective_smart_sharpen(false) != 0
@@ -174,8 +197,7 @@ impl App {
         }
         // The shared-allocation eligibility is established by this producer;
         // its semantic owner is the accepted edit input, never an ID lookup.
-        let _ = self.shared_source_texture_for_edit(ctx, &edit_key, &pixels)?;
-        self.source_material_for_idx(idx)
+        self.shared_resident_texture_for_edit(ctx, &edit_key, &pixels)
     }
 
     pub(crate) fn resident_final_prepare_texture(
@@ -218,26 +240,71 @@ impl App {
     }
 
     /// No materialization, I/O, texture allocation, mask loading or AI start.
-    fn resident_final_prepare_input(
-        &self,
-        idx: usize,
-    ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
-        if self.fs_entry_is_animated(idx) || self.comic_pages.contains(&idx) {
-            return None;
-        }
-        let key = self.current_edit_result_key(idx);
-        if let Some(edit) = self.edit_result_cache.get(&key) {
-            return Some((key, edit.pixels.clone()));
-        }
-        if self.mask_pages.contains(&idx)
-            || self.local_adjust_pages.contains(&idx)
-            || self.local_adjust_page_layers.contains_key(&idx)
-            || self.conceal_pages.contains(&idx)
+    fn resident_final_prepare_input(&self, idx: usize) -> Option<ResidentFinalPrepareInput> {
+        if self.fs_entry_is_animated(idx)
+            || self.comic_pages.contains(&idx)
+            || self.commit_pending_matches_current_erase_key(idx)
+            || self.current_edit_stage_producer_pending(idx)
         {
             return None;
         }
-        self.current_raw_source_pixels(idx)
-            .map(|pixels| (key, pixels))
+        let key = self.current_edit_result_key(idx);
+        let params = self.effective_params(idx);
+        // An adopted exact AI result already contains its complete adjusted
+        // input. Still wait for any current edit producer, including CpuReady:
+        // its adoption owns invalidation even if it does not advance the key.
+        if let Some((_, ai)) = self.final_ai_cache.iter().find(|(ai_key, ai)| {
+            ai_key.edit_key == key
+                && self.final_ai_key_for_pixels(key, ai.source_size, params) == Some(**ai_key)
+        }) {
+            return Some(ResidentFinalPrepareInput::AfterAi {
+                key,
+                pixels: ai.pixels.clone(),
+                source_size: ai.source_size,
+                used_upscale: ai.used_upscale,
+            });
+        }
+        // Presence-only metadata cannot distinguish inactive layers from a
+        // missing upper stage. Hydration belongs to the existing local owner.
+        if self.local_adjust_pages.contains(&idx)
+            && !self.local_adjust_page_layers.contains_key(&idx)
+        {
+            return None;
+        }
+        if let Some(edit) = self.edit_result_cache.get(&key) {
+            return Some(ResidentFinalPrepareInput::ResidentEdited {
+                key,
+                pixels: edit.pixels.clone(),
+            });
+        }
+        // Each stage is cumulative. Require only the highest active stage,
+        // never its evicted lower inputs, and never fall through a missing
+        // upper stage to a display-only lower fallback.
+        let edited = if self.conceal_pages.contains(&idx)
+            || (self.conceal_mode
+                && self.conceal_preview_active
+                && self.fullscreen_idx == Some(idx))
+        {
+            Some(
+                self.conceal_cache
+                    .get(&idx)
+                    .filter(|entry| entry.generation == self.conceal_generation)?
+                    .pixels
+                    .clone(),
+            )
+        } else if self.has_active_local_adjust_layers(idx) {
+            Some(self.current_local_adjust_pixels(idx)?)
+        } else if self.mask_pages.contains(&idx) {
+            Some(self.current_erase_result_pixels(idx)?)
+        } else {
+            None
+        };
+        if let Some(pixels) = edited {
+            Some(ResidentFinalPrepareInput::ResidentEdited { key, pixels })
+        } else {
+            self.current_raw_source_pixels(idx)
+                .map(|pixels| ResidentFinalPrepareInput::Unedited { key, pixels })
+        }
     }
 
     pub(super) fn final_prepare_plan_from_resident(
@@ -249,26 +316,25 @@ impl App {
         [usize; 2],
         FinalCompositePlan,
     )> {
-        if self.fs_entry_is_animated(idx) || self.comic_pages.contains(&idx) {
-            return None;
-        }
-        let edit_key = self.current_edit_result_key(idx);
         let params = self.effective_params(idx);
         let lut = self.resolved_creative_lut(params);
-        // A completed exact AI result already owns its adjusted input. Neither
-        // hydrate raw/edit material nor apply tone again on the UI thread.
-        if let Some((_, ai)) = self.final_ai_cache.iter().find(|(key, ai)| {
-            key.edit_key == edit_key
-                && self.final_ai_key_for_pixels(edit_key, ai.source_size, params) == Some(**key)
-        }) {
-            return Some((
-                self.final_composite_key_for_pixels(edit_key, ai.source_size, params),
-                ai.pixels.clone(),
-                ai.source_size,
-                build_final_composite_plan_after_ai(params, lut, ai.used_upscale),
-            ));
-        }
-        let (edit_key, pixels) = self.resident_final_prepare_input(idx)?;
+        let (edit_key, pixels) = match self.resident_final_prepare_input(idx)? {
+            ResidentFinalPrepareInput::AfterAi {
+                key,
+                pixels,
+                source_size,
+                used_upscale,
+            } => {
+                return Some((
+                    self.final_composite_key_for_pixels(key, source_size, params),
+                    pixels,
+                    source_size,
+                    build_final_composite_plan_after_ai(params, lut, used_upscale),
+                ));
+            }
+            ResidentFinalPrepareInput::ResidentEdited { key, pixels }
+            | ResidentFinalPrepareInput::Unedited { key, pixels } => (key, pixels),
+        };
         if let Some(ai_key) = self.final_ai_key_for_pixels(edit_key, pixels.size, params) {
             if !self.final_ai_failed.contains(&ai_key) {
                 return None;
@@ -663,10 +729,10 @@ impl App {
             DISPLAY_IMAGE_TEXTURE_OPTIONS
         };
         if !nearest {
-            if let Some(texture) =
-                self.shared_source_texture_for_edit(ctx, &key.edit_key, &ready.pixels)
+            if let Some(resource) =
+                self.shared_resident_texture_for_edit(ctx, &key.edit_key, &ready.pixels)
             {
-                return Some(texture);
+                return Some(resource.source_texture().clone());
             }
         }
         let edit = self.edit_result_cache.get(&key.edit_key)?;
@@ -1011,3 +1077,6 @@ impl App {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod resident_edited_tests;
