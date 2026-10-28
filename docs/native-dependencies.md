@@ -20,7 +20,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 このスクリプトは以下を順に実行する:
 
 1. `setup-pdfium.sh` — `vendor/pdfium/bin/pdfium.dll` を取得
-2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.2 と zlib 1.3.1 のソース、`VERSION` を取得
+2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.3 と zlib 1.3.1 のソース、`VERSION` を取得
 3. `setup-libavif.sh` — `vendor/libavif/` に libavif / dav1d / libyuv の静的ライブラリ・ヘッダ・notice・`VERSION` を作成
 4. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
 5. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
@@ -117,7 +117,8 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - **ソース**: [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
   (毎週月曜に Chromium 最新版から自動ビルド)
 - **アセット**: `pdfium-win-x64.tgz` (V8 なし版、軽量)
-- **現在のバージョン**: `vendor/pdfium/VERSION` を参照
+- **現在のバージョン**: `chromium/8125` (`158.0.8125.0`、2026-10-28 更新)。
+  `vendor/pdfium/VERSION` と資産照合は [更新記録](dependency-update-20261028.md) を参照
 
 ### リリース前チェック (必須)
 
@@ -396,7 +397,7 @@ x264 / x265 (エンコーダ) は GPL なので含まれない (mIV はデコー
 
 ## LibRaw ソース・ライセンス管理
 
-RAW は LibRaw 0.22.2 を CDDL-1.0 で静的リンクする。zlib 1.3.1 と既存の
+RAW は LibRaw 0.22.3 を CDDL-1.0 で静的リンクする。zlib 1.3.1 と既存の
 libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加しない。
 エージェント用セットアップは `bash scripts/setup-libraw.sh`（bootstrap に含む）、
 更新確認は `bash scripts/setup-libraw.sh check`。この bash 手順は利用者には渡さない。
@@ -411,7 +412,7 @@ libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加し�
 - 対応ソースは [docs/libraw-source-distribution.md](libraw-source-distribution.md) に従って
   SHA-256 を照合し、mikage.to へ配置する。tarball は git に入れず、`.sha256` を追跡する。
 - LibRaw 更新時はソース・checksum・notice・製品ページの同梱版とリンクを同時に更新し、
-  古い配布版の対応ソースも残す。
+  古い配布版の対応ソースと追跡済み `.sha256`、製品ページの旧版リンクも残す。
 
 ## VST3 host bridge 管理 (v0.9.0+)
 

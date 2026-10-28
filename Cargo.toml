@@ -408,7 +408,9 @@ cssparser = "0.37"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 webp = "0.3"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# 2.6.1 regresses data_start bounds, corrupt local-header rejection and I/O details.
+# Unpin only after all three contracts are preserved; see dependency-update-20261028.md.
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.20"
 delharc = "0.6"
 # `unrar 0.5.8` の UCM_CHANGEVOLUMEW callback は P1 を固定長 2048 文字で読み、

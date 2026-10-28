@@ -15,9 +15,9 @@
 //! On the real data above that is 290 MB -> 17.5 KB, because a mask is mostly one
 //! flat value and deflate collapses the runs. Measured, not estimated.
 //!
-//! `<count>` is the element count. deflate accepts a truncated stream and simply
-//! stops, so without it a half-written file would decode to a short buffer that
-//! looks valid here and goes wrong much later, wherever it gets indexed.
+//! `<count>` is the element count. It validates the decoded length independently
+//! of the deflate decoder's integrity checks, so a short buffer cannot look valid
+//! here and go wrong much later, wherever it gets indexed.
 //!
 //! ## Why 8 bits for alpha
 //!
@@ -624,9 +624,17 @@ mod tests {
         let error = serde_json::from_str::<RasterVectorMask>(&truncated)
             .expect_err("a short buffer must not pass for a full mask");
         assert!(
-            error.to_string().contains("bytes"),
-            "the error should say the length disagreed: {error}"
+            error.to_string().contains("mask deflate:"),
+            "the deflate decoder should reject the incomplete stream: {error}"
         );
+
+        // A complete stream with the wrong declared count must still fail our
+        // own length check, independently of the deflate decoder's checks.
+        let wrong_count = json.replace("q8z:4096:", "q8z:4095:");
+        assert_ne!(wrong_count, json);
+        let error = serde_json::from_str::<RasterVectorMask>(&wrong_count)
+            .expect_err("a mismatched count must not pass for a full mask");
+        assert!(error.to_string().contains("bytes"), "{error}");
     }
 
     /// A per-mask ceiling does not bound a file.
