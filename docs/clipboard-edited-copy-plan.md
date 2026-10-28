@@ -1,6 +1,6 @@
 # 編集を反映した画像をクリップボードへコピー (§1.261)
 
-**状態**: 実装済み (レビュー前、2026-10-28)。実装は `clip-edited-1261` ブランチ。
+**状態**: 実装済み・独立レビュー ACCEPT (2026-10-28)。利用者の実機確认待ち。実装は `clip-edited-1261` ブランチ。
 **出典**: 利用者要望 2026-09-21 / 焼き込み段の設定 2026-09-23 ([next-release-backlog.md](next-release-backlog.md) §1.261)。
 **関連**: [bake-stage-unification-plan.md](bake-stage-unification-plan.md) (段 `BakeStage` と共通 worker 合成)、
 [ui-responsiveness.md](ui-responsiveness.md) §4、[virtual-folders.md](virtual-folders.md)、
@@ -93,6 +93,7 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
   update で poll → 結果を通知                   ←
 ```
 
+- **既知の制約 (§1.511)**: snapshot の固定は Ctrl+E・一括書き出しと共通の `book_baked_edit_snapshot` を UI スレッドで呼ぶ。未読み込みのページでは注釈フォントの解析・補正レイヤーの DB 読み込み・マスク展開がここで同期に走る (1 回に 1 ページ分、見開きで 2 ページ)。共通 producer の性質なので、この項目だけ別の producer にせず、4 つの入口をまとめて §1.511 で worker へ移す (実装レビューで合意)。
 - **job は App に 1 本だけ** (`edited_clipboard_copy: Option<EditedClipboardCopyPending>`)。
   worker の実装は `src/edited_clipboard_copy.rs` に置く。
   新しい要求は前の job の cancel を立てて置き換える。結果の channel も置き換わるので、古い
