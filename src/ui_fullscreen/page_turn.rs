@@ -1860,6 +1860,66 @@ impl App {
         }
     }
 
+    /// The accepted crop owns its legacy resolution, including a basis that is
+    /// still unknown because the raster was too small. Reuse it through normal
+    /// adoption and source-quality publication. Read raw document edits here:
+    /// calling page_turn_content would recursively resolve this same value.
+    pub(crate) fn page_turn_legacy_crop(
+        &self,
+        idx: usize,
+        legacy: crate::export_crop::CropSettings,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let destination = self.page_turn_destination();
+        let matches_unit = |unit: &PaintedUnit| {
+            unit.destination == destination
+                && unit.items == self.items_generation
+                && unit.mode == self.spread_mode
+                && unit.reading_rtl
+                    == (self
+                        .spread_mode
+                        .canonical_reading_direction()
+                        .unwrap_or(self.reading_direction)
+                        == ReadingDirection::Rtl)
+                && unit.slice == self.fullscreen_page_slice
+                && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+        };
+        let content = match &self.page_turn_presentation.state {
+            PresentationState::Offered { outgoing, offer }
+                if matches_unit(outgoing) && offer.fact.destination == destination =>
+            {
+                &offer
+                    .ready_sources
+                    .0
+                    .iter()
+                    .find(|source| source.occurrence.idx == idx)?
+                    .content
+            }
+            PresentationState::Turning { incoming, .. }
+            | PresentationState::Completing { incoming, .. }
+                if matches_unit(incoming) =>
+            {
+                incoming
+                    .pages
+                    .iter()
+                    .zip(&incoming.content)
+                    .find(|(page, _)| page.occurrence.idx == idx)?
+                    .1
+            }
+            _ => return None,
+        };
+        let crop = content.crop?;
+        let mut edit = self.current_edit_result_key(idx);
+        edit.source_gen = 0;
+        (legacy.valid_source_size().is_none()
+            && legacy.rect == crop.rect
+            && legacy.aspect_mode == crop.aspect_mode
+            && content.edit == edit
+            && content.params == *self.effective_params(idx)
+            && content.comic_generation == self.comic_generation
+            && content.gap == self.settings.spread_page_gap_px)
+            .then_some(crop)
+    }
+
     /// Resident-only counterpart of ordinary processed + fallback selection.
     /// Incomplete final output is displayable; this never invokes a producer.
     fn page_turn_resident_source(
@@ -2596,13 +2656,17 @@ impl App {
                         .0
                         .iter()
                         .zip(&unit.pages)
-                        .all(|(source, p)| {
+                        .zip(&unit.content)
+                        .all(|((source, p), content)| {
                             source.occurrence == p.occurrence
                                 && source.resource.source_texture_id()
                                     == p.resource.source_texture_id()
                                 && source.resource.source_generation()
                                     == p.resource.source_generation()
-                                && source.content == self.page_turn_content(p.occurrence.idx)
+                                // Content was resolved while the presentation owner
+                                // was installed. Do not resolve it again after taking
+                                // that owner out for this transition.
+                                && source.content == *content
                         });
                 if matching {
                     match prepare_leaf(&outgoing, &unit, offer.forward) {
@@ -3074,25 +3138,48 @@ fn paint_white_companion(painter: &egui::Painter, rect: egui::Rect, clip: egui::
 fn prepared_page_crop(
     page: &PreparedPagedPage,
 ) -> Option<crate::page_turn_animation::PageCropPaint> {
-    let crop = page.crop?;
+    page.crop.map(|crop| page_crop_paint(&page.transform, crop))
+}
+
+fn page_crop_paint(
+    transform: &DisplayedImageTransform,
+    crop: crate::export_crop::CropSettings,
+) -> crate::page_turn_animation::PageCropPaint {
     let size = crop.valid_source_size().unwrap_or([
-        page.transform.source_size.x.max(1.0) as usize,
-        page.transform.source_size.y.max(1.0) as usize,
+        transform.source_size.x.max(1.0) as usize,
+        transform.source_size.y.max(1.0) as usize,
     ]);
     let full = crate::ui_crop::crop_corners(
-        &page.transform,
+        transform,
         size,
         crate::export_crop::CropRect::full(size[0], size[1]),
     );
     let corners =
-        crate::ui_crop::crop_corners(&page.transform, size, crop.rect.sanitized(size[0], size[1]));
-    Some(
-        crate::page_turn_animation::PageCropPaint::from_screen_corners(
-            full,
-            corners,
-            page.transform.paint_rect,
-        ),
+        crate::ui_crop::crop_corners(transform, size, crop.rect.sanitized(size[0], size[1]));
+    crate::page_turn_animation::PageCropPaint::from_screen_corners(
+        full,
+        corners,
+        transform.paint_rect,
     )
+}
+
+/// A flat image and a prepared comparison composite use the same crop owner.
+/// The composite supplies its actual transform, without creating a second page
+/// resource or adding crop to the compared pixels.
+pub(super) fn paint_flat_crop(
+    painter: &egui::Painter,
+    transform: &DisplayedImageTransform,
+    crop: crate::export_crop::CropSettings,
+) {
+    paint_projection_meshes(
+        painter,
+        crate::page_turn_animation::project_flat_crop(
+            transform.paint_rect,
+            painter.clip_rect().intersect(transform.viewport_rect),
+            &transform.paint_quad().positions,
+            page_crop_paint(transform, crop),
+        ),
+    );
 }
 
 pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
@@ -3104,18 +3191,8 @@ pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
     );
     page.resource
         .paint_texture(&page.transform, &page.painter, egui::Color32::WHITE);
-    if let Some(crop) = prepared_page_crop(page) {
-        paint_projection_meshes(
-            &page.painter,
-            crate::page_turn_animation::project_flat_crop(
-                page.transform.paint_rect,
-                page.painter
-                    .clip_rect()
-                    .intersect(page.transform.viewport_rect),
-                &page.transform.paint_quad().positions,
-                crop,
-            ),
-        );
+    if let Some(crop) = page.crop {
+        paint_flat_crop(&page.painter, &page.transform, crop);
     }
     #[cfg(all(windows, feature = "test-script"))]
     crate::test_script::record_drawn_paint(

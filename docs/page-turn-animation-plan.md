@@ -6397,6 +6397,26 @@ global input／folder／context 置換は cache を除去、全体隠蔽設定�
 検証コマンド・件数・F2 の修正前 skip 証拠は `target/pageturn-1461/implementation-report.md` に記録する。
 製品起動と commit は実施しない。
 
+### 28.3.2 段階 A 独立実装レビューの E6 修正（2026-10-28）
+
+`402605109` に対する独立レビュー `target/pageturn-1461/impl-a-review-1.md` の P2 2件を修正する。
+比較を解除せず、準備済み比較の CPU／shader 合成直後に通常 flat と共通の crop owner を接続する。
+比較準備待ちは通常 owner、編集 overlay はハンドル／入力だけを維持する。
+
+legacy crop は受付と通常表示が同じ resident-only accessor で解決する。FullSource thumbnail の
+原寸情報と、原寸がない場合の sampler を含め、PDF layout や AI sampler を基準に流用しない。
+受付後は既存の accepted content が crop（未確定の基準を含む）を所有し、品質 publication が
+通常採用の前後どちらに来ても文書編集として扱わない。未確定値を paint 準備で別の基準付き値へ
+書き換えず、clamp は既存 transform に委ねる。通常表示が同じ純粋解決結果の有効基準だけを
+永続採用する。新しい pending／queue／保持 field は追加しない。
+submit の offer 照合には、presentation owner を取り出す前に捕捉した unit.content を使う。
+owner の一時取り出し中に crop を再解決して未確定値を品質更新後の値へ変えない。
+
+共通 owner の比較描画と thumbnail-only 受付→通常採用→初 curl、品質更新、実 crop 変更、
+context／item 不一致の headless 回帰を追加する。旧 overlay の全描画経路の到達表、
+`viewer_context_audit` と指定検証の結果は `target/pageturn-1461/implementation-report.md` に追記する。
+製品ページ `index.html` は利用者指示により変更しない。commit／製品起動／build-dev は実施しない。
+
 ### 28.4 段階 B (局所補正・隠蔽・注釈の先回り、§1.401 の残り) — 設計前の論点
 
 利用者の判断で今回の版に入れる (2026-10-28)。段階 A の実装後に別に設計し、独立レビューを受ける。第 1・2 版レビューで次が分かっている。

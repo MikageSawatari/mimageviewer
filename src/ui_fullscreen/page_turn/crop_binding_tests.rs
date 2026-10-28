@@ -62,14 +62,310 @@ fn crop_legacy_normal_adoption_preserves_the_pure_acceptance_binding() {
     );
     assert!(before == app.page_turn_content(0));
 
-    // A too-small raster stays provisional and clamps in the frame's source
-    // coordinates, rather than the fit/AI sampler dimensions.
+    // A too-small raster stays provisional. The prepared value stays raw, and
+    // the projector alone clamps it in the immutable transform's coordinates.
     legacy.rect.max_x = 900.0;
     app.export_crop_page_settings.insert(0, legacy);
     let paint = app.prepared_single_page_crop(0, [100, 150], false).unwrap();
-    assert_eq!(paint.source_size, Some([100, 150]));
-    assert_eq!(paint.rect.max_x, 100.0);
+    assert_eq!(paint, legacy);
     assert_eq!(app.export_crop_page_settings[&0], legacy);
+    install(&ctx);
+    app.settings.page_turn_animation_enabled = true;
+    frame(&ctx, |ui, ctx| {
+        draw_current(&mut app, ui, ctx);
+    });
+    let PresentationState::Flat(unit) = &app.page_turn_presentation.state else {
+        panic!()
+    };
+    let transform = unit.pages[0]
+        .transform
+        .with_coordinate_source_size(egui::vec2(100.0, 150.0));
+    let projected = page_crop_paint(&transform, paint);
+    let expected = [
+        egui::pos2(0.1, 20.0 / 150.0),
+        egui::pos2(1.0, 20.0 / 150.0),
+        egui::pos2(1.0, 100.0 / 150.0),
+        egui::pos2(0.1, 100.0 / 150.0),
+    ];
+    for (actual, expected) in projected.corners.into_iter().zip(expected) {
+        assert!((actual - expected).length() < 0.00001);
+    }
+}
+
+fn thumbnail_legacy_crop_app(
+    ctx: &egui::Context,
+    source_dims: Option<(u32, u32)>,
+) -> crate::app::AppTestEnvForTest {
+    install(ctx);
+    install_fs_navigator_input_tracking(ctx);
+    let mut app = ready_app(ctx, SpreadMode::Single);
+    app.settings.page_turn_animation_enabled = true;
+    app.settings.page_turn_animation_duration_ms = 600;
+    app.fs_cache.remove(&1);
+    app.page_dims_cache.clear();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.thumbnails[1] = ThumbnailState::loaded_raster(
+        ctx.load_texture(
+            "legacy-crop-thumbnail-only",
+            egui::ColorImage::filled([80, 120], egui::Color32::LIGHT_BLUE),
+            crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        ),
+        crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+        false,
+        120,
+        crate::source_coverage::SourceCoverage::FullSource,
+        source_dims,
+        None,
+    );
+    let mut legacy = crop();
+    legacy.source_size = None;
+    app.export_crop_page_settings.insert(1, legacy);
+    frame(ctx, |ui, ctx| {
+        draw_current(&mut app, ui, ctx);
+    });
+    app
+}
+
+fn offer_thumbnail_legacy_crop(app: &mut App, ctx: &egui::Context) {
+    app.page_turn_external_operation(
+        ctx,
+        ViewerOperationId::Slideshow(next_operation_batch()),
+        OperationPhase::Press,
+        "slideshow",
+    );
+    app.offer_page_turn(ctx, 1, true);
+    assert!(matches!(
+        app.page_turn_presentation.state,
+        PresentationState::Offered { .. }
+    ));
+    assert!(app.begin_fs_page_navigation_sequence(ctx, 0, 1, false));
+    app.fullscreen_idx = Some(1);
+}
+
+fn publish_larger_crop_source(app: &mut App, ctx: &egui::Context, size: [usize; 2]) {
+    let pixels = egui::ColorImage::filled(size, egui::Color32::GOLD);
+    app.fs_cache.insert(
+        1,
+        FsCacheEntry::Static {
+            tex: ctx.load_texture(
+                "legacy-crop-published-source",
+                pixels.clone(),
+                crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            ),
+            pixels: Arc::new(pixels),
+            source_dims: Some(size),
+            load_seq: 2,
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    app.input_generation.insert(1, 99);
+    app.record_page_dims_for_spread(1, (size[0] as u32, size[1] as u32));
+}
+
+#[test]
+fn crop_thumbnail_legacy_acceptance_normal_adoption_and_first_curl_preserve_binding() {
+    // Cover thumbnails both with source metadata and with only a whole-source
+    // sampler, and source publication on either side of ordinary adoption.
+    for source_dims in [None, Some((160, 240))] {
+        for publish_before_adoption in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = thumbnail_legacy_crop_app(&ctx, source_dims);
+            let size = source_dims.map_or([80, 120], |(w, h)| [w as usize, h as usize]);
+            let accepted = app.page_turn_content(1);
+            let expected = app.export_crop_page_settings[&1].with_legacy_source_size(size);
+            assert_eq!(app.resident_export_crop_source_size(1), Some(size));
+            assert_eq!(accepted.crop, Some(expected));
+            assert_eq!(app.export_crop_page_settings[&1].source_size, None);
+
+            frame(&ctx, |ui, ctx| {
+                offer_thumbnail_legacy_crop(&mut app, ctx);
+                if publish_before_adoption {
+                    publish_larger_crop_source(&mut app, ctx, [800, 1200]);
+                }
+                assert_eq!(app.resident_export_crop_for_idx(1), Some(expected));
+                assert!(app.page_turn_content(1) == accepted);
+                assert_eq!(app.export_crop_page_settings[&1].source_size, None);
+                assert_eq!(
+                    app.page_turn_resident_source(1).unwrap().1,
+                    if publish_before_adoption {
+                        "normal"
+                    } else {
+                        "thumbnail"
+                    }
+                );
+                // Exercise the actual normal-display adoption entry, including a
+                // frame whose new source dimensions differ from accepted quality.
+                let mut state = FsFrameState::overview_shell();
+                state.image_dims = Some(if publish_before_adoption {
+                    (800, 1200)
+                } else {
+                    (size[0] as u32, size[1] as u32)
+                });
+                assert_eq!(
+                    app.prepare_single_crop_from_frame_state(1, &state),
+                    Some(expected)
+                );
+                assert_eq!(app.export_crop_page_settings[&1], expected);
+                assert!(app.page_turn_content(1) == accepted);
+                if !publish_before_adoption {
+                    publish_larger_crop_source(&mut app, ctx, [800, 1200]);
+                }
+                assert!(app.page_turn_content(1) == accepted);
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                    panic!("accepted thumbnail must submit through the normal page route")
+                };
+                assert!(
+                    receipt.curl,
+                    "ordinary legacy adoption must preserve the first curl"
+                );
+            });
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Turning { .. }
+            ));
+            assert!(app.page_turn_held_resource(1).is_some());
+            assert!(app.page_turn_content(1) == accepted);
+            let mut changed = expected;
+            changed.rect.min_x += 1.0;
+            app.export_crop_page_settings.insert(1, changed);
+            assert!(app.page_turn_held_resource(1).is_none());
+            assert!(app.page_turn_content(1) != accepted);
+        }
+    }
+}
+
+#[test]
+fn crop_oversized_legacy_publication_preserves_unknown_binding_and_held_projection() {
+    for source_dims in [None, Some((160, 240))] {
+        for publish_before_first_curl in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = thumbnail_legacy_crop_app(&ctx, source_dims);
+            let mut legacy = app.export_crop_page_settings[&1];
+            legacy.rect.max_x = 700.0;
+            app.export_crop_page_settings.insert(1, legacy);
+            let accepted = app.page_turn_content(1);
+            assert_eq!(accepted.crop, Some(legacy));
+            frame(&ctx, |ui, ctx| {
+                offer_thumbnail_legacy_crop(&mut app, ctx);
+                if publish_before_first_curl {
+                    publish_larger_crop_source(&mut app, ctx, [800, 1200]);
+                }
+                assert_eq!(app.resident_export_crop_for_idx(1), Some(legacy));
+                let mut state = FsFrameState::overview_shell();
+                state.image_dims = Some(if publish_before_first_curl {
+                    (800, 1200)
+                } else {
+                    source_dims.unwrap_or((80, 120))
+                });
+                assert_eq!(
+                    app.prepare_single_crop_from_frame_state(1, &state),
+                    Some(legacy)
+                );
+                assert_eq!(app.export_crop_page_settings[&1], legacy);
+                assert!(app.page_turn_content(1) == accepted);
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                    panic!()
+                };
+                assert!(
+                    receipt.curl,
+                    "metadata={source_dims:?} publication_before_first_curl={publish_before_first_curl}: {:?}",
+                    take_test_events()
+                );
+            });
+            let PresentationState::Turning { incoming, .. } = &app.page_turn_presentation.state
+            else {
+                panic!()
+            };
+            let held = incoming.pages[0].clone();
+            assert_eq!(held.crop, Some(legacy));
+            let projected = prepared_page_crop(&held).unwrap();
+            publish_larger_crop_source(&mut app, &ctx, [1000, 1500]);
+            frame(&ctx, |ui, ctx| {
+                assert_eq!(app.resident_export_crop_for_idx(1), Some(legacy));
+                let mut state = FsFrameState::overview_shell();
+                state.image_dims = Some((1000, 1500));
+                assert_eq!(
+                    app.prepare_single_crop_from_frame_state(1, &state),
+                    Some(legacy)
+                );
+                // The editing overlay's ordinary accessor can clamp a paint
+                // value without adopting the newly sufficient quality raster.
+                assert!(app.export_crop_for_idx(1, [1000, 1500]).is_some());
+                assert_eq!(app.export_crop_page_settings[&1], legacy);
+                assert!(app.page_turn_content(1) == accepted);
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                    panic!()
+                };
+                assert!(receipt.curl);
+            });
+            let PresentationState::Turning { incoming, .. } = &app.page_turn_presentation.state
+            else {
+                panic!()
+            };
+            let current = &incoming.pages[0];
+            assert_eq!(current.crop, Some(legacy));
+            assert_eq!(current.transform.source_size, held.transform.source_size);
+            assert_eq!(
+                current.resource.paint_texture_id(),
+                held.resource.paint_texture_id()
+            );
+            assert_eq!(prepared_page_crop(current).unwrap(), projected);
+            assert!(app.page_turn_content(1) == accepted);
+            let mut changed = legacy;
+            changed.rect.min_x += 1.0;
+            app.export_crop_page_settings.insert(1, changed);
+            assert!(app.page_turn_held_resource(1).is_none());
+            assert!(app.page_turn_content(1) != accepted);
+        }
+    }
+}
+
+#[test]
+fn crop_legacy_accepted_basis_rejects_changed_document_and_owner() {
+    let ctx = egui::Context::default();
+    let mut app = thumbnail_legacy_crop_app(&ctx, None);
+    let legacy = app.export_crop_page_settings[&1];
+    frame(&ctx, |_, ctx| offer_thumbnail_legacy_crop(&mut app, ctx));
+    let accepted_basis = |app: &App| app.page_turn_legacy_crop(1, legacy);
+    assert_eq!(
+        accepted_basis(&app),
+        Some(legacy.with_legacy_source_size([80, 120]))
+    );
+    let mut changed = legacy;
+    changed.rect.min_x += 1.0;
+    assert_eq!(app.page_turn_legacy_crop(1, changed), None);
+    changed = legacy;
+    changed.aspect_mode = CropAspectMode::Square;
+    assert_eq!(app.page_turn_legacy_crop(1, changed), None);
+
+    let original = app.items[1].clone();
+    app.items[1] = GridItem::Image(PathBuf::from("c:/page-turn/other-document.png"));
+    assert_eq!(accepted_basis(&app), None);
+    app.items[1] = original;
+    app.items_generation += 1;
+    assert_eq!(accepted_basis(&app), None);
+    app.items_generation -= 1;
+    app.erase_mask_generation.insert(1, 1);
+    assert_eq!(accepted_basis(&app), None);
+    app.erase_mask_generation.remove(&1);
+    app.settings.spread_page_gap_px += 1;
+    assert_eq!(accepted_basis(&app), None);
+    app.settings.spread_page_gap_px -= 1;
+
+    let layout = Arc::clone(&app.spread_display_units_cache.units);
+    app.spread_display_units_cache.units = Arc::new((*layout).clone());
+    assert_eq!(accepted_basis(&app), None);
+    app.spread_display_units_cache.units = layout;
+    let PresentationState::Offered { offer, .. } = &mut app.page_turn_presentation.state else {
+        panic!()
+    };
+    offer.fact.destination.viewport = egui::ViewportId::from_hash_of("other-crop-owner");
+    assert_eq!(accepted_basis(&app), None);
 }
 
 #[cfg(windows)]

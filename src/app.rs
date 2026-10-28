@@ -83107,6 +83107,28 @@ impl App {
         Some(adopted)
     }
 
+    /// Pixel basis available to both crop acceptance and ordinary display.
+    /// Thumbnail layout dimensions (notably a PDF page box) and processed/AI
+    /// sampler sizes are not source coordinates. A whole-source thumbnail with
+    /// no coordinate metadata can still supply the legacy raster fallback.
+    pub(crate) fn resident_export_crop_source_size(&self, idx: usize) -> Option<[usize; 2]> {
+        self.canonical_source_dimensions(idx)
+            .map(|dims| dims.as_size())
+            .or_else(|| self.fs_early_dims.get(&idx).copied())
+            .or_else(|| {
+                self.fs_page_coordinate_source_size(idx)
+                    .map(|size| [size.x.round() as usize, size.y.round() as usize])
+            })
+            .or_else(|| {
+                let resource = self.fs_thumbnail_resource_for_display(idx).ok()?;
+                matches!(
+                    resource.source_coverage(),
+                    crate::source_coverage::SourceCoverage::FullSource
+                )
+                .then(|| resource.source_texture().size())
+            })
+    }
+
     /// Immutable document crop binding. Unlike export_crop_for_idx, this does
     /// not adopt legacy dimensions, hydrate metadata, or persist anything.
     pub(crate) fn resident_export_crop_for_idx(
@@ -83117,13 +83139,14 @@ impl App {
         if settings.valid_source_size().is_some() {
             return Some(settings);
         }
-        // The ordinary frame uses the original raster dimensions as its legacy
-        // basis. Resolve that same memory-only basis for acceptance, without
-        // committing it. Its later adoption is not a document crop edit.
-        let size = self
-            .canonical_source_dimensions(idx)
-            .map(|dims| dims.as_size())
-            .or_else(|| self.fs_early_dims.get(&idx).copied());
+        if let Some(accepted) = self.page_turn_legacy_crop(idx, settings) {
+            // This also preserves an unresolved legacy value when the accepted
+            // raster was too small. Quality publication is not a crop edit.
+            return Some(accepted);
+        }
+        // Resolve the same memory-only basis as ordinary crop display, including
+        // thumbnail-only pages. Only ordinary display commits its later adoption.
+        let size = self.resident_export_crop_source_size(idx);
         Some(size.map_or(settings, |size| settings.with_legacy_source_size(size)))
     }
 
@@ -83132,8 +83155,13 @@ impl App {
         idx: usize,
         image_size: [usize; 2],
     ) -> Option<crate::export_crop::CropSettings> {
-        self.ensure_export_crop_source_size(idx, image_size)
-            .map(|settings| settings.scaled_to(image_size))
+        let settings = self.resident_export_crop_for_idx(idx)?;
+        if let Some(size) = settings.valid_source_size() {
+            let _ = self.ensure_export_crop_source_size(idx, size);
+        }
+        // Unresolved legacy settings are only clamped for this paint. Layout or
+        // processed-sampler dimensions must not become a persisted reference.
+        Some(settings.scaled_to(image_size))
     }
 
     /// 保存対象画像 (final composite。AI アップスケールで source とサイズが違うことが

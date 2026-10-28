@@ -3548,6 +3548,13 @@ mip 有無を VRAM 会計へ渡す。Native 先回りも実際に共有可能な
 受付はメモリだけを読み、legacy 基準寸法の永続採用は従来の通常表示 owner に残す。
 保持表示は capture-time crop を保持し、別フォルダで同じ idx を使っても新頁の crop を参照しない。
 
+準備済み比較（固定画像・ワイプ・差分）も、合成画像の実 transform で同じ flat crop owner を
+一度だけ呼ぶ。比較準備中は通常ページの owner を使い、編集 overlay は引き続きハンドルだけを描く。
+legacy crop のメモリ内基準解決は受付と通常表示で共有し、FullSource サムネイルの原寸情報、
+情報がない場合の resident raster も含む。受付後の品質更新では既存の受付内容が crop を保持する。
+矩形が収まらず基準を未確定のまま受け付けた場合もその値を保持し、paint の clamp は transform に
+委ねる。基準が解決できた場合の永続採用は通常表示でだけ行う。
+
 `ensure_edit_result_pixels` は新規組立て時と CPU-only entry の表示昇格時の両方で、
 upload の枚数制限より先に現在 context の `fs_cache` の静止画 source を調べる。
 現在の `EditResultKey`（item identity と各世代を含む）が一致し、source/edit pixels が

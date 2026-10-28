@@ -6611,4 +6611,10 @@ current producer（未採用 ready を含む）との開始競合を共通採用
 fork の空 owner・兄弟 context の失効隔離を維持する。閲覧用 crop は prepared page／内容 binding／
 capture-time holdover page が所有し、移譲先や idx 再利用先から crop を引き直さない。
 自動検証の結果は `target/pageturn-1461/implementation-report.md` と紙めくり計画 §28.3.1 に記録する。
+
+同日の独立実装レビュー追補では、比較合成にも共通 crop paint を接続し、legacy 基準の純粋解決を
+通常表示と受付で共有する。既存 accepted content の crop を品質更新の間も保持し、item／context／
+layout／編集が異なる場合は再利用しない。新しい保持状態や viewport／host 操作は追加しない。
+これは §28 の同じ所有境界の修正で、比較の解除や失効回避の guard は加えない。
+検証と旧描画経路の到達表は同じ実装報告の E6 再レビュー対応に追記する。
 アプリは起動しない。後発 local 正規化による同 key 失効は段階 B の既知残差として残す。

@@ -53,6 +53,8 @@ use eframe::egui;
 #[cfg(test)]
 mod book_composition_tests;
 #[cfg(test)]
+mod compare_crop_tests;
+#[cfg(test)]
 mod coverage_spread_tests;
 #[cfg(test)]
 mod coverage_tests;
@@ -11674,6 +11676,8 @@ impl App {
     ) -> Option<crate::export_crop::CropSettings> {
         let (w, h) = state.image_dims?;
         let size = [w as usize, h as usize];
+        // This display accessor adopts only the same pure crop resolution as
+        // acceptance. Frame layout or quality dimensions are only paint inputs.
         let _ = self.export_crop_for_idx(idx, size);
         self.prepared_single_page_crop(idx, size, state.original_preview_active)
     }
@@ -11693,25 +11697,15 @@ impl App {
         if original_preview_active || (!self.export_crop_mode && earlier_tool) {
             return None;
         }
-        self.resident_export_crop_for_idx(idx)
-            .map(|settings| {
-                // An oversized legacy rectangle cannot adopt this preview's basis.
-                // Clamp only the paint value in the ordinary frame's coordinates.
-                if settings.valid_source_size().is_some() {
-                    settings
-                } else {
-                    settings.scaled_to(image_size)
-                }
+        self.resident_export_crop_for_idx(idx).or_else(|| {
+            self.export_crop_mode.then(|| {
+                crate::export_crop::CropSettings::authored(
+                    crate::export_crop::CropRect::full(image_size[0], image_size[1]),
+                    self.export_crop_aspect_mode,
+                    image_size,
+                )
             })
-            .or_else(|| {
-                self.export_crop_mode.then(|| {
-                    crate::export_crop::CropSettings::authored(
-                        crate::export_crop::CropRect::full(image_size[0], image_size[1]),
-                        self.export_crop_aspect_mode,
-                        image_size,
-                    )
-                })
-            })
+        })
     }
 
     fn resolve_fs_display_material_from_caches(
@@ -28394,6 +28388,14 @@ impl App {
                                                 compare_requested,
                                                 self.compare_prepared_pair_matches(paint_idx),
                                             );
+                                            let compare_crop = requested_draw.draws_prepared_compare()
+                                                .then(|| self.prepare_single_crop_from_frame_state(paint_idx, &state))
+                                                .flatten()
+                                                // The comparison canvas may be larger than the source.
+                                                // Resolve only its paint value in the same coordinates
+                                                // as the crop handles, leaving document/turn binding raw.
+                                                .zip(state.image_dims)
+                                                .map(|(crop, (w, h))| crop.scaled_to([w as usize, h as usize]));
                                             let prepared_compare_drawn = requested_draw
                                                 .draws_prepared_compare()
                                                 && self.draw_compare_prepared_mode(
@@ -28403,6 +28405,7 @@ impl App {
                                                     paint_idx,
                                                     compare_mode,
                                                     zp,
+                                                    compare_crop,
                                                 );
                                             if prepared_compare_drawn {
                                                 navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
@@ -48030,10 +48033,21 @@ impl App {
         zoom_pan: Option<(f32, egui::Vec2)>,
         fit_scale_limits: FullscreenFitScaleLimits,
     ) -> Option<egui::Rect> {
+        Self::compare_image_transform(full_rect, 0, image_size, zoom_pan, fit_scale_limits)
+            .map(|transform| transform.full_image_rect)
+    }
+
+    fn compare_image_transform(
+        full_rect: egui::Rect,
+        page_idx: usize,
+        image_size: [usize; 2],
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        fit_scale_limits: FullscreenFitScaleLimits,
+    ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
             pixel_fit: RectPixelFit::Texels,
-            page_idx: 0,
+            page_idx,
             viewport_rect: full_rect,
             source_size: tex_size,
             texture_size: tex_size,
@@ -48046,7 +48060,6 @@ impl App {
             pixels_per_point: fit_scale_limits.pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan },
         })
-        .map(|transform| transform.full_image_rect)
     }
 
     #[cfg(windows)]
@@ -48830,10 +48843,20 @@ impl App {
         fs_idx: usize,
         mode: crate::app::CompareViewMode,
         zoom_pan: Option<(f32, egui::Vec2)>,
+        crop: Option<crate::export_crop::CropSettings>,
     ) -> bool {
         if !self.compare_prepared_pair_matches(fs_idx) {
             return false;
         }
+        let transform = self.compare_preparation.prepared_pair().and_then(|pair| {
+            Self::compare_image_transform(
+                image_rect,
+                fs_idx,
+                pair.target_size,
+                zoom_pan,
+                self.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+            )
+        });
         // Do not read `ctx.input().modifiers` here: the fullscreen viewport can retain a stale
         // modifier snapshot while the physical Ctrl state changes during the same drag.
         let ctrl_held =
@@ -48875,6 +48898,9 @@ impl App {
                 &bg_style,
             );
             ui.painter().add(shader_shape.shape);
+            if let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+                page_turn::paint_flat_crop(ui.painter(), transform, crop);
+            }
             if let crate::app::CompareViewMode::Wipe { fraction, .. } = mode {
                 let affordance = compare_wipe_affordance(ctrl_held);
                 // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
@@ -48889,7 +48915,7 @@ impl App {
         }
 
         let fit_scale_limits = self.fullscreen_fit_scale_limits(ctx.pixels_per_point());
-        match mode {
+        let painted = match mode {
             crate::app::CompareViewMode::PinnedNormal => {
                 let tex =
                     self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
@@ -48946,8 +48972,6 @@ impl App {
                     Some(clip),
                     fit_scale_limits,
                 );
-                let affordance = compare_wipe_affordance(ctrl_held);
-                Self::draw_compare_wipe_affordance(ui, ref_rect, fraction, affordance);
                 true
             }
             crate::app::CompareViewMode::Diff => {
@@ -48969,7 +48993,22 @@ impl App {
                 true
             }
             crate::app::CompareViewMode::Off => false,
+        };
+        if painted && let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+            page_turn::paint_flat_crop(ui.painter(), transform, crop);
         }
+        if painted
+            && let (Some(transform), crate::app::CompareViewMode::Wipe { fraction, .. }) =
+                (transform.as_ref(), mode)
+        {
+            Self::draw_compare_wipe_affordance(
+                ui,
+                transform.full_image_rect,
+                fraction,
+                compare_wipe_affordance(ctrl_held),
+            );
+        }
+        painted
     }
 
     fn draw_compare_pinned_image(
@@ -74549,6 +74588,7 @@ mod tests {
                                     7,
                                     crate::app::CompareViewMode::wipe(0.5),
                                     None,
+                                    None,
                                 );
                             })
                     });
@@ -74595,6 +74635,7 @@ mod tests {
                                     image_rect,
                                     8,
                                     crate::app::CompareViewMode::PinnedNormal,
+                                    None,
                                     None,
                                 );
                             })
