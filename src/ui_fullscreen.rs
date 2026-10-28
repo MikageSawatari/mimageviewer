@@ -8440,6 +8440,11 @@ const TRANSFORM_EPSILON: f32 = 0.001;
 /// パンがゼロとみなせるしきい値（length_sq）
 const PAN_EPSILON_SQ: f32 = 0.25;
 
+/// 拡大・縮小を対称に扱い、fit 付近の丸め誤差だけを無変換とする。
+fn zoom_differs_from_fit(zoom: f32) -> bool {
+    (zoom - 1.0).abs() > ZOOM_NEAR_ONE - 1.0
+}
+
 /// 共有 pool 由来の HIGH を超えた場合だけ trim を開始し、遠い非可視 unit を何個外せば
 /// LOW 以下に到達するかを返す。候補が足りなければ全候補を返し、可視 unit と準備帯は
 /// 呼び出し側で除外する。0% (無制限) では HIGH/LOW が `None` なので trim を無効化する。
@@ -14518,9 +14523,7 @@ impl App {
     /// フルスクリーン通常モードのズーム/パンが有効なら返す。
     /// 1.0 付近の誤差範囲だけ None。縮小も描画側へ渡す。
     pub(crate) fn fs_zoom_pan(&self) -> Option<(f32, egui::Vec2)> {
-        if (self.fs_zoom - 1.0).abs() > ZOOM_NEAR_ONE - 1.0
-            || self.fs_pan.length_sq() > PAN_EPSILON_SQ
-        {
+        if zoom_differs_from_fit(self.fs_zoom) || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
             Some((self.fs_zoom, self.fs_pan))
         } else {
             None
@@ -40906,7 +40909,7 @@ impl App {
         {
             return FsCanvasClickAction::None;
         }
-        let has_transform = zoom > ZOOM_NEAR_ONE
+        let has_transform = zoom_differs_from_fit(zoom)
             || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
         if self.fs_front_pointer.backing_double_clicked(response) && has_transform {
@@ -65864,6 +65867,97 @@ mod tests {
         // can still be recentred even though its clicks kept turning pages.
         let panned = egui::vec2(120.0, -40.0);
         assert!(panned.length_sq() > PAN_EPSILON_SQ);
+    }
+
+    #[test]
+    fn canvas_double_click_resets_shrunk_zoom_without_changing_single_click_ownership() {
+        for zoom in [
+            0.8,
+            1.25,
+            1.0,
+            0.99999,
+            1.00001,
+            ZOOM_NEAR_ONE,
+            2.0 - ZOOM_NEAR_ONE,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = crate::app::setup_app_for_test();
+            app.fs_zoom = zoom;
+            app.fs_pan = egui::Vec2::ZERO;
+            app.fs_free_rotation = 0.0;
+            app.spread_mode = SpreadMode::Single;
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+            let pos = egui::pos2(400.0, 200.0);
+            // Establish the hit target, then deliver two physical press/release pairs
+            // through the same backing-click boundary used by the fullscreen handler.
+            for frame in 0..5 {
+                let mut events = vec![egui::Event::PointerMoved(pos)];
+                if frame > 0 {
+                    events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame % 2 == 1,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        time: Some(frame as f64 * 0.05),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.capture_fs_front_pointer_input(&ctx, rect);
+                        let response = ui.interact(
+                            rect,
+                            egui::Id::new("zoom-reset-canvas"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        app.fs_front_pointer.accept_backing_click(&response, false);
+                        let action = app.plan_fs_canvas_click(
+                            &ctx,
+                            &response,
+                            rect,
+                            StillSeekGeometry::bar_only(),
+                            false,
+                            false,
+                            false,
+                            false,
+                            None,
+                            false,
+                            zoom,
+                            egui::Vec2::ZERO,
+                        );
+                        if frame == 2 {
+                            assert!(response.clicked(), "zoom={zoom}");
+                            if zoom > ZOOM_NEAR_ONE {
+                                assert!(matches!(action, FsCanvasClickAction::None));
+                            } else {
+                                assert!(
+                                    matches!(action, FsCanvasClickAction::PageSide(1)),
+                                    "zoom={zoom}"
+                                );
+                            }
+                        } else if frame == 4 {
+                            assert!(app.fs_front_pointer.backing_double_clicked(&response));
+                            if zoom == 0.8 || zoom == 1.25 {
+                                assert!(
+                                    matches!(action, FsCanvasClickAction::ResetTransform),
+                                    "zoom={zoom}"
+                                );
+                            } else {
+                                assert!(
+                                    matches!(action, FsCanvasClickAction::PageSide(1)),
+                                    "fit roundoff must not offer reset: zoom={zoom}"
+                                );
+                            }
+                        }
+                    },
+                )
+                .drop_without_applying_deltas();
+            }
+        }
     }
 
     fn navigation_trace_page(

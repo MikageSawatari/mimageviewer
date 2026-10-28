@@ -2238,14 +2238,16 @@ Image / Analysis は pivot と中心に同じ点を渡して pan を倍率比で
 動画 / 音声 / 編集モード / ページ一覧は対象外。比較では通常の画像キーと同様に有効。
 長押しリピートは同一フレームで各操作1回にまとめる。入力所有と詳細は [キー仕様](keymap-spec.md#キーによる段階ズーム1470)。
 
-通常表示への変換受け渡し `fs_zoom_pan()` は `abs(fs_zoom - 1.0) > ZOOM_NEAR_ONE - 1.0`
+通常表示への変換受け渡し `fs_zoom_pan()` は `zoom_differs_from_fit(fs_zoom)`
 または有意な pan がある場合に `Some` を返す。拡大・縮小を上下対称に扱い、1.0 付近の
 丸め誤差（0.99999 等）かつ pan なしだけを無変換にする。これにより fit から中央基準で
 縮小したキー / ゲームパッド LT / 中央での Ctrl+ホイールも `DisplayedImageTransform` へ倍率が届く。
 単ページ・白い相方付き単独配置・見開き・比較・類似プレビュー・snapshot の geometry は同じ値を使う。
 ページめくりアニメーションの既存 `fs_zoom_pan().is_none()` 条件も縮小中は不成立になる
 （無変換ページだけをめくる方針を維持）。入力所有・detached の述語 / viewport 経路は変更しない。
-ゲームパッド pan、ピクセルグリッド、クリック所有 / double-click reset の既存上側閾値は別の問いなので変更しない。
+ダブルクリックのリセット可否も同じ `zoom_differs_from_fit(zoom)` を使い、縮小中もリセットできる。
+この helper は `abs(zoom - 1.0) > ZOOM_NEAR_ONE - 1.0` を一か所で定義する。
+ゲームパッド pan、ピクセルグリッド、単クリック所有は「拡大中か」を問う既存上側閾値を維持する。
 
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
 **解決後の `DisplayedImageTransform` と描画は共用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
