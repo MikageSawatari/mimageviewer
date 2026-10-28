@@ -6425,3 +6425,65 @@ context／item 不一致の headless 回帰を追加する。旧 overlay の全�
   MI-GAN の Remote 排他 (`LocalAiActivityLease`)、Ctrl+E の段 gate (段が無いと再操作が要る) の問題が出る。
 - 注釈は cold な doc / font の worker 化、bake 結果の投機登録、注釈だけ・無変換頁の下地 Arc の受け渡しが要る。
 組み合わせを減らす手 (保存済みの編集一式から 1 つの世代で作る、など) を先に検討する。利用者に見える挙動が変わる案は着手前に相談する。
+
+### 28.5 段階 B の設計 (第 3 版、ACCEPT) — 局所補正・隠蔽・注釈を次 unit で先回りして作る
+
+利用者の判断 (2026-10-28): 今回の版に入れる。独立設計レビュー (GPT-6.1 Sol / xhigh) は第 1・2 版 REVISE、第 3 版 ACCEPT
+(`target/pageturn-1461/design-review-b{1,2,3}.md`)。段階 A の §28.4 の論点はこの節で解消した。
+
+**組み合わせを減らす方針。** 段ごとに作って段ごとに失効させるのをやめ、1 つの key (EditResultKey) の下で編集一式を 1 本の job で作り、
+照合を済ませてから 1 か所で一度に公開する。今の段 producer は下の段の完成ごとに上の段と edit / final を消す (`clear_conceal_caches` →
+`clear_edit_result_caches_for_idx`)。隠蔽 cache は全体世代しか持たず、どの下段の上に作ったかを記録しないので、下段の公開ごとに消すしかない。
+同じ key の下段 → 上段 → final → 注釈を 1 本で作って同時に入れれば、途中の失効そのものが要らない。
+
+**B0 所有と状態。** 既存 `final_effect_pending` の Speculative job が所有し、状態を `Computing → CpuReady → Registering → 公開` の型で排他的に表す。
+新しい map / queue / ready フラグは作らない。Computing は共通投機 permit・(注釈を含むとき) 既存 comic 実走行枠・CPU 結果予約を worker の実終了まで保持する。
+CpuReady は全出力の画素を予約付きで保持する (OverBudget でも消さず、既存の不要化・圧力回収・取消に任せる)。Registering は新しい texture (final、注釈) を
+ROOT 最終 hook の共通登録枠で 1 枚ずつ登録して pending 内に保持し、揃ったら一度だけ公開する。共有 handle は枠を消費しない。非公開の texture も全 context の VRAM 会計に含める。
+登録が残れば次の ROOT frame を要求し、OverBudget では再描画・再計算のループを作らない。
+
+**B1 対象と、今回作る出力。** Next unit の頁だけ (Previous は resident-only のまま)。演出 ON・paged・現 unit 提示後。final AI が必要な頁は対象外
+(AI 結果が cache にあれば after-AI 計画)。下の入力が exact resident であること (消しゴムのある頁は既存 Commit の完成画素、無い頁は raw。消しゴムの Commit が
+pending なら待つ。MI-GAN はこの job に含めない)。その頁の local / conceal / comic producer、利用者の LUT / segmentation producer が動いていないこと。
+待つ頁は continue で相方を進める。今回進められる出力で決める:
+- 局所補正 / 隠蔽の段が未完成 → 段から final まで。注釈がある頁で font が揃い comic 枠が取れれば注釈まで、そうでなければ final で止める。
+- final が complete で注釈だけ不足 → font が揃い comic 枠が取れれば注釈だけ (下地は cache の final 正本 Arc)。そうでなければ spawn しない。
+- 注釈だけ・無変換の頁は、final = edit = raw の Arc を下地とする。
+font の充足: doc が `comic_docs` にある頁は、UI がメモリだけを読む純粋判定 (`comic_overlay.rs:63` の参照 font 列挙を共有、本文と名前プレート)。
+`FontSet::get` の fallback を「ある」に使わない。doc が cold なら worker が読み、font 判定も worker で行う。
+
+**B2 入力と worker。** UI で捕捉するのは Arc・設定・key だけ: 下の入力 Arc、受理済み display basis、context・item identity・世代・EditResultKey・
+LocalAdjustResultKey・隠蔽世代・注釈世代・params、注釈の canonical 座標寸法 (画素寸法・clamp 寸法で代用しない)。局所補正の層は hydrate 済みならその Arc、
+未 hydrate なら DB path + page key。隠蔽マスクは DB path + page key と preset の値。注釈 doc は cached ならその値、cold なら DB path + page key。
+FontSet の Arc と読み込み済み font key の集合は snapshot。worker は `materialize_local_adjust` (層の寸法正規化を含む) → `materialize_conceal` →
+`FinalCompositePlan` (after-AI は結果の `used_upscale`) → final 正本 Arc (clamp 前) を下地に注釈を合成 → final と注釈の upload 画素をそれぞれ同じ Triangle clamp で作る。
+完成済みの消しゴム画素へ black flatten / MI-GAN を再適用しない。raw に投機独自の black flatten を足さない。Remote の adapter は呼ばず、
+`edit_source` / `final_composite` の CPU 処理だけを共有する。cold doc の解決は bake できなくても正常な結果として返す (Disconnected にしない)。
+
+**B3 公開。** 全照合 (items 世代・item identity・各 key・世代・下の入力 Arc・params・現在の doc) と、注釈を除外する条件 (doc 不一致・font 不足) を
+最初の mutation より前に確定する。段・edit・final を一括公開し、段採用用の失効は呼ばない (実編集・source 更新・params 変更の既存失効は弱めない)。
+`local_adjust_cache` / `conceal_cache` には CPU-only entry (texture なし) を入れる。局所補正の層の正規化結果は、層・presence・選択の整合と prepared snapshot 同期だけを行う
+共通 helper で採用する (local 世代を進めない、利用者 producer を取り消さない、兄弟 context へ publication しない)。doc は `comic_docs` に key が無いときだけ入れ、
+既存 doc を上書きしない。現在の doc と異なる bake は公開しない。final cache の正本 Arc と `comic_cache.base` は同じ Arc。画像の無い結果は GPU 登録を待たずに予約を解放する。
+
+**B4 段の「実体化済み」と「描画可能」を分ける。** 実体化済み = exact な画素 + 現在入力に対する層の寸法正規化。producer の起動判定はこちら (texture 不足を再レンダーの理由にしない)。
+描画可能 = 実体化済み + texture。`current_*_material` はこちらで、副作用なし。texture が要る表示 (局所補正・隠蔽の編集モード、final が無いときの段の表示) は、
+明示的な表示 ensure が既存画素を 1 frame 1 枚で upload する (画素・key を変えず、上段を失効させない)。Ctrl+E の段 gate は画素を見るので CPU-only で満たせる。
+CPU-only entry を作るのは B の公開だけ。既存 producer の公開は従来どおり texture 付き。
+
+**B5 表示要求と編集要求。** 表示要求の最初の入口 (通常 update の local producer 呼び出し・detached の同等箇所・final の表示引取り・注釈の同期 DB 読みより前) で、
+その頁の B 由来 job を 1 つの helper で解決する。非 blocking で受信してから状態を見て、CpuReady / Registering なら表示へ引き取り (作成済み handle を再 upload しない)、
+Computing なら取消・公開権撤去して既存の通常経路へ戻す。B 由来 job を DisplayPrepared へ昇格させない。編集要求 (Ctrl+E を含む入場・切替・original 待ちからの再開・
+Resume 経路) は、その頁の B 由来 job を取り消してから既存 owner へ渡し、B の完了から編集 continuation を発火させない。
+したがって、B の準備不足を理由にめくりを待たせたり省いたりせず、編集結果の見え始めも遅らせない。公開を、受理済み素材・held resource・canonical receipt の差し替え理由にしない。
+表示引取り時に残る GPU 登録のコストは未計測で、計測対象に残す。
+
+**B6 CPU 予約。** 画像 allocation 単位の保守的な上限 (checked 演算): 新規の局所補正画素・隠蔽画素、final 正本 (+ 別 allocation なら upload)、注釈正本 (+ 別 allocation なら upload)。
+共有 Arc は重複計上しない。after-AI は AI 結果寸法から求める。1GiB は未採用の画像結果の予約で、総 RAM 上限ではない。
+
+**B7 context。** park は新 job を開始しない。開始済み worker の内部 (局所補正 → 隠蔽 → final → 注釈) は完走してよく、再開時に再照合する (§27.17.3 の「park 中の完了後に次の comic 段を開始しない」は、
+新 job を開始しないという意味に読み替える)。F12 は同じ owner を移し、fork は pending・receiver・取消 token を共有しない。兄弟 context を変えない。
+detached-rework-plan.md §11 に記録する。
+
+**B8 残るもの。** 注釈の font が未準備の頁 (セッションで初めて注釈を表示する前など)、消しゴムの MI-GAN が間に合わない頁、VRAM 予算外、final AI が必要な頁、
+Previous の先回り。これらは段階 A と同じく、resident な最上位でめくる。
