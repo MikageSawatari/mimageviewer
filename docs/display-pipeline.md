@@ -2226,10 +2226,13 @@ fullscreen の close はその context の状態を Idle にし、retire は bun
 `FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
 Ctrl+Space＋primary 左右ドラッグの連続ズームは中ボタンドラッグと同じ `MiddleZoomDrag` を所有する。
-入力種類・開始時の `FsZoomOwner`・pivot・zoom・pan・rect center を固定し、共通の
+入力種類・開始した面（閲覧／編集）・開始時の `FsZoomOwner`・pivot・zoom・pan・rect center を固定し、共通の
 `zoom_at` で中ボタンは `2^(-dy/100)`、scrubby は `2^(dx/100)` を計算する。
 4 px のしきい値と `zoom_preserve_pivot` を共用し、通常・分析・編集は `ZOOM_MIN..ZOOM_MAX`、
 Z は既存の0.05～16に制限する。360は入力のみ消費する。終了時だけ各 owner の倍率で PDF を再描画する。
+4 px 未満では直前値を維持して書き戻さない。面／現在の `fs_zoom_owner()` が開始時と異なれば書き込まず終了する。
+閲覧処理は編集で開始した scrubby に触れず、編集 helper も閲覧で開始した状態に触れない。
+scrubby は分析モードでは開始せず、ガイド入力と組み合わせない。従来の分析ホイール／中ボタンは維持する。
 編集5モードは既存の Space パン helper を共用し、通常閲覧では touch／gesture／click／pan より先に primary を所有する。
 chord 解放後は倍率変更を終了し、primary 解放まで同じ typed state に保持して他の操作へ流さない。
 入力所有・対象 context の詳細は [キー仕様](keymap-spec.md#左右ドラッグによる連続ズーム)。
