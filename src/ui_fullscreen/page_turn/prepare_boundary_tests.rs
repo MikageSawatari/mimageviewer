@@ -699,6 +699,7 @@ fn draw_with_absent_source(
         Some(&mut sources),
         live,
         None,
+        crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
     ) {
         app.fullscreen_page_layout
             .push_occurrence(transform, held[0].occurrence);

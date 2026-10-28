@@ -93,6 +93,7 @@ fn draw(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitR
             Some(&mut sources),
             true,
             None,
+            crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
         )
         .expect("a partial or underlay-only page still has a submitted transform");
     app.fullscreen_page_layout

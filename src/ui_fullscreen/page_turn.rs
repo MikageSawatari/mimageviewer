@@ -13,6 +13,8 @@ mod cover_tests;
 mod coverage_lifecycle_tests;
 #[cfg(test)]
 mod crop_binding_tests;
+#[cfg(all(test, windows))]
+mod crop_order_tests;
 #[cfg(test)]
 mod draw_submit_tests;
 #[cfg(test)]
@@ -2518,7 +2520,17 @@ impl App {
         pages: &[PreparedPagedPage],
         white: Option<(egui::Rect, egui::Rect)>,
     ) -> Option<SubmittedUnitReceipt> {
-        self.submit_paged_display_unit_with_clock(ctx, pages, white, presentation_now)
+        self.submit_paged_display_unit_with_flat_crop(ctx, pages, white, FlatCropPaint::WithPage)
+    }
+
+    pub(super) fn submit_paged_display_unit_with_flat_crop(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+        white: Option<(egui::Rect, egui::Rect)>,
+        flat_crop: FlatCropPaint<'_>,
+    ) -> Option<SubmittedUnitReceipt> {
+        self.submit_paged_display_unit_at_crop_phase(ctx, pages, white, flat_crop, presentation_now)
     }
 
     pub(super) fn page_turn_submission_eligible(
@@ -2532,11 +2544,29 @@ impl App {
             && !self.page_turn_loupe_hold(ctx)
     }
 
+    #[cfg(test)]
     fn submit_paged_display_unit_with_clock(
         &mut self,
         ctx: &egui::Context,
         pages: &[PreparedPagedPage],
         white: Option<(egui::Rect, egui::Rect)>,
+        clock: impl FnOnce() -> Instant,
+    ) -> Option<SubmittedUnitReceipt> {
+        self.submit_paged_display_unit_at_crop_phase(
+            ctx,
+            pages,
+            white,
+            FlatCropPaint::WithPage,
+            clock,
+        )
+    }
+
+    fn submit_paged_display_unit_at_crop_phase(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+        white: Option<(egui::Rect, egui::Rect)>,
+        mut flat_crop: FlatCropPaint<'_>,
         clock: impl FnOnce() -> Instant,
     ) -> Option<SubmittedUnitReceipt> {
         if pages.is_empty() {
@@ -2551,7 +2581,7 @@ impl App {
         // OFF does no effect clock, snapshot/inventory work, geometry projection or input diagnostics.
         if !self.settings.page_turn_animation_enabled {
             for page in pages {
-                paint_flat_page(page);
+                paint_flat_page_at_crop_phase(page, &mut flat_crop);
             }
             if let Some((rect, clip)) = white {
                 paint_white_companion(&pages[0].painter, rect, clip);
@@ -2576,7 +2606,7 @@ impl App {
         if !eligible {
             self.page_turn_presentation.cancel("ineligible_view");
             for page in pages {
-                paint_flat_page(page);
+                paint_flat_page_at_crop_phase(page, &mut flat_crop);
             }
             if let Some((rect, clip)) = white {
                 paint_white_companion(&pages[0].painter, rect, clip);
@@ -2976,7 +3006,7 @@ impl App {
         }
         if !curl {
             for page in &unit.pages {
-                paint_flat_page(page);
+                paint_flat_page_at_crop_phase(page, &mut flat_crop);
             }
             if let Some((rect, clip)) = white {
                 paint_white_companion(&unit.pages[0].painter, rect, clip);
@@ -3183,6 +3213,47 @@ pub(super) fn paint_flat_crop(
 }
 
 pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
+    paint_flat_page_at_crop_phase(page, &mut FlatCropPaint::WithPage);
+}
+
+/// A paint phase, not presentation state: binding/snapshots always retain crop.
+/// Curl projects it on each face; ordinary flat paint composes it after canvas
+/// overlays through the same crop owner.
+pub(super) enum FlatCropPaint<'a> {
+    WithPage,
+    AfterCanvas(&'a mut FlatCrop),
+}
+
+/// Frame-local paint value from the actual bound flat page. It never owns a
+/// resource, request or presentation state, and curl never produces this value.
+#[derive(Default)]
+pub(super) enum FlatCrop {
+    #[default]
+    None,
+    Bound {
+        painter: egui::Painter,
+        transform: DisplayedImageTransform,
+        crop: crate::export_crop::CropSettings,
+    },
+}
+
+impl FlatCrop {
+    pub(super) fn paint(self) {
+        if let Self::Bound {
+            painter,
+            transform,
+            crop,
+        } = self
+        {
+            paint_flat_crop(&painter, &transform, crop);
+        }
+    }
+}
+
+pub(super) fn paint_flat_page_at_crop_phase(
+    page: &PreparedPagedPage,
+    phase: &mut FlatCropPaint<'_>,
+) {
     paint_image_underlay(&page.painter, page.transform.paint_quad(), &page.underlay);
     #[cfg(test)]
     crate::app::paint_record_test_support::record_selected_paint_resource(
@@ -3192,7 +3263,16 @@ pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
     page.resource
         .paint_texture(&page.transform, &page.painter, egui::Color32::WHITE);
     if let Some(crop) = page.crop {
-        paint_flat_crop(&page.painter, &page.transform, crop);
+        match phase {
+            FlatCropPaint::WithPage => paint_flat_crop(&page.painter, &page.transform, crop),
+            FlatCropPaint::AfterCanvas(output) => {
+                **output = FlatCrop::Bound {
+                    painter: page.painter.clone(),
+                    transform: page.transform,
+                    crop,
+                };
+            }
+        }
     }
     #[cfg(all(windows, feature = "test-script"))]
     crate::test_script::record_drawn_paint(
@@ -4954,6 +5034,7 @@ mod tests {
                 Some(&mut sources),
                 true,
                 None,
+                crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
             )
             .expect("accepted fit metadata permits ordinary drawing");
         app.fullscreen_page_layout

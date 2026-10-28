@@ -571,6 +571,7 @@ fn draw_specified_current(
                     Some(&mut sources),
                     true,
                     None,
+                    crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
                 )
                 .expect("accepted partial page remains drawable");
             app.fullscreen_page_layout.push_occurrence(transform, *page);

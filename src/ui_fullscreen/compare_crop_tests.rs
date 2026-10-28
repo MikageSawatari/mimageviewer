@@ -2,7 +2,15 @@
 use super::*;
 use crate::export_crop::{CropAspectMode, CropRect, CropSettings};
 
-fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool) {
+fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool, shader: bool) {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let gpu = shader.then(|| {
+        egui_kittest::wgpu::create_render_state(
+            crate::test_ui::wgpu_setup(),
+            egui_wgpu::RendererOptions::default(),
+        )
+    });
     for mode in [
         crate::app::CompareViewMode::PinnedNormal,
         crate::app::CompareViewMode::wipe(0.43),
@@ -73,6 +81,16 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool) {
                 }
                 _ => unreachable!(),
             };
+            let use_shader = shader && !matches!(mode, crate::app::CompareViewMode::PinnedNormal);
+            let prepared = if use_shader {
+                crate::app::ComparePreparedPixels::ShaderPair {
+                    pinned_rgba: Arc::new(vec![80; target_size[0] * target_size[1] * 4]),
+                    current_rgba: Arc::new(vec![160; target_size[0] * target_size[1] * 4]),
+                }
+            } else {
+                prepared
+            };
+            app.wgpu_render_state = gpu.clone();
             app.compare_preparation =
                 crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
                     key: 81,
@@ -108,18 +126,22 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool) {
                 );
                 assert_eq!(app.compare_view_mode, mode, "crop must not exit comparison");
                 let pair = app.compare_preparation.prepared_pair().unwrap();
-                let compare_textures: Vec<_> = match mode {
-                    crate::app::CompareViewMode::PinnedNormal => {
-                        vec![pair.pinned_texture.as_ref().unwrap().id()]
+                let compare_textures: Vec<_> = if use_shader {
+                    vec![]
+                } else {
+                    match mode {
+                        crate::app::CompareViewMode::PinnedNormal => {
+                            vec![pair.pinned_texture.as_ref().unwrap().id()]
+                        }
+                        crate::app::CompareViewMode::Wipe { .. } => vec![
+                            pair.current_texture.as_ref().unwrap().id(),
+                            pair.pinned_texture.as_ref().unwrap().id(),
+                        ],
+                        crate::app::CompareViewMode::Diff => {
+                            vec![pair.diff_texture.as_ref().unwrap().id()]
+                        }
+                        _ => unreachable!(),
                     }
-                    crate::app::CompareViewMode::Wipe { .. } => vec![
-                        pair.current_texture.as_ref().unwrap().id(),
-                        pair.pinned_texture.as_ref().unwrap().id(),
-                    ],
-                    crate::app::CompareViewMode::Diff => {
-                        vec![pair.diff_texture.as_ref().unwrap().id()]
-                    }
-                    _ => unreachable!(),
                 };
                 let painted_textures: Vec<_> = output
                     .shapes
@@ -129,9 +151,9 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool) {
                         _ => None,
                     })
                     .collect();
-                for texture in compare_textures {
+                for texture in &compare_textures {
                     assert!(
-                        painted_textures.contains(&texture),
+                        painted_textures.contains(texture),
                         "the prepared comparison itself must be painted"
                     );
                 }
@@ -197,6 +219,43 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool) {
                         "crop follows the actual compare transform"
                     );
                 }
+                let crop_order = output
+                    .shapes
+                    .iter()
+                    .position(|s| {
+                        matches!(
+                            &s.shape, egui::Shape::Mesh(mesh) if mesh.vertices.iter().any(|v|
+                                v.color == egui::Color32::from_rgb(255, 230, 100))
+                        )
+                    })
+                    .expect("common crop owner");
+                let composite = output.shapes.iter().enumerate().filter_map(|(i,s)| {
+                    (if use_shader { matches!(s.shape, egui::Shape::Callback(_)) } else {
+                        matches!(&s.shape, egui::Shape::Mesh(mesh) if compare_textures.contains(&mesh.texture_id))
+                    }).then_some(i)
+                }).last().expect("actual prepared composite");
+                assert!(composite < crop_order);
+                if matches!(mode, crate::app::CompareViewMode::Wipe { .. }) {
+                    let (_, light) = compare_wipe_affordance_colors();
+                    let wipe: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| {
+                            matches!(&s.shape, egui::Shape::LineSegment { stroke, .. }
+                            if stroke.width == 2.0 && stroke.color == light)
+                            .then_some(i)
+                        })
+                        .collect();
+                    assert_eq!(wipe.len(), 2, "actual Wipe line and handle mark");
+                    assert!(
+                        wipe.iter().all(|i| composite < *i && *i < crop_order),
+                        "Wipe affordance must precede crop dim/frame, shader={use_shader}"
+                    );
+                }
+                assert!(output.shapes.iter().enumerate().filter(|(_,s)| matches!(
+                    &s.shape, egui::Shape::Circle(c) if c.fill == egui::Color32::from_rgb(255, 245, 180)
+                )).all(|(i,_)| i > crop_order));
                 let handles = output.shapes.iter().filter(|shape| matches!(
                     &shape.shape, egui::Shape::Circle(circle) if circle.fill == egui::Color32::from_rgb(255, 245, 180)
                 )).count();
@@ -234,16 +293,23 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool) {
 
 #[test]
 fn crop_ready_compare_browsing_paints_dim_and_border_once() {
-    assert_ready_compare_crop(false, false);
+    assert_ready_compare_crop(false, false, false);
 }
 
 #[test]
 fn crop_ready_compare_editing_paints_dim_and_border_once_with_handles() {
-    assert_ready_compare_crop(true, false);
+    assert_ready_compare_crop(true, false, false);
 }
 
 #[test]
 fn crop_ready_compare_oversized_legacy_uses_source_coordinates_for_frame_and_handles() {
-    assert_ready_compare_crop(false, true);
-    assert_ready_compare_crop(true, true);
+    assert_ready_compare_crop(false, true, false);
+    assert_ready_compare_crop(true, true, false);
+}
+
+#[test]
+#[cfg(windows)]
+fn crop_ready_compare_shader_wipe_affordance_precedes_dim_frame_and_handles() {
+    assert_ready_compare_crop(false, false, true);
+    assert_ready_compare_crop(true, false, true);
 }

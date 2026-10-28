@@ -6418,6 +6418,28 @@ context／item 不一致の headless 回帰を追加する。旧 overlay の全�
 `viewer_context_audit` と指定検証の結果は `target/pageturn-1461/implementation-report.md` に追記する。
 製品ページ `index.html` は利用者指示により変更しない。commit／製品起動／build-dev は実施しない。
 
+### 28.3.3 Z照準／拡大のcrop積層順を復元（2026-10-29）
+
+段階Bの採用／登録ownerを確認した上で、段階A以前（`d4dfc7d9b`）の描画順を復元する。
+旧順は、画像→pixel grid（拡大時）→照準暗転／照準枠（照準時）→canvas overlay→crop暗転→
+crop黒／黄枠→編集handles。crop暗転も照準枠より後であり、枠だけ後へ移す案は採らない。
+
+Zの画像部分はcropなしで準備し、mainは実際に描いたtransformがZである場合に、従来のcrop段で
+共通`paint_flat_crop`へ渡す。単独Z描画のwrapperも同じ薄いrouterを使う。
+既存のprepared material／snapshot crop／非eligibleなZのreceipt契約は維持し、新しい状態やownerは作らない。
+同日の利用者scope訂正に従い、通常flatと準備済み比較も段階A以前のcrop段へ戻す。
+通常は画像→pixel grid→canvas overlay→crop暗転／枠→handles、Wipeはcomposite→操作表示→
+canvas overlay→crop暗転／枠→handles。cropはprepared bindingに残し、実際のflat描画だけが
+採用済みpainter・transform・cropのフレーム内描画値を返す。型は`FlatCropPaint::WithPage | AfterCanvas`。
+新しいApp field／queue／pendingは作らず、curlは後描画値を生成しない。最初のcanonical、
+OFF、非eligible、取消によるflatも同じ境界を通す。捕捉表示はWithPageを維持する。
+curl投影と段階Bの素材準備・公開・取消には変更を加えない。
+
+実fullscreen rendererのheadless回帰でZ照準／拡大／通常、演出ON/OFFと通常のcrop編集を確認する。
+通常grid／text・CPU／shader Wipeの順と、実rendererのcurl→canonical／取消の欠落・二重描画も検査する。
+全経路の旧順との照合と指定検証は
+`target/pageturn-1461/implementation-report.md`の積層順列および追補へ記録する。
+
 ### 28.4 段階 B (局所補正・隠蔽・注釈の先回り、§1.401 の残り) — 設計前の論点
 
 利用者の判断で今回の版に入れる (2026-10-28)。段階 A の実装後に別に設計し、独立レビューを受ける。第 1・2 版レビューで次が分かっている。

@@ -3569,8 +3569,17 @@ mip 有無を VRAM 会計へ渡す。Native 先回りも実際に共有可能な
 受付はメモリだけを読み、legacy 基準寸法の永続採用は従来の通常表示 owner に残す。
 保持表示は capture-time crop を保持し、別フォルダで同じ idx を使っても新頁の crop を参照しない。
 
+Z照準／拡大は画像・pixel grid・照準暗転／照準枠を先に描き、実際のZ transformを使って
+同じflat crop ownerを呼ぶ。mainでは従来のcrop合成段（canvas overlayの後、crop handlesの前）、
+単独Z描画ではそのcompositeの最後に呼ぶ。crop暗転と枠を照準の下へ移さず、二度描かない。
+通常flatも実際にbindしたprepared pageのcrop／transform／clipをフレーム内の描画値として返し、
+pixel gridとcanvas overlayの後、handlesの前で同じownerが描く。受付・snapshotにはcrop bindingを残す。
+curlはこの後描画値を生成せず、各faceに投影する。canonicalの最初のflatから同じ後描画段を使い、
+演出OFF／非eligible／取消のflatも同じ境界を通す。捕捉表示は従来どおり捕捉cropを面と一緒に描く。
+
 準備済み比較（固定画像・ワイプ・差分）も、合成画像の実 transform で同じ flat crop owner を
-一度だけ呼ぶ。比較準備中は通常ページの owner を使い、編集 overlay は引き続きハンドルだけを描く。
+一度だけ呼ぶ。WipeはCPU／shaderともcomposite→操作表示→canvas overlay→crop暗転／枠の旧順。
+比較準備中は通常ページのownerを使い、編集overlayは引き続きハンドルだけを描く。
 legacy crop のメモリ内基準解決は受付と通常表示で共有し、FullSource サムネイルの原寸情報、
 情報がない場合の resident raster も含む。受付後の品質更新では既存の受付内容が crop を保持する。
 矩形が収まらず基準を未確定のまま受け付けた場合もその値を保持し、paint の clamp は transform に

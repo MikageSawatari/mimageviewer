@@ -61,6 +61,8 @@ mod coverage_spread_tests;
 #[cfg(test)]
 mod coverage_tests;
 #[cfg(test)]
+mod crop_order_tests;
+#[cfg(test)]
 mod display_basis_tests;
 #[cfg(test)]
 mod final_demand_topology_tests;
@@ -14785,7 +14787,7 @@ impl App {
         state: &FsFrameState,
         seek_geometry: StillSeekGeometry,
     ) -> Option<DisplayedImageTransform> {
-        self.draw_fs_zoom_mode_with_receipt(
+        let painted = self.draw_fs_zoom_mode_with_receipt(
             ui,
             ctx,
             image_rect,
@@ -14794,7 +14796,28 @@ impl App {
             state,
             seek_geometry,
             None,
-        )
+        );
+        if let Some(transform) = painted.as_ref() {
+            let crop = self.prepare_single_crop_from_frame_state(fs_idx, state);
+            Self::paint_fs_frame_crop(ui, transform, crop);
+        }
+        painted
+    }
+
+    /// Route flat composites to the shared crop owner at the original phase,
+    /// after grid/aim/Wipe and canvas overlays, before crop edit handles.
+    fn paint_fs_frame_crop(
+        ui: &egui::Ui,
+        transform: &DisplayedImageTransform,
+        crop: Option<crate::export_crop::CropSettings>,
+    ) {
+        if let Some(crop) = crop {
+            page_turn::paint_flat_crop(
+                &ui.painter().with_clip_rect(transform.viewport_rect),
+                transform,
+                crop,
+            );
+        }
     }
 
     fn draw_fs_zoom_mode_with_receipt(
@@ -14808,7 +14831,6 @@ impl App {
         seek_geometry: StillSeekGeometry,
         submitted: Option<&mut FsNavigatorTextureSources>,
     ) -> Option<DisplayedImageTransform> {
-        let crop = self.prepare_single_crop_from_frame_state(fs_idx, state);
         let rotation = self.get_rotation(fs_idx);
         let paint_resource = self.fullscreen_paint_payload_for_page(
             fs_idx,
@@ -14861,7 +14883,8 @@ impl App {
                 None,
                 submitted,
                 false,
-                crop,
+                None,
+                page_turn::FlatCropPaint::WithPage,
             );
         };
         // 表示トリムが有効ならズーム対象をトリム後 bbox に絞る (切り落とした余白を見せない)。
@@ -14968,7 +14991,11 @@ impl App {
             trim_bbox,
             submitted,
             false,
-            crop,
+            // Z composes its aim/grid overlays before the shared crop owner.
+            // It is not an animated page; ordinary/canonical crop binding stays
+            // with the normal prepared-page path.
+            None,
+            page_turn::FlatCropPaint::WithPage,
         );
         if active {
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
@@ -28229,6 +28256,7 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
+                        let mut flat_crop = page_turn::FlatCrop::None;
                         let mut primary_draw = CompareFramePrimaryDraw::OrdinaryOnly;
                         let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
                             FsNavigatorTextureSources::single(
@@ -28394,14 +28422,6 @@ impl App {
                                                 compare_requested,
                                                 self.compare_prepared_pair_matches(paint_idx),
                                             );
-                                            let compare_crop = requested_draw.draws_prepared_compare()
-                                                .then(|| self.prepare_single_crop_from_frame_state(paint_idx, &state))
-                                                .flatten()
-                                                // The comparison canvas may be larger than the source.
-                                                // Resolve only its paint value in the same coordinates
-                                                // as the crop handles, leaving document/turn binding raw.
-                                                .zip(state.image_dims)
-                                                .map(|(crop, (w, h))| crop.scaled_to([w as usize, h as usize]));
                                             let prepared_compare_drawn = requested_draw
                                                 .draws_prepared_compare()
                                                 && self.draw_compare_prepared_mode(
@@ -28411,7 +28431,7 @@ impl App {
                                                     paint_idx,
                                                     compare_mode,
                                                     zp,
-                                                    compare_crop,
+                                                    None,
                                                 );
                                             if prepared_compare_drawn {
                                                 navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
@@ -28484,6 +28504,7 @@ impl App {
                                                     selected_display_unit.is_current().then_some(&mut navigator_texture_sources),
                                                     self.settings.page_turn_animation_enabled && !state.original_preview_active && self.page_turn_view_eligible(fs_idx),
                                                     crop,
+                                                    page_turn::FlatCropPaint::AfterCanvas(&mut flat_crop),
                                                 );
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 if painted.is_some() {
@@ -28674,6 +28695,10 @@ impl App {
                                 ctx.request_repaint();
                             }
 
+                            // Only actual flat paint, including the first canonical
+                            // landing, produces this value. Curl owns face-projected
+                            // crop and leaves it empty through its last frame.
+                            flat_crop.paint();
                             let has_crop = self.export_crop_for_idx(paint_idx, image_size).is_some();
                             // crop はパイプライン最後段。crop の枠 / 暗転は「切り取りツール」
                             // または「素の通常表示」でのみ出す。各ツールは自分の手前までの
@@ -28696,6 +28721,17 @@ impl App {
                                             self.export_crop_panel_rect(full_rect).contains(p)
                                         })
                                     });
+                                if matches!(transform.placement, ResolvedDisplayPlacement::Z { .. })
+                                    || primary_draw.draws_prepared_compare()
+                                {
+                                    let crop = self.prepare_single_crop_from_frame_state(paint_idx, &state)
+                                        .map(|crop| if primary_draw.draws_prepared_compare() {
+                                            // Compare's canvas can differ from the source;
+                                            // keep the same coordinates as its crop handles.
+                                            crop.scaled_to(image_size)
+                                        } else { crop });
+                                    Self::paint_fs_frame_crop(ui, transform, crop);
+                                }
                                 let used = self.draw_export_crop_overlay(
                                     ui,
                                     transform,
@@ -43919,6 +43955,7 @@ impl App {
             None,
             false,
             None,
+            page_turn::FlatCropPaint::WithPage,
         )
     }
 
@@ -43953,6 +43990,7 @@ impl App {
         submitted: Option<&mut FsNavigatorTextureSources>,
         live_eligible: bool,
         crop: Option<crate::export_crop::CropSettings>,
+        mut flat_crop: page_turn::FlatCropPaint<'_>,
     ) -> Option<DisplayedImageTransform> {
         // Current items resolve the active split here. A captured holdover keeps
         // its capture-time crop even if the replacement item or mode changes.
@@ -44097,8 +44135,12 @@ impl App {
             let img_rect = transform.full_image_rect;
             let total_scale = transform.total_scale;
             if let Some(submitted) = submitted {
-                let receipt =
-                    self.submit_paged_display_unit(ui.ctx(), std::slice::from_ref(&page), white);
+                let receipt = self.submit_paged_display_unit_with_flat_crop(
+                    ui.ctx(),
+                    std::slice::from_ref(&page),
+                    white,
+                    flat_crop,
+                );
                 let presentation = receipt
                     .as_ref()
                     .is_some_and(SubmittedUnitReceipt::has_presentation_binding);
@@ -44132,7 +44174,7 @@ impl App {
                     );
                     white_painter.rect_filled(white_rect, 0.0, egui::Color32::WHITE);
                 }
-                page_turn::paint_flat_page(&page);
+                page_turn::paint_flat_page_at_crop_phase(&page, &mut flat_crop);
             }
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
@@ -45245,6 +45287,7 @@ impl App {
                 (previous.previous.pages.len() == 1)
                     .then_some(page.crop)
                     .flatten(),
+                page_turn::FlatCropPaint::WithPage,
             ) {
                 self.fullscreen_page_layout
                     .push_occurrence(transform, page.occurrence);
@@ -48904,9 +48947,6 @@ impl App {
                 &bg_style,
             );
             ui.painter().add(shader_shape.shape);
-            if let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
-                page_turn::paint_flat_crop(ui.painter(), transform, crop);
-            }
             if let crate::app::CompareViewMode::Wipe { fraction, .. } = mode {
                 let affordance = compare_wipe_affordance(ctrl_held);
                 // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
@@ -48916,6 +48956,9 @@ impl App {
                     fraction,
                     affordance,
                 );
+            }
+            if let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+                page_turn::paint_flat_crop(ui.painter(), transform, crop);
             }
             return true;
         }
@@ -49000,9 +49043,6 @@ impl App {
             }
             crate::app::CompareViewMode::Off => false,
         };
-        if painted && let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
-            page_turn::paint_flat_crop(ui.painter(), transform, crop);
-        }
         if painted
             && let (Some(transform), crate::app::CompareViewMode::Wipe { fraction, .. }) =
                 (transform.as_ref(), mode)
@@ -49013,6 +49053,9 @@ impl App {
                 fraction,
                 compare_wipe_affordance(ctrl_held),
             );
+        }
+        if painted && let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+            page_turn::paint_flat_crop(ui.painter(), transform, crop);
         }
         painted
     }
@@ -49540,6 +49583,7 @@ impl App {
                         Some(&mut sources),
                         false,
                         page.crop,
+                        page_turn::FlatCropPaint::WithPage,
                     )
                 };
                 if let Some(transform) = transform {
@@ -69082,6 +69126,7 @@ mod tests {
                                     None,
                                     true,
                                     None,
+                                    page_turn::FlatCropPaint::WithPage,
                                 )
                                 .is_some()
                             );
@@ -92741,6 +92786,7 @@ pub(crate) mod page_turn_submission_tests {
                         Some(&mut sources),
                         app.settings.page_turn_animation_enabled,
                         app.prepared_single_page_crop(page.idx, [80, 120], false),
+                        crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
                     )
                     .unwrap();
                 app.fullscreen_page_layout.push_occurrence(transform, *page);
