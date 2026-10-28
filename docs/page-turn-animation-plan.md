@@ -6260,3 +6260,118 @@ computer-use で実キーを送った。04 (8000×8192) の idx12 (13|12) から
 - §27.17.19 で止まっていた「F12 の別ウィンドウで前の見開きへ戻る」は、静止の機会があれば滑らかになった。着地した頁は 13|12 → 11|10 → 9|8 → 7|6 → 5|4 → 7|6 → 9|8 で正しい。
 - 準備の時間がないまま戻ると、従来どおり前 unit を同期で作る (設計 §27.17.20 の限界)。この 1 回は F12 の窓作成直後で、新しい窓の大きさに合わせた Native 再生成と 0.4〜0.9 秒の frame 間隔が重なっており、
   §27.17.19 の 164〜176ms との差がこの変更によるものかは**未確認**。
+
+## 28. 通常フォルダのめくり (§1.461) と編集済み頁のめくり素材 (§1.457 / §1.401)（2026-10-28）
+
+正本はこの節。§22.1 の「受付時の素材選択」と §27.17.6 の「編集頁の先回り準備」をこの節で更新する。
+設計は ClaudeCode、独立設計レビューは GPT-6.1 Sol / xhigh の 3 往復 (第 1・2 版 REVISE、第 3 版の段階 A を ACCEPT)。
+記録は `target/pageturn-1461/design-review-{1,2,3}.md`。利用者の判断 (2026-10-28、親セッション経由):
+局所補正・隠蔽・注釈の先回りも今回の版に入れる (段階 B、別に設計・レビューする)。
+
+### 28.1 通常フォルダでめくりが始まらない (§1.461) — 原因
+
+観測 (利用者の開発機の perf ログ `%APPDATA%\mimageviewer\logs\perf_events.3.jsonl`、2026-10-27、v4.9.0 前後):
+通常フォルダ (`E:\share\...\..._files\6.jpg` など、見開き 6|7・8|9) をキーで送った 314 回すべてが
+`cat=page_turn_animation kind=skip reason=book_presentation_not_fully_allowed` で、めくりは 1 回も始まっていない。
+別のログ (perf_events.jsonl / .2) には start / finish が 73 件 / 45 件ある (各ファイル先頭 3 件の start の直前に出ている頁の key は、6 件とも ZIP の頁)。
+
+コード上の経路:
+- めくりの受付 (`page_turn.rs:2196` 付近) は、めくる先の表示単位の presentation demand について
+  `book_presentation_allowed` が全頁 Allowed であることを求める。
+- 通常の画像 (`GridItem::Image`) は本の構成の candidate を持たない (`source_composition_candidate`、
+  `book_composition_permission.rs:498`)。許可の表 `occurrences` には、通常表示が `retain_book_presentation_demand` で
+  **表示中の demand だけ** を `Allowed(None)` として入れる (同 557〜591。表示中以外は retain で消す)。
+- めくる先の demand はまだ表示されていないので表に無い。構成 service がある (製品の通常起動では常にある、
+  `book_composition_runtime.rs:521`) と `decision` (同 376) は表に無い occurrence を `Checking` にするので、受付が毎回 skip する。
+- ZIP / PDF の頁は本の navigation の許可の流れで先に表へ入るので、この skip に当たらない。
+- 既存のめくりテスト (`ready_app` など) は `book_composition_service = None` で、表に無い occurrence を Hidden でない限り
+  許す別の分岐 (同 605〜621) を通るため、通常フォルダと同じ `GridItem::Image` でも始まって終わっていた。
+
+**F1 修正方針。** 「通常の画像は取得すべき構成の許可を持たない」という既存の規則 (retain の挿入時にだけ書かれている) を、
+めくる先の判定でも同じ 1 か所の規則で使う。適用範囲は下の「F1 の適用範囲」。candidate を持つ頁 (ZIP / PDF) で表に無いものは従来どおり `Checking`。
+
+**F2 回帰テスト。** 構成 service がある (製品と同じ) 状態で、通常フォルダ (`load_folder` で開いた実フォルダ、
+`src/app/tests/plain_folder_spread.rs` の `make_folder` / `configure` を流用) の単頁と見開きで、キー送りのめくりが
+受付・開始・完走することを handler-level で確かめる。修正前はこのテストが `book_presentation_not_fully_allowed` で
+落ちることを確認する。ZIP の頁で表に無いものは従来どおり Checking になることも確かめる。
+
+**F1 の適用範囲 (第 3 版で確定)。** 規則 (「`presentation_candidate` を持たない occurrence は、取得すべき構成許可を持たない」) は
+retain と問い合わせが共有する 1 つの helper に書く。問い合わせ側では **めくる先 (target) の判定** にだけ使う:
+めくり受付と次 target の判定 (`fs_page_turn_decision_for_frame_with_perf`、ui_fullscreen.rs:33863)。
+新しい問い合わせは、既存の pending / Unreadable gate と表にある entry (Hidden / Checking / Allowed) をそのまま使い、
+**未登録の occurrence の解決だけ** を変える。既存 entry を candidate なしを理由に上書きしない。
+連結読みのレイアウト (ui_fullscreen.rs:46848〜47000) と表示中 demand の照合は従来の問い合わせのまま。連結は表を「可視 demand の admission」
+として使い、処理範囲を retain 済みに限る設計なので、F1 を広げると非可視頁の同期 metadata 処理 (cold `get_rotation` の DB 読み) が増える (第 2 版レビュー P2)。
+通常フォルダで新しく通る処理: navigation sequence の target 照合と readiness、必要時の target thumbnail / passthrough 要求、入力保持・burst 判定、
+33863 側の target load と prefetch window 更新。めくり専用ではないので ON / OFF の両方で回帰を見る。
+「本として扱う」画像フォルダも `GridItem::Image` のままで構成 candidate を持たない (`book_materialization.rs:24`、book-composition-plan.md:55)ので、
+F1 は有効な構成許可を緩めない。
+
+### 28.2 編集済み頁のめくり (§1.457) — 観測と原因
+
+利用者の報告 (2026-10-28): 消しゴムで編集した頁へめくると、アニメーション中は消しゴム未反映で、着地後に切り替わってちらつく。
+開発側では実機で再現していない。以下はコードの参照による。
+
+| 場所 | 現在の動き |
+| --- | --- |
+| めくり受付の素材選択 `page_turn_resident_source` (page_turn.rs:1857) | RAW 未現像→preview、exact final (+comic)、faithful gate、**source (編集前)**、thumbnail。編集の段を見ない |
+| 通常表示の resident 解決 `resolve_fs_display_material_from_caches` (ui_fullscreen.rs:11670) | comic → final → faithful gate → edit_result → 隠蔽 → 局所補正 → 消しゴム → source → thumbnail |
+| 通常表示の処理経路 `resolve_fs_processed_material_from_caches` (ui_fullscreen.rs:13170) | 段が揃えば final を同期で完成。段が未完成なら source を出す |
+| 消しゴムの段 | 先読みの source 受信時 (`poll_prefetch` → `auto_apply_saved_mask`) に MI-GAN を起動し `erase_result_cache` へ |
+| 局所補正・隠蔽の段 | 表示時と、legacy の AI / カラー化先読みの `ensure_edit_result_pixels_cpu` からだけ起動 |
+| D3 の CPU final 準備 `resident_final_prepare_input` (final_prepare.rs:221) | exact edit_result が無い編集頁は対象外 |
+| 注釈 (comic) | D3 は comic 頁を準備しない。bake は doc の DB 読み・font 列挙/parse を UI で同期実行 |
+| 切り抜き | 単頁の通常表示が暗転・枠を平面 overlay で描く (ui_fullscreen.rs:28606)。めくり中は到着頁の平面 overlay が curl の上に描かれる |
+
+原因: 先読みで消しゴムの段ができていても、めくりは段を見ずに編集前の source を選び、着地後の通常表示が段から final を作って切り替える。
+補正もある頁では D3 が編集頁を対象外にしているので、final も先に用意されない。
+
+### 28.3 段階 A の設計 (第 3 版、ACCEPT)
+
+**E1 受付時の素材選択を通常表示の段の順に揃える。** comic (exact base) → final (exact) → faithful gate → edit_result (exact key・texture あり)
+→ 隠蔽 → 局所補正 → 消しゴム → source → thumbnail。隠蔽 → 局所補正 → 消しゴムの「副作用なし・exact な material 選択」は 1 つの helper にし、
+通常表示と受付で共有する。edit_result は通常表示の緩い一致 (holdover) と受付の exact 一致を分けたまま。各 entry の display_basis を継承する。
+隠蔽の exact は `conceal_cache[idx].generation == conceal_generation` と idx 別の失効 (`clear_conceal_caches(idx)`) の組で、実装時に失効の呼び出し元を列挙して確かめる。
+品質ラベルに `edit` / `conceal` / `local_adjust` / `erase` を足す。producer・decode・upload・DB 読みは呼ばない (§22.1 の契約)。
+
+段が 1 つも resident でない編集頁は source でめくる。これは未 resident 時のちらつきを完全には解消しない。演出 OFF も段の完成前は source を出すが、
+faithful gate・holdover の例外があり、ON は受付素材を canonical 採用まで固定するので、途中で完成した編集の見え始めは OFF より遅れ得る。
+
+**E2 編集結果の texture を最上段の段と共有する。** `shared_source_texture_for_edit` を一般化する。共有条件は同 context・exact key・画素 Arc 同一・寸法一致・
+item identity 一致・texture options が `DISPLAY_IMAGE_TEXTURE_OPTIONS` (LINEAR) と一致。edit_result の LINEAR 契約を維持し、NEAREST の段は共有しない
+(後段フィルタを None に戻したとき NEAREST を通常 final として再利用する退行を防ぐ、第 1 版レビュー P2)。`resident_final_prepare_material` は
+実際に共有した段の material を返す (source を返さない。D3-4 の `resident_canonical_resource` の同一性検査と揃える)。共有を広げる範囲で、
+段 / edit の VRAM 会計の mip を実 options に揃える。ON / OFF 共通で、編集頁の着地時の再 upload が無くなる。
+
+**E3 D3 CPU final の入力を、完成した編集の累積結果へ広げる。** 入力計画は排他的な型 (`AfterAi / ResidentEdited / Unedited` 相当) にする。
+`ResidentEdited` は頁にある**全編集を反映済み**の、exact と証明できる最上位の段に限る (各段は下位を含む累積なので下位 cache は必須にしない。
+active な局所補正・隠蔽が未完成なら、exact な消しゴム段だけから complete final を作らない)。開始条件に「頁にある全段の producer が pending でない」
+(結果受信済み・未採用の ready を含む) を入れる。消しゴムは `commit_pending_matches_current_erase_key`、局所補正・隠蔽は採用側の条件を純粋 helper に抽出する。
+待つ頁は `continue` で相方を進める。要求時の key・入力寸法を固定し、Next / Previous で同じ純粋解決を使う (Previous は producer を起こさない)。
+消しゴムだけ・最終補正なしの頁は CPU 仕事が無く、E2 の共有 texture が material と Native prewarm の対象になる (`final_prepare_plan_from_resident` の早期 return は維持)。
+
+「全段 pending なし」は開始済み producer との競合を避ける条件であり、後発の同 key 失効までは防がない (第 3 版レビュー P3)。確認済みの経路:
+現在頁と相方へは final の有無と独立に local producer を起動し (update_phases.rs:1999)、層が全部無効でもマスク寸法が合わなければ正規化 worker が動き
+(app.rs:83635)、その `LocalInactive` 採用も `clear_conceal_caches` を通して D3 の pending / 登録済み final を消す (app.rs:83961、84295、83332)。
+「実編集」と「同じ入力の再実体化」の失効分離は段階 B で扱う。頻度は未実測。
+
+**E6 切り抜きの暗転・枠を単頁の prepared paint の owner へ移す。** 閲覧用の暗転・枠を、通常 flat・curl の表裏・canonical で同じ owner が同じ投影
+(leaf 座標・分割・表裏変換、flat は可視 polygon で clip) に通して、黒 alpha の別 mesh として面の直後に描く。編集用ハンドル・入力処理は既存 overlay に残し、
+crop 編集時に暗転・枠を二重に描かない。表示条件 (SNS 分割・元画像表示・erase/local/conceal/補正/分析中の抑止、実際の二頁表示での抑止、片頁の見開きでは出す) は今と同じ。
+binding は基準寸法付きの crop 値で、受付はメモリだけを読む pure accessor を使う (`export_crop_for_idx` の legacy 基準寸法の採用・永続化は通常表示に残す)。
+品質 publication の寸法変更を crop 変更と誤認しない。held page を clone する前に crop binding の一致を確かめ、古い crop を引き継がない。
+
+**E7 その他の編集。** SNS 分割中はめくり対象外。90 度単位の回転と表示トリムは受理した transform・UV・clip から canonical へ渡っている。
+自由回転・zoom・比較・編集中表示は既存の除外がある (第 1 版レビューで確認)。
+
+**detached。** 既存 D3 owner の拡張、受付素材選択の共通化、crop 描画 owner の統一は、症状パッチではなく構造的修正として設計担当と独立レビュー担当が合意。
+F12 移譲、park 中の新規開始停止と既存 job 保持、fork の空 owner、兄弟 context 不変を維持し、[detached-rework-plan.md §11](detached-rework-plan.md) に記録する。
+
+### 28.4 段階 B (局所補正・隠蔽・注釈の先回り、§1.401 の残り) — 設計前の論点
+
+利用者の判断で今回の版に入れる (2026-10-28)。段階 A の実装後に別に設計し、独立レビューを受ける。第 1・2 版レビューで次が分かっている。
+- 段の producer を前倒しで起こすだけでは、実走行数の上限 (取消が実終了を待たない)、非表示頁の texture 登録の迂回、UI の重い前処理 (black flatten) が残る。
+- D3 側で編集を実体化すると段 owner との二重所有になり、段完了時の失効 (`clear_conceal_caches` / `clear_edit_result_caches_for_idx`) が D3 の結果を消す、
+  MI-GAN の Remote 排他 (`LocalAiActivityLease`)、Ctrl+E の段 gate (段が無いと再操作が要る) の問題が出る。
+- 注釈は cold な doc / font の worker 化、bake 結果の投機登録、注釈だけ・無変換頁の下地 Arc の受け渡しが要る。
+組み合わせを減らす手 (保存済みの編集一式から 1 つの世代で作る、など) を先に検討する。利用者に見える挙動が変わる案は着手前に相談する。
