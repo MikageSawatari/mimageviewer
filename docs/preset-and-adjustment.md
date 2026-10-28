@@ -234,6 +234,8 @@ native presenter の画像補正パネル末尾に読込行と保存行を表示
 | コピーボタン | 「← コピー」(右→左) と「コピー →」(左→右) の対称配置。`App::copy_spread_adjust(src, dst)` を呼ぶ |
 | 同一判定 | `effective_params(left) == effective_params(right)` (実効値の `==`)。一致しているときは両コピーボタン disabled (= 「揃っている」状態が UI から自明) |
 
+実アプリでの確認 (§1.458、2026-10-28、観測者 ClaudeCode。隔離データ・dev-runtime ビルドを computer-use で操作): 右→左の見開きで補正パネルを開くと「右ページ」が選ばれ、「左ページ」を選んでから次の見開きへ送ると「右ページ」に戻った。左→右と末尾の表紙補助表示は実アプリでは未確認 (自動テストのみ)。
+
 #### コピー操作の中身
 
 `copy_spread_adjust(src, dst)` は `effective_params(src)` (3 層解決後) を `set_page_params(dst, ...)`

@@ -1941,6 +1941,7 @@ CPU fallback の managed texture も版ごとに pair 内へ保持する。
 `resolve_original_preview_material`、加工版のフレームは従来の加工payloadを使う。
 比較中は通常の元画像bypassを呼ばず、元素材が退去済みなら既存のthumbnail fallbackに任せて
 ルーペからMaterialOnlyロードや再試行を始めない。current以外の採取対象ページと比較Offは従来どおり。
+実アプリでの確認 (§1.79、2026-10-28、観測者 ClaudeCode。隔離データ・dev-runtime ビルドを computer-use で操作): ワイプ比較と差分強調で、押している間に両側が元画像になり、ワイプ位置は変わらず、離すと加工版へ戻った。PinnedNormal・ルーペ・ナビゲータは実アプリでは未確認 (自動テストのみ)。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
