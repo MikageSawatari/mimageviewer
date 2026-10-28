@@ -1755,6 +1755,16 @@ impl App {
             return;
         }
 
+        // Preview owns the canvas; navigation above keeps its own primary stream.
+        // Consume a held canvas press through its release so leaving preview
+        // cannot turn the remainder of that press into a brush/shape operation.
+        if self.erase_preview_active {
+            if primary_down {
+                self.fs_primary_suppression.arm_pointer_stream();
+            }
+            return;
+        }
+
         if self.book_append_undo_in_progress() {
             if primary_down || primary_pressed || primary_released || secondary_pressed {
                 self.admit_book_append_followup_mutation();
@@ -3022,6 +3032,14 @@ impl App {
 
     /// ボタンとキーを合成した一つの押下遷移で、保存なしプレビューを投入する。
     fn update_erase_preview(&mut self, ctx: &egui::Context, pointer_pressed: bool) {
+        // Canvas input precedes the panel. A key and a drawing press can arrive
+        // together, so respect a drawing owner created in this same frame too.
+        if !self.erase_preview_active
+            && self.erase_preview_hold == ErasePreviewHoldState::Held
+            && self.erase_drawing_in_progress()
+        {
+            self.erase_preview_hold = ErasePreviewHoldState::BlockedUntilRelease;
+        }
         // MI-GAN は既存の非同期経路を使う。保持中は再投入せず、押し直すと
         // 最新マスクで再投入する。空マスクなら何も起きない。
         let preview_pressed =
@@ -5982,6 +6000,67 @@ mod section1445_slider_tests {
                 .any(|node| node.is_focused()),
             "numeric editing must still own focus before the first canvas press"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_hold_and_brush_press_in_the_same_frame_keep_the_drawing_owner() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE014, egui::ViewportId::ROOT);
+        let mut harness = erase_slider_harness(EraseTool::Brush);
+        harness.state_mut().ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test(
+                "preview simultaneous press test",
+            );
+        let now = std::time::Instant::now();
+        crate::key_input::enqueue_test_synthetic_command(
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                crate::key_input::SyntheticNavigationKey::Tab,
+                Default::default(),
+            ),
+        );
+        crate::key_input::advance_test_synthetic_input(now);
+        harness.event(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: Some(egui::Key::Tab),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let seed = egui::pos2(700.0, 200.0);
+        harness.hover_at(seed);
+        harness.drag_at(seed);
+        harness.run_steps(1);
+        assert!(
+            harness
+                .state()
+                .erase_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|pixel| *pixel)
+        );
+        assert_eq!(
+            harness.state().erase_preview_hold,
+            ErasePreviewHoldState::BlockedUntilRelease
+        );
+        assert!(!harness.state().erase_preview_active);
+        assert!(harness.state().erase_inpaint_pending.is_empty());
+        let moved = seed + egui::vec2(30.0, 0.0);
+        harness.event(egui::Event::PointerMoved(moved));
+        harness.run_steps(1);
+        assert_eq!(harness.state().erase_last_paint_pos, Some(moved));
+        harness.event(egui::Event::PointerButton {
+            pos: moved,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(2);
+        assert!(harness.state().erase_last_paint_pos.is_none());
+        assert!(!harness.state().erase_preview_active);
+        assert!(harness.state().erase_inpaint_pending.is_empty());
     }
 
     #[cfg(windows)]

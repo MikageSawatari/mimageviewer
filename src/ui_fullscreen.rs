@@ -70306,6 +70306,342 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn erase_preview_canvas_test(
+        ctx: &egui::Context,
+        tool: crate::app::EraseTool,
+    ) -> (
+        crate::app::AppTestEnvForTest,
+        DisplayedImageTransform,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::ui_erase::{
+            EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey, EraseInpaintProgress,
+            EraseInpaintPurpose,
+        };
+        let (mut app, _, idx) = setup_flat_navigator_input_test();
+        let transform = navigator_test_transform(
+            idx,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+            },
+        );
+        app.erase_mode = true;
+        app.erase_tool = tool;
+        app.erase_paint_mode = true;
+        app.erase_mask_size = [1600, 1200];
+        app.erase_mask = Some(vec![false; 1600 * 1200]);
+        app.erase_shapes = vec![crate::mask_db::Shape::Line {
+            op: crate::mask_db::ShapeOp::Add,
+            kind: crate::mask_db::LineKind::Diagonal,
+            p0: (400.0, 600.0),
+            p1: (1200.0, 600.0),
+            thickness: 40.0,
+        }];
+        let pixels = Arc::new(egui::ColorImage::filled([1600, 1200], egui::Color32::WHITE));
+        let display_basis = crate::material_display_basis::MaterialDisplayBasis::from_sampler(
+            [1600, 1200],
+            crate::source_coverage::SourceCoverage::FullSource,
+        );
+        app.erase_base_cache.insert(
+            idx,
+            crate::app::EraseBaseSource::raster(Arc::clone(&pixels)),
+        );
+        app.erase_preview_cache.insert(
+            idx,
+            crate::app::ErasePreviewCacheEntry {
+                display_basis,
+                texture: ctx.load_texture(
+                    "erase-preview-canvas",
+                    Arc::clone(&pixels),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels,
+            },
+        );
+        // Keep a completed preview and an in-flight request: neither may be
+        // invalidated by input which the preview owns. No AI worker is started.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let items_generation = app.items_generation;
+        let path_key = app.page_path_key(idx);
+        app.erase_inpaint_pending.insert(
+            EraseInpaintPendingKey {
+                idx,
+                kind: EraseInpaintKind::Preview,
+            },
+            EraseInpaintPending {
+                display_basis,
+                idx,
+                items_generation,
+                path_key,
+                rx,
+                progress_rx,
+                progress: EraseInpaintProgress::Preparing,
+                cancel: Arc::clone(&cancel),
+                started_at: std::time::Instant::now(),
+                input_generation: 0,
+                mask_generation: 0,
+                purpose: EraseInpaintPurpose::Preview {
+                    origin: "canvas-regression",
+                },
+            },
+        );
+        app.erase_preview_active = true;
+        (app, transform, cancel)
+    }
+
+    #[cfg(windows)]
+    fn erase_preview_canvas_key(
+        key: crate::key_input::SyntheticNavigationKey,
+        down: bool,
+        ctrl: bool,
+    ) {
+        let now = std::time::Instant::now();
+        let command = if down {
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                key,
+                crate::key_input::SyntheticModifiers {
+                    ctrl,
+                    ..Default::default()
+                },
+            )
+        } else {
+            crate::key_input::SyntheticKeyCommand::up(now, key)
+        };
+        crate::key_input::enqueue_test_synthetic_command(command);
+        crate::key_input::advance_test_synthetic_input(now);
+    }
+
+    #[cfg(windows)]
+    fn erase_preview_canvas_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        transform: &DisplayedImageTransform,
+        events: Vec<egui::Event>,
+    ) {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(transform.viewport_rect),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.keyboard_owner_for_pass(ctx);
+                // The production wheel/click router advances this same owner before
+                // edit input. Exercise its release transition, never reset the field.
+                let _ = app.fs_primary_suppression.apply(
+                    FullscreenPrimarySuppressionEvent::PointerFrame {
+                        released: ctx.input(|input| input.pointer.primary_released()),
+                    },
+                );
+                app.handle_erase_paint(ctx, transform, Default::default());
+                app.draw_erase_overlay(ui, ctx, transform);
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    fn erase_preview_canvas_primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_primary_cannot_mutate_any_tool_or_invalidate_preview() {
+        use crate::app::EraseTool;
+        let _input = crate::key_input::lock_test_input();
+        for tool in [
+            EraseTool::Brush,
+            EraseTool::Bucket,
+            EraseTool::Lasso,
+            EraseTool::Polygon,
+            EraseTool::Line,
+            EraseTool::VertLine,
+            EraseTool::HorizLine,
+            EraseTool::Rect,
+            EraseTool::Ellipse,
+            EraseTool::Select,
+        ] {
+            crate::key_input::arm_test_synthetic_input(0xE010, egui::ViewportId::ROOT);
+            erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+            let ctx = egui::Context::default();
+            crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+            let (mut app, transform, cancel) = erase_preview_canvas_test(&ctx, tool);
+            let idx = app.fullscreen_idx.unwrap();
+            let texture = app.erase_preview_cache[&idx].texture.id();
+            let shapes = app.erase_shapes.clone();
+            let pos = transform.viewport_rect.center();
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    erase_preview_canvas_primary(pos, true),
+                ],
+            );
+            assert!(app.fs_primary_suppression.is_active(), "{tool:?}");
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![egui::Event::PointerMoved(pos + egui::vec2(60.0, 35.0))],
+            );
+            assert!(app.erase_preview_active);
+            assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+            assert_eq!(app.erase_shapes, shapes);
+            assert!(app.erase_selected_shape.is_none());
+            assert!(
+                app.erase_last_paint_pos.is_none()
+                    && app.erase_line_start.is_none()
+                    && app.erase_shape_drag_start.is_none()
+                    && app.erase_drag.is_none()
+                    && app.erase_lasso_points.is_empty()
+            );
+            assert!(app.erase_undo_stack.is_empty());
+            assert_eq!(app.erase_preview_cache[&idx].texture.id(), texture);
+            assert_eq!(app.erase_inpaint_pending.len(), 1);
+            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_requires_a_fresh_primary_press_after_preview_release() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE011, egui::ViewportId::ROOT);
+        erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+        let ctx = egui::Context::default();
+        let (mut app, transform, cancel) =
+            erase_preview_canvas_test(&ctx, crate::app::EraseTool::Brush);
+        let pos = transform.viewport_rect.center() + egui::vec2(0.0, 100.0);
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![
+                egui::Event::PointerMoved(pos),
+                erase_preview_canvas_primary(pos, true),
+            ],
+        );
+        erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, false, false);
+        erase_preview_canvas_frame(&mut app, &ctx, &transform, vec![]);
+        assert!(!app.erase_preview_active);
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![egui::Event::PointerMoved(pos + egui::vec2(30.0, 0.0))],
+        );
+        assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![erase_preview_canvas_primary(pos, false)],
+        );
+        assert!(!app.fs_primary_suppression.is_active());
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![
+                egui::Event::PointerMoved(pos),
+                erase_preview_canvas_primary(pos, true),
+            ],
+        );
+        assert!(app.erase_mask.as_ref().unwrap().iter().any(|pixel| *pixel));
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_keeps_space_pan_and_ctrl_space_zoom_available() {
+        let _input = crate::key_input::lock_test_input();
+        for ctrl in [false, true] {
+            crate::key_input::arm_test_synthetic_input(0xE012, egui::ViewportId::ROOT);
+            erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+            let ctx = egui::Context::default();
+            let (mut app, transform, cancel) =
+                erase_preview_canvas_test(&ctx, crate::app::EraseTool::Brush);
+            erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Space, true, ctrl);
+            let pos = transform.viewport_rect.center();
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    erase_preview_canvas_primary(pos, true),
+                ],
+            );
+            assert!(!app.fs_primary_suppression.is_active());
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![egui::Event::PointerMoved(pos + egui::vec2(100.0, 0.0))],
+            );
+            if ctrl {
+                assert!((app.fs_zoom - 4.0).abs() < 1e-4);
+            } else {
+                assert_ne!(app.fs_pan, egui::Vec2::ZERO);
+                assert!(app.erase_preview_active);
+            }
+            assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+            assert!(
+                app.erase_preview_cache
+                    .contains_key(&app.fullscreen_idx.unwrap())
+            );
+            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![erase_preview_canvas_primary(pos, false)],
+            );
+            assert!(app.fs_pan_drag_start.is_none());
+            assert!(app.fs_middle_zoom_drag.is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_does_not_latch_a_primary_click_released_in_the_same_frame() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE013, egui::ViewportId::ROOT);
+        erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+        let ctx = egui::Context::default();
+        let (mut app, transform, cancel) =
+            erase_preview_canvas_test(&ctx, crate::app::EraseTool::Brush);
+        let pos = transform.viewport_rect.center();
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![
+                egui::Event::PointerMoved(pos),
+                erase_preview_canvas_primary(pos, true),
+                erase_preview_canvas_primary(pos, false),
+            ],
+        );
+        assert!(!app.fs_primary_suppression.is_active());
+        assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     #[test]
     fn scrub_zoom_stationary_drag_does_not_create_a_repaint_loop() {
         for input in [ZoomDragInput::Middle, ZoomDragInput::Scrub] {
