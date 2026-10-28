@@ -1,5 +1,36 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+## 左右ドラッグによる連続ズーム
+
+既定は Ctrl+Space を押しながら primary pointer（ペン／マウス左ボタン）で左右ドラッグ。
+右で拡大、左で縮小し、押下位置を固定したまま開始時の倍率と pan から毎回計算する。
+100 px で2倍／半分、開始しきい値は中ボタンドラッグと同じ4 px。
+しきい値内へ戻すと開始時の倍率と pan に戻る。通常・分析・編集は0.1～50倍、
+Z ズームは既存の0.05～16倍を維持する。360では入力だけを所有し視点は変更しない。
+
+| Action | Context | Trigger | 既定 |
+| --- | --- | --- | --- |
+| `FsScrubZoomHold` | FsImage | KeyHold | Ctrl+Space |
+| `EraseScrubZoomHold` | Erase | KeyHold | Ctrl+Space |
+| `ConcealScrubZoomHold` | Conceal | KeyHold | Ctrl+Space |
+| `CropScrubZoomHold` | Crop | KeyHold | Ctrl+Space |
+| `TextScrubZoomHold` | Text | KeyHold | Ctrl+Space |
+| `LaScrubZoomHold` | LocalAdjust | KeyHold | Ctrl+Space |
+
+この6操作だけ `FullChord` policy を使い、通常キーと修飾キーの組合せを許可する。
+従来の KeyHold は `SinglePlainKey` のまま。修飾は完全一致で、Ctrl+Space は
+`FsSpaceCheck` を発火させない。Crop の Ctrl 併用パンも含め、共通 helper でズームを優先する。
+描画・選択等のドラッグ中は開始しない。パネル上で開始せず、開始後はパネルを横切っても続く。
+chord または primary を離すと倍率変更を終了し、通常・分析・編集の PDF は最終倍率で再描画する。
+chord を先に離した場合も primary を離すまで同じ押下を所有し、描画・クリックへ流さない。
+通常閲覧は静止画のキャンバスが対象で、動画・音声・音楽・ページ一覧は対象外。
+TextEdit／IME／modal／非アクティブ窓の既存入力所有を優先し、detached の配送経路は変更しない。
+
+右 Ctrl+Space では従来の `FsOriginalPreviewHold` も成立し、元画像表示を併用する。
+入力方式によっては Ctrl+Space が入力の切り替えに使われるため、その場合は操作カスタマイズで別のキーへ変更する。
+中ボタンと scrubby は種類・開始時の持ち主を持つ一つのドラッグ状態を共有し、同時開始しない。
+組合せを減らすため、chord 解放後の再開・パンへの切替は設けず、同じ primary の終端まで所有する。
+
 ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
 動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
 受理済み移動が未提示の間はanimationのON／OFFにかかわらずOによる新規入場を受け付けない。
@@ -706,6 +737,7 @@ Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持�
 | 入力 | 動作 |
 |---|---|
 | <kbd>Space</kbd>+左ドラッグ | 一時パン。進行中の描画 / 図形 / crop / 注釈ドラッグは途中でパンへ切り替えず、現在の操作を完結させる |
+| <kbd>Ctrl</kbd>+<kbd>Space</kbd>+左右ドラッグ | 押した位置を中心に右で拡大・左で縮小。描画・選択等のドラッグ中は開始しない |
 | マウスホイール | 画像上ではズーム。スクロール可能なツールパネル上ではパネルスクロールを優先 |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | ホイール押し込み+上下ドラッグ | 中ボタンドラッグズーム。パネル上で開始した場合は無視 |
@@ -984,7 +1016,7 @@ permit のあるフレームで割当キー自体の解放を確認してから�
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | ドラッグ中も現在の切り取り範囲を先に確定・保存し、現在の表示結果を別ファイルへエクスポートする。Action: `CropExecute` |
 | <kbd>Esc</kbd> | ドラッグ中は開始前の切り取り設定（crop なしも含む）へ戻し、保存せずドラッグだけを取り消す。モードは維持する。ドラッグしていなければ切り取りモードを終了する固定操作 |
 | <kbd>Ctrl</kbd>+左ドラッグ | 既存の切り取り枠やハンドル上からでも、新しい切り取り範囲を作成する。Action: `CropForceCreateHold`。既定は <kbd>Ctrl</kbd> で、操作カスタマイズから変更・無効化できる |
-| <kbd>Space</kbd>+左ドラッグ | 一時パン。`CropSpacePan` と `CropForceCreateHold` を同時に押した場合もパンを優先する。開始後に修飾キーを押す、または離しても、同じ左ドラッグを切り取り操作へ切り替えない |
+| <kbd>Space</kbd>+左ドラッグ | 一時パン。`CropSpacePan` と `CropForceCreateHold` を同時に押した場合もパンを優先するが、`CropScrubZoomHold` が成立すると左右ドラッグズームを優先する。開始後に修飾キーを押す、または離しても、同じ左ドラッグを切り取り操作へ切り替えない |
 | マウスドラッグ | 切り取り範囲を作成、移動、またはリサイズする。アスペクト固定時は、辺なら反対辺、角なら反対角を固定して拡大縮小する |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | マウスホイール | 画像上ではズーム。ツールパネル上ではパネルスクロール |

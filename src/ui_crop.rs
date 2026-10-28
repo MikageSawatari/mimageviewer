@@ -927,6 +927,11 @@ impl App {
             && self.handle_overlay_space_pan_drag(
                 ui.ctx(),
                 space_pan_held,
+                crate::keyboard_input::focused_key_state_permit(ui.ctx()).is_some_and(|permit| {
+                    self.keymap
+                        .key_held_action(ui.ctx(), permit, KeyAction::CropScrubZoomHold)
+                }),
+                transform.viewport_rect.center(),
                 pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
                 primary_pressed,
                 primary_down,

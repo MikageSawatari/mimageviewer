@@ -23,7 +23,7 @@
 # - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。
 # - ModifierHold は Ctrl / Shift / Alt / RightCtrl / RightShift / RightAlt の
 #   いずれか 1 つだけ指定できます。Right* は右側限定、それ以外は左右不問です。
-# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
+# - KeyHold は通常キー 1 つです。左右ドラッグズームだけ修飾キーも指定できます。
 # - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,
 #   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,
 #   [, ], Semicolon, :, ,, ., \, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter
@@ -419,6 +419,7 @@
 # FsRotateCcw = L ; 現在の画像を左に90度回転する
 # FsImageAnalysis = Shift+Z ; 画像分析モードを開く
 # FsZoomMode = Z ; 全画面ズームモード (押している間ズーム範囲を指定)
+# FsScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 # FsNavigatorToggle = Alt+N ; ナビゲータの表示を切り替える
 # FsPageTurnAnimationToggle = none ; ページめくりアニメーションを切り替える
 # FsNavigatorHold = Alt ; 押している間だけナビゲータを表示する
@@ -648,6 +649,7 @@
 # ErasePaintMode = D ; 描画モードに切り替える
 # EraseEraseMode = F ; 消去モードに切り替える
 # EraseSpacePan = Space ; 押している間だけ画像をパン操作する
+# EraseScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 # ErasePreviewHold = Tab ; 押している間だけ消しゴムの結果をプレビューする
 
 [Conceal] ; 隠蔽加工モード
@@ -680,10 +682,12 @@
 # ConcealToolRect = R ; 矩形ツールに切り替える
 # ConcealToolEllipse = O ; 楕円ツールに切り替える
 # ConcealSpacePan = Space ; 押している間だけ画像をパン操作する
+# ConcealScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 
 [Crop] ; 切り取りモード
 # CropForceCreateHold = Ctrl ; 押している間、ドラッグで新しい切り取り枠を作る
 # CropSpacePan = Space ; 押している間だけ画像をパン操作する
+# CropScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 # CropExecute = Ctrl+E ; 切り取りを実行する
 
 [SnsSplit] ; SNS 分割モード
@@ -695,6 +699,7 @@
 # TextRedo.2 = Ctrl+Shift+Z ; テキスト注釈編集をやり直す
 # TextUndo = Ctrl+Z ; テキスト注釈編集を元に戻す
 # TextSpacePan = Space ; 押している間だけ画像をパン操作する
+# TextScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 
 [LocalAdjust] ; 補正レイヤー
 # LaShowSource = Q ; 元画像表示を切り替える
@@ -716,3 +721,4 @@
 # LaConfirmPolygon = Enter ; 補正レイヤーの多角形マスクを確定する
 # LaDeleteShape = Delete ; 選択中の補正図形を削除する
 # LaSpacePan = Space ; 押している間だけ画像をパン操作する
+# LaScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する

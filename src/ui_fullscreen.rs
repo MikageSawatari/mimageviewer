@@ -15136,19 +15136,7 @@ impl App {
         full_rect: egui::Rect,
         front: FsFrontPointerFrameInput,
     ) -> bool {
-        // ZipPla 風ズーム (照準中 / 確定中) は専用描画経路で fs_zoom/fs_pan を使わない。
-        // 中ボタンドラッグで不可視の fs_zoom を書き換えず、専用の fs_zoom_factor を動かす。
-        if self.fs_zoom_mode_engaged() {
-            return self.handle_zoom_mode_middle_drag(ctx, front);
-        }
-        // 360 度ビューも自前の視点を持つ。ここを塞がないと、中ボタンドラッグが
-        // 画面に何も起こさないまま fs_zoom を動かす (ピンチと同じ取りこぼし)。
-        // FOV はホイールが担当しているので、ここでは何もせず入力だけ消費する。
-        if matches!(self.fs_zoom_owner(), FsZoomOwner::Panorama) {
-            self.fs_middle_zoom_drag = None;
-            return ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
-        }
-        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
+        let (down, pressed, released, pos) = ctx.input(|i| {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
                 i.pointer.button_pressed(egui::PointerButton::Middle),
@@ -15157,130 +15145,113 @@ impl App {
                 i.pointer.interact_pos(),
             )
         });
-
-        // 押下開始フレーム: 現在のズーム/パン/ピボットをスナップショット。
-        // 同フレームで既にドラッグ中なら無視 (重複開始を防ぐ)。
-        if is_pressed && self.fs_middle_zoom_drag.is_none() {
-            if let Some(pos) = current_pos {
-                // 分析モードでは画像エリアが右パネル分左にずれるので中心が違う
-                let rect_center = if self.analysis_mode {
-                    analysis_image_rect(full_rect).center()
-                } else {
-                    full_rect.center()
-                };
-                let (start_zoom, start_pan) = if self.analysis_mode {
-                    (self.analysis_zoom, self.analysis_pan)
-                } else {
-                    (self.fs_zoom, self.fs_pan)
-                };
-                self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
-                    pivot: pos,
-                    start_zoom,
-                    start_pan,
-                    rect_center,
-                    is_analysis: self.analysis_mode,
-                });
-            }
-        }
-
-        // ドラッグ中: 押しっぱなしの間、毎フレーム pivot からの差分で新しいズームを計算。
-        if is_down {
-            if let (Some(drag), Some(pos)) = (self.fs_middle_zoom_drag.clone(), current_pos) {
-                let dy = pos.y - drag.pivot.y;
-                if dy.abs() < MIDDLE_DRAG_THRESHOLD_PX {
-                    // しきい値以下: ズーム変更なし (クリック暴発防止)
-                    return true;
-                }
-                // 上方向 (dy < 0) で拡大、下方向で縮小
-                let factor = 2.0_f32.powf(-dy / MIDDLE_DRAG_UNIT_PX);
-                let new_zoom = (drag.start_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-                // pivot 位置が画面上で動かないように pan を補正。ホイールズームと違い
-                // 差分累積ではなく毎回 start 値基準で計算することで、dy が元に戻れば
-                // pan も完全に元へ戻る (累積誤差が発生しない)。
-                let new_pan = zoom_preserve_pivot(
-                    drag.pivot,
-                    drag.rect_center,
-                    drag.start_pan,
-                    drag.start_zoom,
-                    new_zoom,
-                );
-                // 書き戻し先はドラッグ開始時の is_analysis で固定
-                // (途中でモードが切り替わっても書き先がブレないように)
-                if drag.is_analysis {
-                    self.analysis_zoom = new_zoom;
-                    self.analysis_pan = new_pan;
-                } else {
-                    self.fs_zoom = new_zoom;
-                    self.set_fs_pan_from_input(new_zoom, new_pan);
-                }
-                return true;
-            }
-        }
-
-        // リリース: PDF のときだけ新倍率で再レンダリング要求 (ドラッグ中は発行しない)。
-        if is_released {
-            if let Some(drag) = self.fs_middle_zoom_drag.take() {
-                let final_zoom = if drag.is_analysis {
-                    self.analysis_zoom
-                } else {
-                    self.fs_zoom
-                };
-                if (final_zoom - drag.start_zoom).abs() > f32::EPSILON {
-                    self.maybe_rerender_pdf(final_zoom);
-                }
-                return true;
-            }
-        }
-
-        false
+        let owner = self.fs_zoom_owner();
+        let rect = if owner == FsZoomOwner::Analysis {
+            analysis_image_rect(full_rect)
+        } else {
+            full_rect
+        };
+        self.handle_drag_zoom(
+            ctx,
+            ZoomDragInput::Middle,
+            owner,
+            rect.center(),
+            true,
+            true,
+            pressed,
+            down,
+            released,
+            pos,
+        )
     }
 
-    fn handle_zoom_mode_middle_drag(
+    /// One owner and one start-relative calculation for middle and primary scrub drags.
+    /// A scrub whose chord ends retains the physical primary stream until release.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_drag_zoom(
         &mut self,
         ctx: &egui::Context,
-        front: FsFrontPointerFrameInput,
+        input: ZoomDragInput,
+        owner: FsZoomOwner,
+        rect_center: egui::Pos2,
+        held: bool,
+        can_start: bool,
+        pressed: bool,
+        down: bool,
+        released: bool,
+        pos: Option<egui::Pos2>,
     ) -> bool {
-        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
-            (
-                i.pointer.button_down(egui::PointerButton::Middle),
-                i.pointer.button_pressed(egui::PointerButton::Middle),
-                !front.owns_release(egui::PointerButton::Middle)
-                    && i.pointer.button_released(egui::PointerButton::Middle),
-                i.pointer.interact_pos(),
-            )
-        });
-
-        if is_pressed && self.fs_middle_zoom_drag.is_none() {
-            if let Some(pos) = current_pos {
-                self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
-                    pivot: pos,
-                    start_zoom: self.fs_zoom_factor,
-                    start_pan: egui::Vec2::ZERO,
-                    rect_center: egui::Pos2::ZERO,
-                    is_analysis: false,
-                });
+        if let Some(drag) = &self.fs_middle_zoom_drag {
+            if drag.input != input {
+                return false;
             }
+        } else if held
+            && can_start
+            && pressed
+            && let Some(pivot) = pos
+        {
+            let (start_zoom, start_pan) = match owner {
+                FsZoomOwner::Image => (self.fs_zoom, self.fs_pan),
+                FsZoomOwner::Analysis => (self.analysis_zoom, self.analysis_pan),
+                FsZoomOwner::ZoomMode => (self.fs_zoom_factor, egui::Vec2::ZERO),
+                FsZoomOwner::Panorama => (1.0, egui::Vec2::ZERO),
+            };
+            self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
+                input,
+                owner,
+                pivot,
+                start_zoom,
+                start_pan,
+                rect_center,
+                phase: ZoomDragPhase::Dragging,
+            });
         }
-
-        if is_down {
-            if let (Some(drag), Some(pos)) = (self.fs_middle_zoom_drag.clone(), current_pos) {
-                let dy = pos.y - drag.pivot.y;
-                if dy.abs() < MIDDLE_DRAG_THRESHOLD_PX {
-                    return true;
+        let Some(drag) = self.fs_middle_zoom_drag.clone() else {
+            return false;
+        };
+        if drag.phase == ZoomDragPhase::Dragging {
+            if !held || released || !down {
+                self.finish_drag_zoom(&drag);
+                if input == ZoomDragInput::Scrub && down && !released {
+                    self.fs_middle_zoom_drag.as_mut().unwrap().phase = ZoomDragPhase::AwaitRelease;
+                } else {
+                    self.fs_middle_zoom_drag = None;
                 }
-                let factor = 2.0_f32.powf(-dy / MIDDLE_DRAG_UNIT_PX);
-                self.fs_zoom_factor = (drag.start_zoom * factor).clamp(0.05, 16.0);
-                ctx.request_repaint();
-                return true;
+            } else if let Some(pos) = pos {
+                let (zoom, pan) = drag.zoom_at(pos);
+                match drag.owner {
+                    FsZoomOwner::Image => {
+                        self.fs_zoom = zoom;
+                        self.set_fs_pan_from_input(zoom, pan);
+                    }
+                    FsZoomOwner::Analysis => {
+                        self.analysis_zoom = zoom;
+                        self.analysis_pan = pan;
+                    }
+                    FsZoomOwner::ZoomMode => {
+                        if self.fs_zoom_factor != zoom {
+                            self.fs_zoom_factor = zoom;
+                            ctx.request_repaint();
+                        }
+                    }
+                    FsZoomOwner::Panorama => {}
+                }
             }
+        } else if released || !down {
+            self.fs_middle_zoom_drag = None;
         }
+        true
+    }
 
-        if is_released && self.fs_middle_zoom_drag.take().is_some() {
-            ctx.request_repaint();
-            return true;
+    fn finish_drag_zoom(&mut self, drag: &MiddleZoomDrag) {
+        let zoom = match drag.owner {
+            FsZoomOwner::Image => self.fs_zoom,
+            FsZoomOwner::Analysis => self.analysis_zoom,
+            FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => return,
+        };
+        if (zoom - drag.start_zoom).abs() > f32::EPSILON {
+            self.maybe_rerender_pdf(zoom);
         }
-
-        false
     }
 
     /// Overlay editing tools share Photoshop-style temporary pan: hold Space and
@@ -15290,16 +15261,53 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         space_held: bool,
+        scrub_held: bool,
+        rect_center: egui::Pos2,
         can_start: bool,
         primary_pressed: bool,
         primary_down: bool,
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
     ) -> bool {
+        let scrub_held = scrub_held && !self.any_modal_dialog_open_for_fullscreen_keys();
+        // Scrub wins here, including Crop's Ctrl+Space pan exception.
+        let scrub_active = self
+            .fs_middle_zoom_drag
+            .as_ref()
+            .is_some_and(|drag| drag.input == ZoomDragInput::Scrub);
+        if scrub_active || (scrub_held && self.fs_pan_drag_start.is_none()) {
+            let used = self.handle_drag_zoom(
+                ctx,
+                ZoomDragInput::Scrub,
+                FsZoomOwner::Image,
+                rect_center,
+                scrub_held,
+                can_start,
+                primary_pressed,
+                primary_down,
+                primary_released,
+                pointer_pos,
+            );
+            if used || (scrub_held && can_start) {
+                // A concurrent middle drag keeps the zoom owner; the scrub chord
+                // still claims this primary press so tools cannot start drawing.
+                if !used && primary_pressed {
+                    self.fs_primary_suppression.arm_pointer_stream();
+                }
+                ctx.set_cursor_icon(egui::CursorIcon::ZoomIn);
+                return true;
+            }
+        }
         let active = self.fs_pan_drag_start.is_some();
         if !space_held {
             if active {
                 self.fs_pan_drag_start = None;
+                // Ctrl added during an existing Space pan must not turn that
+                // same primary stream into a brush stroke or a new zoom.
+                if scrub_held && primary_down {
+                    self.fs_primary_suppression.arm_pointer_stream();
+                    return true;
+                }
             }
             return false;
         }
@@ -15416,19 +15424,55 @@ fn should_draw_fs_pixel_grid(
 
 /// 中ボタンドラッグズームのスナップショット状態 (v0.8.1)。
 /// ドラッグ開始フレームで固定し、以降はここからの差分でズームを計算する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomDragInput {
+    Middle,
+    Scrub,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomDragPhase {
+    Dragging,
+    AwaitRelease,
+}
+
 #[derive(Clone)]
 pub(crate) struct MiddleZoomDrag {
-    /// ドラッグ開始時のカーソル位置 (このピボットが画面上で動かないように pan を補正)
-    pub pivot: egui::Pos2,
-    /// 開始時の zoom (fs_zoom または analysis_zoom のいずれか)
-    pub start_zoom: f32,
-    /// 開始時の pan
-    pub start_pan: egui::Vec2,
-    /// ピボット計算に使う画像エリアの中心 (通常モードは full_rect.center()、
-    /// 分析モードは analysis_image_rect.center())
-    pub rect_center: egui::Pos2,
-    /// ドラッグ開始時に分析モードだったか (途中でモード切替されても書き戻し先を固定)
-    pub is_analysis: bool,
+    input: ZoomDragInput,
+    owner: FsZoomOwner,
+    phase: ZoomDragPhase,
+    pivot: egui::Pos2,
+    start_zoom: f32,
+    start_pan: egui::Vec2,
+    rect_center: egui::Pos2,
+}
+
+impl MiddleZoomDrag {
+    fn zoom_at(&self, pos: egui::Pos2) -> (f32, egui::Vec2) {
+        let distance = match self.input {
+            ZoomDragInput::Middle => self.pivot.y - pos.y,
+            ZoomDragInput::Scrub => pos.x - self.pivot.x,
+        };
+        // Returning inside the dead zone restores the exact start, including pan.
+        let zoom = if distance.abs() < MIDDLE_DRAG_THRESHOLD_PX {
+            self.start_zoom
+        } else {
+            let (min, max) = if self.owner == FsZoomOwner::ZoomMode {
+                (0.05, 16.0)
+            } else {
+                (ZOOM_MIN, ZOOM_MAX)
+            };
+            (self.start_zoom * 2.0_f32.powf(distance / MIDDLE_DRAG_UNIT_PX)).clamp(min, max)
+        };
+        let pan = zoom_preserve_pivot(
+            self.pivot,
+            self.rect_center,
+            self.start_pan,
+            self.start_zoom,
+            zoom,
+        );
+        (zoom, pan)
+    }
 }
 
 /// 分析モード時の画像表示領域（パネル分を右側に確保した残り）を返す。
@@ -39774,6 +39818,62 @@ impl App {
                         && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
                 })
             });
+        let scrub_active = self
+            .fs_middle_zoom_drag
+            .as_ref()
+            .is_some_and(|drag| drag.input == ZoomDragInput::Scrub);
+        let scrub_held =
+            crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                self.keymap
+                    .key_held_action(ctx, permit, KeyAction::FsScrubZoomHold)
+            });
+        let scrub_canvas = !state.is_video
+            && !music_view_active
+            && self.page_overview.session().is_none()
+            && !self.is_overlay_edit_mode_active()
+            && !self.view_trim_mode
+            && panel_fs_idx.is_some_and(|idx| {
+                matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
+                )
+            });
+        if scrub_active || (scrub_canvas && scrub_held) {
+            let (pressed, down, released, pos) = ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.primary_down(),
+                    i.pointer.primary_released(),
+                    i.pointer.interact_pos(),
+                )
+            });
+            let owner = self.fs_zoom_owner();
+            let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
+            let can_start = cursor_on_edit_canvas
+                && !overflow_pointer_input.primary_owned
+                && !primary_suppression.suppresses_current_frame()
+                && self.fs_pan_drag_start.is_none()
+                && self.fs_rotation_drag_start.is_none();
+            let used = self.handle_drag_zoom(
+                ctx,
+                ZoomDragInput::Scrub,
+                owner,
+                rect.center(),
+                scrub_held && scrub_canvas && !modal_input_blocked,
+                can_start,
+                pressed,
+                down,
+                released,
+                pos,
+            );
+            if used || (scrub_held && can_start && pressed) {
+                if pressed {
+                    self.fs_primary_suppression.arm_pointer_stream();
+                }
+                ctx.set_cursor_icon(egui::CursorIcon::ZoomIn);
+                return FsWheelFrameResult::default();
+            }
+        }
         self.handle_edit_brush_radius_wheel(ctx, cursor_on_edit_canvas);
         let touch_input_enabled = still_touch_input_enabled(StillTouchInputEnabledInputs {
             is_video: state.is_video,
@@ -41009,7 +41109,13 @@ impl App {
             self.fs_secondary_press.cancel();
         }
         if pointer.middle_owned {
-            self.fs_middle_zoom_drag = None;
+            if self
+                .fs_middle_zoom_drag
+                .as_ref()
+                .is_some_and(|drag| drag.input == ZoomDragInput::Middle)
+            {
+                self.fs_middle_zoom_drag = None;
+            }
             self.cancel_mouse_middle_short_click();
         }
         let touch_excluded = if menu_presented || pointer.touch_owned {
@@ -70035,6 +70141,510 @@ mod tests {
                 unchanged
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_primary_handler_owns_click_and_drag_but_excludes_media() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        for media in 0..3 {
+            let (mut app, rect, idx) = setup_flat_navigator_input_test();
+            app.settings.fullscreen_navigator_visible = false;
+            app.settings.touch_still_chrome_learned = true;
+            app.fs_prev_focused = true;
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n");
+            if media == 1 {
+                app.items[idx] = GridItem::Video(PathBuf::from("scrub.mp4"));
+            }
+            if media == 2 {
+                app.items[idx] = GridItem::Audio(PathBuf::from("scrub.mp3"));
+            }
+            let mut state = navigator_test_frame_state();
+            state.is_video = media == 1;
+            let ctx = egui::Context::default();
+            install_fs_navigator_input_tracking(&ctx);
+            crate::key_input::arm_test_synthetic_input(0xE007, egui::ViewportId::ROOT);
+            let now = std::time::Instant::now();
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                now,
+                SyntheticNavigationKey::Tab,
+                SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            crate::key_input::advance_test_synthetic_input(now);
+            let start = rect.center();
+            for frame in 0..4 {
+                let pos = start + egui::vec2(if frame == 0 { 0.0 } else { 100.0 }, 0.0);
+                if frame == 2 {
+                    let later = now + std::time::Duration::from_millis(1);
+                    crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+                        later,
+                        SyntheticNavigationKey::Tab,
+                    ));
+                    crate::key_input::advance_test_synthetic_input(later);
+                }
+                let mut events = vec![egui::Event::PointerMoved(pos)];
+                if frame == 0 || frame == 3 {
+                    events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 0,
+                        modifiers: if frame == 0 {
+                            egui::Modifiers::CTRL
+                        } else {
+                            egui::Modifiers::NONE
+                        },
+                    });
+                }
+                app.frame_counter += 1;
+                let mut result = (FsPageNav::None, false);
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(rect),
+                            events,
+                            focused: true,
+                            time: Some(frame as f64 * 0.1),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            let _owner = app.keyboard_owner_for_pass(ctx);
+                            ctx.root_ui(|root| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    root,
+                                    |ui| {
+                                        result = app.handle_fs_wheel_and_click(
+                                            ui, ctx, rect, &state, false, 0, &mut None,
+                                        );
+                                    },
+                                );
+                            });
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                if media == 0 {
+                    assert!(matches!(result.0, FsPageNav::None));
+                    assert_eq!(app.fs_zoom, if frame == 0 { 2.0 } else { 4.0 });
+                    assert_eq!(app.fs_middle_zoom_drag.is_some(), frame < 3);
+                    assert!(app.fs_pan_drag_start.is_none());
+                } else {
+                    assert!(app.fs_middle_zoom_drag.is_none());
+                    assert_eq!(app.fs_zoom, 2.0);
+                }
+            }
+            crate::key_input::clear_test_synthetic_input();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_erase_press_does_not_paint_and_drawing_cannot_start_scrub() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        for drawing in [false, true] {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            app.erase_mode = true;
+            app.erase_tool = crate::app::EraseTool::Brush;
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[Erase]\nEraseScrubZoomHold = Ctrl+Tab\n");
+            if drawing {
+                app.erase_line_start = Some((10.0, 10.0));
+            }
+            let transform = navigator_test_transform(
+                idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+                },
+            );
+            let pos = transform.viewport_rect.center();
+            let ctx = egui::Context::default();
+            install_fs_navigator_input_tracking(&ctx);
+            crate::key_input::arm_test_synthetic_input(0xE008, egui::ViewportId::ROOT);
+            let now = std::time::Instant::now();
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                now,
+                SyntheticNavigationKey::Tab,
+                SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            crate::key_input::advance_test_synthetic_input(now);
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        focused: true,
+                        screen_rect: Some(transform.viewport_rect),
+                        events: vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::CTRL,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let _owner = app.keyboard_owner_for_pass(ctx);
+                        app.handle_erase_paint(ctx, &transform, Default::default());
+                    },
+                )
+                .drop_without_applying_deltas();
+            assert_eq!(app.fs_middle_zoom_drag.is_some(), !drawing);
+            if !drawing {
+                assert!(app.erase_last_paint_pos.is_none());
+                assert!(app.erase_drag.is_none());
+            }
+            crate::key_input::clear_test_synthetic_input();
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_stationary_drag_does_not_create_a_repaint_loop() {
+        for input in [ZoomDragInput::Middle, ZoomDragInput::Scrub] {
+            for owner in [
+                FsZoomOwner::Image,
+                FsZoomOwner::Analysis,
+                FsZoomOwner::ZoomMode,
+                FsZoomOwner::Panorama,
+            ] {
+                let mut app = crate::app::setup_app_for_test();
+                let ctx = egui::Context::default();
+                let pivot = egui::pos2(300.0, 200.0);
+                let mut delay = std::time::Duration::ZERO;
+                for frame in 0..4 {
+                    let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+                        assert!(app.handle_drag_zoom(
+                            ctx,
+                            input,
+                            owner,
+                            pivot,
+                            true,
+                            true,
+                            frame == 0,
+                            true,
+                            false,
+                            Some(pivot)
+                        ));
+                    });
+                    delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                    output.drop_without_applying_deltas();
+                }
+                assert_eq!(delay, std::time::Duration::MAX, "{input:?} {owner:?}");
+                // An actual Z factor change still wakes the dedicated drawing path.
+                if owner == FsZoomOwner::ZoomMode {
+                    let moved = pivot
+                        + match input {
+                            ZoomDragInput::Middle => egui::vec2(0.0, -100.0),
+                            ZoomDragInput::Scrub => egui::vec2(100.0, 0.0),
+                        };
+                    let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+                        assert!(app.handle_drag_zoom(
+                            ctx,
+                            input,
+                            owner,
+                            pivot,
+                            true,
+                            true,
+                            false,
+                            true,
+                            false,
+                            Some(moved)
+                        ));
+                    });
+                    assert_eq!(
+                        output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                        std::time::Duration::ZERO
+                    );
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_and_middle_share_start_pivot_threshold_and_owner_limits() {
+        for owner in [
+            FsZoomOwner::Image,
+            FsZoomOwner::Analysis,
+            FsZoomOwner::ZoomMode,
+        ] {
+            let base = MiddleZoomDrag {
+                input: ZoomDragInput::Middle,
+                owner,
+                phase: ZoomDragPhase::Dragging,
+                pivot: egui::pos2(240.0, 180.0),
+                rect_center: egui::pos2(300.0, 220.0),
+                start_zoom: 2.0,
+                start_pan: egui::vec2(20.0, -10.0),
+            };
+            let scrub = MiddleZoomDrag {
+                input: ZoomDragInput::Scrub,
+                ..base.clone()
+            };
+            for distance in [-10000.0, -100.0, -4.0, -3.0, 0.0, 3.0, 4.0, 100.0, 10000.0] {
+                let expected = base.zoom_at(base.pivot + egui::vec2(0.0, -distance));
+                let actual = scrub.zoom_at(scrub.pivot + egui::vec2(distance, 300.0));
+                assert_eq!(actual, expected);
+                if distance.abs() < MIDDLE_DRAG_THRESHOLD_PX {
+                    assert_eq!(actual, (base.start_zoom, base.start_pan));
+                }
+                let (min, max) = if owner == FsZoomOwner::ZoomMode {
+                    (0.05, 16.0)
+                } else {
+                    (ZOOM_MIN, ZOOM_MAX)
+                };
+                if distance == -10000.0 {
+                    assert_eq!(actual.0, min);
+                }
+                if distance == 10000.0 {
+                    assert_eq!(actual.0, max);
+                }
+            }
+            assert_eq!(base.zoom_at(base.pivot + egui::vec2(0.0, -100.0)).0, 4.0);
+            assert_eq!(base.zoom_at(base.pivot), (2.0, base.start_pan));
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_writes_start_owner_and_finishes_pdf_once_on_chord_release() {
+        let ctx = egui::Context::default();
+        let pivot = egui::pos2(300.0, 200.0);
+        for owner in [
+            FsZoomOwner::Image,
+            FsZoomOwner::Analysis,
+            FsZoomOwner::ZoomMode,
+            FsZoomOwner::Panorama,
+        ] {
+            let mut app = super::specified_scale_consumer_tests::pdf_app(&ctx, 1);
+            app.fs_zoom = 1.0;
+            app.analysis_zoom = 1.0;
+            app.fs_zoom_factor = 1.0;
+            let probe = crate::app::PdfRerenderRequestProbe::start();
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                owner,
+                pivot,
+                true,
+                true,
+                true,
+                true,
+                false,
+                Some(pivot)
+            ));
+            // A different input cannot replace the current owner.
+            assert!(!app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Middle,
+                FsZoomOwner::Image,
+                pivot,
+                true,
+                true,
+                true,
+                true,
+                false,
+                Some(pivot)
+            ));
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                FsZoomOwner::Image,
+                pivot,
+                true,
+                true,
+                false,
+                true,
+                false,
+                Some(pivot + egui::vec2(100.0, 0.0))
+            ));
+            assert_eq!(
+                app.fs_zoom,
+                if owner == FsZoomOwner::Image {
+                    2.0
+                } else {
+                    1.0
+                }
+            );
+            assert_eq!(
+                app.analysis_zoom,
+                if owner == FsZoomOwner::Analysis {
+                    2.0
+                } else {
+                    1.0
+                }
+            );
+            assert_eq!(
+                app.fs_zoom_factor,
+                if owner == FsZoomOwner::ZoomMode {
+                    2.0
+                } else {
+                    1.0
+                }
+            );
+            assert!(probe.take_requests().is_empty());
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                owner,
+                pivot,
+                false,
+                true,
+                false,
+                true,
+                false,
+                Some(pivot)
+            ));
+            assert_eq!(
+                probe.take_requests().len(),
+                usize::from(matches!(owner, FsZoomOwner::Image | FsZoomOwner::Analysis))
+            );
+            assert_eq!(
+                app.fs_middle_zoom_drag.as_ref().unwrap().phase,
+                ZoomDragPhase::AwaitRelease
+            );
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                owner,
+                pivot,
+                false,
+                true,
+                false,
+                false,
+                true,
+                Some(pivot)
+            ));
+            assert!(app.fs_middle_zoom_drag.is_none());
+            assert!(probe.take_requests().is_empty());
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_overlay_wins_pan_blocks_panel_and_keeps_primary_until_release() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(300.0, 200.0);
+        assert!(!app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            false,
+            true,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_middle_zoom_drag.is_none());
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            true,
+            true,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_middle_zoom_drag.is_some());
+        // Continuing over a panel is allowed. Returning to the origin restores pan.
+        let start = (app.fs_zoom, app.fs_pan);
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            false,
+            false,
+            true,
+            false,
+            Some(pos + egui::vec2(100.0, 0.0))
+        ));
+        assert!(app.fs_zoom > start.0);
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            false,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert_eq!((app.fs_zoom, app.fs_pan), start);
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            false,
+            pos,
+            false,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            false,
+            pos,
+            false,
+            false,
+            false,
+            true,
+            Some(pos)
+        ));
+        assert!(app.fs_middle_zoom_drag.is_none());
+        // Holding a chord after primary went down cannot start a new scrub.
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            true,
+            pos,
+            true,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_middle_zoom_drag.is_none());
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            false,
+            pos,
+            true,
+            true,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_pan_drag_start.is_some());
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            true,
+            pos,
+            true,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_middle_zoom_drag.is_none());
+        assert!(app.fs_primary_suppression.is_active());
     }
 
     #[test]

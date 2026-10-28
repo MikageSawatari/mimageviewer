@@ -1280,6 +1280,19 @@ impl Chord {
         )
     }
 
+    fn validate_for_action(self, action: KeyAction) -> Result<(), &'static str> {
+        if action.trigger() == KeyTrigger::KeyHold
+            && action.binding_policy() == BindingPolicy::FullChord
+        {
+            return if matches!(self, Self::Key { .. }) {
+                Ok(())
+            } else {
+                Err("KeyHold actions require a normal key")
+            };
+        }
+        self.validate_for_trigger(action.trigger())
+    }
+
     fn validate_for_trigger(self, trigger: KeyTrigger) -> Result<(), &'static str> {
         match trigger {
             KeyTrigger::Press if matches!(self, Self::Key { .. }) => Ok(()),
@@ -1761,6 +1774,7 @@ pub enum KeyAction {
     FsRotateCcw,
     FsImageAnalysis,
     FsZoomMode,
+    FsScrubZoomHold,
     FsPanorama,
     FsPanoramaProjection,
     FsNavigatorToggle,
@@ -1945,6 +1959,7 @@ pub enum KeyAction {
     ErasePaintMode,
     EraseEraseMode,
     EraseSpacePan,
+    EraseScrubZoomHold,
     ErasePreviewHold,
     ConcealExit,
     ConcealConfirmPolygon,
@@ -1970,14 +1985,17 @@ pub enum KeyAction {
     ConcealToolRect,
     ConcealToolEllipse,
     ConcealSpacePan,
+    ConcealScrubZoomHold,
     CropForceCreateHold,
     CropSpacePan,
+    CropScrubZoomHold,
     CropExecute,
     SnsSplitExecute,
     TextConfirm,
     TextRedo,
     TextUndo,
     TextSpacePan,
+    TextScrubZoomHold,
     LaShowSource,
     LaShowMask,
     LaPaintAdd,
@@ -1997,6 +2015,7 @@ pub enum KeyAction {
     LaConfirmPolygon,
     LaDeleteShape,
     LaSpacePan,
+    LaScrubZoomHold,
 }
 
 /// Video adjustment-slot load actions in slot-index order.
@@ -2354,6 +2373,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsRotateCcw,
     KeyAction::FsImageAnalysis,
     KeyAction::FsZoomMode,
+    KeyAction::FsScrubZoomHold,
     KeyAction::FsPanorama,
     KeyAction::FsPanoramaProjection,
     KeyAction::FsNavigatorToggle,
@@ -2536,6 +2556,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ErasePaintMode,
     KeyAction::EraseEraseMode,
     KeyAction::EraseSpacePan,
+    KeyAction::EraseScrubZoomHold,
     KeyAction::ErasePreviewHold,
     KeyAction::ConcealExit,
     KeyAction::ConcealConfirmPolygon,
@@ -2561,14 +2582,17 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealToolRect,
     KeyAction::ConcealToolEllipse,
     KeyAction::ConcealSpacePan,
+    KeyAction::ConcealScrubZoomHold,
     KeyAction::CropForceCreateHold,
     KeyAction::CropSpacePan,
+    KeyAction::CropScrubZoomHold,
     KeyAction::CropExecute,
     KeyAction::SnsSplitExecute,
     KeyAction::TextConfirm,
     KeyAction::TextRedo,
     KeyAction::TextUndo,
     KeyAction::TextSpacePan,
+    KeyAction::TextScrubZoomHold,
     KeyAction::LaShowSource,
     KeyAction::LaShowMask,
     KeyAction::LaPaintAdd,
@@ -2588,6 +2612,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::LaConfirmPolygon,
     KeyAction::LaDeleteShape,
     KeyAction::LaSpacePan,
+    KeyAction::LaScrubZoomHold,
 ];
 // Keep this list in sync with `KeyAction`. The keymap tests compare the enum
 // inventory and this array so newly added actions cannot silently miss ini generation.
@@ -2606,7 +2631,7 @@ impl CommandSpec {
             action,
             scope: action.context(),
             trigger: action.trigger(),
-            binding_policy: BindingPolicy::for_trigger(action.trigger()),
+            binding_policy: action.binding_policy(),
         }
     }
 
@@ -4424,6 +4449,7 @@ impl KeyAction {
             FsRotateCcw => "FsRotateCcw",
             FsImageAnalysis => "FsImageAnalysis",
             FsZoomMode => "FsZoomMode",
+            FsScrubZoomHold => "FsScrubZoomHold",
             FsPanorama => "FsPanorama",
             FsPanoramaProjection => "FsPanoramaProjection",
             FsNavigatorToggle => "FsNavigatorToggle",
@@ -4606,6 +4632,7 @@ impl KeyAction {
             ErasePaintMode => "ErasePaintMode",
             EraseEraseMode => "EraseEraseMode",
             EraseSpacePan => "EraseSpacePan",
+            EraseScrubZoomHold => "EraseScrubZoomHold",
             ErasePreviewHold => "ErasePreviewHold",
             ConcealExit => "ConcealExit",
             ConcealConfirmPolygon => "ConcealConfirmPolygon",
@@ -4631,14 +4658,17 @@ impl KeyAction {
             ConcealToolRect => "ConcealToolRect",
             ConcealToolEllipse => "ConcealToolEllipse",
             ConcealSpacePan => "ConcealSpacePan",
+            ConcealScrubZoomHold => "ConcealScrubZoomHold",
             CropForceCreateHold => "CropForceCreateHold",
             CropSpacePan => "CropSpacePan",
+            CropScrubZoomHold => "CropScrubZoomHold",
             CropExecute => "CropExecute",
             SnsSplitExecute => "SnsSplitExecute",
             TextConfirm => "TextConfirm",
             TextRedo => "TextRedo",
             TextUndo => "TextUndo",
             TextSpacePan => "TextSpacePan",
+            TextScrubZoomHold => "TextScrubZoomHold",
             LaShowSource => "LaShowSource",
             LaShowMask => "LaShowMask",
             LaPaintAdd => "LaPaintAdd",
@@ -4658,6 +4688,7 @@ impl KeyAction {
             LaConfirmPolygon => "LaConfirmPolygon",
             LaDeleteShape => "LaDeleteShape",
             LaSpacePan => "LaSpacePan",
+            LaScrubZoomHold => "LaScrubZoomHold",
         }
     }
 
@@ -5181,6 +5212,7 @@ impl KeyAction {
             FsRotateCw => "現在の画像を右に90度回転する",
             FsRotateCcw => "現在の画像を左に90度回転する",
             FsImageAnalysis => "画像分析モードを開く",
+            FsScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
@@ -5371,6 +5403,7 @@ impl KeyAction {
             EraseToolEllipse => "楕円ツールに切り替える",
             ErasePaintMode => "描画モードに切り替える",
             EraseEraseMode => "消去モードに切り替える",
+            EraseScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             EraseSpacePan => "押している間だけ画像をパン操作する",
             ErasePreviewHold => "押している間だけ消しゴムの結果をプレビューする",
             ConcealExit => "隠蔽加工モードを終了する",
@@ -5396,14 +5429,17 @@ impl KeyAction {
             ConcealToolHLine => "横線ツールに切り替える",
             ConcealToolRect => "矩形ツールに切り替える",
             ConcealToolEllipse => "楕円ツールに切り替える",
+            ConcealScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             ConcealSpacePan => "押している間だけ画像をパン操作する",
             CropForceCreateHold => "押している間、ドラッグで新しい切り取り枠を作る",
+            CropScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             CropSpacePan => "押している間だけ画像をパン操作する",
             CropExecute => "切り取りを実行する",
             SnsSplitExecute => "SNS 分割を実行する",
             TextConfirm => "テキスト注釈モードを確定または終了する",
             TextRedo => "テキスト注釈編集をやり直す",
             TextUndo => "テキスト注釈編集を元に戻す",
+            TextScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             TextSpacePan => "押している間だけ画像をパン操作する",
             LaShowSource => "元画像表示を切り替える",
             LaShowMask => "マスク表示を切り替える",
@@ -5423,6 +5459,7 @@ impl KeyAction {
             LaToolEllipse => "楕円ツールに切り替える",
             LaConfirmPolygon => "補正レイヤーの多角形マスクを確定する",
             LaDeleteShape => "選択中の補正図形を削除する",
+            LaScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             LaSpacePan => "押している間だけ画像をパン操作する",
         }
     }
@@ -5430,6 +5467,12 @@ impl KeyAction {
     pub fn context(self) -> KeyContext {
         use KeyAction::*;
         match self {
+            FsScrubZoomHold => KeyContext::FsImage,
+            EraseScrubZoomHold => KeyContext::Erase,
+            ConcealScrubZoomHold => KeyContext::Conceal,
+            CropScrubZoomHold => KeyContext::Crop,
+            TextScrubZoomHold => KeyContext::Text,
+            LaScrubZoomHold => KeyContext::LocalAdjust,
             GlobalLocalSearch
             | GlobalFavSearch
             | GlobalMetadataSearch
@@ -5952,9 +5995,20 @@ impl KeyAction {
         }
     }
 
+    pub fn binding_policy(self) -> BindingPolicy {
+        use KeyAction::*;
+        match self {
+            FsScrubZoomHold | EraseScrubZoomHold | ConcealScrubZoomHold | CropScrubZoomHold
+            | TextScrubZoomHold | LaScrubZoomHold => BindingPolicy::FullChord,
+            _ => BindingPolicy::for_trigger(self.trigger()),
+        }
+    }
+
     pub fn trigger(self) -> KeyTrigger {
         use KeyAction::*;
         match self {
+            FsScrubZoomHold | EraseScrubZoomHold | ConcealScrubZoomHold | CropScrubZoomHold
+            | TextScrubZoomHold | LaScrubZoomHold => KeyTrigger::KeyHold,
             FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold | CropForceCreateHold => {
                 KeyTrigger::ModifierHold
             }
@@ -6850,6 +6904,7 @@ impl KeyAction {
             // Shift+Z へ移動・アクション名も FsImageAnalysis へ改名した (v2.0.0、旧 `FsAnalysis`
             // のカスタム割当は未知アクションとして無視され、新既定へ移行する)。
             FsImageAnalysis => ChordList::one(Chord::shift(Z)),
+            FsScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
@@ -7037,6 +7092,7 @@ impl KeyAction {
             EraseToolEllipse => ChordList::one(Chord::key(O)),
             ErasePaintMode => ChordList::one(Chord::key(D)),
             EraseEraseMode => ChordList::one(Chord::key(F)),
+            EraseScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             EraseSpacePan => ChordList::one(Chord::key(Space)),
             ErasePreviewHold => ChordList::one(Chord::key(Tab)),
             ConcealExit => ChordList::one(Chord::ctrl(M)),
@@ -7062,14 +7118,17 @@ impl KeyAction {
             ConcealToolHLine => ChordList::one(Chord::key(H)),
             ConcealToolRect => ChordList::one(Chord::key(R)),
             ConcealToolEllipse => ChordList::one(Chord::key(O)),
+            ConcealScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             ConcealSpacePan => ChordList::one(Chord::key(Space)),
             CropForceCreateHold => ChordList::one(Chord::modifier(ModKind::Ctrl)),
+            CropScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             CropSpacePan => ChordList::one(Chord::key(Space)),
             CropExecute => ChordList::one(Chord::ctrl(E)),
             SnsSplitExecute => ChordList::EMPTY,
             TextConfirm => ChordList::one(Chord::ctrl(T)),
             TextRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
             TextUndo => ChordList::one(Chord::ctrl(Z)),
+            TextScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             TextSpacePan => ChordList::one(Chord::key(Space)),
             LaShowSource => ChordList::one(Chord::key(Q)),
             LaShowMask => ChordList::one(Chord::key(W)),
@@ -7089,6 +7148,7 @@ impl KeyAction {
             LaToolEllipse => ChordList::one(Chord::key(O)),
             LaConfirmPolygon => ChordList::one(Chord::key(Enter)),
             LaDeleteShape => ChordList::one(Chord::key(Delete)),
+            LaScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             LaSpacePan => ChordList::one(Chord::key(Space)),
         }
     }
@@ -7671,7 +7731,7 @@ impl Keymap {
             }
             match parse_chord(rhs) {
                 Ok(chord) => {
-                    if let Err(msg) = chord.validate_for_trigger(action.trigger()) {
+                    if let Err(msg) = chord.validate_for_action(action) {
                         warnings.push(format!(
                             "line {line_no}: '{}' ignored: {msg}",
                             action.ini_name()
@@ -8882,7 +8942,9 @@ impl Keymap {
         out.push_str(
             "#   いずれか 1 つだけ指定できます。Right* は右側限定、それ以外は左右不問です。\n",
         );
-        out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
+        out.push_str(
+            "# - KeyHold は通常キー 1 つです。左右ドラッグズームだけ修飾キーも指定できます。\n",
+        );
         out.push_str(
             "# - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,\n",
         );
@@ -9606,10 +9668,9 @@ impl Keymap {
         chord: Chord,
     ) -> bool {
         let _ = ctx;
-        // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
-        // 同時に押されている間は不成立にして、Ctrl+Z (undo) / Shift+Z (分析) 等が KeyHold
-        // アクション (例: 全画面ズーム) を誤起動しないようにする (Codex P1)。FS ビューポートで
-        // stale な egui modifiers を避け、押下中判定と同じく OS 直読みを使う。
+        // Exact modifiers keep Ctrl+Z / Shift+Z from activating a plain Z hold.
+        // Only scrub actions accept modified bindings at validation. On Windows,
+        // read OS levels to avoid stale egui modifiers in fullscreen viewports.
         #[cfg(windows)]
         {
             // Windows では OS 直読み (KeyName の固有 VK) を唯一の判定にする
@@ -9624,9 +9685,9 @@ impl Keymap {
         }
         #[cfg(not(windows))]
         {
-            if chord.has_key_modifiers() {
+            let Some((ctrl, shift, alt)) = chord.key_modifiers() else {
                 return false;
-            }
+            };
             let Some(name) = chord.key_name() else {
                 return false;
             };
@@ -9635,7 +9696,7 @@ impl Keymap {
             };
             ctx.input(|i| {
                 let m = i.modifiers;
-                !m.ctrl && !m.shift && !m.alt && i.key_down(key)
+                m.ctrl == ctrl && m.shift == shift && m.alt == alt && i.key_down(key)
             })
         }
     }
@@ -9994,7 +10055,7 @@ fn parse_setting_chords(
         }
         match parse_chord(trimmed) {
             Ok(chord) => {
-                if let Err(msg) = chord.validate_for_trigger(action.trigger()) {
+                if let Err(msg) = chord.validate_for_action(action) {
                     warnings.push(format!(
                         "settings: '{}'.{} ignored: {}",
                         action.ini_name(),
@@ -10029,9 +10090,7 @@ pub fn parse_chord_for_action(action: KeyAction, text: &str) -> Result<Option<Ch
         return Ok(None);
     }
     let chord = parse_chord(trimmed)?;
-    chord
-        .validate_for_trigger(action.trigger())
-        .map_err(str::to_string)?;
+    chord.validate_for_action(action).map_err(str::to_string)?;
     Ok(Some(chord))
 }
 
@@ -11259,7 +11318,7 @@ mod tests {
             assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
             for chord in action.default_chords().iter() {
                 assert!(
-                    chord.validate_for_trigger(action.trigger()).is_ok(),
+                    chord.validate_for_action(action).is_ok(),
                     "{} has an invalid default chord: {}",
                     action.ini_name(),
                     chord.display_name()
@@ -11601,10 +11660,7 @@ mod tests {
             );
             assert_eq!(spec.scope, spec.action.context());
             assert_eq!(spec.trigger, spec.action.trigger());
-            assert_eq!(
-                spec.binding_policy,
-                BindingPolicy::for_trigger(spec.action.trigger())
-            );
+            assert_eq!(spec.binding_policy, spec.action.binding_policy());
         }
     }
 
@@ -13160,6 +13216,104 @@ mod tests {
         // どのアクションにも override は付かない (= 全員新既定へ)。
         assert!(!keymap.overrides.contains_key(&KeyAction::FsImageAnalysis));
         assert!(!keymap.overrides.contains_key(&KeyAction::FsZoomMode));
+    }
+
+    #[test]
+    fn scrub_zoom_defaults_policy_contexts_and_conflicts() {
+        let actions = [
+            (KeyAction::FsScrubZoomHold, KeyContext::FsImage),
+            (KeyAction::EraseScrubZoomHold, KeyContext::Erase),
+            (KeyAction::ConcealScrubZoomHold, KeyContext::Conceal),
+            (KeyAction::CropScrubZoomHold, KeyContext::Crop),
+            (KeyAction::TextScrubZoomHold, KeyContext::Text),
+            (KeyAction::LaScrubZoomHold, KeyContext::LocalAdjust),
+        ];
+        for (action, scope) in actions {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+            assert_eq!(action.context(), scope);
+            assert_eq!(action.binding_policy(), BindingPolicy::FullChord);
+            let chord = Chord::ctrl(KeyName::Space);
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                vec![chord]
+            );
+            assert_eq!(
+                parse_chord_for_action(action, "Ctrl+Space"),
+                Ok(Some(chord))
+            );
+            assert!(parse_chord_for_action(action, "Ctrl").is_err());
+            let rebound = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = Ctrl+Space\n",
+                scope.ini_name(),
+                action.ini_name()
+            ));
+            assert!(rebound.warnings().is_empty(), "{:?}", rebound.warnings());
+            assert!(rebound.binding_conflicts().is_empty());
+            for other in KeyAction::all()
+                .iter()
+                .copied()
+                .filter(|other| *other != action && actions_can_overlap(action, *other))
+            {
+                assert!(
+                    !other.default_chords().iter().any(|c| c == chord),
+                    "{other:?}"
+                );
+            }
+        }
+        for action in [
+            KeyAction::FsZoomMode,
+            KeyAction::EraseSpacePan,
+            KeyAction::ErasePreviewHold,
+            KeyAction::ConcealSpacePan,
+            KeyAction::CropSpacePan,
+            KeyAction::TextSpacePan,
+            KeyAction::LaSpacePan,
+        ] {
+            assert_eq!(action.binding_policy(), BindingPolicy::SinglePlainKey);
+            assert!(parse_chord_for_action(action, "Ctrl+Space").is_err());
+        }
+        let chord = KeyAction::FsSpaceCheck
+            .default_chords()
+            .iter()
+            .next()
+            .unwrap();
+        assert!(!chord.matches_egui(egui::Key::Space, egui::Modifiers::CTRL));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_modified_hold_uses_focused_physical_chord_and_stops_on_release() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        crate::key_input::arm_test_synthetic_input(0xE006, egui::ViewportId::ROOT);
+        let keymap = Keymap::from_ini_str(
+            "[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n[Erase]\nEraseSpacePan = Tab\n",
+        );
+        let now = std::time::Instant::now();
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            now,
+            SyntheticNavigationKey::Tab,
+            SyntheticModifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        ));
+        crate::key_input::advance_test_synthetic_input(now);
+        begin_key_pass(&ctx, egui::Key::Tab, egui::Modifiers::CTRL);
+        let permit = crate::keyboard_input::focused_key_state_permit(&ctx).unwrap();
+        assert!(keymap.key_held_action(&ctx, permit, KeyAction::FsScrubZoomHold));
+        assert!(!keymap.key_held_action(&ctx, permit, KeyAction::EraseSpacePan));
+        let later = now + std::time::Duration::from_millis(1);
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+            later,
+            SyntheticNavigationKey::Tab,
+        ));
+        crate::key_input::advance_test_synthetic_input(later);
+        assert!(!keymap.key_held_action(&ctx, permit, KeyAction::FsScrubZoomHold));
+        ctx.end_pass().drop_without_applying_deltas();
+        crate::key_input::clear_test_synthetic_input();
     }
 
     #[test]

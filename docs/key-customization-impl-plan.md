@@ -1,5 +1,13 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+左右ドラッグズームの `Fs/Erase/Conceal/Crop/Text/LaScrubZoomHold` は各既存 context の
+KeyHold（既定 Ctrl+Space）。この6 action だけ action 別の `FullChord` policy を選び、
+INI・設定復元・GUI 入力／capture が共有する action 検証へ通す。従来の KeyHold の
+`SinglePlainKey` は維持する。Windows の held 判定は既存の完全一致 OS level をそのまま使い、
+非 Windows も chord の修飾を完全一致させる。native 動画の対象 scope は拡張しない。
+共通 overlay helper が Crop の Ctrl 併用 Space パンより scrubby を優先する。
+元画像の右 Ctrl ホールドは変更しない。[入力所有と倍率制限](keymap-spec.md#左右ドラッグによる連続ズーム)。
+
 2026-10-26 §1.444: `FsListOrderPrev` / `FsListOrderNext` は `FsCommon` / Press、
 既定 `Ctrl+Shift+Up` / `Ctrl+Shift+Down`。説明は「一覧の表示順で前 / 次の本を開く」。
 `EachPhysicalPress` で物理押下を数えるが、移動の準備中は既存 gate で拒否し累積しない。
@@ -119,7 +127,7 @@ Remoteの旧`SetSpread`は型付き受付で最新構成との一致を検証し
 - **入力パターンは 3 種、差し替え方向は固定** (design doc §8.6):
   - **Press** (通常キー押下、M=ルーペ・ロックトグル含む): キー↔通常キー / 修飾↔修飾 自由
   - **Modifier-hold** (Shift ルーペ): 修飾↔修飾のみ
-  - **Key-hold** (Space パン): キー↔通常キー
+  - **Key-hold** (Space パン): キー↔通常キー。左右ドラッグズームの6操作だけ修飾付き chord も許可
   - 不可能な方向: 「通常キーを修飾として振る舞わせる」(`i.modifiers` に現れないため)
 - つまり簡易版では **Shift ルーペを M 長押しへ置き換えることはしない**。M は Press の
   ルーペ・ロックトグルとしてなら再割当できる。
@@ -710,6 +718,7 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
   CropForceCreateHold `Ctrl` (MH) / CropSpacePan `Space` (KH)
 - Crop の pointer-down 分類だけは、実効 `CropSpacePan` と実効
   `CropForceCreateHold` の組合せを解決し、両方が押されていれば Pan を優先する。
+  ただし `CropScrubZoomHold` が成立する押下は共通 overlay helper が先に所有する。
   汎用 KeyHold の完全一致規則は変更せず、余分な modifier group は拒否する。
   pointer-down 後は既存の Pan / Create / Edit owner に保持し、修飾キー変化で再分類しない。
 

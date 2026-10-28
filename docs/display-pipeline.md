@@ -2225,6 +2225,15 @@ fullscreen の close はその context の状態を Idle にし、retire は bun
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、
 `FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
+Ctrl+Space＋primary 左右ドラッグの連続ズームは中ボタンドラッグと同じ `MiddleZoomDrag` を所有する。
+入力種類・開始時の `FsZoomOwner`・pivot・zoom・pan・rect center を固定し、共通の
+`zoom_at` で中ボタンは `2^(-dy/100)`、scrubby は `2^(dx/100)` を計算する。
+4 px のしきい値と `zoom_preserve_pivot` を共用し、通常・分析・編集は `ZOOM_MIN..ZOOM_MAX`、
+Z は既存の0.05～16に制限する。360は入力のみ消費する。終了時だけ各 owner の倍率で PDF を再描画する。
+編集5モードは既存の Space パン helper を共用し、通常閲覧では touch／gesture／click／pan より先に primary を所有する。
+chord 解放後は倍率変更を終了し、primary 解放まで同じ typed state に保持して他の操作へ流さない。
+入力所有・対象 context の詳細は [キー仕様](keymap-spec.md#左右ドラッグによる連続ズーム)。
+
 キーの段階ズーム（`FsZoomIn` / `FsZoomOut`、既定 `+` / `;`（US は `=`）/ テンキー `+` と
 `-` / テンキー `-`）は画面中央を基準に ×1.25 / ÷1.25。
 `fs_zoom_owner()` に従い、通常画像（単ページ / 見開き / 縦横連結）は `fs_zoom` / `fs_pan`、

@@ -12753,6 +12753,11 @@ impl App {
             && self.handle_overlay_space_pan_drag(
                 ctx,
                 space_pan_held,
+                crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                    self.keymap
+                        .key_held_action(ctx, permit, KeyAction::LaScrubZoomHold)
+                }),
+                full_rect.center(),
                 !pointer_over_panel,
                 primary_pressed,
                 primary_down,
