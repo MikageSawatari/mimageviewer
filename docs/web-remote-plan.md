@@ -1622,6 +1622,13 @@ video_viewer_entry_rejected が 0 件でも、その手前のどの route が実
 > スマートフォルダ定義の変更では進まない。ここへ home 設定を足していく方向で直すと、次に増えた
 > 設定でまた漏れる。セッション取得を入口にすれば、home 側は本体で何が変わっても一律に読み直せる。
 >
+> 画素を変える本体側の**全体設定** (末尾表紙、「自動余白カットを標準で有効にする」(§1.216) など) も
+> 1 行目の扱いで、generation には入れない。container は `RemoteReadingSettings` をページ要求ごとに
+> settings_kv から読み、表示トリムは本別の保存値 (`follow_global / none / auto / manual`) と
+> この全体設定を本体と同じ resolver で解決する。既知の穴: 開いておいた環境設定の OK と Remote 取得が
+> 同じ frame に重なると、確定が取得の後になる経路がある (2026-10-28 の §1.216 設計レビューで指摘、
+> 全体設定に共通。バックログで別に扱う)。
+>
 > この分担は [briefs/codex-remote-session-epoch-addendum.md](briefs/codex-remote-session-epoch-addendum.md)
 > 「セッションを版の正本にする / 切断されたら明示的に再接続するまで止まる」で確定した。
 > 実装は `applyRemoteSessionId` (セッション ID が変われば cache epoch 更新 + 各 cache 破棄)。
