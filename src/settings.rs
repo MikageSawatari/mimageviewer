@@ -64,6 +64,39 @@ pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
 pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
 pub const UI_SCALE_FACTOR_STEP_COUNT: usize = 16;
 
+pub const THUMB_NAME_FONT_SCALE_PERCENT_MIN: u32 = 100;
+pub const THUMB_NAME_FONT_SCALE_PERCENT_MAX: u32 = 200;
+pub const THUMB_NAME_FONT_SCALE_PERCENT_OPTIONS: [u32; 5] = [100, 125, 150, 175, 200];
+pub const THUMB_NAME_MAX_LINES_MIN: u32 = 1;
+pub const THUMB_NAME_MAX_LINES_MAX: u32 = 4;
+
+fn default_thumb_name_font_scale_percent() -> u32 {
+    THUMB_NAME_FONT_SCALE_PERCENT_MIN
+}
+
+fn default_thumb_name_max_lines() -> u32 {
+    THUMB_NAME_MAX_LINES_MIN
+}
+
+fn deserialize_thumb_name_font_scale_percent<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.clamp(
+        THUMB_NAME_FONT_SCALE_PERCENT_MIN,
+        THUMB_NAME_FONT_SCALE_PERCENT_MAX,
+    ))
+}
+
+fn deserialize_thumb_name_max_lines<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.clamp(THUMB_NAME_MAX_LINES_MIN, THUMB_NAME_MAX_LINES_MAX))
+}
+
 pub const PDF_WORKER_COUNT_MIN: u32 = 3;
 pub const PDF_WORKER_COUNT_MAX: u32 = 10;
 pub const PDF_WORKER_COUNT_DEFAULT: u32 = 5;
@@ -4791,6 +4824,18 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
+    /// 一覧のファイル名・フォルダ名だけに適用する文字サイズの倍率 (%)。
+    #[serde(
+        default = "default_thumb_name_font_scale_percent",
+        deserialize_with = "deserialize_thumb_name_font_scale_percent"
+    )]
+    pub thumb_name_font_scale_percent: u32,
+    /// 一覧のファイル名・フォルダ名を折り返して表示する最大行数。
+    #[serde(
+        default = "default_thumb_name_max_lines",
+        deserialize_with = "deserialize_thumb_name_max_lines"
+    )]
+    pub thumb_name_max_lines: u32,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -7719,6 +7764,8 @@ impl Default for Settings {
             thumb_next_pages: default_thumb_next_pages(),
             gpu_memory_percent: default_gpu_memory_percent(),
             thumb_idle_upgrade: true,
+            thumb_name_font_scale_percent: default_thumb_name_font_scale_percent(),
+            thumb_name_max_lines: default_thumb_name_max_lines(),
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -9936,6 +9983,13 @@ impl Settings {
             self.notification_duration = NotificationDuration::Standard;
         }
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
+        self.thumb_name_font_scale_percent = self.thumb_name_font_scale_percent.clamp(
+            THUMB_NAME_FONT_SCALE_PERCENT_MIN,
+            THUMB_NAME_FONT_SCALE_PERCENT_MAX,
+        );
+        self.thumb_name_max_lines = self
+            .thumb_name_max_lines
+            .clamp(THUMB_NAME_MAX_LINES_MIN, THUMB_NAME_MAX_LINES_MAX);
         self.ui_font.sanitize();
         self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
         let sns_split_target = crate::sns_split::SnsTarget::from_stable_key(
@@ -10876,6 +10930,88 @@ mod tests {
         assert_eq!(loaded.details_name_colors, DetailsNameColors::default());
         assert_eq!(loaded.details_name_width, 222.0);
         assert_eq!(loaded.text_contrast, TextContrast::Strong);
+    }
+
+    #[test]
+    fn thumb_name_settings_serde_defaults_choices_and_clamps_ranges() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        for defaults in [Settings::default(), missing] {
+            assert_eq!(defaults.thumb_name_font_scale_percent, 100);
+            assert_eq!(defaults.thumb_name_max_lines, 1);
+        }
+        for percent in THUMB_NAME_FONT_SCALE_PERCENT_OPTIONS {
+            for lines in THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX {
+                let settings = Settings {
+                    thumb_name_font_scale_percent: percent,
+                    thumb_name_max_lines: lines,
+                    ..Settings::default()
+                };
+                let restored: Settings =
+                    serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+                assert_eq!(restored.thumb_name_font_scale_percent, percent);
+                assert_eq!(restored.thumb_name_max_lines, lines);
+            }
+        }
+        for (percent, lines, expected_percent, expected_lines) in [
+            (0, 0, 100, 1),
+            (99, 1, 100, 1),
+            (133, 3, 133, 3),
+            (201, 5, 200, 4),
+            (u32::MAX, u32::MAX, 200, 4),
+        ] {
+            let restored: Settings = serde_json::from_value(serde_json::json!({
+                "thumb_name_font_scale_percent": percent,
+                "thumb_name_max_lines": lines,
+            }))
+            .unwrap();
+            assert_eq!(restored.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(restored.thumb_name_max_lines, expected_lines);
+            let mut direct = Settings {
+                thumb_name_font_scale_percent: percent,
+                thumb_name_max_lines: lines,
+                ..Settings::default()
+            };
+            direct.sanitize();
+            assert_eq!(direct.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(direct.thumb_name_max_lines, expected_lines);
+        }
+    }
+
+    #[test]
+    fn thumb_name_settings_db_missing_keys_clamp_and_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key IN ('thumb_name_font_scale_percent', 'thumb_name_max_lines')",
+            [],
+        )
+        .unwrap();
+        let missing = db.load_into_settings().unwrap();
+        assert_eq!(missing.thumb_name_font_scale_percent, 100);
+        assert_eq!(missing.thumb_name_max_lines, 1);
+        for (percent, lines, expected_percent, expected_lines) in
+            [(0, 0, 100, 1), (201, 5, 200, 4), (175, 3, 175, 3)]
+        {
+            for (key, value) in [
+                ("thumb_name_font_scale_percent", percent),
+                ("thumb_name_max_lines", lines),
+            ] {
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings_kv (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![key, value.to_string()],
+                )
+                .unwrap();
+            }
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(loaded.thumb_name_max_lines, expected_lines);
+            db.save_full(&loaded).unwrap();
+            let reread = db.load_into_settings().unwrap();
+            assert_eq!(reread.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(reread.thumb_name_max_lines, expected_lines);
+        }
     }
 
     #[test]

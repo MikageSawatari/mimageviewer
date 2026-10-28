@@ -214,6 +214,36 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["送る", "エクスプローラー", "Explorer", "登録"]
     ),
     entry!(
+        "thumbnail/name-font-scale",
+        Thumbnail,
+        "名前の文字サイズ:",
+        [
+            "サムネイル",
+            "一覧",
+            "ファイル名",
+            "フォルダ名",
+            "拡大",
+            "倍率",
+            "フォント",
+            "スケーリング"
+        ]
+    ),
+    entry!(
+        "thumbnail/name-max-lines",
+        Thumbnail,
+        "名前の最大行数:",
+        [
+            "サムネイル",
+            "一覧",
+            "ファイル名",
+            "フォルダ名",
+            "長い名前",
+            "折り返し",
+            "複数行",
+            "省略"
+        ]
+    ),
+    entry!(
         "thumbnail/favorite-view-state",
         Thumbnail,
         "お気に入りごとに表示状態を記憶する",
@@ -1987,6 +2017,24 @@ mod tests {
                 .expect("audio thumbnail setting is searchable");
             assert_eq!(entry.page, page);
             assert!(PAGES_SOURCE.contains(&format!("anchored(ui, state, \"{anchor}\"")));
+        }
+    }
+
+    #[test]
+    fn thumb_name_settings_search_finds_font_scale_and_wrapping() {
+        for (query, anchor) in [
+            ("名前 文字サイズ", "thumbnail/name-font-scale"),
+            ("フォント スケーリング", "thumbnail/name-font-scale"),
+            ("名前 最大行数", "thumbnail/name-max-lines"),
+            ("フォルダ名 折り返し", "thumbnail/name-max-lines"),
+            ("長い名前 複数行", "thumbnail/name-max-lines"),
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.page == PreferencesPage::Thumbnail && entry.anchor == anchor),
+                "missing thumbnail-name result: {query}"
+            );
         }
     }
 

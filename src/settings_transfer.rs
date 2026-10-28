@@ -286,6 +286,8 @@ preferences_policy! {
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
         thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
+        thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
+        thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
         thumb_tooltip_show_filename: bool => ("サムネイルツールチップ：ファイル名", |_, _| true, plain, plain);
         thumb_tooltip_show_image_dimensions: bool => ("サムネイルツールチップ：画像サイズ", |_, _| true, plain, plain);
@@ -1026,6 +1028,16 @@ mod tests {
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
         settings.thumb_show_resume_meter = !settings.thumb_show_resume_meter;
+        settings.thumb_name_font_scale_percent = if settings.thumb_name_font_scale_percent == 200 {
+            100
+        } else {
+            200
+        };
+        settings.thumb_name_max_lines = if settings.thumb_name_max_lines == 4 {
+            1
+        } else {
+            4
+        };
         settings.selection_info_display_mode = different_enum(
             &settings.selection_info_display_mode,
             &[
@@ -1923,13 +1935,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 470);
+        assert_eq!(entries.len(), 472);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            149
+            151
         );
         assert_eq!(
             entries
@@ -1959,7 +1971,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 147);
+        assert_eq!(wire.len(), 149);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1974,6 +1986,58 @@ mod tests {
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
         );
+    }
+
+    #[test]
+    fn thumb_name_settings_transfer_roundtrip_missing_and_invalid_values() {
+        let source = Settings {
+            thumb_name_font_scale_percent: 175,
+            thumb_name_max_lines: 4,
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(destination.thumb_name_font_scale_percent, 175);
+        assert_eq!(destination.thumb_name_max_lines, 4);
+        assert!(
+            report
+                .changed_fields
+                .iter()
+                .any(|field| field == "サムネイル一覧の名前の文字サイズ")
+        );
+        assert!(
+            report
+                .changed_fields
+                .iter()
+                .any(|field| field == "サムネイル一覧の名前の最大行数")
+        );
+        parse_preferences(INITIAL_V1)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(destination.thumb_name_font_scale_percent, 175);
+        assert_eq!(destination.thumb_name_max_lines, 4);
+
+        for (field, invalid) in [
+            ("thumb_name_font_scale_percent", json!(99)),
+            ("thumb_name_font_scale_percent", json!(201)),
+            ("thumb_name_font_scale_percent", json!(-1)),
+            ("thumb_name_font_scale_percent", json!(150.5)),
+            ("thumb_name_max_lines", json!(0)),
+            ("thumb_name_max_lines", json!(5)),
+            ("thumb_name_max_lines", json!("2")),
+            ("thumb_name_max_lines", Value::Null),
+        ] {
+            let report = parse_preferences(&document(json!({field: invalid})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1, "{field}");
+            assert_eq!(destination.thumb_name_font_scale_percent, 175);
+            assert_eq!(destination.thumb_name_max_lines, 4);
+        }
     }
 
     #[test]

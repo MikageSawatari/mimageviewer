@@ -4937,6 +4937,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 None,
                 false,
+                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
             );
             crate::app::draw_cell(
                 ui,
@@ -19914,6 +19915,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     filter_match_count,
                                     media_duration.as_deref(),
                                     self.settings.thumb_show_resume_meter,
+                                    crate::thumb_overlay_layout::ThumbnailNameStyle { font_scale: self.settings.thumb_name_font_scale_percent as f32 / 100.0, max_lines: self.settings.thumb_name_max_lines as usize },
                                 );
 
                                 let selected_before = self.selected == Some(idx);
@@ -20023,6 +20025,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         filter_match_count,
                                         media_duration.as_deref(),
                                         self.settings.thumb_show_resume_meter,
+                                        crate::thumb_overlay_layout::ThumbnailNameStyle { font_scale: self.settings.thumb_name_font_scale_percent as f32 / 100.0, max_lines: self.settings.thumb_name_max_lines as usize },
                                     );
                                 }
 

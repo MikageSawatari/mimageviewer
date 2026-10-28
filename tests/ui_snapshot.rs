@@ -29,6 +29,17 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn thumbnail_name_style_multiline_dark() {
+    snapshot_with_theme_at_size(
+        "thumbnail_name_style_multiline_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(460.0, 440.0),
+        None,
+        mimageviewer::draw_thumbnail_name_style_snapshot_fixture,
+    );
+}
+
+#[test]
 fn toolbar_pinned_search_light() {
     snapshot_with_theme_at_size(
         "toolbar_pinned_search_light",
@@ -3114,6 +3125,7 @@ fn cell_filename_mixed_glyphs_dark() {
             let empty_tags = Vec::new();
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    name_style: Default::default(),
                     cell,
                     inner,
                     book_resume_meter: false,
@@ -3179,6 +3191,7 @@ fn compact_file_format_badges_light() {
                 .then_some(name);
                 let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                        name_style: Default::default(),
                         cell,
                         inner,
                         book_resume_meter: false,
@@ -3294,6 +3307,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
             let empty_tags = Vec::new();
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    name_style: Default::default(),
                     cell,
                     inner,
                     book_resume_meter: false,
@@ -3353,6 +3367,7 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
         );
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                name_style: Default::default(),
                 cell,
                 inner,
                 book_resume_meter: false,
@@ -3475,6 +3490,7 @@ fn bookmark_time_and_tag_badges_dark() {
             let tags = vec!["#長い日本語タグ".to_owned(), "旅行".to_owned()];
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    name_style: Default::default(),
                     cell,
                     inner,
                     book_resume_meter: false,
