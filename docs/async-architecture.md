@@ -96,7 +96,7 @@ ResidentEdited は必要な全編集を反映済みの exact な最上位累積�
 ready を含む）が無いことを確認し、待つ頁は continue して相方の準備を進める。
 local/conceal の現在入力判定は採用側と共有する純粋 helper を使う。Next/Previous は同じ解決を使い、
 要求 key と source_size は開始時に固定する。新しい stage producer・queue・pending は追加しない。
-後発の local 寸法正規化が同じ key の D3 を失効させる既存経路は残り、段階 B で扱う。
+この段階に残った後発local寸法正規化による同key失効は、下記段階Bの一括公開・正規化採用境界で扱う。
 入力・permission の再開・実表示復帰は selector 非依存の共通 service を通るが、単なる context mount は通さない。
 app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
 通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。
@@ -111,13 +111,37 @@ park／mount／fork の新しい非同期 owner は作らず、cold metadata 準
 D3-5整理（2026-10-19）: Native canonical の完全性・位置検索は既存 installed topology の証拠／索引を使い、
 未採用なら skip する。slideshow の nav/unit 列も収集・再照合から再構築しない。最新 callback の値は
 既存 frame owner に置き、最終 hook の処理後に消費する。別 cache owner／queue／heartbeat は作らない。
-source／AI の既存先読み要求範囲と producer は維持する。D3-3 の編集入力・comic CPU-only 化は
-次の版の後の [backlog §1.401](next-release-backlog.md) へ延期し、通常表示要求の従来経路は保持する。
+source／AI の既存先読み要求範囲と producer は維持する。D3-5当時延期したD3-3の編集入力・comic準備は、
+2026-10-28の利用者判断により下記§28段階Bで扱う。通常表示要求の従来経路は保持する。
 横断監査と計測／未確認事項の正本は [page-turn 計画 §27.17.17](page-turn-animation-plan.md)。
 CPU 需要用の従来 resolver に残っていた全頁走査・mixed slideshow 列再構築も、D3-5 で同じ既存
 `SpreadDisplayUnitsCache` 内の派生 record へ移す。cold だけ導出し、warm は scalar／Arc identity と索引で読む。
 共通adoption／producer／keepのprefixで同pass採用し、ROOT直接採用も覆う。visible token／units／証拠は変更せず、
 同じ枝は既存索引を参照し、異なる枝だけ完全recordを持つ。forkのfresh owner、mount／park／promoteの移譲は維持する。
+
+§28 段階B（2026-10-28〜29、実装済み・検証結果は別記）は`app/prepared_edit.rs`にNextの編集一式のCPU準備を置く。
+`final_effect_pending`の排他的な`Computing / CpuReady / Registering`が要求・結果・登録途中textureを所有し、
+別map／queue／readyフラグは作らない。UIで固定したcontext・item identity・世代・各key・params・入力Arc・canonical寸法から、
+workerが局所補正（coldならDB読取りと寸法正規化）→隠蔽→final→注釈→各upload clampを行う。
+現在入力のerase Commit、local／conceal／comic、該当LUT／segmentation producerと競合する頁は開始せず、相方へ進む。
+Previousはresident-onlyのままで、BのためにMI-GANやfinal AIを開始しない。
+
+共通投機permitと必要なcomic実走行枠は取消後もworker実終了まで保持する。CPU結果予約はallocation単位で共有Arcを重複計上せず、
+channel／CpuReady／Registering／表示引取りを通じて公開・破棄まで保持する。context 1unit／全体2unit／1GiBは維持する。
+font不足や空docでもcold doc解決は正常結果で、照合後に既存`comic_docs`の欠けているkeyだけへ採用する。
+画像なし結果はGPU登録を待たず予約を解放し、font不足だけで画像jobを再spawnしない。
+
+公開は全照合と注釈の除外可否を最初のmutation前に決め、段・edit・final・対応comicを一括採用する。
+Registeringの新規textureはROOT共通枠で1枚ずつ作り、途中はpending内に私有して全contextのVRAMへ計上する。
+共有handleは追加枠を使わない。登録残は次のROOT frameを要求し、OverBudgetでは結果を保持して再描画・再計算ループを作らない。
+表示入口は非blocking受信後にComputingなら取消・公開権撤去、CpuReady／Registeringなら表示引取りとし、作成済みhandleを再利用する。
+BはDisplayPreparedへ昇格しない。編集の入場・切替・original待ち再開・Resume・Ctrl+EはBを取り消して既存ownerへ渡し、
+B完了から編集continuationを発火させない。
+
+parkでは新jobを開始しないが、開始済みworker内部の全段は完走してよい。結果・予約・非公開textureは同ownerに残し、resume時に再照合する。
+F12は同ownerを移し、forkはpending／receiver／取消tokenを共有しない。兄弟contextへ失効や正規化のpublicationを送らない。
+新しい待機仕様はなく、めくりは受理時のresident素材を用いる。設計は[計画§28.5](page-turn-animation-plan.md)、
+検証結果と残件は`target/pageturn-1461/implementation-report-b.md`を参照する。
 
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 

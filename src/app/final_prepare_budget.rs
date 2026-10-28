@@ -984,7 +984,11 @@ impl App {
         let Some(pending) = self.final_effect_pending.get_mut(&key) else {
             return;
         };
-        if !matches!(pending.state, final_prepare::FinalEffectState::CpuReady(_)) {
+        if !matches!(
+            pending.state,
+            final_prepare::FinalEffectState::CpuReady(_)
+                | final_prepare::FinalEffectState::Registering(_)
+        ) {
             return;
         }
         if !pending.gpu_diagnostics.first(reason, demand_position) {

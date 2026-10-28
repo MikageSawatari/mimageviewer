@@ -711,6 +711,7 @@ use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerConte
 pub(crate) mod final_prepare;
 mod final_prepare_budget;
 mod final_prepare_cpu;
+mod prepared_edit;
 use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, FinalEffectState};
 #[cfg(test)]
 pub(crate) mod final_prepare_tests;
@@ -10181,7 +10182,7 @@ pub(crate) struct LocalAdjustCacheEntry {
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
-    pub texture: egui::TextureHandle,
+    pub texture: Option<egui::TextureHandle>,
 }
 
 /// 隠蔽合成結果のキャッシュエントリ (Phase 4)。
@@ -10196,7 +10197,7 @@ pub(crate) struct ConcealCacheEntry {
     /// 書き出すので、現状は描画パスでは未使用だが将来使う前提でフィールドを保持。
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
-    pub texture: egui::TextureHandle,
+    pub texture: Option<egui::TextureHandle>,
     pub generation: u64,
 }
 
@@ -11895,7 +11896,7 @@ impl LocalAdjustCacheEntry {
         Self {
             texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
-            texture,
+            texture: Some(texture),
             display_basis,
         }
     }
@@ -11911,7 +11912,7 @@ impl ConcealCacheEntry {
         Self {
             texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
-            texture,
+            texture: Some(texture),
             generation,
             display_basis,
         }
@@ -66867,8 +66868,10 @@ impl App {
                         app.evict_final_pipeline_cache(fs_idx);
                     }
                     if let Some(other) = spread_other {
+                        app.resolve_prepared_edit_for_display(ctx, other);
                         app.maybe_start_local_adjust_render(other);
                     }
+                    app.resolve_prepared_edit_for_display(ctx, fs_idx);
                     app.maybe_start_local_adjust_render(fs_idx);
                     if let Some(keep_set) = continuous_keep_set.as_ref() {
                         app.evict_adjustment_cache_for_keep_set(keep_set);
@@ -77379,6 +77382,7 @@ impl App {
         entry: OriginalMaterialEntry,
     ) -> bool {
         if entry != OriginalMaterialEntry::MaterialOnly {
+            self.cancel_prepared_edit_for_entry(idx);
             self.cancel_original_material_entry_intents(None);
         }
         if self.current_raw_source_pixels(idx).is_some() {
@@ -77533,6 +77537,7 @@ impl App {
         if entry == OriginalMaterialEntry::MaterialOnly {
             return;
         }
+        self.cancel_prepared_edit_for_entry(idx);
         if let OriginalMaterialEntry::ViewTrim { request } = entry {
             self.resume_view_trim_after_original(ctx, idx, request);
             return;
@@ -82921,6 +82926,15 @@ impl App {
         if let Some(key) = self.page_path_key(idx) {
             self.cancel_superseded_page_edit_producers(&key, &layers, false);
         }
+        self.adopt_materialized_local_layers(idx, layers);
+    }
+
+    /// Adopt normalization/hydration without publishing an edit or cancelling its producers.
+    pub(crate) fn adopt_materialized_local_layers(
+        &mut self,
+        idx: usize,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+    ) {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);
@@ -83498,6 +83512,72 @@ impl App {
             .map(|entry| Arc::clone(&entry.pixels))
     }
 
+    /// Exact CPU completion is independent of whether this stage has been uploaded.
+    pub(crate) fn local_adjust_is_materialized(&self, idx: usize) -> bool {
+        let Some(layers) = self.local_adjust_page_layers.get(&idx) else {
+            return !self.local_adjust_pages.contains(&idx);
+        };
+        if let Some(source) = self.current_local_adjust_source_pixels(idx)
+            && layers
+                .iter()
+                .any(|layer| !layer.masks_match_dims(source.size[0].max(1), source.size[1].max(1)))
+        {
+            return false;
+        }
+        !layers
+            .iter()
+            .any(|layer| layer.enabled && layer.opacity > 0.0)
+            || self.current_local_adjust_pixels(idx).is_some()
+    }
+
+    /// Upload an already materialized stage without changing its key or invalidating later stages.
+    pub(crate) fn ensure_local_adjust_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
+        if !self.local_adjust_is_materialized(idx) {
+            self.maybe_start_local_adjust_render(idx);
+            return None;
+        }
+        let key = self.current_local_adjust_key(idx);
+        let entry = self.local_adjust_cache.get(&key)?;
+        if entry.texture.is_none() {
+            if self.last_edit_materialize_upload_frame == self.frame_counter {
+                ctx.request_repaint();
+                return None;
+            }
+            let pixels = Arc::clone(&entry.pixels);
+            let options = self.display_texture_options(idx);
+            self.speculative_gpu_frame.note_ordinary_upload();
+            let upload_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+            let texture = ctx.load_texture(
+                format!(
+                    "local_adjust_{}_{}_{}_{}",
+                    key.idx, key.input_gen, key.erase_mask_gen, key.local_gen
+                ),
+                final_prepare::final_upload_pixels(&pixels),
+                options,
+            );
+            if let Some(upload_t0) = upload_t0 {
+                emit_edit_materialize_ms(
+                    "upload",
+                    "local",
+                    self.page_path_key(idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
+                );
+            }
+            self.bind_display_texture_identity(&texture, self.item_id(idx));
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+            let entry = self.local_adjust_cache.get_mut(&key)?;
+            entry.texture_options = options;
+            entry.texture = Some(texture);
+        }
+        self.current_local_adjust_material(idx)
+    }
+
     pub(crate) fn current_local_adjust_layer_bypass_key(
         &self,
         idx: usize,
@@ -83615,6 +83695,9 @@ impl App {
         idx: usize,
         continuation: LocalMaterializeContinuation,
     ) {
+        if continuation != LocalMaterializeContinuation::Display {
+            self.cancel_prepared_edit_for_entry(idx);
+        }
         if !self.local_adjust_pages.contains(&idx)
             && !self.local_adjust_page_layers.contains_key(&idx)
         {
@@ -83707,7 +83790,7 @@ impl App {
         if loaded_layers_are_inactive && !masks_need_resize {
             return;
         }
-        if self.current_local_adjust_texture(idx).is_some() && !masks_need_resize {
+        if self.current_local_adjust_pixels(idx).is_some() && !masks_need_resize {
             return;
         }
         if masks_need_resize {
@@ -83972,7 +84055,7 @@ impl App {
                         EditMaterializeKind::Local { continuation, .. } => continuation,
                         _ => return false,
                     };
-                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    self.adopt_materialized_local_layers(idx, layers);
                     self.local_adjust_cache.retain(|key, _| key.idx != idx);
                     let key = self.current_local_adjust_key(idx);
                     let pixels = Arc::new(image);
@@ -84004,7 +84087,7 @@ impl App {
                                 false,
                             ),
                             pixels,
-                            texture,
+                            texture: Some(texture),
                         },
                     );
                     if !matches!(
@@ -84035,7 +84118,7 @@ impl App {
                         _ => return false,
                     };
                     let layers_empty = layers.is_empty();
-                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    self.adopt_materialized_local_layers(idx, layers);
                     if layers_empty && let Some(page_key) = self.page_path_key(idx) {
                         Self::set_page_key_presence(
                             &mut self.local_adjust_page_keys,
@@ -84104,7 +84187,7 @@ impl App {
                                 false,
                             ),
                             pixels,
-                            texture,
+                            texture: Some(texture),
                             generation: key.conceal_gen,
                         },
                     );
@@ -84256,7 +84339,7 @@ impl App {
                             false,
                         ),
                         pixels,
-                        texture,
+                        texture: Some(texture),
                     },
                 );
                 ctx.request_repaint();
@@ -84338,7 +84421,7 @@ impl App {
                             false,
                         ),
                         pixels,
-                        texture,
+                        texture: Some(texture),
                     },
                 );
                 ctx.request_repaint();
@@ -84884,6 +84967,17 @@ impl App {
         idx: usize,
         purpose: ConcealMaterializePurpose,
     ) {
+        if !matches!(purpose, ConcealMaterializePurpose::Display) {
+            self.cancel_prepared_edit_for_entry(idx);
+        }
+        if purpose == ConcealMaterializePurpose::Display
+            && self
+                .conceal_cache
+                .get(&idx)
+                .is_some_and(|entry| entry.generation == self.conceal_generation)
+        {
+            return;
+        }
         if self.local_adjust_pages.contains(&idx)
             && !self.local_adjust_page_layers.contains_key(&idx)
         {
@@ -85045,9 +85139,10 @@ impl App {
 
     fn ensure_conceal_texture_impl(
         &mut self,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         if self.erase_mode || (self.conceal_mode && !self.conceal_preview_active) {
             return None;
         }
@@ -85056,10 +85151,42 @@ impl App {
             return None;
         }
         let current_gen = self.conceal_generation;
-        if let Some(entry) = self.conceal_cache.get(&idx) {
-            if entry.generation == current_gen {
-                return Some(entry.texture.clone());
+        if let Some(entry) = self
+            .conceal_cache
+            .get(&idx)
+            .filter(|entry| entry.generation == current_gen)
+        {
+            if let Some(texture) = &entry.texture {
+                return Some(texture.clone());
             }
+            if self.last_edit_materialize_upload_frame == self.frame_counter {
+                ctx.request_repaint();
+                return None;
+            }
+            let pixels = Arc::clone(&entry.pixels);
+            let options = self.display_texture_options(idx);
+            self.speculative_gpu_frame.note_ordinary_upload();
+            let upload_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+            let texture = ctx.load_texture(
+                format!("conceal_{idx}_g{current_gen}"),
+                final_prepare::final_upload_pixels(&pixels),
+                options,
+            );
+            if let Some(upload_t0) = upload_t0 {
+                emit_edit_materialize_ms(
+                    "upload",
+                    "conceal",
+                    self.page_path_key(idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
+                );
+            }
+            self.bind_display_texture_identity(&texture, self.item_id(idx));
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+            let entry = self.conceal_cache.get_mut(&idx)?;
+            entry.texture_options = options;
+            entry.texture = Some(texture.clone());
+            return Some(texture);
         }
         self.maybe_start_conceal_materialize(idx, ConcealMaterializePurpose::Display);
         None
@@ -85212,6 +85339,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         if self.fs_entry_is_animated(idx) {
             // Animated images are playback-only. Edit/final cache keys are not
             // frame-aware, so caching a derived frame here would freeze playback.
@@ -87405,9 +87533,20 @@ impl App {
             }
         }
         for key in disconnected {
-            self.final_effect_pending.remove(&key);
-            self.final_composite_cache
-                .remove_with_drop_reason(&key, "worker_disconnected");
+            let edited = self
+                .final_effect_pending
+                .remove(&key)
+                .is_some_and(|pending| pending.state.edit_input().is_some());
+            if !edited {
+                self.final_composite_cache
+                    .remove_with_drop_reason(&key, "worker_disconnected");
+            } else {
+                crate::logger::log(format!(
+                    "[edit-prepare] worker disconnected idx={}",
+                    key.edit_key.idx
+                ));
+                self.show_feedback_toast("編集画像の先読みを完了できませんでした".to_owned());
+            }
         }
         completed
     }
@@ -87437,6 +87576,9 @@ impl App {
         }
         let mut had_updates = false;
         for key in completed {
+            if self.adopt_prepared_edit(ctx, key, phase, false) {
+                continue;
+            }
             let Some(pending) = self.final_effect_pending.get(&key) else {
                 continue;
             };
@@ -87562,6 +87704,7 @@ impl App {
                 _ => None,
             };
             let (result, prepared_upload) = match ready {
+                FinalEffectReady::Edited(_) => unreachable!("edit pipeline adopted by its owner"),
                 FinalEffectReady::Legacy(result) => (result, None),
                 FinalEffectReady::Prepared(ready) => (
                     FinalCompositeResult::Ready {
@@ -87830,6 +87973,7 @@ impl App {
         source_size: [usize; 2],
         output_complete: bool,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, key.edit_key.idx);
         let reuse_prefetch = self
             .final_effect_pending
             .get(&key)
@@ -88182,6 +88326,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         #[cfg(test)]
         final_prepare_tests::observe_lookup(self);
         self.poll_final_effects(ctx);
@@ -88583,7 +88728,8 @@ impl App {
     /// 触れる前に呼ぶことで、注釈無し画像の通常閲覧をほぼゼロオーバーヘッドに保つ
     /// (Codex P3。comic.db lookup は page_path_key ごとに 1 度だけ、以降はメモリ)。
     /// デモ有効時はシードのため常に true。
-    pub(crate) fn comic_has_objects(&mut self, idx: usize) -> bool {
+    pub(crate) fn comic_has_objects(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         let Some(key) = self.page_path_key(idx) else {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };
@@ -88936,7 +89082,7 @@ impl App {
             });
         }
         // 注釈が無い画像は下地に触れず即 None (通常閲覧はゼロオーバーヘッド、Codex P3)。
-        if !self.comic_has_objects(idx) {
+        if !self.comic_has_objects(ctx, idx) {
             return None;
         }
         // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
@@ -89233,7 +89379,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<Arc<egui::ColorImage>> {
-        if !self.comic_has_objects(idx) {
+        if !self.comic_has_objects(ctx, idx) {
             return None;
         }
         let base = self.ensure_final_composite_pixels(ctx, idx)?;
@@ -103545,7 +103691,7 @@ mod material_display_owner_tests {
                         LocalAdjustCacheEntry {
                             texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
-                            texture: texture.clone(),
+                            texture: Some(texture.clone()),
                             display_basis: expected,
                         },
                     );
@@ -103557,7 +103703,7 @@ mod material_display_owner_tests {
                         LocalAdjustCacheEntry {
                             texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
-                            texture: texture.clone(),
+                            texture: Some(texture.clone()),
                             display_basis: expected,
                         },
                     );
@@ -103859,12 +104005,15 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        if !self.local_adjust_is_materialized(idx) {
+            return None;
+        }
         let entry = self
             .local_adjust_cache
             .get(&self.current_local_adjust_key(idx))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -103879,7 +104028,7 @@ impl App {
             .get(&self.current_local_adjust_layer_bypass_key(idx, layer_idx))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -103894,7 +104043,7 @@ impl App {
             .get(&self.current_local_adjust_prefix_preview_key(idx, layer_count))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -103935,7 +104084,7 @@ impl App {
             .filter(|entry| entry.generation == self.conceal_generation)?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))

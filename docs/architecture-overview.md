@@ -378,6 +378,7 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `run_native_failure.rs` | `run_native` 復帰後の単一終了境界。watchdog休止、失敗分類・原因連鎖の記録、既存cleanup、terminal・flush後のnative通知を順序付ける。自動script実行は通知だけを抑止する。詳細は [描画失敗の報告設計](render-init-failure-report-plan.md) |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。非描画の`logic`と、root Uiを受ける`ui`へ状態遷移を接続する |
 | `app/update_phases.rs` | service・input・render・post-renderの既存順序を所有。表示採用とGPU uploadはUI側へ残す |
+| `app/prepared_edit.rs` | 紙めくり§28段階BのNext編集準備。局所補正・隠蔽・final・注釈をCPU workerで作り、既存`final_effect_pending`のComputing／CpuReady／Registeringで一括公開まで所有する。新しい待機ownerを持たず、表示引取りと編集入口の取消を同じ境界へ集約する。実装・検証進行中、結果は`target/pageturn-1461/implementation-report-b.md` |
 | `app/close_return.rs` / `app/root_lifecycle.rs` | teardown前に捕捉したClose帰還を存続mainの既存navigation ownerへ移し、root Closeをlogic直後のbackend終了判定へ接続する |
 | `crates/startup-diagnostics` | launcher/core共通の常時起動timeline。UIは固定容量のmemoryへ非blockingで公開し、独立writerがJSONLを保存する。UI heartbeatと独立した限定watchdog、同runの引継ぎ、保存先分類を所有する。詳細は [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §3・§10 |
 | `ui_startup.rs` | 起動stage/経過時間と「検索の準備中」の純粋描画。Indexerの5秒overlay上限・worker継続・単一採用はAppの `IndexerInit` が所有する |

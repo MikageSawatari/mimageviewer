@@ -3,6 +3,11 @@ use super::final_prepare_cpu::{FinalPrepareReservation, FinalPrepareUnit, FinalP
 use super::*;
 use crate::ui_fullscreen::{FinalUnitPosition, NextFinalUnitDemand};
 
+pub(super) fn next_final_prepare_request_id() -> u64 {
+    static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+    NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(super) enum FinalEffectOrigin {
     LegacyDisplay,
     LegacyPrefetch,
@@ -41,16 +46,23 @@ pub(super) enum FinalEffectReceiver {
         rx: mpsc::Receiver<PreparedFinalPixels>,
         _reservation: Arc<FinalPrepareReservation>,
     },
+    Edited {
+        input: Arc<super::prepared_edit::PreparedEditInput>,
+        rx: mpsc::Receiver<super::prepared_edit::PreparedEditPixels>,
+        _reservation: Arc<FinalPrepareReservation>,
+    },
 }
 
 pub(super) enum FinalEffectState {
     Computing(FinalEffectReceiver),
     CpuReady(FinalEffectReady),
+    Registering(super::prepared_edit::PreparedEditRegistration),
 }
 
 pub(super) enum FinalEffectReady {
     Legacy(FinalCompositeResult),
     Prepared(PreparedFinalPixels),
+    Edited(super::prepared_edit::PreparedEditPixels),
 }
 
 pub(super) struct PreparedFinalPixels {
@@ -87,15 +99,26 @@ enum ResidentFinalPrepareInput {
 }
 
 impl FinalEffectState {
+    pub(super) fn edit_input(&self) -> Option<&super::prepared_edit::PreparedEditInput> {
+        match self {
+            Self::Computing(FinalEffectReceiver::Edited { input, .. }) => Some(input),
+            Self::CpuReady(FinalEffectReady::Edited(ready)) => Some(&ready.input),
+            Self::Registering(registration) => Some(&registration.ready.input),
+            _ => None,
+        }
+    }
     /// Receipt changes only the existing owner. It never selects a display source.
     pub(super) fn receive(&mut self) -> Result<(), mpsc::TryRecvError> {
         let ready = match self {
-            Self::CpuReady(_) => return Ok(()),
+            Self::CpuReady(_) | Self::Registering(_) => return Ok(()),
             Self::Computing(FinalEffectReceiver::Legacy(rx)) => {
                 FinalEffectReady::Legacy(rx.try_recv()?)
             }
             Self::Computing(FinalEffectReceiver::Prepared { rx, .. }) => {
                 FinalEffectReady::Prepared(rx.try_recv()?)
+            }
+            Self::Computing(FinalEffectReceiver::Edited { rx, .. }) => {
+                FinalEffectReady::Edited(rx.try_recv()?)
             }
         };
         *self = Self::CpuReady(ready);
@@ -209,7 +232,7 @@ impl App {
             .map(|resource| resource.source_texture().clone())
     }
 
-    fn final_prepare_wake(&self, ctx: &egui::Context) -> FinalPrepareWake {
+    pub(super) fn final_prepare_wake(&self, ctx: &egui::Context) -> FinalPrepareWake {
         FinalPrepareWake {
             ctx: ctx.clone(),
             viewport: self.page_turn_destination().viewport,
@@ -237,6 +260,10 @@ impl App {
                     && unit.items_generation == self.items_generation
                     && unit.pages.iter().any(|page| page.idx == key.edit_key.idx)
             })
+            && pending
+                .state
+                .edit_input()
+                .is_none_or(|input| self.prepared_edit_input_is_current(input))
     }
 
     /// No materialization, I/O, texture allocation, mask loading or AI start.
@@ -388,6 +415,12 @@ impl App {
         let mut reclaim_attempted = false;
         for page in &unit.pages {
             let idx = page.idx;
+            if self.prepared_edit_page(idx) {
+                if self.spawn_prepared_edit_job(ctx, idx, unit.clone(), &mut reclaim_attempted) {
+                    return;
+                }
+                continue;
+            }
             if self.exact_complete_final_composite_entry(idx).is_some() {
                 continue;
             }
@@ -518,7 +551,7 @@ impl App {
 
     /// This call performs no adoption/registration or producer work. Only a
     /// reservation-pressure snapshot (at most two units) chooses these owners.
-    fn reclaim_previous_final_results(
+    pub(super) fn reclaim_previous_final_results(
         &mut self,
         units: &[FinalPrepareUnit],
         requester: &FinalPrepareUnit,
@@ -581,6 +614,9 @@ impl App {
                     let location = match &pending.state {
                         FinalEffectState::CpuReady(FinalEffectReady::Prepared(_)) => "cpu_ready",
                         FinalEffectState::Computing(FinalEffectReceiver::Prepared { .. }) => "channel",
+                        FinalEffectState::CpuReady(FinalEffectReady::Edited(_)) => "cpu_ready",
+                        FinalEffectState::Computing(FinalEffectReceiver::Edited { .. }) => "channel",
+                        FinalEffectState::Registering(_) => "registering",
                         _ => continue,
                     };
                     let received = app.final_effect_pending.get_mut(&key).unwrap().state.receive();
@@ -639,7 +675,9 @@ impl App {
             .filter_map(|(key, pending)| {
                 (matches!(
                     pending.state,
-                    FinalEffectState::Computing(FinalEffectReceiver::Prepared { .. })
+                    FinalEffectState::Computing(
+                        FinalEffectReceiver::Prepared { .. } | FinalEffectReceiver::Edited { .. }
+                    )
                 ) && matches!(&pending.origin, FinalEffectOrigin::Speculative(unit)
                     if self.final_prepare_unit_position(unit) == Some(FinalUnitPosition::Previous))
                     && self.final_prepare_key_position(*key) == Some(FinalUnitPosition::Previous)
@@ -830,8 +868,7 @@ impl App {
             }
         };
         let requested_position = requested_position.map_or("unknown", FinalUnitPosition::as_str);
-        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
-        let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        let request_id = next_final_prepare_request_id();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_reservation = reservation.clone();
@@ -1002,6 +1039,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> PreparedFinalDisplay {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         let Some(key) = self.final_effect_pending.iter().find_map(|(key, pending)| {
             (key.edit_key.idx == idx
                 && (!pending.origin.is_legacy()

@@ -88786,7 +88786,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(app.fullscreen_idx, Some(main_idx));
             app.with_active_viewer_context(|parked| {
                 assert_eq!(parked.fullscreen_idx, Some(owner_idx));
-                assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
+                assert_eq!(
+                    parked.conceal_cache[&owner_idx]
+                        .texture
+                        .as_ref()
+                        .unwrap()
+                        .id(),
+                    owner_texture
+                );
             })
             .unwrap();
             rendered.1.drop_without_applying_deltas();

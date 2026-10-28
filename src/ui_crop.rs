@@ -394,6 +394,7 @@ impl App {
         if !self.raw_edit_target_entry_allowed(target_idx) {
             return;
         }
+        self.cancel_prepared_edit_for_entry(target_idx);
         self.cancel_original_material_entry_intents(None);
         if let Some(pivot) = pivot {
             self.export_crop_spread_ctx = Some(pivot);

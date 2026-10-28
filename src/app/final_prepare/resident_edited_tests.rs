@@ -48,7 +48,7 @@ pub(super) fn stage(
                     texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     display_basis,
                     pixels: pixels.clone(),
-                    texture,
+                    texture: Some(texture),
                 },
             );
         }
@@ -60,7 +60,7 @@ pub(super) fn stage(
                     texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     display_basis,
                     pixels: pixels.clone(),
-                    texture,
+                    texture: Some(texture),
                     generation: app.conceal_generation,
                 },
             );

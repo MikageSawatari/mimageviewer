@@ -1997,8 +1997,10 @@ impl App {
                     self.evict_final_pipeline_cache(fs_idx);
                 }
                 if let Some(other) = spread_other {
+                    self.resolve_prepared_edit_for_display(ctx, other);
                     self.maybe_start_local_adjust_render(other);
                 }
+                self.resolve_prepared_edit_for_display(ctx, fs_idx);
                 self.maybe_start_local_adjust_render(fs_idx);
                 if let Some(keep_set) = continuous_keep_set.as_ref() {
                     self.evict_adjustment_cache_for_keep_set(keep_set);

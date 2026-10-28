@@ -139,6 +139,27 @@ edit texture 確保前に再利用する。通常同期 miss、無補正 handle 
 現在は上記 D3-2 と下記 D3-4 の条件を満たす場合だけ先回り準備へ接続する。
 slideshow の still-only unit 計算は表示 cache を置換しない。詳細・検証は page-turn 計画 §27.17.12。
 
+### 次unitの編集素材の一括準備（§28 段階B、2026-10-28〜29、実装済み・検証結果は別記）
+
+段階BはON／pagedの現unit提示後、Nextだけで局所補正→隠蔽→final→注釈を先回りして作る。
+完成erase画素を入力にする場合はMI-GANや黒背景合成を再適用しない。after-AIは`used_upscale`に従い、
+注釈はclamp前のfinal正本へ合成する。finalと注釈のupload画素はそれぞれ通常と同じTriangle clampで作る。
+必要なfontが不足する場合もdoc解決は正常終端し、作れるlocal／conceal／finalは採用できる。
+入力・key・世代・params・doc／fontのpreflight後、必要なtextureが揃ってから段・edit・final・対応comicを一括公開する。
+final正本とcomicの下地は同じArcを持ち、段採用だけで上段を失効させない。
+
+local／concealの段cacheはCPU-only entryを持てる。実体化済みはexact画素＋寸法正規化、描画可能はそれにtextureがある状態である。
+resident lookupは副作用なし。表示ensureだけが既存画素を1 frame 1枚uploadし、texture不足を再レンダーやkey変更の理由にしない。
+新規の投機textureはROOT共通枠で1枚ずつ登録し、途中の非公開textureも全contextのVRAM会計へ入れる。
+登録残は次のROOT frameへ進め、OverBudgetでは結果を保持して再描画ループを起こさない。
+
+表示要求は先に非blocking受信する。BのComputingは取消して通常経路へ戻し、CpuReady／Registeringは表示へ引き取って作成済みhandleを再利用する。
+既存legacyカラー化／LUTの表示昇格契約は維持し、BをDisplayPreparedへ昇格させない。
+Ctrl+Eを含む編集入口はBを取り消して既存ownerへ渡す。Bの不足を理由にめくりの受付を待たせたり演出を省いたりしない。
+演出は受理済みのresident素材に固定し、品質公開でheld resource／canonical receiptを差し替えない。
+設計と実装記録は[紙めくり計画§28.5](page-turn-animation-plan.md)、検証結果・未計測の表示引取りGPUコストは
+`target/pageturn-1461/implementation-report-b.md`を参照する。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で

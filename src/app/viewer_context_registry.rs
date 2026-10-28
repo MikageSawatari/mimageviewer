@@ -2408,6 +2408,7 @@ impl<'a> ContextRef<'a> {
                 similar_panel: &bundle.similar_panel,
                 fs_cache: &bundle.fs_cache,
                 final_composite_cache: &bundle.final_composite_cache,
+                final_effect_pending: &bundle.final_effect_pending,
                 adjustment_cache: &bundle.adjustment_cache,
                 erase_result_cache: &bundle.erase_result_cache,
                 erase_preview_cache: &bundle.erase_preview_cache,

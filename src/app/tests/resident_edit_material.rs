@@ -3,6 +3,107 @@ use super::phase_c_support::setup_app;
 use super::source_texture_test_support::seed;
 use super::*;
 
+#[test]
+fn cpu_only_edit_stages_complete_without_rerender_and_share_the_upload_frame() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app();
+    image(&mut app, &ctx);
+    let (local, _, _) = stage(
+        &mut app,
+        &ctx,
+        "local_adjust",
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+    );
+    let (conceal, _, _) = stage(&mut app, &ctx, "conceal", DISPLAY_IMAGE_TEXTURE_OPTIONS);
+    let local_key = app.current_local_adjust_key(0);
+    let edit_key = app.current_edit_result_key(0);
+    app.local_adjust_cache.get_mut(&local_key).unwrap().texture = None;
+    app.conceal_cache.get_mut(&0).unwrap().texture = None;
+    let display_basis = app.conceal_cache[&0].display_basis;
+    app.edit_result_cache.insert(
+        edit_key,
+        EditResultEntry {
+            display_basis,
+            pixels: conceal.clone(),
+            texture: None,
+        },
+    );
+
+    assert!(app.local_adjust_is_materialized(0));
+    assert!(app.current_local_adjust_material(0).is_none());
+    assert!(app.current_conceal_material(0).is_none());
+    app.maybe_start_local_adjust_render(0);
+    app.maybe_start_conceal_materialize(0, ConcealMaterializePurpose::Display);
+    assert!(app.local_adjust_pending.is_empty());
+
+    app.last_edit_materialize_upload_frame = app.frame_counter;
+    assert!(app.ensure_local_adjust_material(&ctx, 0).is_none());
+    app.frame_counter += 1;
+    assert!(app.ensure_local_adjust_material(&ctx, 0).is_some());
+    assert!(app.ensure_conceal_material(&ctx, 0).is_none());
+    app.frame_counter += 1;
+    assert!(app.ensure_conceal_material(&ctx, 0).is_some());
+
+    assert!(Arc::ptr_eq(
+        &app.local_adjust_cache[&local_key].pixels,
+        &local
+    ));
+    assert!(Arc::ptr_eq(&app.conceal_cache[&0].pixels, &conceal));
+    assert!(Arc::ptr_eq(
+        &app.edit_result_cache[&edit_key].pixels,
+        &conceal
+    ));
+    assert_eq!(app.current_local_adjust_key(0), local_key);
+    assert_eq!(app.current_edit_result_key(0), edit_key);
+    assert!(app.local_adjust_pending.is_empty());
+}
+
+#[test]
+fn adopting_materialized_layers_preserves_the_user_producer_and_edit_generation() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app();
+    image(&mut app, &ctx);
+    stage(
+        &mut app,
+        &ctx,
+        "local_adjust",
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+    );
+    let owner = app.capture_page_edit_owner(0).unwrap();
+    let page_key = owner.target.page_key.clone();
+    let persisted_before = app.local_adjust_page_keys.contains(&page_key);
+    let before = app.current_local_adjust_key(0);
+    let document = app.local_adjust_page_layers[&0].clone();
+    let (_tx, rx) = mpsc::channel();
+    app.local_adjust_lut_pending = Some(LocalAdjustLutLoadPending {
+        owner,
+        fs_idx: 0,
+        layer_idx: 0,
+        document,
+        path: PathBuf::from("C:/resident-edit/test.cube"),
+        rx,
+    });
+    app.local_adjust_selected_layers.insert(0, 99);
+    let normalized = local_adjust_core::LocalAdjustmentLayers::new(vec![
+        local_adjust_core::LocalAdjustmentLayer::new(
+            "normalized",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        ),
+    ]);
+    app.adopt_materialized_local_layers(0, normalized.clone());
+    assert!(app.local_adjust_lut_pending.is_some());
+    assert_eq!(app.current_local_adjust_key(0), before);
+    assert_eq!(app.local_adjust_page_layers[&0], normalized);
+    assert_eq!(app.local_adjust_selected_layers[&0], 0);
+    assert_eq!(
+        app.local_adjust_page_keys.contains(&page_key),
+        persisted_before
+    );
+    assert!(app.local_adjust_pages.contains(&0));
+    assert!(app.local_adjust_cache.contains_key(&before));
+}
+
 fn image(app: &mut App, ctx: &egui::Context) {
     app.items
         .push(GridItem::Image(PathBuf::from("C:/resident-edit/0.png")));
@@ -59,7 +160,7 @@ fn stage(
                     texture_options: options,
                     display_basis,
                     pixels: pixels.clone(),
-                    texture,
+                    texture: Some(texture),
                 },
             );
         }
@@ -71,7 +172,7 @@ fn stage(
                     texture_options: options,
                     display_basis,
                     pixels: pixels.clone(),
-                    texture,
+                    texture: Some(texture),
                     generation: app.conceal_generation,
                 },
             );
@@ -265,9 +366,9 @@ fn resident_edit_sharing_requires_same_arc_dimensions_key_and_item_identity() {
                         }
                         "local_adjust" => {
                             let key = app.current_local_adjust_key(0);
-                            app.local_adjust_cache.get_mut(&key).unwrap().texture = texture
+                            app.local_adjust_cache.get_mut(&key).unwrap().texture = Some(texture)
                         }
-                        _ => app.conceal_cache.get_mut(&0).unwrap().texture = texture,
+                        _ => app.conceal_cache.get_mut(&0).unwrap().texture = Some(texture),
                     }
                 }
             }

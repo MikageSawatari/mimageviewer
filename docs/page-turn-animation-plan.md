@@ -4219,11 +4219,12 @@ spawn前に対象頁の既知寸法から、正本pixelsとupload用pixelsの最
 | --- | --- | --- | --- |
 | 表示用カラー化／LUTのComputing | cancelせず保持。worker完走を許可 | 最初のlookup前に受信・exact照合・採用 | 該当ownerだけcancelし、公開権を外す |
 | 表示用カラー化／LUTのCpuReady | 保持。parkを理由に再計算しない | 最初のlookup前に表示要求として登録・採用 | 破棄 |
-| 投機Computing | 開始済みworkerの完走を許可。新段・次jobは開始しない | 現需要とkeyを再検証。不要なら破棄 | cancel。実permitは終了まで保持 |
+| 投機Computing | 開始済みworkerの内部各段は完走可能。新jobは開始しない（§28.5 B7） | 現需要とkeyを再検証。不要なら破棄 | cancel。実permitは終了まで保持 |
 | 投機CpuReady | 予約付きで保持可能。圧力時の投機退去対象 | 現需要内なら共通登録枠へ。不要なら破棄 | 破棄・予約解放 |
+| 投機Registering（段階B） | 予約・非公開textureを同じpendingに保持。新規登録・公開は行わない | 全照合後に残りを共通登録枠へ。表示引取りは作成済みhandleを再利用 | 破棄・予約と非公開textureを解放 |
 | 登録済み通常cache／Native | 既存保持・退去方針 | exact key／需要を再検証 | 既存失効。生存batch leaseは最後のdropまで |
 
-投機jobがpark中に完成しても、次のcomic段やNative生成を自動開始しない。結果は同じpending／channel内に有界で残す。単なるmountと表示再開は区別し、会計等の一時mountで投機を再開しない。
+投機jobがpark中に完成しても、別jobとしてのcomic準備やNative生成を自動開始しない。§28.5の段階Bでは、開始済みworker内部の局所補正→隠蔽→final→注釈は完走してよい。旧記述の「次のcomic段を開始しない」は新jobを開始しない意味に読み替える。結果は同じpending／channel内に有界で残す。単なるmountと表示再開は区別し、会計等の一時mountで投機を再開しない。
 
 F12のmount／deposit／promoteは同じcontextのcache・pending・需要を移す。forkはreceiver／cancel／permitを共有しない新owner。Aのclose・採用・取消がBへ作用しない。
 
@@ -6487,3 +6488,42 @@ detached-rework-plan.md §11 に記録する。
 
 **B8 残るもの。** 注釈の font が未準備の頁 (セッションで初めて注釈を表示する前など)、消しゴムの MI-GAN が間に合わない頁、VRAM 予算外、final AI が必要な頁、
 Previous の先回り。これらは段階 A と同じく、resident な最上位でめくる。
+
+### 28.5.1 段階 B の実装記録（2026-10-28〜29、実装済み・検証結果は別記・実機未確認）
+
+設計第3版の独立 ACCEPT は `target/pageturn-1461/design-review-b3.md`。以下は実装境界の記録であり、
+自動検証・独立実装レビュー・性能の成功を示すものではない。結果と残件は `target/pageturn-1461/implementation-report-b.md` を正本とする。
+
+- `app/prepared_edit.rs` が Next の局所補正・隠蔽・final・注釈を一つの入力 snapshot と worker で準備する。
+  既存 `final_effect_pending` の `Computing / CpuReady / Registering` が要求・結果・登録途中textureを排他的に所有する。
+  Previous は resident-only。erase Commit と既存local／conceal／comic／該当LUT／segmentation producerの競合時はその頁を見送り、相方を進める。
+- 完成erase画素を再処理せず、after-AIは結果の`used_upscale`に従う。注釈はclamp前のfinal正本へ合成し、
+  finalと注釈それぞれのupload画素へTriangle clampを適用する。注釈のみならexact complete final（無変換ではedit／raw）を下地とする。
+  下段の実体化入力と最終入力は`PreparedFinalInput::Edit / AfterAi / Completed`で分ける。完成AI／finalがあっても、
+  residentな下段に対するlocalの画素・寸法正規化やconceal画素が不足する場合は同workerで補う。
+  Completedの正本・handle・表示基準は維持し、AfterAiへ補正を二重適用しない。CPU-only段からidentity finalだけが退去した場合も再レンダーせず登録を補う。
+- cold docの読取りはfont不足・空docでも正常に終端し、照合後に`comic_docs`の欠けているkeyだけへ採用する。
+  本文・名前プレートの参照fontをfallbackなしで判定し、既存docを上書きしない。画像のない結果はGPU登録を待たず予約を解放する。
+  既存cacheから作れる出力を再評価し、font不足や空docだけを理由に画像jobを繰り返さない。
+- 最初のmutation前に入力・key・世代・params・doc／fontを照合する。新規textureはROOT共通枠で1枚ずつ登録し、
+  揃うまで画像cacheを部分公開しない。非公開textureも全contextのVRAM会計へ含め、共有handleには追加登録を課さない。
+  登録が残れば次のROOT frameを要求し、OverBudgetは結果を保持して再描画・再計算ループを作らない。
+- 公開ではlocal／concealのCPU-only entry、edit、final、対応comicを一括採用する。final正本と`comic_cache.base`は同じArc。
+  段採用のための上段失効は行わず、実編集時の既存失効を維持する。局所層の寸法正規化は層・presence・選択・prepared snapshotの整合だけを更新し、
+  local世代を進めず、利用者producerや兄弟contextを変更しない。
+  共通helperのpresenceはidx側の実体化状態であり、メモリ内だけの編集を保存済みpage keyへ追加しない。
+  workerが空文書を解決した場合の保存済みpresence除去は、通常のinactive文書採用と同じ公開境界で行う。
+- 段の実体化済み判定はexact画素と寸法正規化、描画可能判定はそれにtextureを加えたものへ分離する。
+  texture不足では再レンダーせず、明示的な表示ensureで既存画素だけを1 frame 1枚uploadする。resident lookupは副作用なしで、Ctrl+Eの段gateも画素で満たす。
+- 表示は非blocking受信後に状態を判定し、Computingなら取消・公開権撤去して通常経路へ戻す。CpuReady／Registeringは表示へ引き取り、
+  作成済みhandleを再利用する。BをDisplayPreparedへ昇格させない。編集の入場・切替・original待ち再開・Resume・Ctrl+EではBを取り消して既存ownerへ渡す。
+- 共通投機permitと必要なcomic実走行枠はworkerの実終了まで保持する。CPU結果予約は共有allocationを重複計上せず、
+  channel・CpuReady・Registering・表示引取りから公開／破棄まで保持する。park／resume／F12／forkの境界は§27.17.3とdetached計画§11に記録した。
+  Nearestの既存CPU executorが作る別allocationも予約する。元NextがPreviousへ移ったBも既存の全Next優先・Previous取消規則へ従う。
+  新Bの登録は同頁の旧Bを退役させる。表示受信・stale採用拒否の取消単位は要求keyとし、旧新世代の一方の取消がもう一方へ作用しない。
+- lowerの表示基準はtexture有無によらずexact entryの受理値を捕捉する。既存finalの基準とは別に保持し、edit結果の公開にも引き継ぐ。
+  Bと従来D3でrequest ID採番を共有し、CPU開始／ready／実終了と各final・comic登録を同IDへ接続する。
+  private登録は`published=false`、表示引取りは`display_takeover`で区別し、残GPU登録時間と段表示ensureのupload時間を既存perfへ記録する。
+
+Bの不足を理由とする新しい待機・演出省略は加えない。受理済み素材、held resource、canonical receiptを品質公開で差し替えない。
+表示引取り時に残るGPU登録コストを含む性能確認と利用者実機確認は未完了である。

@@ -118,6 +118,51 @@ fn full(backend: &mut eframe::HeadlessEpiIntegration, app: &mut App, events: Vec
     output.drop_without_applying_deltas();
 }
 
+#[test]
+#[cfg(windows)]
+fn prepared_edit_full_update_takes_ready_b_before_the_first_local_producer_call() {
+    let mut env = prepared();
+    let ctx = context();
+    for idx in 0..4 {
+        let path = env.tmp.path().join(format!("b-update-{idx}.png"));
+        image(&mut env, &ctx, path);
+    }
+    env.fullscreen_idx = Some(0);
+    env.viewer_presentation = ViewerPresentation::MainWindow;
+    env.native_video_in_window_active = true;
+    env.reading_flow = crate::settings::ReadingFlow::Paged;
+    env.spread_mode = crate::settings::SpreadMode::Single;
+    env.settings.page_turn_animation_enabled = true;
+    let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    // Match the existing real-Full material fixtures: initial sizing/discard
+    // adoption finishes before a background result is published into the frame.
+    full(&mut backend, &mut env, Vec::new());
+    assert_eq!(env.fullscreen_idx, Some(0));
+    assert!(matches!(
+        env.fs_cache.get(&1),
+        Some(FsCacheEntry::Static { .. })
+    ));
+    let _ = env.page_turn_prefetch_targets(0, 2, 2);
+    let (key, cancel) = env.seed_prepared_edit_entry_test(&ctx, 1, false);
+    let expected = env.prepared_edit_test_local_pixels(key);
+    env.fullscreen_idx = Some(1);
+    full(&mut backend, &mut env, Vec::new());
+    assert!(env.final_effect_pending.is_empty());
+    assert!(
+        !cancel.load(Ordering::Relaxed),
+        "requested={:?} current={:?}, local pending={:?}",
+        key.edit_key,
+        env.current_edit_result_key(1),
+        env.local_adjust_pending.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        Arc::ptr_eq(&env.current_local_adjust_pixels(1).unwrap(), &expected),
+        "ordinary local production did not replace the prepared CPU allocation"
+    );
+    assert!(env.local_adjust_pending.is_empty());
+    assert!(env.final_composite_cache.contains_key(&key));
+}
+
 fn image(app: &mut App, ctx: &egui::Context, path: PathBuf) -> usize {
     let idx = app.items.len();
     app.items.push(GridItem::Image(path));
@@ -420,14 +465,14 @@ fn egui037_continuation_real_minimized_full_retains_material_upload_budget_throu
     let textures: HashSet<_> = env
         .local_adjust_cache
         .values()
-        .map(|entry| entry.texture.id())
+        .map(|entry| entry.texture.as_ref().expect("ordinary local upload").id())
         .collect();
     assert_eq!(textures.len(), 3);
     full(&mut backend, &mut env, Vec::new());
     assert_eq!(
         env.local_adjust_cache
             .values()
-            .map(|entry| entry.texture.id())
+            .map(|entry| entry.texture.as_ref().expect("ordinary local upload").id())
             .collect::<HashSet<_>>(),
         textures
     );

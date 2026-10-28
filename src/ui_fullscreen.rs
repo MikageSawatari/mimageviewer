@@ -33,6 +33,8 @@ mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
 #[cfg(test)]
+mod prepared_edit_entry_tests;
+#[cfg(test)]
 mod retained_material_entry_tests;
 #[cfg(test)]
 mod slideshow_settings_tests;
@@ -12215,7 +12217,11 @@ impl App {
             return "edit";
         }
         if self.conceal_cache.get(&idx).is_some_and(|entry| {
-            entry.generation == self.conceal_generation && entry.texture.id() == texture_id
+            entry.generation == self.conceal_generation
+                && entry
+                    .texture
+                    .as_ref()
+                    .is_some_and(|texture| texture.id() == texture_id)
         }) {
             return "conceal";
         }
@@ -13315,7 +13321,7 @@ impl App {
                     return self.resolve_local_adjust_source_material(ctx, idx);
                 }
                 LocalAdjustPreviewAction::FullComposite => {
-                    if let Some(local_adjust_tex) = self.current_local_adjust_material(idx) {
+                    if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
                         return Some(local_adjust_tex);
                     }
                     return self.resolve_local_adjust_source_material(ctx, idx);
@@ -13324,7 +13330,7 @@ impl App {
         }
 
         if self.conceal_mode && !self.conceal_preview_active {
-            if let Some(local_adjust_tex) = self.current_local_adjust_material(idx) {
+            if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
                 return Some(local_adjust_tex);
             }
             if let Some(erase_result_tex) = self.ensure_erase_result_material(ctx, idx) {
@@ -55625,6 +55631,7 @@ impl App {
         indices: &[usize],
     ) -> Result<(), String> {
         for &idx in indices {
+            self.cancel_prepared_edit_for_entry(idx);
             if (self.has_active_local_adjust_layers(idx)
                 && self.current_local_adjust_pixels(idx).is_none())
                 || (self.local_adjust_pages.contains(&idx)
