@@ -6600,3 +6600,13 @@ per-viewport opt-out、detached述語・状態・placement保存先・同期経�
 egui viewportの影だけで説明できない。v4.7.1..masterのowner・前面移譲と§1.387 A1〜A3も照合し、動画の原因は未特定として残す。
 presenter/host/HUDと点滅対策は変更しない。調査の詳細は backlog §1.426 に記録した (v4.8.1 で出荷後に削除。全文は commit `94017f82e` の `docs/next-release-backlog.md`)。
 利用者が確認用ビルドで、静止画・動画・F12 の有無・複数ウィンドウとも解消を確認した (2026-10-24)。動画で効いた仕組みは未解明。
+
+### §11 追補: §1.458 見開き編集対象の既定値の導出（2026-10-28）
+
+ClaudeCode指定設計とCodexのコード確認に基づき、既定の側を複数時点で保存する状態を廃止する構造修正を行う。
+`App` と `ViewerContextBundle` の既存 `adjust_spread_target` を `Option<AdjustSpreadTarget>` にそろえ、
+Noneは現在表示される同じ役割付きページ列から導出、Someは利用者の画面上の左右の明示選択とする。
+既存のcapture / mount / swapによるcontext所有は維持し、永続化・IPC・detached述語・HWND・viewport配送は変更しない。
+連続読みの通常のseek・再アンカーでは、実ページが変わる場合も明示選択を保持する。
+再計算の時点・非同期要求・回復状態を増やす症状パッチではなく、読む側の共通解決へ集約して保存状態を減らす。
+§2 (憲法) を読んだうえで、ClaudeCode (Opus 5.5) と独立レビュー (Codex gpt-6.1-sol xhigh、2026-10-28) の双方が「症状パッチではなく構造的修正である」ことに合意した。新しい detached 用フラグ・placement の保存先・時間窓は足していない。

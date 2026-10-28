@@ -39548,9 +39548,9 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.current_adjust_target_idx(), Some(0));
 
         app.spread_mode = SpreadMode::Ltr;
-        app.adjust_spread_target = AdjustSpreadTarget::Left;
+        app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
         assert_eq!(app.current_adjust_target_idx(), Some(0));
-        app.adjust_spread_target = AdjustSpreadTarget::Right;
+        app.adjust_spread_target = Some(AdjustSpreadTarget::Right);
         assert_eq!(app.current_adjust_target_idx(), Some(1));
     }
 
@@ -40030,6 +40030,559 @@ mod favorite_adjustment_defaults_tests {
         app.analysis_mode = false;
     }
 
+    fn section1458_spread_app(
+        ctx: &egui::Context,
+        mode: crate::settings::SpreadMode,
+        count: usize,
+    ) -> AppTestEnv {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("section1458-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.current_folder = Some(folder.clone());
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        app.items = (0..count)
+            .map(|idx| GridItem::Image(folder.join(format!("{idx}.png"))))
+            .collect();
+        app.visible_indices = (0..count).collect();
+        app.details_order = (0..count).collect();
+        app.thumbnails = (0..count).map(|_| ThumbnailState::Pending).collect();
+        app.viewer_navigation_caches.invalidate();
+        for idx in 0..count {
+            insert_export_static_source(&mut app, ctx, idx, [4, 6], "section1458-source");
+        }
+        app.spread_mode = mode;
+        app.fullscreen_idx = Some(0);
+        app
+    }
+
+    #[test]
+    fn section1458_page_edit_pivot_follows_reading_order_and_keeps_screen_pair() {
+        use crate::settings::SpreadMode;
+
+        for (mode, anchor, target, pair) in [
+            (SpreadMode::Ltr, 1, 0, (0, 1)),
+            (SpreadMode::Rtl, 1, 0, (1, 0)),
+            (SpreadMode::LtrCover, 2, 1, (1, 2)),
+            (SpreadMode::RtlCover, 2, 1, (2, 1)),
+        ] {
+            let mut app = section1458_spread_app(&egui::Context::default(), mode, 4);
+            let (actual, pivot) = app.plan_page_edit_pivot(anchor);
+            assert_eq!(actual, target, "{mode:?}");
+            let pivot = pivot.unwrap();
+            assert_eq!(pivot.pair, pair);
+            assert_eq!(pivot.navigation_anchor_idx, anchor);
+            assert_eq!(pivot.saved_mode, mode);
+            assert_eq!(
+                app.spread_mode, mode,
+                "planning must not mutate display state"
+            );
+        }
+        for (mode, anchor) in [(SpreadMode::Single, 1), (SpreadMode::RtlCover, 0)] {
+            let mut app = section1458_spread_app(&egui::Context::default(), mode, 4);
+            let (target, pivot) = app.plan_page_edit_pivot(anchor);
+            assert_eq!(target, anchor);
+            assert!(pivot.is_none());
+        }
+    }
+
+    fn section1458_paint_spread(
+        app: &mut App,
+        screen_pages: impl IntoIterator<Item = crate::ui_fullscreen::SpreadPageOccurrence>,
+    ) {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+        };
+
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Spread);
+        for (slot, page) in screen_pages.into_iter().enumerate() {
+            let rect =
+                egui::Rect::from_min_size(egui::pos2(slot as f32 * 4.0, 0.0), egui::vec2(4.0, 6.0));
+            let transform = DisplayedImageTransform::from_resolved_rect(
+                DisplayedImageTransformInput {
+                    pixel_fit: RectPixelFit::Texels,
+                    page_idx: page.idx,
+                    viewport_rect: egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(8.0, 6.0),
+                    ),
+                    source_size: egui::vec2(4.0, 6.0),
+                    texture_size: egui::vec2(4.0, 6.0),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    pixels_per_point: 1.0,
+                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                },
+                rect,
+            )
+            .unwrap();
+            app.fullscreen_page_layout.push_occurrence(transform, page);
+        }
+    }
+
+    #[test]
+    fn section1458_final_cover_edit_and_adjustment_start_on_navigation_page() {
+        use crate::settings::{FinalCoverSpreadPreference, SpreadMode};
+        use crate::ui_fullscreen::SpreadPageRole;
+
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            for (count, forced_last) in [(4, false), (4, true), (5, true)] {
+                let mut app = section1458_spread_app(&egui::Context::default(), mode, count);
+                app.settings.final_cover_spread_enabled = true;
+                app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
+                app.settings.last_page_alone_enabled = forced_last;
+                let anchor = count - 1;
+                app.fullscreen_idx = Some(anchor);
+                let pages = app
+                    .resolve_visible_spread_presentation_in_reading_order(anchor)
+                    .unwrap();
+                assert_eq!(pages[0].role, SpreadPageRole::Navigation);
+                assert_eq!(pages[0].idx, anchor);
+                assert_eq!(pages[1].role, SpreadPageRole::FrontCoverSupplement);
+                let (target, pivot) = app.plan_page_edit_pivot(anchor);
+                let pivot = pivot.unwrap();
+                assert_eq!(target, anchor, "{mode:?}, forced_last={forced_last}");
+                let navigation_on_right = mode.is_rtl() != (forced_last && count % 2 == 0);
+                assert_eq!(
+                    pivot.pair,
+                    if navigation_on_right {
+                        (0, anchor)
+                    } else {
+                        (anchor, 0)
+                    }
+                );
+                assert_eq!(pivot.navigation_anchor_idx, anchor);
+                assert!(app.adjust_spread_target.is_none());
+                assert_eq!(app.current_adjust_target_idx(), Some(anchor));
+                assert_eq!(
+                    app.resolve_visible_spread_edit_pages(anchor)
+                        .unwrap()
+                        .reading_start,
+                    if navigation_on_right {
+                        AdjustSpreadTarget::Right
+                    } else {
+                        AdjustSpreadTarget::Left
+                    }
+                );
+
+                // The painted-layout path must retain the same role and physical pair.
+                let screen_pages = app
+                    .spread_display_composition_for_anchor(anchor)
+                    .pages_in_screen_order(mode);
+                section1458_paint_spread(&mut app, screen_pages);
+                let (painted_target, painted_pivot) = app.plan_page_edit_pivot(anchor);
+                assert_eq!(painted_target, anchor);
+                assert_eq!(painted_pivot.unwrap().pair, pivot.pair);
+            }
+        }
+    }
+
+    #[test]
+    fn section1458_stale_tail_cover_layout_does_not_pivot_front_cover_to_tail() {
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPageOccurrence as Page;
+
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            let mut app = section1458_spread_app(&egui::Context::default(), mode, 4);
+            app.settings.final_cover_spread_enabled = true;
+            // Build the old tail independently of the current front-cover composition.
+            let navigation = Page::navigation(3, 3);
+            let supplement = Page::final_cover_supplement(0, 3);
+            section1458_paint_spread(
+                &mut app,
+                if mode.is_rtl() {
+                    [supplement, navigation]
+                } else {
+                    [navigation, supplement]
+                },
+            );
+            assert!(app.resolve_visible_spread_edit_pages(3).is_some());
+            app.fullscreen_idx = Some(0);
+            assert!(app.resolve_visible_spread_edit_pages(0).is_none());
+            let (target, pivot) = app.plan_page_edit_pivot(0);
+            assert_eq!(target, 0);
+            assert!(
+                pivot.is_none(),
+                "{mode:?}: a supplement occurrence is not a navigation match"
+            );
+            assert_eq!(app.current_adjust_target_idx(), Some(0));
+            assert_eq!(app.current_local_adjust_edit_idx(), Some(0));
+        }
+    }
+
+    #[test]
+    fn section1458_adjust_default_follows_shift_landing_in_paged_and_continuous_reading() {
+        use crate::settings::{ReadingFlow, SpreadMode};
+        use crate::ui_fullscreen::FsPageNav;
+
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, SpreadMode::RtlCover, 4);
+            app.settings.final_cover_spread_enabled = true;
+            app.settings.last_page_alone_enabled = true;
+            app.reading_flow = flow;
+            app.fullscreen_idx = Some(3);
+            assert_eq!(app.continuous_reading_active_for_idx(3), !flow.is_paged());
+            let from = app.resolve_visible_spread_edit_pages(3).unwrap();
+            assert_eq!(from.pair, (3, 0));
+            assert_eq!(from.reading_start, AdjustSpreadTarget::Left);
+            assert_eq!(app.current_adjust_target_idx(), Some(3));
+            app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
+
+            let mut action = crate::ui_fullscreen::FsKeyAction::default();
+            app.queue_spread_shift_action(3, -1, &mut action);
+            let FsPageNav::Target(target) = action.page_nav else {
+                panic!("shift must produce a concrete landing target");
+            };
+            assert_eq!(target, 2);
+            assert!(app.adjust_spread_target.is_none());
+            let mut perf = None;
+            app.land_still_page_navigation_target(
+                &ctx,
+                3,
+                target,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                &mut perf,
+            );
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(2),
+                "{flow:?}: exercise the actual landing"
+            );
+            let landed = app.resolve_visible_spread_edit_pages(2).unwrap();
+            assert_eq!(landed.pair, (2, 1));
+            assert_eq!(landed.reading_start, AdjustSpreadTarget::Right);
+            assert!(app.adjust_spread_target.is_none());
+            assert_eq!(app.current_adjust_target_idx(), Some(1), "{flow:?}");
+            assert_eq!(app.current_local_adjust_edit_idx(), Some(1), "{flow:?}");
+            assert_eq!(app.plan_page_edit_pivot(2).0, 1);
+        }
+    }
+
+    #[test]
+    fn section1458_last_page_setting_rebuild_keeps_adjustment_and_editor_on_navigation() {
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPageOccurrence as Page;
+
+        let _input_guard = crate::key_input::lock_test_input();
+        for initially_alone in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, SpreadMode::RtlCover, 4);
+            app.settings.final_cover_spread_enabled = true;
+            app.settings.last_page_alone_enabled = initially_alone;
+            app.fullscreen_idx = Some(3);
+            let navigation = Page::navigation(3, 3);
+            let supplement = Page::final_cover_supplement(0, 3);
+            section1458_paint_spread(
+                &mut app,
+                if initially_alone {
+                    [navigation, supplement]
+                } else {
+                    [supplement, navigation]
+                },
+            );
+            assert_eq!(app.current_adjust_target_idx(), Some(3));
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[FsImage]\nFsToggleLastPageAlone = F13\n");
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F13,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            app.keyboard_owner_for_pass(&ctx);
+            let _ = app.handle_fs_key_input(&ctx, 3, false);
+            ctx.end_pass().drop_without_applying_deltas();
+            assert_eq!(
+                app.page_alone_enabled_for_current_book().last,
+                !initially_alone
+            );
+            let rebuilt = app.resolve_visible_spread_edit_pages(3).unwrap();
+            assert_eq!(rebuilt.pair, if initially_alone { (0, 3) } else { (3, 0) });
+            assert!(app.adjust_spread_target.is_none());
+            assert_eq!(app.current_adjust_target_idx(), Some(3));
+            assert_eq!(app.current_local_adjust_edit_idx(), Some(3));
+            app.enter_local_adjust_mode(&ctx);
+            assert!(app.local_adjust_mode);
+            assert_eq!(app.fullscreen_idx, Some(3));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+        }
+    }
+
+    #[test]
+    fn section1458_explicit_adjust_side_persists_in_continuous_reading_and_clears_on_paged_turn() {
+        use crate::settings::{ReadingFlow, SpreadMode};
+
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, SpreadMode::Rtl, 6);
+            app.reading_flow = flow;
+            // This is the state stored by the physical left-page selector.
+            app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
+            for _ in 0..2 {
+                assert_eq!(app.current_adjust_target_idx(), Some(1));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(1));
+                assert_eq!(
+                    app.plan_page_edit_pivot(0).0,
+                    0,
+                    "entry keeps its reading-start rule"
+                );
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+            }
+            if !flow.is_paged() {
+                app.seek_to_continuous_page_with_contract(
+                    &ctx,
+                    0,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                );
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+            }
+            let mut perf = None;
+            app.land_still_page_navigation_target(
+                &ctx,
+                0,
+                2,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                &mut perf,
+            );
+            assert_eq!(app.fullscreen_idx, Some(2));
+            if flow.is_paged() {
+                assert!(app.adjust_spread_target.is_none());
+                assert_eq!(app.current_adjust_target_idx(), Some(2));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(2));
+            } else {
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+                assert_eq!(app.current_adjust_target_idx(), Some(3));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(3));
+                // Scrolling can re-anchor without opening or seeking a file.
+                app.adjust_spread_target = Some(AdjustSpreadTarget::Right);
+                app.reanchor_continuous_reading_viewer(
+                    &ctx,
+                    &[0.0, 100.0, 200.0],
+                    1,
+                    2,
+                    crate::page_split::PageSlice::Full,
+                    HistoryTrigger::AutoAdvance,
+                );
+                assert_eq!(app.fullscreen_idx, Some(2));
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Right));
+                app.reanchor_continuous_reading_viewer(
+                    &ctx,
+                    &[0.0, 100.0, 200.0],
+                    2,
+                    4,
+                    crate::page_split::PageSlice::Full,
+                    HistoryTrigger::AutoAdvance,
+                );
+                assert_eq!(app.fullscreen_idx, Some(4));
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Right));
+                assert_eq!(app.current_adjust_target_idx(), Some(4));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(4));
+            }
+        }
+    }
+
+    fn section1458_finish_conceal_entry(app: &mut App, ctx: &egui::Context) {
+        // Exercise the real worker and its adoption path through complete_conceal_mode_entry.
+        assert!(!app.conceal_mode);
+        assert!(app.local_adjust_pending.contains_key(&0));
+        assert!(!app.local_adjust_pending.contains_key(&1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.conceal_mode && std::time::Instant::now() < deadline {
+            app.poll_local_adjust_render(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.conceal_mode, "conceal worker must complete entry");
+        assert!(app.conceal_base_cache.contains_key(&0));
+        assert!(!app.conceal_base_cache.contains_key(&1));
+    }
+
+    #[test]
+    fn section1458_every_edit_entry_uses_reading_start_including_async_conceal() {
+        use crate::settings::SpreadMode;
+
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            for tool in 0..6 {
+                let ctx = egui::Context::default();
+                let mut app = section1458_spread_app(&ctx, mode, 4);
+                // Enter from the second page's navigation index as well as the first page.
+                app.fullscreen_idx = Some(1);
+                match tool {
+                    0 => app.enter_erase_mode(1),
+                    1 => {
+                        app.enter_conceal_mode(&ctx, 1);
+                        section1458_finish_conceal_entry(&mut app, &ctx);
+                    }
+                    2 => app.enter_local_adjust_mode(&ctx),
+                    3 => app.enter_export_crop_mode(1),
+                    4 => app.enter_text_mode(1),
+                    5 => app.enter_sns_split_mode(1).unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    [
+                        app.erase_mode,
+                        app.conceal_mode,
+                        app.local_adjust_mode,
+                        app.export_crop_mode,
+                        app.text_mode,
+                        app.sns_split.is_some()
+                    ][tool]
+                );
+                assert_eq!(app.fullscreen_idx, Some(0), "{mode:?}, tool={tool}");
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(
+                    app.page_edit_spread_pair(),
+                    Some(if mode.is_rtl() { (1, 0) } else { (0, 1) })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1458_edit_keys_use_reading_start_including_async_conceal() {
+        use crate::settings::SpreadMode;
+
+        let _input_guard = crate::key_input::lock_test_input();
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            // Crop has no entry KeyAction; its handler entry is covered above.
+            for (tool, key, modifiers) in [
+                (0, egui::Key::E, egui::Modifiers::NONE),
+                (1, egui::Key::M, egui::Modifiers::CTRL),
+                (2, egui::Key::G, egui::Modifiers::CTRL),
+                (3, egui::Key::T, egui::Modifiers::CTRL),
+                (4, egui::Key::F13, egui::Modifiers::NONE),
+            ] {
+                let ctx = egui::Context::default();
+                let mut app = section1458_spread_app(&ctx, mode, 4);
+                app.fullscreen_idx = Some(1);
+                app.keymap =
+                    crate::keymap::Keymap::from_ini_str("[FsImage]\nFsSnsSplitMode = F13\n");
+                ctx.begin_pass(egui::RawInput {
+                    events: vec![
+                        egui::Event::ModifiersChanged(modifiers),
+                        egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        },
+                    ],
+                    ..Default::default()
+                });
+                app.keyboard_owner_for_pass(&ctx);
+                let _ = app.handle_fs_key_input(&ctx, 1, false);
+                ctx.end_pass().drop_without_applying_deltas();
+                if tool == 1 {
+                    section1458_finish_conceal_entry(&mut app, &ctx);
+                }
+                assert!(
+                    [
+                        app.erase_mode,
+                        app.conceal_mode,
+                        app.local_adjust_mode,
+                        app.text_mode,
+                        app.sns_split.is_some()
+                    ][tool],
+                    "{mode:?}, key={key:?}"
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(
+                    app.page_edit_spread_pair(),
+                    Some(if mode.is_rtl() { (1, 0) } else { (0, 1) })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1458_adjust_target_resets_on_open_mode_shift_and_direction() {
+        use crate::settings::{ReadingDirection, SpreadMode};
+
+        for (mode, opposite, expected, direction) in [
+            (
+                SpreadMode::Ltr,
+                SpreadMode::Rtl,
+                AdjustSpreadTarget::Left,
+                ReadingDirection::Ltr,
+            ),
+            (
+                SpreadMode::Rtl,
+                SpreadMode::Ltr,
+                AdjustSpreadTarget::Right,
+                ReadingDirection::Rtl,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, mode, 6);
+            app.adjust_spread_target = Some(if expected == AdjustSpreadTarget::Left {
+                AdjustSpreadTarget::Right
+            } else {
+                AdjustSpreadTarget::Left
+            });
+            app.fullscreen_idx = None;
+            app.open_fullscreen(0, HistoryTrigger::UserChosen);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.adjust_spread_target, None, "open {mode:?}");
+
+            app.adjust_spread_target = Some(expected);
+            app.spread_mode = opposite;
+            assert!(app.apply_fullscreen_spread_mode(&ctx, 0, mode));
+            assert_eq!(app.adjust_spread_target, None, "mode {mode:?}");
+
+            app.adjust_spread_target = Some(if expected == AdjustSpreadTarget::Left {
+                AdjustSpreadTarget::Right
+            } else {
+                AdjustSpreadTarget::Left
+            });
+            let mut action = crate::ui_fullscreen::FsKeyAction::default();
+            app.queue_spread_shift_action(0, 1, &mut action);
+            assert!(
+                !action.page_nav.is_none(),
+                "shift must actually be accepted"
+            );
+            assert_eq!(app.adjust_spread_target, None, "shift {mode:?}");
+
+            app.adjust_spread_target = Some(expected);
+            app.spread_mode = opposite;
+            app.reading_direction = direction;
+            assert!(app.sync_spread_mode_from_reading_direction());
+            assert_eq!(app.spread_mode, mode);
+            assert_eq!(app.adjust_spread_target, None, "direction {mode:?}");
+
+            // open_fullscreen also tears down an editor's Single pivot. Resolve the
+            // initial target after that restores the actual reading direction.
+            app.reset_live_spread_shift(false);
+            app.enter_erase_mode(0);
+            assert!(app.erase_mode);
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            app.open_fullscreen(0, HistoryTrigger::UserChosen);
+            assert_eq!(app.spread_mode, mode);
+            assert_eq!(app.adjust_spread_target, None, "open after erase {mode:?}");
+        }
+    }
+
     /// **6 つの編集ツールが同じ手順で単ページへ倒れ、抜けたら見開きへ戻る。**
     ///
     /// 補正レイヤー (Ctrl+G) だけこの手順を持たず、見開きから入るとマスク編集も左右の
@@ -40150,7 +40703,8 @@ mod favorite_adjustment_defaults_tests {
             app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
             app.fullscreen_idx = Some(3);
 
-            let (_, pivot) = app.plan_page_edit_pivot(3);
+            let (target, pivot) = app.plan_page_edit_pivot(3);
+            assert_eq!(target, 3, "editing starts on the Navigation page");
             let pivot = pivot.expect("final singleton has a presentation supplement");
             assert_eq!(pivot.pair, screen_pair);
             assert_eq!(pivot.navigation_anchor_idx, 3);

@@ -228,9 +228,9 @@ native presenter の画像補正パネル末尾に読込行と保存行を表示
 
 | 要素 | 仕様 |
 | --- | --- |
-| L/R セレクタ | 「左ページ」「右ページ」の 2 ボタン (selectable_label)。既定は **常に左ページ**。`open_fullscreen` (= ページ送り、ペア切替、初回フルスクリーン) と spread_mode 切替で `AdjustSpreadTarget::Left` にリセット。Single (単ページ / 表紙単独 / 横長単独) のときは表示しない |
+| L/R セレクタ | 「左ページ」「右ページ」の 2 ボタン (selectable_label)。`adjust_spread_target: Option<AdjustSpreadTarget>` の None は未選択で、**表示中の組から読む順の最初のページ (左→右なら左、右→左なら右)** を都度導く。末尾の表紙補助表示では配置指定にかかわらず Navigation の実ページを選ぶ。左右ボタンを押すと Some でその画面上の側を明示選択し、同じページに留まる間と連続読みの通常の seek・再アンカーでは保持する。ページ単位の送り・ずらしの受付・open_fullscreen・モード変更・読む向き同期では None に戻す。Single (単ページ / 表紙単独 / 横長単独) のときは表示しない |
 | L/R 基準 | **画面上の左右で固定** (LTR/RTL 不変)。消しゴム `EraseSpreadCtx` の慣習と統一 |
-| 編集対象解決 | パネル冒頭で `resolve_spread_pair(fs_root_idx)` を引き、Double のとき `adjust_spread_target` に応じて `target_idx = left or right`。以降のスライダー読み書き / 個別化 / Undo はすべて `target_idx` 経由 (= 単ページ経路と同一) |
+| 編集対象解決 | `resolve_visible_spread_edit_pages(fs_root_idx)` が、同じ役割付きページ列から画面上のペアと `AdjustSpreadTarget::reading_start` による開始側を返す。描画済みレイアウトは対象 idx を Navigation として含むときだけ採用し、それ以外は現在の構成を使う。補正パネル / 補正レイヤーパネル / スロット適用は明示選択があればその側、なければ開始側を使う。編集入口は同じ列の開始側を使う。以降のスライダー読み書き / 個別化 / Undo はすべて `target_idx` 経由 (= 単ページ経路と同一) |
 | コピーボタン | 「← コピー」(右→左) と「コピー →」(左→右) の対称配置。`App::copy_spread_adjust(src, dst)` を呼ぶ |
 | 同一判定 | `effective_params(left) == effective_params(right)` (実効値の `==`)。一致しているときは両コピーボタン disabled (= 「揃っている」状態が UI から自明) |
 
@@ -260,7 +260,7 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 設計初期は「両ページ」モードを検討したが、左右が異なる状態で「両ページ」を選んだ瞬間に
 片方の補正値がもう片方で上書きされる破壊的操作が避けられず、デフォルト選択
 (同一なら両ページ / 異なれば左) のロジックも暗黙的になりやすい。代わりに
-「常に左ページから始まる + 揃えたいときはコピーボタン」という明示的 UI に絞った。
+「読む順の最初のページから始まる + 揃えたいときはコピーボタン」という明示的 UI に絞った。
 両ページ同値の運用要望は **お気に入り標準 (favorite_params) で代替できる** ため、
 今回は意図的にスコープ外。
 

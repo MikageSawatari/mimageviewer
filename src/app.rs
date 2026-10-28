@@ -12860,6 +12860,30 @@ pub(crate) struct PageEditSpreadPivot {
 }
 
 impl App {
+    /// ペアと初期編集側を、同じ表示単位の役割付きページ列から解決する。
+    pub(crate) fn resolve_visible_spread_edit_pages(
+        &mut self,
+        idx: usize,
+    ) -> Option<VisibleSpreadEditPages> {
+        let pages = if self.spread_mode.is_spread()
+            && let Some(pages) = self.fullscreen_page_layout.spread_occurrences()
+            && pages.iter().any(|page| {
+                page.role == crate::ui_fullscreen::SpreadPageRole::Navigation && page.idx == idx
+            }) {
+            pages.to_vec()
+        } else {
+            self.spread_display_composition_for_anchor(idx)
+                .pages_in_screen_order(self.spread_mode)
+        };
+        let [left, right] = pages.as_slice() else {
+            return None;
+        };
+        Some(VisibleSpreadEditPages {
+            pair: (left.idx, right.idx),
+            reading_start: AdjustSpreadTarget::reading_start(self.spread_mode, &pages),
+        })
+    }
+
     /// 編集するページと、見開きなら戻すための退避を決める。**この時点では何も変えない。**
     ///
     /// 素材の取得など失敗しうる準備を先に済ませてから
@@ -12869,17 +12893,17 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> (usize, Option<PageEditSpreadPivot>) {
-        match self.resolve_visible_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => (
-                left,
+        match self.resolve_visible_spread_edit_pages(fs_idx) {
+            Some(pages) => (
+                pages.target_idx(pages.reading_start),
                 Some(PageEditSpreadPivot {
                     saved_mode: self.spread_mode,
-                    pair: (left, right),
+                    pair: pages.pair,
                     navigation_anchor_idx: fs_idx,
                 }),
             ),
             // 単ページ / 表紙単独 / 横長単独。倒す必要が無い。
-            crate::ui_fullscreen::SpreadPair::Single => (fs_idx, None),
+            None => (fs_idx, None),
         }
     }
 
@@ -12966,12 +12990,59 @@ impl App {
 /// 見開き表示中に補正パネルが編集対象とするページ (画面上の左/右で固定、
 /// LTR/RTL は問わない)。Single (単ページ / 表紙単独 / 横長単独) では参照されず、
 /// L/R セレクタも UI 上に出ない。`open_fullscreen` (= ページ送り、ペア切替、
-/// 初回フルスクリーン) と spread_mode 切替で `Left` にリセットされる。
+/// 初回フルスクリーン) と spread_mode 切替で明示選択を解除する。
+/// 選択が無ければ、現在表示される組の読む順の最初のページを都度使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum AdjustSpreadTarget {
     #[default]
     Left,
     Right,
+}
+
+/// 画面上のペアと、その同じ表示単位で最初に編集する側。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VisibleSpreadEditPages {
+    pub pair: (usize, usize),
+    pub reading_start: AdjustSpreadTarget,
+}
+
+impl VisibleSpreadEditPages {
+    pub(crate) fn target_idx(self, side: AdjustSpreadTarget) -> usize {
+        match side {
+            AdjustSpreadTarget::Left => self.pair.0,
+            AdjustSpreadTarget::Right => self.pair.1,
+        }
+    }
+}
+
+impl AdjustSpreadTarget {
+    /// 見開きで最初に編集する側。左右の意味は画面上の位置のまま保つ。
+    pub(crate) fn reading_start(
+        spread_mode: crate::settings::SpreadMode,
+        screen_pages: &[crate::ui_fullscreen::SpreadPageOccurrence],
+    ) -> Self {
+        use crate::ui_fullscreen::SpreadPageRole;
+
+        // 単独表示の配置指定で実ページが反対側に来ても、補助表紙からは始めない。
+        if screen_pages
+            .iter()
+            .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+            && let Some(position) = screen_pages
+                .iter()
+                .position(|page| page.role == SpreadPageRole::Navigation)
+        {
+            return if position == 0 {
+                Self::Left
+            } else {
+                Self::Right
+            };
+        }
+        if spread_mode.is_rtl() {
+            Self::Right
+        } else {
+            Self::Left
+        }
+    }
 }
 
 /// 仮想フォルダ (PDF/ZIP) 進入時の親 catalog への write-back ターゲット。
@@ -18250,8 +18321,9 @@ pub struct App {
     /// 見開きから SNS 分割モードに入ったときの spread 状態スナップショット。
     pub(crate) sns_split_spread_ctx: Option<PageEditSpreadPivot>,
     /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
-    /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
-    pub(crate) adjust_spread_target: AdjustSpreadTarget,
+    /// 参照されない。`open_fullscreen` / spread_mode 切替で明示選択を解除する。
+    /// None follows the current spread's reading start; Some is an explicit screen-side choice.
+    pub(crate) adjust_spread_target: Option<AdjustSpreadTarget>,
     /// 補正パネルの標準 / このページ選択。対象 idx が変わったときだけ初期化する。
     pub(crate) adjust_scope_selection: AdjustScopeSelection,
     /// `adjust_scope_selection` を初期化済みの編集対象 idx。
@@ -21358,7 +21430,7 @@ impl App {
             sns_split: None,
             sns_split_drag: None,
             sns_split_spread_ctx: None,
-            adjust_spread_target: AdjustSpreadTarget::Left,
+            adjust_spread_target: None,
             adjust_scope_selection: AdjustScopeSelection::Standard,
             adjust_scope_selection_idx: None,
             adjustment_page_params: std::collections::HashMap::new(),
@@ -69975,7 +70047,7 @@ impl App {
             FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache,
             refresh_video_markers_perf_t0,
         );
-        self.adjust_spread_target = AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
         // 常時 ON にする方針 (v1.0.0)。グリッドからの Enter (= Critical な
         // enumerate_pages_async) が、サムネ先読みの Normal ジョブ in-flight 待ちで
@@ -91562,15 +91634,12 @@ impl App {
     /// に応じた左/右ページの idx。フルスクリーンを開いていなければ None。
     pub(crate) fn current_adjust_target_idx(&mut self) -> Option<usize> {
         let fs_idx = self.fullscreen_idx?;
-        Some(match self.resolve_visible_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                match self.adjust_spread_target {
-                    AdjustSpreadTarget::Left => left,
-                    AdjustSpreadTarget::Right => right,
-                }
-            }
-            crate::ui_fullscreen::SpreadPair::Single => fs_idx,
-        })
+        Some(
+            self.resolve_visible_spread_edit_pages(fs_idx)
+                .map_or(fs_idx, |pages| {
+                    pages.target_idx(self.adjust_spread_target.unwrap_or(pages.reading_start))
+                }),
+        )
     }
 
     /// 保存スロットをグリッド上の対象に適用する。対象はページ単位のみ

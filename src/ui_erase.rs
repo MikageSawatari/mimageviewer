@@ -305,7 +305,7 @@ impl App {
     /// 消しゴムモードに入る。DB にマスクがあればロードする。
     ///
     /// 見開きモード中に呼ばれた場合は spread_mode を一時的に Single へ落とし、
-    /// `fullscreen_idx` を見開きペアの左ページに固定する (消しゴムは単一ページ前提のため)。
+    /// `fullscreen_idx` を見開きの読む順の最初のページに固定する (消しゴムは単一ページ前提のため)。
     /// 終了時に `reset_erase_mode` が元の spread_mode を復元する。ペアの右ページへは
     /// パネルの「右ページ」ボタンで `switch_erase_target_in_spread` 経由で切り替える。
     /// 透明部を含む画像を「黒の不透明背景に合成」して全面不透明にする。
@@ -321,7 +321,7 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
-        // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
+        // 見開きから入った場合は読む順の最初のページへピボット。Single 起動 / 片側のみのページ
         // (表紙・末尾奇数・横長画像) ではピボットは要らない。
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
         if !self.raw_edit_target_entry_allowed(target_idx) {

@@ -29492,7 +29492,7 @@ impl App {
                                     if self.spread_mode.is_spread() && self.analysis_mode {
                                         self.reset_analysis_mode();
                                     }
-                                    self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+                                    self.adjust_spread_target = None;
                                     if !spread_changed_from_direction {
                                         self.normalize_spread_position(ctx);
                                     }
@@ -33027,7 +33027,7 @@ impl App {
                 if !self.set_live_spread_shift(anchor_idx) {
                     return;
                 }
-                self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+                self.adjust_spread_target = None;
                 action.page_nav = FsPageNav::Target(new_idx);
             }
         } else {
@@ -36390,7 +36390,7 @@ impl App {
 
         // E: 消しゴムモード切り替え (分析・補正中は無効)。
         // 見開き中の起動は `enter_erase_mode` が一時的に Single に切り替えて
-        // 左ページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
+        // 読む順の最初のページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
         if key_e
             && !self.analysis_mode
             && !self.adjustment_mode.is_open()
@@ -44914,7 +44914,7 @@ impl App {
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
         self.panorama_projection_popup_open = false;
-        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         if !self.reading_flow.is_paged() {
             self.reset_continuous_reading_transform();
             self.disable_non_paged_fullscreen_modes(fs_idx);
@@ -45210,7 +45210,7 @@ impl App {
         self.reading_direction = direction;
         self.spread_popup_open = false;
         self.panorama_projection_popup_open = false;
-        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         if !self.reading_flow.is_paged() {
             self.reset_continuous_reading_transform();
             self.disable_non_paged_fullscreen_modes(fs_idx);
@@ -45277,7 +45277,7 @@ impl App {
         if self.extracted_result_surface().is_none() {
             self.settings.update_active_favorite_spread_mode(new_mode);
         }
-        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         true
     }
 
