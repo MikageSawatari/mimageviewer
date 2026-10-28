@@ -1627,7 +1627,7 @@ video_viewer_entry_rejected が 0 件でも、その手前のどの route が実
 > settings_kv から読み、表示トリムは本別の保存値 (`follow_global / none / auto / manual`) と
 > この全体設定を本体と同じ resolver で解決する。既知の穴: 開いておいた環境設定の OK と Remote 取得が
 > 同じ frame に重なると、確定が取得の後になる経路がある (2026-10-28 の §1.216 設計レビューで指摘、
-> 全体設定に共通。バックログで別に扱う)。
+> 全体設定に共通。[バックログ §1.630](next-release-backlog.md))。
 >
 > この分担は [briefs/codex-remote-session-epoch-addendum.md](briefs/codex-remote-session-epoch-addendum.md)
 > 「セッションを版の正本にする / 切断されたら明示的に再接続するまで止まる」で確定した。

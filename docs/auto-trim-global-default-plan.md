@@ -139,7 +139,7 @@ Remote container の `remote_view_trim_plan_timed`、Remote の get / set handle
    全体設定すべてに共通する問題で、本機能だけ別経路にすると前例と食い違う。起こるのは、開いておいた
    Preferences の OK と Remote 端末の接続がたまたま同じ frame になったときだけで、結果も「その session で
    取得済みのページが旧トリムのまま見える」(データは失われない、次の session で直る) に留まる。
-   別項目としてバックログへ起票する。
+   別項目としてバックログへ起票する (§1.630)。
 2. **[P2] メタ情報転送は `state_json` を型として読み書きしている** (`PortableContainerState.view_trim`、
    export で deserialize・import で serialize)。§0.2 の「そのまま写す」はメタ情報転送には当たらない。
    → DB・portable 形式の両方が**同じ codec** (旧形式と version 2 を読み、version 2 を書く) を通す。
