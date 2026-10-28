@@ -843,20 +843,6 @@ terminal に host HWND を破棄するため、次の ON では約 300ms の hid
 
 「次の版の後に回す」「見送り」「現状維持」と決めた項目を、2026-10-21 に本体のバックログから移した。
 
-### 1.401 ページめくり D3-3: 編集済み・注釈付きの頁でも final を先回り準備する — D3 の残り (2026-10-19)
-
-- 状態: **次の版の後に回す (利用者 2026-10-19)**。D3-1 / D3-2 / D3-4(a)(b) / D3-5 は master に取り込み済み (`656af0431`)。
-  設計の正本は [page-turn 計画 §27.17](page-turn-animation-plan.md) (D3-3 行、§27.17.6 の編集入力・comic、改訂 1 の P2-5)。
-- 現状: 先回り準備は、CPU 入力が揃っている頁 (補正・AI 完了済み・カラー化・LUT・sharpen・post) と、既に exact な edit pixels がある頁だけが対象。
-  未実体化の編集 (erase / local / conceal の materialization、mask の DB 読み・black flatten) と comic (注釈) の頁は、従来どおり表示時に同期で作るので、
-  その頁のめくり始めは止まり得る。
-- 対応: 既存 materialization owner に CPU-only 消費の入口を設け、comic の metadata / font / stamp 準備と CPU 完成・登録を分離し、共通 permit・CPU 予約・
-  登録枠・VRAM admission へ接続する (§27.17.6・§27.17.9 の D3-3 行)。cold 注釈・未読込 font・Pair 両頁同時完成を試験する。
-- 戻る方向の先回りは §1.405 として次の版に入れた (master `6cdeef1e4`、記録は計画 §27.17.20〜§27.17.23)。
-  残り: 開いた直後 (Next の CPU 準備が始まるのは開いて約 1.3 秒後) に準備の時間なく戻ると、前 unit は従来どおり同期で作る (04 見開きで 157〜340ms)。
-  F12 の連動別ウィンドウは test-script から前面にできず、`scripts/page-turn/back-f12-*.rhai` と `back-two-context-reversal.rhai` は駆動できない (計画 §27.17.22)。
-- 規模 / 優先度: Medium (2〜4 日) / P3。
-
 ### 1.398 操作のない間に、ZIP/PDF からフォルダの代表サムネイルを作成する — 5ch >>581 (2026-10-18)
 
 - 状態: **次の版の後に回す (利用者 2026-10-18)**。設計案作成・独立レビュー前・未実装。規模は実装 1,000〜1,800 行・6〜10 日の見積り。[idle 作成計画](folder-representative-idle-archive-plan.md) に対象範囲・取消・否定結果の記憶・移行・段階実装案を記載。既定 ON/OFF と探索予算は受入前に決める。
