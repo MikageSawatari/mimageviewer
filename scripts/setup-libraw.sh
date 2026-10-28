@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION=0.22.2
+VERSION=0.22.3
 VENDOR=vendor/libraw
 
 if [[ "${1:-}" == check ]]; then
@@ -23,9 +23,9 @@ import urllib.request
 
 root = pathlib.Path('vendor/libraw')
 archives = (
-    ('LibRaw-0.22.2.tar.gz',
-     'https://github.com/LibRaw/LibRaw/archive/refs/tags/0.22.2.tar.gz',
-     '627928088300ecde6ca91ffd202e189203f04ad61ad12f0fe9dc57b9a7a0fb3c', root),
+    ('LibRaw-0.22.3.tar.gz',
+     'https://github.com/LibRaw/LibRaw/archive/refs/tags/0.22.3.tar.gz',
+     '7edf96c5b70cff88980a02ab0fc8af125cb6a4a377985573c654439d9d02355c', root),
     ('zlib-1.3.1.tar.gz',
      'https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz',
      '17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c',
@@ -51,5 +51,5 @@ for name, url, expected, dest in archives:
             member.name = str(relative)
             source.extract(member, dest)
     print(f'Verified and extracted {name}', flush=True)
-(root / 'VERSION').write_text('0.22.2\n', encoding='ascii')
+(root / 'VERSION').write_text('0.22.3\n', encoding='ascii')
 PY
