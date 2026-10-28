@@ -1,19 +1,33 @@
+//! Cardinality aggregation.
+//!
+//!   * [`str_collector`] holds the `ColumnType::Str` segment collector, which accumulates term
+//!     ordinals and resolves them to HLL coupons at finalization.
+//!   * [`numeric_collector`] holds the segment collector for every other column type, which feeds
+//!     the HLL sketch directly during collection.
+//!
+//! Both segment collectors converge on the same
+//! [`IntermediateMetricResult::Cardinality`] payload, so results coming from a
+//! str column and from a numeric column (e.g. a JSON path that resolves to
+//! both) merge through the single [`CardinalityCollector::merge_fruits`]
+//! implementation here.
+
+mod numeric_collector;
+mod str_collector;
+mod term_ord_accumulator;
+
 use std::hash::Hash;
 
-use columnar::column_values::CompactSpaceU64Accessor;
-use columnar::{Column, ColumnType, Dictionary, StrColumn};
-use common::f64_to_u64;
-use datasketches::hll::{HllSketch, HllType, HllUnion};
-use rustc_hash::FxHashSet;
+use columnar::ColumnType;
+use common::BitSet;
+use datasketches::hll::{Coupon, HllSketch, HllType, HllUnion};
+pub(crate) use numeric_collector::SegmentNumericCardinalityCollector;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+pub(crate) use str_collector::SegmentStrCardinalityCollector;
+pub(crate) use term_ord_accumulator::{TermOrdSet, BITSET_MAX_TERM_ORD};
 
-use crate::aggregation::agg_data::AggregationsSegmentCtx;
-use crate::aggregation::intermediate_agg_result::{
-    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
-};
 use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
+use crate::aggregation::value_source::ValueSource;
 use crate::aggregation::*;
-use crate::TantivyError;
 
 /// Log2 of the number of registers for the HLL sketch.
 /// 2^11 = 2048 registers, giving ~2.3% relative error and ~1KB per sketch (Hll4).
@@ -82,21 +96,17 @@ pub struct CardinalityAggregationReq {
     pub missing: Option<Key>,
 }
 
-/// Contains all information required by the SegmentCardinalityCollector to perform the
+/// Contains all information required by the segment cardinality collectors to perform the
 /// cardinality aggregation on a segment.
-pub struct CardinalityAggReqData {
+pub(crate) struct CardinalityAggReqData {
     /// The column accessor to access the fast field values.
-    pub accessor: Column<u64>,
-    /// The column_type of the field.
-    pub column_type: ColumnType,
-    /// The string dictionary column if the field is of type string.
-    pub str_dict_column: Option<StrColumn>,
+    pub(crate) accessor: Box<dyn ValueSource>,
     /// The missing value normalized to the internal u64 representation of the field type.
-    pub missing_value_for_accessor: Option<u64>,
+    pub(crate) missing_value_for_accessor: Option<u64>,
     /// The name of the aggregation.
-    pub name: String,
+    pub(crate) name: String,
     /// The aggregation request.
-    pub req: CardinalityAggregationReq,
+    pub(crate) req: CardinalityAggregationReq,
 }
 
 impl CardinalityAggReqData {
@@ -117,194 +127,6 @@ impl CardinalityAggregationReq {
     /// Returns the field name the aggregation is computed on.
     pub fn field_name(&self) -> &str {
         &self.field
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SegmentCardinalityCollector {
-    buckets: Vec<SegmentCardinalityCollectorBucket>,
-    accessor_idx: usize,
-    /// The column accessor to access the fast field values.
-    accessor: Column<u64>,
-    /// The column_type of the field.
-    column_type: ColumnType,
-    /// The missing value normalized to the internal u64 representation of the field type.
-    missing_value_for_accessor: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Default)]
-pub(crate) struct SegmentCardinalityCollectorBucket {
-    cardinality: CardinalityCollector,
-    entries: FxHashSet<u64>,
-}
-impl SegmentCardinalityCollectorBucket {
-    pub fn new(column_type: ColumnType) -> Self {
-        Self {
-            cardinality: CardinalityCollector::new(column_type as u8),
-            entries: FxHashSet::default(),
-        }
-    }
-    fn into_intermediate_metric_result(
-        mut self,
-        req_data: &CardinalityAggReqData,
-    ) -> crate::Result<IntermediateMetricResult> {
-        if req_data.column_type == ColumnType::Str {
-            let fallback_dict = Dictionary::empty();
-            let dict = req_data
-                .str_dict_column
-                .as_ref()
-                .map(|el| el.dictionary())
-                .unwrap_or_else(|| &fallback_dict);
-            let mut has_missing = false;
-
-            // TODO: replace FxHashSet with something that allows iterating in order
-            // (e.g. sparse bitvec)
-            let mut term_ids = Vec::new();
-            for term_ord in self.entries.into_iter() {
-                if term_ord == u64::MAX {
-                    has_missing = true;
-                } else {
-                    // we can reasonably exclude values above u32::MAX
-                    term_ids.push(term_ord as u32);
-                }
-            }
-
-            term_ids.sort_unstable();
-            dict.sorted_ords_to_term_cb(term_ids.iter().map(|term| *term as u64), |term| {
-                self.cardinality.insert(term);
-                Ok(())
-            })?;
-            if has_missing {
-                // Replace missing with the actual value provided
-                let missing_key =
-                    req_data.req.missing.as_ref().expect(
-                        "Found sentinel value u64::MAX for term_ord but `missing` is not set",
-                    );
-                match missing_key {
-                    Key::Str(missing) => {
-                        self.cardinality.insert(missing.as_str());
-                    }
-                    Key::F64(val) => {
-                        let val = f64_to_u64(*val);
-                        self.cardinality.insert(val);
-                    }
-                    Key::U64(val) => {
-                        self.cardinality.insert(*val);
-                    }
-                    Key::I64(val) => {
-                        self.cardinality.insert(*val);
-                    }
-                }
-            }
-        }
-
-        Ok(IntermediateMetricResult::Cardinality(self.cardinality))
-    }
-}
-
-impl SegmentCardinalityCollector {
-    pub fn from_req(
-        column_type: ColumnType,
-        accessor_idx: usize,
-        accessor: Column<u64>,
-        missing_value_for_accessor: Option<u64>,
-    ) -> Self {
-        Self {
-            buckets: vec![SegmentCardinalityCollectorBucket::new(column_type); 1],
-            column_type,
-            accessor_idx,
-            accessor,
-            missing_value_for_accessor,
-        }
-    }
-
-    fn fetch_block_with_field(
-        &mut self,
-        docs: &[crate::DocId],
-        agg_data: &mut AggregationsSegmentCtx,
-    ) {
-        agg_data.column_block_accessor.fetch_block_with_missing(
-            docs,
-            &self.accessor,
-            self.missing_value_for_accessor,
-        );
-    }
-}
-
-impl SegmentAggregationCollector for SegmentCardinalityCollector {
-    fn add_intermediate_aggregation_result(
-        &mut self,
-        agg_data: &AggregationsSegmentCtx,
-        results: &mut IntermediateAggregationResults,
-        parent_bucket_id: BucketId,
-    ) -> crate::Result<()> {
-        self.prepare_max_bucket(parent_bucket_id, agg_data)?;
-        let req_data = &agg_data.get_cardinality_req_data(self.accessor_idx);
-        let name = req_data.name.to_string();
-        // take the bucket in buckets and replace it with a new empty one
-        let bucket = std::mem::take(&mut self.buckets[parent_bucket_id as usize]);
-
-        let intermediate_result = bucket.into_intermediate_metric_result(req_data)?;
-        results.push(
-            name,
-            IntermediateAggregationResult::Metric(intermediate_result),
-        )?;
-
-        Ok(())
-    }
-
-    fn collect(
-        &mut self,
-        parent_bucket_id: BucketId,
-        docs: &[crate::DocId],
-        agg_data: &mut AggregationsSegmentCtx,
-    ) -> crate::Result<()> {
-        self.fetch_block_with_field(docs, agg_data);
-        let bucket = &mut self.buckets[parent_bucket_id as usize];
-
-        let col_block_accessor = &agg_data.column_block_accessor;
-        if self.column_type == ColumnType::Str {
-            for term_ord in col_block_accessor.iter_vals() {
-                bucket.entries.insert(term_ord);
-            }
-        } else if self.column_type == ColumnType::IpAddr {
-            let compact_space_accessor = self
-                .accessor
-                .values
-                .clone()
-                .downcast_arc::<CompactSpaceU64Accessor>()
-                .map_err(|_| {
-                    TantivyError::AggregationError(
-                        crate::aggregation::AggregationError::InternalError(
-                            "Type mismatch: Could not downcast to CompactSpaceU64Accessor"
-                                .to_string(),
-                        ),
-                    )
-                })?;
-            for val in col_block_accessor.iter_vals() {
-                let val: u128 = compact_space_accessor.compact_to_u128(val as u32);
-                bucket.cardinality.insert(val);
-            }
-        } else {
-            for val in col_block_accessor.iter_vals() {
-                bucket.cardinality.insert(val);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn prepare_max_bucket(
-        &mut self,
-        max_bucket: BucketId,
-        _agg_data: &AggregationsSegmentCtx,
-    ) -> crate::Result<()> {
-        if max_bucket as usize >= self.buckets.len() {
-            self.buckets.resize_with(max_bucket as usize + 1, || {
-                SegmentCardinalityCollectorBucket::new(self.column_type)
-            });
-        }
-        Ok(())
     }
 }
 
@@ -350,7 +172,8 @@ impl<'de> Deserialize<'de> for CardinalityCollector {
 impl CardinalityCollector {
     fn new(salt: u8) -> Self {
         Self {
-            sketch: HllSketch::new(LG_K, HllType::Hll4),
+            sketch: HllSketch::new(LG_K, HllType::Hll8)
+                .expect("LG_K is within the supported range"),
             salt,
         }
     }
@@ -358,8 +181,12 @@ impl CardinalityCollector {
     /// Insert a value into the HLL sketch, salted by the column type.
     /// The salt ensures that identical u64 values from different column types
     /// (e.g. bool `false` vs i64 `0`) are counted as distinct.
-    pub(crate) fn insert<T: Hash>(&mut self, value: T) {
+    fn insert(&mut self, value: impl Hash) {
         self.sketch.update((self.salt, value));
+    }
+
+    fn insert_coupon(&mut self, coupon: Coupon) {
+        self.sketch.update_with_coupon(coupon);
     }
 
     /// Compute the final cardinality estimate.
@@ -374,25 +201,73 @@ impl CardinalityCollector {
     }
 
     pub(crate) fn merge_fruits(&mut self, right: CardinalityCollector) -> crate::Result<()> {
-        let mut union = HllUnion::new(LG_K);
+        let mut union = HllUnion::new(LG_K).expect("LG_K is within the supported range");
         union.update(&self.sketch);
         union.update(&right.sketch);
-        self.sketch = union.get_result(HllType::Hll4);
+        self.sketch = union.to_sketch(HllType::Hll8);
         Ok(())
     }
 }
 
+/// Builds the segment collector for a cardinality aggregation.
+///
+/// str and non-str columns use two entirely different collectors: str
+/// accumulates term ordinals and resolves them into HLL coupons at
+/// finalization, non-str feeds the HLL sketch directly. Both produce the same
+/// [`IntermediateMetricResult::Cardinality`], so they merge uniformly.
+pub(crate) fn build_segment_cardinality_collector(
+    req_data: CardinalityAggReqData,
+) -> crate::Result<Box<dyn SegmentAggregationCollector>> {
+    if req_data.accessor.column_type() != ColumnType::Str {
+        return Ok(Box::new(SegmentNumericCardinalityCollector::from_req(
+            req_data,
+        )?));
+    }
+    // For str columns, we need to collect the set of term ordinals encounterred.
+    //
+    //
+    // In the case of physical columns, the dictionary is known so we have an upperbound
+    // of the term ord that will be encounterred.
+    //
+    // We choose a different representation depending on the number of maximum
+    // number of terms.
+    //   * small (< BITSET_MAX_TERM_ORD): `BitSet`, pre-allocated.
+    //   * large: `TermOrdSet` (sparse HashSet that promotes to a paged bitset).
+    Ok(
+        if let Some(column) = req_data.accessor.as_physical_column() {
+            let max_term_ord_inclusive = column.max_value();
+            if max_term_ord_inclusive < BITSET_MAX_TERM_ORD {
+                Box::new(SegmentStrCardinalityCollector::<BitSet>::from_req(
+                    req_data,
+                    max_term_ord_inclusive,
+                ))
+            } else {
+                Box::new(SegmentStrCardinalityCollector::<TermOrdSet>::from_req(
+                    req_data,
+                    max_term_ord_inclusive,
+                ))
+            }
+        } else {
+            // For the moment, for non physical str column, we rely on the regular
+            // term ord set.
+            // TODO fix me! Although we do not have control over this, these values are likely
+            // created using a inc counter, with their unicity given by a hashmap already.
+            // We probably do not need another HashSet.
+            Box::new(SegmentStrCardinalityCollector::<TermOrdSet>::from_req(
+                req_data,
+                u64::MAX,
+            ))
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
-
-    use std::net::IpAddr;
-    use std::str::FromStr;
-
     use columnar::MonotonicallyMappableToU64;
 
     use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::tests::{exec_request, get_test_index_from_terms};
-    use crate::schema::{IntoIpv6Addr, Schema, FAST};
+    use crate::schema::{Schema, FAST, STRING};
     use crate::Index;
 
     #[test]
@@ -450,63 +325,35 @@ mod tests {
     }
 
     #[test]
-    fn cardinality_aggregation_u64() -> crate::Result<()> {
+    fn cardinality_aggregation_bytes_excluded_from_accessors() -> crate::Result<()> {
+        // `Bytes` columns are opened as raw per-segment dictionary ordinals (like `Str`), but
+        // unlike `Str`, cardinality has no dictionary-resolution path for them: it would hash
+        // the raw ordinal directly, which are segment dependant. Ignore bytes values instead of
+        // counting them wrong.
         let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_u64_field("id", FAST);
+        let field = schema_builder.add_bytes_field("raw", FAST);
         let index = Index::create_in_ram(schema_builder.build());
         {
             let mut writer = index.writer_for_tests()?;
-            writer.add_document(doc!(id_field => 1u64))?;
-            writer.add_document(doc!(id_field => 2u64))?;
-            writer.add_document(doc!(id_field => 3u64))?;
-            writer.add_document(doc!())?;
+            writer.add_document(doc!(field => vec![1u8]))?;
+            writer.add_document(doc!(field => vec![2u8]))?;
+            writer.commit()?;
+            writer.add_document(doc!(field => vec![3u8]))?;
+            writer.add_document(doc!(field => vec![4u8]))?;
             writer.commit()?;
         }
 
         let agg_req: Aggregations = serde_json::from_value(json!({
             "cardinality": {
                 "cardinality": {
-                    "field": "id",
-                    "missing": 0u64
+                    "field": "raw"
                 },
             }
         }))
         .unwrap();
 
         let res = exec_request(agg_req, &index)?;
-        assert_eq!(res["cardinality"]["value"], 4.0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn cardinality_aggregation_ip_addr() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let field = schema_builder.add_ip_addr_field("ip_field", FAST);
-        let index = Index::create_in_ram(schema_builder.build());
-        {
-            let mut writer = index.writer_for_tests()?;
-            // IpV6 loopback
-            writer.add_document(doc!(field=>IpAddr::from_str("::1").unwrap().into_ipv6_addr()))?;
-            writer.add_document(doc!(field=>IpAddr::from_str("::1").unwrap().into_ipv6_addr()))?;
-            // IpV4
-            writer.add_document(
-                doc!(field=>IpAddr::from_str("127.0.0.1").unwrap().into_ipv6_addr()),
-            )?;
-            writer.commit()?;
-        }
-
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "cardinality": {
-                "cardinality": {
-                    "field": "ip_field"
-                },
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        assert_eq!(res["cardinality"]["value"], 2.0);
+        assert_eq!(res["cardinality"]["value"], 0.0);
 
         Ok(())
     }
@@ -535,6 +382,42 @@ mod tests {
         .unwrap();
 
         let res = exec_request(agg_req, &index)?;
+        assert_eq!(res["cardinality"]["value"], 4.0);
+
+        Ok(())
+    }
+
+    /// A JSON path that resolves to both a Str column and a numeric column
+    /// produces two collector instances per segment — one with `Str` buckets
+    /// and one with `Numeric` buckets. Their `IntermediateMetricResult`s must
+    /// merge into the union cardinality.
+    #[test]
+    fn cardinality_aggregation_json_str_and_numeric() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_json_field("json", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(field => json!({"value": "hello"})))?;
+            writer.add_document(doc!(field => json!({"value": "world"})))?;
+            writer.add_document(doc!(field => json!({"value": "hello"})))?; // dup str
+            writer.add_document(doc!(field => json!({"value": i64::from_u64(7u64)})))?;
+            writer.add_document(doc!(field => json!({"value": i64::from_u64(42u64)})))?;
+            writer.add_document(doc!(field => json!({"value": i64::from_u64(7u64)})))?; // dup num
+            writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "cardinality": {
+                "cardinality": {
+                    "field": "json.value"
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        // 4 distinct values: "hello", "world", 7, 42.
         assert_eq!(res["cardinality"]["value"], 4.0);
 
         Ok(())
@@ -575,6 +458,30 @@ mod tests {
         assert_eq!(estimate, 3.0);
     }
 
+    /// Verifies that merging two small sketches (both in List/Set coupon mode)
+    /// produces an exact result — i.e. the HllUnion does not unnecessarily
+    /// promote to the full HLL array when the combined cardinality is small.
+    #[test]
+    fn cardinality_collector_merge_stays_exact_for_small_sets() {
+        use super::CardinalityCollector;
+
+        let mut left = CardinalityCollector::default();
+        for i in 0u64..50 {
+            left.insert(i);
+        }
+
+        let mut right = CardinalityCollector::default();
+        for i in 30u64..100 {
+            right.insert(i);
+        }
+
+        left.merge_fruits(right).unwrap();
+        let estimate = left.finalize().unwrap();
+        // 100 distinct values (0..100). Both sketches are in Set mode (< 192 coupons),
+        // so the union should stay in coupon mode and give an exact count.
+        assert_eq!(estimate, 100.0);
+    }
+
     #[test]
     fn cardinality_collector_serialize_deserialize_binary() {
         use datasketches::hll::HllSketch;
@@ -589,6 +496,98 @@ mod tests {
         let bytes = collector.to_sketch_bytes();
         let deserialized = HllSketch::deserialize(&bytes).unwrap();
         assert!((deserialized.estimate() - 3.0).abs() < 0.01);
+    }
+
+    /// Tests that the `missing` parameter correctly counts a single empty document
+    /// for both u64 and str columns.
+    #[test]
+    fn cardinality_aggregation_missing_value_single_empty_doc() {
+        let mut schema_builder = Schema::builder();
+        let id_field = schema_builder.add_u64_field("id", FAST);
+        let name_field = schema_builder.add_text_field("name", STRING | FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests().unwrap();
+        writer
+            .add_document(doc!(id_field=>1u64,name_field=>"some_name"))
+            .unwrap();
+        writer.add_document(doc!()).unwrap();
+        writer.commit().unwrap();
+
+        {
+            // int colum with missing value non redundant
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "cardinality": {
+                    "cardinality": {
+                        "field": "id",
+                        "missing": 42u64
+                    },
+                }
+            }))
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(res["cardinality"]["value"], 2.0);
+        }
+
+        {
+            // int colum with missing value redundant
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "cardinality": {
+                    "cardinality": {
+                        "field": "id",
+                        "missing": 1u64
+                    },
+                }
+            }))
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(res["cardinality"]["value"], 1.0);
+        }
+
+        {
+            // str colum with missing value non redundant
+            // With more than one segment, this is not well handled.
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "cardinality": {
+                    "cardinality": {
+                        "field": "name",
+                        "missing": "other_name"
+                    },
+                }
+            }))
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(res["cardinality"]["value"], 2.0);
+        }
+
+        {
+            // str colum with missing value redundant
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "cardinality": {
+                    "cardinality": {
+                        "field": "name",
+                        "missing": "some_name"
+                    },
+                }
+            }))
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(res["cardinality"]["value"], 1.0);
+        }
+
+        {
+            // str column with missing value with a number type.
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "cardinality": {
+                    "cardinality": {
+                        "field": "name",
+                        "missing": 3,
+                    },
+                }
+            }))
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(res["cardinality"]["value"], 2.0);
+        }
     }
 
     #[test]

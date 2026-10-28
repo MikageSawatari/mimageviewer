@@ -28,15 +28,8 @@ struct ScorerWrapper<T> {
 }
 
 #[cfg(test)]
-pub(super) fn seek_danger_test_wrapper(scorer: Box<dyn Scorer>) -> impl Scorer {
+pub(super) fn seek_danger_test_wrapper(scorer: Box<dyn Scorer>) -> impl DocSet {
     ScorerWrapper::new(scorer)
-}
-
-#[cfg(test)]
-impl<T: Scorer> Scorer for ScorerWrapper<T> {
-    fn score(&mut self) -> Score {
-        self.scorer.score()
-    }
 }
 
 impl<T: Scorer> ScorerWrapper<T> {

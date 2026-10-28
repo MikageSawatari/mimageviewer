@@ -438,7 +438,7 @@ opener = "0.8"
 rfd = "0.15"
 # 全文検索エンジン。Ctrl+G グローバルメタ検索の bigram インデックスに使用予定。
 # v1 プロトタイプ計測中 (docs/archive/search-metadata/search-expansion-design.md §15.1.1)。問題なければ本採用。
-tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression"] }
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # お気に入りのファイルシステム監視。Windows は ReadDirectoryChangesW ベース。
 # crossbeam-channel を有効にして、重い std::mpsc を避ける。
@@ -483,7 +483,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 [dev-dependencies]
 libc = "0.2"
 winit = "0.30.13"
-tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
 tempfile = "3"
 eframe = { version = "0.37.0", features = ["miv-test-script-window-witness"] }
 # `examples/bench_pdf_count.rs` (PDFium vs lopdf 比較ベンチマーク) でのみ使用。

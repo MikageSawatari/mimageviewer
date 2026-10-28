@@ -1,6 +1,6 @@
 # 依存物の更新 — 2026-10-28
 
-backlog §1.460 の段A（Rust・通常crate・PDFium・LibRaw）と段B（ort / ONNX Runtime）の記録。
+backlog §1.460 の段A（Rust・通常crate・PDFium・LibRaw）、段B（ort / ONNX Runtime）、段C（tantivy）の記録。
 版、入力資産の同一性、非対話検証を扱い、公開・配布の完了記録ではない。
 設計・検収は ClaudeCode、実装・テストは Codex が担当する。
 
@@ -13,9 +13,10 @@ backlog §1.460 の段A（Rust・通常crate・PDFium・LibRaw）と段B（ort /
 | PDFium | `chromium/8100`（backlogの更新前記録） | `chromium/8125`, `158.0.8125.0` |
 | LibRaw | 0.22.2 | 0.22.3。zlib 1.3.1、turbojpeg-sys 1.2.0 は維持 |
 | FFmpeg | `n7.1.5-16-g9a4bb2c579` | 据え置き |
+| Tantivy | 0.26.2 + mIV patch | 0.27.0 + 全mIV patch + 追加AND経路改変。追加改変のA/Bは基準未達、扱いは検収待ち |
 
 段Aの結果は以下、段Bは[末尾の記録](#dependency-stage-b)を参照。
-段C（tantivy）、段D（EffeTune Mixwright / VST3 SDK）はこれから行う。
+段C（tantivy）は[追加AND改変まで実装・検証したが、A/Bの性能基準は未達](#stage-c-and-route)。段D（EffeTune Mixwright / VST3 SDK）はこれから行う。
 
 初回に阻害されたLibRawのアクセス権とbench基準の欠落は、ClaudeCodeが修復・配置した。
 LibRaw全225ファイルを照合済み。独立レビューでzip 2.6.1の追加退行2件が確認され、
@@ -536,3 +537,439 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 第三者ライセンス表示・追跡noticeにはort / ONNX Runtimeの旧版番号は無く、
 `src/ui_dialogs/about.rs` のONNX Runtime / MIT表示は変更不要だった。
+
+<a id="dependency-stage-c"></a>
+
+## 段C — tantivy 0.27.0とmIV改変
+
+作業基点は `deps-update-1460` / `5acf4c310`、開始時はclean。コミット・push・製品起動なし。
+ほかの作業ツリーは変更せず、生成crateだけを指定されたworkspace外scratchpadへ作った。
+ビルド・テストは `MSBUILDDISABLENODEREUSE=1` / `CARGO_NET_OFFLINE=true`、Cargo CLIも原則 `--offline`。
+script内部にもoffline環境を継承した。以下は初回候補の記録で、性能・全体gateへのClaudeCodeの判断と
+AND経路の追加改変・再検証は[追補](#stage-c-and-route)を参照。
+
+### 入力・依存版・マージ
+
+ClaudeCode取得済みの `scratchpad/dl-tantivy/` のcrateを再照合した。registryのソースと原本は改変していない。
+
+| 入力 | SHA-256 |
+| --- | --- |
+| tantivy 0.26.2 | `861facfabd71044968f364837f9a083b56464ba5a59079f88706ee5c451ca069` |
+| tantivy 0.27.0 | `ad1ebacf6bc124b741ffbfb088f9835cb55e1e2ff57e182e9219e3efa1377b97` |
+
+0.27.0のpackaged VCS commitは `67889269cae67063c372bc236b102d632a021568`。
+base=0.26.2原本 / ours=旧vendor / theirs=0.27.0原本として改行を正規化し3者マージした。
+上流追加39ファイルを配置、上流削除7ファイルを削除。非追跡の単体Cargo.lockを除く原本405ファイル中398ファイルが
+最終照合でもbyte一致し、相違はmanifestのfeatureとローカル改変6ソースだけだった。
+ローカル専用 `.cargo-ok` / `MIV-PATCH.md` / `atomic_write_diagnostics.rs` も維持した。
+
+rootの通常/dev依存2か所を0.27へ変更し、`cargo update -p tantivy --offline` はexit 0。
+
+| crate | 旧 → 新 |
+| --- | --- |
+| tantivy-columnar / sstable / stacker | 0.7.0 → 0.27.0 |
+| tantivy-common / bitpacker / query-grammar | 0.11.0 / 0.10.0 / 0.26.0 → 0.27.0 |
+| tantivy-tokenizer-api | 0.7.0据置 |
+| datasketches / lru / lz4_flex / murmurhash32 | 0.2.0 / 0.16.4 / 0.13.1 / 0.3.1 → 0.5.0 / 0.18.5 / 0.14.0 / 0.4.0 |
+| 追加 | base64 0.23.1（既存0.22.1も残る）、serde-tuple-vec-map 1.0.1、unwrap-infallible 1.0.0 |
+
+root lockのSHA-256は `a8e9298560d97ce90779f6aaa5717691db9bc887cc3f06d2a70a9844d135925e`。
+単体vendor test専用のfrostem/dev依存はroot graphへ持ち込んでいない。
+以下のログは全て `target/dependency-update-20261028/stage-c/` を基点とする。
+原本差分・中間物・一覧は `merge-inventory.json` / `port-audit-final.json` に保存した。
+
+| 変更対象 | 理由・判断 |
+| --- | --- |
+| root Cargo.toml / Cargo.lock | 通常/devの2指定と依存graphを0.27へ更新。既存featureを維持 |
+| vendor Cargo.toml / Cargo.toml.orig / .cargo_vcs_info.json | 0.27.0原本へ置換。normalized manifestだけに既存miv-test-hooksを保持 |
+| directory/mmap_directory/mod.rs / directory/mod.rs | persistだけの4回制限・段別診断・hookを保持。上流のtry_exists・非atomic writerのflush整理も反映。競合なし |
+| indexer/index_writer.rs | rollbackの所有引数をIndexWriter::new(self.index.clone(), ...)とし、observer継承を保持（手動競合解消） |
+| indexer/segment_updater.rs | try_schedule_task / diagnostic scope / executed-task hookと上流debug!を両立（手動競合解消）。plugin-aware merge/GCも維持 |
+| indexer/segment_manager.rs | source集合拒否のprivate typed outcomeを保持。競合なし |
+| query/intersection.rs | 右辺だけのscore_out_of_lineを保持。ローカルtest ctorのnum_docsをsegment_num_docsへ追従 |
+| query/boolean_query/boolean_weight.rs（追補） | ClaudeCode指定で純Term ANDのpruningだけ旧Intersection経路へ戻し、密な2語/4語の採点・順位回帰を追加 |
+| その他のvendor source / examples / notices等 | 全て0.27.0原本へ置換・追加・削除。新block_wand_intersectionにも追加のmIV改変なし |
+| tests/fts_tantivy_compat.rs / tests/fixtures/fts_tantivy_0262/** | 実0.26.2生成索引と通常open/update/merge/reopenの固定回帰 |
+| .gitattributes | index/**を-textとし、JSONを含むfixture原本のcheckout時変換を防ぐ |
+| vendor/tantivy/MIV-PATCH.md | 基準0.27.0と移植・検証を追記。0.26.xの履歴を保持 |
+| docs/search-architecture.md / docs/README.md / 本文書 | 現行候補版・検収状態、更新索引、入力/差分/検証を記録 |
+
+別contextのGPT-6.1 Sol / xhighが旧新原本からの差分を照合した。
+persist・diagnostic・observer・source-set拒否のローカル追加/削除行は旧版と一致し、intersectionの差はtest ctor名追従のみ。
+rollback継承、plugin merge失敗の通知、lock解放後のcallback、typed拒否と公開Future互換性に指摘なし。
+新しい回復処理、guard、fallback、retry拡大、warning掃除は行っていない。
+
+### §1.424 — 採点経路とdumpbin
+
+新BooleanWeightは純粋な複数TermScorerかつReadFreqのANDをTermIntersectionとし、top-levelの
+for_each_pruningで新block_wand_intersectionを使う。bench_searchの純Term ANDはこの経路になる。
+mIVのbigram AND→source OR→token AND→Basic filterという通常の入れ子では、子weightのscorer() /
+into_box_scorerが従来Intersectionを作るため、既存barrierは今も必要である。
+一方、各tokenがunique bigramを1つ持ち、sourceが1つ、追加Basic filterなし等で子が単一TermScorerまで
+展開される場合は、mIVも新経路へ到達する。benchだけで旧製品経路の確認を代替できない。
+
+新経路はleaderのBM25を候補bufferへ先に計算し、別passでsecondaryをseek/採点する。
+旧版の左右BM25を同一式で評価する構造はない。既存barrierは削除せず、新barrierも追加していない。
+以下の実生成コードでこの判断を確認した。
+
+symbol coreはRust 1.99.1 / release / 通常製品feature、CARGO_INCREMENTAL=0 /
+CARGO_PROFILE_RELEASE_STRIP=false / CARGO_PROFILE_RELEASE_DEBUG=line-tables-only。
+`cargo build --release -p mimageviewer --bin mimageviewer-core --target-dir target/core-sym --locked --offline`
+はexit 0、12分07秒。`dumpbin /disasm:nobytes target/core-sym/release/mimageviewer-core.exe` はexit 0、27.94秒。
+core SHA-256は `4df2aa47adc5858150e0a324c869061eaedb3fe582a04da5b733eaba58635517`。
+
+| 製品関数 | instruction数 | unpcklps / addps / divps | scalar mulss / addss / divss |
+| --- | ---: | --- | --- |
+| score_out_of_line（Box） | 4 | 全0 | 0 / 0 / 0（vtableへ渡す） |
+| score_out_of_line（TermScorer） | 33 | 全0 | 1 / 1 / 1 |
+| block_wand_intersection | 1156 | 全0 | 6 / 19 / 6 |
+| Intersection::score（Box） | 39 | 全0 | 0 / 3 / 0 |
+| Intersection::score（TermScorer） | 72 | 全0 | 1 / 4 / 1 |
+
+上流の追加でimpl$3はimpl$5となった。同じScorer実装を型・symbolで同定した。
+旧helperへのcall、新blockへのBooleanWeightのcallも残る。
+証跡はdumpbin-scoring.json / scoring-function-{1..5}.txt、full dumpはcore-disasm.txt（約1.16GB）。
+独立レビューでも集計・scalar計算・callを確認し、追加barrier不要に同意した。
+ただし呼出し先が全てscalarという主張ではない。直接callee BlockSegmentPostings::block_max_scoreは
+addps 4 / divps 2を含むが、8文書の全laneをmovdqu・変換・broadcastで初期化する意図的SIMDであり、
+既知のstale upper lanesとは異なる。性能全体の保証とは分けて扱う。
+
+性能回帰を確認した後にbench自身も追加dumpした。5対象関数は全て上記3命令が0、
+新blockは1213命令（製品とは展開が異なる）、scalar数は6 / 19 / 6だった。
+bench-dumpbin-scoring.json / bench-scoring-function-{1..5}.txtを参照。
+この確認も性能回帰の根因を確定するものではない。
+
+### 0.26生成索引の互換性
+
+同梱CHANGELOGと旧新原本・local registryを比較し、形式の不互換は見つからなかった。
+下位crateに独立CHANGELOGがない範囲はソースで比較した。
+
+| 形式 | 根拠 |
+| --- | --- |
+| 本体 | INDEX_FORMAT_VERSION=7 / oldest=4、directory/footer.rsの許容範囲を維持 |
+| columnar | format_version.rsはbyte同一。writer V2 / reader V1,V2。reader製品コードも変更なし。変更はmapping/batch read/linear overflow修正等 |
+| sstable | writer v3、reader v2/v3を維持。旧dictionary→新indexへ移動、ordinal修正等 |
+| docstore | store/footer.rs / writer.rs / schema/document/de.rsは同一、V2を維持。LZ4のu32 LE size + block形式も維持 |
+| postings | term_info.rs同一。serializerは参照型・flush等の変更で形式変更は見当たらず。readerはblock探索最適化等 |
+| common / stacker等 | common serialize/vintに差分なし、stacker変更はarena境界等。tokenizer-apiは据置、query-grammarは入力解析変更 |
+| schema/meta | text_options.rsは旧bool / with_tokenizerのJSONを保持。新custom extension列は旧metaで空へdefault |
+
+上流v6/v7 fixtureは旧新で全SHA-256一致し、format testsも成功した。ただし上流v7は0.23.0生成なので、
+ClaudeCodeの承認に従い、実0.26.2で小さなmIV schema fixtureを追加した。
+指定scratchpad配下のmiv-fts-0262-generatorに独立crateを作り、registry =0.26.2 /
+default無効 + mmap,lz4-compressionを使用した。lockのsource/checksumとstore footerの0.26.2 / format7を確認済み。
+root patchを使わず、workspaceにも追加していない。
+全15フィールド・順序・属性・mimv_bigram（NgramTokenizer(2,2,false)+LowerCaser）がmIVと一致する。
+
+固定indexは3文書・1segment・10ファイル・8,279 bytes。隣のREADME.md / generator.rs / SHA256SUMSに
+manifest、再生成手順・コード・由来・hashを残した。testは必ずtemp directoryへコピーし、通常FtsIndex::open_atで開く。
+現行新規schemaとの一致、旧日本語bigram検索・全stored原文・数値、upsert/delete/add→commit/reload、
+旧新segment双方の存在を確認した明示merge、再open後の正確なpath集合・件数・内容を検査し成功した。
+原本はtest後も全10ファイルのSHA-256一致。Git filter後のblob hashもrawと同じ（fixture-audit.json）。
+独立レビューのCRLF変換防止指摘に対しindex/**を-textにし、属性unsetを確認した。ほかに重要な指摘なし。
+このfixtureはmIV schemaの回帰であり、未使用FAST等を含む全Tantivy schemaの網羅保証ではない。
+
+### 自動検証
+
+| コマンド・対象 | 件数・結果 / ログ |
+| --- | --- |
+| cargo check -p mimageviewer --bin mimageviewer-core --locked --offline | 前回checkpointでexit 0、1分08秒。同じ製品コード・root lockの証拠を再利用。以後の追加はtest/docs。check.log |
+| cargo test -p mimageviewer --test fts_tantivy_compat --test fts_tantivy_integrity --locked --offline | 新互換1成功（0.17秒）+ integrity14成功（2.39秒）、exit 0、compile 3分07秒。fts-integration-resume.log |
+| vendor nextest --manifest-path vendor/tantivy/Cargo.toml --lib --features miv-test-hooks --locked --offline -E 'test(/query::intersection::tests\|block_wand_intersection::tests\|compat_tests::test_format\|directory::mmap_directory::tests\|indexer::segment_manager::tests/)' | 31成功 / 1322 skipped、4.876秒。採点bits/順序/負ゼロ、block property、mmap、format6/7。tantivy-tests-resume.log |
+| vendor nextest 同条件 -E 'test(/indexer::index_writer::tests\|indexer::segment_updater::tests/)' | 59成功 / 1294 skipped、8.527秒。tantivy-indexer-tests.log |
+| cargo nextest run -p mimageviewer --lib --locked --offline -E 'test(/search\|fts\|tantivy/)' | 588成功 / 14030 skipped、17.042秒、compile 7分18秒。search-lib.log |
+| cargo tree -p mimageviewer -e features,normal,build -i tantivy --locked --offline | exit 0、mmap/lz4のみでmiv-test-hooksを含まない。tantivy-normal-features.log |
+| .\scripts\test-lib-full.ps1 | exit 0、14553成功 / 65 skipped / 失敗0、512.168秒。lib-full.log |
+| .\scripts\test-full.ps1 -SuppressCrashDialogs | exit 100、workspace 15934成功 / 7失敗 / 69 skipped。下記詳細。test-full.log |
+| 最終cargo fmt（引数なし）、cargo fmt --check、git diff --check | 全てexit 0。fmt.log / fmt-check.log / diff-check.log |
+
+lib全件の3件SLOWは音楽144.453秒、RAW223.058秒、大規模scan305.215秒で、既存600秒枠内で成功。
+§1.447のページめくり間欠失敗はこの実行で観測していない。
+JUnitはtarget/test-lib-full/runs/20261028T084453964Z-e26f91d9/、
+source IDは64a7f570a41bb90531df45259defca6735724141f453656081794bbc7341b789。
+実行中の文書追記でInputs changedとなり再利用台帳は保存されなかった。製品/test/fixture/lockは変更していない。
+exit 0と全件成功JUnitは有効で、文書編集だけを理由に同じlib全件を再実行していない。
+全体gateはworkspace/pack-build-toolsとvendorの別graphを確認するため追加した。
+
+### bench回帰（失敗、baseline未変更）
+
+Rust 1.99.1 / release / dev-tools / symbol条件でbench_searchをビルド（exit 0、15分46秒）し、
+自分のビルド・テスト終了後に同じbinaryで --docs 50000 --json <runN.json> を3回実行した。
+binary SHA-256はa4629d520d84f8322a30f06836a7b8b0256d9f716b0b26989a91444a28cad5a1。
+
+| generic_jp（カメラ、2-bigram AND） | total ms | post ms |
+| --- | ---: | ---: |
+| baseline | 25.0732 | 5.6843 |
+| run1 | 38.5156 | 4.3448 |
+| run2 | 38.2961 | 4.5563 |
+| run3 | 38.5754 | 4.6907 |
+
+python scripts/check_bench_regression.py vendor/bench_baseline.json <run1.json> <run2.json> <run3.json> はexit 1。
+最良値でも+52.7% / +13.2229 msで、+30%かつ+1msを超える。3回の幅は0.2793msで、今回はノイズ扱いにしない。
+他9queryは判定閾値内（rare_jp_andは+35.3% / +0.0545msのNOISE）。
+--saveは使わず、baseline SHA-256は前後とも2b2d0b88e3ff5edb56c1d8640853e0d35e8634d99e71f8bb8f7ff70f5ce23b0a。
+JSON / log / command / hashはbench-run{1..3}.json / bench-comparison.log / bench-result.json。
+
+total-postは約33.7〜34.2ms対baseline19.3889msで、post遅延では説明できない。
+新block経路の候補score/buffer、secondary別pass、block_max/suffix/threshold処理がdenseな2termで
+余分な作業になることは原因候補だが、実行頻度やprofileを測っておらず根因は未確定。
+独立レビューも性能gate失敗を保持し採否判断へ返す結論に同意した。
+hits=10000はHARD_MAX打切り件数であり、結果集合/順位の同一証明ではない。
+benchは単一field純Term ANDで、通常mIV入れ子queryの速度差を直接示すものでもない。
+製品にも到達し得る新経路なのでgate失敗は有効である。回避patch/guard/fallbackは追加していない。
+
+### 中断・準備失敗と今回のbuild
+
+前回、rootの-p tantivy単体testは非workspace packageのdev依存制約でexit 101、
+manifest指定nextestはmetadata解決の未cache frostemでexit 102、いずれも実行0件だった。
+その時点の「足りなければ止めて報告」に従い、実装者が開始済みの統合testとsymbol core sessionへ
+Ctrl-Cを送り中断した。runner exit 1はtimeout/製品test失敗ではなく、中断を成功へ読み替えていない。
+今回ClaudeCodeがcache補充後、cargo generate-lockfile --manifest-path vendor/tantivy/Cargo.toml --offlineは成功し、
+互換範囲のfrostem 1.20260821.7/dev依存を選んだ。単体test後のvendor Cargo.lockは削除済み。
+証跡はvendor-test-resolved.lockへ保存し、commit対象に含めない。
+
+通常release wrapperは-PreserveRuntime -SkipVst3Bridge --locked --offlineで稼働中processを検出し、
+cargo開始前にexit 1。process停止やAPPDATAのcache操作は行っていない。
+target/releaseに成果物がまだないことを確認し、同repositoryの新規出力へcore→remote→EPUB→launcherを
+直接cargoで作った。初回jobs=4はturbojpeg-sysのCMake/MSBuild段でexit 101（MSBuild exit 1、詳細compiler errorなし）。
+段Aの通過実績を基にjobs=1で再実行し、全4段成功した。timeoutではなく、製品不具合とは分類しない。
+
+| release直接build（--locked --offline、incremental=0、jobs=1） | 結果 |
+| --- | --- |
+| core | exit 0、43分09秒 |
+| remote --features embedded-web-assets | exit 0、3分34秒 |
+| EPUB worker | exit 0、1分59秒 |
+| launcher | exit 0、約46秒 |
+
+release-j1-result.json / release-j1-stage-*.logを参照。通常feature、portable無効、未署名の検証用成果物。
+公式VC runtime 4本を出力先へ配置し、製品4 exeのPE gateはruntime=4 / pe=4成功。
+初回PE確認は実装者の指定がtarget/release全体と広すぎ、build-scriptも走査して失敗した。
+製品4 exeに訂正した再実行はexit 0（release-pe-selected.log / release-pe.json）。
+アプリは起動していない。
+
+| 検証用release成果物 | bytes | SHA-256 |
+| --- | ---: | --- |
+| mimageviewer.exe | 506586112 | 8d913f989e36cdbcdaa3a1900a0677c9ba74e5d114e4c722286df3e274009e1d |
+| mimageviewer-core.exe | 342678016 | 21d7a1ba69eb93e268fa2b688226496052cf9d79040f73923b2d1000144cc4dc |
+| mimageviewer-remote.exe | 13839872 | 26d2ec4860b9a8c2ead8a8f049c289f60c0d2e4bfdd7fc20a39240729d126e5e |
+| mimageviewer-epub-pdf.exe | 5023232 | d57f1ddd81a98cacd9c558f4c36043eb46a7943b6de86d79fe6831a39e450602 |
+
+詳細はrelease-artifacts.json。実機確認は未実施。性能回帰を判断した後、必要なら利用者がrepository rootで実行する。
+通常の %APPDATA%\mimageviewer を使い実際の設定・データを更新し得る。single-instance mutexも共有するため、
+インストール版・常駐tray版を先に終了する。エージェントはこのbinaryを起動していない。
+
+```powershell
+Start-Process -FilePath .\target\release\mimageviewer.exe
+```
+
+確認するのは、既存索引を開き、2語AND・source/favorite filterと通常の索引更新が従来どおり動くこと。
+既存索引の削除・再構築や通常設定のresetを検証準備として要求しない。
+
+### 全体gateの失敗と限定再確認
+
+全体gateはexit 100。workspace / pack-build-toolsの56 binariesで15934成功 / 7失敗 / 69 skipped
+（15941実行、668.814秒）。compileは22分49秒、script全体2059.40秒。
+第1段で停止したため、後続workspace doctestとstandalone egui系vendor 5 graphは未実施
+（vendor Tantivyの90件とは別）。全体gateを成功扱いにしない。test-full.log / test-full-result.jsonが元の結果。
+
+| 失敗 | 観測と限定再確認 |
+| --- | --- |
+| video::audio::tests::headless_seek_readiness_keeps_audio_tx_draining_without_a_device | 5秒期限後にaudio queueが5件残り、0件のassertに失敗。同じworkspace featureの2件限定runでは成功。既存lib全件でも成功したが、同名の既知backlogは見つからず原因未確定 |
+| video::clockless_transcode::tests::finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch | producer待ち5秒Timeout。同名の負荷時timeoutはbacklog §1.389に既記録。上と同じ限定runで成功。§1.447のページめくり失敗ではない |
+| test_ai_upscale: test_upscale_all_models / test_upscale_full_size / test_runtime_and_model_loading | onnxruntime.dll extractがos error 5。既存integration testにdata_dir overrideがなく、非cfg(test) libraryのdefault APPDATAへ展開する経路をソースで確認 |
+| test_tile_blend: test_screentone_patterns / test_screentone_tile_blend | 同じORT DLL抽出のアクセス拒否 |
+
+音声2件は同じworkspace / pack-build-tools / --locked --offline条件で完全名filter、retries=0を指定し、
+2成功 / 16008 skipped、1.246秒（timing-failures-isolated.log）。
+実時間5秒に依存する検査と全件時のみの失敗は確認できるが、両方を一括して既知不安定と断定しない。
+閾値延長・ignore・再試行設定・製品変更は加えていない。
+
+AI5件は通常profileのまま再実行せず、子processのAPPDATAだけをrepository target内の新規使い捨てdirectoryへ向け、
+同じworkspace featureで失敗5件だけをtest-threads=1 / retries=0で再確認した。
+5成功 / 2 skipped（ほか54 binaries除外）、17.765秒。
+commandと隔離先はai-failures-isolated-result.json、出力はai-failures-isolated.log。
+通常設定のコピー・reset・rename・ACL変更は行っていない。
+この隔離再確認は元の全体gate失敗を取り消さない。integration testの通常profile依存をTantivy移植とは
+別のtest setup課題として残し、実profileへの再試行で通さない。
+この全体実行でも§1.447のページめくり失敗は出ていない。
+
+### 初回候補の最終照合とClaudeCodeへの判断事項
+
+最終cargo fmt（引数なし）/ cargo fmt --check / git diff --checkは全てexit 0。
+ログはfmt.log / fmt-check.log / diff-check.log。workspace fmt前後で全RustソースのSHA-256は不変。
+単体generatorだけはworkspace外のため別途rustfmtをかけ、保存ソースとscratchpadを同期した。
+fixture全10ファイル、root lock、bench baselineのhashは最終照合でも不変。vendor Cargo.lockは存在しない。
+最終文書QAでPowerShell→Pythonのstdin文字コードによる日本語破損を検出し、UTF-8経路で修復した。
+製品/test/fixtureへの影響はなく、文書の日本語・placeholder・差分も再確認した。
+
+ClaudeCodeに判断を返すのは、generic_jpの性能回帰を伴う0.27.0候補を採用するか。
+採用保留・別の性能調査chunk・遅延を受容したbaseline更新の判断は設計/検収側で行う。
+実装者はbaselineを更新せず、性能回避の症状patchも追加していない。コミットはClaudeCodeへ委ねる。
+加えて、全体gateの安全な隔離条件と時間依存2件の検収・別課題扱いを検収側へ返す。
+限定再確認の成功を元の全体gate成功へ読み替えない。
+
+<a id="stage-c-and-route"></a>
+
+### 追補 — 純Term ANDのpruning経路を0.26相当へ戻す
+
+ClaudeCodeは0.27.0を採用し、`boolean_weight.rs` の `for_each_pruning` にある
+`SpecializedScorer::TermIntersection` の腕だけを従来経路へ戻すと決定した。
+0.26.2原本はこのspecializationを持たず、通常のboxed scorerを `for_each_pruning_scorer` に渡す。
+0.27では `into_box_scorer(TermIntersection(...), &self.score_combiner_fn, num_docs)` で
+同じIntersectionを作り、その採点ループへ渡す。union、scorer構築、閾値更新や厳密な `>` 比較は変えない。
+既存 `score_out_of_line` を維持し、`block_wand_intersection.rs` と上流テストは原本のまま残した。
+製品経路から呼ばれなくなった関数・再exportのwarningは掃除せず残している。
+
+理由は初回のgeneric_jpだけの遅延と経路変更の一致。ただし同時間帯に他worktreeの5本のbuildが
+動いていたとの情報があり、負荷を切り分けるため保存した改変前binaryと改変後binaryを交互に測る。
+撤去条件は「上流の経路がmIVの密なbigram ANDで0.26と同等以下の速さになったら」。
+改変箇所の短いMIVコメントと `MIV-PATCH.md` にも理由・初回測定値・撤去条件を記した。
+
+追加testは513文書、2語/4語ANDでposting block境界を越え、通常scorerとの全doc ID・score bitsの一致と、
+TopDocsのlimit 1/10/全件におけるscore・同点順序まで検査する。
+初回は0.27 TopDocs APIの `.order_by_score()` を追加testが呼び忘れcompile失敗した。
+修正後は1件成功（0.036秒）。製品コードの失敗や間欠失敗ではない。
+別contextのGPT-6.1 Sol / xhighによる独立レビューでは追加改変に重要な指摘なし。
+
+test-fullは今回再実行せず、AI5件はsandboxの通常APPDATA展開拒否による環境要因、時間依存2件は段D後にClaudeCodeがsandbox外の最終test-fullで再確認する（ClaudeCode判断）。
+
+以下の追補ログは `target/dependency-update-20261028/stage-c-and/` を基点とする。
+
+| 追補の自動検証（全てlocked/offline、node reuse無効） | 件数・結果 |
+| --- | --- |
+| vendor nextest --manifest-path vendor/tantivy/Cargo.toml --lib --features miv-test-hooks -E 'test(/query::boolean_query::\|query::intersection::tests\|compat_tests::test_format\|directory::mmap_directory::tests\|indexer::segment_manager::tests\|indexer::index_writer::tests\|indexer::segment_updater::tests/)' | 122成功 / 1232 skipped、12.220秒。新回帰、上流block property、既存改変を含む。vendor-tests.log |
+| cargo test -p mimageviewer --test fts_tantivy_integrity --test fts_tantivy_compat | 互換1成功（0.45秒）+ integrity14成功（8.50秒）、compile 6分18秒。fts-integration.log |
+| cargo nextest run -p mimageviewer --lib -E 'test(/search\|fts\|tantivy/)' | 588成功 / 14030 skipped、26.470秒、compileを含む704.75秒。search-lib.log |
+| cargo tree -p mimageviewer -e features,normal,build -i tantivy | mmap/lz4のみ、miv-test-hooksなし。tantivy-normal-features.log |
+
+上記にテスト失敗・中断はなく、§1.447の間欠失敗も出ていない。
+単体テスト用vendor Cargo.lockは削除済み。完全なcommand・exit code・wall timeはverification-results.json。
+
+追加改変後の製品coreは、通常featureで次を実行し成功した（45分52秒、build-core.log）。
+`MSBUILDDISABLENODEREUSE=1` / `CARGO_NET_OFFLINE=true` / `CARGO_BUILD_JOBS=1` /
+`CARGO_INCREMENTAL=0` / `CARGO_PROFILE_RELEASE_STRIP=false` /
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` を指定した。
+
+```powershell
+cargo build --release -p mimageviewer --bin mimageviewer-core --target-dir target/core-sym --locked --offline
+```
+
+core SHA-256は `dc5ccb2ec046359e35c59d160eb6da9af55a6f27a4790a7f34a3e24d76ee2649`。
+コンパイラ引数もopt-level=3 / lto=thin / codegen-units=16 / line-tables-onlyを確認した。
+ビルドは長時間CPU処理を続けて完了し、timeout・中断・再起動はしていない。
+PE gateも製品coreだけを指定してruntime=4 / pe=1、exit 0（core-pe.log / core-pe.json）。
+
+`dumpbin /disasm:nobytes` はexit 0だが、MSVCのPDB readerは今回のPDBをInvalid file formatとして拒否し、
+関数名なしの命令列になった。作業directoryをPDBの隣へ変えても同じで、製品の失敗ではない。
+LLVMのllvm-pdbutilではPDBを読め、PEのRSDSとGUID/ageが一致した（GUID
+63EE3BC6-E7FB-B49C-4C4C-44205044422E、age 1）。Tantivyの16 moduleからS_GPROC32のsection/offset/code sizeを取得し、
+PE section RVAへ変換して、同じcoreのdumpbin出力から各関数の全命令を抽出した。
+MSVC readerが拒否する具体的な理由までは特定していない。PDB SHA-256は
+`fefa9b5bbba4cc8b4d18802fd5e48a0e5f16fe42ac53312dbb01c1c03f8b0fe2`。
+
+| 前回の5関数との照合 | 命令数 | unpcklps / addps / divps | mulss / addss / divss |
+| --- | ---: | --- | --- |
+| score_out_of_line（Box） | 4 | 0 / 0 / 0 | 0 / 0 / 0 |
+| score_out_of_line（TermScorer） | 33 | 0 / 0 / 0 | 1 / 1 / 1 |
+| Intersection::score（Box, Box） | 39 | 0 / 0 / 0 | 0 / 3 / 0 |
+| Intersection::score（TermScorer, Box） | 72 | 0 / 0 / 0 | 1 / 4 / 1 |
+| block_wand_intersection | 製品から除去 | 対象コードなし | 対象コードなし |
+
+pruningのTermIntersection分岐は0x144CE0938でinto_box_scorer（0x144CD8220）を呼び、
+その腕は0x144CD8292でintersect_scorers（0x144C06BE0）を呼ぶ。
+返すvtable 0x1534E2408 / 0x1534E2540のscore slot +0x98は、それぞれ上表の2種のIntersection::scoreを指す。
+pruningループもこの+0x98をcallし、閾値を比較・更新する。新block関数へのcallはない。
+両scoreからhelperへのcallも残る。ICFによりhelperのアドレスはexclude::score（Box）/
+TermScorer::scoreと共有されるため、別名だけを見てbarrier消失と誤認せず、PDBの同一addressを照合した。
+証跡はdumpbin-scoring.json、functions-{1..4}.txt、routes-{1..5}.txt、core-disasm.txt、
+core-pdb-summary.txt、core-pdb-tantivy-*.txt、resolve-pdb.py / check-callgraph.py。
+独立レビューでもPE/PDBのhash・GUID/age、16 moduleの2572 proc recordと各範囲、元dumpbinからの
+9抽出ファイルの全命令、4 direct callのE8 rel32、両vtableのQWORDを別途照合し、重要な不備なし。
+この確認は指定採点経路の証拠であり、全calleeがscalarであることや実行性能の証明ではない。
+
+前節のtarget/release成果物は追加改変前。今回の改変を含む通常製品coreは
+`target/core-sym/release/mimageviewer-core.exe` であり、エージェントは起動していない。
+
+#### 交互A/B 6回（採否基準未達）
+
+改変前benchは元のSHA-256 `a4629d520d84f8322a30f06836a7b8b0256d9f716b0b26989a91444a28cad5a1` を確認し、
+`target/dependency-update-20261028/bench_search_unpatched.exe` へコピーして保存した。
+改変後はcoreと同じrelease/symbol環境で次を実行し、exit 0、17分30秒（build-bench.log）。
+
+```powershell
+cargo build --release -p mimageviewer --features dev-tools --bin bench_search --target-dir target/core-sym --locked --offline
+```
+
+改変後bench SHA-256は `46c2ebae6eff91d6a1c624a93aa01ecd61a3dde89f29defd059e4cd1510c80b3`。
+同じdirectoryへbench_search_patched.exeとして保存もした。
+管理下のbuild/test/dump/review処理を終えてから、2026-10-28 20:55:25〜20:55:48 JSTに
+改変前→後→前→後→前→後を実行した。全回同じcwd・`--docs 50000 --json <run.json>`。
+ホスト全体の無負荷は測定しておらず、外部負荷なしとは扱わない。
+bench本体は全6回exit 0、各回をcheck_bench_regression.pyで個別比較した結果は全てexit 1。
+
+generic_jpのbaselineはtotal 25.0732 ms / post 5.6843 ms。
+
+| 順 | binary | generic_jp total ms | post ms | baseline比 | 比較exit / 回帰query数 |
+| --- | --- | ---: | ---: | ---: | --- |
+| 1 | 改変前 | 46.9803 | 5.7155 | +87.4% | 1 / 4 |
+| 2 | 改変後 | 54.1618 | 6.1193 | +116.0% | 1 / 5 |
+| 3 | 改変前 | 60.3189 | 6.8732 | +140.6% | 1 / 6 |
+| 4 | 改変後 | 54.7336 | 6.2259 | +118.3% | 1 / 4 |
+| 5 | 改変前 | 55.1229 | 6.5629 | +119.8% | 1 / 5 |
+| 6 | 改変後 | 58.2245 | 6.7648 | +132.2% | 1 / 5 |
+
+各群3回のquery別最良値による比較も前exit 1 / 後exit 1。
+
+| query | baseline ms | 前best ms | 後best ms | 後の判定 |
+| --- | ---: | ---: | ---: | --- |
+| en_ai_phrase | 1.3500 | 1.7715 | 2.2528 | NOISE |
+| en_common | 16.8501 | 26.0123 | 28.2095 | REGRESSION |
+| generic_jp | 25.0732 | 46.9803 | 54.1618 | REGRESSION |
+| medium_jp | 7.2017 | 10.6922 | 11.2843 | REGRESSION |
+| medium_jp_3 | 0.7442 | 1.3624 | 1.1450 | NOISE |
+| medium_jp_and | 1.6528 | 2.9555 | 2.3803 | NOISE |
+| rare_jp | 1.0340 | 1.0231 | 1.3516 | NOISE |
+| rare_jp_and | 0.1543 | 0.2800 | 0.3362 | NOISE |
+| super_generic | 0.0062 | 0.0086 | 0.0078 | OK |
+| unique_id | 1.1204 | 1.7855 | 1.5392 | NOISE |
+
+改変後generic_jpのbestでも+116.0% / +29.0886 msで、閾値内への回復はない。
+best同士では後が前より+15.3%だが、ペア差は+15.3% / -9.3% / +5.6%と符号が混在する。
+前の幅は13.3386 ms、後は4.0627 ms、中央値は前55.1229 / 後54.7336 ms。
+このばらつきと他queryの両群での遅延を含む計測から、改善・悪化の因果や新block経路の寄与率は確定しない。
+経路変更だけを元の遅れの原因として切り分けられたとも扱わない。
+前の回帰4件→後3件というquery別bestの合成結果だけで全体改善とは言わない。
+hits=10000も打切り件数であり、検索結果同一性の証明には使わない（正しさは上記の回帰テストで検査）。
+
+独立レビューでも実binary/baselineのhash、6 JSONの順・値・exit、best比較を照合し、
+「機能・生成コードは通過、性能は未達、追加改変は採否保留の候補として保持」という扱いに同意した。
+6回以外の追加計測や性能patch、baselineの--saveは行っていない。
+baseline SHA-256は前後とも `2b2d0b88e3ff5edb56c1d8640853e0d35e8634d99e71f8bb8f7ff70f5ce23b0a`。
+ログはab-{1..6}-{unpatched,patched}.json / .log / -comparison.log、
+ab-{unpatched,patched}-combined.log、ab-results.json / ab-summary.json / run-ab.py。
+
+#### 追補の照合と引継ぎ
+
+原本405ファイルとの最終照合は397一致、相違はmanifestと既存6ソースにboolean_weight.rsを加えた7ソース。
+新block本体・moduleは原本とbyte一致し、source-audit.json / port-audit.jsonに記録した。
+0.26.2固定索引・root lock・baselineは追加改変で変更していない。
+
+ClaudeCodeへ返す判断点は、性能基準未達だった追加AND経路改変の扱いと、負荷を管理した再計測などの次の条件。
+0.27.0採用方針自体を再度問い合わせず、指定の追加改変を未採用候補として残す。
+実装者の判断で別のguard/fallback/最適化を足したり、今回の候補をcommitしたりしない。
+段D後のsandbox外test-fullはClaudeCode担当のまま。
+
+必要な実機確認に使うなら、通常版・常駐tray版を先に終了し、repository rootで次を実行する。
+通常の %APPDATA%\mimageviewer を使い、実際の設定・データを更新し得る。エージェントは起動しない。
+確認対象は既存索引の2語AND、source/favorite絞込み、通常の索引更新。
+性能基準未達の候補であり、実機操作の成功を性能gateの代用にはしない。
+
+```powershell
+Start-Process -FilePath .\target\core-sym\release\mimageviewer-core.exe
+```
+
+最終のcargo fmt（引数なし）/ cargo fmt --check / git diff --checkは全てexit 0。
+照合したRust 1106ファイルはfmt前後で不変。fixture全10ファイルのSHA-256とGit filter後のblob、
+root lock・baseline・保存した改変前benchのhashも一致し、vendor Cargo.lockは存在しない。
+追補のUTF-8も確認した（final-audit.json、fmt.log / fmt-check.log / diff-check.log）。
+ブランチはdeps-update-1460、HEADは5acf4c310のまま。コミット・push・製品起動は行っていない。
