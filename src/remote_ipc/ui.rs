@@ -2658,14 +2658,12 @@ impl crate::app::App {
             } = pending.request()
         {
             let result = (|| {
-                let state =
-                    serde_json::from_value::<crate::view_trim::ViewTrimBookState>(state.clone())
-                        .map_err(|_| {
-                            RemoteWriteError::new(
-                                RemoteWriteErrorCode::BadRequest,
-                                "表示トリム設定が正しくありません",
-                            )
-                        })?;
+                let state = super::normalize_remote_view_trim_state(state).map_err(|_| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::BadRequest,
+                        "表示トリム設定が正しくありません",
+                    )
+                })?;
                 let key = remote_spread_key(context_address)?;
                 if self.view_trim_db.is_none() {
                     return Err(RemoteWriteError::new(
@@ -3577,7 +3575,7 @@ impl crate::app::App {
     }
 
     fn remote_view_trim_state(
-        &self,
+        &mut self,
         context_address: &mimageviewer_ipc::RemoteAddress,
     ) -> RemoteWriteResponse {
         let key = match remote_spread_key(context_address) {
@@ -3590,35 +3588,29 @@ impl crate::app::App {
                 "view_trim.db を利用できません",
             );
         };
-        let mut state = db
-            .get_book_state(&key.exact)
-            .or_else(|| {
-                key.fallback
-                    .as_deref()
-                    .and_then(|fallback| db.get_book_state(fallback))
-            })
-            .unwrap_or_default();
-        let legacy_margin_fit = matches!(
-            self.settings.fullscreen_fit_mode,
-            crate::settings::FullscreenFitMode::MarginFit
-        ) || self.settings.margin_fit_enabled;
-        state.apply_mode = crate::view_trim::effective_view_trim_base_apply_mode(
-            state.apply_mode,
-            legacy_margin_fit,
-        );
-        state.book_settings = state.book_settings.clamped();
-        match serde_json::to_value(state) {
-            Ok(state) => RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(state)),
-            Err(error) => {
-                crate::logger::log(format!(
-                    "remote_ipc: view trim state serialization failed: {error}"
-                ));
-                write_error(
-                    RemoteWriteErrorCode::Internal,
-                    "表示トリム設定を返せませんでした",
-                )
-            }
+        let loaded = db.load_book_preference_with_fallback(&key.exact, key.fallback.as_deref());
+        let legacy_auto = loaded.allows_legacy_margin_fit_migration()
+            && (matches!(
+                self.settings.fullscreen_fit_mode,
+                crate::settings::FullscreenFitMode::MarginFit
+            ) || self.settings.margin_fit_enabled);
+        if matches!(
+            loaded,
+            crate::view_trim_db::ViewTrimBookLoad::Invalid(_)
+                | crate::view_trim_db::ViewTrimBookLoad::Error(_)
+        ) {
+            crate::logger::log(format!("remote_ipc: view trim read failed: {loaded:?}"));
+            self.show_feedback_toast(
+                "表示トリムの設定を読み込めないため、トリムなしで表示しています".into(),
+            );
         }
+        RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(
+            super::remote_view_trim_wire_state(
+                loaded.state_or_default(),
+                self.settings.auto_view_trim_default_enabled,
+                legacy_auto,
+            ),
+        ))
     }
 
     fn persist_remote_view_trim(
@@ -3644,13 +3636,8 @@ impl crate::app::App {
             );
         };
         let previous_separate = db
-            .get_book_state(&key.exact)
-            .or_else(|| {
-                key.fallback
-                    .as_deref()
-                    .and_then(|fallback| db.get_book_state(fallback))
-            })
-            .unwrap_or_default()
+            .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref())
+            .state_or_default()
             .book_settings
             .spread_separate;
         if previous_separate != state.book_settings.spread_separate {
@@ -3658,7 +3645,7 @@ impl crate::app::App {
             state.book_settings.spread_separate = previous_separate;
             state.book_settings = state.book_settings.with_spread_separate(separate);
         }
-        if let Err(error) = db.set_book_state(&key.exact, state) {
+        if let Err(error) = db.set_book_state(&key.exact, key.fallback.as_deref(), state) {
             crate::logger::log(format!("remote_ipc: view trim write failed: {error}"));
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -3686,18 +3673,13 @@ impl crate::app::App {
                 );
             }
         }
-        match serde_json::to_value(state) {
-            Ok(state) => RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(state)),
-            Err(error) => {
-                crate::logger::log(format!(
-                    "remote_ipc: persisted view trim state serialization failed: {error}"
-                ));
-                write_error(
-                    RemoteWriteErrorCode::Internal,
-                    "保存した表示トリム設定を返せませんでした",
-                )
-            }
-        }
+        RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(
+            super::remote_view_trim_wire_state(
+                state,
+                self.settings.auto_view_trim_default_enabled,
+                false,
+            ),
+        ))
     }
 
     fn persist_remote_sort_order(&mut self, value: &str) -> RemoteWriteResponse {
@@ -6217,8 +6199,11 @@ mod tests {
                     RemoteWriteRequest::SetViewTrim {
                         address: address.clone(),
                         context_address: address,
-                        state: serde_json::to_value(crate::view_trim::ViewTrimBookState::default())
-                            .unwrap(),
+                        state: crate::remote_ipc::remote_view_trim_wire_state(
+                            crate::view_trim::ViewTrimBookState::default(),
+                            false,
+                            false,
+                        ),
                     }
                 } else {
                     RemoteWriteRequest::SetViewMode {

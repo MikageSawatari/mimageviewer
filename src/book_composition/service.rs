@@ -847,20 +847,13 @@ fn run_worker(
             Command::ViewTrimBook(key, mut value, admission, write, reply) => {
                 let result: Result<crate::view_trim::ViewTrimBookState, String> = (|| {
                     admission.validate(&state)?;
-                    value.apply_mode =
-                        crate::view_trim::view_trim_base_apply_mode(value.apply_mode);
                     value.book_settings = value.book_settings.clamped();
                     let db =
                         crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
                             .map_err(|error| error.to_string())?;
                     let previous_separate = db
-                        .get_book_state(&key.exact)
-                        .or_else(|| {
-                            key.fallback
-                                .as_deref()
-                                .and_then(|fallback| db.get_book_state(fallback))
-                        })
-                        .unwrap_or_default()
+                        .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref())
+                        .state_or_default()
                         .book_settings
                         .spread_separate;
                     if previous_separate != value.book_settings.spread_separate {
@@ -868,7 +861,7 @@ fn run_worker(
                         value.book_settings.spread_separate = previous_separate;
                         value.book_settings = value.book_settings.with_spread_separate(separate);
                     }
-                    db.set_book_state(&key.exact, value)
+                    db.set_book_state(&key.exact, key.fallback.as_deref(), value)
                         .map_err(|error| error.to_string())?;
                     Ok(value)
                 })(

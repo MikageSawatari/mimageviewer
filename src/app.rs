@@ -16370,8 +16370,8 @@ pub struct App {
     /// 表示トリム (読みながら使う表示専用の余白カット) の調整パネル表示。
     /// 出力用の切り取りとは独立し、保存 / エクスポートのピクセルには影響しない。
     pub(crate) view_trim_mode: bool,
-    /// 表示トリムの本単位適用モード。Page は旧 DB 互換用で、新規 UI ではここへ永続しない。
-    pub(crate) view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    /// 本別の選択だけを保持し、表示モードは全体既定とページ行から解決する。
+    pub(crate) view_trim_book_preference: crate::view_trim::ViewTrimBookPreference,
     /// 廃止済みの一時 Page scope slot。detached viewer の凍結中は context bundle の形を
     /// 変えないため常に None の互換枠として残す。適用範囲は enabled なページ行から導出する。
     pub(crate) view_trim_page_apply_root_idx: Option<usize>,
@@ -20201,6 +20201,7 @@ impl App {
             crate::startup_result(miv_startup::Stage::AppDbOpen, "view_trim_db", || {
                 crate::view_trim_db::ViewTrimDb::open()
             })
+            .map_err(|error| crate::logger::log(format!("view_trim.db open failed: {error}")))
             .ok();
         crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
         let content_identity_fallback_io_sem =
@@ -20655,7 +20656,7 @@ impl App {
                 crate::ui_fullscreen::FullscreenNavigatorInteractionOwner::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
-            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
+            view_trim_book_preference: crate::view_trim::ViewTrimBookPreference::default(),
             view_trim_page_apply_root_idx: None,
             view_trim_page_spread_separate: false,
             view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
@@ -28303,22 +28304,18 @@ impl App {
         key: &std::path::Path,
         fallback: Option<&std::path::Path>,
     ) {
-        let state = self
-            .view_trim_db
-            .as_ref()
-            .and_then(|db| db.get_book_state(key))
-            .or_else(|| {
-                fallback.and_then(|fb| {
-                    self.view_trim_db
-                        .as_ref()
-                        .and_then(|db| db.get_book_state(fb))
-                })
-            })
-            .unwrap_or_default();
-        self.view_trim_apply_mode = match state.apply_mode {
-            crate::view_trim::ViewTrimApplyMode::Page => crate::view_trim::ViewTrimApplyMode::None,
-            mode => mode,
-        };
+        let loaded = self.view_trim_db.as_ref().map_or_else(
+            || {
+                crate::view_trim_db::ViewTrimBookLoad::Error(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some("view_trim.db を利用できません".to_string()),
+                ))
+            },
+            |db| db.load_book_preference_with_fallback(key, fallback),
+        );
+        self.notify_view_trim_load_failure(&loaded);
+        let state = loaded.state_or_default();
+        self.view_trim_book_preference = state.preference;
         self.view_trim_book_settings = state.book_settings;
         self.view_trim_page_apply_root_idx = None;
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
@@ -28327,33 +28324,57 @@ impl App {
             self.settings.fullscreen_fit_mode,
             crate::settings::FullscreenFitMode::MarginFit
         ) || self.settings.margin_fit_enabled;
-        if legacy_margin_fit {
+        if legacy_margin_fit
+            && !matches!(
+                loaded,
+                crate::view_trim_db::ViewTrimBookLoad::Invalid(_)
+                    | crate::view_trim_db::ViewTrimBookLoad::Error(_)
+            )
+        {
             self.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
             self.settings.margin_fit_enabled = false;
-            if matches!(
-                self.view_trim_apply_mode,
-                crate::view_trim::ViewTrimApplyMode::None
-            ) {
-                self.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
-            }
             self.settings.save();
-            if let Some(db) = &self.view_trim_db {
+            if loaded.allows_legacy_margin_fit_migration() {
+                self.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
                 let migrated = crate::view_trim::ViewTrimBookState {
-                    apply_mode: self.view_trim_apply_mode,
+                    preference: self.view_trim_book_preference,
                     book_settings: self.view_trim_book_settings,
                 };
                 if let Some(service) = &self.book_composition_service {
                     let _ = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
-                        book: Some((key.to_owned(), migrated)),
+                        book: Some((
+                            key.to_owned(),
+                            fallback.map(std::path::Path::to_owned),
+                            migrated,
+                        )),
                         pages: vec![],
                     });
-                } else if let Err(err) = db.set_book_state(key, migrated) {
-                    crate::logger::log(format!(
-                        "view_trim: failed to migrate legacy margin fit for book: {err}"
-                    ));
+                } else if let Some(db) = &self.view_trim_db {
+                    if let Err(err) = db.set_book_state(key, fallback, migrated) {
+                        crate::logger::log(format!(
+                            "view_trim: failed to migrate legacy margin fit for book: {err}"
+                        ));
+                    }
                 }
             }
         }
+    }
+
+    pub(crate) fn notify_view_trim_load_failure(
+        &mut self,
+        loaded: &crate::view_trim_db::ViewTrimBookLoad,
+    ) {
+        let error = match loaded {
+            crate::view_trim_db::ViewTrimBookLoad::Invalid(error) => error.to_string(),
+            crate::view_trim_db::ViewTrimBookLoad::Error(error) => error.to_string(),
+            _ => return,
+        };
+        crate::logger::log(format!(
+            "view_trim: failed to load book preference: {error}"
+        ));
+        self.show_feedback_toast(
+            "表示トリムの設定を読み込めないため、トリムなしで表示しています".to_string(),
+        );
     }
 
     pub(crate) fn persist_current_view_trim_book_state(&mut self) {
@@ -28363,21 +28384,19 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
-        let (Some(db), Some(key)) = (&self.view_trim_db, self.spread_container_key()) else {
+        let (Some(db), Some(key)) = (
+            &self.view_trim_db,
+            self.spread_container_key_with_fallback(),
+        ) else {
             return;
         };
         let state = crate::view_trim::ViewTrimBookState {
-            apply_mode: match self.view_trim_apply_mode {
-                crate::view_trim::ViewTrimApplyMode::Page => {
-                    crate::view_trim::ViewTrimApplyMode::None
-                }
-                mode => mode,
-            },
+            preference: self.view_trim_book_preference,
             book_settings: self.view_trim_book_settings,
         };
         if let Some(service) = &self.book_composition_service {
             let receipt = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
-                book: Some((key, state)),
+                book: Some((key.exact, key.fallback, state)),
                 pages: vec![],
             });
             if let Ok(Err(error)) = receipt.try_recv() {
@@ -28389,7 +28408,7 @@ impl App {
             }
             return;
         }
-        if let Err(err) = db.set_book_state(&key, state) {
+        if let Err(err) = db.set_book_state(&key.exact, key.fallback.as_deref(), state) {
             crate::logger::log(format!("view_trim: failed to save book state: {err}"));
         } else {
             self.record_current_container_content_identity(
@@ -48497,13 +48516,9 @@ impl App {
             self.singleton_spread_endpoint_preferences =
                 container.singleton_spread_endpoint_preferences;
             self.page_alone_preferences = container.page_alone_preferences;
-            let trim = container.view_trim.unwrap_or_default();
-            self.view_trim_apply_mode = match trim.apply_mode {
-                crate::view_trim::ViewTrimApplyMode::Page => {
-                    crate::view_trim::ViewTrimApplyMode::None
-                }
-                mode => mode,
-            };
+            self.notify_view_trim_load_failure(&container.view_trim);
+            let trim = container.view_trim.state_or_default();
+            self.view_trim_book_preference = trim.preference;
             self.view_trim_book_settings = trim.book_settings;
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;

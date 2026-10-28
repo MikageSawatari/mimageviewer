@@ -333,6 +333,9 @@ pub(crate) struct RemoteReadingSettings {
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
     pub(crate) follow_document_reading_direction: bool,
     pub(crate) final_cover_spread_enabled: bool,
+    pub(crate) auto_view_trim_default_enabled: bool,
+    pub(crate) margin_fit_enabled: bool,
+    pub(crate) fullscreen_fit_mode: crate::settings::FullscreenFitMode,
     pub(crate) singleton_spread_first_enabled: bool,
     pub(crate) singleton_spread_last_enabled: bool,
     pub(crate) page_after_cover_alone_enabled: bool,
@@ -350,6 +353,9 @@ impl RemoteReadingSettings {
             default_reading_direction: settings.default_reading_direction,
             follow_document_reading_direction: settings.follow_document_reading_direction,
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
+            auto_view_trim_default_enabled: settings.auto_view_trim_default_enabled,
+            margin_fit_enabled: settings.margin_fit_enabled,
+            fullscreen_fit_mode: settings.fullscreen_fit_mode,
             singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
             singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
             page_after_cover_alone_enabled: settings.page_after_cover_alone_enabled,
@@ -927,6 +933,19 @@ impl SettingsDb {
                 &inner.conn,
                 "final_cover_spread_enabled",
                 || fallback.final_cover_spread_enabled,
+            )?,
+            auto_view_trim_default_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "auto_view_trim_default_enabled",
+                || false,
+            )?,
+            margin_fit_enabled: read_settings_kv_typed(&inner.conn, "margin_fit_enabled", || {
+                fallback.margin_fit_enabled
+            })?,
+            fullscreen_fit_mode: read_settings_kv_typed(
+                &inner.conn,
+                "fullscreen_fit_mode",
+                || fallback.fullscreen_fit_mode,
             )?,
             singleton_spread_first_enabled: endpoints.first,
             singleton_spread_last_enabled: endpoints.last,
@@ -6289,6 +6308,53 @@ mod tests {
     }
 
     #[test]
+    fn auto_view_trim_default_kv_roundtrip_and_missing_key_are_off() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                auto_view_trim_default_enabled: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .auto_view_trim_default_enabled,
+                enabled
+            );
+            assert_eq!(
+                db.load_remote_reading_settings(&Settings::default())
+                    .unwrap()
+                    .auto_view_trim_default_enabled,
+                enabled
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'auto_view_trim_default_enabled'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .auto_view_trim_default_enabled
+        );
+        let fallback = Settings {
+            auto_view_trim_default_enabled: true,
+            ..Settings::default()
+        };
+        assert!(
+            !db.load_remote_reading_settings(&fallback)
+                .unwrap()
+                .auto_view_trim_default_enabled
+        );
+    }
+
+    #[test]
     fn remote_reading_settings_are_live_and_keep_missing_old_key_defaults() {
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut live = Settings::default();
@@ -6297,6 +6363,9 @@ mod tests {
         live.default_reading_flow = crate::settings::ReadingFlow::Horizontal;
         live.default_reading_direction = crate::settings::ReadingDirection::Rtl;
         live.final_cover_spread_enabled = false;
+        live.auto_view_trim_default_enabled = true;
+        live.margin_fit_enabled = true;
+        live.fullscreen_fit_mode = crate::settings::FullscreenFitMode::MarginFit;
         live.singleton_spread_first_enabled = true;
         live.singleton_spread_last_enabled = true;
         live.spread_page_gap_px = 19;

@@ -38,7 +38,7 @@ fn ready_for_mode(
     app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
     app.settings.margin_fit_enabled = false;
     app.settings.still_seek_strip_visible = false;
-    app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::None;
     for idx in 0..4 {
         app.rotation_cache
             .insert(idx, crate::rotation_db::Rotation::None);

@@ -346,6 +346,7 @@ preferences_policy! {
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
+        auto_view_trim_default_enabled: bool => ("自動余白カットを標準で有効にする", |_, _| true, plain, plain);
         singleton_spread_first_enabled: bool => ("最初のページを単独表示", |_, _| true, plain, plain);
         singleton_spread_last_enabled: bool => ("最後のページを単独表示", |_, _| true, plain, plain);
         page_after_cover_alone_enabled: bool => ("表紙の次を単独表示", |_, _| true, plain, plain);
@@ -1215,6 +1216,7 @@ mod tests {
             &[ReadingDirection::Ltr, ReadingDirection::Rtl],
         );
         settings.final_cover_spread_enabled = !settings.final_cover_spread_enabled;
+        settings.auto_view_trim_default_enabled = !settings.auto_view_trim_default_enabled;
         settings.singleton_spread_first_enabled = !settings.singleton_spread_first_enabled;
         settings.singleton_spread_last_enabled = !settings.singleton_spread_last_enabled;
         settings.page_after_cover_alone_enabled = !settings.page_after_cover_alone_enabled;
@@ -1921,15 +1923,48 @@ mod tests {
     }
 
     #[test]
+    fn auto_view_trim_default_transfer_roundtrip_missing_and_invalid_values() {
+        for enabled in [true, false] {
+            let source = Settings {
+                auto_view_trim_default_enabled: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut destination = Settings {
+                auto_view_trim_default_enabled: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.auto_view_trim_default_enabled, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.auto_view_trim_default_enabled, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(
+                    json!({"auto_view_trim_default_enabled": invalid}),
+                ))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.auto_view_trim_default_enabled, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 470);
+        assert_eq!(entries.len(), 471);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            149
+            150
         );
         assert_eq!(
             entries
@@ -1959,7 +1994,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 147);
+        assert_eq!(wire.len(), 148);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

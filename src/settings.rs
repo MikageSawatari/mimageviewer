@@ -5206,6 +5206,9 @@ pub struct Settings {
     /// 表紙あり見開きで、末尾の単ページへ表紙を添える全体既定。各本の明示設定が優先する。
     #[serde(default = "default_true")]
     pub final_cover_spread_enabled: bool,
+    /// 本別設定が「全体設定に従う」のとき、自動余白カットを有効にする。
+    #[serde(default)]
+    pub auto_view_trim_default_enabled: bool,
     /// 見開き先頭の単ページを本来の側へ置く全体既定。
     #[serde(default)]
     pub singleton_spread_first_enabled: bool,
@@ -7771,6 +7774,7 @@ impl Default for Settings {
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
+            auto_view_trim_default_enabled: false,
             singleton_spread_first_enabled: false,
             singleton_spread_last_enabled: false,
             page_after_cover_alone_enabled: false,
@@ -15218,6 +15222,16 @@ mod tests {
             assert!(settings.page_turn_animation_enabled);
             assert_eq!(settings.page_turn_animation_duration_ms, expected);
         }
+    }
+
+    #[test]
+    fn auto_view_trim_global_default_is_off_for_new_and_legacy_settings() {
+        assert!(!Settings::default().auto_view_trim_default_enabled);
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.auto_view_trim_default_enabled);
+        let enabled: Settings =
+            serde_json::from_str(r#"{"auto_view_trim_default_enabled":true}"#).unwrap();
+        assert!(enabled.auto_view_trim_default_enabled);
     }
 
     #[test]

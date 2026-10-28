@@ -175,7 +175,7 @@ fn ready_pdf_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEn
     app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
     app.settings.margin_fit_enabled = false;
     app.settings.still_seek_strip_visible = false;
-    app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::None;
     // Canonical PDF page boxes deliberately differ in aspect and units from the
     // resident 80x120 raster. This catches substitution of sampled texture size.
     for idx in 0..4 {
