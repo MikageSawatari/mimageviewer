@@ -51,7 +51,7 @@ CF_DIB でクリップボードへ置く。
   一覧の未表示ページは一括書き出しと同じ結果。未表示ページでは表示側の canonical 寸法が無いため、
   注釈の基準寸法と旧形式の切り取りの基準寸法が decode 後の寸法になる (一括書き出し・製本と同じ)。
   この既存の差 (旧形式 crop + AI 拡大、PDF ページの注釈) はコピー固有ではないので、本件では直さず
-  backlog §1.510 として起票する。
+  backlog §1.640 として起票する。
 
 ### 拒否する条件 (Ctrl+E と同じ文言の系統で通知)
 
@@ -93,7 +93,7 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
   update で poll → 結果を通知                   ←
 ```
 
-- **既知の制約 (§1.511)**: snapshot の固定は Ctrl+E・一括書き出しと共通の `book_baked_edit_snapshot` を UI スレッドで呼ぶ。未読み込みのページでは注釈フォントの解析・補正レイヤーの DB 読み込み・マスク展開がここで同期に走る (1 回に 1 ページ分、見開きで 2 ページ)。共通 producer の性質なので、この項目だけ別の producer にせず、4 つの入口をまとめて §1.511 で worker へ移す (実装レビューで合意)。
+- **既知の制約 (§1.641)**: snapshot の固定は Ctrl+E・一括書き出しと共通の `book_baked_edit_snapshot` を UI スレッドで呼ぶ。未読み込みのページでは注釈フォントの解析・補正レイヤーの DB 読み込み・マスク展開がここで同期に走る (1 回に 1 ページ分、見開きで 2 ページ)。共通 producer の性質なので、この項目だけ別の producer にせず、4 つの入口をまとめて §1.641 で worker へ移す (実装レビューで合意)。
 - **job は App に 1 本だけ** (`edited_clipboard_copy: Option<EditedClipboardCopyPending>`)。
   worker の実装は `src/edited_clipboard_copy.rs` に置く。
   新しい要求は前の job の cancel を立てて置き換える。結果の channel も置き換わるので、古い
@@ -287,13 +287,13 @@ detached 述語・viewport 経路には変更を加えていない。新しい�
 - 最終 source/config/snapshot 20 ファイルの SHA-256 を `source-manifest.json` に保存し、
   ビルド完了後の照合不一致は 0 件。`Cargo.toml`・`Cargo.lock`・`rust-toolchain.toml`・vendor の差分はない。
 - 全件 lib / full gate と独立実装レビューは ClaudeCode 側の後続確認。実クリップボードへの貼り付け等の
-  対話確認は未実施。未表示ページの旧 crop／注釈基準寸法の既存差は §3・backlog §1.510 のまま。
+  対話確認は未実施。未表示ページの旧 crop／注釈基準寸法の既存差は §3・backlog §1.640 のまま。
 
 ## 12. 独立レビュー・全件テスト・実機確認 (2026-10-28)
 
 - 独立実装レビュー (Codex gpt-6.1-sol / xhigh / read-only、実装者とは別の会話): ACCEPT。
   指摘 1 件 (snapshot の固定で注釈フォント・補正レイヤー・マスクの読み込みが UI スレッドで同期に走る) は、
-  Ctrl+E・一括書き出しと共通の producer の性質なので backlog §1.511 で 4 つの入口をまとめて直すことで合意した (§5)。
+  Ctrl+E・一括書き出しと共通の producer の性質なので backlog §1.641 で 4 つの入口をまとめて直すことで合意した (§5)。
 - 本体 lib 全件 (`test-lib-full.ps1`): 14586 件中 14585 件成功。失敗 1 件は
   `preferences_context_menu_layout_snapshot` で、新しいメニュー行が既存の「画像をクリップボードにコピー」の直後に
   増えたことによる差分だった。画像を目視して更新し、再実行で成功。`test-full.ps1` は、この作業ツリーに release の
