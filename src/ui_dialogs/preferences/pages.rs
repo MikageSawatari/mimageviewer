@@ -12430,6 +12430,86 @@ mod tests {
     }
 
     #[test]
+    fn zoom_key_editor_keeps_plus_when_only_another_row_changes() {
+        let mut state = zoom_key_editor_state();
+        let keymap = crate::keymap::Keymap::empty();
+        let action = KeyAction::FsZoomIn;
+        open_operation_assignment_editor(
+            &mut state,
+            OperationAssignmentTarget::Key(action),
+            OperationAssignmentTab::Keyboard,
+        );
+        super::ensure_command_editor_loaded(&mut state, &keymap, action);
+        assert_eq!(state.command_chord_inputs[0], "+");
+        state.command_chord_inputs[2] = "F24".into();
+        apply_command_editor(&mut state, action);
+        assert_eq!(state.command_edit_error, None);
+        let restored = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+        assert_eq!(
+            restored.effective_chords(action),
+            vec![
+                crate::keymap::Chord::shift(KeyName::Semicolon),
+                crate::keymap::Chord::key(KeyName::Semicolon),
+                crate::keymap::Chord::key(KeyName::F24)
+            ]
+        );
+    }
+
+    fn zoom_key_editor_state() -> PreferencesState {
+        PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
+            None,
+            crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+            false,
+            0,
+            0,
+            0,
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zoom_key_capture_display_can_be_saved() {
+        let _guard = crate::key_input::lock_test_input();
+        for (ctrl, alt) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut state = zoom_key_editor_state();
+            let keymap = crate::keymap::Keymap::empty();
+            let action = KeyAction::FsZoomIn;
+            super::ensure_command_editor_loaded(&mut state, &keymap, action);
+            let ctx = eframe::egui::Context::default();
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                        operation_id: crate::key_input::KeyOperationId::unassigned(),
+                        source_hwnd: 1,
+                        source_viewport: ctx.viewport_id(),
+                        virtual_key: 0xBB,
+                        scan_code: 0,
+                        extended: false,
+                        pressed: true,
+                        repeat: false,
+                        ctrl,
+                        shift: true,
+                        alt,
+                    }]);
+                    let expected = crate::keymap::Chord::new(ctrl, true, alt, KeyName::Semicolon);
+                    let captured = super::poll_command_chord_capture(ctx, action, false)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(captured, expected.display_name());
+                    state.command_chord_inputs[0] = captured;
+                    apply_command_editor(&mut state, action);
+                    assert_eq!(state.command_edit_error, None);
+                    let restored = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+                    assert_eq!(restored.effective_chords(action)[0], expected);
+                    crate::key_input::clear_test_frame();
+                })
+                .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
     fn opening_key_assignment_editor_preserves_overview_context_filter() {
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),

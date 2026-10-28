@@ -14516,9 +14516,11 @@ impl App {
     }
 
     /// フルスクリーン通常モードのズーム/パンが有効なら返す。
-    /// 閾値以下なら None (描画側で無変換パスに流れるよう明示するため)。
+    /// 1.0 付近の誤差範囲だけ None。縮小も描画側へ渡す。
     pub(crate) fn fs_zoom_pan(&self) -> Option<(f32, egui::Vec2)> {
-        if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
+        if (self.fs_zoom - 1.0).abs() > ZOOM_NEAR_ONE - 1.0
+            || self.fs_pan.length_sq() > PAN_EPSILON_SQ
+        {
             Some((self.fs_zoom, self.fs_pan))
         } else {
             None
@@ -69772,6 +69774,86 @@ mod tests {
         assert!(!fs_navigator_visibility_requested(
             false, true, false, false
         ));
+    }
+
+    #[test]
+    fn key_zoom_out_from_fit_reaches_displayed_transform_for_all_normal_inputs() {
+        for producer in 0..3 {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            app.fs_zoom = 1.0;
+            app.fs_pan = egui::Vec2::ZERO;
+            app.settings.page_turn_animation_enabled = true;
+            assert!(app.page_turn_view_eligible(idx));
+            let fit = navigator_test_transform(
+                idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: app.fs_zoom_pan(),
+                },
+            );
+            match producer {
+                0 => assert!(app.apply_fs_key_zoom_step(&ctx, false)),
+                1 => assert!(app.apply_gamepad_fullscreen_zoom(-1.0, 1.0)),
+                _ => {
+                    let (mut zoom, mut pan) = (app.fs_zoom, app.fs_pan);
+                    assert!(App::apply_wheel_zoom(
+                        &mut zoom,
+                        &mut pan,
+                        -WHEEL_SENSITIVITY,
+                        Some(egui::Pos2::ZERO),
+                        egui::Pos2::ZERO
+                    ));
+                    app.fs_zoom = zoom;
+                    app.set_fs_pan_from_input(zoom, pan);
+                }
+            }
+            assert!(app.fs_zoom < 1.0);
+            assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+            assert_eq!(app.fs_zoom_pan(), Some((app.fs_zoom, egui::Vec2::ZERO)));
+            assert!(!app.page_turn_view_eligible(idx));
+            let shrunk = navigator_test_transform(
+                idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: app.fs_zoom_pan(),
+                },
+            );
+            assert!(
+                (shrunk.layout_full_image_rect.size()
+                    - fit.layout_full_image_rect.size() * app.fs_zoom)
+                    .length()
+                    < 2.0
+            );
+            assert!(shrunk.layout_full_image_rect.width() < fit.layout_full_image_rect.width());
+            assert!(
+                shrunk
+                    .layout_full_image_rect
+                    .center()
+                    .distance(fit.layout_full_image_rect.center())
+                    < 1.1
+            );
+            if producer == 0 {
+                assert_eq!(app.fs_zoom, 0.8);
+            }
+        }
+    }
+
+    #[test]
+    fn fs_zoom_pan_treats_fit_roundoff_symmetrically_and_preserves_pan() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_pan = egui::Vec2::ZERO;
+        for zoom in [1.0, 0.99999, 1.00001, ZOOM_NEAR_ONE, 2.0 - ZOOM_NEAR_ONE] {
+            app.fs_zoom = zoom;
+            assert_eq!(app.fs_zoom_pan(), None, "zoom={zoom}");
+        }
+        for zoom in [0.8, 1.25] {
+            app.fs_zoom = zoom;
+            assert_eq!(app.fs_zoom_pan(), Some((zoom, egui::Vec2::ZERO)));
+        }
+        app.fs_zoom = 1.0;
+        app.fs_pan = egui::vec2(10.0, -20.0);
+        assert_eq!(app.fs_zoom_pan(), Some((1.0, app.fs_pan)));
     }
 
     #[test]

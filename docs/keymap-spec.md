@@ -758,15 +758,18 @@ Shift 押しを `+` とする。修飾なしは JIS の `;` / US の `=`。下�
 VK_OEM_MINUS（0xBD、`Minus`）は修飾なし。表示専用の `display_name` は
 `Shift+Semicolon` → `+`、`Ctrl+Shift+Semicolon` → `Ctrl++` とする。
 settings.db / JSON の `settings_name` は既存の `Shift+;`（Ctrl 付きは `Ctrl+Shift+;`）を維持する。
-chord 解析は既存の `Shift+;` / `Shift+Semicolon` をともに受理する。
+chord 解析は既存の `Shift+;` / `Shift+Semicolon` に加え、表示形の `+` を受理する。
+`Ctrl++` / `Alt++` / `Ctrl+Alt++` 等の末尾 `++` は、その修飾 + Shift + Semicolon として読む。
+通常の `Ctrl+A` 等の区切りは維持し、編集欄の初期表示・「押して入力」の表示形も保存できる。
+既定 chord 全件の表示往復に合わせ、右修飾キーの表示名（`右Ctrl` / `右Shift` / `右Alt`）も解析で受理する。
 ini テンプレート / 参照ファイルの生成だけは、`;` / `#` を含む表記をコメント記号と衝突しない
 KeySlot の別名へ置き換える。拡大は `Shift+Semicolon` / `Semicolon` と書き、旧 ini 取り込みでも
 その別名を読む。現行キーでこの変換が必要なのは `Semicolon` だけで、`#` を出すキーはない。
-修飾なしの JSON 保存表記も既存の `;` / `-` を維持し、`+` 自体は区切り文字なので parse alias にしない。
+修飾なしの JSON 保存表記も既存の `;` / `-` を維持する。表示形を入力しても保存・ini 出力表記は変えない。
 修飾なし `Semicolon` の表示は従来の `;` を維持する。
 
 1 回につき ×1.25 / ÷1.25。OS リピートを受け付け、同一フレームは各操作1回
-（`SinglePerFrame`）へまとめる。マウス位置を使わず、表示領域の中央を固定する。
+（`SinglePerFrame`）へまとめる。マウス位置を使わず、画面の中央を基準にする。
 書き先は既存 `fs_zoom_owner()` に従う。
 
 | owner | 適用 |
@@ -779,9 +782,13 @@ KeySlot の別名へ置き換える。拡大は `Shift+Semicolon` / `Semicolon` 
 Image / Analysis で変化したらそれぞれの倍率を `maybe_rerender_pdf` へ渡す。
 上下限で変化しなければ何もしない。変化時だけ repaint を要求する。
 Image / Analysis とも中心・pivot に同じ点（原点）を渡すと pan は倍率比で拡縮される。
-これで表示中央が固定され、矩形の位置 / 寸法は計算に不要となる。
+ページ単位表示ではこれで表示中央が固定され、矩形の位置 / 寸法は計算に不要となる。
 キー段では表示矩形・seek geometry を計算せず、root から配送された入力でも同じ結果となる。
 設計の簡素化: キー段で完結させ、フレーム間 pending や専用の viewport 配送を増やさない。
+
+連結読みの主軸位置は `fs_vertical_scroll` が所有するため、`fs_pan` だけを拡縮する現在の
+キー / Ctrl+ホイール / ピンチでは表示中央がずれ得る。全ズーム入力に共通する既存課題として
+今回の修正対象から外し、主軸位置・スクロール所有は変更しない。
 
 動画 / 音声 / 音楽ビューでは consume しない。消しゴム / 隠蔽 / 切り取り / SNS 分割 /
 テキスト注釈 / 補正レイヤーでは既存 `FsFitModeCycle` と同じ early return に従い実行しない。

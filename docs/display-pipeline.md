@@ -2226,15 +2226,26 @@ fullscreen の close はその context の状態を Idle にし、retire は bun
 `FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
 キーの段階ズーム（`FsZoomIn` / `FsZoomOut`、既定 `+` / `;`（US は `=`）/ テンキー `+` と
-`-` / テンキー `-`）は表示領域中央を固定して ×1.25 / ÷1.25。
+`-` / テンキー `-`）は画面中央を基準に ×1.25 / ÷1.25。
 `fs_zoom_owner()` に従い、通常画像（単ページ / 見開き / 縦横連結）は `fs_zoom` / `fs_pan`、
 分析は `analysis_zoom` / `analysis_pan`、360 は FOV、Z 照準 / 確定中は `fs_zoom_factor` を変更する。
 通常 / 分析はピンチの倍率・pivot 関数、360 はピンチの FOV 関数、Z はホイール刻みを共用し、
 通常 / 分析の変化時だけ各倍率で PDF 再描画を要求する。既存の clamp / pan 制約を維持する。
 Image / Analysis は pivot と中心に同じ点を渡して pan を倍率比で拡縮するため、キー段で
-表示矩形 / seek geometry を計算しない。中央固定の計算はキー段で完結し、viewer 配送や pending は増やさない。
+表示矩形 / seek geometry を計算しない。ページ単位表示の中央固定計算はキー段で完結し、viewer 配送や pending は増やさない。
+連結読みでは主軸位置を `fs_vertical_scroll` が持つため、キー / Ctrl+ホイール / ピンチの
+いずれも現在の `fs_pan` の拡縮だけでは中央がずれ得る。この共通課題は今回変更しない。
 動画 / 音声 / 編集モード / ページ一覧は対象外。比較では通常の画像キーと同様に有効。
 長押しリピートは同一フレームで各操作1回にまとめる。入力所有と詳細は [キー仕様](keymap-spec.md#キーによる段階ズーム1470)。
+
+通常表示への変換受け渡し `fs_zoom_pan()` は `abs(fs_zoom - 1.0) > ZOOM_NEAR_ONE - 1.0`
+または有意な pan がある場合に `Some` を返す。拡大・縮小を上下対称に扱い、1.0 付近の
+丸め誤差（0.99999 等）かつ pan なしだけを無変換にする。これにより fit から中央基準で
+縮小したキー / ゲームパッド LT / 中央での Ctrl+ホイールも `DisplayedImageTransform` へ倍率が届く。
+単ページ・白い相方付き単独配置・見開き・比較・類似プレビュー・snapshot の geometry は同じ値を使う。
+ページめくりアニメーションの既存 `fs_zoom_pan().is_none()` 条件も縮小中は不成立になる
+（無変換ページだけをめくる方針を維持）。入力所有・detached の述語 / viewport 経路は変更しない。
+ゲームパッド pan、ピクセルグリッド、クリック所有 / double-click reset の既存上側閾値は別の問いなので変更しない。
 
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
 **解決後の `DisplayedImageTransform` と描画は共用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、

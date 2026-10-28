@@ -176,11 +176,16 @@ impl ModKind {
             Some(Self::Alt)
         } else if value.eq_ignore_ascii_case("rightctrl")
             || value.eq_ignore_ascii_case("rightcontrol")
+            || value.eq_ignore_ascii_case(Self::RightCtrl.display_name())
         {
             Some(Self::RightCtrl)
-        } else if value.eq_ignore_ascii_case("rightshift") {
+        } else if value.eq_ignore_ascii_case("rightshift")
+            || value.eq_ignore_ascii_case(Self::RightShift.display_name())
+        {
             Some(Self::RightShift)
-        } else if value.eq_ignore_ascii_case("rightalt") {
+        } else if value.eq_ignore_ascii_case("rightalt")
+            || value.eq_ignore_ascii_case(Self::RightAlt.display_name())
+        {
             Some(Self::RightAlt)
         } else {
             None
@@ -9992,7 +9997,21 @@ fn parse_chord(rhs: &str) -> Result<Chord, String> {
     let mut alt = false;
     let mut key = None;
     let mut right_modifier = None;
-    for token in rhs.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+    // A displayed '+' is a key, while the preceding '+' remains a separator:
+    // '+' -> Shift+Semicolon, 'Ctrl++' -> Ctrl+Shift+Semicolon.
+    let trimmed = rhs.trim();
+    let (modifier_part, plus_key) = if trimmed == "+" {
+        ("", true)
+    } else if let Some(prefix) = trimmed.strip_suffix("++") {
+        (prefix, !prefix.is_empty())
+    } else {
+        (trimmed, false)
+    };
+    for token in modifier_part
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if let Some(kind) = ModKind::parse(token) {
             match kind {
                 ModKind::Ctrl | ModKind::Shift | ModKind::Alt => {
@@ -10040,6 +10059,13 @@ fn parse_chord(rhs: &str) -> Result<Chord, String> {
                 key = Some(parsed);
             }
         }
+    }
+    if plus_key {
+        if key.is_some() || right_modifier.is_some() {
+            return Err(format!("'{rhs}' combines '+' with another key"));
+        }
+        shift = true;
+        key = Some(KeyName::Semicolon);
     }
     if let Some(kind) = right_modifier {
         return Ok(Chord::modifier(kind));
@@ -15694,7 +15720,10 @@ mod tests {
             "Ctrl+Shift+;"
         );
         assert_eq!(Chord::key(KeySlot::Semicolon).display_name(), ";");
-        assert!(parse_chord_for_action(KeyAction::FsZoomIn, "+").is_err());
+        assert_eq!(
+            parse_chord_for_action(KeyAction::FsZoomIn, "+").unwrap(),
+            Some(plus)
+        );
     }
 
     #[test]
@@ -15754,6 +15783,72 @@ mod tests {
             );
             crate::key_input::clear_test_frame();
             ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn display_chords_roundtrip_all_action_defaults_and_key_slots() {
+        for action in KeyAction::all().iter().copied() {
+            for chord in action.default_chords().iter() {
+                assert_eq!(
+                    parse_chord_for_action(action, &chord.display_name()).unwrap(),
+                    Some(chord),
+                    "{action:?}: {chord:?}"
+                );
+            }
+        }
+        for name in enum_variant_names_from_source("KeySlot") {
+            let key = KeySlot::parse(&name).unwrap();
+            for bits in 0..8 {
+                let chord = Chord::new(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, key);
+                assert_eq!(
+                    parse_chord(&chord.display_name()).unwrap(),
+                    chord,
+                    "{chord:?}"
+                );
+            }
+        }
+        for kind in ModKind::ALL {
+            let chord = Chord::modifier(kind);
+            assert_eq!(parse_chord(&chord.display_name()).unwrap(), chord);
+        }
+    }
+
+    #[test]
+    fn plus_display_chords_parse_without_changing_storage_or_ini_spelling() {
+        for text in ["Shift+;", "Shift+Semicolon", "+"] {
+            assert_eq!(
+                parse_chord_for_action(KeyAction::FsZoomIn, text).unwrap(),
+                Some(Chord::shift(KeySlot::Semicolon))
+            );
+        }
+        for (text, ctrl, alt) in [
+            ("+", false, false),
+            ("Ctrl++", true, false),
+            ("Alt++", false, true),
+            ("Ctrl+Alt++", true, true),
+        ] {
+            let expected = Chord::new(ctrl, true, alt, KeySlot::Semicolon);
+            assert_eq!(parse_chord(text).unwrap(), expected);
+            let ini = Keymap::from_ini_str(&format!("[FsImage]\nFsZoomIn = {text} ; zoom\n"));
+            assert_eq!(
+                ini.override_chords(KeyAction::FsZoomIn),
+                Some(&[expected][..])
+            );
+            assert_eq!(parse_chord(&expected.ini_name()).unwrap(), expected);
+            assert!(!expected.ini_name().contains(';'));
+            assert!(expected.settings_name().ends_with(';'));
+        }
+        assert_eq!(
+            parse_chord("Ctrl+Alt+A").unwrap(),
+            Chord::ctrl_alt(KeySlot::A)
+        );
+        assert_eq!(
+            parse_chord("Ctrl+NumpadAdd").unwrap(),
+            Chord::ctrl(KeySlot::NumpadAdd)
+        );
+        for invalid in ["A++", "RightCtrl++", "Ctrl+A++", "++"] {
+            assert!(parse_chord(invalid).is_err(), "{invalid}");
         }
     }
 

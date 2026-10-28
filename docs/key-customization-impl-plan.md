@@ -491,7 +491,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 §1.470: `FsZoomIn` / `FsZoomOut` は `FsImage` / `Press` のキーボード専用操作。
 既定は拡大 `Shift+Semicolon` / `Semicolon` / `NumpadAdd`、縮小 `Minus` / `NumpadSubtract`。
 表示の `+` は settings.db / JSON 保存時には既存の `Shift+;` を維持する。chord 解析は既存の
-`Shift+;` / `Shift+Semicolon` の両方を受理し、`+` の parse alias は追加しない。
+`Shift+;` / `Shift+Semicolon` に加えて表示形の `+` / `Ctrl++` 等も受理する。
+末尾の `++` は通常の `+` 区切りと区別して Shift+Semicolon のキーを表し、編集欄初期値・
+キャプチャ結果の表示形を再解析して保存できる。既定 chord の表示往復には右修飾キーの表示名も含める。
 ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`Shift+Semicolon` /
 `Semicolon` と書く。旧 ini 取り込みでもコメントに切られず、その別名を受理する。
 既存の全 Action 列挙でヘルプ / キーカスタマイズへ表示し、リング系の対応表は増やさない。
