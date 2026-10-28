@@ -9,7 +9,7 @@ source + 編集 snapshot を worker へ渡す共通合成経路へ移った。
 
 ## 1. なぜやるのか
 
-### 4 つの出力が同じ段の語彙と合成順を使う
+### 5 つの出力が同じ段の語彙と合成順を使う
 
 | 機能 | 経路 | 既定の段 |
 | --- | --- | --- |
@@ -17,6 +17,7 @@ source + 編集 snapshot を worker へ渡す共通合成経路へ移った。
 | 画像 Ctrl+E | worker 合成 (`compose_export_entry`) | 表示用補正まで |
 | バッチ Ctrl+E | worker 合成 (`write_composited_page`) | 表示用補正まで |
 | 外部ツール (単ページ / 見開き) | materializer worker 合成 | 編集まで |
+| 編集を反映した画像のコピー | worker 合成 (`compose_export_entry`、[§1.261](clipboard-edited-copy-plan.md)) | 表示用補正まで |
 
 以前は、カラー化やポストフィルタを掛けた画像を 1 枚書き出すと乗り、まとめて書き出すと
 乗らなかった。現在はどちらも同じ `BakeStage` と同じ合成順を使い、必要なら出力ごとに

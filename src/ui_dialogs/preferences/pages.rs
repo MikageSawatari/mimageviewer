@@ -1876,7 +1876,7 @@ pub(super) fn page_bake_stage(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 type BakeStageField = fn(&mut crate::settings::Settings) -> &mut crate::bake_stage::BakeStage;
 
-fn bake_stage_rows() -> [(&'static str, BakeStageField, &'static str); 4] {
+fn bake_stage_rows() -> [(&'static str, BakeStageField, &'static str); 5] {
     [
         ("製本", |s| &mut s.bake_stage_book, "本棚へ追加するページ"),
         (
@@ -1894,6 +1894,11 @@ fn bake_stage_rows() -> [(&'static str, BakeStageField, &'static str); 4] {
             |s| &mut s.bake_stage_external_tool,
             "別のアプリへ渡す一時ファイル",
         ),
+        (
+            "クリップボードへコピー",
+            |s| &mut s.bake_stage_clipboard,
+            "右クリックの編集を反映した画像をコピー",
+        ),
     ]
 }
 
@@ -1903,7 +1908,7 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.heading("書き出しの焼き込み");
     ui.add(
         egui::Label::new(concat!(
-            "画像をファイルへ出すとき、どこまで反映するかを出力ごとに選びます。",
+            "画像をファイルやクリップボードへ出すとき、どこまで反映するかを出力ごとに選びます。",
             "右の段ほど多くを焼き込みます。",
         ))
         .wrap(),
@@ -12086,7 +12091,7 @@ mod tests {
             settings.bake_stage_export,
             crate::bake_stage::BakeStage::Edits
         );
-        assert_eq!(bake_stage_rows().len(), 4);
+        assert_eq!(bake_stage_rows().len(), 5);
     }
 
     #[test]

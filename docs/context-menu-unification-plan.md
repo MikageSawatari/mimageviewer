@@ -53,6 +53,13 @@
     dispatch はメニューを開いた時点で解決した `shell_paths` と、`GridCutFiles` /
     `GridCopyFiles` から呼ぶ共通 Shell clipboard helper を使う。
 
+13. **「編集を反映した画像をコピー」を既存の画像コピーの直後へ追加する**
+    (2026-10-28、[clipboard-edited-copy-plan.md](clipboard-edited-copy-plan.md))。
+    stable name / command は `CopyEditedImageToClipboard`。一覧は右クリックした `Image` /
+    `ZipImage` / `PdfPage` 1 件、フルスクリーン（F12 別ウィンドウを含む）は Ctrl+E と同じ対象で、
+    見開きは左右を結合する。native / egui は共通 model を使い、保存済みの並びにも既定位置へ補う。
+    既存コピーは向きと回転のみの挙動を保ち、新項目は `bake_stage_clipboard`（既定 `DisplayAdjust`）まで合成する。
+
 ## 1.1 表記の方針 — ブランド接頭辞は付けない
 
 「mIV:」や「(mIV)」を全項目へ付ける案は採らない。理由:

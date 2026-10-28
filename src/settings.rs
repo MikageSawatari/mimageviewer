@@ -5073,6 +5073,9 @@ pub struct Settings {
     pub bake_stage_export_batch: crate::bake_stage::BakeStage,
     #[serde(default)]
     pub bake_stage_external_tool: crate::bake_stage::BakeStage,
+    /// 編集を反映したクリップボード画像の段。単枚 Ctrl+E と同じ段を既定とする。
+    #[serde(default = "default_bake_stage_clipboard")]
+    pub bake_stage_clipboard: crate::bake_stage::BakeStage,
     /// 製本の本棚ルート。None のときは OS の Pictures/mimageviewer/books を使う。
     #[serde(default)]
     pub book_root: Option<PathBuf>,
@@ -7286,6 +7289,10 @@ fn default_bake_stage_export() -> crate::bake_stage::BakeStage {
     crate::bake_stage::BakeStage::DisplayAdjust
 }
 
+fn default_bake_stage_clipboard() -> crate::bake_stage::BakeStage {
+    crate::bake_stage::BakeStage::DisplayAdjust
+}
+
 fn default_active_book_name() -> String {
     crate::books::DEFAULT_BOOK_NAME.to_string()
 }
@@ -7759,6 +7766,7 @@ impl Default for Settings {
             bake_stage_export: default_bake_stage_export(),
             bake_stage_export_batch: default_bake_stage_export(),
             bake_stage_external_tool: crate::bake_stage::BakeStage::default(),
+            bake_stage_clipboard: default_bake_stage_clipboard(),
             book_root: None,
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
@@ -10888,6 +10896,27 @@ mod tests {
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
         assert!(!restored.thumb_show_resume_meter);
+    }
+
+    #[test]
+    fn clipboard_bake_stage_defaults_to_display_adjust_and_roundtrips_each_stage() {
+        use crate::bake_stage::BakeStage;
+
+        assert_eq!(
+            Settings::default().bake_stage_clipboard,
+            BakeStage::DisplayAdjust
+        );
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.bake_stage_clipboard, BakeStage::DisplayAdjust);
+        for stage in BakeStage::ALL {
+            let settings = Settings {
+                bake_stage_clipboard: stage,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.bake_stage_clipboard, stage);
+        }
     }
 
     #[test]

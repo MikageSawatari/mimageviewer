@@ -1,6 +1,6 @@
 # 編集を反映した画像をクリップボードへコピー (§1.261)
 
-**状態**: 設計 (2026-10-28)。実装は `clip-edited-1261` ブランチ。
+**状態**: 実装済み (レビュー前、2026-10-28)。実装は `clip-edited-1261` ブランチ。
 **出典**: 利用者要望 2026-09-21 / 焼き込み段の設定 2026-09-23 ([next-release-backlog.md](next-release-backlog.md) §1.261)。
 **関連**: [bake-stage-unification-plan.md](bake-stage-unification-plan.md) (段 `BakeStage` と共通 worker 合成)、
 [ui-responsiveness.md](ui-responsiveness.md) §4、[virtual-folders.md](virtual-folders.md)、
@@ -94,6 +94,7 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
 ```
 
 - **job は App に 1 本だけ** (`edited_clipboard_copy: Option<EditedClipboardCopyPending>`)。
+  worker の実装は `src/edited_clipboard_copy.rs` に置く。
   新しい要求は前の job の cancel を立てて置き換える。結果の channel も置き換わるので、古い
   job の結果は届かない。組み合わせを「最後の 1 本だけが生きている」に減らす。
 - **後から行ったコピーを上書きしない**: 規則は「要求した後にクリップボードが誰かに変えられたら、
@@ -226,3 +227,63 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
 
 実装 + 独立レビュー + 修正で **1〜1.5 日**。次の版に全部入れる前提で進める。
 外すなら §7 の KeyAction だけを後回しにできる (約 50 行)。
+
+## 11. 実装記録 (2026-10-28、レビュー前)
+
+- `App::composite_source_for_idx` に単ページ source の対応付けを集約し、一括書き出し・
+  Ctrl+E・新しいコピーから使う。コピー用 snapshot は `crop_legacy_writeback = None` にする。
+- `edited_clipboard_copy.rs` は単ページ／見開きの source と編集 snapshot を所有する。
+  `export_dialog::decode_output_page` と `render_export_composite_owned` を共用し、Ctrl+E の
+  `_0` と同じ decode・合成・見開き結合を通す。`predicted_size` 等のダイアログ専用情報は運ばない。
+  要求内のページは Box で所有し、大きな enum の variant 差を避ける。設計上の動作変更はない。
+- 共通 writer は新項目にだけ OS baseline を渡し、全画像 writer の mIV 世代は open 後にも確認する。
+  書いた／mIV 世代負け／OS 世代変更／失敗を返す。UI 要求は mutex を取らず、worker の完了は
+  ROOT repaint と App 全体の単一 pending の poll へ渡す。段によらず worker が AI activity lease を持つ。
+- メニューの保存済み並びへの追加は既存 `resolved_order` の canonical slot 補充に従う。
+  チェック集合用メニューの構成は既存どおり維持し、単項目メニューで新項目を表示する。
+
+### §6 の前提確認
+
+`App::update_active_viewer_context` は `with_active_viewer_context` の内側で
+`render_fullscreen_viewport` を呼ぶ。`with_active_viewer_context` は対象 context を
+`with_viewer_context` でマウントし、`swap_viewer_context_bundle` が `items` と
+`fullscreen_idx`（PDF password と編集 pending も含む）を交換する。その描画内から
+`show_fs_context_menu` → `dispatch_native_grid_context_command` が同期して呼ばれる。
+native と egui fallback は同じ dispatch を使う。したがって dispatch 時の両フィールドはその窓のもの。
+detached 述語・viewport 経路には変更を加えていない。新しいコピー pending は bundle に含めない。
+
+### 検証
+
+対象は HEAD `9bfe08a4d` からの未コミット差分。コミット・製品バイナリの起動は行わない。
+実行ログは `target/clipboard-edited-verification/` に保存する。
+
+- 初回 `cargo check` は TurboJPEG の MSBuild 並列実行で `MSB3191`。`-j 1` で再実行して成功。
+  依存定義・vendor は変更していない。
+- テストバイナリ初回生成は成功したが、一覧取得時に `0xc0000135`。指定の手順で
+  `vendor/ffmpeg/bin/*.dll` を `target/debug/deps/` にコピーして再実行した。
+- `clipboard_bake_stage_preferences_snapshot`: 1 passed。新規
+  `tests/snapshots/clipboard_bake_stage_preferences.png` (590×365、78,454 bytes) を生成して目視し、
+  5 行の設定表・既定選択・説明文が収まることを確認した。
+- 初回 clippy の変更箇所に出た 3 件（enum サイズ、固定長 chunk、条件の入れ子）は修正した。
+- テストを含む clippy で見つかった fixture 初期化・固定長 chunk の 3 件も修正した。
+- 対象 lib は 300 件実行し、299 passed / 1 failed。失敗は新設定追加に伴う
+  `all_settings_fields_are_classified` の件数期待値の更新漏れ（470→471、149→150、147→148）。
+  修正後、その 1 件と clippy 修正の影響する worker テスト 6 件を再実行し、7 passed。
+  その他の成功済み 293 件は同じ製品コードの結果を再利用する。
+- `cargo test --test ui_snapshot -- --test-threads=2`: 213 passed / 0 failed。既存 PNG は変更なし。
+- 最終 `cargo check -p mimageviewer --bin mimageviewer-core`、
+  `cargo clippy -p mimageviewer --bin mimageviewer-core --tests`、引数なし `cargo fmt` と
+  `cargo fmt --check` は成功。clippy の JSON 診断を追加・変更行と照合し、変更箇所の診断は 0 件。
+  既存コードの警告は残している（`clippy-confirmed.log` / `clippy-changed-lines.json`）。
+- `python scripts/check_ui_glyphs.py`: 0 件。
+  `python scripts/check_site_cards.py`: 49 cards / 0 over the limit。`git diff --check` 成功。
+- 検証ビルドも初回 TurboJPEG の CMake build が失敗したため、
+  `cargo build --profile dev-runtime -p turbojpeg-sys -j 1` で既存依存のネイティブ部分を直列準備した。
+  その後 `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は成功。
+  `target/dev-runtime/` に core・Remote・EPUB PDF worker と DLL を配置し、PE 検査も
+  runtime=4 / pe=3 で成功した（`build-dev-ready.log`）。通常 feature set で portable は有効にしていない。
+  バイナリは起動していない。
+- 最終 source/config/snapshot 20 ファイルの SHA-256 を `source-manifest.json` に保存し、
+  ビルド完了後の照合不一致は 0 件。`Cargo.toml`・`Cargo.lock`・`rust-toolchain.toml`・vendor の差分はない。
+- 全件 lib / full gate と独立実装レビューは ClaudeCode 側の後続確認。実クリップボードへの貼り付け等の
+  対話確認は未実施。未表示ページの旧 crop／注釈基準寸法の既存差は §3・backlog §1.510 のまま。

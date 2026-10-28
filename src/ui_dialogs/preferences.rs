@@ -7780,6 +7780,100 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_bake_stage_ui_ok_save_and_reload_preserves_selected_stage() {
+        use crate::bake_stage::BakeStage;
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        assert!(
+            crate::settings_db::boot_settings_db(app.tmp.path())
+                .db
+                .is_some()
+        );
+        app.open_preferences_page(PreferencesPage::BakeStage);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run();
+        for stage in BakeStage::ALL {
+            harness
+                .get_by_label(&format!("クリップボードへコピー / {}", stage.label()))
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .bake_stage_clipboard,
+                stage
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(!harness.state().show_preferences);
+            assert_eq!(harness.state().settings.bake_stage_clipboard, stage);
+            let loaded = crate::settings_db::SettingsDb::open(harness.state().tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            assert_eq!(loaded.bake_stage_clipboard, stage);
+            harness.state_mut().settings.bake_stage_clipboard = loaded.bake_stage_clipboard;
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::BakeStage);
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .bake_stage_clipboard,
+                stage
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_bake_stage_preferences_snapshot() {
+        use egui_kittest::kittest::Queryable;
+
+        let state = preferences_state_for_test(&crate::settings::Settings::default());
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(590.0, 365.0))
+            .build_ui_state(
+                |root_ui, state| {
+                    crate::os_theme::apply_resolved(
+                        root_ui.ctx(),
+                        crate::os_theme::ResolvedTheme::Dark,
+                    );
+                    egui::CentralPanel::default().show(root_ui, |ui| page_bake_stage(ui, state));
+                },
+                state,
+            );
+        harness.run();
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(590.0, 365.0));
+        for stage in crate::bake_stage::BakeStage::ALL {
+            assert!(
+                bounds.contains_rect(
+                    harness
+                        .get_by_label(&format!("クリップボードへコピー / {}", stage.label()))
+                        .rect()
+                )
+            );
+        }
+        harness.snapshot("clipboard_bake_stage_preferences");
+    }
+
+    #[test]
     fn preferences_position_setting_off_explicit_anchor_and_search_override() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();

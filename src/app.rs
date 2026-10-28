@@ -16871,6 +16871,9 @@ pub struct App {
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
+    /// OS-global clipboard output; intentionally stays outside viewer context bundles.
+    pub(crate) edited_clipboard_copy:
+        Option<crate::edited_clipboard_copy::EditedClipboardCopyPending>,
     /// 現在表示中の実フォルダを、メイン viewer が閉じた後に再読み込みする対象。
     /// Ctrl+E 完了と、viewer 中に届いた監視由来の再走査が同じ先送りを使う。
     pub(crate) folder_refresh_pending: Option<book_append_refresh::FolderRefreshRequest>,
@@ -20855,6 +20858,7 @@ impl App {
             export_dialog: None,
             export_batch_dialog: None,
             export_pending: None,
+            edited_clipboard_copy: None,
             folder_refresh_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,

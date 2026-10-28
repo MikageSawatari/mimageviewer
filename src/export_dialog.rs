@@ -134,7 +134,10 @@ mod composite_tests {
         };
         let image = egui::ColorImage::new([2, 1], vec![egui::Color32::RED, egui::Color32::BLUE]);
         let decoded_pixels = image.pixels.as_ptr();
-        let decoded = DecodedExportComposite::Single(DecodedExportPage { page: &page, image });
+        let decoded = DecodedExportComposite::Single(DecodedExportPage {
+            edits: &page.edits,
+            image,
+        });
         let cancel = Arc::new(AtomicBool::new(false));
 
         let rendered = render_export_composite_owned(decoded, None, None, &cancel).unwrap();
@@ -952,14 +955,14 @@ impl std::fmt::Display for ExportRenderError {
     }
 }
 
-struct DecodedExportPage<'a> {
-    page: &'a ExportPageComposite,
+pub(crate) struct DecodedExportPage<'a> {
+    edits: &'a crate::books::BakedEditSnapshot,
     image: egui::ColorImage,
 }
 
 /// decode 結果と、その結果を作ったページ要求を同じ variant に束ねる。
 /// これにより Single / Spread の組み合わせ不一致を型で表現不能にする。
-enum DecodedExportComposite<'a> {
+pub(crate) enum DecodedExportComposite<'a> {
     Single(DecodedExportPage<'a>),
     Spread {
         left: DecodedExportPage<'a>,
@@ -972,9 +975,26 @@ fn decode_export_page<'a>(
     cancel: &Arc<AtomicBool>,
     raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<DecodedExportPage<'a>, ExportRenderError> {
-    let image = crate::books::decode_composite_source_for_materialization(
+    decode_output_page(
         &page.source,
+        &page.edits,
         page.pdf_render_long_edge,
+        cancel,
+        raw,
+    )
+}
+
+/// Shared source decode for Ctrl+E and edited clipboard output. No display cache or resize.
+pub(crate) fn decode_output_page<'a>(
+    source: &crate::books::CompositeSource,
+    edits: &'a crate::books::BakedEditSnapshot,
+    pdf_render_long_edge: u32,
+    cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<DecodedExportPage<'a>, ExportRenderError> {
+    let image = crate::books::decode_composite_source_for_materialization(
+        source,
+        pdf_render_long_edge,
         Arc::clone(cancel),
         raw,
     )
@@ -985,10 +1005,10 @@ fn decode_export_page<'a>(
             ExportRenderError::Failed(message)
         }
     })?;
-    Ok(DecodedExportPage { page, image })
+    Ok(DecodedExportPage { edits, image })
 }
 
-fn decode_export_composite<'a>(
+pub(crate) fn decode_export_composite<'a>(
     composite: &'a ExportComposite,
     cancel: &Arc<AtomicBool>,
     raw: Option<&crate::raw::RawDecodeContext>,
@@ -1012,17 +1032,22 @@ fn render_export_composite(
 ) -> Result<egui::ColorImage, ExportRenderError> {
     match decoded {
         DecodedExportComposite::Single(decoded) => render_export_page(
-            decoded.page,
+            decoded.edits,
             decoded.image.clone(),
             preset,
             crop_override,
             cancel,
         ),
         DecodedExportComposite::Spread { left, right } => {
-            let left =
-                render_export_page(left.page, left.image.clone(), preset, crop_override, cancel)?;
+            let left = render_export_page(
+                left.edits,
+                left.image.clone(),
+                preset,
+                crop_override,
+                cancel,
+            )?;
             let right = render_export_page(
-                right.page,
+                right.edits,
                 right.image.clone(),
                 preset,
                 crop_override,
@@ -1033,7 +1058,7 @@ fn render_export_composite(
     }
 }
 
-fn render_export_composite_owned(
+pub(crate) fn render_export_composite_owned(
     decoded: DecodedExportComposite<'_>,
     preset: Option<&ConcealPreset>,
     crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
@@ -1041,37 +1066,32 @@ fn render_export_composite_owned(
 ) -> Result<egui::ColorImage, ExportRenderError> {
     match decoded {
         DecodedExportComposite::Single(decoded) => {
-            render_export_page(decoded.page, decoded.image, preset, crop_override, cancel)
+            render_export_page(decoded.edits, decoded.image, preset, crop_override, cancel)
         }
         DecodedExportComposite::Spread { left, right } => {
-            let left = render_export_page(left.page, left.image, preset, crop_override, cancel)?;
-            let right = render_export_page(right.page, right.image, preset, crop_override, cancel)?;
+            let left = render_export_page(left.edits, left.image, preset, crop_override, cancel)?;
+            let right =
+                render_export_page(right.edits, right.image, preset, crop_override, cancel)?;
             Ok(crate::capture::combine_spread_color_images(&left, &right)?)
         }
     }
 }
 
 fn render_export_page(
-    page: &ExportPageComposite,
+    edits: &crate::books::BakedEditSnapshot,
     decoded: egui::ColorImage,
     preset: Option<&ConcealPreset>,
     crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, ExportRenderError> {
-    crate::books::compose_export_entry(
-        decoded,
-        &page.edits,
-        preset,
-        crop_override,
-        Arc::clone(cancel),
-    )
-    .map_err(|message| {
-        if cancel.load(Ordering::Relaxed) {
-            ExportRenderError::Cancelled
-        } else {
-            ExportRenderError::Failed(message)
-        }
-    })
+    crate::books::compose_export_entry(decoded, edits, preset, crop_override, Arc::clone(cancel))
+        .map_err(|message| {
+            if cancel.load(Ordering::Relaxed) {
+                ExportRenderError::Cancelled
+            } else {
+                ExportRenderError::Failed(message)
+            }
+        })
 }
 
 /// 書き出し直前の縮小段。Ctrl+E の単ページ / 見開きと、一括エクスポート・製本が通る

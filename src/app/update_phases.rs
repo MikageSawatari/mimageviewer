@@ -589,6 +589,7 @@ impl App {
         self.poll_saved_group_open(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
         self.poll_export_pending(ctx);
+        self.poll_edited_clipboard_copy();
         self.poll_compare_pin_load_pending(ctx);
         self.poll_compare_pin_pending(ctx);
         self.poll_compare_prepare_pending(ctx);

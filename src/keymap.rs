@@ -1728,6 +1728,7 @@ pub enum KeyAction {
     FsAddToActiveBook,
     FsAddToCollectionTarget,
     FsExport,
+    FsCopyEditedImage,
     FsCompareToggle,
     FsCompareCycle,
     FsCompareWipe,
@@ -2318,6 +2319,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsAddToActiveBook,
     KeyAction::FsAddToCollectionTarget,
     KeyAction::FsExport,
+    KeyAction::FsCopyEditedImage,
     KeyAction::FsCompareToggle,
     KeyAction::FsCompareCycle,
     KeyAction::FsCompareWipe,
@@ -4385,6 +4387,7 @@ impl KeyAction {
             FsAddToActiveBook => "FsAddToActiveBook",
             FsAddToCollectionTarget => "FsAddToCollectionTarget",
             FsExport => "FsExport",
+            FsCopyEditedImage => "FsCopyEditedImage",
             FsCompareToggle => "FsCompareToggle",
             FsCompareCycle => "FsCompareCycle",
             FsCompareWipe => "FsCompareWipe",
@@ -5140,6 +5143,7 @@ impl KeyAction {
             FsAddToActiveBook => "現在のページを追加先の本へ追加する",
             FsAddToCollectionTarget => "現在の実画像を追加先のコレクションへ追加する",
             FsExport => "現在の表示結果を別ファイルへ書き出す",
+            FsCopyEditedImage => "編集を反映した画像をコピー",
             FsCompareToggle => "現在の画像を比較スロットに固定または解除する",
             FsCompareCycle => "比較スロットのピン画像と現在画像を切り替えて表示する",
             FsCompareWipe => "ワイプ比較を切り替える",
@@ -5706,6 +5710,7 @@ impl KeyAction {
             | FsAddToActiveBook
             | FsAddToCollectionTarget
             | FsExport
+            | FsCopyEditedImage
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -6241,6 +6246,7 @@ impl KeyAction {
             | FsAddToActiveBook
             | FsAddToCollectionTarget
             | FsExport
+            | FsCopyEditedImage
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -6799,6 +6805,7 @@ impl KeyAction {
             FsAddToActiveBook => ChordList::one(Chord::ctrl(B)),
             FsAddToCollectionTarget => ChordList::EMPTY,
             FsExport => ChordList::one(Chord::ctrl(E)),
+            FsCopyEditedImage => ChordList::EMPTY,
             FsCompareToggle => ChordList::one(Chord::key(X)),
             FsCompareCycle => ChordList::one(Chord::key(C)),
             FsCompareWipe => ChordList::one(Chord::shift(C)),
@@ -11189,6 +11196,23 @@ mod tests {
             grid_default
         );
         assert_eq!(keymap.effective_chords(KeyAction::FsExport), vec![rebound]);
+    }
+
+    #[test]
+    fn edited_image_copy_is_an_unbound_rebindable_fullscreen_press_action() {
+        let action = KeyAction::FsCopyEditedImage;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::parse_ini_name("FsCopyEditedImage"), Some(action));
+        assert!(action.default_chords().iter().next().is_none());
+        let rebound = Chord::ctrl_shift(KeyName::C);
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(action, vec![rebound]);
+        assert_eq!(
+            Keymap::from_settings(&settings).effective_chords(action),
+            vec![rebound]
+        );
     }
 
     #[test]
