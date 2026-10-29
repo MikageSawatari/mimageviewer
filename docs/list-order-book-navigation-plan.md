@@ -529,6 +529,9 @@ B_book.zip・A_book) を「日付↓」で並べ、F から Ctrl+Shift+↓ / ↑
 
 ## 12. 5ch >>649 評価フィルタと一覧順移動の調査 (2026-10-29)
 
+「共通受付への修正設計」より前は `8775cbfa1` に含まれる**修正前の調査記録**。
+修正後の設計決定・実装・検証は本節の末尾に追記する。
+
 対象: `ratingnav-649`、基点 `f9156a375`。Codexによるソース調査と非対話テスト。
 製品コードの修正・製品バイナリの起動・commitは行わない。
 報告者の観測は「移動前に★一時解除中になる」までであり、絞り込み対象外の本への
@@ -660,3 +663,141 @@ double-click/gamepad4件は成功 (`folder.log`)。失敗を緩和せず専用2�
 >>649の残る不明点は、表示への違和感か、実際に対象外の本へ移動したか。
 追加確認を求めるなら、その区別と、実移動がある場合だけ「元→先の本の種類・評価」を1例に絞る。
 現時点で一覧順移動や評価一時解除を変更する根拠はなく、別の自動表示不具合とは切り分けて扱う。
+
+### 共通受付への修正設計・着手前の入口比較 (2026-10-29)
+
+基点は調査記録をcommitした `8775cbfa1`。ClaudeCode設計担当から、Enterだけに予約を
+追加せず、3入口の一覧から本を開く受付を単一helperへ集約する指示を受けた。
+以下は製品コード編集前の照合結果。
+
+| 項目 | Enter | ダブルクリック | ゲームパッド | 共通化の扱い |
+| --- | --- | --- | --- | --- |
+| 履歴のmissing確認・一覧復元cursor保存 | guard→cursor保存 | activation許可→cursor保存 | guard→cursor保存 | 入口の前処理として維持 |
+| ファイル名stackの直接閲覧 | `stack_try_open_from_grid(..., false)` | 同 `true` | 同 `false` | pointer由来の差を入口に残す |
+| 独立book openへの配送 | stack後・kind分岐前 | 同左 | 同左 | 既存の専用ownerへの配送と順序を維持。変換書庫等も利用するため共通helperの外 |
+| global searchのFolder drill-in | 専用分岐なし | `active && drill.is_some()`なら履歴記録→drill、通常openを通さない | 専用分岐なし | 意図的なdouble-clickの例外として入口に残す |
+| 自動表示の判定 | `should_auto_fullscreen_grid_container` | 同左 | 同左 | helperへ集約 |
+| auto時の旧active context park | あり、失敗ならopen中止 | 同左 | **呼出しなし** | 未確定の差①、設計判断待ち |
+| Smart folderへの配送 | park後、通常処理より先 | 同左 | 自動表示判定後、通常処理より先 | helper内で通常Folderの副作用より先に既存ownerへ渡す |
+| 通常Folderの読書履歴への帰路記録 | **受付時なし** | 受付時に記録 | `!is_virtual_folder(path)`なら記録 | Enterは予約と同じcommitで削除された。Folderの受付へ戻す案 |
+| 通常Folderの評価一時解除 | **受付時なし**。採用時のscope再評価で発動 | 受付時に発動 | `!is_virtual_folder(path)`なら受付時に発動 | Enterの欠落を揃える案。解除で一覧を再構築せず、設定を書き換えない |
+| 通常Folderの自動表示予約 | **なし** | auto時に既存 `pending_auto_fs_open` を設定 | `!is_virtual_folder(path)`かつauto時に設定 | 今回確認したEnterの回帰を修正 |
+| 通常Folderと書庫の判別 | 入力armは型。上記3副作用自体なし | `GridItem::Folder`という型 | **パス拡張子の `is_virtual_folder`** | 未確定の差②。`A.zip`等の名前の実Folderで異なる |
+| ZIP/PDFの履歴・評価解除・auto意図 | `GridVirtualOpenEffects`として採用時に反映 | 同左 | 同左 | 意図的な採用境界。Folderの受付時副作用を適用しない |
+| 一覧順の記録・物理open要求 | `grid_physical_navigation` | 同左 (Folderは副作用設定後) | 同左 (通常Folderは副作用設定後) | helperの末尾で既存入口へ渡す。列の固定規則は維持 |
+
+構造案は、既存の状態・workerを増やさず、受付の副作用を一つのhelperに集約すること。
+2026-10-29の独立設計レビュー (GPT-6.1 Sol / xhigh) は、これは症状パッチではなく
+受付の所有境界を揃える構造的修正と判断した。ただし次の2差は変更してよいとの根拠が不足し、
+依頼者の「判断できない差・出荷済み挙動を変える差は実装を止めて報告」に従い、
+製品コード未編集で設計担当へ返した。
+
+1. gamepadのparkなしは初期追加 `07eb006ce` (2026-06-07) から存在。
+   Enter/double-clickへparkを加えた `5ba4d5373` (2026-07-01) もgamepadを変更していない。
+   現在のgamepad配送はmain前面ならrootの一覧へ配送されるため、active contextが有っても
+   park不要という説明は成立しない。一方、下位のZIPには別のpreserve/promote処理があり、
+   今回追加してよいと断定する直接の仕様・回帰証拠は見つからなかった。
+2. gamepadの拡張子判定は `77f9a346d` で通常FolderとZIP/PDFの副作用を分けた際に入った。
+   型へ揃えると `A.zip` / `A.pdf` という実directoryで履歴・解除・予約を変更する。
+   新しい入力制限ではないが、今回どこまで揃えるか設計判断が必要。
+
+### Enter予約欠落の導入履歴
+
+- 原因commit: `77f9a346df1e64391c3fef323409056e615390f5`
+  (2026-09-27、`Folder history for Rating and Collection children; keep Rating view order`)。
+  ZIP/PDFの履歴・評価・表示意図を採用時のeffectsへ移す変更で、同じmatch armにあった
+  Folderの `note_reading_history_open` / `pending_auto_fs_open` / 評価解除まで削除された。
+  `grid_physical_navigation(idx, p, auto_fs)`のFolder用Direct要求は表示予約へ反映しないため、
+  Enterだけ自動表示しなくなった。
+- `v4.1.0`のEnterの該当armには3処理とも存在し、最初に原因commitを含むtagは `v4.2.0`。
+  `v4.2.0` / `v4.3.0` / `v4.4.0` / `v4.5.0` / `v4.6.0` / `v4.7.0` /
+  `v4.8.0` / `v4.9.0`のソースで欠落を確認した。各旧版の実行検査はしていない。
+
+### §1.480の設計担当決定と実装 (2026-10-29)
+
+設計担当ClaudeCodeは、Enterとdouble-clickだけを共通化し、gamepadのparkと拡張子付き
+実Folderの差は出荷済み挙動として維持・§1.481へ分離すると決定した。
+独立設計レビュー (GPT-6.1 Sol / xhigh) は、保留2点を変更範囲から外したこの設計を
+実装可能とし、既存の受付副作用を単一境界へ集約する構造的修正であって症状パッチではないと確認した。
+
+`app/collection_grid.rs::accept_grid_container_open(ctx,index)` に既存double-clickの順で
+自動表示判定→auto時の既存park→Smartの専用ownerへ配送→通常Folderの履歴記録・評価解除・
+既存の自動表示予約→`grid_physical_navigation`をまとめた。
+Enterとdouble-clickはこのhelperへ渡す。待機・新しい製品状態・worker・回復機構は追加しない。
+
+| 項目 | Enter修正後 | double-click修正後 | gamepad修正後 |
+| --- | --- | --- | --- |
+| Folder/ZIP/PDFの受付 | 共通helperへ1回 | 共通helperへ1回 | 既存コードのまま。helperを通らない |
+| auto判定・park・Smart | helperの既存順 | helperの既存順 | 既存の差を維持 |
+| 通常Folderの履歴・評価解除・予約 | 削除されていた3処理を復元 | 既存と同じ副作用・順 | 既存の拡張子判定を維持 |
+| global search Folder drill-in | 既存どおり | 呼出側で既存例外を維持 | 既存どおり |
+| 独立book open・stack・入力guard | helperより先の既存入口 | 同左。pointer由来のstack引数も維持 | 製品無差分 |
+| ZIP/PDF effects | 従来の採用時に反映 | 従来の採用時に反映 | 従来どおり |
+| 一覧記録 | 既存 `grid_physical_navigation` | 同左 | 同左 |
+
+#### v4.1.0のEnterとの比較
+
+- 履歴記録 `note_reading_history_open`、評価解除 `maybe_suppress_rating_filter_for_opened_container`、
+  auto時の既存予約は、いずれもv4.1.0のEnterが持っていた処理であり、新機能ではない。
+- v4.1.0は履歴→予約→評価解除、今回は現行double-clickに合わせ履歴→評価解除→予約。
+  解除helperは設定・一覧を変更せず、予約はbool代入であり、どちらもload/一覧記録より前に
+  同じ値が成立する。途中の非同期採用や待機はなく、handler-levelで受付後の値を検査する。
+- v4.1.0の同じarmにあったfacet解除と `record_rating_view_nav_open` は、現在の
+  FacetRouteとtypedな `GridVirtual` / `RatingSource` の採用責務へ移っているため復活しない。
+  ZIP/PDFを受付時解除へ戻すこともない。
+- 現行のSmart `StartupListIntent`、独立book open、一覧順snapshot等はv4.1.0後の仕組みだが、
+  修正前のEnterにも既に接続されていた。今回それらの機能・配送・採用境界は変更しない。
+
+#### 修正後の検証
+
+検証担当はCodex root。ログは `target/ratingnav649-fix/`。
+ビルド・テストには `MSBUILDDISABLENODEREUSE=1`。製品起動とcommitは行わない。
+既存の14件は期待を緩めず、auto ONの全入口は直接ページ表示、OFFはページ一覧と厳密に検査する。
+Enter/pointerの同helperへの1回の到達 (test専用thread-local counter)、Folderの既存帰路clear、
+ZIPの採用前不変を加え、履歴からのFolder open/帰路とgamepadの拡張子付き実Folder維持も追加した。
+Smartに消費されたdouble-clickの早期returnも維持する。独立レビューでこの制御フロー差を
+P2として指摘されて修正し、Folder/ZIPの両方で同passのprimary/secondary releaseを使う回帰を追加した。
+同じ入力が通常受付では実際にmenuを開くpositive controlを先に検査し、その後Smart受付では
+要求だけが受理され、menu・通常Folder副作用・列の再取得へ進まないことを確認する。
+フォローアップ独立レビューはACCEPT、新しいP1/P2なし。
+
+| コマンド・条件 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo fmt` (引数なし) | 成功 / 0 | tool出力 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ratingnav649/)' --no-fail-fast --success-output immediate --failure-output immediate` | 最終17/17成功 / 0、2.011秒 | `focused-ratingnav-final.log` |
+| `.\scripts\test-focused.ps1` | 共有pathの `app.rs` と文書を検出、テストを走らせずexit 2 | `test-focused-final.log` |
+| `.\scripts\test-lib-full.ps1` | 14,888/14,888成功・既存ignored 65件 / 0、524.883秒 | `test-lib-full.log` / 下記台帳 |
+| `cargo fmt --check` / `git diff --check` | ともに成功 / 0 | `fmt-check.log` / tool出力 |
+| `cargo build --profile dev-runtime -p turbojpeg-sys` (`CARGO_BUILD_JOBS=1`) | coldなネイティブ依存準備、成功 / 0、2分35秒 | `dev-native-prerequisite.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 通常featureのcore/remote/EPUB workerとDLLを作成、成功 / 0。VCRT/PE監査 runtime=4 / pe=3 成功、起動なし | `build-dev.log` |
+
+最初の焦点検証16件も16/16成功 (2.302秒、`focused-ratingnav.log`)。
+その後、上記P2の修正と回帰追加により最終17件を再検証した。
+
+lib全件のrunは `target/test-lib-full/runs/20261029T121511774Z-61d3f033/`、
+成功receiptは `target/test-lib-full/a3f9eed91078c47dfdb284e37972f930785da6dd1593e88a08eb387f5463eab7.json`。
+一覧順移動・評価フィルタ・自動表示・double-click・gamepad・Smart/Collection/Rating・
+既存のdetached/headless入力回帰を含むlib全件を通し、レビュー側はこの結果を再利用する。
+workspace/vendor/doctestのfull gateと、実UI/実ゲームパッドの操作は今回行っていない。
+確認用buildは既存の方針に従い準備し、エージェントからは起動しない。
+
+同じ全件runのJUnitから関連名を抽出した `target/ratingnav649-fix/related-counts.json` では、
+一覧順67件、評価filter/membership/suppression 118件、auto表示34件、double-click/reclick 77件、
+gamepad 143件が成功、失敗/skipは各0。分類には重複があり、別の再実行ではない。
+
+変更ファイルは製品の `src/app.rs` / `src/app/collection_grid.rs` / `src/ui_main.rs`、
+回帰の `src/app/list_order_ratingnav649_tests.rs`、本書と `docs/next-release-backlog.md` /
+`docs/detached-rework-plan.md`。gamepad製品コード・keymap・設定形式・依存・build/test scriptは無差分。
+
+確認用バイナリは `target/dev-runtime/mimageviewer-core.exe`。通常featureで、portableではない。
+ユーザーが確認する場合のコマンド (エージェント未実行):
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定・データを更新し得る。
+single-instance mutexを共有するため、先にインストール版・tray常駐版を終了する。
+確認対象は、画像だけの通常FolderをEnter/double-clickで開く際のauto ONで直接ページ表示、
+OFFでページ一覧、★5絞り込みからの一覧順A/C移動と親での条件復元。
+今回の作業は非対話検証のみで、起動・実入力・commitを行っていない。

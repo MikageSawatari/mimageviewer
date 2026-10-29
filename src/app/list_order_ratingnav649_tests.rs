@@ -13,6 +13,32 @@ enum Entry {
     Gamepad,
 }
 
+fn accept_entry(
+    app: &mut App,
+    ctx: &egui::Context,
+    entry: Entry,
+) -> Option<crate::ui_main::AddressBarNav> {
+    app.take_grid_container_open_accept_count_for_test();
+    let index = app.selected.unwrap();
+    let nav = match entry {
+        Entry::Enter => grid_enter(app),
+        Entry::Gamepad => app.handle_gamepad_grid_accept(ctx),
+        Entry::DoubleClick => Some(crate::ui_main::ratingnav649_double_click_for_test(
+            app, index,
+        )),
+    };
+    assert_eq!(
+        app.take_grid_container_open_accept_count_for_test(),
+        if matches!(entry, Entry::Gamepad) {
+            0
+        } else {
+            1
+        },
+        "Enter/pointer use the shared admission exactly once; gamepad keeps its existing route"
+    );
+    nav
+}
+
 fn names(app: &App) -> Vec<String> {
     app.current_grid_order()
         .iter()
@@ -73,6 +99,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
         app.settle_open_path_classification_for_test();
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
+        app.poll_reading_history_thumbnail_sources(ctx);
         app.poll_sidecar_restore(ctx);
         app.poll_book_composition_service_for_test(ctx);
         app.poll_book_presentation_permission(ctx);
@@ -83,6 +110,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
                 .is_none()
             && app.zip_enumerate_pending.is_none()
             && app.fs_nav_after_pdf_enumerate.is_none()
+            && app.reading_history_sources_pending.is_empty()
             && !app.sidecar_restore_active()
         {
             break;
@@ -277,15 +305,34 @@ fn scenario(zip_books: bool, entry: Entry, date_desc: bool) {
             .items
             .iter()
             .position(|item| item.container_path() == Some(first.as_path()));
-        let idx = app.selected.unwrap();
-        let nav = match entry {
-            Entry::Enter => grid_enter(&mut app),
-            Entry::Gamepad => app.handle_gamepad_grid_accept(&ctx),
-            Entry::DoubleClick => Some(crate::ui_main::ratingnav649_double_click_for_test(
-                &mut app, idx,
-            )),
+        let previous_return = root.join("previous-history-return");
+        app.reading_history_return_from = Some(previous_return.clone());
+        let nav = accept_entry(&mut app, &ctx, entry)
+            .expect("normal input must return the container request");
+        if zip_books {
+            assert_eq!(
+                app.reading_history_return_from.as_ref(),
+                Some(&previous_return)
+            );
+            assert!(
+                app.rating_filter_suppressed_at.is_none(),
+                "virtual effects wait for adoption"
+            );
+            assert!(
+                !app.pending_auto_fs_open,
+                "virtual request owns the auto-open intent"
+            );
+        } else {
+            assert!(
+                app.reading_history_return_from.is_none(),
+                "ordinary Folder clears the old history return at admission"
+            );
+            assert_eq!(
+                app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+                Some(first)
+            );
+            assert_eq!(app.pending_auto_fs_open, auto_open);
         }
-        .expect("normal input must return the container request");
         trace(&app, "open accepted before load");
         let snapshot = app
             .list_order
@@ -296,6 +343,12 @@ fn scenario(zip_books: bool, entry: Entry, date_desc: bool) {
         apply_open(&mut app, &ctx, nav, entry);
         settle(&mut app, &ctx);
         assert_unrated_pages(&mut app, first, &paths);
+        assert!(app.reading_history_return_from.is_none());
+        assert_eq!(
+            app.fullscreen_idx.is_some(),
+            auto_open,
+            "all normal inputs honor the auto-open setting"
+        );
         if !auto_open {
             assert!(
                 app.fullscreen_idx.is_none(),
@@ -303,8 +356,6 @@ fn scenario(zip_books: bool, entry: Entry, date_desc: bool) {
             );
         }
         if app.fullscreen_idx.is_none() {
-            // The separate auto-open regressions below retain the Enter/folder defect.
-            // Continue the >>649 membership investigation through the visible page list.
             eprintln!("649 explicit page Enter: configured_auto_open={auto_open}");
             app.selected = Some(0);
             assert!(
@@ -360,7 +411,7 @@ fn folder_enter_auto_open(filter: [bool; 6]) {
     app.finish_page_identity_preparation_for_test();
     app.selected = Some(0);
     assert!(app.should_auto_fullscreen_grid_container(0));
-    let nav = grid_enter(&mut app).expect("normal folder Enter");
+    let nav = accept_entry(&mut app, &ctx, Entry::Enter).expect("normal folder Enter");
     eprintln!(
         "649 Enter auto-open admission: requested=true pending_auto_fs_open={}",
         app.pending_auto_fs_open
@@ -384,6 +435,220 @@ fn ratingnav649_folder_enter_auto_open_with_rating_filter() {
 #[test]
 fn ratingnav649_folder_enter_auto_open_without_rating_filter() {
     folder_enter_auto_open([true; 6]);
+}
+
+#[test]
+fn ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return() {
+    use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+    for entry in [Entry::Enter, Entry::DoubleClick] {
+        for auto_open in [false, true] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let book = app.tmp.path().join("history-folder");
+            std::fs::create_dir(&book).unwrap();
+            image::RgbImage::new(2, 2)
+                .save(book.join("001.png"))
+                .unwrap();
+            app.active_quick_folder_slot = None;
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_zip_pdf = auto_open;
+            app.settings.auto_fullscreen_image_folders = auto_open;
+            app.settings.rating_filter = FIVE_ONLY;
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set(&crate::adjustment_db::normalize_path(&book), 5)
+                .unwrap();
+            let history = ReadingHistoryEntry::new(
+                book.clone(),
+                ReadingHistoryKind::Folder,
+                None,
+                "history-folder".into(),
+                None,
+                None,
+            );
+            app.reading_history_db
+                .as_ref()
+                .unwrap()
+                .upsert(history, 1000)
+                .unwrap();
+            app.enter_reading_history_from_menu();
+            settle(&mut app, &ctx);
+            assert!(app.items_are_reading_history_view);
+            assert_eq!(app.items.len(), 1);
+            app.selected = Some(0);
+            let nav = accept_entry(&mut app, &ctx, entry).unwrap();
+            assert_eq!(app.reading_history_return_from.as_ref(), Some(&book));
+            assert_eq!(
+                app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+                Some(&book)
+            );
+            assert_eq!(app.pending_auto_fs_open, auto_open);
+            assert!(
+                app.list_order.is_none(),
+                "history cannot replace a normal-folder snapshot"
+            );
+            apply_open(&mut app, &ctx, nav, entry);
+            settle(&mut app, &ctx);
+            assert_eq!(app.effective_folder().as_ref(), Some(&book));
+            assert_eq!(app.fullscreen_idx.is_some(), auto_open);
+            assert_eq!(app.reading_history_return_from.as_ref(), Some(&book));
+            app.close_fullscreen();
+            let nav = app.handle_grid_parent_folder_action().unwrap();
+            apply_open(&mut app, &ctx, nav, Entry::Enter);
+            settle(&mut app, &ctx);
+            assert!(
+                app.items_are_reading_history_view,
+                "return to the originating history list"
+            );
+            assert!(app.rating_filter_suppressed_at.is_none());
+            assert_eq!(app.settings.rating_filter, FIVE_ONLY);
+        }
+    }
+}
+
+#[test]
+fn ratingnav649_gamepad_extension_named_folder_keeps_existing_receipt() {
+    for name in ["A.zip", "A.pdf"] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let root = app.tmp.path().join("extension-named-folders");
+        let book = root.join(name);
+        std::fs::create_dir_all(&book).unwrap();
+        image::RgbImage::new(2, 2)
+            .save(book.join("001.png"))
+            .unwrap();
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.rating_filter = FIVE_ONLY;
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&crate::adjustment_db::normalize_path(&book), 5)
+            .unwrap();
+        app.load_folder(root.clone());
+        app.finish_page_identity_preparation_for_test();
+        assert!(matches!(app.items.as_slice(), [GridItem::Folder(_)]));
+        app.selected = Some(0);
+        let previous = root.join("previous-return");
+        app.reading_history_return_from = Some(previous.clone());
+        let nav = accept_entry(&mut app, &ctx, Entry::Gamepad).unwrap();
+        assert!(matches!(nav, crate::ui_main::AddressBarNav::Direct(ref path, _) if path == &book));
+        assert_eq!(captured_paths(&app), [book]);
+        assert_eq!(app.reading_history_return_from.as_ref(), Some(&previous));
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert!(
+            !app.pending_auto_fs_open,
+            "the deferred gamepad difference is unchanged"
+        );
+    }
+}
+
+#[test]
+fn ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_click() {
+    for zip_book in [false, true] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.grid_click_selection_mode = crate::settings::GridClickSelectionMode::Explorer;
+        app.settings.grid_open_selected_item_on_click = false;
+        app.settings.ring_shortcuts.set_right_drag_mode(
+            crate::ring_shortcut::RightDragContext::Grid,
+            crate::ring_shortcut::RightDragMode::Disabled,
+        );
+        let source = app.tmp.path().join("smart-pointer-source");
+        std::fs::create_dir(&source).unwrap();
+        let book = source.join(if zip_book { "book.zip" } else { "book" });
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        if zip_book {
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+            writer
+                .start_file("001.png", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(png.get_ref()).unwrap();
+            writer.finish().unwrap();
+        } else {
+            std::fs::create_dir(&book).unwrap();
+            std::fs::write(book.join("001.png"), png.get_ref()).unwrap();
+        }
+        // Positive control: the same composite input reaches the ordinary footer.
+        app.load_folder(source.clone());
+        app.finish_page_identity_preparation_for_test();
+        let idx = app
+            .items
+            .iter()
+            .position(|item| item.container_path() == Some(book.as_path()))
+            .unwrap();
+        app.selected = Some(idx);
+        assert!(crate::ui_main::ratingnav649_pointer_open_for_test(&mut app, idx, true).is_some());
+        assert!(
+            app.context_menu_idx.is_some(),
+            "the secondary release is a real context-menu input"
+        );
+        app.context_menu_idx = None;
+        let snapshot = app.list_order.as_ref().unwrap().clone();
+        let mut definition = crate::settings::SmartFolderDefinition::new("Smart pointer receipt");
+        definition.rules.push(crate::settings::SmartFolderRule::new(
+            source.clone(),
+            true,
+            Default::default(),
+        ));
+        let id = definition.id;
+        app.settings.smart_folders.push(definition);
+        app.open_smart_folder_staged(id, false);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            app.poll_sidecar_restore(&ctx);
+            app.poll_smart_folder(&ctx);
+            app.poll_search(&ctx);
+            if app.items_are_smart_folder_view
+                && app.current_smart_folder_id == Some(id)
+                && app.smart_folder_pending.is_none()
+                && app.smart_folder_prepare_pending.is_none()
+                && app.smart_folder_transition.is_none()
+                && app.search_pending.is_none()
+                && !app.sidecar_restore_active()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Smart pointer fixture did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let idx = app
+            .items
+            .iter()
+            .position(|item| item.container_path() == Some(book.as_path()))
+            .expect("Smart root contains the book");
+        app.selected = Some(idx);
+        app.reading_history_return_from = Some(source.clone());
+        app.take_grid_container_open_accept_count_for_test();
+        let nav = crate::ui_main::ratingnav649_pointer_open_for_test(&mut app, idx, true);
+        assert_eq!(app.take_grid_container_open_accept_count_for_test(), 1);
+        assert!(nav.is_none(), "Smart request consumes the pointer open");
+        assert!(
+            app.smart_folder_transition.is_some()
+                || app.top_level_grid_view.open_path_classification().is_some()
+        );
+        assert!(
+            app.context_menu_idx.is_none(),
+            "consumed open must return before processing the secondary release"
+        );
+        assert_eq!(app.reading_history_return_from.as_ref(), Some(&source));
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert!(!app.pending_auto_fs_open);
+        assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+    }
 }
 
 macro_rules! case {

@@ -28,6 +28,16 @@ use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 // Headless pointer entry shared by the rating/list-order investigation tests.
 #[cfg(test)]
 pub(crate) fn ratingnav649_double_click_for_test(app: &mut App, idx: usize) -> AddressBarNav {
+    ratingnav649_pointer_open_for_test(app, idx, false)
+        .expect("physical double-click must reach the grid open handler")
+}
+
+#[cfg(test)]
+pub(crate) fn ratingnav649_pointer_open_for_test(
+    app: &mut App,
+    idx: usize,
+    simultaneous_secondary_release: bool,
+) -> Option<AddressBarNav> {
     let ctx = egui::Context::default();
     let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 120.0));
     let pos = rect.center();
@@ -44,6 +54,16 @@ pub(crate) fn ratingnav649_double_click_for_test(app: &mut App, idx: usize) -> A
                 pressed,
                 modifiers: egui::Modifiers::NONE,
             });
+        }
+        if frame == 4 && simultaneous_secondary_release {
+            for pressed in [true, false] {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
         }
         ctx.begin_pass(egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -83,7 +103,7 @@ pub(crate) fn ratingnav649_double_click_for_test(app: &mut App, idx: usize) -> A
             assert!(nav.is_none(), "selection/press alone must not open");
         }
     }
-    nav.expect("physical double-click must reach the grid open handler")
+    nav
 }
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
 use crate::wheel_input::consume_wheel_input;
@@ -17004,46 +17024,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         self.note_reading_history_open(idx);
                         self.drill_into_subfolder(p);
                     } else {
-                        let p = p.clone();
-                        let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                        #[cfg(windows)]
-                        if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx)
-                        {
+                        let Some(next_nav) = self.accept_grid_container_open(ctx, idx) else {
                             return nav;
-                        }
-                        if self.begin_smart_grid_container_navigation(
-                            idx,
-                            p.clone(),
-                            auto_fs,
-                            crate::app::StartupListIntent::container_open(auto_fs),
-                        ) {
-                            return nav;
-                        }
-                        self.note_reading_history_open(idx);
-                        self.maybe_suppress_rating_filter_for_opened_container(idx);
-                        if auto_fs {
-                            self.pending_auto_fs_open = true;
-                        }
-                        nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
+                        };
+                        nav = Some(next_nav);
                     }
                 }
-                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_)) => {
                     // Folder 分岐とは global_search drill-in 判定が違うためここは別のまま。
-                    let p = p.clone();
-                    let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                    #[cfg(windows)]
-                    if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
+                    let Some(next_nav) = self.accept_grid_container_open(ctx, idx) else {
                         return nav;
-                    }
-                    if self.begin_smart_grid_container_navigation(
-                        idx,
-                        p.clone(),
-                        auto_fs,
-                        crate::app::StartupListIntent::container_open(auto_fs),
-                    ) {
-                        return nav;
-                    }
-                    nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
+                    };
+                    nav = Some(next_nav);
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::Audio(_))

@@ -38,6 +38,23 @@
 
 ## 1. 優先候補
 
+### 1.480 通常フォルダをEnterで開くと、自動ページ表示ONでもページ一覧で止まる — 5ch >>649 の調査中に開発側で見つけた (2026-10-29)
+
+- 状態: **実装・独立レビュー・自動検証・確認用build完了、設計担当の検収待ち**。これは報告者が観測した現象ではない。>>649の評価フィルタと一覧順移動を非対話テストで調べた際、開発側で見つけた別不具合。評価フィルタON/OFFの両方で再現する。
+- 原因: `77f9a346d` (2026-09-27) でZIP/PDFのopen effectsを採用境界へ移す際、Enterの同じ分岐にあった通常Folderの自動表示予約も削除された。v4.1.0には予約があり、最初に欠落を含むtagはv4.2.0。v4.9.0までの該当ソースでも欠落を確認した (旧版の実行検査ではない)。
+- 方針: **2026-10-29設計担当決定**により、Enter・ダブルクリックのFolder/ZIP/PDF受付だけを `accept_grid_container_open` へ集約。既存double-clickと同じ通常Folderの履歴・評価解除・自動表示予約をEnterにも適用する。ZIP/PDFの採用時effects、double-click固有の検索drill-in、独立book openのownerは維持する。評価の一時解除を廃止せず、親一覧の記録列を広げない。
+- ゲームパッドの製品コードは変更しない。parkと拡張子付き実Folderの2差は、出荷済み挙動として別の **§1.481** へ分離した。
+- 検証: 調査時に失敗したEnter自動表示2件・一覧順移動12件を維持し、2入口の同じhelperへの到達、自動表示ON/OFF、履歴set/clearと帰路、ゲームパッドの従来経路を検査する。詳細な入口比較・履歴・結果は [一覧順移動計画 §12](list-order-book-navigation-plan.md#12-5ch-649-評価フィルタと一覧順移動の調査-2026-10-29)。
+- 結果: 焦点17件・lib全件14,888件成功、失敗0 (既存ignored 65件)。`cargo fmt` / `fmt --check` / `git diff --check`成功。通常featureのdev-runtime core/remote/EPUB workerを作成、起動なし・commitなし。実UIは未検証。
+
+### 1.481 ゲームパッドの本openとEnter/ダブルクリックで、parkと拡張子付き実フォルダの受付が異なる — §1.480 の着手前調査で開発側が確認 (2026-10-29)
+
+- 状態: **未着手・§1.480から分離（設計担当決定 2026-10-29）**。報告者が観測した不具合ではなく、コード・履歴から確認した出荷済みの入口差。今回の修正ではゲームパッドをhelperへ移さず、両差を維持する。
+- park: `handle_gamepad_grid_accept` のFolder/ZIP/PDFには、Enter/double-clickがauto時に呼ぶ `park_active_detached_context_for_new_grid_open` がない。ゲームパッドの初期追加 `07eb006ce` からこの差があり、park導入 `5ba4d5373` もゲームパッドを変更していない。現在はmain前面ならrootの一覧へ配送されるため、active contextが有っても「常にviewerへ配送されるのでpark不要」とは説明できない。一方、下位ZIPには別のpreserve/promote処理もあるため、呼出しを足すだけで直ると断定しない。
+- 実フォルダの判別: double-clickは `GridItem::Folder` の型で履歴記録・評価解除・自動表示予約を行うが、ゲームパッドは `!is_virtual_folder(path)` という拡張子判定を使う。実directoryの名前が `A.zip` / `A.pdf` 等の場合、ゲームパッドだけこの副作用を実行しない。差は `77f9a346d` で入り、v4.9.0にも存在する。
+- 修正時: main/activeの配送と下位ZIPの退避・昇格を含めて所有境界を調査し、どの入力でどの本と窓を保持するか先に決める。[CLAUDE.md「Detached viewer リワーク中のルール」](../CLAUDE.md#detached-viewer-リワーク中のルール) と [detached計画 §2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要) に従い、構造的修正の合意と§11の記録を行う。症状guardや新しいpendingで吸収しない。
+- 検証: 同じmain/active contextと本でEnter/double-click/gamepadを比較し、park先・窓の保持・本のowner・一覧記録・履歴を確認する。拡張子付き実Folderは型と物理実体に基づく採択仕様を直接検査する。§1.480の回帰には、ゲームパッドの拡張子付き実Folderの受付が従来のままである検査を追加する。
+
 ### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
 
 - 状態: **未着手・修正対象として採用 (2026-10-29)**。修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。

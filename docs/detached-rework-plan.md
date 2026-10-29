@@ -1455,6 +1455,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-29 §1.480 Enterとdouble-clickの本open受付の共通化
+
+設計担当ClaudeCodeの決定に従い、`accept_grid_container_open`へEnter/double-clickの
+Folder/ZIP/PDF受付を集約し、Enterで失われていた通常Folderの履歴・評価解除・auto予約を復元する。
+ここでのdetached変更は、両入口が既に行っていたauto時の
+`park_active_detached_context_for_new_grid_open`呼出しをhelperへ移すことだけ。
+独立book openは従来どおりhelperより前に専用ownerへ配送する。
+gamepadにはparkを新規適用せず、製品コードを変更しない。未確定の入口差は別の§1.481へ分離した。
+
+新しいdetached述語・状態・runtime/window owner・park/mount処理・viewport・focus・配置の
+変更はない。既存受付の副作用を一つの所有境界へ戻す構造的修正であり、症状guard・遅延・
+retry・追加repaintによる回避ではないことに、設計担当の指示とCodexの前提確認・独立設計レビュー
+(GPT-6.1 Sol / xhigh) で合意した。入口比較と検証結果は
+[一覧順移動計画 §12](list-order-book-navigation-plan.md#12-5ch-649-評価フィルタと一覧順移動の調査-2026-10-29)へ記録する。
+
 ### 2026-10-28 §1.79 比較元画像版の worker 所有（実装・独立レビュー済み）
 
 ClaudeCode の `target/fsview-work/design-1079.md` 第3版（独立設計レビュー2回済み）に従い、
