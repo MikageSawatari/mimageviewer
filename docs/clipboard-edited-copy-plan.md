@@ -177,9 +177,12 @@ UI スレッド (メニュー dispatch)                     worker "clipboard-ed
   (stable name `CopyEditedImageToClipboard`、表示「編集を反映した画像をコピー」)。
   native / egui 両方のメニューに同じ model から出る。保存済みのメニュー並びを持つ利用者にも、
   既定位置 (既存コピーの直後) に現れること。
-- キー: `KeyAction::FsCopyEditedImage` を足し、**既定キーは割り当てない** (フルスクリーン context、
-  環境設定で割り当て可能)。対象はフルスクリーンのメニューと同じ。`docs/keymap.ini.default`・
-  `docs/keymap-spec.md` を揃える。一覧のキーとリング操作は v1 では足さない。
+- キー: `KeyAction::FsCopyEditedImage` と `GridCopyEditedImage` は**既定キーなし**で割り当て可能。
+  §1.477 (2026-10-29、実装済み・実機未確認) で一覧のキーと `RingActionId::CopyEditedImage`
+  (`copy_edited_image`) を追加し、キー / リング / ジェスチャ / マウスボタン / Xリングを
+  メニューと同じ受付へ通す。一覧は選択中の1項目、画像FSはチェック集合によらず表示中のページが対象。
+  一覧にチェックがある場合はメニューと同じく本操作を出さず、割り当てからも何もしない。
+  コピー5種の対応表・適格性は [キー仕様](keymap-spec.md#コピー操作の割り当て1477) を参照。
 - mIV Remote は対象外。
 
 ## 8. テスト

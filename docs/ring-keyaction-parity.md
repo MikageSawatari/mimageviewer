@@ -5,6 +5,24 @@
 > 「リング/パッド/ジェスチャ (`RingActionId`) には登録したが、キーボード (`KeyAction`) には
 > 登録し忘れた」操作を洗い出し、再発を防ぐための対応表。
 
+## コピー5種の対応（§1.477、2026-10-29）
+
+**実装済み・実機未確認。** 次の5操作はGrid / ImageFullscreenの両方で候補とし、
+キー / リング / ジェスチャ / マウスボタン / Xリングを共通実行経路へ通す。
+動画・音声フルスクリーンには追加しない。
+
+| RingActionId | Grid KeyAction | FsImage KeyAction | 保存ID |
+| --- | --- | --- | --- |
+| `CopyFiles` | `GridCopyFiles` | `FsCopyFiles` | `copy_files`（追加） |
+| `ImageCopyPath` | `GridCopyPath` | `FsCopyPath` | `image_copy_path`（維持） |
+| `ImageCopyFileName` | `GridCopyFileName` | `FsCopyFileName` | `image_copy_file_name`（維持） |
+| `ImageCopyToClipboard` | `GridCopyImage` | `FsCopyImage` | `image_copy_to_clipboard`（維持） |
+| `CopyEditedImage` | `GridCopyEditedImage` | `FsCopyEditedImage` | `copy_edited_image`（追加） |
+
+既定は従来の `GridCopyFiles` = Ctrl+Cだけで、追加の割り当てはない。
+旧3操作も固定allowlistからKeyAction対応済みへ移す。既存保存IDの意味は変えない。
+対象解決・非対応条件は [キー仕様](keymap-spec.md#コピー操作の割り当て1477) を参照。
+
 ## 背景
 
 `RingActionId` (126 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
@@ -25,7 +43,10 @@
 - ⚪ 設計上 ring/パッド専用 (場所ジャンプ等。キー化不要)
 - 固定: キーボード入力としては予約・OS/Shell 連携・マウス専用などの理由で keymap 対象外
 
-## 集計 (actionable 124 / `None`・`Unknown` 除く)
+## 初回棚卸し時の集計 (2026-06-25、actionable 124 / `None`・`Unknown` 除く)
+
+以下の件数は初回棚卸しの記録。後続追加を含む現在の分類はソースの恒久テストを正とし、
+コピー操作の現行対応は上の§1.477を参照する。
 
 | 判定 | 件数 |
 |---|---|
@@ -61,8 +82,8 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 | `ClearRecentFolders` | フォルダバー設定「最近開いたフォルダ履歴をクリア」 | KeyAction 化 | ✅ `GridClearRecentFolders` として KeyAction 化。既定キーなし、Grid 文脈だけで共有のクリア・保存・通知入口を実行する |
 | `ClearQuickFolderSlots` | フォルダバー設定「A/B の記憶した場所と一覧位置をクリア」 | KeyAction 化 | ✅ `GridClearQuickFolderSlots` として KeyAction 化。既定キーなし、Grid 文脈だけで共有のクリア・保存・通知入口を実行する。永続名は互換維持 |
 | `ImageHome` / `ImageEnd` | Home/End 生処理 | KeyAction 化 | ✅ `FsJumpFirst` / `FsJumpLast` として KeyAction 化。既定 Home / End。画像 / 動画フルスクリーン共通 |
-| `ImageCopyToClipboard` | ring/マウス/パッドから clipboard copy を実行 | 固定明記が妥当 | 固定。OS クリップボード経路で、通常の Ctrl+C / Shell menu / context menu と同じ固定入力レイヤーに置く |
-| `ImageCopyPath` / `ImageCopyFileName` | ring/マウス/パッドからパス / ファイル名を clipboard へコピー | 固定明記 or KeyAction | 固定。OS クリップボード / Shell 連携として keymap 対象外 |
+| `ImageCopyToClipboard` | ring/マウス/パッドから画像をコピー | KeyAction化（§1.477） | ✅ `GridCopyImage` / `FsCopyImage`。メニューと同じ元画像コピーを実行する |
+| `ImageCopyPath` / `ImageCopyFileName` | ring/マウス/パッドからパス / ファイル名をコピー | KeyAction化（§1.477） | ✅ `GridCopyPath` / `FsCopyPath`、`GridCopyFileName` / `FsCopyFileName`。旧保存IDを維持する |
 | `ImageOpenFolder` | ring/マウス/パッドから Explorer で表示フォルダを開く。対応するキー操作なし | KeyAction 化 or ring 専用明記 | ⚪ ring 専用。画像フルスクリーン中の補助操作で、既存キーボード操作は無い |
 | `GridToggleSnapshotLock` | ring/マウス/パッドから ★固定を切替。対応するキー操作なし | キー操作があれば KeyAction、無ければ ring 専用明記 | ⚪ ring 専用。フォルダバー UI とリング用の一発操作として扱う |
 

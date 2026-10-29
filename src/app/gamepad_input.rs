@@ -8121,6 +8121,47 @@ impl App {
 
         match action {
             RingActionId::None | RingActionId::Unknown(_) => None,
+            action @ (RingActionId::CopyFiles
+            | RingActionId::ImageCopyPath
+            | RingActionId::ImageCopyFileName
+            | RingActionId::ImageCopyToClipboard
+            | RingActionId::CopyEditedImage) => {
+                let key = match (context, action) {
+                    (RingShortcutContext::Grid, RingActionId::CopyFiles) => {
+                        KeyAction::GridCopyFiles
+                    }
+                    (RingShortcutContext::Grid, RingActionId::ImageCopyPath) => {
+                        KeyAction::GridCopyPath
+                    }
+                    (RingShortcutContext::Grid, RingActionId::ImageCopyFileName) => {
+                        KeyAction::GridCopyFileName
+                    }
+                    (RingShortcutContext::Grid, RingActionId::ImageCopyToClipboard) => {
+                        KeyAction::GridCopyImage
+                    }
+                    (RingShortcutContext::Grid, RingActionId::CopyEditedImage) => {
+                        KeyAction::GridCopyEditedImage
+                    }
+                    (RingShortcutContext::ImageFullscreen, RingActionId::CopyFiles) => {
+                        KeyAction::FsCopyFiles
+                    }
+                    (RingShortcutContext::ImageFullscreen, RingActionId::ImageCopyPath) => {
+                        KeyAction::FsCopyPath
+                    }
+                    (RingShortcutContext::ImageFullscreen, RingActionId::ImageCopyFileName) => {
+                        KeyAction::FsCopyFileName
+                    }
+                    (RingShortcutContext::ImageFullscreen, RingActionId::ImageCopyToClipboard) => {
+                        KeyAction::FsCopyImage
+                    }
+                    (RingShortcutContext::ImageFullscreen, RingActionId::CopyEditedImage) => {
+                        KeyAction::FsCopyEditedImage
+                    }
+                    _ => return None,
+                };
+                self.execute_copy_key_action(ctx, key);
+                None
+            }
             RingActionId::ImagePageOverview => {
                 if context == RingShortcutContext::ImageFullscreen {
                     self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
@@ -8458,39 +8499,11 @@ impl App {
                 }
                 None
             }
-            RingActionId::ImageCopyToClipboard
-                if context == RingShortcutContext::ImageFullscreen =>
-            {
-                if let Some(fs_idx) = self.fullscreen_idx
-                    && !self.copy_item_image_to_clipboard(fs_idx)
-                {
-                    self.show_feedback_warning(
-                        "この項目は画像コピーに対応していません".to_string(),
-                    );
-                }
-                None
-            }
             RingActionId::ImageOpenFolder if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.open_item_folder_in_explorer(fs_idx)
                 {
                     self.show_feedback_warning("フォルダを開けません".to_string());
-                }
-                None
-            }
-            RingActionId::ImageCopyPath if context == RingShortcutContext::ImageFullscreen => {
-                if let Some(fs_idx) = self.fullscreen_idx
-                    && !self.copy_item_path_to_clipboard(ctx, fs_idx)
-                {
-                    self.show_feedback_warning("パスをコピーできません".to_string());
-                }
-                None
-            }
-            RingActionId::ImageCopyFileName if context == RingShortcutContext::ImageFullscreen => {
-                if let Some(fs_idx) = self.fullscreen_idx
-                    && !self.copy_item_file_name_to_clipboard(ctx, fs_idx)
-                {
-                    self.show_feedback_warning("ファイル名をコピーできません".to_string());
                 }
                 None
             }

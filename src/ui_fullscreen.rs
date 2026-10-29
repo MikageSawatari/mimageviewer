@@ -35754,12 +35754,9 @@ impl App {
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
-        let key_copy_edited = !is_video_fs
-            && !fs_music_view_active
-            && self.fs_context_menu_idx.is_none()
-            && self
-                .keymap
-                .consume_action_no_repeat(ctx, KeyAction::FsCopyEditedImage);
+        if !current_item_is_video && !fs_music_view_active && self.fs_context_menu_idx.is_none() {
+            self.handle_copy_action_keys(ctx, true);
+        }
         let key_sns_split = !is_video_fs
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
@@ -36793,10 +36790,6 @@ impl App {
             )
         {
             self.open_export_dialog_for_current(ctx, fs_idx);
-        }
-
-        if key_copy_edited {
-            self.request_edited_clipboard_copy(ctx, fs_idx, true);
         }
 
         // S: スライドショー開始/停止トグル (旧 P、左手で押しやすいよう S へ移行)

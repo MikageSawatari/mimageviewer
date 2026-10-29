@@ -1187,6 +1187,38 @@ fn epub_convert_submenu() -> MenuNode {
     }
 }
 
+/// Resolve the copy entries offered by the item menu, independently of menu layout.
+/// Shortcuts use this same eligibility and the page/representative label aliases.
+pub(crate) fn item_copy_command(
+    kind: ContextMenuItemKind,
+    has_checked: bool,
+    requested: MenuCommand,
+) -> Option<MenuCommand> {
+    use MenuCommand::*;
+    match requested {
+        CopyFiles if has_checked || kind.is_real_item() => Some(CopyFiles),
+        CopyPath if kind == ContextMenuItemKind::Stack && !has_checked => {
+            Some(CopyRepresentativePath)
+        }
+        CopyPath => Some(CopyPath),
+        CopyFileName if !has_checked && kind.has_file_name() => Some(CopyFileName),
+        CopyFileName if !has_checked && kind == ContextMenuItemKind::PdfPage => Some(CopyPageName),
+        CopyImageToClipboard
+            if !has_checked
+                && matches!(
+                    kind,
+                    ContextMenuItemKind::Image | ContextMenuItemKind::ZipImage
+                ) =>
+        {
+            Some(CopyImageToClipboard)
+        }
+        CopyEditedImageToClipboard if !has_checked && kind.supports_page_edits() => {
+            Some(CopyEditedImageToClipboard)
+        }
+        _ => None,
+    }
+}
+
 pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     let mut nodes = Vec::new();
 
@@ -1321,7 +1353,9 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         return apply_context_menu_layout(nodes, ContextMenuParentId::Root, &input.layout);
     }
 
-    if !input.is_folder_context && input.kind.is_real_item() {
+    if !input.is_folder_context
+        && item_copy_command(input.kind, false, MenuCommand::CopyFiles).is_some()
+    {
         push_group(
             &mut nodes,
             [
@@ -1362,7 +1396,9 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     }
 
     let mut copy_group = Vec::new();
-    if input.kind == ContextMenuItemKind::Stack {
+    if item_copy_command(input.kind, false, MenuCommand::CopyPath)
+        == Some(MenuCommand::CopyRepresentativePath)
+    {
         copy_group.push(item(
             MenuCommand::CopyRepresentativePath,
             "代表画像のパスをコピー",
@@ -1377,24 +1413,23 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             },
         ));
     }
-    if input.kind.has_file_name() && !input.is_folder_context {
+    if item_copy_command(input.kind, false, MenuCommand::CopyFileName)
+        == Some(MenuCommand::CopyFileName)
+        && !input.is_folder_context
+    {
         copy_group.push(item(MenuCommand::CopyFileName, "ファイル名をコピー"));
-    } else if input.kind == ContextMenuItemKind::PdfPage {
+    } else if item_copy_command(input.kind, false, MenuCommand::CopyFileName)
+        == Some(MenuCommand::CopyPageName)
+    {
         copy_group.push(item(MenuCommand::CopyPageName, "ページ名をコピー"));
     }
-    if matches!(
-        input.kind,
-        ContextMenuItemKind::Image | ContextMenuItemKind::ZipImage
-    ) {
+    if item_copy_command(input.kind, false, MenuCommand::CopyImageToClipboard).is_some() {
         copy_group.push(item(
             MenuCommand::CopyImageToClipboard,
             "画像をクリップボードにコピー",
         ));
     }
-    if matches!(
-        input.kind,
-        ContextMenuItemKind::Image | ContextMenuItemKind::ZipImage | ContextMenuItemKind::PdfPage
-    ) {
+    if item_copy_command(input.kind, false, MenuCommand::CopyEditedImageToClipboard).is_some() {
         copy_group.push(item(
             MenuCommand::CopyEditedImageToClipboard,
             "編集を反映した画像をコピー",
@@ -1665,6 +1700,55 @@ mod tests {
                 deselect: Some("Ctrl+D".to_string()),
             },
             layout: ContextMenuLayoutSettings::default(),
+        }
+    }
+
+    #[test]
+    fn copy_action_eligibility_matches_the_menu_for_every_item_kind() {
+        use ContextMenuItemKind::*;
+        for kind in [
+            Folder,
+            Image,
+            Video,
+            Audio,
+            ZipFile,
+            PdfFile,
+            ConvertibleArchive,
+            ZipImage,
+            PdfPage,
+            Stack,
+            ZipDir,
+            SearchContainer,
+            CollectionPlaceholder,
+        ] {
+            for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+                for checked in [false, true] {
+                    let mut snapshot = input(kind, surface);
+                    snapshot.has_checked = checked;
+                    snapshot.checked_count = usize::from(checked);
+                    let nodes = build_context_menu(&snapshot);
+                    for requested in [
+                        MenuCommand::CopyFiles,
+                        MenuCommand::CopyPath,
+                        MenuCommand::CopyFileName,
+                        MenuCommand::CopyImageToClipboard,
+                        MenuCommand::CopyEditedImageToClipboard,
+                    ] {
+                        let resolved = item_copy_command(kind, checked, requested.clone());
+                        if let Some(command) = resolved {
+                            assert!(
+                                command_state(&nodes, command.clone()).is_some(),
+                                "{kind:?}/{surface:?}/checked={checked}: {command:?}"
+                            );
+                        } else {
+                            assert!(
+                                command_state(&nodes, requested.clone()).is_none(),
+                                "{kind:?}/{surface:?}/checked={checked}: {requested:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

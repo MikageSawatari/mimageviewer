@@ -61698,8 +61698,13 @@ impl App {
             return;
         };
         if let Some(verb) = verb {
-            self.invoke_shell_clipboard_verb(ctx, verb);
+            if verb == crate::native_context_menu::ShellClipboardVerb::Copy {
+                self.execute_copy_key_action(ctx, KeyAction::GridCopyFiles);
+            } else {
+                self.invoke_shell_clipboard_verb(ctx, verb);
+            }
         }
+        self.handle_copy_action_keys(ctx, false);
 
         if ctrl_v {
             self.handle_clipboard_paste_with(

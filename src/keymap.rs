@@ -1626,6 +1626,10 @@ pub enum KeyAction {
     GridDeselect,
     GridCutFiles,
     GridCopyFiles,
+    GridCopyPath,
+    GridCopyFileName,
+    GridCopyImage,
+    GridCopyEditedImage,
     GridOrganizeFiles,
     GridToggleCheck,
     GridDelete,
@@ -1767,6 +1771,10 @@ pub enum KeyAction {
     FsAddToCollectionTarget,
     FsExport,
     FsCopyEditedImage,
+    FsCopyFiles,
+    FsCopyPath,
+    FsCopyFileName,
+    FsCopyImage,
     FsCompareToggle,
     FsCompareCycle,
     FsCompareWipe,
@@ -2226,6 +2234,10 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridCutFiles,
     KeyAction::GridCopyFiles,
+    KeyAction::GridCopyPath,
+    KeyAction::GridCopyFileName,
+    KeyAction::GridCopyImage,
+    KeyAction::GridCopyEditedImage,
     KeyAction::GridOrganizeFiles,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
@@ -2367,6 +2379,10 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsAddToCollectionTarget,
     KeyAction::FsExport,
     KeyAction::FsCopyEditedImage,
+    KeyAction::FsCopyFiles,
+    KeyAction::FsCopyPath,
+    KeyAction::FsCopyFileName,
+    KeyAction::FsCopyImage,
     KeyAction::FsCompareToggle,
     KeyAction::FsCompareCycle,
     KeyAction::FsCompareWipe,
@@ -4303,6 +4319,10 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridCutFiles => "GridCutFiles",
             GridCopyFiles => "GridCopyFiles",
+            GridCopyPath => "GridCopyPath",
+            GridCopyFileName => "GridCopyFileName",
+            GridCopyImage => "GridCopyImage",
+            GridCopyEditedImage => "GridCopyEditedImage",
             GridOrganizeFiles => "GridOrganizeFiles",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
@@ -4444,6 +4464,10 @@ impl KeyAction {
             FsAddToCollectionTarget => "FsAddToCollectionTarget",
             FsExport => "FsExport",
             FsCopyEditedImage => "FsCopyEditedImage",
+            FsCopyFiles => "FsCopyFiles",
+            FsCopyPath => "FsCopyPath",
+            FsCopyFileName => "FsCopyFileName",
+            FsCopyImage => "FsCopyImage",
             FsCompareToggle => "FsCompareToggle",
             FsCompareCycle => "FsCompareCycle",
             FsCompareWipe => "FsCompareWipe",
@@ -5060,6 +5084,10 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridCutFiles => "選択中またはチェック済みの実ファイル/実フォルダを切り取る",
             GridCopyFiles => "選択中またはチェック済みの実ファイル/実フォルダをコピーする",
+            GridCopyPath => "パスをコピー",
+            GridCopyFileName => "ファイル名をコピー",
+            GridCopyImage => "画像をクリップボードにコピー",
+            GridCopyEditedImage => "編集を反映した画像をコピー",
             GridOrganizeFiles => "選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => {
@@ -5209,6 +5237,10 @@ impl KeyAction {
             FsAddToCollectionTarget => "現在の実画像を追加先のコレクションへ追加する",
             FsExport => "現在の表示結果を別ファイルへ書き出す",
             FsCopyEditedImage => "編集を反映した画像をコピー",
+            FsCopyFiles => "表示中の実ファイルをコピーする",
+            FsCopyPath => "パスをコピー",
+            FsCopyFileName => "ファイル名をコピー",
+            FsCopyImage => "画像をクリップボードにコピー",
             FsCompareToggle => "現在の画像を比較スロットに固定または解除する",
             FsCompareCycle => "比較スロットのピン画像と現在画像を切り替えて表示する",
             FsCompareWipe => "ワイプ比較を切り替える",
@@ -5657,6 +5689,10 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridCopyPath
+            | GridCopyFileName
+            | GridCopyImage
+            | GridCopyEditedImage
             | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
@@ -5791,6 +5827,10 @@ impl KeyAction {
             | FsAddToCollectionTarget
             | FsExport
             | FsCopyEditedImage
+            | FsCopyFiles
+            | FsCopyPath
+            | FsCopyFileName
+            | FsCopyImage
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -6199,6 +6239,10 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridCopyPath
+            | GridCopyFileName
+            | GridCopyImage
+            | GridCopyEditedImage
             | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
@@ -6340,6 +6384,10 @@ impl KeyAction {
             | FsAddToCollectionTarget
             | FsExport
             | FsCopyEditedImage
+            | FsCopyFiles
+            | FsCopyPath
+            | FsCopyFileName
+            | FsCopyImage
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -6773,6 +6821,10 @@ impl KeyAction {
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridCutFiles => ChordList::one(Chord::ctrl(X)),
             GridCopyFiles => ChordList::one(Chord::ctrl(C)),
+            GridCopyPath => ChordList::EMPTY,
+            GridCopyFileName => ChordList::EMPTY,
+            GridCopyImage => ChordList::EMPTY,
+            GridCopyEditedImage => ChordList::EMPTY,
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridRename | GridReload | GridOrganizeFiles => ChordList::EMPTY,
@@ -6901,6 +6953,10 @@ impl KeyAction {
             FsAddToCollectionTarget => ChordList::EMPTY,
             FsExport => ChordList::one(Chord::ctrl(E)),
             FsCopyEditedImage => ChordList::EMPTY,
+            FsCopyFiles => ChordList::EMPTY,
+            FsCopyPath => ChordList::EMPTY,
+            FsCopyFileName => ChordList::EMPTY,
+            FsCopyImage => ChordList::EMPTY,
             FsCompareToggle => ChordList::one(Chord::key(X)),
             FsCompareCycle => ChordList::one(Chord::key(C)),
             FsCompareWipe => ChordList::one(Chord::shift(C)),
@@ -11239,6 +11295,11 @@ mod tests {
             "ImageBackgroundCycle".to_string(),
             "ImageFitModeCycle".to_string(),
             "ImageComparePin".to_string(),
+            "CopyFiles".to_string(),
+            "CopyEditedImage".to_string(),
+            "ImageCopyToClipboard".to_string(),
+            "ImageCopyPath".to_string(),
+            "ImageCopyFileName".to_string(),
             "ImageHome".to_string(),
             "ImageEnd".to_string(),
             "ImageSpreadShiftLeft".to_string(),
@@ -11284,13 +11345,10 @@ mod tests {
             "GridScrollBottom".to_string(),
             "GridToggleSnapshotLock".to_string(),
             "ImageOpenFolder".to_string(),
-            // These are intentionally fixed because they depend on OS/browser/clipboard routes
+            // These are intentionally fixed because they depend on OS/browser routes
             // or reserved navigation semantics rather than ordinary keymap dispatch.
             "GridHistoryBack".to_string(),
             "GridHistoryForward".to_string(),
-            "ImageCopyToClipboard".to_string(),
-            "ImageCopyPath".to_string(),
-            "ImageCopyFileName".to_string(),
             // PageUp/PageDown-style fixed direction for ring/mouse/gesture assignments.
             "ImageSpreadShiftPrev".to_string(),
             "ImageSpreadShiftNext".to_string(),
@@ -11376,6 +11434,65 @@ mod tests {
             Keymap::from_settings(&settings).effective_chords(action),
             vec![rebound]
         );
+    }
+
+    #[test]
+    fn copy_actions_keep_contexts_defaults_and_independent_overrides() {
+        use crate::context_menu_model::ContextMenuItemId;
+
+        let pairs = [
+            (KeyAction::GridCopyFiles, KeyAction::FsCopyFiles, None),
+            (
+                KeyAction::GridCopyPath,
+                KeyAction::FsCopyPath,
+                Some(ContextMenuItemId::CopyPath),
+            ),
+            (
+                KeyAction::GridCopyFileName,
+                KeyAction::FsCopyFileName,
+                Some(ContextMenuItemId::CopyFileName),
+            ),
+            (
+                KeyAction::GridCopyImage,
+                KeyAction::FsCopyImage,
+                Some(ContextMenuItemId::CopyImageToClipboard),
+            ),
+            (
+                KeyAction::GridCopyEditedImage,
+                KeyAction::FsCopyEditedImage,
+                Some(ContextMenuItemId::CopyEditedImageToClipboard),
+            ),
+        ];
+        let rebound = Chord::ctrl_shift(KeyName::C);
+        for (grid, fullscreen, menu_item) in pairs {
+            for (action, context) in [(grid, KeyContext::Grid), (fullscreen, KeyContext::FsImage)] {
+                assert!(KeyAction::all().contains(&action));
+                assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+                assert_eq!(action.context(), context);
+                assert_eq!(action.trigger(), KeyTrigger::Press);
+                assert!(action.is_user_facing());
+                if let Some(item) = menu_item {
+                    assert_eq!(action.description(), item.label());
+                }
+                let expected = if action == KeyAction::GridCopyFiles {
+                    vec![Chord::ctrl(KeyName::C)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(action.default_chords().iter().collect::<Vec<_>>(), expected);
+                let mut settings = KeymapSettings::default();
+                settings.set_override_chords(action, vec![rebound]);
+                let settings: KeymapSettings =
+                    serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+                let keymap = Keymap::from_settings(&settings);
+                assert_eq!(keymap.effective_chords(action), vec![rebound]);
+                let sibling = if action == grid { fullscreen } else { grid };
+                assert_eq!(
+                    keymap.effective_chords(sibling),
+                    sibling.default_chords().iter().collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

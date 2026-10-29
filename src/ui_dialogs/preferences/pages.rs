@@ -2437,6 +2437,10 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
     ui.add_space(12.0);
     let conflicted = conflicted_actions(&conflicts);
     let rows = command_overview_rows(state, &keymap, &conflicted);
+    let assignment_width = rows
+        .iter()
+        .map(|row| assignment_summary_width(ui, &row.assignments))
+        .fold(0.0_f32, f32::max);
     egui::Grid::new("operation_command_overview_actions")
         .num_columns(5)
         .spacing([10.0, 4.0])
@@ -2470,7 +2474,7 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
                 }
                 ui.label(row.label).on_hover_text(row.hover);
                 ui.label(row.context);
-                assignment_summary(ui, &row.assignments);
+                assignment_summary(ui, &row.assignments, assignment_width);
                 if row.status.is_empty() {
                     ui.label(egui::RichText::new("既定").weak());
                 } else {
@@ -2778,6 +2782,13 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         _ => return out,
     };
     let ring_action = match action {
+        KeyAction::GridCopyFiles | KeyAction::FsCopyFiles => RingActionId::CopyFiles,
+        KeyAction::GridCopyPath | KeyAction::FsCopyPath => RingActionId::ImageCopyPath,
+        KeyAction::GridCopyFileName | KeyAction::FsCopyFileName => RingActionId::ImageCopyFileName,
+        KeyAction::GridCopyImage | KeyAction::FsCopyImage => RingActionId::ImageCopyToClipboard,
+        KeyAction::GridCopyEditedImage | KeyAction::FsCopyEditedImage => {
+            RingActionId::CopyEditedImage
+        }
         KeyAction::GridParentFolder => RingActionId::GridParentFolder,
         KeyAction::GridTreeFolderPrev => RingActionId::TreeFolderPrev,
         KeyAction::GridTreeFolderNext => RingActionId::TreeFolderNext,
@@ -2967,18 +2978,52 @@ fn compact_operation_label_with_suffixes(label: &str, suffixes: &[&str]) -> Stri
     }
 }
 
-fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
+fn assignment_text_width(ui: &egui::Ui, text: impl Into<egui::WidgetText>) -> f32 {
+    text.into()
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::FontSelection::Default,
+        )
+        .size()
+        .x
+}
+
+fn assignment_values_width(ui: &egui::Ui, values: &[String]) -> f32 {
+    values
+        .iter()
+        .map(|value| assignment_text_width(ui, egui::RichText::new(value).monospace()))
+        .fold(0.0_f32, f32::max)
+}
+
+fn assignment_summary_width(ui: &egui::Ui, groups: &[(&str, Vec<String>)]) -> f32 {
+    groups
+        .iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(label, values)| {
+            assignment_text_width(ui, format!("{label}:"))
+                + ui.spacing().item_spacing.x
+                + assignment_values_width(ui, values)
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)], column_width: f32) {
     if groups.iter().all(|(_, values)| values.is_empty()) {
         ui.label(egui::RichText::new("なし").weak());
         return;
     }
 
     ui.vertical(|ui| {
+        ui.set_min_width(column_width.max(assignment_summary_width(ui, groups)));
         for (label, values) in groups {
             for value in values {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{label}:")).weak());
-                    ui.monospace(value);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(format!("{label}:")).weak()).extend(),
+                    );
+                    ui.add(egui::Label::new(egui::RichText::new(value).monospace()).extend());
                 });
             }
         }
@@ -3656,7 +3701,7 @@ fn command_editor_source_chord_section(
                             }
                             ui.label(compact_key_action_label(action))
                                 .on_hover_text(action.description());
-                            assignment_values(ui, &labels);
+                            assignment_values(ui, &labels, 0.0);
                             ui.label(chord_assignment_candidate_status(keymap, action, chord))
                                 .on_hover_text(
                                     "空きあり: 未使用のキー欄へ自動入力します。\n置換が必要: 編集ダイアログで置き換える行を選びます。",
@@ -4313,6 +4358,24 @@ fn command_list(
     let filter = state.command_filter.trim().to_string();
     let key_filter = state.command_key_filter.trim().to_string();
     let conflicted = conflicted_actions(conflicts);
+    let rows: Vec<_> = KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| {
+            action.is_user_facing()
+                && operation_keyboard_context_filter_matches(
+                    state.operation_keyboard_context,
+                    action.context(),
+                )
+                && command_action_matches_filter(*action, &filter)
+        })
+        .map(|action| (action, keymap.chord_labels(action)))
+        .filter(|(_, labels)| command_key_labels_match_filter(labels, &key_filter))
+        .collect();
+    let key_column_width = rows
+        .iter()
+        .map(|(_, labels)| assignment_values_width(ui, labels))
+        .fold(0.0_f32, f32::max);
     ui.label(egui::RichText::new("コマンド一覧").strong());
 
     egui::Grid::new("command_settings_actions")
@@ -4327,22 +4390,7 @@ fn command_list(
             ui.strong("状態");
             ui.end_row();
 
-            for &action in KeyAction::all()
-                .iter()
-                .filter(|action| action.is_user_facing())
-            {
-                if !operation_keyboard_context_filter_matches(
-                    state.operation_keyboard_context,
-                    action.context(),
-                ) {
-                    continue;
-                }
-                let labels = keymap.chord_labels(action);
-                if !command_action_matches_filter(action, &filter)
-                    || !command_key_labels_match_filter(&labels, &key_filter)
-                {
-                    continue;
-                }
+            for (action, labels) in rows {
                 let selected = state.command_selected == Some(action);
                 if ui
                     .selectable_label(selected, if selected { "選択中" } else { "編集" })
@@ -4354,7 +4402,7 @@ fn command_list(
                 ui.label(compact_key_action_label(action))
                     .on_hover_text(action.description());
 
-                assignment_values(ui, &labels);
+                assignment_values(ui, &labels, key_column_width);
 
                 ui.label(key_action_context_label(action));
 
@@ -4430,7 +4478,7 @@ fn command_editor_for_action(
 
     let effective_labels = keymap.chord_labels(action);
     ui.small("現在有効なキー:");
-    assignment_summary(ui, &[("キー", effective_labels)]);
+    assignment_summary(ui, &[("キー", effective_labels)], 0.0);
 
     let assignment_state = match state.settings.keymap.override_chord_labels(action) {
         Some(labels) if labels.is_empty() => "状態: キー割り当て解除を保存済み",
@@ -4722,13 +4770,16 @@ fn set_single_command_chord_input(state: &mut PreferencesState, label: &str) {
     state.command_edit_error = None;
 }
 
-fn assignment_values(ui: &mut egui::Ui, values: &[String]) {
+fn assignment_values(ui: &mut egui::Ui, values: &[String], column_width: f32) {
     if values.is_empty() {
         ui.label(egui::RichText::new("未設定").weak());
     } else {
         ui.vertical(|ui| {
+            // A chord is one unit; only separate bindings start a new line.
+            // Reserve its measured font width before Grid lays out later columns.
+            ui.set_min_width(column_width.max(assignment_values_width(ui, values)));
             for value in values {
-                ui.monospace(value);
+                ui.add(egui::Label::new(egui::RichText::new(value).monospace()).extend());
             }
         });
     }
@@ -12371,6 +12422,195 @@ mod tests {
                 RingActionId::OpenOperationCustomize,
             )]
         );
+    }
+
+    #[test]
+    fn copy_key_actions_map_to_matching_ring_contexts() {
+        for (grid, image, ring) in [
+            (
+                KeyAction::GridCopyFiles,
+                KeyAction::FsCopyFiles,
+                RingActionId::CopyFiles,
+            ),
+            (
+                KeyAction::GridCopyPath,
+                KeyAction::FsCopyPath,
+                RingActionId::ImageCopyPath,
+            ),
+            (
+                KeyAction::GridCopyFileName,
+                KeyAction::FsCopyFileName,
+                RingActionId::ImageCopyFileName,
+            ),
+            (
+                KeyAction::GridCopyImage,
+                KeyAction::FsCopyImage,
+                RingActionId::ImageCopyToClipboard,
+            ),
+            (
+                KeyAction::GridCopyEditedImage,
+                KeyAction::FsCopyEditedImage,
+                RingActionId::CopyEditedImage,
+            ),
+        ] {
+            for (action, context) in [
+                (grid, RingShortcutContext::Grid),
+                (image, RingShortcutContext::ImageFullscreen),
+            ] {
+                assert_eq!(
+                    ring_bindings_for_key_action(action),
+                    vec![(context, ring.clone())]
+                );
+                assert!(operation_assignment_tab_enabled(
+                    &OperationAssignmentTarget::Key(action),
+                    OperationAssignmentTab::RingPad,
+                ));
+                assert!(operation_assignment_tab_enabled(
+                    &OperationAssignmentTarget::Key(action),
+                    OperationAssignmentTab::MouseButtons,
+                ));
+            }
+        }
+    }
+
+    fn command_chord_layout_state() -> PreferencesState {
+        let mut state = zoom_key_editor_state();
+        state.command_filter = "コピー".into();
+        state.command_key_filter = "Ctrl+".into();
+        state.operation_keyboard_context = Some(crate::keymap::KeyContext::Grid);
+        for &action in KeyAction::all() {
+            state.settings.keymap.set_override_chords(action, vec![]);
+        }
+        for (action, labels) in command_chord_layout_bindings() {
+            let chords = labels
+                .iter()
+                .map(|label| {
+                    crate::keymap::parse_chord_for_action(action, label)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            state.settings.keymap.set_override_chords(action, chords);
+        }
+        state
+    }
+
+    fn command_chord_layout_bindings() -> [(KeyAction, Vec<&'static str>); 2] {
+        [
+            (
+                KeyAction::GridCopyFiles,
+                vec!["Ctrl+Alt+NumpadSubtract", "Ctrl+Alt+-"],
+            ),
+            (
+                KeyAction::GridCopyPath,
+                vec!["Ctrl+Shift+PageUp", "Alt+Home", "Ctrl+Shift+F24"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn command_chords_keep_one_line_and_reserve_measured_column_width() {
+        use egui_kittest::kittest::Queryable;
+
+        for (width, zoom, font_size) in [(760.0, 1.0, 13.0), (300.0, 1.0, 20.0), (760.0, 2.0, 17.0)]
+        {
+            let state = command_chord_layout_state();
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(width, 720.0))
+                .build_ui_state(
+                    move |ui, (state, expected, fonts_ready)| {
+                        if !*fonts_ready {
+                            crate::ui_fonts::configure_fonts(ui.ctx());
+                            ui.ctx().set_zoom_factor(zoom);
+                            *fonts_ready = true;
+                            ui.ctx().request_repaint();
+                            return;
+                        }
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Monospace,
+                            egui::FontId::monospace(font_size),
+                        );
+                        let keymap = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+                        expected.clear();
+                        for (action, _) in command_chord_layout_bindings() {
+                            for value in keymap.chord_labels(action) {
+                                let galley =
+                                    egui::WidgetText::from(egui::RichText::new(&value).monospace())
+                                        .into_galley(
+                                            ui,
+                                            Some(egui::TextWrapMode::Extend),
+                                            f32::INFINITY,
+                                            egui::FontSelection::Default,
+                                        );
+                                expected.push((value, galley.size()));
+                            }
+                        }
+                        super::command_list(ui, state, &keymap, &[]);
+                    },
+                    (state, Vec::<(String, egui::Vec2)>::new(), false),
+                );
+            harness.run();
+            let expected = &harness.state().1;
+            assert_eq!(expected.len(), 5);
+            let key_left = harness.get_by_label(&expected[0].0).rect().left();
+            let mut key_right = key_left;
+            for (value, size) in expected {
+                let rect = harness.get_by_label(value).rect();
+                assert!(
+                    (rect.width() - size.x).abs() <= 1.0,
+                    "{value}: {rect:?} vs {size:?}"
+                );
+                assert!(
+                    (rect.height() - size.y).abs() <= 1.0,
+                    "chord wrapped: {value}"
+                );
+                assert!(
+                    (rect.left() - key_left).abs() <= 1.0,
+                    "key column must align"
+                );
+                key_right = key_right.max(rect.right());
+            }
+            let path_chords: Vec<_> = expected[2..]
+                .iter()
+                .map(|(label, _)| harness.get_by_label(label).rect())
+                .collect();
+            assert!(
+                path_chords
+                    .windows(2)
+                    .all(|pair| pair[0].bottom() <= pair[1].top())
+            );
+            let contexts: Vec<_> = harness
+                .get_all_by_label(super::key_action_context_label(KeyAction::GridCopyFiles))
+                .collect();
+            assert!(!contexts.is_empty());
+            for context in contexts {
+                assert!(
+                    context.rect().left() + 1.0 >= key_right,
+                    "next column overlaps chord"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_chords_catalog_snapshot_dark() {
+        let mut state = command_chord_layout_state();
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(900.0, 300.0))
+            .build_ui(move |ui| {
+                crate::os_theme::apply_resolved(ui.ctx(), crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts_ready = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                let keymap = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+                super::command_list(ui, &mut state, &keymap, &[]);
+            });
+        harness.run();
+        harness.snapshot("command_chords_catalog_dark");
     }
 
     #[test]

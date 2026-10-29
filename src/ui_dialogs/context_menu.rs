@@ -395,6 +395,13 @@ fn classify_checked_file_operation_selection(
 }
 
 #[derive(Clone)]
+enum ItemCopyMenuSubject {
+    Item,
+    BookmarkSource(PathBuf),
+    Unavailable,
+}
+
+#[derive(Clone)]
 struct NativeGridContextMenuTarget {
     shell_paths: Option<Vec<PathBuf>>,
     real_paths: Vec<PathBuf>,
@@ -402,6 +409,7 @@ struct NativeGridContextMenuTarget {
     checked_file_operation_selection: CheckedFileOperationSelection,
     item: GridItem,
     item_index: Option<usize>,
+    copy_subject: ItemCopyMenuSubject,
     is_folder_context: bool,
     has_checked: bool,
     checked_count: usize,
@@ -425,6 +433,20 @@ const COLLECTION_JUMP_NO_PARENT_MESSAGE: &str =
     "ドライブまたは共有ルートには親フォルダがありません";
 
 impl NativeGridContextMenuTarget {
+    fn copy_command(&self, requested: MenuCommand) -> Option<MenuCommand> {
+        match &self.copy_subject {
+            ItemCopyMenuSubject::BookmarkSource(_) => {
+                (requested == MenuCommand::CopyPath).then_some(requested)
+            }
+            ItemCopyMenuSubject::Unavailable => None,
+            ItemCopyMenuSubject::Item => crate::context_menu_model::item_copy_command(
+                ContextMenuItemKind::from_grid_item(&self.item),
+                self.has_checked,
+                requested,
+            ),
+        }
+    }
+
     fn is_fullscreen_video(&self) -> bool {
         self.surface == ContextMenuSurface::Fullscreen && matches!(self.item, GridItem::Video(_))
     }
@@ -793,6 +815,101 @@ fn windows_path_root_for_file_operation(path: &Path) -> Option<String> {
 }
 
 impl crate::app::App {
+    /// Key and ring copy actions resolve the same item snapshot as its context menu.
+    pub(crate) fn execute_copy_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: crate::keymap::KeyAction,
+    ) {
+        self.dispatch_copy_key_action_with(ctx, action, |app, ctx, command, target| {
+            let _ = app.dispatch_native_grid_context_command(ctx, command, target);
+        });
+    }
+
+    fn dispatch_copy_key_action_with(
+        &mut self,
+        ctx: &egui::Context,
+        action: crate::keymap::KeyAction,
+        dispatch: impl FnOnce(&mut Self, &egui::Context, MenuCommand, &NativeGridContextMenuTarget),
+    ) {
+        use crate::keymap::KeyAction::*;
+        let (surface, requested) = match action {
+            GridCopyFiles => (ContextMenuSurface::Grid, MenuCommand::CopyFiles),
+            GridCopyPath => (ContextMenuSurface::Grid, MenuCommand::CopyPath),
+            GridCopyFileName => (ContextMenuSurface::Grid, MenuCommand::CopyFileName),
+            GridCopyImage => (ContextMenuSurface::Grid, MenuCommand::CopyImageToClipboard),
+            GridCopyEditedImage => (
+                ContextMenuSurface::Grid,
+                MenuCommand::CopyEditedImageToClipboard,
+            ),
+            FsCopyFiles => (ContextMenuSurface::Fullscreen, MenuCommand::CopyFiles),
+            FsCopyPath => (ContextMenuSurface::Fullscreen, MenuCommand::CopyPath),
+            FsCopyFileName => (ContextMenuSurface::Fullscreen, MenuCommand::CopyFileName),
+            FsCopyImage => (
+                ContextMenuSurface::Fullscreen,
+                MenuCommand::CopyImageToClipboard,
+            ),
+            FsCopyEditedImage => (
+                ContextMenuSurface::Fullscreen,
+                MenuCommand::CopyEditedImageToClipboard,
+            ),
+            _ => return,
+        };
+        if !self.grid_item_input_allowed() {
+            return;
+        }
+        let idx = match surface {
+            ContextMenuSurface::Grid => self.selected.or_else(|| {
+                // Ctrl+C historically works on a checked set without a cursor, too.
+                (action == GridCopyFiles)
+                    .then(|| self.checked.iter().copied().min())
+                    .flatten()
+            }),
+            ContextMenuSurface::Fullscreen => self.fullscreen_idx,
+        };
+        let Some(idx) = idx else { return };
+        let Some(item) = self.items.get(idx).cloned() else {
+            return;
+        };
+        let has_checked = surface == ContextMenuSurface::Grid && !self.checked.is_empty();
+        let target = self.context_menu_target(idx, item, false, has_checked, None, surface, None);
+        let command = target.copy_command(requested);
+        // Preserve the released GridCopyFiles refusal for a virtual selection.
+        let Some(command) =
+            command.or_else(|| (action == GridCopyFiles).then_some(MenuCommand::CopyFiles))
+        else {
+            return;
+        };
+        dispatch(self, ctx, command, &target);
+    }
+
+    pub(crate) fn handle_copy_action_keys(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        use crate::keymap::KeyAction::*;
+        let actions = if fullscreen {
+            [
+                FsCopyFiles,
+                FsCopyPath,
+                FsCopyFileName,
+                FsCopyImage,
+                FsCopyEditedImage,
+            ]
+            .as_slice()
+        } else {
+            // GridCopyFiles also accepts the OS semantic Copy event at its existing checkpoint.
+            [
+                GridCopyPath,
+                GridCopyFileName,
+                GridCopyImage,
+                GridCopyEditedImage,
+            ]
+            .as_slice()
+        };
+        for &action in actions {
+            if self.keymap.consume_action_no_repeat(ctx, action) {
+                self.execute_copy_key_action(ctx, action);
+            }
+        }
+    }
     pub(crate) fn capture_grid_context_menu_owner(&self, index: usize) -> GridContextMenuOwner {
         GridContextMenuOwner {
             index,
@@ -831,6 +948,7 @@ impl crate::app::App {
         let mut open_bookmark = false;
         let mut delete_bookmark = false;
         let mut open_explorer = false;
+        let mut copy_path = false;
         let checked_count = self.checked.len();
         let pos = self.context_menu_pos;
         egui::Window::new("bookmark-grid-context")
@@ -850,7 +968,7 @@ impl crate::app::App {
                     close = true;
                 }
                 if ui.button("パスをコピー").clicked() {
-                    copy_path_text(ctx, &source);
+                    copy_path = true;
                     close = true;
                 }
                 if explorer_target.is_some()
@@ -881,6 +999,18 @@ impl crate::app::App {
                     close = true;
                 }
             });
+        if copy_path {
+            let target = self.context_menu_target(
+                idx,
+                row.item.clone(),
+                false,
+                false,
+                None,
+                ContextMenuSurface::Grid,
+                None,
+            );
+            let _ = self.dispatch_native_grid_context_command(ctx, MenuCommand::CopyPath, &target);
+        }
         if open_bookmark {
             self.open_bookmark_browser_row(ctx, &row);
         }
@@ -1029,88 +1159,6 @@ impl crate::app::App {
         }
 
         nav
-    }
-
-    pub(crate) fn copy_item_path_to_clipboard(&mut self, ctx: &egui::Context, idx: usize) -> bool {
-        let Some(item) = self.items.get(idx).cloned() else {
-            return false;
-        };
-        let text = match item {
-            GridItem::Image(path)
-            | GridItem::Video(path)
-            | GridItem::Audio(path)
-            | GridItem::Folder(path)
-            | GridItem::ZipFile(path)
-            | GridItem::PdfFile(path) => native_path_text(&path),
-            GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
-                native_path_text(&path)
-            }
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            }
-            | GridItem::ZipDir {
-                zip_path,
-                dir_prefix: entry_name,
-                ..
-            } => format!("{}:{}", native_path_text(&zip_path), entry_name),
-            GridItem::PdfPage {
-                pdf_path, page_num, ..
-            } => format!("{}:Page {}", native_path_text(&pdf_path), page_num + 1),
-            // ファイル名スタック: 代表画像の実パスをコピー。
-            GridItem::Stack { representative, .. } => native_path_text(&representative),
-            GridItem::CollectionPlaceholder { path, .. } => native_path_text(&path),
-        };
-        ctx.copy_text(text);
-        true
-    }
-
-    pub(crate) fn copy_item_file_name_to_clipboard(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-    ) -> bool {
-        let Some(item) = self.items.get(idx) else {
-            return false;
-        };
-        let name = item.name().to_string();
-        if name.is_empty() {
-            return false;
-        }
-        ctx.copy_text(name);
-        true
-    }
-
-    pub(crate) fn copy_item_image_to_clipboard(&mut self, idx: usize) -> bool {
-        let Some(item) = self.items.get(idx).cloned() else {
-            return false;
-        };
-        let rotation = self.get_rotation(idx);
-        match item {
-            GridItem::Image(path) => {
-                copy_image_to_clipboard(
-                    &path,
-                    rotation,
-                    self.raw_develop_executor.clone(),
-                    self.settings.raw_brightness,
-                );
-                true
-            }
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => {
-                copy_zip_image_to_clipboard(
-                    &zip_path,
-                    &entry_name,
-                    rotation,
-                    self.raw_develop_executor.clone(),
-                    self.settings.raw_brightness,
-                );
-                true
-            }
-            _ => false,
-        }
     }
 
     pub(crate) fn open_item_folder_in_explorer(&mut self, idx: usize) -> bool {
@@ -1341,6 +1389,21 @@ impl crate::app::App {
             checked_file_operation_selection,
             item,
             item_index: (!is_folder_context).then_some(idx),
+            copy_subject: if surface == ContextMenuSurface::Grid && !is_folder_context {
+                if self.items_are_drive_list {
+                    ItemCopyMenuSubject::Unavailable
+                } else if self.items_are_bookmark_view {
+                    self.bookmark_browser_rows
+                        .get(idx)
+                        .map_or(ItemCopyMenuSubject::Unavailable, |row| {
+                            ItemCopyMenuSubject::BookmarkSource(row.source_path().to_path_buf())
+                        })
+                } else {
+                    ItemCopyMenuSubject::Item
+                }
+            } else {
+                ItemCopyMenuSubject::Item
+            },
             is_folder_context,
             has_checked,
             checked_count: if has_checked { self.checked.len() } else { 0 },
@@ -1438,7 +1501,7 @@ impl crate::app::App {
                     ),
                     ContextMenuSurface::Fullscreen => (
                         None,
-                        None,
+                        Some(crate::keymap::KeyAction::FsCopyFiles),
                         crate::keymap::KeyAction::FsRotateCcw,
                         crate::keymap::KeyAction::FsRotateCw,
                         None,
@@ -1715,6 +1778,14 @@ impl crate::app::App {
                 None
             }
             MenuCommand::CopyPath | MenuCommand::CopyRepresentativePath => {
+                match &target.copy_subject {
+                    ItemCopyMenuSubject::BookmarkSource(path) => {
+                        copy_path_text(ctx, path);
+                        return None;
+                    }
+                    ItemCopyMenuSubject::Unavailable => return None,
+                    ItemCopyMenuSubject::Item => {}
+                }
                 if target.has_checked
                     && target.checked_file_operation_selection
                         != CheckedFileOperationSelection::RealOnly
@@ -3282,6 +3353,547 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 }
 
 #[cfg(test)]
+mod copy_action_tests {
+    use super::*;
+    use crate::keymap::KeyAction;
+
+    fn actions() -> [(KeyAction, KeyAction, MenuCommand); 5] {
+        use KeyAction::*;
+        [
+            (GridCopyFiles, FsCopyFiles, MenuCommand::CopyFiles),
+            (GridCopyPath, FsCopyPath, MenuCommand::CopyPath),
+            (GridCopyFileName, FsCopyFileName, MenuCommand::CopyFileName),
+            (
+                GridCopyImage,
+                FsCopyImage,
+                MenuCommand::CopyImageToClipboard,
+            ),
+            (
+                GridCopyEditedImage,
+                FsCopyEditedImage,
+                MenuCommand::CopyEditedImageToClipboard,
+            ),
+        ]
+    }
+
+    fn take_copied_text(ctx: &egui::Context) -> Vec<String> {
+        ctx.output_mut(|out| {
+            std::mem::take(&mut out.commands)
+                .into_iter()
+                .filter_map(|command| {
+                    if let egui::OutputCommand::CopyText(text) = command {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+    }
+
+    fn bookmark_rows() -> Vec<crate::bookmark_browser::BookmarkBrowserRow> {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+        use crate::bookmark_browser::{BookmarkBrowserRow, BookmarkRowSource};
+        let mut rows = Vec::new();
+        for (kind, source, item, page_identity) in [
+            (
+                BookContainerKind::CompiledBook,
+                r"C:/media/製本",
+                GridItem::Image(PathBuf::from(r"C:\media\製本\page.jpg")),
+                PageIdentity::RelativePath("page.jpg".into()),
+            ),
+            (
+                BookContainerKind::ImageFolder,
+                r"C:/media/画像本",
+                GridItem::Image(PathBuf::from(r"C:\media\画像本\page.jpg")),
+                PageIdentity::RelativePath("page.jpg".into()),
+            ),
+            (
+                BookContainerKind::Zip,
+                r"C:/media/book.zip",
+                GridItem::ZipImage {
+                    zip_path: PathBuf::from(r"C:\media\book.zip"),
+                    entry_name: "page.jpg".into(),
+                },
+                PageIdentity::ArchiveEntry("page.jpg".into()),
+            ),
+            (
+                BookContainerKind::Pdf,
+                r"C:/media/book.pdf",
+                GridItem::PdfPage {
+                    pdf_path: PathBuf::from(r"C:\media\book.pdf"),
+                    page_num: 2,
+                    content_type: None,
+                },
+                PageIdentity::PdfPage(2),
+            ),
+            (
+                BookContainerKind::OtherArchive,
+                r"C:/media/book.7z",
+                GridItem::ZipImage {
+                    zip_path: PathBuf::from(r"C:\cache\converted.zip"),
+                    entry_name: "page.jpg".into(),
+                },
+                PageIdentity::ArchiveEntry("page.jpg".into()),
+            ),
+        ] {
+            rows.push(BookmarkBrowserRow {
+                source: BookmarkRowSource::Book(BookBookmark {
+                    id: rows.len() as i64,
+                    container_key: source.into(),
+                    container_path: source.into(),
+                    container_kind: kind,
+                    page_identity,
+                    page_index_hint: 2,
+                    created_at_ms: 0,
+                    title: None,
+                }),
+                item,
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: 0,
+                missing: false,
+            });
+        }
+        for is_audio in [false, true] {
+            let path = PathBuf::from(if is_audio {
+                r"C:/media/audio.flac"
+            } else {
+                r"C:/media/video.mp4"
+            });
+            rows.push(BookmarkBrowserRow {
+                source: BookmarkRowSource::Media {
+                    id: 10,
+                    path: path.clone(),
+                    pts_secs: 4.5,
+                    title: None,
+                    is_audio,
+                },
+                item: if is_audio {
+                    GridItem::Audio(path)
+                } else {
+                    GridItem::Video(path)
+                },
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: 0,
+                missing: false,
+            });
+        }
+        rows
+    }
+
+    #[test]
+    fn bookmark_copy_actions_preserve_original_source_text_and_ignore_checks() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        app.items_are_bookmark_view = true;
+        app.bookmark_browser_rows = bookmark_rows();
+        app.items = app
+            .bookmark_browser_rows
+            .iter()
+            .map(|row| row.item.clone())
+            .collect();
+        let ctx = egui::Context::default();
+        for idx in 0..app.items.len() {
+            app.selected = Some(idx);
+            for checked in [false, true] {
+                app.checked.clear();
+                if checked {
+                    app.checked.extend([0, 2, 3]);
+                }
+                // Before this change the dedicated menu called exactly this helper.
+                copy_path_text(&ctx, app.bookmark_browser_rows[idx].source_path());
+                let expected = take_copied_text(&ctx);
+                assert_eq!(expected.len(), 1);
+                let target = app.context_menu_target(
+                    idx,
+                    app.items[idx].clone(),
+                    false,
+                    false,
+                    None,
+                    ContextMenuSurface::Grid,
+                    None,
+                );
+                let _ =
+                    app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+                assert_eq!(take_copied_text(&ctx), expected);
+                app.execute_copy_key_action(&ctx, KeyAction::GridCopyPath);
+                assert_eq!(take_copied_text(&ctx), expected);
+                let _ = app.apply_ring_action(
+                    &ctx,
+                    RingShortcutContext::Grid,
+                    RingActionId::ImageCopyPath,
+                    "bookmark-copy-test",
+                );
+                assert_eq!(take_copied_text(&ctx), expected);
+                for action in [
+                    KeyAction::GridCopyFileName,
+                    KeyAction::GridCopyImage,
+                    KeyAction::GridCopyEditedImage,
+                ] {
+                    app.dispatch_copy_key_action_with(&ctx, action, |_, _, _, _| {
+                        panic!("not offered by the bookmark menu")
+                    });
+                }
+                app.dispatch_copy_key_action_with(
+                    &ctx,
+                    KeyAction::GridCopyFiles,
+                    |app, _, command, target| {
+                        assert_eq!(command, MenuCommand::CopyFiles);
+                        match app.collect_shell_clipboard_paths() {
+                            Ok(paths) => assert_eq!(target.shell_paths.as_ref(), Some(&paths)),
+                            Err(_) => assert!(target.shell_paths.is_none()),
+                        }
+                    },
+                );
+            }
+        }
+        // The menu request owns its source even if the live sidecar is later replaced.
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        copy_path_text(&ctx, app.bookmark_browser_rows[0].source_path());
+        let expected = take_copied_text(&ctx);
+        app.bookmark_browser_rows.clear();
+        let _ = app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+        assert_eq!(take_copied_text(&ctx), expected);
+        app.execute_copy_key_action(&ctx, KeyAction::GridCopyPath);
+        assert!(take_copied_text(&ctx).is_empty());
+    }
+
+    #[test]
+    fn bookmark_menu_keeps_its_existing_entries_and_copy_click_result() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for (checked, missing) in [(false, false), (true, false), (true, true)] {
+            let mut app = crate::app::setup_app_for_test();
+            app.items_are_bookmark_view = true;
+            app.bookmark_browser_rows = bookmark_rows();
+            app.bookmark_browser_rows[1].missing = missing;
+            app.items = app
+                .bookmark_browser_rows
+                .iter()
+                .map(|row| row.item.clone())
+                .collect();
+            app.selected = Some(1);
+            if checked {
+                app.checked.extend([2, 3]);
+            }
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(1));
+            let expected = native_path_text(app.bookmark_browser_rows[1].source_path());
+            let mut fonts_ready = false;
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(560.0, 320.0))
+                .build_ui_state(
+                    move |ui, (app, copied): &mut (crate::app::AppTestEnvForTest, Vec<String>)| {
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ui.ctx());
+                            fonts_ready = true;
+                            ui.ctx().request_repaint();
+                            return;
+                        }
+                        if app.context_menu_idx.is_some() {
+                            let _ = app.show_bookmark_grid_context_menu(ui.ctx(), 1);
+                        }
+                        copied.extend(take_copied_text(ui.ctx()));
+                    },
+                    (app, Vec::new()),
+                );
+            harness.run();
+            let delete = if checked {
+                "ブックマークを 2 件削除"
+            } else {
+                "ブックマークを削除"
+            };
+            let labels = [
+                "ブックマーク位置を開く",
+                "パスをコピー",
+                "このフォルダをエクスプローラで開く",
+                delete,
+            ];
+            let rects: Vec<_> = labels
+                .iter()
+                .map(|label| harness.get_by_label(label).rect())
+                .collect();
+            assert!(
+                rects
+                    .windows(2)
+                    .all(|pair| pair[0].bottom() <= pair[1].top())
+            );
+            assert_eq!(
+                harness
+                    .get_by_label(labels[0])
+                    .accesskit_node()
+                    .is_disabled(),
+                missing
+            );
+            for label in [
+                "コピー",
+                "ファイル名をコピー",
+                "画像をクリップボードにコピー",
+                "編集を反映した画像をコピー",
+            ] {
+                assert!(harness.query_by_label(label).is_none(), "{label}");
+            }
+            harness.get_by_label("パスをコピー").click();
+            harness.run();
+            assert_eq!(harness.state().1, vec![expected]);
+            assert!(harness.state().0.context_menu_idx.is_none());
+        }
+    }
+
+    #[test]
+    fn drive_items_have_no_new_copy_menu_but_background_and_legacy_copy_stay_available() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items_are_drive_list = true;
+        app.items = vec![GridItem::Folder(PathBuf::from(r"C:\"))];
+        app.selected = Some(0);
+        let ctx = egui::Context::default();
+        for action in [
+            KeyAction::GridCopyPath,
+            KeyAction::GridCopyFileName,
+            KeyAction::GridCopyImage,
+            KeyAction::GridCopyEditedImage,
+        ] {
+            app.dispatch_copy_key_action_with(&ctx, action, |_, _, _, _| {
+                panic!("drive items have no item menu")
+            });
+        }
+        let mut called = false;
+        app.dispatch_copy_key_action_with(
+            &ctx,
+            KeyAction::GridCopyFiles,
+            |_, _, command, target| {
+                called = true;
+                assert_eq!(command, MenuCommand::CopyFiles);
+                assert_eq!(
+                    target.shell_paths.as_ref(),
+                    Some(&vec![PathBuf::from(r"C:\")])
+                );
+            },
+        );
+        assert!(called);
+        for bookmark_background in [false, true] {
+            app.items_are_drive_list = !bookmark_background;
+            app.items_are_bookmark_view = bookmark_background;
+            let path = PathBuf::from(r"C:\grid-background");
+            let target = app.context_menu_target(
+                usize::MAX,
+                GridItem::Folder(path.clone()),
+                true,
+                false,
+                Some(path.clone()),
+                ContextMenuSurface::Grid,
+                None,
+            );
+            let nodes = app.context_menu_nodes(&target, false);
+            assert!(nodes.iter().any(|node| matches!(
+                node,
+                MenuNode::Item {
+                    command: MenuCommand::CopyPath,
+                    ..
+                }
+            )));
+            let _ = app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+            assert_eq!(take_copied_text(&ctx), vec![native_path_text(&path)]);
+        }
+    }
+
+    #[test]
+    fn every_copy_action_dispatches_the_item_menu_command_and_target() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\media\cursor.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\media\viewer.jpg")),
+        ];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(1);
+        let ctx = egui::Context::default();
+        for (grid, fs, expected_command) in actions() {
+            for (action, idx, surface) in [
+                (grid, 0, ContextMenuSurface::Grid),
+                (fs, 1, ContextMenuSurface::Fullscreen),
+            ] {
+                let expected = app.context_menu_target(
+                    idx,
+                    app.items[idx].clone(),
+                    false,
+                    false,
+                    None,
+                    surface,
+                    None,
+                );
+                let mut called = false;
+                app.dispatch_copy_key_action_with(&ctx, action, |_, _, command, target| {
+                    called = true;
+                    assert_eq!(command, expected_command);
+                    assert_eq!(target.item_index, expected.item_index);
+                    assert_eq!(target.item.name(), expected.item.name());
+                    assert_eq!(target.surface, expected.surface);
+                    assert_eq!(target.shell_paths, expected.shell_paths);
+                    assert_eq!(target.has_checked, expected.has_checked);
+                });
+                assert!(called, "{action:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn copy_actions_keep_checked_menu_rules_and_fullscreen_ignores_checks() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\media\folder")),
+            GridItem::Image(PathBuf::from(r"C:\media\viewer.jpg")),
+        ];
+        app.selected = Some(1);
+        app.fullscreen_idx = Some(1);
+        app.checked.extend([0, 1]);
+        let paths = app.collect_shell_clipboard_paths().unwrap();
+        let ctx = egui::Context::default();
+        for (grid, fs, command) in actions() {
+            let mut called = false;
+            app.dispatch_copy_key_action_with(&ctx, grid, |_, _, found, target| {
+                called = true;
+                assert_eq!(found, command);
+                assert!(target.has_checked);
+                assert_eq!(target.real_paths, paths);
+                assert_eq!(target.shell_paths.as_ref(), Some(&paths));
+            });
+            assert_eq!(
+                called,
+                matches!(grid, KeyAction::GridCopyFiles | KeyAction::GridCopyPath)
+            );
+            app.dispatch_copy_key_action_with(&ctx, fs, |_, _, found, target| {
+                assert_eq!(found, command);
+                assert!(!target.has_checked);
+                assert_eq!(
+                    target.shell_paths.as_ref(),
+                    Some(&vec![PathBuf::from(r"C:\media\viewer.jpg")])
+                );
+            });
+        }
+        app.selected = None;
+        let mut called = false;
+        app.dispatch_copy_key_action_with(
+            &ctx,
+            KeyAction::GridCopyFiles,
+            |_, _, command, target| {
+                called = true;
+                assert_eq!(command, MenuCommand::CopyFiles);
+                assert_eq!(target.shell_paths.as_ref(), Some(&paths));
+            },
+        );
+        assert!(called);
+    }
+
+    #[test]
+    fn copy_actions_share_pdf_menu_aliases_and_reject_non_image_targets() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\media\book.pdf"),
+            page_num: 2,
+            content_type: None,
+        }];
+        app.selected = Some(0);
+        let ctx = egui::Context::default();
+        app.dispatch_copy_key_action_with(
+            &ctx,
+            KeyAction::GridCopyFileName,
+            |_, _, command, target| {
+                assert_eq!(command, MenuCommand::CopyPageName);
+                assert_eq!(target.item_index, Some(0));
+            },
+        );
+        app.dispatch_copy_key_action_with(&ctx, KeyAction::GridCopyImage, |_, _, _, _| {
+            panic!("PDF has no unedited image copy menu entry")
+        });
+        app.items[0] = GridItem::Folder(PathBuf::from(r"C:\media\folder"));
+        for action in [KeyAction::GridCopyImage, KeyAction::GridCopyEditedImage] {
+            app.dispatch_copy_key_action_with(&ctx, action, |_, _, _, _| {
+                panic!("folder has no image copy menu entry")
+            });
+        }
+    }
+
+    #[test]
+    fn key_and_ring_text_copy_outputs_match_the_actual_menu_dispatch() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\media\cursor.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\media\viewer.jpg")),
+        ];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(1);
+        let ctx = egui::Context::default();
+        let take_text = || {
+            ctx.output_mut(|out| {
+                std::mem::take(&mut out.commands)
+                    .into_iter()
+                    .filter_map(|command| {
+                        if let egui::OutputCommand::CopyText(text) = command {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        for (context, idx, surface, path_key, name_key) in [
+            (
+                RingShortcutContext::Grid,
+                0,
+                ContextMenuSurface::Grid,
+                KeyAction::GridCopyPath,
+                KeyAction::GridCopyFileName,
+            ),
+            (
+                RingShortcutContext::ImageFullscreen,
+                1,
+                ContextMenuSurface::Fullscreen,
+                KeyAction::FsCopyPath,
+                KeyAction::FsCopyFileName,
+            ),
+        ] {
+            for (key, ring, command) in [
+                (path_key, RingActionId::ImageCopyPath, MenuCommand::CopyPath),
+                (
+                    name_key,
+                    RingActionId::ImageCopyFileName,
+                    MenuCommand::CopyFileName,
+                ),
+            ] {
+                let target = app.context_menu_target(
+                    idx,
+                    app.items[idx].clone(),
+                    false,
+                    false,
+                    None,
+                    surface,
+                    None,
+                );
+                let _ = app.dispatch_native_grid_context_command(&ctx, command, &target);
+                let expected = take_text();
+                assert_eq!(expected.len(), 1);
+                app.execute_copy_key_action(&ctx, key);
+                assert_eq!(take_text(), expected);
+                let _ = app.apply_ring_action(&ctx, context, ring, "copy-test");
+                assert_eq!(take_text(), expected);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod raw_clipboard_tests {
     use super::*;
     use image::GenericImageView;
@@ -3416,6 +4028,7 @@ mod delete_confirm_tests {
             checked_file_operation_selection: CheckedFileOperationSelection::Empty,
             item,
             item_index: Some(0),
+            copy_subject: ItemCopyMenuSubject::Item,
             is_folder_context: false,
             has_checked: false,
             checked_count: 0,
@@ -4045,6 +4658,7 @@ mod delete_confirm_tests {
             checked_file_operation_selection: CheckedFileOperationSelection::RealOnly,
             item: GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             item_index: Some(0),
+            copy_subject: ItemCopyMenuSubject::Item,
             is_folder_context: false,
             has_checked: true,
             checked_count: 1,

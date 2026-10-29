@@ -1,5 +1,21 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.477 (2026-10-29、実装済み・実機未確認): 一覧と画像フルスクリーンのコピー5種を
+キー / リング / ジェスチャ / マウスボタン / Xリングへ揃える。
+`GridCopyFiles` / `FsCopyFiles`、`GridCopyPath` / `FsCopyPath`、
+`GridCopyFileName` / `FsCopyFileName`、`GridCopyImage` / `FsCopyImage`、
+`GridCopyEditedImage` / `FsCopyEditedImage` をそれぞれ `Grid` / `FsImage` の `Press` とする。
+既存 `GridCopyFiles` のCtrl+Cを維持し、他はすべて既定なし。
+ring対応は `CopyFiles` / `ImageCopyPath` / `ImageCopyFileName` / `ImageCopyToClipboard` /
+`CopyEditedImage`。旧image系の保存IDは変更せず、新IDは `copy_files` / `copy_edited_image`。
+共通modelの `item_copy_command` がメニューと割り当て操作の適格性を所有する。
+対象targetは `copy_subject` に通常項目 / ブックマークsource1件 / 利用不可を捕捉する。
+ブックマークのパスは専用メニューと同じ本のsourceをコピーし、チェックを無視する（利用者判断2026-10-29）。
+他の新規3操作はブックマークで、新規4操作はドライブ項目で何もしない。既存 `GridCopyFiles` は変更しない。
+対象・チェック集合・見開き・非対応項目の扱いは [キー仕様](keymap-spec.md#コピー操作の割り当て1477) を正とする。
+コマンド一覧のキー列は実フォントの最長chord幅を予約し、1 chordを1行で表示する。
+親のwrap継承と幅の未実測による途中改行を解消し、既存の縦スクロールと狭幅の横clipを維持する。
+
 左右ドラッグズームの `Fs/Erase/Conceal/Crop/Text/LaScrubZoomHold` は各既存 context の
 KeyHold（既定 Ctrl+Space）。この6 action だけ action 別の `FullChord` policy を選び、
 INI・設定復元・GUI 入力／capture が共有する action 検証へ通す。従来の KeyHold の
@@ -599,6 +615,7 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
   RatingBookPreferred1..5/Clear/StepUp/StepDownも全操作 `none`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridCopyFiles / GridCutFiles は Shell clipboard 実行経路を保ったまま keymap 化済み。
+  GridCopyPath / GridCopyFileName / GridCopyImage / GridCopyEditedImage は既定なしのPress（§1.477）。
   Paste `Ctrl+V`、D&D、右クリック操作そのものは OS/clipboard/マウス経路を含むため固定。
 - Shift+矢印の範囲選択は GridCursor の派生動作として固定。
 
@@ -664,6 +681,8 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
 - FsExport `Ctrl+E` ★ / FsCapture `Ctrl+S` ★
 - FsCopyEditedImage (P、既定未割り当て): フルスクリーンの「編集を反映した画像をコピー」と共通の受付。
   Ctrl+E と同じページ／見開き対象に、`bake_stage_clipboard` の段までを原寸で反映する。
+- FsCopyFiles / FsCopyPath / FsCopyFileName / FsCopyImage は既定なしのPress（§1.477）。
+  コピー5種は画像FSとGridのring候補にも対応し、動画・音声FSには追加しない。
 - FsCompareToggle `X` ★ / FsCompareCycle `C` ★ / FsCompareWipe `Shift+C` ★ / FsCompareDiff `Alt+C` ★
 - FsSpreadSingle/L/LCover/R/RCover `1`..`5` (P) ★
 - FsReadingFlowCycle `6` (P) ★ / FsReadingDirectionToggle `7` (P) ★ / FsFitModeCycle `0` (P) ★
@@ -748,7 +767,7 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
   右ドラッグ、戻る/進む、動画・音声の修飾なし通常ホイールは `Settings.ring_shortcuts` で限定カスタマイズ。
   その他の通常ホイールは固定で、マウス入力全般は引き続き keymap.ini の対象外。
 - Clipboard/delete files: `Event::Copy` / `Event::Cut`、Win32 クリップボード paste、
-  ファイル削除ワーカー起動。
+  ファイル削除ワーカー起動。イベント自体の固定扱いと、§1.477のコピー離散コマンドは区別する。
 - OS 状態参照: native presenter の一部 routing。元画像表示の OS 状態参照は
   `FsOriginalPreviewHold` の ModifierHold helper 内で扱う。
 
