@@ -4382,8 +4382,8 @@ fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time
 /// visible holdover to the user.
 ///
 /// The navigation sequence is retired only after every target page was painted live in canonical
-/// flat output. Accepted page-turn output can already show that unit while the sequence remains
-/// active. Otherwise its lifetime supplies the UX-delay anchor, independent of decode readiness.
+/// flat output. This pass's turn/landing submission can already show that unit while the sequence
+/// remains active. Otherwise its lifetime supplies the UX-delay anchor, independent of decode readiness.
 fn fs_page_wait_indicator_visible(
     processing_status_visible: bool,
     target_presented_by_page_turn: bool,
@@ -28857,12 +28857,12 @@ impl App {
                         // ── 移動先ページ未提示インジケーター ──
                         // NavigationSequence は target display unit の全ページが live に描かれた
                         // frame で上の emit_fs_page_turn_ready_for_display_unit が破棄する。したがって
-                        // 演出 owner がすでに target unit を提示していれば表示しない。それ以外は
+                        // この pass で演出 owner の target unit を描いていれば表示しない。それ以外は
                         // sequence の未 retire 時間で判定する。decode pending の有無には結び付けない。
                         if similar_preview_presentation.is_none()
                             && fs_page_wait_indicator_visible(
                             self.settings.fullscreen_processing_status_visible,
-                            self.fs_navigation_target_presented_by_page_turn(),
+                            self.fs_navigation_target_presented_by_page_turn(ctx, &navigator_texture_sources),
                             self.fs_holdover_tex.as_ref(),
                             paint_idx,
                             self.items_generation,

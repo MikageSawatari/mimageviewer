@@ -1508,9 +1508,27 @@ impl App {
         self.page_turn_presented_current_unit().is_some()
     }
 
-    /// Presentation can show the target before its canonical flat retires the
-    /// navigation sequence. This fact changes only the wait indicator.
-    pub(super) fn fs_navigation_target_presented_by_page_turn(&self) -> bool {
+    /// The badge shares this pass's output with the drawn turn/landing, so it
+    /// uses submission identity rather than a prior output's acceptance. The
+    /// navigation observer still requires an accepted canonical flat.
+    pub(super) fn fs_navigation_target_presented_by_page_turn(
+        &self,
+        ctx: &egui::Context,
+        sources: &FsNavigatorTextureSources,
+    ) -> bool {
+        let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+            return false;
+        };
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Turning { incoming, .. }
+            | PresentationState::Completing { incoming, .. } => incoming,
+            // Ordinary flat output belongs to the navigation observer. It
+            // must not conceal a new wait merely because Flat(target) survived.
+            _ => return false,
+        };
+        let SubmittedContentBinding::Presentation(content) = &receipt.binding else {
+            return false;
+        };
         let Some(FsNavigationSequenceTarget::Display(target)) = self
             .fs_holdover_tex
             .as_ref()
@@ -1519,13 +1537,31 @@ impl App {
         else {
             return false;
         };
-        target.items_generation == self.items_generation
+        receipt.frame == ctx.cumulative_frame_nr()
+            && receipt.pass == ctx.cumulative_pass_nr()
+            && receipt.destination == unit.destination
+            && self.page_turn_unit_matches_current(unit)
+            && *content == unit.content
+            && receipt.content_matches(self)
+            && unit.pages.len() == receipt.pages().len()
+            && unit.pages.len() == sources.pages.len()
+            // Curl may occlude an incoming page. Match the submitted materials,
+            // not canonical visibility/acceptance evidence.
+            && unit.pages.iter().zip(receipt.pages()).zip(&sources.pages).all(
+                |((page, (occurrence, source, paint, _)), selected)| {
+                    page.occurrence == *occurrence
+                        && selected.occurrence == *occurrence
+                        && page.resource.source_texture_id() == *source
+                        && selected.resource.source_texture_id() == *source
+                        && page.resource.paint_texture_id() == *paint
+                        && selected.resource.paint_texture_id() == *paint
+                },
+            )
+            && target.items_generation == self.items_generation
             && self.fullscreen_idx == Some(target.anchor_idx)
-            && self.page_turn_presented_current_unit().is_some_and(|unit| {
-                target.pages().iter().all(|idx| {
-                    unit.pages.iter().any(|page| {
-                        page.occurrence == SpreadPageOccurrence::navigation(*idx, target.anchor_idx)
-                    })
+            && target.pages().iter().all(|idx| {
+                unit.pages.iter().any(|page| {
+                    page.occurrence == SpreadPageOccurrence::navigation(*idx, target.anchor_idx)
                 })
             })
     }
@@ -1543,7 +1579,11 @@ impl App {
             }
             _ => return None,
         };
-        (unit.destination == self.page_turn_destination()
+        self.page_turn_unit_matches_current(unit).then_some(unit)
+    }
+
+    fn page_turn_unit_matches_current(&self, unit: &PaintedUnit) -> bool {
+        unit.destination == self.page_turn_destination()
             && unit.items == self.items_generation
             && unit.mode == self.spread_mode
             && unit.slice == self.fullscreen_page_slice
@@ -1552,8 +1592,7 @@ impl App {
                 unit.pages
                     .iter()
                     .any(|page| page.occurrence.navigation_anchor_idx == idx)
-            }))
-        .then_some(unit)
+            })
     }
 
     /// Accepted output evidence is independent of current cache quality. Match
