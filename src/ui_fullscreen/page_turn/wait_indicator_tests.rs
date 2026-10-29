@@ -41,8 +41,16 @@ fn seed_offer(
     mode: SpreadMode,
     origin: Instant,
 ) -> crate::app::AppTestEnvForTest {
+    seed_offer_in_app(ctx, ready_app(ctx, mode), origin)
+}
+
+fn seed_offer_in_app(
+    ctx: &egui::Context,
+    mut app: crate::app::AppTestEnvForTest,
+    origin: Instant,
+) -> crate::app::AppTestEnvForTest {
     install(ctx);
-    let mut app = ready_app(ctx, mode);
+    let mode = app.spread_mode;
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
     app.thumbnails = (0..4).map(|_| ThumbnailState::Pending).collect();
@@ -84,6 +92,102 @@ fn seed_offer(
 }
 
 #[test]
+fn page_wait_indicator_appears_while_initial_spread_output_is_unaccepted_and_incoming_occluded() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let origin = Instant::now();
+    let clock = super::clock_tests::TestClock::at(origin);
+    let ctx = egui::Context::default();
+    let mut app = ready_app(&ctx, SpreadMode::Rtl);
+    app.settings.spread_page_gap_px = 0;
+    // RTL forward turns the left leaf. A wide outgoing left leaf fully covers
+    // the narrower incoming left leaf at p=0, as in the width-swap regression.
+    for idx in [0, 3] {
+        let pixels = Arc::new(egui::ColorImage::filled([40, 120], egui::Color32::GREEN));
+        let tex = ctx.load_texture(
+            format!("initial-occluded-{idx}"),
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex,
+                pixels,
+                source_dims: Some([40, 120]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.record_page_dims_for_spread(idx, (40, 120));
+        app.record_page_layout_dims_for_spread(idx, (40, 120));
+    }
+    let mut app = seed_offer_in_app(&ctx, app, origin);
+    let first_output_at = origin + Duration::from_millis(750);
+    clock.set(first_output_at);
+    frame(&ctx, |ui, ctx| {
+        let sources = draw(&mut app, ui, ctx);
+        assert!(receipt(&sources).curl);
+        assert!(!receipt(&sources).was_accepted());
+        let PresentationState::Turning {
+            clock,
+            projection,
+            offer,
+            ..
+        } = &app.page_turn_presentation.state
+        else {
+            panic!("initial turn")
+        };
+        assert_eq!(*clock, MotionClock::AwaitingAcceptedOutput);
+        assert_eq!(clock.progress(first_output_at, offer.duration), 0.0);
+        let initial = crate::page_turn_animation::project_prepared(
+            &projection.outgoing,
+            &projection.incoming,
+            projection.direction,
+            projection.recipe,
+            0.0,
+            false,
+        )
+        .unwrap();
+        assert!(
+            initial
+                .visibility
+                .incoming
+                .iter()
+                .all(|page| page.visible_area == 0.0),
+            "the regression must actually hide every incoming page"
+        );
+        assert!(initial.visibility.outgoing_front_area > 0.0);
+        assert!(
+            indicator_visible(&app, ctx, &sources, first_output_at),
+            "unaccepted p=0 still shows only the old spread after a 750ms wait"
+        );
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+    });
+    clock.set(first_output_at + Duration::from_millis(1));
+    frame(&ctx, |ui, ctx| {
+        app.begin_page_turn_viewer_frame(ctx, false, None);
+        let sources = draw(&mut app, ui, ctx);
+        assert!(receipt(&sources).curl);
+        assert!(matches!(app.page_turn_presentation.state,
+            PresentationState::Turning { clock: MotionClock::Running { start_at }, .. }
+                if start_at == first_output_at));
+        assert!(
+            !indicator_visible(
+                &app,
+                ctx,
+                &sources,
+                first_output_at + Duration::from_millis(1)
+            ),
+            "a running curl is presentation without a per-page visibility threshold"
+        );
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+    });
+}
+
+#[test]
 fn page_wait_indicator_hidden_during_600ms_turn_without_retiring_navigation_until_flat() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
@@ -104,8 +208,8 @@ fn page_wait_indicator_hidden_during_600ms_turn_without_retiring_navigation_unti
             assert!(receipt(&sources).curl);
             assert!(!receipt(&sources).was_accepted());
             assert!(
-                !indicator_visible(&app, ctx, &sources, waiting_at),
-                "same-pass initial curl"
+                indicator_visible(&app, ctx, &sources, waiting_at),
+                "initial curl is still awaiting accepted output"
             );
             first = Some(sources);
         });

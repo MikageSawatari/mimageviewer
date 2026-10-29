@@ -107,8 +107,8 @@
 
 - 状態: **実装済み・実機未確認** (ブランチ `pageturn-1461-1457`、未 merge)。設計・記録は [page-turn 計画 §28.6](page-turn-animation-plan.md)。
 - 観測 (ClaudeCode、隔離データ・dev-runtime `a41744e6d`): 通常フォルダ PNG 4 枚、めくり ON・600ms では →／→／← の終盤に中央バッジが約 0.1〜0.16 秒出る。再訪でも発生し、OFF では出ない。
-- 原因・対応: sequence が canonical flat の全頁 Live 採用まで残る間に 500ms の表示遅延を超える。初回実装 `dd5d00727` には着地 frame の未受理 evidence と過去 Flat(A) による待機隠しの P2 があった。完了条件は維持し、同じ frame／pass で実際に提出した Turning／Completing の receipt と移動先全 Navigation 頁を照合する。通常 Flat は対象外とし、片頁未提示のバッジを保つ。
-- 検証: 純関数1件と TestClock／実 renderer による状態遷移5件。`dd5d00727` で新しい着地／A→B→A の2回帰が目的の assertion で失敗した。修正後はバッジ12件、snapshot213件、最後の本体lib14,660件が全成功（既存除外65件）。関連309件の初回は308成功＋既知§1.447の1失敗、同名単独は成功し、最後のlib全件でも成功した。独立レビューの未解決指摘なし。詳細は計画 §28.6。今回は利用者指定で build-dev を実行せず、製品起動・実機確認も未実施。
+- 原因・対応: sequence が canonical flat の全頁 Live 採用まで残る間に 500ms の表示遅延を超える。初回実装 `dd5d00727` には着地 frame の未受理 evidence と過去 Flat(A) による待機隠しの P2 があった。完了条件は維持し、同じ frame／pass で実際に提出した Running の Turning／Completing の receipt と移動先全 Navigation 頁を照合する。開始待ちの Turning（第2回REVISE対応）と通常 Flat は対象外とし、旧頁だけを残す待機・片頁未提示のバッジを保つ。
+- 検証: 純関数1件と TestClock／実 renderer による状態遷移6件（バッジ関連13件）。`dd5d00727` で着地／A→B→A の2回帰、`551289142` で750ms後の初期遮蔽・開始待ち回帰が目的の assertion で失敗した。最新の関連310件は309成功＋既知§1.447の1失敗、同名単独は成功。snapshot213件と最後の本体lib14,661件は全成功（既存除外65件、vacant leaf を含め失敗なし）。独立レビューの未解決指摘なし。詳細は計画 §28.6。今回は利用者指定で build-dev を実行せず、製品起動・実機確認も未実施。
 
 ### 1.458 右→左の見開きで読んでいるとき、消しゴムなどの編集画面を右ページ (読む順の最初のページ) から始める — 利用者の要望 (2026-10-28)
 

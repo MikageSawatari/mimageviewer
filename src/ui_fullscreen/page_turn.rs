@@ -1509,8 +1509,9 @@ impl App {
     }
 
     /// The badge shares this pass's output with the drawn turn/landing, so it
-    /// uses submission identity rather than a prior output's acceptance. The
-    /// navigation observer still requires an accepted canonical flat.
+    /// uses submission identity once motion is Running, or for a flat landing.
+    /// AwaitingAcceptedOutput still holds the old spread at p=0. The navigation
+    /// observer separately requires an accepted canonical flat.
     pub(super) fn fs_navigation_target_presented_by_page_turn(
         &self,
         ctx: &egui::Context,
@@ -1520,7 +1521,11 @@ impl App {
             return false;
         };
         let unit = match &self.page_turn_presentation.state {
-            PresentationState::Turning { incoming, .. }
+            PresentationState::Turning {
+                incoming,
+                clock: MotionClock::Running { .. },
+                ..
+            }
             | PresentationState::Completing { incoming, .. } => incoming,
             // Ordinary flat output belongs to the navigation observer. It
             // must not conceal a new wait merely because Flat(target) survived.
@@ -1545,7 +1550,7 @@ impl App {
             && receipt.content_matches(self)
             && unit.pages.len() == receipt.pages().len()
             && unit.pages.len() == sources.pages.len()
-            // Curl may occlude an incoming page. Match the submitted materials,
+            // A running curl may occlude an incoming page. Match the submitted materials,
             // not canonical visibility/acceptance evidence.
             && unit.pages.iter().zip(receipt.pages()).zip(&sources.pages).all(
                 |((page, (occurrence, source, paint, _)), selected)| {

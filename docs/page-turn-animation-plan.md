@@ -6588,31 +6588,53 @@ Bの不足を理由とする新しい待機・演出省略は加えない。受�
   自然着地の新 flat evidence は同じ frame 内では未受理なのでバッジが1 frame 再表示される。
   比較等の描画が残した過去の Flat(A) は A→B→A の新しい Awaiting とも identity が一致し、実際には B の holdover を描く待機を隠せる。
 - 修正: `fs_navigation_target_presented_by_page_turn(ctx, sources)` は、バッジ直前の実描画で得た Paged receipt を正本にする。
-  同じ frame／pass、destination、content binding、現在の Turning／Completing incoming の items 世代・mode・slice・layout・anchor、
+  同じ frame／pass、destination、content binding、現在の Running の Turning／Completing incoming の items 世代・mode・slice・layout・anchor、
   全 occurrence／source／paint と sequence の全 Navigation 頁を照合する。受理 hook 前の自然着地も、画像とバッジが同じ出力へ入るため対象にする。
-  curl の遮蔽を canonical 全可視証拠と混同せず、receipt の可視面積・過去の acceptance はこのバッジ判定には使わない。
+  Turning は `MotionClock::Running` のときだけ数える。`AwaitingAcceptedOutput` は progress 0 で incoming 全頁が隠れる姿勢もあるため、開始待ちとしてバッジを保つ。
+  動き始めた curl は移動先へ向かう提示中とし、可視面積の閾値は導入しない。開始受理は既存の typed clock で区別し、現在の receipt 自体の acceptance は要求しない。
+  Completing は同じ pass の移動先 flat 提出を数え、受理 hook 前の自然着地でも非表示にする。canonical 全可視・採用証拠とは区別する。
   sequence の完了条件・履歴・類似本確定・継続操作の barrier は変更しない。背景準備の既存 accepted 問い合わせも意味を維持する。
 - Flat は対象外。ON の通常 flat は既存の navigation observer の経路であり、演出の例外へ含めると通常の未提示待ちを隠す余地を作る。
   通常 flat の全 Live／片頁非 Live の実提出を検査し、片頁不足の既存バッジを維持する。
   新 state・待機・delay 変更は不要で、frame-local な提出を使う方が単純。モーダル化や操作制限も加えない。
 - 終端: 自然着地・Turning 取消後の Completing は、その pass で incoming に bind された flat を描けば非表示。
   非 Live で sequence が残っても、この条件を満たす Completing は対象となる。canonical 採用後の sequence 退役は従来どおり。
-  Offered 取消後の旧 Flat、Inactive、古い frame／pass、binding／素材不一致、LegacyRendered／Unsubmitted は通常の待機判定へ戻る。
+  開始待ちの Turning、Offered 取消後の旧 Flat、Inactive、古い frame／pass、binding／素材不一致、LegacyRendered／Unsubmitted は通常の待機判定へ戻る。
   設定・source・geometry・binding 変更後も、記憶だけでは抑制しない。F12 は共通描画箇所を使い、detached 述語・viewport 経路は未変更。
-- 回帰: 純関数1件＋状態遷移5件。単頁／LTR／RTL の 600ms turn を550msと601msの同じ描画 closure 内で検査し、
+- 回帰: 純関数1件＋状態遷移6件。単頁／LTR／RTL の 600ms turn を550msと601msの同じ描画 closure 内で検査し、
   hook 前の着地でバッジ非表示かつ sequence 未完了、次 frame の採用で完了することを確認する。
   P2-2 は製品の captured／non-live holdover 描画で B を描き、Flat(A) の残存を fingerprint で確かめ、A の cache 退去後の再待機を検査する。
   比較 UI 自体を構築する試験ではなく、不適格な通常 fallback と同じ「presentation binding のない receipt、Flat(A) 維持」の経路を使う。
   古い frame／pass、binding／paint 不一致、片頁不足、取消、設定変更、Inactive、通常 Flat の片頁非 Live も対象。
 - `dd5d00727` の製品コードに新しい着地／往復回帰だけを加えると、2件とも目的のバッジ assertion で失敗した。
   証跡は `target/pageturn-1601/revise1/dd5d00727-red-confirmed.log`。初回の307件・snapshot213件・lib14,658件成功はこの2経路を見逃しており、今回の修正後の証拠とは分ける。
-- 修正後の自動検証（通常 feature／test profile、`dd5d00727` 上の今回の差分）:
+- 第1回REVISE対応後の検証（通常 feature／test profile、`dd5d00727` 上の差分、`551289142` までの証拠）:
   `cargo nextest run -p mimageviewer --lib -E 'test(/page_wait_indicator/)' --no-fail-fast` は12/12成功。
   `cargo nextest run -p mimageviewer --lib -E 'test(/page_wait|page_turn/)' --no-fail-fast` は初回308成功／既知§1.447の vacant leaf 1失敗（33.322秒）。
   条件や期待値を変えず同名の exact filter で単独再実行し、1/1成功（2.482秒）。
   `cargo test --test ui_snapshot` は213/213成功（32.54秒、基準画像更新なし）。
   最後の `scripts/test-lib-full.ps1` は14,660/14,660成功・既存除外65件（506.285秒、vacant leaf を含め失敗なし）。
   関連・単独・snapshot・旧コードの失敗証跡は `target/pageturn-1601/revise1/`、全件ログは
-  `target/test-lib-full/runs/20261029T005658157Z-c7fb1a93/`。独立レビューの未解決指摘なし。
+  `target/test-lib-full/runs/20261029T005658157Z-c7fb1a93/`。この時点の独立レビューでは以下の開始待ちを見逃していた。
   全テストの後に引数なしの `cargo fmt` と `cargo fmt --check` が成功した。
   今回は利用者指定により build-dev を実行せず、製品起動・実機確認・コミットも行わない。
+
+#### 第2回REVISE対応 — 開始待ちと動作中の区別（2026-10-29）
+
+`551289142` は Turning の clock を問わず、初回の未受理 curl でもバッジを消していた。
+既存の `page_turn_current_unit_presented` と同じ Running 条件を加え、Completing の同じ pass の flat 判定は維持した。
+RTL 前進・gap 0・幅入れ替わりの実 renderer 回帰で、sequence の opened_at は受理時刻のまま、
+初回描画前に TestClock を750msへ進めた。実際の prepared projection で incoming 全頁の可視面積0・旧頁の可視を確認し、
+同じ描画 closure 内で開始待ちのバッジ表示を検査する。受理後の次 frame は Running に移り、頁別の可視閾値なしに非表示となる。
+この可視面積の確認はテストだけに置き、製品判定には持ち込まない。既存の初回 curl の期待値も開始待ち表示へ訂正した。
+`551289142` の製品コードのまま、新回帰は目的のバッジ assertion で失敗した（`target/pageturn-1601/revise2/551289142-red.log`）。
+修正後の自動検証（通常 feature／test profile、`551289142` 上の今回の差分）:
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/page_wait|page_turn/)' --no-fail-fast` は初回309成功／既知§1.447の vacant leaf 1失敗（34.454秒）。新規の開始待ち回帰と既存の動作中・着地回帰は成功。
+- 条件や期待値を変えず同名の exact filter で単独再実行し、1/1成功（2.724秒）。
+- `cargo test --test ui_snapshot` は213/213成功（32.79秒、基準画像更新なし）。
+- 最後の `scripts/test-lib-full.ps1` は14,661/14,661成功・既存除外65件（517.392秒、vacant leaf を含め失敗なし）。
+- 関連・単独・snapshot・旧コードの失敗証跡は `target/pageturn-1601/revise2/`、全件ログは `target/test-lib-full/runs/20261029T012253207Z-66915b4d/`。独立レビューの未解決指摘なし。
+- 全テストの後に引数なしの `cargo fmt` と `cargo fmt --check` が成功した。
+
+今回は利用者指定により build-dev・製品起動・コミットは行わない。実機確認は ClaudeCode へ引き継ぐ。
