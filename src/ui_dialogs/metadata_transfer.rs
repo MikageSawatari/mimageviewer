@@ -1816,14 +1816,14 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let book = temp.path().join("book");
         let state = crate::view_trim::ViewTrimBookState {
-            apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+            preference: crate::view_trim::ViewTrimBookPreference::Manual,
             book_settings: crate::view_trim::ViewTrimBookSettings {
                 enabled: true,
                 ..Default::default()
             },
         };
         let batch = crate::view_trim_db::ViewTrimWriteBatch {
-            book: Some((book.clone(), state)),
+            book: Some((book.clone(), None, state)),
             pages: Vec::new(),
         };
         let data_dir = temp.path().to_path_buf();
@@ -1837,7 +1837,11 @@ mod tests {
 
         let db =
             crate::view_trim_db::ViewTrimDb::open_at(&temp.path().join("view_trim.db")).unwrap();
-        assert_eq!(db.get_book_state(&book), Some(state));
+        assert_eq!(
+            db.load_book_preference_with_fallback(&book, None)
+                .state_or_default(),
+            state
+        );
     }
 
     #[test]

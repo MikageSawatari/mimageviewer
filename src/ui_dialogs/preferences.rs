@@ -2160,6 +2160,7 @@ fn preferences_change_book_append_write_settings(live: &Settings, edited: &Setti
             live.default_reading_direction,
             live.follow_document_reading_direction,
             live.final_cover_spread_enabled,
+            live.auto_view_trim_default_enabled,
             live.singleton_spread_first_enabled,
             live.singleton_spread_last_enabled,
             live.page_after_cover_alone_enabled,
@@ -2171,6 +2172,7 @@ fn preferences_change_book_append_write_settings(live: &Settings, edited: &Setti
             edited.default_reading_direction,
             edited.follow_document_reading_direction,
             edited.final_cover_spread_enabled,
+            edited.auto_view_trim_default_enabled,
             edited.singleton_spread_first_enabled,
             edited.singleton_spread_last_enabled,
             edited.page_after_cover_alone_enabled,
@@ -2747,6 +2749,7 @@ impl App {
             let old_fullscreen_side_panel_mode =
                 self.settings.fullscreen_side_panel_mode.normalized();
             let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
+            let old_auto_view_trim_default_enabled = self.settings.auto_view_trim_default_enabled;
             let old_singleton_spread_placement_enabled = (
                 self.settings.singleton_spread_first_enabled,
                 self.settings.singleton_spread_last_enabled,
@@ -2822,6 +2825,18 @@ impl App {
             }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
             self.install_preferences_settings(state.settings);
+            if old_auto_view_trim_default_enabled != self.settings.auto_view_trim_default_enabled {
+                #[cfg(windows)]
+                self.invalidate_auto_view_trim_display_in_parked_contexts();
+                if self.view_trim_book_preference
+                    == crate::view_trim::ViewTrimBookPreference::FollowGlobal
+                {
+                    if let Some(idx) = self.fullscreen_idx {
+                        self.reanchor_continuous_reading_after_view_trim_change(idx);
+                    }
+                    ctx.request_repaint();
+                }
+            }
             if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
                 #[cfg(windows)]
                 self.invalidate_final_cover_spread_display_in_parked_contexts();
@@ -4521,6 +4536,96 @@ mod tests {
                 .file_type_visibility
                 .is_all_visible()
         );
+    }
+
+    #[test]
+    fn auto_view_trim_default_is_a_preferences_book_append_write_setting() {
+        let live = Settings::default();
+        let mut edited = live.clone();
+        assert!(!preferences_change_book_append_write_settings(
+            &live, &edited
+        ));
+        edited.auto_view_trim_default_enabled = true;
+        assert!(preferences_change_book_append_write_settings(
+            &live, &edited
+        ));
+        assert!(preferences_change_book_append_write_settings(
+            &edited, &live
+        ));
+    }
+
+    #[test]
+    fn auto_view_trim_default_preferences_cancel_ok_save_and_reopen() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.auto_view_trim_default_enabled);
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::SpreadMode,
+            "spread/auto-view-trim",
+        ));
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        for (cancel, expected) in [(true, false), (false, true), (false, false)] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::SpreadMode,
+                        "spread/auto-view-trim",
+                    ));
+            }
+            harness.run_steps(5);
+            assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+            harness
+                .get_by_label("自動余白カットを標準で有効にする")
+                .click();
+            harness.run();
+            assert!(harness.state().preferences_dialog_has_unsaved_changes());
+            // The live value changes only at OK, never while editing a draft.
+            let before = harness.state().settings.auto_view_trim_default_enabled;
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert_eq!(
+                    harness.state().settings.auto_view_trim_default_enabled,
+                    before
+                );
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness.state().settings.auto_view_trim_default_enabled,
+                expected
+            );
+            assert_eq!(Settings::load().auto_view_trim_default_enabled, expected);
+            harness
+                .state_mut()
+                .open_preferences_request(PreferencesOpenRequest::anchored(
+                    PreferencesPage::SpreadMode,
+                    "spread/auto-view-trim",
+                ));
+            harness.run_steps(5);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .auto_view_trim_default_enabled,
+                expected
+            );
+            assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        }
     }
 
     #[test]
@@ -6646,6 +6751,44 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_viewer_notice_visibility");
+    }
+
+    #[test]
+    fn auto_view_trim_default_setting_snapshot_light_off() {
+        auto_view_trim_default_setting_snapshot(
+            "preferences_auto_view_trim_default_light_off",
+            crate::os_theme::ResolvedTheme::Light,
+            false,
+        );
+    }
+
+    #[test]
+    fn auto_view_trim_default_setting_snapshot_dark_on() {
+        auto_view_trim_default_setting_snapshot(
+            "preferences_auto_view_trim_default_dark_on",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+        );
+    }
+
+    fn auto_view_trim_default_setting_snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        mut enabled: bool,
+    ) {
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(400.0, 100.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    crate::os_theme::apply_resolved(root_ui.ctx(), theme);
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_auto_view_trim_default_setting(ui, &mut enabled);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
     }
 
     #[test]

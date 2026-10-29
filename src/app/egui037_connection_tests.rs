@@ -548,7 +548,7 @@ fn egui037_continuation_real_full_inpaint_resumes_view_trim_with_new_pointer_lev
         // Enter the actual embedded viewer before capturing the operation fingerprint.
         full(&mut backend, &mut env, vec![pointer(old_down)]);
         assert_eq!(env.fullscreen_idx, Some(0));
-        env.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        env.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         env.view_trim_book_settings.enabled = true;
         // Request through the real entry so its private state fingerprint is not forged.
         let raw = env.fs_cache.remove(&0).unwrap();

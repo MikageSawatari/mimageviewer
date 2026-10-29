@@ -828,7 +828,8 @@ test("PIN login uses a text-capable mobile keyboard without text correction", ()
 });
 
 const viewTrimState = () => ({
-  apply_mode: "book",
+  preference: "manual",
+  effective_apply_mode: "book",
   book_settings: {
     enabled: true,
     spread_separate: false,
@@ -851,6 +852,61 @@ test("view trim keeps the core book shape and switches spread controls without p
   ]);
   assert.deepEqual(separate.book_settings.spread_linked, normalized.book_settings.spread_linked);
   assert.equal("page_override" in separate, false);
+});
+
+test("view trim accepts four preferences and displays only the server effective mode", () => {
+  for (const preference of ["follow_global", "none", "auto", "manual"]) {
+    const value = { ...viewTrimState(), preference, effective_apply_mode: "none" };
+    const normalized = normalizeRemoteViewTrimState(value);
+    assert.equal(normalized.preference, preference);
+    assert.equal(normalized.effective_apply_mode, "none");
+  }
+  assert.equal(normalizeRemoteViewTrimState({ ...viewTrimState(), preference: "book" }), null);
+  assert.equal(normalizeRemoteViewTrimState({ ...viewTrimState(), effective_apply_mode: "page" }), null);
+  const { effective_apply_mode, ...withoutEffectiveMode } = viewTrimState();
+  assert.equal(normalizeRemoteViewTrimState(withoutEffectiveMode), null);
+});
+
+test("view trim mode changes retain manual values and wait for the server global readout", async () => {
+  const panel = new ViewerViewTrimPanel();
+  panel.root.querySelectorAll = () => [];
+  panel.serverState = normalizeRemoteViewTrimState({
+    ...viewTrimState(), effective_apply_mode: "auto",
+  });
+  panel.serverState.book_settings.enabled = false;
+  const before = structuredClone(panel.serverState.book_settings);
+  let commits = 0;
+  panel.commit = async () => { commits += 1; };
+  assert.deepEqual(panel.modeSelect.children.map((option) => option.value), [
+    "follow_global", "none", "auto", "manual",
+  ]);
+  for (const preference of ["follow_global", "none", "auto", "manual"]) {
+    panel.modeSelect.value = preference;
+    panel.modeSelect.dispatchEvent({ type: "change" });
+    assert.equal(panel.serverState.preference, preference);
+    const expected = preference === "manual" ? { ...before, enabled: true } : before;
+    assert.deepEqual(panel.serverState.book_settings, expected);
+    assert.equal(panel.enabledInput.checked, expected.enabled);
+    assert.equal(panel.modeSelect.children[0].textContent, "全体設定に従う");
+    assert.equal(panel.controls.hidden, preference !== "manual");
+  }
+  assert.equal(commits, 4);
+  for (const preference of ["follow_global", "none", "auto"]) {
+    panel.modeSelect.value = preference;
+    panel.modeSelect.dispatchEvent({ type: "change" });
+    assert.deepEqual(panel.serverState.book_settings, { ...before, enabled: true });
+  }
+  assert.equal(commits, 7);
+  for (const [effective_apply_mode, label] of [
+    ["auto", "全体設定に従う（現在: 自動余白カット）"],
+    ["none", "全体設定に従う（現在: トリムなし）"],
+  ]) {
+    panel.serverState = normalizeRemoteViewTrimState({
+      ...viewTrimState(), preference: "follow_global", effective_apply_mode,
+    });
+    panel.renderState();
+    assert.equal(panel.modeSelect.children[0].textContent, label);
+  }
 });
 
 test("sort state accepts only server-provided options and keeps a visible lock reason", () => {

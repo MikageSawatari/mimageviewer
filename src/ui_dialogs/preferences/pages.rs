@@ -10422,6 +10422,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });
+    anchored(ui, state, "spread/auto-view-trim", |ui, state| {
+        draw_auto_view_trim_default_setting(ui, &mut state.settings.auto_view_trim_default_enabled);
+    });
     anchored(ui, state, "spread/page-turn-animation", |ui, state| {
         draw_page_turn_animation_setting(
             ui,
@@ -10882,6 +10885,11 @@ mod fullscreen_manual_nav_wrap_setting_tests {
 pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
     ui.checkbox(enabled, "末尾に表紙を添える");
     ui.small("表紙あり見開きで末尾が単ページになる本に適用します。本ごとの設定が優先されます。");
+}
+
+pub(super) fn draw_auto_view_trim_default_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "自動余白カットを標準で有効にする");
+    ui.small("本ごとの設定が優先されます。回転したページには適用しません。");
 }
 
 pub(super) fn draw_page_turn_animation_setting(

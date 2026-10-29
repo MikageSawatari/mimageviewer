@@ -1698,7 +1698,7 @@ pub(in crate::app) struct ViewerContextBundle {
     analysis_filter_mag: u8,
     analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
     view_trim_mode: bool,
-    view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    view_trim_book_preference: crate::view_trim::ViewTrimBookPreference,
     view_trim_page_apply_root_idx: Option<usize>,
     view_trim_page_spread_separate: bool,
     view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
@@ -2947,7 +2947,7 @@ impl ViewerContextBundle {
             analysis_filter_mag: 0,
             analysis_guide_drag: None,
             view_trim_mode: false,
-            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
+            view_trim_book_preference: crate::view_trim::ViewTrimBookPreference::default(),
             view_trim_page_apply_root_idx: None,
             view_trim_page_spread_separate: false,
             view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
@@ -3378,7 +3378,7 @@ impl App {
             analysis_filter_mag,
             analysis_guide_drag,
             view_trim_mode,
-            view_trim_apply_mode,
+            view_trim_book_preference,
             view_trim_page_apply_root_idx,
             view_trim_page_spread_separate,
             view_trim_book_settings,
@@ -3713,7 +3713,7 @@ impl App {
         swap_field!(analysis_filter_mag);
         swap_field!(analysis_guide_drag);
         swap_field!(view_trim_mode);
-        swap_field!(view_trim_apply_mode);
+        swap_field!(view_trim_book_preference);
         swap_field!(view_trim_page_apply_root_idx);
         swap_field!(view_trim_page_spread_separate);
         swap_field!(view_trim_book_settings);
@@ -4097,7 +4097,7 @@ impl App {
             analysis_filter_mag,
             analysis_guide_drag,
             view_trim_mode,
-            view_trim_apply_mode,
+            view_trim_book_preference,
             view_trim_page_apply_root_idx,
             view_trim_page_spread_separate,
             view_trim_book_settings,
@@ -4506,7 +4506,7 @@ impl App {
             current_color_cache_map,
             current_color_catalog,
             view_trim_mode,
-            view_trim_apply_mode,
+            view_trim_book_preference,
             view_trim_page_apply_root_idx,
             view_trim_page_spread_separate,
             view_trim_book_settings,
@@ -4634,7 +4634,7 @@ impl App {
         let mut detached = self.split_current_context_preserving_main_grid();
 
         detached.view_trim_mode = self.view_trim_mode;
-        detached.view_trim_apply_mode = self.view_trim_apply_mode;
+        detached.view_trim_book_preference = self.view_trim_book_preference;
         detached.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx;
         detached.view_trim_page_spread_separate = self.view_trim_page_spread_separate;
         detached.view_trim_book_settings = self.view_trim_book_settings.clone();
@@ -5153,6 +5153,32 @@ impl App {
     /// Every context except the one currently projected onto `App`. See `ContextTable::other_ids`.
     pub(in crate::app) fn other_viewer_context_ids(&self) -> Vec<ViewerContextId> {
         self.viewer_contexts.table.other_ids()
+    }
+
+    /// Trim changes affect display geometry, not source pixels or detection results.
+    /// Parked contexts keep their pan/rotation and reanchor through the normal renderer.
+    pub(crate) fn invalidate_auto_view_trim_display_in_parked_contexts(&mut self) {
+        for id in self.viewer_contexts.table.other_ids() {
+            let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
+                continue;
+            };
+            if bundle.view_trim_book_preference
+                != crate::view_trim::ViewTrimBookPreference::FollowGlobal
+            {
+                continue;
+            }
+            bundle.fullscreen_page_layout.clear();
+            bundle.fs_vertical_cache_keep_set.clear();
+            bundle.continuous_page_transitions.clear();
+            bundle.slideshow_scroll_range_cache = None;
+            if !bundle.reading_flow.is_paged() && bundle.fullscreen_idx.is_some() {
+                bundle.fs_vertical_scroll = 0.0;
+                bundle.continuous_reading_scroll_transition =
+                    Some(ContinuousReadingScrollTransition::AwaitingReanchor {
+                        history_trigger: HistoryTrigger::UserChosen,
+                    });
+            }
+        }
     }
 
     /// A global final-cover setting is shared by every viewer context, while the geometry and
@@ -8779,6 +8805,68 @@ mod tests {
             assert_eq!(owner.fs_vertical_scroll, 333.0);
         })
         .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_auto_view_trim_change_invalidates_only_inherited_geometry_and_preserves_pixels() {
+        use crate::view_trim::ViewTrimBookPreference as P;
+        let mut app = crate::app::setup_app_for_test();
+        app.view_trim_book_preference = P::FollowGlobal;
+        app.fs_pan = egui::vec2(7.0, 9.0);
+        let mut contexts = Vec::new();
+        for (window, preference) in [
+            (741, P::FollowGlobal),
+            (742, P::None),
+            (743, P::Auto),
+            (744, P::Manual),
+        ] {
+            let id = app.build_window_context_for_test(window, |owner| {
+                owner.view_trim_book_preference = preference;
+                owner.fullscreen_idx = Some(0);
+                owner.reading_flow = crate::settings::ReadingFlow::Vertical;
+                owner.fs_vertical_scroll = 123.0;
+                owner.fs_pan = egui::vec2(13.0, 17.0);
+                owner.fs_free_rotation = 23.0;
+                owner.fs_margin_bbox_cache.insert(0, (4, 5, None));
+                owner.fs_vertical_cache_keep_set.insert(0);
+                owner
+                    .fullscreen_page_layout
+                    .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+            });
+            contexts.push((id, preference));
+        }
+        app.invalidate_auto_view_trim_display_in_parked_contexts();
+        assert_eq!(app.fs_pan, egui::vec2(7.0, 9.0));
+        for (id, preference) in contexts {
+            let bundle = app.viewer_contexts.table.at_rest(id).unwrap();
+            assert_eq!(bundle.view_trim_book_preference, preference);
+            assert_eq!(bundle.fs_pan, egui::vec2(13.0, 17.0));
+            assert_eq!(bundle.fs_free_rotation, 23.0);
+            assert_eq!(bundle.fs_margin_bbox_cache.get(&0), Some(&(4, 5, None)));
+            if preference == P::FollowGlobal {
+                assert_eq!(
+                    bundle.fullscreen_page_layout.kind(),
+                    crate::displayed_image_transform::FullscreenPageLayoutKind::Empty
+                );
+                assert!(bundle.fs_vertical_cache_keep_set.is_empty());
+                assert_eq!(bundle.fs_vertical_scroll, 0.0);
+                assert!(matches!(
+                    bundle.continuous_reading_scroll_transition,
+                    Some(ContinuousReadingScrollTransition::AwaitingReanchor {
+                        history_trigger: HistoryTrigger::UserChosen
+                    })
+                ));
+            } else {
+                assert_eq!(
+                    bundle.fullscreen_page_layout.kind(),
+                    crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
+                );
+                assert!(bundle.fs_vertical_cache_keep_set.contains(&0));
+                assert_eq!(bundle.fs_vertical_scroll, 123.0);
+                assert!(bundle.continuous_reading_scroll_transition.is_none());
+            }
+        }
     }
 
     #[cfg(windows)]

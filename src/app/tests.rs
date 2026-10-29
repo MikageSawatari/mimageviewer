@@ -39560,6 +39560,264 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn view_trim_unavailable_database_does_not_inherit_global_auto_or_migrate_legacy_fit() {
+        let mut app = setup_app();
+        app.view_trim_db = None;
+        app.settings.auto_view_trim_default_enabled = true;
+        app.settings.margin_fit_enabled = true;
+        let key = app.tmp.path().join("unavailable-trim-db");
+        app.apply_view_trim_for_key(&key);
+        assert_eq!(
+            app.view_trim_book_preference,
+            crate::view_trim::ViewTrimBookPreference::None
+        );
+        assert_eq!(
+            app.effective_view_trim_apply_mode_for_idx(0),
+            crate::view_trim::ViewTrimApplyMode::None
+        );
+        assert!(app.settings.margin_fit_enabled);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text
+                    == "表示トリムの設定を読み込めないため、トリムなしで表示しています")
+        );
+    }
+
+    #[test]
+    fn pending_view_trim_transfer_keeps_nested_follow_global_marker() {
+        use crate::view_trim::{ViewTrimBookPreference as P, ViewTrimBookState};
+        let mut app = setup_app();
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        let key = app.spread_container_key_with_fallback().unwrap();
+        let root = key
+            .fallback
+            .as_ref()
+            .expect("nested book has root fallback");
+        app.view_trim_db
+            .as_ref()
+            .unwrap()
+            .set_book_state(
+                root,
+                None,
+                ViewTrimBookState {
+                    preference: P::Auto,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.view_trim_book_preference = P::FollowGlobal;
+        app.view_trim_save_pending = true;
+        let pending = app.take_pending_view_trim_transfer().unwrap();
+        assert_eq!(
+            pending
+                .batch
+                .book
+                .as_ref()
+                .map(|(exact, fallback, _)| (exact, fallback)),
+            Some((&key.exact, &key.fallback))
+        );
+        app.view_trim_db
+            .as_mut()
+            .unwrap()
+            .apply_write_batch(&pending.batch)
+            .unwrap();
+        let loaded = app
+            .view_trim_db
+            .as_ref()
+            .unwrap()
+            .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref());
+        assert!(matches!(
+            loaded,
+            crate::view_trim_db::ViewTrimBookLoad::Stored(
+                ViewTrimBookState {
+                    preference: P::FollowGlobal,
+                    ..
+                },
+                _
+            )
+        ));
+    }
+
+    #[test]
+    fn view_trim_manual_selection_enables_default_book_and_follow_global_preserves_settings() {
+        use crate::view_trim::{ViewTrimBookPreference as P, ViewTrimBookSettings};
+        use crate::view_trim_db::ViewTrimBookLoad;
+        use egui_kittest::kittest::Queryable;
+
+        fn select_mode(app: &mut App, label: &str) {
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(460.0, 680.0))
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .build_ui(|ui| {
+                    let ctx = ui.ctx().clone();
+                    app.draw_view_trim_controls(
+                        ui,
+                        &ctx,
+                        0,
+                        crate::ui_fullscreen::SpreadPair::Single,
+                        420.0,
+                        640.0,
+                    );
+                });
+            harness.run();
+            harness.get_by_label(label).click();
+            harness.run();
+        }
+
+        let mut app = setup_app();
+        app.current_folder = Some(app.tmp.path().join("trim-default-book"));
+        let path = app.current_folder.as_ref().unwrap().join("page.jpg");
+        app.items.push(GridItem::Image(path));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        let key = app.spread_container_key_with_fallback().unwrap();
+        assert!(key.fallback.is_none());
+        assert!(matches!(
+            app.view_trim_db
+                .as_ref()
+                .unwrap()
+                .load_book_preference_with_fallback(&key.exact, None),
+            ViewTrimBookLoad::Missing
+        ));
+        assert_eq!(app.view_trim_book_preference, P::FollowGlobal);
+        assert_eq!(app.view_trim_book_settings, ViewTrimBookSettings::default());
+
+        select_mode(&mut app, "手動設定");
+        let ViewTrimBookLoad::Stored(manual, _) = app
+            .view_trim_db
+            .as_ref()
+            .unwrap()
+            .load_book_preference_with_fallback(&key.exact, None)
+        else {
+            panic!("Manual selection must persist a book row");
+        };
+        assert_eq!(manual.preference, P::Manual);
+        assert!(manual.book_settings.enabled);
+
+        // 保存した手動余白も、FollowGlobal への切替で保持する。
+        app.view_trim_book_settings.single.left = 0.08;
+        app.view_trim_book_settings.spread_linked.outer = 0.06;
+        app.persist_current_view_trim_book_state();
+        let book = app.view_trim_book_settings;
+        select_mode(&mut app, "全体設定に従う（現在: トリムなし）");
+        let ViewTrimBookLoad::Stored(inherited, _) = app
+            .view_trim_db
+            .as_ref()
+            .unwrap()
+            .load_book_preference_with_fallback(&key.exact, None)
+        else {
+            panic!("FollowGlobal must retain the enabled book settings and margins");
+        };
+        assert_eq!(inherited.preference, P::FollowGlobal);
+        assert_eq!(inherited.book_settings, book);
+        assert!(inherited.book_settings.enabled);
+    }
+
+    #[test]
+    fn view_trim_panel_mode_changes_preserve_manual_values_and_page_rows() {
+        use crate::view_trim::{
+            ViewTrimBookPreference as P, ViewTrimMargins, ViewTrimPageOverride,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut app = setup_app();
+        app.current_folder = Some(app.tmp.path().join("trim-book"));
+        let path = app.current_folder.as_ref().unwrap().join("page.jpg");
+        app.items.push(GridItem::Image(path));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.view_trim_book_preference = P::Manual;
+        app.view_trim_book_settings.single.left = 0.08;
+        let book = app.view_trim_book_settings;
+        let page = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            top: 0.09,
+            ..Default::default()
+        });
+        app.view_trim_page_overrides.insert(0, page);
+        app.persist_view_trim_page_override(0, page);
+        let key = app.page_path_key(0).unwrap();
+        for (global, label, preference) in [
+            (false, "トリムなし", P::None),
+            (false, "自動余白カット（本全体）", P::Auto),
+            (false, "全体設定に従う（現在: トリムなし）", P::FollowGlobal),
+            (
+                true,
+                "全体設定に従う（現在: 自動余白カット）",
+                P::FollowGlobal,
+            ),
+            (true, "手動設定", P::Manual),
+        ] {
+            app.settings.auto_view_trim_default_enabled = global;
+            {
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(460.0, 680.0))
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .build_ui(|ui| {
+                        let ctx = ui.ctx().clone();
+                        app.draw_view_trim_controls(
+                            ui,
+                            &ctx,
+                            0,
+                            crate::ui_fullscreen::SpreadPair::Single,
+                            420.0,
+                            640.0,
+                        );
+                    });
+                harness.run();
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            assert_eq!(app.view_trim_book_preference, preference);
+            let mut expected_book = book;
+            if preference == P::Manual {
+                expected_book.enabled = true;
+            }
+            assert_eq!(app.view_trim_book_settings, expected_book);
+            assert_eq!(app.view_trim_page_overrides.get(&0), Some(&page));
+            assert_eq!(
+                app.view_trim_db.as_ref().unwrap().get_page_override(&key),
+                Some(page)
+            );
+        }
+    }
+
+    #[test]
+    fn view_trim_load_only_migrates_missing_and_legacy_none_and_preserves_invalid_row() {
+        use crate::view_trim::{ViewTrimBookPreference as P, ViewTrimBookState};
+        let mut app = setup_app();
+        let conn = rusqlite::Connection::open(app.tmp.path().join("view_trim.db")).unwrap();
+        for (name, json, expected) in [
+            ("missing", None, P::Auto),
+            ("legacy-none", Some(r#"{"apply_mode":"none","book_settings":{"single":{"left":0.08,"top":0,"right":0,"bottom":0}}}"#.to_string()), P::Auto),
+            ("legacy-page", Some(r#"{"apply_mode":"page"}"#.to_string()), P::None),
+            ("current-none", Some(serde_json::to_string(&ViewTrimBookState { preference: P::None, ..Default::default() }).unwrap()), P::None),
+            ("current-marker", Some(serde_json::to_string(&ViewTrimBookState::default()).unwrap()), P::FollowGlobal),
+            ("invalid", Some(r#"{"version":3,"preference":"auto"}"#.to_string()), P::None),
+        ] {
+            let path = app.tmp.path().join(name);
+            let key = crate::path_key::normalize(&path);
+            if let Some(json) = &json {
+                conn.execute("INSERT INTO view_trim_books(book_key,state_json) VALUES(?1,?2)", rusqlite::params![key, json]).unwrap();
+            }
+            app.settings.margin_fit_enabled = true;
+            app.settings.auto_view_trim_default_enabled = true;
+            app.apply_view_trim_for_key(&path);
+            assert_eq!(app.view_trim_book_preference, expected, "{name}");
+            if name == "legacy-none" { assert_eq!(app.view_trim_book_settings.single.left, 0.08); }
+            if name.starts_with("current") || name == "invalid" || name == "legacy-page" {
+                let after: String = conn.query_row("SELECT state_json FROM view_trim_books WHERE book_key=?1", [&key], |row| row.get(0)).unwrap();
+                assert_eq!(Some(after), json, "{name} must not be rewritten");
+            }
+            if name == "invalid" {
+                assert_eq!(app.effective_view_trim_apply_mode_for_idx(0), crate::view_trim::ViewTrimApplyMode::None);
+                assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| text == "表示トリムの設定を読み込めないため、トリムなしで表示しています"));
+            }
+        }
+    }
+
+    #[test]
     fn view_trim_change_recenters_only_an_active_continuous_reader() {
         use crate::grid_item::GridItem;
         use crate::settings::ReadingFlow;
@@ -39611,7 +39869,7 @@ mod favorite_adjustment_defaults_tests {
         app.hydrate_view_trim_page_overrides_for_current_items();
 
         assert_eq!(app.view_trim_page_overrides.get(&0), Some(&saved));
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         // 再水和した enabled 行は一時的な選択操作を待たず、そのページの手動設定になる。
         assert_eq!(
             app.effective_view_trim_apply_mode_for_idx(0),
@@ -39642,7 +39900,7 @@ mod favorite_adjustment_defaults_tests {
             top: 0.04,
             ..Default::default()
         });
-        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single = book_margins;
         app.view_trim_page_overrides.insert(0, page_override);
@@ -39671,7 +39929,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn non_manual_view_trim_modes_ignore_page_overrides() {
         use crate::grid_item::{GridItem, ThumbnailState};
-        use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
 
         let mut app = setup_app();
         app.items
@@ -39685,9 +39943,15 @@ mod favorite_adjustment_defaults_tests {
             }),
         );
 
-        for mode in [ViewTrimApplyMode::None, ViewTrimApplyMode::Auto] {
-            app.view_trim_apply_mode = mode;
-            assert_eq!(app.effective_view_trim_apply_mode_for_idx(0), mode);
+        for preference in [
+            crate::view_trim::ViewTrimBookPreference::None,
+            crate::view_trim::ViewTrimBookPreference::Auto,
+        ] {
+            app.view_trim_book_preference = preference;
+            assert_eq!(
+                app.effective_view_trim_apply_mode_for_idx(0),
+                preference.resolve(false)
+            );
             assert_eq!(app.view_trim_single_bbox(0), None);
         }
     }
@@ -39695,9 +39959,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn manual_spread_resolves_one_sided_override_and_book_fallback() {
         use crate::grid_item::{GridItem, ThumbnailState};
-        use crate::view_trim::{
-            ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide,
-        };
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide};
 
         let mut app = setup_app();
         for name in ["left.jpg", "right.jpg"] {
@@ -39715,7 +39977,7 @@ mod favorite_adjustment_defaults_tests {
             right: 0.06,
             ..Default::default()
         };
-        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.spread_separate = true;
         app.view_trim_book_settings.spread_right = right_book;
@@ -81865,7 +82127,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 },
                 maximized: false,
             });
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.spread_separate = false;
         app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
@@ -83085,7 +83347,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_binding_for_test(Some(72));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.fs_transparent_bg_mode = 1;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.spread_separate = true;
         app.view_trim_book_settings.spread_left = crate::view_trim::ViewTrimMargins {
@@ -83251,7 +83513,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.transition_detached_window_state(73, DetachedWindowState::Active, "test");
         app.set_detached_window_binding_for_test(Some(73));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
         let left = push_image(&mut app, r"C:\pics\auto-trim-left.png");
         let right = push_image(&mut app, r"C:\pics\auto-trim-right.png");
 
@@ -83349,7 +83611,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(74));
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
             left: 0.10,
@@ -83367,7 +83629,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fullscreen_idx = None;
         app.selected = Some(main_idx);
         app.viewer_presentation = ViewerPresentation::MainWindow;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::None;
         app.view_trim_book_settings = crate::view_trim::ViewTrimBookSettings::default();
         app.view_trim_page_overrides.clear();
 
@@ -83378,8 +83640,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 ViewerPresentation::DetachedWindow
             );
             assert_eq!(
-                mounted.view_trim_apply_mode,
-                crate::view_trim::ViewTrimApplyMode::Book,
+                mounted.view_trim_book_preference,
+                crate::view_trim::ViewTrimBookPreference::Manual,
                 "active detached context must not inherit the main folder trim mode"
             );
             let actual = mounted
@@ -83390,8 +83652,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         .expect("active detached context should mount");
 
         assert_eq!(
-            app.view_trim_apply_mode,
-            crate::view_trim::ViewTrimApplyMode::None,
+            app.view_trim_book_preference,
+            crate::view_trim::ViewTrimBookPreference::None,
             "mounting the detached context must restore the main folder trim mode"
         );
     }

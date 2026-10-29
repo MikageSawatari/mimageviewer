@@ -152,7 +152,7 @@ fn run_coverage_lifecycle(empty: bool) {
         .unwrap(),
     );
     if empty {
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_page_overrides.insert(
             1,
             crate::view_trim::ViewTrimPageOverride::from_margins(

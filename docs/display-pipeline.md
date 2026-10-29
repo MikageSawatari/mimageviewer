@@ -2416,7 +2416,16 @@ rect のうち bbox 部分だけを UV 指定して描く。トリム量によ�
 漫画ビューア用途で読みながら使う表示専用トリム。左端 / 上端 / 右端ホバーで開く左パネルの
 `画像補正 / 表示トリム / ブックマーク` タブから操作し、選択中タブは `Settings::fullscreen_left_panel_tab`
 へ保存する。
-本側の基本モードは `ViewTrimApplyMode::{None, Auto, Book}` のラジオで選ぶ。
+本側の保存値は `ViewTrimBookPreference::{FollowGlobal, None, Auto, Manual}` の 4 ラジオで選び
+(§1.216、設計は [auto-trim-global-default-plan.md](auto-trim-global-default-plan.md))、
+App / `ViewerContextBundle` はこの preference だけを持つ。表示側は描画のたびに共通 resolver で
+`Settings::auto_view_trim_default_enabled` (環境設定「自動余白カットを標準で有効にする」、既定 OFF) と
+合わせて基本モード `ViewTrimApplyMode::{None, Auto, Book}` へ解決する。`FollowGlobal` は全体 ON で
+`Auto`、OFF で `None`、`Manual` は `Book`。行が無い本は `FollowGlobal` なので、全体 OFF のままなら
+従来どおりトリムなし。全体設定の変更は環境設定の OK で、mounted context が `FollowGlobal` なら
+トリム panel のモード変更と同じ再 anchor、parked context は `FollowGlobal` のものだけ layout 等を
+無効化する (pan・自由回転と余白検出 cache は保持)。passive な F12 窓は再 active 化で通常描画へ戻る
+まで旧トリムの snapshot のまま。
 `None` は bbox を使わず、`Auto` は表示中ページごとに `cached_margin_bbox` を使う。
 ただし見開きの `Auto` は左右をペアで調停し、上下だけ少ないカット幅に揃える。
 `Book` は手動設定の基底モードで、各 `idx` に enabled なページ個別行があれば `Page`、
@@ -2448,10 +2457,16 @@ bbox を採用せず、ページ全体を回転して表示する。表示トリ
 手動値へ流し込む自動検出で左右の結果がずれないようにする。見開き連動で左右を別々に調整しない場合は、
 手動値へ流し込む自動検出も上下 / 中央側 / 外側の共通値に左右の少ないカット幅を採用する。
 `Auto` は保存済みの手動値を作らず、ページごとに検出する。
-旧 `FullscreenFitMode::MarginFit` が保存されている場合は、表示トリムの適用モード `Auto` と
-ページ全体フィットへ移行して保存する。
-基本適用モードと本全体設定は `view_trim.db::view_trim_books` に本キー
+旧 `FullscreenFitMode::MarginFit` が保存されている場合は、行が無い本か旧形式の `none` 行の本だけ
+表示トリムの `Auto` とページ全体フィットへ移行して保存する (新形式の明示値は上書きしない)。
+本別 preference と本全体設定は `view_trim.db::view_trim_books` に本キー
 (`spread_container_key` と同じ粒度。ネスト ZIP は zip_path + 実効 prefix) で保存する。
+`state_json` は `{"version":2,"preference":..,"apply_mode":<旧版向けの写し>,"book_settings":..}`。
+`version` の無い旧形式は `apply_mode` を `auto→Auto / book→Manual / none・page→None` と読む
+(旧版は `none` + 既定値の行を削除していたため、行なしと明示のトリムなしは区別できず、行なしは
+`FollowGlobal` と読む)。root の `FollowGlobal` + 既定値は行を持たず、ネスト本の `FollowGlobal` は
+root fallback を遮る行として残す (末尾表紙の本別設定と同じ規則)。読めない行・DB エラーは
+通知してトリムなしで表示し、fallback も書き換えもしない。メタ情報転送の portable 形式も同じ codec を通す。
 ページ個別設定は `view_trim.db::view_trim_pages` に `page_path_key` で保存する。
 `Page` は本側の適用モードとしては保存しない。代わりに enabled なページ個別行そのものが
 そのページの永続 Page 選択を表す。`effective_view_trim_apply_mode_for_idx(idx)` が基本モードと

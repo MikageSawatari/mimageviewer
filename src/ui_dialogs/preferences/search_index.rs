@@ -883,6 +883,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["表紙", "末尾", "見開き", "本ごとの設定"]
     ),
     entry!(
+        "spread/auto-view-trim",
+        SpreadMode,
+        "自動余白カットを標準で有効にする",
+        ["トリム", "余白", "自動", "既定", "本ごとの設定", "回転"]
+    ),
+    entry!(
         "spread/page-turn-animation",
         SpreadMode,
         "ページめくりアニメーション",
@@ -1749,6 +1755,18 @@ mod tests {
             .position(|candidate| *candidate == page)
             .unwrap();
         ("カテゴリ", 0, index)
+    }
+
+    #[test]
+    fn auto_view_trim_default_search_reaches_its_anchor() {
+        for query in ["自動余白カット", "トリム 既定", "余白 回転"] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.anchor == "spread/auto-view-trim"
+                        && entry.page == PreferencesPage::SpreadMode)
+            );
+        }
     }
 
     #[test]

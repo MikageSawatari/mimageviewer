@@ -323,49 +323,140 @@ pub fn harmonize_spread_auto_bboxes(
     (left_margins.bbox(), right_margins.bbox())
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// 保存する本別の選択。表示結果の `Page` はここには含めない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewTrimBookPreference {
+    #[default]
+    FollowGlobal,
+    None,
+    Auto,
+    Manual,
+}
+
+impl ViewTrimBookPreference {
+    pub fn resolve(self, global_auto_trim: bool) -> ViewTrimApplyMode {
+        match self {
+            Self::FollowGlobal if global_auto_trim => ViewTrimApplyMode::Auto,
+            Self::FollowGlobal | Self::None => ViewTrimApplyMode::None,
+            Self::Auto => ViewTrimApplyMode::Auto,
+            Self::Manual => ViewTrimApplyMode::Book,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewTrimBookProvenance {
+    Legacy(ViewTrimApplyMode),
+    Current,
+}
+
+/// DB とメタ情報 package が共有する状態。新規保存は常に version 2。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ViewTrimBookState {
-    #[serde(default)]
-    pub apply_mode: ViewTrimApplyMode,
-    #[serde(default)]
+    pub preference: ViewTrimBookPreference,
     pub book_settings: ViewTrimBookSettings,
 }
 
-impl ViewTrimBookState {
-    pub fn is_removable(self) -> bool {
-        matches!(self.apply_mode, ViewTrimApplyMode::None)
-            && self.book_settings == ViewTrimBookSettings::default()
+impl Serialize for ViewTrimBookState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct CurrentState {
+            version: u8,
+            preference: ViewTrimBookPreference,
+            apply_mode: ViewTrimApplyMode,
+            book_settings: ViewTrimBookSettings,
+        }
+        CurrentState {
+            version: 2,
+            preference: self.preference,
+            // 旧版の reader は未知 field を無視して、この写しを使う。
+            apply_mode: self.preference.resolve(false),
+            book_settings: self.book_settings,
+        }
+        .serialize(serializer)
     }
 }
 
-/// 保存値を本単位の基底モードへ正規化する。
-/// `Page` は enabled なページ個別行からだけ導出され、本単位では保持しない。
-pub fn view_trim_base_apply_mode(stored: ViewTrimApplyMode) -> ViewTrimApplyMode {
-    match stored {
-        ViewTrimApplyMode::Page => ViewTrimApplyMode::None,
-        mode => mode,
+impl<'de> Deserialize<'de> for ViewTrimBookState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        decode_view_trim_book_value(value)
+            .map(|(state, _)| state)
+            .map_err(serde::de::Error::custom)
     }
 }
 
-/// 本体表示と remote 表示が共有する旧 margin-fit 互換の基底モード解決。
-pub fn effective_view_trim_base_apply_mode(
-    stored: ViewTrimApplyMode,
-    legacy_margin_fit_active: bool,
-) -> ViewTrimApplyMode {
-    let mode = view_trim_base_apply_mode(stored);
-    if matches!(mode, ViewTrimApplyMode::None) && legacy_margin_fit_active {
-        ViewTrimApplyMode::Auto
+/// 行の有無と旧 margin-fit 移行を区別する DB reader も同じ decoder を使う。
+pub fn decode_view_trim_book_state(
+    json: &str,
+) -> Result<(ViewTrimBookState, ViewTrimBookProvenance), serde_json::Error> {
+    decode_view_trim_book_value(serde_json::from_str(json)?)
+}
+
+fn decode_view_trim_book_value(
+    value: serde_json::Value,
+) -> Result<(ViewTrimBookState, ViewTrimBookProvenance), serde_json::Error> {
+    let invalid = |message| <serde_json::Error as serde::de::Error>::custom(message);
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("view trim state must be an object"))?;
+    if let Some(version) = object.get("version") {
+        if version.as_u64() != Some(2) {
+            return Err(invalid("unsupported view trim state version"));
+        }
+        #[derive(Deserialize)]
+        struct CurrentState {
+            preference: ViewTrimBookPreference,
+            #[serde(default)]
+            book_settings: ViewTrimBookSettings,
+        }
+        let current: CurrentState = serde_json::from_value(value)?;
+        Ok((
+            ViewTrimBookState {
+                preference: current.preference,
+                book_settings: current.book_settings,
+            },
+            ViewTrimBookProvenance::Current,
+        ))
     } else {
-        mode
+        #[derive(Deserialize)]
+        struct LegacyState {
+            #[serde(default)]
+            apply_mode: ViewTrimApplyMode,
+            #[serde(default)]
+            book_settings: ViewTrimBookSettings,
+        }
+        let legacy: LegacyState = serde_json::from_value(value)?;
+        Ok((
+            ViewTrimBookState {
+                preference: match legacy.apply_mode {
+                    ViewTrimApplyMode::None | ViewTrimApplyMode::Page => {
+                        ViewTrimBookPreference::None
+                    }
+                    ViewTrimApplyMode::Auto => ViewTrimBookPreference::Auto,
+                    ViewTrimApplyMode::Book => ViewTrimBookPreference::Manual,
+                },
+                book_settings: legacy.book_settings,
+            },
+            ViewTrimBookProvenance::Legacy(legacy.apply_mode),
+        ))
     }
 }
 
-/// 基底が `Book` のときだけ、enabled なページ個別行を `Page` へ昇格させる。
-pub fn effective_view_trim_apply_mode(
-    base_mode: ViewTrimApplyMode,
+/// legacy_auto は読込結果が Missing / 旧 None の場合に限り caller が有効にする。
+pub fn resolve_view_trim_apply_mode(
+    preference: ViewTrimBookPreference,
+    global_auto_trim: bool,
+    legacy_auto: bool,
     page_override: Option<ViewTrimPageOverride>,
 ) -> ViewTrimApplyMode {
-    match base_mode {
+    let base = if legacy_auto {
+        ViewTrimApplyMode::Auto
+    } else {
+        preference.resolve(global_auto_trim)
+    };
+    match base {
         ViewTrimApplyMode::Book if page_override.is_some_and(|value| value.enabled) => {
             ViewTrimApplyMode::Page
         }
@@ -415,6 +506,149 @@ fn clamp_pair(start: &mut f32, end: &mut f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versioned_codec_preserves_preferences_and_manual_values_for_old_readers() {
+        #[derive(Deserialize)]
+        struct OldState {
+            apply_mode: ViewTrimApplyMode,
+            book_settings: ViewTrimBookSettings,
+        }
+        for (preference, old_mode) in [
+            (
+                ViewTrimBookPreference::FollowGlobal,
+                ViewTrimApplyMode::None,
+            ),
+            (ViewTrimBookPreference::None, ViewTrimApplyMode::None),
+            (ViewTrimBookPreference::Auto, ViewTrimApplyMode::Auto),
+            (ViewTrimBookPreference::Manual, ViewTrimApplyMode::Book),
+        ] {
+            let state = ViewTrimBookState {
+                preference,
+                book_settings: ViewTrimBookSettings {
+                    enabled: true,
+                    single: ViewTrimMargins {
+                        left: 0.08,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            };
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                decode_view_trim_book_state(&json).unwrap(),
+                (state, ViewTrimBookProvenance::Current)
+            );
+            let old: OldState = serde_json::from_str(&json).unwrap();
+            assert_eq!(old.apply_mode, old_mode);
+            assert_eq!(old.book_settings, state.book_settings);
+            // Current readers ignore the downgrade mirror even if it disagrees.
+            let mut value = serde_json::to_value(state).unwrap();
+            value["apply_mode"] = serde_json::json!("unknown");
+            assert_eq!(
+                serde_json::from_value::<ViewTrimBookState>(value).unwrap(),
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn codec_distinguishes_legacy_modes_and_rejects_invalid_current_rows() {
+        for (mode, preference, original) in [
+            (
+                "none",
+                ViewTrimBookPreference::None,
+                ViewTrimApplyMode::None,
+            ),
+            (
+                "page",
+                ViewTrimBookPreference::None,
+                ViewTrimApplyMode::Page,
+            ),
+            (
+                "auto",
+                ViewTrimBookPreference::Auto,
+                ViewTrimApplyMode::Auto,
+            ),
+            (
+                "book",
+                ViewTrimBookPreference::Manual,
+                ViewTrimApplyMode::Book,
+            ),
+        ] {
+            let json = serde_json::json!({"apply_mode": mode, "book_settings": {"single": {"left": 0.09,"right":0.0,"top":0.0,"bottom":0.0}}});
+            let (state, provenance) = decode_view_trim_book_state(&json.to_string()).unwrap();
+            assert_eq!(state.preference, preference);
+            assert_eq!(state.book_settings.single.left, 0.09);
+            assert_eq!(provenance, ViewTrimBookProvenance::Legacy(original));
+        }
+        for invalid in [
+            "null",
+            "[]",
+            "{",
+            r#"{"version":1,"preference":"auto"}"#,
+            r#"{"version":"2","preference":"auto"}"#,
+            r#"{"version":null,"preference":"auto"}"#,
+            r#"{"version":2.0,"preference":"auto"}"#,
+            r#"{"version":2,"apply_mode":"auto"}"#,
+            r#"{"version":2,"preference":"book"}"#,
+        ] {
+            assert!(decode_view_trim_book_state(invalid).is_err(), "{invalid}");
+            assert!(
+                serde_json::from_str::<ViewTrimBookState>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_only_promotes_manual_pages_and_resolves_global_live() {
+        let page = Some(ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.1,
+            ..Default::default()
+        }));
+        for global in [false, true] {
+            for page in [
+                None,
+                Some(ViewTrimPageOverride {
+                    enabled: false,
+                    ..Default::default()
+                }),
+            ] {
+                assert_eq!(
+                    resolve_view_trim_apply_mode(
+                        ViewTrimBookPreference::Manual,
+                        global,
+                        false,
+                        page
+                    ),
+                    ViewTrimApplyMode::Book
+                );
+            }
+            for (preference, expected) in [
+                (
+                    ViewTrimBookPreference::FollowGlobal,
+                    if global {
+                        ViewTrimApplyMode::Auto
+                    } else {
+                        ViewTrimApplyMode::None
+                    },
+                ),
+                (ViewTrimBookPreference::None, ViewTrimApplyMode::None),
+                (ViewTrimBookPreference::Auto, ViewTrimApplyMode::Auto),
+                (ViewTrimBookPreference::Manual, ViewTrimApplyMode::Page),
+            ] {
+                assert_eq!(
+                    resolve_view_trim_apply_mode(preference, global, false, page),
+                    expected
+                );
+            }
+            assert_eq!(
+                resolve_view_trim_apply_mode(ViewTrimBookPreference::None, global, true, page),
+                ViewTrimApplyMode::Auto
+            );
+        }
+    }
 
     #[test]
     fn linked_spread_maps_inner_and_outer_to_screen_sides() {
@@ -583,22 +817,6 @@ mod tests {
     }
 
     #[test]
-    fn effective_mode_normalizes_saved_page_and_promotes_legacy_none_to_auto() {
-        assert_eq!(
-            effective_view_trim_base_apply_mode(ViewTrimApplyMode::Page, false),
-            ViewTrimApplyMode::None
-        );
-        assert_eq!(
-            effective_view_trim_base_apply_mode(ViewTrimApplyMode::None, true),
-            ViewTrimApplyMode::Auto
-        );
-        assert_eq!(
-            effective_view_trim_base_apply_mode(ViewTrimApplyMode::Book, true),
-            ViewTrimApplyMode::Book
-        );
-    }
-
-    #[test]
     fn effective_book_mode_promotes_only_enabled_page_override() {
         let disabled = ViewTrimPageOverride {
             enabled: false,
@@ -610,15 +828,25 @@ mod tests {
         });
 
         assert_eq!(
-            effective_view_trim_apply_mode(ViewTrimApplyMode::Book, Some(disabled)),
+            resolve_view_trim_apply_mode(
+                ViewTrimBookPreference::Manual,
+                false,
+                false,
+                Some(disabled)
+            ),
             ViewTrimApplyMode::Book
         );
         assert_eq!(
-            effective_view_trim_apply_mode(ViewTrimApplyMode::Book, Some(enabled)),
+            resolve_view_trim_apply_mode(
+                ViewTrimBookPreference::Manual,
+                false,
+                false,
+                Some(enabled)
+            ),
             ViewTrimApplyMode::Page
         );
         assert_eq!(
-            effective_view_trim_apply_mode(ViewTrimApplyMode::Auto, Some(enabled)),
+            resolve_view_trim_apply_mode(ViewTrimBookPreference::Auto, false, false, Some(enabled)),
             ViewTrimApplyMode::Auto
         );
     }

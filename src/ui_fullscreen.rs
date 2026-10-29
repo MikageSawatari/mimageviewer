@@ -89952,7 +89952,7 @@ mod specified_scale_consumer_tests {
 
     #[test]
     fn specified_scale_review_real_eviction_re_resolves_book_and_page_trim() {
-        use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
         for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
             for paired in [false, true] {
                 for page_scope in [false, true] {
@@ -89960,7 +89960,8 @@ mod specified_scale_consumer_tests {
                     let (mut app, units) = specified_eviction_fixture(&ctx, flow, paired);
                     app.settings.fullscreen_specified_scale = height(100);
                     app.settings.spread_page_gap_px = 0;
-                    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+                    app.view_trim_book_preference =
+                        crate::view_trim::ViewTrimBookPreference::Manual;
                     let rect =
                         egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
                     app.continuous_reading_layout(&ctx, rect, &units, 0, false)
@@ -90115,7 +90116,7 @@ mod specified_scale_consumer_tests {
                 height(100)
             };
             if matches!(change, Change::Rotation) {
-                app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+                app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
                 app.view_trim_book_settings.enabled = true;
                 app.view_trim_book_settings.single.top = 0.1;
                 app.view_trim_book_settings.single.bottom = 0.1;
@@ -90296,7 +90297,7 @@ mod specified_scale_consumer_tests {
             );
         };
         install(&mut app, pixels(20), 1);
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
         app.continuous_reading_layout(&ctx, rect, &units, 0, false)
             .unwrap();
@@ -90326,7 +90327,7 @@ mod specified_scale_consumer_tests {
         );
         // Manual policy reads current settings; returning to Auto uses only the
         // accepted detection input, never the previous Manual policy's bbox.
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single.top = 0.1;
         app.view_trim_book_settings.single.bottom = 0.1;
@@ -90337,7 +90338,7 @@ mod specified_scale_consumer_tests {
             .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
             .unwrap();
         assert!((manual.scale - 1.25).abs() < 0.00001);
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
         app.reanchor_continuous_reading_after_view_trim_change(40);
         app.continuous_reading_layout(&ctx, rect, &units, 40, false)
             .unwrap();
@@ -90387,7 +90388,7 @@ mod specified_scale_consumer_tests {
             owner.reading_flow = ReadingFlow::Vertical;
             owner.spread_mode = crate::settings::SpreadMode::Single;
             owner.viewer_presentation = ViewerPresentation::DetachedWindow;
-            owner.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+            owner.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
             owner.fs_continuous_fit_reference = reference;
             owner.transition_detached_window_state(
                 window_id,
@@ -90426,7 +90427,11 @@ mod specified_scale_consumer_tests {
         });
         assert_eq!(reference_idx(&app), 0);
         assert_eq!(
-            app.view_trim_apply_mode,
+            app.view_trim_book_preference,
+            crate::view_trim::ViewTrimBookPreference::FollowGlobal
+        );
+        assert_eq!(
+            app.resolved_view_trim_base_mode(),
             crate::view_trim::ViewTrimApplyMode::None
         );
     }
@@ -92192,7 +92197,7 @@ mod specified_scale_consumer_tests {
         let mut app = pdf_app(&ctx, 2);
         let _probe = PdfRerenderRequestProbe::start();
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         let trim = crate::view_trim::ViewTrimPageOverride::from_margins(
             crate::view_trim::ViewTrimMargins {
                 left: 0.1,

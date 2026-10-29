@@ -263,7 +263,7 @@ fn plain_folder_spread_import_refresh_limits_opt_in_and_preserves_sibling_contex
                     final_cover_spread_preference: Default::default(),
                     singleton_spread_endpoint_preferences: Default::default(),
                     page_alone_preferences: Default::default(),
-                    view_trim: None,
+                    view_trim: crate::view_trim_db::ViewTrimBookLoad::Missing,
                 }),
                 rating_cache: None,
                 ..metadata_context_result(app.viewer_context_main(), app.items_generation, 0)

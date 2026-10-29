@@ -83,7 +83,7 @@ pub(crate) struct ContainerStateResult {
     pub(crate) singleton_spread_endpoint_preferences:
         crate::settings::SingletonSpreadEndpointPreferences,
     pub(crate) page_alone_preferences: crate::settings::PageAlonePreferences,
-    pub(crate) view_trim: Option<crate::view_trim::ViewTrimBookState>,
+    pub(crate) view_trim: crate::view_trim_db::ViewTrimBookLoad,
 }
 
 pub(crate) struct PageStateResult {
@@ -562,54 +562,61 @@ fn build_context_result(
             })
             .collect()
     });
-    let container_state =
-        if changed.container_state && spread_db.is_some() && container_trim_db.is_some() {
-            request.spread_container_path.as_deref().and_then(|path| {
-                let fallback = request.spread_container_fallback.as_deref();
-                let stored = spread_db
-                    .map(|db| db.get_state_with_fallback(path, fallback))
-                    .unwrap_or_default();
-                let final_cover_spread_preference = spread_db
-                    .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
-                    .unwrap_or_default();
-                let singleton_spread_endpoint_preferences = match spread_db
-                    .map(|db| {
-                        db.get_singleton_spread_endpoint_preferences_with_fallback(path, fallback)
-                    })
-                    .transpose()
-                {
-                    Ok(value) => value.unwrap_or_default(),
-                    Err(error) => {
-                        crate::logger::log(format!(
-                            "spread: metadata refresh endpoint read failed: {error}"
-                        ));
-                        return None;
-                    }
-                };
-                let page_alone_preferences = match spread_db
-                    .map(|db| db.get_page_alone_preferences_with_fallback(path, fallback))
-                    .transpose()
-                {
-                    Ok(value) => value.unwrap_or_default(),
-                    Err(error) => {
-                        crate::logger::log(format!(
-                            "spread: metadata refresh page-alone read failed: {error}"
-                        ));
-                        return None;
-                    }
-                };
-                let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
-                Some(ContainerStateResult {
-                    spread: stored,
-                    final_cover_spread_preference,
-                    singleton_spread_endpoint_preferences,
-                    page_alone_preferences,
-                    view_trim,
+    let container_state = if changed.container_state && spread_db.is_some() {
+        request.spread_container_path.as_deref().and_then(|path| {
+            let fallback = request.spread_container_fallback.as_deref();
+            let stored = spread_db
+                .map(|db| db.get_state_with_fallback(path, fallback))
+                .unwrap_or_default();
+            let final_cover_spread_preference = spread_db
+                .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
+                .unwrap_or_default();
+            let singleton_spread_endpoint_preferences = match spread_db
+                .map(|db| {
+                    db.get_singleton_spread_endpoint_preferences_with_fallback(path, fallback)
                 })
+                .transpose()
+            {
+                Ok(value) => value.unwrap_or_default(),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "spread: metadata refresh endpoint read failed: {error}"
+                    ));
+                    return None;
+                }
+            };
+            let page_alone_preferences = match spread_db
+                .map(|db| db.get_page_alone_preferences_with_fallback(path, fallback))
+                .transpose()
+            {
+                Ok(value) => value.unwrap_or_default(),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "spread: metadata refresh page-alone read failed: {error}"
+                    ));
+                    return None;
+                }
+            };
+            let view_trim = container_trim_db.map_or_else(
+                || {
+                    crate::view_trim_db::ViewTrimBookLoad::Error(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                        Some("表示トリムDBを利用できません".to_string()),
+                    ))
+                },
+                |db| db.load_book_preference_with_fallback(path, fallback),
+            );
+            Some(ContainerStateResult {
+                spread: stored,
+                final_cover_spread_preference,
+                singleton_spread_endpoint_preferences,
+                page_alone_preferences,
+                view_trim,
             })
-        } else {
-            None
-        };
+        })
+    } else {
+        None
+    };
 
     if cancel.load(Ordering::Relaxed) {
         return None;
@@ -972,6 +979,54 @@ mod tests {
     }
 
     #[test]
+    fn view_trim_refresh_open_error_returns_terminal_no_trim_instead_of_retaining_old_state() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::spread_db::SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let unavailable = temp.path().join("view_trim.db");
+        std::fs::create_dir(&unavailable).unwrap();
+        let request = ContextRequest {
+            pin_materialization: Default::default(),
+            context_id: ViewerContextId::for_test(0),
+            items_generation: 1,
+            items: Vec::new(),
+            current_rating_key: None,
+            spread_container_path: Some(PathBuf::from("c:/books/book.zip")),
+            spread_container_fallback: None,
+            shift_read: None,
+            old_folder_pin_keys: HashSet::new(),
+            folder_pin_paths: Vec::new(),
+            folder_pin_aliases: Vec::new(),
+        };
+        let result = run(
+            temp.path().to_owned(),
+            vec![request],
+            ImportChangedSections {
+                container_state: true,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!result.errors.is_empty());
+        let container = result
+            .contexts
+            .into_iter()
+            .next()
+            .unwrap()
+            .container_state
+            .unwrap();
+        assert!(matches!(
+            container.view_trim,
+            crate::view_trim_db::ViewTrimBookLoad::Error(_)
+        ));
+        assert_eq!(
+            container.view_trim.state_or_default().preference,
+            crate::view_trim::ViewTrimBookPreference::None
+        );
+        assert!(unavailable.is_dir());
+    }
+
+    #[test]
     fn spread_preferences_refresh_preserves_nested_fallback_and_explicit_follow_global() {
         use crate::settings::{
             FinalCoverSpreadPreference, PageAlonePreference, PageAlonePreferences,
@@ -984,7 +1039,20 @@ mod tests {
         let root = PathBuf::from("c:/books/outer.zip");
         let nested = root.join("inner/book");
         let spread_db = crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).unwrap();
-        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap();
+        let trim_db =
+            crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap();
+        let inherited_trim = crate::view_trim::ViewTrimBookState {
+            preference: crate::view_trim::ViewTrimBookPreference::Manual,
+            book_settings: crate::view_trim::ViewTrimBookSettings {
+                enabled: true,
+                single: crate::view_trim::ViewTrimMargins {
+                    left: 0.07,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        trim_db.set_book_state(&root, None, inherited_trim).unwrap();
         spread_db
             .set_final_cover_spread_preference(&root, None, FinalCoverSpreadPreference::Off)
             .unwrap();
@@ -1037,6 +1105,7 @@ mod tests {
         };
 
         let state = refresh();
+        assert_eq!(state.view_trim.state_or_default(), inherited_trim);
         assert_eq!(
             state.final_cover_spread_preference,
             FinalCoverSpreadPreference::Off
@@ -1070,7 +1139,11 @@ mod tests {
         spread_db
             .set_page_alone_preferences(&nested, Some(&root), PageAlonePreferences::default())
             .unwrap();
+        trim_db
+            .set_book_state(&nested, Some(&root), Default::default())
+            .unwrap();
         let state = refresh();
+        assert_eq!(state.view_trim.state_or_default(), Default::default());
         assert_eq!(
             state.final_cover_spread_preference,
             FinalCoverSpreadPreference::FollowGlobal

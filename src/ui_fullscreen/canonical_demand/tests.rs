@@ -12,7 +12,7 @@ pub(super) fn ready_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::Ap
     app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
     app.settings.margin_fit_enabled = false;
     app.settings.still_seek_strip_visible = false;
-    app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::None;
     for idx in 0..4 {
         app.rotation_cache
             .insert(idx, crate::rotation_db::Rotation::None);
@@ -155,7 +155,7 @@ fn composed_app(
     app.settings.page_turn_animation_enabled = true;
     app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
     app.settings.margin_fit_enabled = false;
-    app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::None;
     app.fullscreen_idx = Some(anchor);
     for idx in 0..4 {
         let pixels = Arc::new(egui::ColorImage::filled(
@@ -252,7 +252,7 @@ fn canonical_native_demand_matches_unequal_rotated_trimmed_and_landscape_pages()
         ] {
             let ctx = egui::Context::default();
             let mut app = ready_app(&ctx, mode);
-            app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+            app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
             app.view_trim_book_settings.enabled = true;
             app.view_trim_book_settings.spread_linked.top = 0.1;
             app.view_trim_book_settings.spread_linked.bottom = 0.15;
@@ -534,7 +534,7 @@ fn canonical_native_demand_does_not_read_cold_rotation_or_detect_margins() {
         assert!(!app.rotation_cache.contains_key(&1));
         app.rotation_cache
             .insert(1, crate::rotation_db::Rotation::None);
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
         assert!(app.fs_margin_bbox_cache.is_empty());
         assert_eq!(
             app.collect_next_canonical_demand(ctx, inputs),
