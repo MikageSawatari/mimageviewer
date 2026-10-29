@@ -20,7 +20,7 @@
 | autotrim-1216 | 自動余白カットの全体既定 | `Start-Process -FilePath G:\home\mimageviewer-autotrim\target\dev-runtime\mimageviewer-core.exe` |
 | list-ui-1456-223 | 一覧の名前の大きさ・行数、タグの並べ替え | `Start-Process -FilePath G:\home\mimageviewer-listui\target\dev-runtime\mimageviewer-core.exe` |
 | fs-compare-1079-1458 | 比較中の元画像表示、見開きの編集開始側 | `Start-Process -FilePath G:\home\mimageviewer-fsview\target\dev-runtime\mimageviewer-core.exe` |
-| deps-update-1460 | 依存物の更新 (AI・PDF・RAW・検索・EffeTune) | `Start-Process -FilePath G:\home\mimageviewer-deps\target\dev-runtime\mimageviewer-core.exe` (※作り直し中。下の節を参照) |
+| deps-update-1460 | 依存物の更新 (AI・PDF・RAW・検索・EffeTune) | `Start-Process -FilePath G:\home\mimageviewer-deps\target\dev-runtime\mimageviewer-core.exe` (2026-10-29 11:13 に最新で作り直し済み。下の節の注意を参照) |
 | video-overflow-1105 | 動画の「…」とデインターレース | 準備中 (レビュー対応中。できたら知らせる) |
 
 ビルドはどれも、そのブランチの最新のコードを含んでいる (2026-10-29 時点で照合)。
