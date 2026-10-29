@@ -64,6 +64,7 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool, shader: bool
                 source_idx: 2,
                 external_item_key: None,
                 source_size: target_size,
+                original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
             });
             app.compare_view_mode = mode;
             let prepared = match mode {
@@ -103,6 +104,12 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool, shader: bool
                     pinned_texture: None,
                     current_texture: None,
                     diff_texture: None,
+                    current_geometry: crate::app::CompareSourceGeometry {
+                        processed_source_size: [80, 120],
+                        crop: None,
+                        rotation: crate::rotation_db::Rotation::None,
+                    },
+                    original: crate::app::CompareOriginalVariant::Absent,
                 });
             // Enter the actual fullscreen dispatch, after comparison preparation.
             // Warm-up passes settle chrome; each output must contain exactly one crop.
