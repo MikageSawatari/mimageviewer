@@ -10,7 +10,7 @@ fn main() {
     let zlib = root.join("zlib");
     if !makefile.is_file() || !zlib.join("zlib.h").is_file() {
         panic!(
-            "\n+------------------------------------------------------------\n+LibRaw 0.22.2 source is missing from vendor/libraw/.\n+Recovery: bash scripts/setup-libraw.sh\n+Or restore all vendor assets: bash scripts/bootstrap-vendor.sh\n+------------------------------------------------------------"
+            "\n+------------------------------------------------------------\n+LibRaw 0.22.3 source is missing from vendor/libraw/.\n+Recovery: bash scripts/setup-libraw.sh\n+Or restore all vendor assets: bash scripts/bootstrap-vendor.sh\n+------------------------------------------------------------"
         );
     }
     println!("cargo:rerun-if-changed={}", makefile.display());
@@ -25,7 +25,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("Cannot read vendor/libraw/VERSION: {error}\n{recovery}"));
     assert_eq!(
         version.trim(),
-        "0.22.2",
+        "0.22.3",
         "Unexpected LibRaw source version\n{recovery}"
     );
 

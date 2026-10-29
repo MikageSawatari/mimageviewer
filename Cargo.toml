@@ -23,7 +23,6 @@ members = [
     "tools/viewer_context_audit",
 ]
 exclude = [
-    "crates/ort-patched",
     "crates/unrar-patched",
     "vendor/eframe",
     "vendor/egui",
@@ -40,7 +39,6 @@ egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
 epaint = { path = "vendor/epaint" }
 tantivy = { path = "vendor/tantivy" }
-ort = { path = "crates/ort-patched" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
 # launcher = `mimageviewer.exe`) の
@@ -408,7 +406,9 @@ cssparser = "0.37"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 webp = "0.3"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# 2.6.1 regresses data_start bounds, corrupt local-header rejection and I/O details.
+# Unpin only after all three contracts are preserved; see dependency-update-20261028.md.
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.20"
 delharc = "0.6"
 # `unrar 0.5.8` の UCM_CHANGEVOLUMEW callback は P1 を固定長 2048 文字で読み、
@@ -423,7 +423,8 @@ turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"
 base64 = "0.22"
-ort = { version = "2.0.0-rc.12", features = ["directml", "cuda", "tensorrt", "load-dynamic"] }
+# API 24 matches bundled DirectML 1.24.4 and TensorRT pack GPU 1.24.2; rc.15 defaults to API 31.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "directml", "cuda", "tensorrt", "load-dynamic"] }
 ndarray = "0.17"
 # mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
 # JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。
@@ -437,7 +438,7 @@ opener = "0.8"
 rfd = "0.15"
 # 全文検索エンジン。Ctrl+G グローバルメタ検索の bigram インデックスに使用予定。
 # v1 プロトタイプ計測中 (docs/archive/search-metadata/search-expansion-design.md §15.1.1)。問題なければ本採用。
-tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression"] }
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # お気に入りのファイルシステム監視。Windows は ReadDirectoryChangesW ベース。
 # crossbeam-channel を有効にして、重い std::mpsc を避ける。
@@ -482,7 +483,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 [dev-dependencies]
 libc = "0.2"
 winit = "0.30.13"
-tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
 tempfile = "3"
 eframe = { version = "0.37.0", features = ["miv-test-script-window-witness"] }
 # `examples/bench_pdf_count.rs` (PDFium vs lopdf 比較ベンチマーク) でのみ使用。

@@ -280,8 +280,11 @@
    - 経緯: backlog §1.424 (v4.8.1 で出荷後に削除。調査の全文は commit `94017f82e` の `docs/next-release-backlog.md`、要約は `vendor/tantivy/MIV-PATCH.md`) で Rust 1.95 以降の 2 語の AND の採点が遅くなったため、toolchain・tantivy 更新時も確認する。
    - toolchain・tantivy を上げたときは、bench に加えて製品本体の生成コードも確かめる (bench の bin と製品 exe で展開のされ方が違い、bench だけでは見落とすため)。
      `CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --bin mimageviewer-core --target-dir target/core-sym` の後、
-     `dumpbin /disasm:nobytes target/core-sym/release/mimageviewer-core.exe` で `tantivy::query::intersection::impl$3::score<tantivy::query::term_query::term_scorer::TermScorer,...>` を探し、
+     `dumpbin /disasm:nobytes target/core-sym/release/mimageviewer-core.exe` で、`tantivy::query::intersection` の `Intersection` に対する `Scorer` 実装の `score` (型引数 `TermScorer` 版と `Box<dyn Scorer>` 版) と、MIV 改変の `score_out_of_line` を探し、
      `unpcklps`/`addps`/`divps` (左右 2 語を SIMD でまとめた形) が無いことを確かめる。
+     `impl$N` の番号は上流の変更で変わる (0.26.2 は `impl$3`、0.27.0 は `impl$5`) ので、番号ではなく名前空間と型引数で探す。
+     0.27.0 での照合の手順と結果は [依存物の更新記録 2026-10-28](dependency-update-20261028.md) の段 C を参照。
+   - bench は、ほかの build / test が動いていない状態で測る。並行ビルドの負荷で、無関係の query まで +80% 以上ぶれた例がある (2026-10-28)。
    - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
      `python scripts/check_bench_regression.py --save vendor/bench_baseline.json /tmp/bench_new.json`
    - 既存 baseline と比較して **+30% 超 かつ +1.0ms 超の劣化**で exit 1。原因を切り分けてから先に進む。

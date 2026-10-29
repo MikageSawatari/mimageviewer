@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::{fmt, io};
 
@@ -6,14 +7,15 @@ use common::{ByteCount, HasLen};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 
-use crate::directory::{CompositeFile, FileSlice};
+use crate::directory::error::OpenReadError;
+use crate::directory::{CompositeFile, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
-use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
+use crate::index::{Index, InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
-use crate::space_usage::SegmentSpaceUsage;
+use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
 use crate::{DocId, Opstamp};
@@ -30,6 +32,7 @@ use crate::{DocId, Opstamp};
 /// as close to all of the memory data is mmapped.
 #[derive(Clone)]
 pub struct SegmentReader {
+    index: Index,
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
 
     segment_id: SegmentId,
@@ -65,6 +68,11 @@ impl SegmentReader {
     /// Returns the schema of the index this segment belongs to.
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Returns the index this segment belongs to.
+    pub fn index(&self) -> &Index {
+        &self.index
     }
 
     /// Return the number of documents that have been
@@ -159,12 +167,10 @@ impl SegmentReader {
         let postings_file = segment.open_read(SegmentComponent::Postings)?;
         let postings_composite = CompositeFile::open(&postings_file)?;
 
-        let positions_composite = {
-            if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
-                CompositeFile::open(&positions_file)?
-            } else {
-                CompositeFile::empty()
-            }
+        let positions_composite = match segment.open_read(SegmentComponent::Positions) {
+            Ok(positions_file) => CompositeFile::open(&positions_file)?,
+            Err(OpenReadError::FileDoesNotExist(_)) => CompositeFile::empty(),
+            Err(open_read_error) => return Err(open_read_error.into()),
         };
 
         let schema = segment.schema();
@@ -191,6 +197,7 @@ impl SegmentReader {
             .unwrap_or(max_doc);
 
         Ok(SegmentReader {
+            index: segment.index().clone(),
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -323,7 +330,7 @@ impl SegmentReader {
                             // Without expand dots enabled dots need to be escaped.
                             let escaped_json_path = json_path.replace('.', "\\.");
                             let full_path = format!("{field_name}.{escaped_json_path}");
-                            let full_path_unescaped = format!("{}.{}", field_name, &json_path);
+                            let full_path_unescaped = format!("{}.{}", field_name, json_path);
                             map_to_canonical.insert(full_path_unescaped, full_path.to_string());
                             full_path
                         } else {
@@ -452,20 +459,53 @@ impl SegmentReader {
     }
 
     /// Summarize total space usage of this segment.
+    ///
+    /// The per-component usage is assembled from each registered plugin's
+    /// [`SegmentPlugin::space_usage`](crate::plugin::SegmentPlugin::space_usage), plus
+    /// the non-plugin `deletes` entry (the alive bitset).
     pub fn space_usage(&self) -> io::Result<SegmentSpaceUsage> {
-        Ok(SegmentSpaceUsage::new(
+        let mut components: BTreeMap<String, ComponentSpaceUsage> = BTreeMap::new();
+        for plugin in self.index.all_plugins() {
+            let plugin_usage = plugin
+                .space_usage(self)
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            components.extend(plugin_usage);
+        }
+        let deletes = self
+            .alive_bitset_opt
+            .as_ref()
+            .map(AliveBitSet::space_usage)
+            .unwrap_or_default();
+        components.insert(
+            crate::space_usage::DELETES.to_string(),
+            ComponentSpaceUsage::Basic(deletes),
+        );
+        Ok(SegmentSpaceUsage::from_components(
             self.num_docs(),
-            self.termdict_composite.space_usage(self.schema()),
-            self.postings_composite.space_usage(self.schema()),
-            self.positions_composite.space_usage(self.schema()),
-            self.fast_fields_readers.space_usage()?,
-            self.fieldnorm_readers.space_usage(self.schema()),
-            self.get_store_reader(0)?.space_usage(),
-            self.alive_bitset_opt
-                .as_ref()
-                .map(AliveBitSet::space_usage)
-                .unwrap_or_default(),
+            components,
         ))
+    }
+
+    fn relative_path(&self, component: SegmentComponent) -> PathBuf {
+        let mut path = self.segment_id().uuid_string();
+        path.push_str(&match component {
+            SegmentComponent::Postings => ".idx".to_string(),
+            SegmentComponent::Positions => ".pos".to_string(),
+            SegmentComponent::Terms => ".term".to_string(),
+            SegmentComponent::Store => ".store".to_string(),
+            SegmentComponent::TempStore => ".store.temp".to_string(),
+            SegmentComponent::FastFields => ".fast".to_string(),
+            SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
+            SegmentComponent::Custom(ext) => format!(".{ext}"),
+        });
+        PathBuf::from(path)
+    }
+
+    /// Opens one of the component files for reading.
+    pub fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
+        let path = self.relative_path(component);
+        self.index.directory().open_read(&path)
     }
 }
 

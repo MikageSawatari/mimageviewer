@@ -138,7 +138,7 @@ try {
     $fixtures = @(
         @{ Name = 'PDFium'; Script = 'scripts/setup-pdfium.sh'; Text = "Latest release: chromium/8100`nNew version available: chromium/8100"; Latest = 'chromium/8100' },
         @{ Name = 'FFmpeg'; Script = 'scripts/setup-ffmpeg.sh'; Text = "Matched asset: ffmpeg-fixture.zip`nUp to date."; Latest = 'ffmpeg-fixture.zip' },
-        @{ Name = 'LibRaw'; Script = 'scripts/setup-libraw.sh'; Text = "Current LibRaw: 0.22.2; latest release: 0.23.0`nNew version available."; Latest = '0.23.0' }
+        @{ Name = 'LibRaw'; Script = 'scripts/setup-libraw.sh'; Text = "Current LibRaw: 0.22.3; latest release: 0.23.0`nNew version available."; Latest = '0.23.0' }
     )
     foreach ($fixture in $fixtures) {
         $setupText = $fixture.Text

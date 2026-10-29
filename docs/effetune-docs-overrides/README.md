@@ -14,10 +14,9 @@
   新版の更新時にも独立版の操作条件が再流入しないことを確認する。
 
 ```powershell
-python scripts/gen-effetune-docs.py --version v0.14.0
+python scripts/gen-effetune-docs.py --version v0.15.0
 python scripts/test_gen_effetune_docs.py
-python scripts/gen-effetune-docs.py --version v0.14.0 --check
-python scripts/gen-sitemap-xml.py
+python scripts/gen-effetune-docs.py --version v0.15.0 --check
 ```
 
 `vendor/effetune-mixwright/VERSION` がある場合は、その値が `--version` より優先する。
@@ -75,7 +74,7 @@ README の Web アプリ用 HTML は変換対象に入らない。
 
 個別ページには共通操作を読めるカテゴリへのリンクも置く。
 公開するページ構成や訂正内容が変わったら、テストとサイトマップを再生成・検証する。
-サイトマップも作業中に再生成・検証し、コミット後の日付確定は設計担当が再生成する。
+サイトマップは今回の段Dでは変更せず、コミット後に設計担当が再生成する。
 
 ## README の節採否 (2026-10-03)
 
@@ -107,7 +106,39 @@ README の Web アプリ用 HTML は変換対象に入らない。
 | トラブルシューティングとFAQ、技術情報（ブラウザ互換性、ブラウザサポートの詳細、推奨サンプルレート） | ブラウザ／独立アプリの要件・設定。mIV の利用条件は mIV ページで案内 |
 | 利用可能なエフェクト、開発ガイド | エフェクト一覧は生成目次に全111件掲載済み。開発ガイドは利用者向け操作の対象外 |
 
-## 現在の同梱版と訂正 (2026-10-18)
+## 現在の同梱版と訂正 (2026-10-28)
+
+既定 snapshot は `c506bbab8a3dcd75bc5049ebb9b92572b526c557`。
+Mixwright v0.15.0 release commit `8c9a0a561d2ee88d2eef6b06bab138bbd639b3c1` の
+`external/effetune` に対応する。原文は変更せず、133 HTML + 4画像を生成した。
+旧 `v0.14.0/` の公開生成物だけを除き、入口2本と `.htaccess` を更新する。
+旧 snapshot・承認資料・state fixture は履歴として保持する。
+
+- 新しい `measurement.md`、`music-player.md`、`openhome.md` は独立版のマイク測定・
+  内蔵プレーヤー・ネットワーク操作であり、VSTに入口/APIがないため selection で除外。
+  Room EQの既存測定JSON取込は維持する。上流の測定書出しオプションの既定値変更に合わせ、
+  `eq.json` の説明を「オン」に訂正した。
+- READMEの見出し変更に追従し、新しい「エフェクトの共通操作」も採用する。
+  名前付き保存、A/B復元、バックアップ、共有、コントローラー案内の従来の訂正を維持。
+- Counterは曲の再生位置ではなく、hostの処理サンプル累積値を表示する。
+  seek先時刻や速度には対応せず、先読み・無音flush・EOSも含まれ、曲変更時に必ず0にはならない。
+  番号は00、外部入力用クリックresetも使えない。これを `visualizer.json` で訂正。
+- Lyricsに加えてVideoもAdd候補にない（`visualizer-editor.js:575`）。取込済みitemの編集は残る。
+  mIVは映像を送らず、Videoは設定に応じて代表画像へfallbackすることを案内。
+  Lyric Stageは除き、Cinema Stripの音声グラフと新Counter Galleryを維持。
+- HDR設定は `vst-bootstrap.js:36` でVSTにも公開されるため採用し、独立版のClean Feed言及を除く。
+  実機HDR出力の確認済みを意味しない。Color Adjust / Color Map、Mid / Treble / Beat / Width、
+  数字フォントと編集操作は残す。新フォントは同梱の自作MITデータで、外部配信を使わない。
+- SFZの原文が書き直されたため、ファイル/フォルダー登録、元ファイル直接read、
+  `sfz-references.json`、参照だけの削除、バックアップ範囲を新アンカーへ移した。
+  Classic / Eventの説明を残すが、DAWの動的遅延補償をmIVの実機受入結果とは扱わない。
+- analyzer末尾のカテゴリ共通例、basics/eq/saturationの一覧後に移った共通スペクトラム説明は、
+  `move_section_before_heading` で一覧前へ移す。本文・小見出し・既存IDを保ち、個別pluginへ誤分割しない。
+  旧来の「一覧以降の全h2は掲載plugin」という検査は緩めない。
+- controller、analyzer、IR、WASM前提などの完全一致アンカーを新原文に追従した。
+  生成回帰は版の付替拒否、共通節の移動、Counter/Video/HDR/SFZ、新3ページの非掲載も検査する。
+
+## 同梱版と訂正 (2026-10-18、履歴)
 
 既定 snapshot は `01c96f00f8e93595aefab96de4bc4d210e61c53b`。
 Mixwright v0.14.0 release commit `e4147644305f0d373e362fc1485b4cb9889e5b63` の

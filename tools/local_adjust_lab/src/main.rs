@@ -21791,12 +21791,12 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
 }
 
 fn run_u2netp_segmentation(source: &RgbaImageBuf, model_path: &Path) -> Result<RasterMask, String> {
-    ensure_lab_ort_loaded()?;
+    let environment = ensure_lab_ort_loaded()?;
     let input = build_u2netp_input(source)?;
     let input_tensor =
         ort::value::Tensor::from_array(input).map_err(|e| format!("Tensor creation: {e}"))?;
 
-    let mut session = ort::session::Session::builder()
+    let mut session = ort::session::Session::builder(environment)
         .map_err(|e| format!("Session::builder: {e}"))?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
         .map_err(|e| format!("optimization_level: {e}"))?
@@ -22015,8 +22015,8 @@ fn region_neighbors(
     out.into_iter().take(len)
 }
 
-fn ensure_lab_ort_loaded() -> Result<(), String> {
-    static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+fn ensure_lab_ort_loaded() -> Result<&'static ort::environment::Environment, String> {
+    static ORT_INIT: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
     match ORT_INIT.get_or_init(|| {
         let dll_path = lab_ort_dll_path();
         if !dll_path.is_file() {
@@ -22027,10 +22027,10 @@ fn ensure_lab_ort_loaded() -> Result<(), String> {
         }
         ort::init_from(&dll_path)
             .map_err(|e| format!("ort::init_from: {e}"))?
-            .commit();
-        Ok(())
+            .build()
+            .map_err(|e| format!("ORT environment build: {e}"))
     }) {
-        Ok(()) => Ok(()),
+        Ok(environment) => Ok(environment),
         Err(e) => Err(e.clone()),
     }
 }

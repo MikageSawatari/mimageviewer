@@ -433,7 +433,7 @@ Assert-That ($docs.ExitCode -eq 2 -and $docs.StdOut.Contains('docs/example.md'))
 # Use a PS entry script for array arguments (powershell.exe -File does not bind
 # a multi-element string[] reliably). Mix one selectable and one unsupported path.
 $focusedRunsBefore = @(Get-ChildItem (Join-Path $fixture 'target/test-focused/runs') -Directory).Count
-foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/ort-patched/src/lib.rs', 'vendor/egui/src/lib.rs', '.config/nextest.toml', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'helper/build.rs', 'helper/Cargo.toml', 'helper/fixture.bin', 'docs/example.md')) {
+foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/unsupported-patch/src/lib.rs', 'vendor/egui/src/lib.rs', '.config/nextest.toml', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'helper/build.rs', 'helper/Cargo.toml', 'helper/fixture.bin', 'docs/example.md')) {
     $mixedPlan = Get-MivFocusedPlan $fixture @('src/foo.rs', $unsupported)
     Assert-That ($mixedPlan.Entries.Count -eq 1 -and $mixedPlan.BroadPaths -contains $unsupported) "mixed plan omitted unsupported path: $unsupported"
     $entryScript = Join-Path $fixture 'target/mixed-focused.ps1'

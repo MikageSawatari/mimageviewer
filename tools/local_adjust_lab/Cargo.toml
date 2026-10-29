@@ -10,7 +10,8 @@ egui = "0.37.0"
 image = { version = "0.25", features = ["jpeg", "png"] }
 local-adjust-core = { path = "../../crates/local-adjust-core" }
 ndarray = "0.17"
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+# Match the root API 24 selection; workspace feature unification must not enable the API 31 default.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "load-dynamic"] }
 rfd = "0.15"
 base64 = "0.22"
 flate2 = "1"

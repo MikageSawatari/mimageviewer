@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline, deterministic Japanese EffeTune snapshot -> mIV manual.
 
-Usage: python scripts/gen-effetune-docs.py [snapshot] [--version v0.14.0] [--check]
+Usage: python scripts/gen-effetune-docs.py [snapshot] [--version v0.15.0] [--check]
 VERSION in vendor/effetune-mixwright takes precedence over --version.
 Selection and post-conversion corrections live in docs/effetune-docs-overrides.
 Unpublished Markdown links become plain text; root-relative links go upstream.
@@ -26,7 +26,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "htdocs/mimageviewer/manual"
 RULES = ROOT / "docs/effetune-docs-overrides"
-DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/01c96f00"
+DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/c506bbab"
 UPSTREAM = "https://effetune.frieve.com"
 VERSION_PATTERN = r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?'
 REDIRECT_BEGIN = '  # BEGIN GENERATED EFFETUNE REDIRECTS'
@@ -432,7 +432,15 @@ def apply_overrides(body, rules, converter):
             scope, end = section_span(body, rule['scope_heading_id'])
             prefix, body, suffix = body[:scope.start()], body[scope.start():end], body[end:]
         op = rule['operation']
-        if op == 'replace_paragraph':
+        if op == 'move_section_before_heading':
+            match, end = section_span(body, rule['heading_id'])
+            section = body[match.start():end]
+            body = body[:match.start()] + body[end:]
+            destination, _ = section_span(body, rule['before_heading_id'])
+            body = body[:destination.start()] + section + body[destination.start():]
+            body = prefix + body + suffix
+            continue
+        elif op == 'replace_paragraph':
             anchor = '<p>' + converter.inline(rule['anchor']) + '</p>'
             replacement = ('<p>' + converter.inline(rule['replacement']) + '</p>') if rule['replacement'] else ''
         elif op in {'remove_section', 'insert_note'}:
@@ -595,6 +603,11 @@ def chrome(title, description, body, filename, pages, version, commit, categorie
 
 
 def generate(snapshot, version):
+    provenance = (snapshot / 'SOURCE.md').read_text(encoding='utf-8')
+    association = re.search(r'submodule of EffeTune Mixwright (v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)', provenance)
+    if not association or association[1] != version:
+        documented = association[1] if association else 'unspecified'
+        raise ConversionError(f"Snapshot is associated with Mixwright {documented}, not {version}; supply/review matching SOURCE.md and snapshot")
     selection = json.loads((RULES / 'selection.json').read_text(encoding='utf-8'))
     source_dir = snapshot / 'ja'
     known = {p.relative_to(source_dir).as_posix() for p in source_dir.rglob('*.md')}
@@ -604,11 +617,6 @@ def generate(snapshot, version):
     stems = [Path(p).stem for p in published]
     if len(stems) != len(set(stems)) or {'index', 'license'} & set(stems):
         raise ConversionError("Output filename collision")
-    provenance = (snapshot / 'SOURCE.md').read_text(encoding='utf-8')
-    association = re.search(r'submodule of EffeTune Mixwright (v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)', provenance)
-    if not association or association[1] != version:
-        documented = association[1] if association else 'unspecified'
-        raise ConversionError(f"Snapshot is associated with Mixwright {documented}, not {version}; supply/review matching SOURCE.md and snapshot")
     match = re.search(r'^- Commit: ([0-9a-f]{40})\b', provenance, re.M)
     if not match:
         raise ConversionError("SOURCE.md must identify the 40-character upstream commit")

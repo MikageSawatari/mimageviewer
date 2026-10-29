@@ -85,6 +85,7 @@
 | [collection-remote-plan.md](collection-remote-plan.md) | Phase 5の認証済みRemote一覧・閲覧、server-side latest navigation、session / route owner、path・budget・終了順の実装・検収記録 |
 | [post-v3.9.0-sequential-work.md](post-v3.9.0-sequential-work.md) | v3.9.0後の直列開発。§1.115再確認から依存更新・UI改善を経て§1.220までの順序と完了管理 |
 | [dependency-update-20260912.md](dependency-update-20260912.md) | PDFium 8044更新とFFmpeg現行維持の理由、ライセンス、非対話試験、確認buildの内包照合 |
+| [dependency-update-20261028.md](dependency-update-20261028.md) | 依存物更新 段A/B/C。Rust・通常crate・PDFium 8125・LibRaw 0.22.3、ort rc.15 / ORT DirectML 1.24.4、tantivy 0.27.0の版・資産照合・旧索引互換・検証と保留事項 |
 | [msstore-startup-hang-vcrt-investigation-20260915.md](msstore-startup-hang-vcrt-investigation-20260915.md) | §1.241 VC++ ランタイムの無い Windows で起動が終わらない (Store 審査却下) の原因。onnxruntime.dll の依存、ort の失敗経路のデッドロック、Sandbox での陽性対照と修正候補 |
 | [section241-ort-vcrt-startup-fix-plan.md](section241-ort-vcrt-startup-fix-plan.md) | §1.241 の修正設計と検収記録。upstream ort backport、process 共通 AI runtime owner、app-local Microsoft VC runtime、TensorRT typed failure、全 PE 配布 gate |
 | [sidecar-first-visit-investigation-20260912.md](sidecar-first-visit-investigation-20260912.md) | §1.226 初訪問の旧XMPタグ読み取り待ちの調査と自動取り込み廃止。現在のタグDB・一般XMP・サイドカー復元を維持する境界 |
