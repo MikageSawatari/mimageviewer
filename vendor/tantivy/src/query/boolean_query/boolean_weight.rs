@@ -696,7 +696,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 }
             }
             SpecializedScorer::TermIntersection(term_scorers) => {
-                // MIV: retain the 0.26 pruning path for dense bigram ANDs; see MIV-PATCH.md.
+                // MIV: preserve 0.26's grouped score sums and tie ordering; see MIV-PATCH.md.
                 let mut scorer = into_box_scorer(
                     SpecializedScorer::TermIntersection(term_scorers),
                     &self.score_combiner_fn,
@@ -753,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn test_miv_dense_term_intersection_pruning_matches_scorer() -> crate::Result<()> {
+    fn test_miv_term_intersection_preserves_grouped_scores() -> crate::Result<()> {
         let mut schema = Schema::builder();
         let text = schema.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema.build());

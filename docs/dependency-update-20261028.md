@@ -13,10 +13,11 @@ backlog §1.460 の段A（Rust・通常crate・PDFium・LibRaw）、段B（ort /
 | PDFium | `chromium/8100`（backlogの更新前記録） | `chromium/8125`, `158.0.8125.0` |
 | LibRaw | 0.22.2 | 0.22.3。zlib 1.3.1、turbojpeg-sys 1.2.0 は維持 |
 | FFmpeg | `n7.1.5-16-g9a4bb2c579` | 据え置き |
-| Tantivy | 0.26.2 + mIV patch | 0.27.0 + 全mIV patch + 追加AND経路改変。追加改変のA/Bは基準未達、扱いは検収待ち |
+| Tantivy | 0.26.2 + mIV patch | 0.27.0 + 全mIV patch。10/29にscore collector退行を特定してbuffer方式を試作、検収待ち |
 
 段Aの結果は以下、段Bは[末尾の記録](#dependency-stage-b)を参照。
-段C（tantivy）は[追加AND改変まで実装・検証したが、A/Bの性能基準は未達](#stage-c-and-route)。段D（EffeTune Mixwright / VST3 SDK）はこれから行う。
+段C（tantivy）は[10/29の原因調査・collector試作](#stage-c-027-investigation)を参照。
+段D（EffeTune Mixwright / VST3 SDK）の記録も末尾にある。
 
 初回に阻害されたLibRawのアクセス権とbench基準の欠落は、ClaudeCodeが修復・配置した。
 LibRaw全225ファイルを照合済み。独立レビューでzip 2.6.1の追加退行2件が確認され、
@@ -973,6 +974,501 @@ Start-Process -FilePath .\target\core-sym\release\mimageviewer-core.exe
 root lock・baseline・保存した改変前benchのhashも一致し、vendor Cargo.lockは存在しない。
 追補のUTF-8も確認した（final-audit.json、fmt.log / fmt-check.log / diff-check.log）。
 ブランチはdeps-update-1460、HEADは5acf4c310のまま。コミット・push・製品起動は行っていない。
+
+<a id="stage-c-027-investigation"></a>
+
+### 2026-10-29追補 — 0.27のままscore collectorの退行を調査・試作
+
+利用者は0.27を維持して原因を直す方針を選択。開始はdeps-update-1460 / 8619faf90、clean。
+ClaudeCodeの静穏時3回最良値はgeneric_jpが0.26=19.66 / 0.27原経路=37.26 /
+前回の旧AND腕付き=34.96 msだった。元JSONは指定scratchpad/bench-quiet/q_*.json。
+この追補では4月のbaselineを更新せず、同時期に測る0.26 binaryを主な比較対象とする。
+
+#### 実際の経路と前回改変の限界
+
+bench_search.rsのgeneric_jpは「カメラ」を「カメ」「メラ」の2つのMust TermQuery(WithFreqs)にする。
+TopDocs::with_limit(500).and_offset(offset).order_by_score()は
+TopBySortKeyCollector<SortBySimilarityScore>になり、requires_scoring=true。
+Searcherのscoring有効Weightからcollect_segment_top_k、BooleanWeight::for_each_pruningへ進む。
+純Term ANDのTermIntersectionが前回の腕を通り、into_box_scorer→intersect_scorers→
+Intersection<TermScorer, Box<dyn Scorer>>→for_each_pruning_scorerで採点する。
+for_each_no_scoreやfast-field順への迂回ではない。
+
+HARD_MAX=10000は返却後のaccepted hit数であり、postingsの走査を10000件で止めるものではない。
+queryは全50000文書に一致し、500件×20ページを得るため、各ページで同じ候補集合を再走査する。
+collectorのKはoffset+500、500から10000まで増える。benchのpost処理はstored pathの取得で、
+実際の文字列post-filterは行わず返却候補を全てvalidとする。
+根拠はsrc/bin/bench_search.rsのbuild_and_query / run_paged_query、
+vendor/tantivy/src/collector/sort_key_top_collector.rsのcollect_segment、sort_key/sort_by_score.rs、
+query/boolean_query/boolean_weight.rs、query/weight.rs。
+
+製品もsrc/fts_index.rs::search_pageで同じscore collectorを使う。
+src/global_search.rsのworkerが同じSearcher snapshotで500件ずつ取得し、visibility/原文post-filter後の
+validが10000件に達すると打ち切る。通常のqueryはbigram AND→source OR→token Mustとfilterの入れ子で、
+子のscorer()が既にboxed Intersectionを返す場合は親がOther経路になる。
+従って前回の腕が直接変える範囲は限定されるが、collector変更はbenchと製品に共通である。
+
+0.27はscore順のsegment収集をTopNComputerからTopNHeap(BinaryHeap)へ変更した。
+前回はWeight側の経路だけを戻し、この差分を残していた。heapは採用hitごとにpush/sift-downして
+厳密なK位thresholdを更新する。旧bufferは2Kまで追記し、満杯時のmedian選択でKへ切り詰める。
+全一致を毎回scoreしてからthreshold判定する通常Intersectionでは、tight thresholdはBM25計算を省略せず、
+増大するKに対するheap維持の費用が残る。これが主な性能退行だった。
+
+#### 単独因子の切り分け
+
+本体libを毎回再compileする負担を避け、workspace外扱いの一時crateをtarget内に作った。
+tracked bench_search.rsをそのままbinのpathに指定し、同じrelease / thin LTO / codegen-units=16 /
+symbol条件でビルドした。通常のroot版と変更前の調査版はgeneric_jpが38.3962 / 39.0374 msで近い。
+旧AND腕を固定してcollectorだけbufferへ戻す交互probeでは、heap 38.7807 / 37.6954 msに対し
+buffer 24.6444 / 25.1505 msとなった。en_commonも約20→15.6 msへ下がった。
+前者のpage_avgは1.7 ms、後者は1.0 ms、postは4.8 / 4.3 msで、差は主に検索・収集側にある。
+以後、別アプリのCPU負荷（全体約29%）と外部rustcを観測したため、これらを静穏時の数値とは扱わない。
+
+毎回のbenchは既定の多thread writerで索引を再作成するため、固定corpusでもsegment分割とDocId順は固定されない。
+これを除くため、0.26で1 writer / NoMergePolicyにより50000件の共通索引を一度だけ生成し、
+全版が同じ索引を読み取る補助比較も行った。順は0.26→0.27 heap→0.27 bufferを3巡。
+補助比較の0.27はどちらも旧AND腕を維持し、collectorだけを替えている。
+
+| 同一索引のgeneric_jp | run1 ms | run2 ms | run3 ms | best ms |
+| --- | ---: | ---: | ---: | ---: |
+| 0.26 | 26.1909 | 26.7571 | 29.4097 | 26.1909 |
+| 0.27 heap | 33.3185 | 34.2366 | 44.4300 | 33.3185 |
+| 0.27 buffer | 26.4713 | 26.2465 | 27.8482 | 26.2465 |
+
+修正版bestは0.26比+0.21%。この補助測定は外部rustc=1 / cl=0 / core=0が全回であり、無負荷とは扱わない。
+同一index・同一score入力でcollectorだけを変えた比較と、元のbenchによる単独因子比較が同じ方向を示す。
+補助比較の絶対時間はsingle-segment索引なので、毎回索引を作る通常benchの絶対時間と混ぜない。
+
+postingsのk-ary化も調べたが、SegmentPostings本体とbitpacking 0.9.3 / OwnedBytes 0.9は同じ。
+generic_jpは両postingsが全件一致し、通常の進行はnext-doc fastpathとなる。
+search_blockを旧binary searchへ戻す試作は行ったが、主なhot pathを説明しないため最終差分から撤去した。
+0.27のallocation-free Intersection::seek、dense count、k-ary本体・テスト、codecは維持する。
+証跡はtarget/dependency-update-20261028/stage-c-investigation/のprobe-*.json、cut-*.json、
+arm-*.json、common-timing-results.json、各build logとharness/。
+
+#### 旧AND腕を採点互換として残す理由
+
+新block経路は4語以上で((a+b)+c)+d、従来Intersectionは(a+b)+(c+d+...)と加算する。
+上流blockテストも非結合性を明記して新しい加算順の近似比較にしており、0.26のbit一致の証拠ではない。
+共通0.26索引で旧腕を外すと、通常scorerの全78388採点記録は一致したが、ページ収集では
+5 query・4732返却レコードのscore bitsが違った。今回の文書順は10 queryとも同じだった。
+正のf32でも同点の丸め方が変われば順位に影響し得るため、今回の厳密な採点互換では旧腕を維持する。
+性能単独の効果は確認できていないことと区別し、コメントとtest名をgrouped scoresの維持へ改めた。
+
+buffer + 旧腕の最終試作は、同じ0.26索引の10 queryで、全78388採点記録と
+先頭最大10000件ずつの30762返却レコード（path・順位・score bits・DocAddress）が完全一致した。
+両JSONのSHA-256は5cefd397a7533add21ed87050056d7be5d64b1eecbf8edd06da52d3b3144831e。
+rank-026.json / rank-fixed.json / rank-fixed-comparison.json、rank-027-block-comparison.jsonに保存。
+独立レビューも元JSONを照合した。新block本体と上流テストは変更していない。
+
+#### 試作の範囲・取引条件
+
+collector/sort_key/sort_by_score.rsの収集本体を0.26のbuffer方式へ戻す。
+結果・採点・低DocAddress優先の同点規則は変えず、thresholdは保守的な下界なので候補の省略が弱くなるだけ。
+上流heap実装とそのテストは参照として残す。容量はKから2Kへ増え、小K/疎なqueryでは
+0.27のtight thresholdによるWANDの性能上の利点を失う可能性がある。正しさの修正は撤去していない。
+撤去条件は、上流collectorがmIVの高K pagingで0.26相当以上の速度と同じ採点・順位を満たすこと。
+旧AND腕の撤去には、新block側の0.26加算順・同点順位の互換も必要。
+
+新しい実collector入口の回帰は50023文書・2segmentを使い、各segmentで2K境界を越える。
+上位64件の削除前後、同点、limit 1/10/500/10000、offset 9500を全件scorerのoracleとscore bitsまで比較する。
+既存の2語/4語比較はtest_miv_term_intersection_preserves_grouped_scoresへ改名した。
+製品query/schema/feature、既存0.26fixture、baselineは不変。症状を隠すguard/fallbackは追加していない。
+
+<a id="stage-c-027-results"></a>
+
+#### 最終試作の正しさの検査
+
+以下のCargoは全てMSBUILDDISABLENODEREUSE=1 / CARGO_NET_OFFLINE=true、--locked --offline、jobs=4。
+ログはstage-c-investigation/を基点とする。
+
+| コマンド | 件数・結果 |
+| --- | --- |
+| cargo nextest run --manifest-path vendor/tantivy/Cargo.toml --lib --features miv-test-hooks --no-fail-fast | 最終sourceは1346成功 / 1失敗 / 8 ignored、31.820秒、wall47.46秒、exit100。vendor-final.log |
+| cargo test -p mimageviewer --test fts_tantivy_integrity --test fts_tantivy_compat | integrity14成功（2.54秒）、compat1成功（0.15秒）、compile2分03秒、wall127.70秒、exit0。fts-final.log |
+| cargo nextest run -p mimageviewer --lib -E 'test(/search\|fts\|tantivy/)' | 588成功 / 14030 skipped、18.002秒、compile含む215.51秒、exit0。search-final.log |
+
+vendor全件の唯一の失敗は、未変更の
+directory::managed_directory::tests_mmap_specific::test_managed_directory_gc_while_mmapped。
+Windowsではmmap保持中のGC削除が失敗してfileが残る、とするassertが外れた（managed_directory.rs:404）。
+初回の全件runは既定fail-fastで485成功/1失敗時に停止したため、--no-fail-fastで残りも実行し、
+最終sourceでも同じ1件だけが失敗した。runner timeoutでも間欠成功でもない。
+独立した同手順のprobeを0.26と0.27の両方で実行し、どちらもexists_while_mapped=false、
+保持したmappingからの2 bytes読出しは成功した。gc-probe-{026,027}.log / harness/gc.rs。
+従って今回のcollectorとは独立した、現Windows/Rustのunlink動作と既存テストの期待との不一致と判断する。
+既存MIV-PATCHにも、mIV側のGC拒否回帰がno-delete-sharing handleを併用する同じ理由の記録がある。
+full vendorを成功とは扱わず、上流テストや製品にignore/guard/回復処理は追加しない。
+今回のcollector・grouped-score・pagination・postings等のテストは成功している。
+
+完全なcommand/exit/wall timeはfinal-verification-results.json。
+単体vendor Cargo.lockは最終vendor runの後で削除した。root lockは変更していない。
+
+| 今回変更したファイル | 理由 |
+| --- | --- |
+| vendor/tantivy/src/collector/sort_key/sort_by_score.rs | score pagingをbuffer方式に戻し、大きいK・削除・複数segmentの実入口回帰を追加 |
+| vendor/tantivy/src/query/boolean_query/boolean_weight.rs | 旧腕は維持し、コメントとtest名を採点互換の目的へ整理（前回実装から採点処理自体は不変） |
+| vendor/tantivy/MIV-PATCH.md | 原因、前回仮説の修正、取引条件、撤去条件、互換性の根拠を追記 |
+| docs/dependency-update-20261028.md / docs/search-architecture.md | 調査経路・実測・失敗の扱い・試作状態を記録 |
+
+<a id="stage-c-027-performance"></a>
+
+#### 通常benchの最終比較と残差
+
+全ての自分のbuild/test終了後、公式root版を0.26→修正前→試作の順に3巡した。
+修正前は前回の旧AND腕付き0.27（bench_search_patched.exe）で、今回との差はcollectorと回帰テストだけ。
+0.27の2版はrelease / dev-tools / symbol、全版--docs 50000 --json。全queryのhitsは9回とも同じだった。
+後続調査で提供0.26だけprofileが異なると判明したため、この表を同条件のversion比較とは扱わない（後述）。
+tasklist /FO CSV /NHはsandboxでAccess deniedとなったため、そのログを保存し、
+代わりにpsutil.process_iterのprocess名でrustc.exe / cl.exe / mimageviewer-core.exeを数えた。
+以下の9回は全て0 / 0 / 0。CPUは各回の開始前0.25秒に採ったhost全体値であり、run中平均ではない。
+58.1–98.8%を観測し、対象3processが0でも静穏条件を満たしたとは言えない。負荷のアプリ帰属も未確定。
+
+| 順序 | 版 | generic_jp total ms | post ms | rustc / cl / core | 開始前CPU % |
+| ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 0.26 | 37.4152 | 7.3885 | 0 / 0 / 0 | 82.2 |
+| 2 | 0.27修正前 heap | 58.3459 | 6.6500 | 0 / 0 / 0 | 66.0 |
+| 3 | 0.27試作 buffer | 42.1025 | 8.4279 | 0 / 0 / 0 | 60.1 |
+| 4 | 0.26 | 34.7889 | 6.6566 | 0 / 0 / 0 | 62.8 |
+| 5 | 0.27修正前 heap | 59.9789 | 7.7194 | 0 / 0 / 0 | 64.5 |
+| 6 | 0.27試作 buffer | 42.8429 | 7.4343 | 0 / 0 / 0 | 58.1 |
+| 7 | 0.26 | 50.1160 | 11.9309 | 0 / 0 / 0 | 80.0 |
+| 8 | 0.27修正前 heap | 80.3518 | 9.7139 | 0 / 0 / 0 | 90.2 |
+| 9 | 0.27試作 buffer | 47.8958 | 7.6000 | 0 / 0 / 0 | 98.8 |
+
+| 各queryの3回最良値 ms | 0.26 | 0.27 heap | 0.27 buffer | buffer対0.26 |
+| --- | ---: | ---: | ---: | ---: |
+| generic_jp | 34.7889 | 58.3459 | 42.1025 | +21.02% |
+| en_common | 24.8455 | 33.5128 | 25.6879 | +3.39% |
+| medium_jp | 11.1118 | 11.7538 | 11.0183 | −0.84% |
+| medium_jp_and | 3.0024 | 3.1549 | 3.2784 | +9.19% |
+| medium_jp_3 | 1.4868 | 1.5113 | 1.3842 | −6.90% |
+| rare_jp | 1.2759 | 1.2526 | 1.4657 | +14.88% |
+| rare_jp_and | 0.3901 | 0.3161 | 0.2972 | −23.81% |
+| unique_id | 1.9329 | 1.9935 | 2.1329 | +10.35% |
+| en_ai_phrase | 2.2764 | 2.3020 | 2.3116 | +1.55% |
+| super_generic | 0.0102 | 0.0081 | 0.0112 | +9.80% |
+
+generic_jpはheapより27.84%短縮したが、0.26比では21.02%の残差がある。
+前の9回比較も保存した（first-cohort/）。その最良値は0.26=20.3913 / heap=39.3377 /
+buffer=25.1137 msで、対0.26は+23.16%、対heapは36.16%短縮。
+こちらは順序1–7で外部rustc=1、8–9で0（cl/coreは全回0）だったため、終了を待って上表を再測定した。
+改善は両cohortで同じ方向だが、完全回復・静穏条件での採否を確定する証拠にはしない。
+全9回でcheck_bench_regression.pyも実行し、4月baseline比較は全回exit1。
+同時測定の0.26自体もexit1であり、この環境でbaseline gate通過とは報告しない。
+
+追加のlayout probeでは、各公式版が--keepで生成した索引を0.26/試作readerの双方で読んだ。
+generic_jpの同一索引内reader差は−3.51% / +3.11% / +5.12%だった。
+各索引は16 / 16 / 17 segmentで、segmentサイズとDocId順が異なる。
+このprobeだけはTMP/TEMPをG:の証跡配下へ変更しており、通常benchの絶対時間とは混ぜない。
+共通索引の補助測定と合わせ、索引生成条件の影響を分ける必要を示すが、
+通常benchの残差全てがlayoutや負荷によるとは確定していない。短query全般への一般化もしない。
+
+collector変更の寄与は単独因子の試作と共通索引比較で切り分けた。
+通常benchの約21–23%の残差原因は未確定で、静穏時の再測定と残差の追加切り分けが残る。
+この状態で別の上流最適化を推測だけで戻したり、baselineを更新したりはしない。
+生JSON/実行条件はfinal-measurements.json、各final-*.json、final-measurement-summary.json、
+first-cohort/、layout-probe-results.json、tasklist-final.log。補助計測のsourceもharness/に保存。
+
+#### 製品build・生成コード・引き継ぎ
+
+| 検査 | 結果 |
+| --- | --- |
+| cargo build --release -p mimageviewer --bin mimageviewer-core --target-dir target/core-sym --locked --offline | 通常製品feature、symbol付き、1081.74秒、exit0。製品は起動していない |
+| cargo build --release -p mimageviewer --features dev-tools --bin bench_search --target-dir target/core-sym --locked --offline | 同じrelease/symbol条件、271.26秒、exit0。上表の試作binary |
+| cargo tree -p mimageviewer -e features,normal,build -i tantivy --locked --offline | exit0、製品依存にmiv-test-hooks無し |
+| check-vcrt-pe-dependencies.ps1 -InputPaths @('target/core-sym/release/mimageviewer-core.exe') -RequireCompanionRuntime | companion runtime 4本 / PE 1本、成功 |
+| dumpbin /disasm:nobytes + matching PDB | 下記4採点関数でunpcklps / addps / divps全て0。旧Intersection経路へのcallも確認 |
+
+buildはMSBUILDDISABLENODEREUSE=1 / offline / jobs=4、CARGO_INCREMENTAL=0、
+CARGO_PROFILE_RELEASE_STRIP=false / DEBUG=line-tables-only。
+今回のMSVCはPDBを正常に解決した。LLVMはPEとのGUID/age・関数範囲の独立照合に使った。
+GUID=5976381B-C06A-EC78-4C4C-44205044422E、age=1。
+
+| 採点関数 | 命令数 | unpcklps / addps / divps |
+| --- | ---: | --- |
+| score_out_of_line<Box<dyn Scorer>> | 4 | 0 / 0 / 0 |
+| score_out_of_line<TermScorer> | 33 | 0 / 0 / 0 |
+| Intersection<Box, Box>::score | 39 | 0 / 0 / 0 |
+| Intersection<TermScorer, Box>::score | 72 | 0 / 0 / 0 |
+
+for_each_pruning→into_box_scorer→intersect_scorersのcallをraw dumpでも確認した。
+block_wand_intersectionの製品関数は旧腕により不在で、上流source/testは維持。
+dumpbin-scoring.json、functions-{1..4}.txt、routes-{1..5}.txtに範囲とdisassemblyを保存した。
+
+| binary | SHA-256 |
+| --- | --- |
+| 0.26比較用 bench_search_v026.exe | 28a7819ae28ef9bde3ab370d464980c1d6d8f41142b90079ff16bdfa993ee389 |
+| 今回の修正前 bench_search_patched.exe | 46c2ebae6eff91d6a1c624a93aa01ecd61a3dde89f29defd059e4cd1510c80b3 |
+| 今回のbuffer試作 bench_search.exe | fa9399c032a5aacecb529a01da73b69c773a945885a681981bda434a02180069 |
+| 今回の製品 mimageviewer-core.exe | 5e180123e08a26cd18f6582ab0d0a07b1613bf9f00c4bdaf01908aec6cbbcf85 |
+
+試作benchはstage-c-investigation/bench_search_buffer.exeにもコピーした。既存3比較binaryは保持。
+root Cargo.lock、baseline、0.26固定fixtureは不変、vendor Cargo.lock無し。
+最後に引数無しcargo fmt、cargo fmt --check、git diff --checkを実行し、全てexit0。
+fmtによるRust source変更が無いこととfixtureのhash/filterもfinal-audit.jsonで照合する。
+test-fullは今回は再実行せず、前回の環境要因5件・単独成功の時間依存2件を含め、ClaudeCodeがsandbox外で最終確認する。
+
+ClaudeCodeの判断事項は、buffer試作の範囲と容量/thresholdの取引条件の採否、
+静穏条件での通常bench残差の追加調査、collectorと独立した既存Windows GC単体テストの扱い。
+0.27採用の方針自体を再度問い直すものではない。コミット・push・製品起動は行っていない。
+
+<a id="stage-c-027-layout"></a>
+
+### 2026-10-29追補 — 通常benchの索引生成条件と残差
+
+前回のbuffer試作を保持して、writer/merge/codecの既定変更と索引実体を追加調査した。
+この追補の証跡はtarget/dependency-update-20261028/stage-c-residual/。
+通常benchの0.26 / heap / bufferは前回と同じ3 binaryで、hashも変更していない。
+
+#### 上流の差分と製品への影響
+
+| 項目 | 0.26.2と0.27.0の照合 |
+| --- | --- |
+| 既定LogMergePolicy | 原本byte同一。min_num_segments=8、min_layer_size=10000、level_log_size=0.75、max_docs_before_merge=10000000、del_docs_ratio_before_merge=1.0 |
+| writer/queue | 上限8 indexing worker、4 merge thread、queue10000文書、総予算をworker数で割る点は同一 |
+| flush/メモリ計上 | mem_usage >= budget - 1000000でflush。旧ctx+fieldnorm+fast+storeがplugin内訳に分かれたが、合計式と各容量の数え方は同じ。benchにcustom pluginなし |
+| doc store | 既定LZ4、16384-byte block、dedicated compression thread=trueは同じ。StoreWriter原本byte同一 |
+| postings | WithFreqs、128文書のBitPacker4x block、freq/vint形式は同じ。新しいdoc-id mappingは既定では不使用 |
+| schema/fast field | benchはpath=STRING+STORED、name/all_text=bigram+WithFreqs。fast列は0。空の.fast headerはあるがcolumnar圧縮変更の直接対象ではない |
+| index settings | 新しいsort_by_fieldはNone、manual_doc_id_mappingはfalse。形式番号7/最古対応4、columnar形式V2を維持 |
+
+根拠はsrc/bin/bench_search.rs::build_schema/build_index、
+vendor/tantivy/src/index/index.rs::writer、indexer/log_merge_policy.rs、
+indexer/index_writer.rs、indexer/segment_writer.rs、index/index_meta.rs。
+原本同士のhashと保存索引のcomponent bytesはstatic-audit.jsonに記録した。
+
+実際に変わったのはplugin化と書出し順・serializerのclose単位である。
+旧mergeはfieldnorm→postings→store→fast→一括close、新mergeはinverted→fast→storeを
+plugin単位でserialize/closeする（indexer/merger.rs::write、segment_writer.rs::finalize_inner）。
+lz4_flex 0.13.1→0.14.0はalloc featureの新設に伴う圧縮hash tableのstack化、
+Tantivy側wrapperはmem::takeによる未初期化bufferの安全修正を含む。
+正常入力の圧縮形式は同じで、これらはwriterの進行時刻を変え得るが、
+特定の変更が通常benchの残差を生むとまでは確認できていない。
+「merge policyの既定が変わったためsegmentが増えた」という仮説はソースと矛盾する。
+
+benchは128 MiBで既定の多workerを使い、commit後にwait_merging_threadsせずreturnする。
+writerのDropはsegment_updater.kill()→sender破棄→worker joinで、merge完了の待機ではない。
+commitは新segmentとmetadataの公開を待つが、自動merge全体の完了は保証しない。
+従ってworkerへの文書分配と、Dropまでにどのmergeが公開済みかでsegment構成・DocId順が変わる。
+この性質は両版にあり、0.27だけの新しい仕様ではない。
+
+mIVの実索引は64 MiBのwriterをdispatcherが保持し、commit→reader reload後もwriterを使い続ける。
+この環境では既定4 workerになり、benchの8 worker・commit直後Dropとは条件が異なる。
+製品schemaもFAST指定はなく、各テキストをソース別にSTOREDで保持する点が、pathだけを保存するbenchとは異なる。
+0.26既存segmentは0.27の追記だけでは再書出しされず、merge参加時に新規segmentと連結し、
+削除docを除いて出力する。sort/mappingなしのStacked / StackedWithDeletesでは、
+0.27追加のShuffled用heap k-way mergeには入らない。
+doc storeのstackか再圧縮かの選択条件も同じで、appendだけで全面変換される変更はない。
+追加・削除によりglobal BM25統計が変わることと、形式互換の問題は別である。
+fts_tantivy_compatの既存0.26 fixtureへの更新・新旧segment混在・明示merge・再open成功結果は引き続き有効。
+
+既定値が同じなので、製品に「0.26と同じpolicy」を重ねて明示しても今回の差の対策にはならない。
+writer/merge policyやcodecを推測で戻す製品改変は追加しない。
+特にcolumnar全体の差戻しは、大きな下降値でのlinear codec overflow、4GB超辞書merge、
+StrColumn unsafeの上流修正を失うため不適切である。
+
+0.26.2原本の同GCテストも、現Windowsでは0成功/1失敗（同じmanaged_directory.rs:404、0.01秒）だった。
+作業ツリー内の実体コピーでsrc全271ファイルのhash一致を確認し、isolated workspaceを加えただけで実行した。
+原本付属lockはbon 3.10.1等がcache不足のため、そのlock固定での実行は未達。
+コピー内だけoffline互換再解決後、cargo test --lib <完全名> --locked --offline -- --exact --nocaptureで再現した
+（compile含む69.38秒、exit101、gc-original026.json/log、lock更新内容はgc-original026-lock-update.log）。
+この結果は原本の現環境での不一致を確認するもので、公開当時のWindows CI通過を確認した記録ではない。
+ignore/guardは追加しない。
+
+#### merge自体の退行と、完了時刻の差を分ける補助計測
+
+同じ0.26製の16segment索引を毎回実体コピーし、明示mergeだけを0.26→0.27で3巡した。
+別の同一sourceの診断binを各版にリンクし、NoMergePolicy下で全segmentのmergeをwaitして測る。
+全6回が50000文書の1segmentになった。
+
+| 同一入力の明示merge ms | run1 | run2 | run3 | 最良値 |
+| --- | ---: | ---: | ---: | ---: |
+| 0.26 | 578.0094 | 520.6375 | 509.9836 | 509.9836 |
+| 0.27 buffer | 492.3737 | 506.2236 | 496.0030 | 492.3737 |
+
+この負荷条件では新版mergeの減速は再現せず、最良値は新版が3.45%短い。
+開始前CPUは18.9–22.5%、外部core=13、rustc/cl=0なので静穏時の採否値とはしない。
+上流のtrivial postings連結がnext_mapped_doc helper呼出しへ変わった点と、
+fast-field mergeでDocIdMappingをcloneする点も調べたが、性能修正を追加する測定根拠は得られなかった。
+
+さらに通常と同じ既定8 worker/128 MiBで生成し、commit後にwait_merging_threadsだけを追加する
+診断版を0.26→0.27で3巡した。製品コード・tracked benchは変更していない。
+writer自体を1 workerへ変えたり、NoMergePolicyで生成したりする比較ではない。
+通常bench全体からwaitだけを変えた厳密なA/Bではなく、診断binはdir_size/SQLite構築等を省き、
+wait直後にgeneric_jpを測る。通常benchの残差をこの数値だけで解消したとは判定しない。
+
+| 順序 | 版 | commit時segment数 | wait後 | wait ms | generic_jp ms | 開始前CPU % |
+| ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 0.26 | 9 | 32744 + 17256 | 72.6957 | 27.2261 | 26.7 |
+| 2 | 0.27 buffer | 16 | 32744 + 17256 | 158.8319 | 26.3679 | 21.7 |
+| 3 | 0.26 | 9 | 32744 + 17256 | 148.2154 | 27.1345 | 22.5 |
+| 4 | 0.27 buffer | 9 | 32744 + 17256 | 80.0605 | 28.7329 | 29.4 |
+| 5 | 0.26 | 16 | 32744 + 17256 | 158.2709 | 26.6577 | 24.3 |
+| 6 | 0.27 buffer | 9 | 32744 + 17256 | 152.5977 | 26.6100 | 33.4 |
+
+両版ともcommit時は9/16segmentが揺れるが、wait後は全6回が同じ文書数構成の2segment、削除無しになった。
+これはDocId分配やファイルbytesまで同一という意味ではない。
+schema/index_settingsも全6回一致。検索最良値は0.26=26.6577 / buffer=26.3679 ms（−1.09%）。
+外部core=13の負荷条件での補助値であり、通常benchの静穏結果へ置き換えない。
+ただし「0.27だけが常に多segmentになる」「新版のmerge自体が必ず遅くなった」という説明は支持しない。
+先行の通常bench予備runも、0.26が9segment（32744文書のmerge済みsegmentを含む）だった。
+この予備run後、補助binのbuild/測定と競合させないためCPU待機を停止し、通常3巡は新規cohortで実施した。
+補助buildは38.64秒/16.64秒で成功。merge_probe.rs、merge-measurements.json、settle-measurements.jsonに保存。
+
+single-segmentの共通索引だけではmulti-segment時のreader差を除外できないため、
+既存の同一sourceのreader診断binで、各保存索引を0.26→bufferで3巡ずつ読む比較も追加した。
+自分の通常benchと重ならないよう、そのCPU待機中だけsamplerを停止し、補助比較終了後に再開した。
+
+| 各行で同一索引のgeneric_jp最良値 ms | 0.26 reader | buffer reader | 新旧比 |
+| --- | ---: | ---: | ---: |
+| 共通0.26製1segment | 23.6082 | 23.0895 | −2.20% |
+| 通常benchの0.26製16segment | 29.0498 | 28.3873 | −2.28% |
+| wait後の0.27製2segment | 26.7010 | 27.6267 | +3.47% |
+
+開始前CPUは16.7–32.1%。行内の新旧比を比較する補助資料で、静穏値とはしない。
+1/2segmentはG:、16segmentはC:にあり、DocId分配も違うので行間の絶対値からsegment数だけの効果は算出しない。
+同一のmulti-segment入力でも+21%のreader差は再現せず、入力を揃えない通常benchの最良値だけで
+新しいwriter退行や固定のreader退行を断定することはできない。
+scoreの全segment結果を集約するsort_key_top_collector.rsは原本byte同一で、
+TopNComputer本体の差もthreshold fieldの可視性とコメントだけだった（collector-diffs.txt）。
+reader-grid.py / reader-grid.json / reader-grid-summary.jsonに保存。
+
+独立生成した0.26/0.27の索引を同じ0.26 readerで採点して、索引内容側の差も確認した。
+10 query全てで候補総数が一致し、generic_jpの50000文書は58種類のscore bitsとその件数が完全一致した。
+ページ先頭10000件の共通pathは9550件で、その全てのscore bitsも一致した。
+独立生成でDocId分配が異なるため同点選択のpath集合は一致しないが、これは同一索引での新旧reader順位比較とは別である。
+genericの頻度/fieldnorm差で全体の採点分布が変わった兆候は得られなかった。
+index-score-check.py / index-score-comparison.json / index-scores-{026,buffer}.jsonに保存。
+
+<a id="stage-c-027-quiet"></a>
+
+#### 比較用0.26 binaryのprofile差を発見・補正
+
+通常cohortを進める間に、提供されたbench_search_v026.exeと元worktreeのexeをSHAで照合した。
+両方28a7819ae28ef9bde3ab370d464980c1d6d8f41142b90079ff16bdfa993ee389で同一だが、
+Cargo fingerprintのprofileは0.27側と違っていた。compiler/feature/rustflagsは同じだった。
+ゼロ依存の小crateを実行せずbuildし、debug/strip/incrementalの16通りでprofile hashを対応付けた。
+
+| 比較binary | debug | strip | incremental | bin profile hash |
+| --- | --- | --- | --- | --- |
+| 提供0.26（28a7819a…） | 0 | true | 1 | 4789821954036916483 |
+| 0.27 heap / buffer | line-tables-only | false | 0 | 7644041293395466247 |
+
+Tantivy libのprofileも旧16586384879355995654 / 新15325573734508280668で違っていた。
+target/core-symという出力directory名だけではsymbol条件は揃っていなかった。
+profile-audit.json / profile-map.json / profile-map-true.jsonにhash照合と小crateの結果を保存。
+
+従って、前回の「通常benchでは+21%、共通索引では+0.21%」は索引生成条件だけを変えた比較ではない。
+共通索引用の0.26診断binは最初から0.27と同じprofileであり、binaryのprofileも同時に変わっていた。
+この差を含む残差からwriter退行や特定の上流変更を断定できない。
+今回のold-profile通常cohortも4run時点で停止した（全個別benchはexit0、停止は前提不一致によるもの）。
+CPU待機の停止はtest/Cargo timeoutではない。raw JSONはnormal-cohort/にそのまま保持した。
+
+old worktreeのbuild scriptsを読んで、生成先がOUT_DIRに限定され、VST identity gateもread-onlyであることを確認した。
+旧worktreeを入力として、出力だけ段Cの絶対targetへ指定し、同じprofileで0.26を再buildした。
+
+```text
+MSBUILDDISABLENODEREUSE=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=4
+CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_STRIP=false
+CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+cargo build --manifest-path G:/home/mimageviewer-bench026/Cargo.toml -p mimageviewer
+  --release --features dev-tools --bin bench_search
+  --target-dir G:/home/mimageviewer-deps/target/core-sym --locked --offline
+```
+
+363.92秒、exit0。新しい参照はstage-c-residual/bench_search_026_sym.exe、SHA-256
+07b880389ae453b6c894f044979b568aecd612339e10899e38a08076cd386441。
+bin profile=7644041293395466247、compiler/feature/rustflagsも0.27と一致。
+bench_search.rs自体も両worktreeでSHA-256=63f6051af1931b7e2de00c9544658694228b3b6a1e5d31fd4c6021023654baa7で同一。
+旧worktreeはbuild前後ともclean、旧Cargo.lockのSHAも不変。段C側のbuffer exe/PDB/.dは退避分から復元しhash一致を確認した。
+build-matched-026.py / matched-026-build.json / old-tree-preservation.jsonに保存。
+以前の0.26 binaryも変更せず保持している。
+
+#### CPU条件付きの通常bench再測定
+
+補助buildを全て終え、条件一致の0.26→heap→bufferを交互に3巡した。
+全版release / dev-tools / symbol（opt3 / thin LTO / codegen-units16 / incremental0 /
+strip=false / debug=line-tables-only）。heapは前回の旧AND腕付き46c2ebae…、bufferはfa9399c0…。
+--docs 50000 --keep --jsonを指定し、同じ既定C: TEMPを使った。--keepは索引実体の比較のため。
+
+各run直前にpsutil.cpu_percent(interval=1)を確認し、15%以上なら60秒待って再確認（各run最大10回）。
+最終cohortでは全9回が15%未満を満たし、上限後の未達測定は無かった。待機は各0–2回、計6回。
+CPU値は開始直前の1秒平均であり、run中の平均や最大値ではない。
+tasklistはsandboxのAccess deniedのためログを保存し、process数はpsutilで取得した。
+rustc.exe / cl.exe / mimageviewer-core.exeは全9回0 / 0 / 0。
+
+| 順序 | 版 | generic_jp total ms | post ms | 開始前CPU % | 60秒待機回数 | segment数 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.26 条件一致版 | 23.7365 | 4.1594 | 13.7 | 0 | 16 |
+| 2 | 0.27 heap | 39.1629 | 4.5142 | 13.8 | 0 | 17 |
+| 3 | 0.27 buffer | 24.9440 | 4.2009 | 11.6 | 1 | 14 |
+| 4 | 0.26 条件一致版 | 24.7415 | 4.0094 | 14.0 | 2 | 15 |
+| 5 | 0.27 heap | 40.2015 | 4.4565 | 13.8 | 0 | 15 |
+| 6 | 0.27 buffer | 25.8285 | 4.2494 | 13.4 | 1 | 17 |
+| 7 | 0.26 条件一致版 | 24.9266 | 4.3062 | 14.0 | 0 | 16 |
+| 8 | 0.27 heap | 39.8650 | 4.2872 | 14.4 | 0 | 16 |
+| 9 | 0.27 buffer | 25.4576 | 4.2172 | 12.5 | 2 | 14 |
+
+全queryのhits、全indexのschema/index_settingsが一致し、削除は全て0。
+全segmentのmax_docとlive component bytesをmatched-cohort/quiet-measurements.jsonとmeasurement-summary.jsonに保存した。
+
+| 版 | segment数の範囲 | 1segmentの文書数の範囲 | live component合計 MiB |
+| --- | --- | --- | --- |
+| 0.26条件一致版 | 15–16 | 629–4093 | 7.81–7.84 |
+| 0.27 heap | 15–17 | 1–4093 | 7.78–7.81 |
+| 0.27 buffer | 14–17 | 141–4093 | 7.72–7.80 |
+
+live componentはmetaの参照segmentに属するファイルだけを合計した。
+通常benchのdir_sizeはwriterのDrop前に計算するため、obsolete/未公開mergeファイルを含み得る。
+それをindex形式や圧縮方式の差と誤認しないよう、実体比較では分けて扱った。
+doc storeは約0.789 MB、postingsは約6.38–6.48 MBで、fast列の追加・削除や設定変更はない。
+componentサイズの違いだけからcodecの意味変更やsegment増加を結論しない。
+
+| queryの3回最良値 ms | 0.26 条件一致版 | heap | buffer | buffer対0.26 |
+| --- | ---: | ---: | ---: | ---: |
+| generic_jp | 23.7365 | 39.1629 | 24.9440 | +5.09% |
+| en_common | 14.5626 | 20.1153 | 14.9860 | +2.91% |
+| medium_jp | 6.0173 | 7.8391 | 6.4037 | +6.42% |
+| medium_jp_and | 1.7305 | 1.8447 | 1.9105 | +10.40% |
+| medium_jp_3 | 0.8111 | 0.7958 | 0.8169 | +0.72% |
+| rare_jp | 0.8569 | 0.8208 | 0.8802 | +2.72% |
+| rare_jp_and | 0.1939 | 0.1901 | 0.1925 | −0.72% |
+| unique_id | 1.1268 | 1.2174 | 1.2510 | +11.02% |
+| en_ai_phrase | 1.4846 | 1.4434 | 1.3555 | −8.70% |
+| super_generic | 0.0055 | 0.0049 | 0.0045 | −18.18% |
+
+genericはbufferがheapより36.31%短縮し、0.26比では+1.2075 ms / +5.09%が残る。
+median同士では+2.89%。全3巡でbufferは0.26より遅く、完全同速・全query非悪化とは扱わない。
+medium_jp_andは+0.1800 ms / +10.40%、unique_idは+0.1242 ms / +11.02%である。
+4月baseline比較は0.26とbufferが各3/3成功、heapが3/3失敗（各ログに保存）。--saveは使っていない。
+
+前回の約+21%にはprofileの不一致が交絡しており、条件を揃えた通常比較では+5.09%となった。
+debug/strip/incrementalのどれがどれだけ速度に寄与したかや、profile差だけで過去の残差全部を説明できるかは未分離。
+残る5.09%も、独立生成のDocId/segment構成、codegen等へ一意には帰属できていない。
+一方、同profileの共通索引reader比較、同一入力merge、生成後waitの比較は引き続き有効で、
+writer既定変更や新しいmerge減速を支持しない。特定の上流writer変更を原因と認定する根拠は得られなかった。
+
+#### 提案と検収上の取引条件
+
+製品のwriter/merge policyやcodecを追加で戻す変更は見送ることを提案する。
+設定は既に0.26と同じで、追加変更の測定根拠がない。
+benchの再現性改善は、merge完了の有無とsegment実体を出力し、reader比較用に固定索引または
+merge完了後を測るmodeを用意する案を提案する。通常利用のingestをmerge待ちに変える提案ではない。
+今回、その変更はtracked bench/製品へは加えていない。
+
+buffer試作の採否には、今回の同profileの+5.09%、小queryの最大約+11%（上記の絶対差）、
+heapからの36.31%短縮、共通索引での採点・順位互換を合わせて判断する。
+2K容量は0.26の既存挙動への復帰で、0.27 heapのK容量・tight thresholdによる小K/WANDの利点とは取引になる。
+K=offset+limitであり、製品ではpost-filter後のvalid数が10000に達するまでoffsetが10000を越える場合もある。
+旧AND腕は性能単独の効果ではなく、grouped additionのscore bits・同点順位互換のために維持する。
+この理由とprofile差の訂正をMIV-PATCH.mdにも反映した。
+
+今回、製品Rust source・依存版・feature・固定fixtureは変更していないため、前回の
+integrity14件、compat1件、検索lib588件、vendor1346成功/既存GC1失敗/8 ignoredの検証結果を再利用する。
+新たなGC原本テストの失敗確認は上記のとおり。test-fullは再実行しない。
+root Cargo.lock、baseline、固定fixture、製品core/PDBは不変。vendor Cargo.lock無し。
+最後にcargo fmt（引数無し）、fmt check、diff checkが全て成功し、source不変と入力hashをfinal-audit.jsonで確認した。
+コミット・push・製品起動は行っていない。
 
 <a id="stage-d"></a>
 

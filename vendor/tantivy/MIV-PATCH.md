@@ -227,3 +227,93 @@ benefit or isolate routing from load. The patch remains a design-owner-requested
 candidate pending a decision on its disposition and further measurement
 conditions. No further performance patch, baseline save, or extra benchmark run
 was made. Full six-run results are in the stage C follow-up log.
+
+2026-10-29 diagnosis and prototype (design-owner acceptance is pending):
+
+- `src/collector/sort_key/sort_by_score.rs`: restore only
+  `SortBySimilarityScore::collect_segment_top_k` to the 0.26 `TopNComputer`
+  buffer/median algorithm. 0.27 had changed this collector to `TopNHeap` for an
+  exact K-th-score pruning threshold. The benchmark's paginated score search raises
+  K from 500 to 10000; maintaining a heap on accepted hits is expensive there.
+  The ordinary Intersection pruning loop still scores every matching document,
+  so tighter thresholds do not remove that BM25 work. Changing the Weight route
+  alone left this collector regression in place.
+- This is one selection algorithm for all score paging, not a workload guard
+  or failure fallback. The existing heap implementation and upstream tests are
+  retained as a reference. Buffered selection needs capacity 2K instead of K,
+  and its threshold is a conservative, less frequently updated lower bound.
+  Small-K or sparse Block-WAND searches may lose the tighter-threshold speed
+  advantage. Results, ascending DocAddress tie-breaking and deletion filtering
+  retain the 0.26 behavior; no correctness fix is removed.
+  K is offset plus page size. Product post-filtering can push the offset beyond
+  10000 before reaching 10000 valid hits, so 10000 is not a general capacity cap.
+  The 2K capacity restores the released 0.26 memory profile, rather than adding
+  capacity relative to that release.
+- Keep the existing BooleanWeight arm for a separate, demonstrated reason:
+  score compatibility. Intersection uses `(a+b)+sum(rest)` whereas 0.27 block
+  AND accumulates left to right. On one shared 0.26-generated index, removing
+  the arm changed 4732 returned score bit patterns across five queries (the
+  document order happened to match in that corpus). With the arm and buffered
+  collector, all 78388 ordinary-score records and 30762 paged records across
+  ten queries exactly match 0.26, including score bits and document addresses.
+  Its comment and regression name now describe grouped-score compatibility,
+  rather than claiming a standalone performance benefit.
+- `test_miv_buffered_score_paging_with_deletes` covers 50023 documents in two
+  segments, repeated 2K selection boundaries, ties, deletion of the top 64
+  documents, limits 1/10/500/10000 and offset 9500. It compares the real score
+  collector with exhaustive scoring, including exact bits and addresses.
+  `test_miv_term_intersection_preserves_grouped_scores` retains two-/four-term
+  score-order coverage. Upstream heap, block-AND and pagination tests remain.
+- Same-index alternating measurements (external rustc=1, cl/core=0) had best
+  generic_jp 26.1909 ms for 0.26, 33.3185 ms for 0.27 heap, and 26.2465 ms for
+  0.27 buffer (+0.21% versus 0.26). Normal benchmark and final test evidence is
+  recorded in the 2026-10-29 stage C follow-up, not inferred from this auxiliary
+  measurement. The 2026-04 baseline is unchanged.
+- The preceding normal benchmark alternated 0.26 / 0.27 heap / buffer three times.
+  Best generic_jp was 34.7889 / 58.3459 / 42.1025 ms: buffer improves on heap
+  by 27.84%, but remains 21.02% slower than 0.26. All target process counts
+  were zero; host CPU sampled for 0.25 seconds before each run was 58.1–98.8%,
+  so this is not a quiet-host acceptance result. A preceding cohort also left
+  a 23.16% gap. The residual cause and full recovery remain unverified; do not
+  attribute all of it to load or index layout. Full conditions and all-query
+  results are in the dependency update log.
+- No change is retained in postings/codec, k-ary search, allocation-free seek,
+  dense count, schema or index format. The pre-existing right-hand
+  `score_out_of_line` barrier remains unchanged.
+
+Remove the collector patch when the upstream score collector matches or beats
+0.26 on mIV's high-K dense paging while preserving its scores and ordering,
+using matching compiler, profile and features for the comparison.
+Removing the BooleanWeight arm additionally requires the block route to retain
+0.26's grouped addition and tie behavior. The previous speed-only removal
+condition is superseded by these verified compatibility requirements.
+
+Follow-up on index generation (2026-10-29): upstream LogMergePolicy is byte
+identical in 0.26.2 and 0.27.0. Worker limits, memory budgeting, flush conditions,
+docstore LZ4/block defaults and the ordinary postings block format are unchanged.
+The normal benchmark drops its writer after commit without waiting for merges;
+the product keeps a writer across commits. Multiworker segment/doc-id assignment
+and merge completion therefore need to be separated from reader performance.
+Plugin serialization order changed, but it has not been established as the cause
+of the residual. No extra writer/merge/codec patch is added on that hypothesis.
+See the index-layout and CPU-gated measurement follow-up in the dependency log.
+The BooleanWeight arm remains specifically for grouped-score compatibility.
+
+The supplied 0.26 benchmark was subsequently found to use a different Cargo
+profile: debug=0, strip=true, incremental=1. The 0.27 symbol builds use
+line-tables-only, strip=false, incremental=0. The shared-index diagnostic
+binaries already used matching profiles, so the earlier normal/shared-index
+comparison changed both the input and the 0.26 build profile. Its residual
+cannot be assigned to a writer change. A root 0.26 benchmark was rebuilt with
+the exact 0.27 profile, without changing the old worktree; the latest dependency
+log records the matched-profile comparison. No extra writer patch is added.
+
+With the rebuilt 0.26 reference, the nine-run alternating comparison met the
+requested pre-run CPU limit (one-second means 11.6–14.4%, rustc/cl/core all zero).
+Best generic_jp was 23.7365 / 39.1629 / 24.9440 ms for 0.26 / heap / buffer.
+Buffer is 36.31% faster than heap and still 5.09% slower than matched 0.26.
+The exact contribution of debug/strip/incremental and the remaining difference
+is not separated; neither full recovery nor a writer regression is established.
+Medium AND and unique-ID queries remain +0.1800 and +0.1242 ms, respectively.
+All three buffer runs pass the unchanged April baseline gate. Adoption remains
+with the design owner; no writer/codec setting or baseline is changed.

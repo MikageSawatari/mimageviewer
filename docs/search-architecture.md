@@ -183,7 +183,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 
 | モジュール | 役割 |
 | --- | --- |
-| [fts_index.rs](../src/fts_index.rs) | Tantivy 0.27 ラッパ（[段Cの追加AND改変は性能基準未達・検収待ち](dependency-update-20261028.md#stage-c-and-route)）。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page` |
+| [fts_index.rs](../src/fts_index.rs) | Tantivy 0.27 ラッパ（[段Cのscore collector試作・索引生成条件の検討は検収待ち](dependency-update-20261028.md#stage-c-027-layout)）。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page` |
 | [fts_meta.rs](../src/fts_meta.rs) | `fts_meta.db` (SQLite) ラッパ。ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 |
 | [search_index_db.rs](../src/search_index_db.rs) | Ctrl+S 用 `search_index.db` (フォルダ / ZIP / PDF / 動画名) |
 

@@ -2,7 +2,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use crate::collector::sort_key::NaturalComparator;
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::{DocAddress, DocId, Score};
 
 /// Sort by similarity score.
@@ -29,9 +29,7 @@ impl SortKeyComputer for SortBySimilarityScore {
 
     // Sorting by score is special in that it allows for the Block-Wand optimization.
     //
-    // We use a BinaryHeap (TopNHeap) instead of TopNComputer here so that the
-    // threshold is always the exact K-th best score. TopNComputer only updates its
-    // threshold every K docs (at truncation), giving Block-WAND a stale bound.
+    // MIV: retain buffered top-K selection for score paging; see MIV-PATCH.md.
     fn collect_segment_top_k(
         &self,
         k: usize,
@@ -39,10 +37,12 @@ impl SortKeyComputer for SortBySimilarityScore {
         reader: &crate::SegmentReader,
         segment_ord: u32,
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
-        let mut top_n = TopNHeap::new(k);
+        let mut top_n: TopNComputer<Score, DocId, Self::Comparator> =
+            TopNComputer::new_with_comparator(k, self.comparator());
 
         if let Some(alive_bitset) = reader.alive_bitset() {
             let mut threshold = Score::MIN;
+            top_n.threshold = Some(threshold);
             weight.for_each_pruning(Score::MIN, reader, &mut |doc, score| {
                 if alive_bitset.is_deleted(doc) {
                     return threshold;
@@ -61,7 +61,7 @@ impl SortKeyComputer for SortBySimilarityScore {
         Ok(top_n
             .into_vec()
             .into_iter()
-            .map(|(score, doc)| (score, DocAddress::new(segment_ord, doc)))
+            .map(|cid| (cid.sort_key, DocAddress::new(segment_ord, cid.doc)))
             .collect())
     }
 }
@@ -167,6 +167,97 @@ mod tests {
     use super::*;
     use crate::collector::sort_key::NaturalComparator;
     use crate::collector::TopNComputer;
+
+    #[test]
+    fn test_miv_buffered_score_paging_with_deletes() -> crate::Result<()> {
+        use crate::collector::TopDocs;
+        use crate::query::{BooleanQuery, EnableScoring, Query, TermQuery};
+        use crate::schema::{IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
+        use crate::{Index, IndexWriter, Term, TERMINATED};
+
+        let mut schema = Schema::builder();
+        let id = schema.add_text_field("id", STRING | STORED);
+        let text = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+        writer.set_merge_policy(Box::new(crate::merge_policy::NoMergePolicy));
+        // Each segment exceeds 2 * the largest page cutoff. Repeated frequency
+        // patterns exercise equal scores on both sides of each selection boundary.
+        for doc in 0..50_023 {
+            let terms = "alpha ".repeat(1 + doc % 3)
+                + &"beta ".repeat(1 + (doc / 3) % 5)
+                + &"gamma ".repeat(1 + (doc / 15) % 7)
+                + &"delta ".repeat(1 + (doc / 105) % 2);
+            writer.add_document(doc!(id => doc.to_string(), text => terms))?;
+            if doc == 24_999 {
+                writer.commit()?;
+            }
+        }
+        writer.commit()?;
+        let reader = index.reader()?;
+        let query = BooleanQuery::intersection(
+            ["alpha", "beta", "gamma", "delta"]
+                .into_iter()
+                .map(|term| {
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(text, term),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>
+                })
+                .collect(),
+        );
+        for with_deletes in [false, true] {
+            let searcher = reader.searcher();
+            assert_eq!(
+                searcher.num_docs(),
+                50_023 - if with_deletes { 64 } else { 0 }
+            );
+            assert_eq!(searcher.segment_readers().len(), 2);
+            let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let mut expected = Vec::new();
+            for (ord, segment) in searcher.segment_readers().iter().enumerate() {
+                let mut scorer = weight.scorer(segment, 1.0)?;
+                while scorer.doc() != TERMINATED {
+                    let doc = scorer.doc();
+                    if segment
+                        .alive_bitset()
+                        .is_none_or(|alive| alive.is_alive(doc))
+                    {
+                        expected.push((scorer.score(), DocAddress::new(ord as u32, doc)));
+                    }
+                    scorer.advance();
+                }
+            }
+            expected.sort_by(|(score_a, doc_a), (score_b, doc_b)| {
+                score_b.total_cmp(score_a).then_with(|| doc_a.cmp(doc_b))
+            });
+            for (offset, limit) in [(0, 1), (0, 10), (500, 500), (9_500, 500), (0, 10_000)] {
+                let actual = searcher.search(
+                    &query,
+                    &TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_score(),
+                )?;
+                assert_eq!(actual.len(), limit);
+                for ((score, doc), (expected_score, expected_doc)) in
+                    actual.iter().zip(&expected[offset..offset + limit])
+                {
+                    assert_eq!(doc, expected_doc);
+                    assert_eq!(score.to_bits(), expected_score.to_bits());
+                }
+            }
+            if !with_deletes {
+                for (_, address) in expected.iter().take(64) {
+                    let document: crate::TantivyDocument = searcher.doc(*address)?;
+                    let value = document.get_first(id).unwrap().as_str().unwrap();
+                    writer.delete_term(Term::from_field_text(id, value));
+                }
+                writer.commit()?;
+                reader.reload()?;
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_top_n_heap_zero_capacity() {
