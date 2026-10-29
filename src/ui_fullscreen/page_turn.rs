@@ -43,6 +43,8 @@ mod roi_tests;
 mod slideshow_regression_tests;
 #[cfg(test)]
 mod spine_budget_tests;
+#[cfg(test)]
+mod wait_indicator_tests;
 use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
 
 static NEXT_OPERATION_BATCH: AtomicU64 = AtomicU64::new(1);
@@ -1503,6 +1505,32 @@ impl App {
     /// Existing accepted output, never CPU readiness or a newly registered
     /// texture, authorizes background work for the following unit.
     pub(crate) fn page_turn_current_unit_presented(&self) -> bool {
+        self.page_turn_presented_current_unit().is_some()
+    }
+
+    /// Presentation can show the target before its canonical flat retires the
+    /// navigation sequence. This fact changes only the wait indicator.
+    pub(super) fn fs_navigation_target_presented_by_page_turn(&self) -> bool {
+        let Some(FsNavigationSequenceTarget::Display(target)) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| &sequence.target)
+        else {
+            return false;
+        };
+        target.items_generation == self.items_generation
+            && self.fullscreen_idx == Some(target.anchor_idx)
+            && self.page_turn_presented_current_unit().is_some_and(|unit| {
+                target.pages().iter().all(|idx| {
+                    unit.pages.iter().any(|page| {
+                        page.occurrence == SpreadPageOccurrence::navigation(*idx, target.anchor_idx)
+                    })
+                })
+            })
+    }
+
+    fn page_turn_presented_current_unit(&self) -> Option<&PaintedUnit> {
         let unit = match &self.page_turn_presentation.state {
             PresentationState::Flat(unit) if unit.evidence.was_accepted() => unit,
             PresentationState::Turning {
@@ -1513,9 +1541,9 @@ impl App {
             PresentationState::Completing { incoming, .. } if incoming.evidence.was_accepted() => {
                 incoming
             }
-            _ => return false,
+            _ => return None,
         };
-        unit.destination == self.page_turn_destination()
+        (unit.destination == self.page_turn_destination()
             && unit.items == self.items_generation
             && unit.mode == self.spread_mode
             && unit.slice == self.fullscreen_page_slice
@@ -1524,7 +1552,8 @@ impl App {
                 unit.pages
                     .iter()
                     .any(|page| page.occurrence.navigation_anchor_idx == idx)
-            })
+            }))
+        .then_some(unit)
     }
 
     /// Accepted output evidence is independent of current cache quality. Match

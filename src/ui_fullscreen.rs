@@ -4381,17 +4381,18 @@ fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time
 /// Whether the accepted navigation target has not yet been presented long enough to explain the
 /// visible holdover to the user.
 ///
-/// The navigation sequence is the presentation fact: it is retired only after every page in the
-/// target display unit was painted live. Its own lifetime supplies the UX-delay anchor, independent
-/// of whether decode has completed and presentation is waiting on a later pipeline stage.
+/// The navigation sequence is retired only after every target page was painted live in canonical
+/// flat output. Accepted page-turn output can already show that unit while the sequence remains
+/// active. Otherwise its lifetime supplies the UX-delay anchor, independent of decode readiness.
 fn fs_page_wait_indicator_visible(
     processing_status_visible: bool,
+    target_presented_by_page_turn: bool,
     holdover: Option<&FsHoldover>,
     current_idx: usize,
     items_generation: u64,
     now: std::time::Instant,
 ) -> bool {
-    if !processing_status_visible {
+    if !processing_status_visible || target_presented_by_page_turn {
         return false;
     }
     let Some(sequence) = holdover
@@ -28856,11 +28857,12 @@ impl App {
                         // ── 移動先ページ未提示インジケーター ──
                         // NavigationSequence は target display unit の全ページが live に描かれた
                         // frame で上の emit_fs_page_turn_ready_for_display_unit が破棄する。したがって
-                        // sequence 自身の未 retire 時間だけで判定し、decode pending の有無には
-                        // 結び付けない。decode 済みでも upload / presentation 待ちは起こり得る。
+                        // 演出 owner がすでに target unit を提示していれば表示しない。それ以外は
+                        // sequence の未 retire 時間で判定する。decode pending の有無には結び付けない。
                         if similar_preview_presentation.is_none()
                             && fs_page_wait_indicator_visible(
                             self.settings.fullscreen_processing_status_visible,
+                            self.fs_navigation_target_presented_by_page_turn(),
                             self.fs_holdover_tex.as_ref(),
                             paint_idx,
                             self.items_generation,
@@ -63191,6 +63193,7 @@ mod tests {
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(!fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -63205,6 +63208,7 @@ mod tests {
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -63224,12 +63228,15 @@ mod tests {
         let now = opened_at + std::time::Duration::from_secs(1);
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&presenting),
             7,
             3,
             now,
         ));
-        assert!(!fs_page_wait_indicator_visible(true, None, 7, 3, now));
+        assert!(!fs_page_wait_indicator_visible(
+            true, false, None, 7, 3, now
+        ));
     }
 
     #[test]
@@ -63243,6 +63250,7 @@ mod tests {
         );
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -63251,11 +63259,30 @@ mod tests {
     }
 
     #[test]
+    fn page_wait_indicator_hides_for_presented_page_turn_target_with_sequence_still_active() {
+        let opened_at = std::time::Instant::now();
+        let holdover = page_wait_navigation_sequence(
+            opened_at,
+            3,
+            vec![7, 8],
+            navigation_presenting(vec![7, 8], FsNavigationPresentation::Materialized),
+        );
+        let now = opened_at + std::time::Duration::from_secs(1);
+        for presented in [false, true] {
+            assert_eq!(
+                fs_page_wait_indicator_visible(true, presented, Some(&holdover), 7, 3, now),
+                !presented,
+            );
+        }
+    }
+
+    #[test]
     fn page_wait_indicator_respects_processing_status_setting() {
         let opened_at = std::time::Instant::now();
         let holdover =
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(!fs_page_wait_indicator_visible(
+            false,
             false,
             Some(&holdover),
             7,
@@ -63269,6 +63296,7 @@ mod tests {
         let opened_at = std::time::Instant::now();
         assert!(!fs_page_wait_indicator_visible(
             true,
+            false,
             None,
             7,
             3,

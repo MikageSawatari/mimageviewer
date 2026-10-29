@@ -6579,3 +6579,34 @@ Previous の先回り。これらは段階 A と同じく、resident な最上�
 
 Bの不足を理由とする新しい待機・演出省略は加えない。受理済み素材、held resource、canonical receiptを品質公開で差し替えない。
 表示引取り時に残るGPU登録コストを含む性能確認と利用者実機確認は未完了である。
+
+### 28.6 めくり終盤の「読み込み中」バッジ（§1.601、2026-10-29、実装済み・実機未確認）
+
+- 原因: navigation sequence は全 target 頁の Live な canonical flat 採用まで残る（§16.2）。
+  600ms の演出では 500ms のバッジ遅延を先に超えるため、incoming unit が演出で見えていても旧頁の待機として表示していた。
+  ClaudeCode の隔離実機観測（HEAD `a41744e6d`）の時刻とコードの条件が一致する。出荷済みの経路であり、このブランチの新規退行ではない。
+- 判断: sequence 完了条件と履歴・類似本確定・次操作の barrier は変えない。バッジだけに
+  `fs_navigation_target_presented_by_page_turn` の読取り専用の事実を加える。既存の現 unit 提示判定と helper を共用し、
+  context／destination、items 世代、mode、slice、layout Arc、現在 anchor を照合したうえで、sequence の世代・anchor・全 Navigation occurrence を照合する。
+  accepted Flat／Running Turning／accepted Completing は提示済み、Offered／未採用の時計・出力／Inactive／別 unit は対象外。
+  新 state・待機・delay 変更は不要。既存 owner から導出する方が単純で、モーダル化や操作制限を加える理由もない。
+- 終端経路: 自然終了は Completing で canonical flat を提出し、採用後に observer が sequence を退役させて Flat へ進む。
+  thumbnail 等で全 Live が揃わず sequence が残っても、accepted incoming を提示中はバッジを出さない。
+  Turning の取消（次操作／focus／hidden／loupe／不適格表示）は incoming を Completing に保持するため、受理済みなら同様。
+  Offered の取消は旧 Flat へ戻るため現在 target と一致せず従来の待機表示を保つ。設定変更は新 acceptance evidence で未提示を扱う。
+  source／geometry／binding の変更は新 Flat の採用または Inactive への退役を通り、非提示なら通常のバッジ判定に戻る。
+  close／no-page／disabled の Inactive も抑制しない。継続操作は従来どおり canonical 採用と sequence 退役を待つ。
+  F12 も共通描画箇所の判定を使い、detached 述語・viewport 経路は変更しない。
+- テスト: 純関数で 1 秒経過・sequence 残存でも演出提示時だけ非表示を検査する。実 renderer と TestClock で
+  単頁／LTR／RTL の 600ms turn の Offered、550ms の Running、着地 Completing、canonical 採用後の sequence 退役を検査する。
+  見開きの片頁不足、別 anchor、取消、設定変更、Inactive、非 Live の accepted Flat／未採用 Flat、Offered 取消後の旧頁も対象。
+  回帰は純関数 1 件＋状態遷移 3 件を追加した。
+- 自動検証（同 HEAD の未コミット差分、通常 feature／test profile）:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/page_wait|page_turn/)' --no-fail-fast` は 307/307 成功（31.638 秒）。
+  `cargo test --test ui_snapshot` は 213/213 成功（30.20 秒、基準画像の更新なし）。
+  `scripts/test-lib-full.ps1` は 14,658/14,658 成功・既存除外 65 件（511.553 秒、失敗なし、単独再実行なし）。
+  旧バッジ判定へ一時的に戻すと 600ms 回帰 1 件が 550ms の非表示 assertion で失敗し、復元後は上記全件が成功した。
+  最後に引数なしの `cargo fmt` と `cargo fmt --check` が成功。独立レビューの未解決指摘なし。
+  `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` も成功し、通常 profile の core／remote／EPUB worker と PE 依存検査を確認した（起動なし）。
+  関連／snapshot／旧判定ログは `target/pageturn-1601/`、全件ログは
+  `target/test-lib-full/runs/20261029T002045970Z-8ce4195f/`。実アプリの起動・実機確認は未実施。
