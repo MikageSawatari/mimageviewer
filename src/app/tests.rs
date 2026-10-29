@@ -45,6 +45,9 @@ mod thumbnail_request_lifecycle;
 #[path = "tests/section1328_session.rs"]
 mod section1328_session;
 
+#[path = "tests/history_parent_1473.rs"]
+mod history_parent_1473;
+
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
 
