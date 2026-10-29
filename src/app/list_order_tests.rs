@@ -2,6 +2,10 @@ use super::tests::phase_c_support::setup_app;
 use super::*;
 use top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
 
+#[cfg(test)]
+#[path = "list_order_ratingnav649_tests.rs"]
+mod ratingnav649;
+
 fn install_rows(app: &mut App, folder: &Path, rows: Vec<GridItem>) {
     app.current_folder = Some(folder.to_path_buf());
     app.archive_source_override = None;

@@ -25,6 +25,11 @@ use crate::collection_store::{
     CollectionPreparedSnapshot, CollectionStoreError, prepare_collection_snapshot,
 };
 
+#[cfg(test)]
+thread_local! {
+    static GRID_CONTAINER_OPEN_ACCEPT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Offscreen Collection history preparation. The currently mounted surface and rows are owned
 /// by the caller until `Ready` has been validated and explicitly adopted.
 pub(crate) struct CollectionHistoryPrepare {
@@ -1368,6 +1373,49 @@ impl App {
                     CollectionGridPhysicalLoadOrigin::PhysicalSource { .. }
                 )
             })
+    }
+
+    /// Enter and pointer activation share the main-grid container admission effects.
+    /// Callers retain their input guards, stack/detached-book routing and pointer-only drill-in.
+    /// ZIP/PDF effects remain owned by GridVirtual and commit at visible adoption.
+    pub(crate) fn accept_grid_container_open(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        let (path, folder) = match self.items.get(index)? {
+            GridItem::Folder(path) => (path.clone(), true),
+            GridItem::ZipFile(path) | GridItem::PdfFile(path) => (path.clone(), false),
+            _ => return None,
+        };
+        #[cfg(test)]
+        GRID_CONTAINER_OPEN_ACCEPT_COUNT.with(|count| count.set(count.get() + 1));
+        let auto_fullscreen = self.should_auto_fullscreen_grid_container(index);
+        #[cfg(windows)]
+        if auto_fullscreen && !self.park_active_detached_context_for_new_grid_open(ctx, index) {
+            return None;
+        }
+        if self.begin_smart_grid_container_navigation(
+            index,
+            path.clone(),
+            auto_fullscreen,
+            super::StartupListIntent::container_open(auto_fullscreen),
+        ) {
+            return None;
+        }
+        if folder {
+            self.note_reading_history_open(index);
+            self.maybe_suppress_rating_filter_for_opened_container(index);
+            if auto_fullscreen {
+                self.pending_auto_fs_open = true;
+            }
+        }
+        Some(self.grid_physical_navigation(index, path, auto_fullscreen))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_grid_container_open_accept_count_for_test(&self) -> usize {
+        GRID_CONTAINER_OPEN_ACCEPT_COUNT.with(|count| count.replace(0))
     }
 
     pub(crate) fn grid_physical_navigation(

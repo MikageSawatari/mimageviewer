@@ -58131,28 +58131,10 @@ impl App {
                         return None;
                     }
                     match self.items.get(idx) {
-                        Some(GridItem::Folder(p))
-                        | Some(GridItem::ZipFile(p))
-                        | Some(GridItem::PdfFile(p)) => {
-                            // 環境設定 ON のとき ZIP/PDF、または画像だけの通常フォルダは
-                            // ページ一覧を経由せずフルスクリーンで開く。
-                            let p = p.clone();
-                            let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                            #[cfg(windows)]
-                            if auto_fs
-                                && !self.park_active_detached_context_for_new_grid_open(ctx, idx)
-                            {
-                                return None;
-                            }
-                            if self.begin_smart_grid_container_navigation(
-                                idx,
-                                p.clone(),
-                                auto_fs,
-                                crate::app::StartupListIntent::container_open(auto_fs),
-                            ) {
-                                return None;
-                            }
-                            return Some(self.grid_physical_navigation(idx, p, auto_fs));
+                        Some(GridItem::Folder(_))
+                        | Some(GridItem::ZipFile(_))
+                        | Some(GridItem::PdfFile(_)) => {
+                            return self.accept_grid_container_open(ctx, idx);
                         }
                         Some(GridItem::Video(p)) if external_player_video => {
                             crate::ui_helpers::open_external_player(p);

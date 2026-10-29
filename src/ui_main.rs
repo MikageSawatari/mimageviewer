@@ -24,6 +24,87 @@ use crate::settings::{
     GridClickSelectionMode, GridViewMode,
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
+
+// Headless pointer entry shared by the rating/list-order investigation tests.
+#[cfg(test)]
+pub(crate) fn ratingnav649_double_click_for_test(app: &mut App, idx: usize) -> AddressBarNav {
+    ratingnav649_pointer_open_for_test(app, idx, false)
+        .expect("physical double-click must reach the grid open handler")
+}
+
+#[cfg(test)]
+pub(crate) fn ratingnav649_pointer_open_for_test(
+    app: &mut App,
+    idx: usize,
+    simultaneous_secondary_release: bool,
+) -> Option<AddressBarNav> {
+    let ctx = egui::Context::default();
+    let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 120.0));
+    let pos = rect.center();
+    let mut nav = None;
+    for (frame, pressed) in [None, Some(true), Some(false), Some(true), Some(false)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if let Some(pressed) = pressed {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        if frame == 4 && simultaneous_secondary_release {
+            for pressed in [true, false] {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(460.0, 200.0),
+            )),
+            time: Some(frame as f64 * 0.02),
+            events,
+            ..Default::default()
+        });
+        app.begin_grid_click_input_frame(&ctx);
+        let suppress = app.begin_grid_right_drag_primary_frame(&ctx);
+        let pairing = app.begin_grid_primary_click_frame(
+            &ctx,
+            !suppress && ctx.input(|input| input.pointer.primary_clicked()),
+        );
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                if let Some(request) = app.handle_cell_interaction(
+                    ui,
+                    &ctx,
+                    rect,
+                    idx,
+                    &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
+                    false,
+                    suppress,
+                    pairing,
+                    None,
+                ) {
+                    assert!(nav.is_none(), "one double-click must produce one open");
+                    nav = Some(request);
+                }
+            });
+        });
+        ctx.end_pass().drop_without_applying_deltas();
+        if frame < 4 {
+            assert!(nav.is_none(), "selection/press alone must not open");
+        }
+    }
+    nav
+}
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
 use crate::wheel_input::consume_wheel_input;
 
@@ -16943,46 +17024,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         self.note_reading_history_open(idx);
                         self.drill_into_subfolder(p);
                     } else {
-                        let p = p.clone();
-                        let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                        #[cfg(windows)]
-                        if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx)
-                        {
+                        let Some(next_nav) = self.accept_grid_container_open(ctx, idx) else {
                             return nav;
-                        }
-                        if self.begin_smart_grid_container_navigation(
-                            idx,
-                            p.clone(),
-                            auto_fs,
-                            crate::app::StartupListIntent::container_open(auto_fs),
-                        ) {
-                            return nav;
-                        }
-                        self.note_reading_history_open(idx);
-                        self.maybe_suppress_rating_filter_for_opened_container(idx);
-                        if auto_fs {
-                            self.pending_auto_fs_open = true;
-                        }
-                        nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
+                        };
+                        nav = Some(next_nav);
                     }
                 }
-                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_)) => {
                     // Folder 分岐とは global_search drill-in 判定が違うためここは別のまま。
-                    let p = p.clone();
-                    let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                    #[cfg(windows)]
-                    if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
+                    let Some(next_nav) = self.accept_grid_container_open(ctx, idx) else {
                         return nav;
-                    }
-                    if self.begin_smart_grid_container_navigation(
-                        idx,
-                        p.clone(),
-                        auto_fs,
-                        crate::app::StartupListIntent::container_open(auto_fs),
-                    ) {
-                        return nav;
-                    }
-                    nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
+                    };
+                    nav = Some(next_nav);
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::Audio(_))
