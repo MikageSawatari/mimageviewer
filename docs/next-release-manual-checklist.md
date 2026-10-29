@@ -1,29 +1,34 @@
 # 次の版 利用者の実機確認チェックリスト
 
-2026-10-29 作成。並行ブランチごとに、ClaudeCode が隔離データで確かめた範囲を除き、
-**利用者の実機で見てほしい点**をまとめた。各ブランチはまだ master に入っていない。
-確認が済んだ項目は、各ブランチの backlog に観測者付きで記録する (ClaudeCode が転記する)。
+2026-10-29 作成。ClaudeCode が隔離データで確かめた範囲を除き、**利用者の実機で見てほしい点**をまとめた。
+下の 8 本 (機能 7 本と依存物の更新) は、2026-10-29 にすべて master へ merge 済み。
+master の全件テスト (`test-full`) は成功している。確認は master の確認用ビルド 1 本で行える。
+確認が済んだ項目は、backlog に観測者付きで記録する (ClaudeCode が転記する)。
 
-## 起動のしかた (共通)
+## 起動のしかた
 
 - 確認用ビルドは **通常の `%APPDATA%\mimageviewer` の設定・データを更新し得る**。
   インストール版・常駐 tray 版を終了してから起動する (single-instance を共有するため)。
 - 設定を汚したくないときは、末尾に `--data-dir <空のフォルダ>` を付ければ隔離データで起動できる
   (ただしタグ・索引・本の設定など、普段のデータは見えない)。
-- 2 つのブランチを同時には起動しない。
+- 依存物の更新 (検索の索引の版など) も入っているので、確認前に `%APPDATA%\mimageviewer\fts_index` をコピーしておくと安心 (8 節)。
 
-| ブランチ | 内容 | 起動コマンド |
-| --- | --- | --- |
-| pageturn-1461-1457 | ページめくり (通常フォルダ・編集の反映) | `Start-Process -FilePath G:\home\mimageviewer-pageturn\target\dev-runtime\mimageviewer-core.exe` |
-| keyzoom-1470 | キーズーム・Ctrl+Space ズーム・消しゴムの Tab プレビュー | `Start-Process -FilePath G:\home\mimageviewer-keyzoom\target\dev-runtime\mimageviewer-core.exe` |
-| clip-edited-1261 | 編集を反映した画像のコピー | `Start-Process -FilePath G:\home\mimageviewer-clipedit\target\dev-runtime\mimageviewer-core.exe` |
-| autotrim-1216 | 自動余白カットの全体既定 | `Start-Process -FilePath G:\home\mimageviewer-autotrim\target\dev-runtime\mimageviewer-core.exe` |
-| list-ui-1456-223 | 一覧の名前の大きさ・行数、タグの並べ替え | `Start-Process -FilePath G:\home\mimageviewer-listui\target\dev-runtime\mimageviewer-core.exe` |
-| fs-compare-1079-1458 | 比較中の元画像表示、見開きの編集開始側 | `Start-Process -FilePath G:\home\mimageviewer-fsview\target\dev-runtime\mimageviewer-core.exe` |
-| deps-update-1460 | 依存物の更新 (AI・PDF・RAW・検索・EffeTune) | `Start-Process -FilePath G:\home\mimageviewer-deps\target\dev-runtime\mimageviewer-core.exe` (2026-10-29 11:13 に最新で作り直し済み。下の節の注意を参照) |
-| video-overflow-1105 | 動画の「…」とデインターレース、動画の終端・コマ送り | `Start-Process -FilePath G:\home\mimageviewer-deinterlace\target\dev-runtime\mimageviewer-core.exe` |
+リポジトリのルートで次を実行する。
 
-ビルドはどれも、そのブランチの最新のコードを含んでいる (2026-10-29 時点で照合)。
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+| 節 | 内容 (元のブランチ) |
+| --- | --- |
+| 2 | ページめくり (pageturn-1461-1457) |
+| 3 | キーズーム・Ctrl+Space ズーム・消しゴムの Tab プレビュー (keyzoom-1470) |
+| 4 | 編集を反映した画像のコピー (clip-edited-1261) |
+| 5 | 自動余白カットの全体既定 (autotrim-1216) |
+| 6 | 一覧の名前の大きさ・行数、タグの並べ替え (list-ui-1456-223) |
+| 7 | 比較中の元画像表示、見開きの編集開始側 (fs-compare-1079-1458) |
+| 8 | 依存物の更新 (deps-update-1460) |
+| 9 | 動画の「…」とデインターレース、動画の終端・コマ送り (video-overflow-1105) |
 
 ---
 
