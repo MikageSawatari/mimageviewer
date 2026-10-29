@@ -83,8 +83,10 @@ fn composite_pixels_revision_final_pair_navigation_capture_survives_retained_cpu
 pub(crate) fn seed_annotation(app: &mut App, source_dims: [usize; 2]) {
     // A filled bubble needs no font or stamp I/O, but uses the real annotation compositor.
     app.comic_font_registry_loaded = true;
-    app.comic_fonts_loaded = true;
-    app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(comic_core::FontSet::new())),
+        Default::default(),
+    );
     let bubble = comic_core::BubbleObject {
         shape: comic_core::BubbleShape::RoundRect {
             half_w: source_dims[0] as f32 / 4.0,

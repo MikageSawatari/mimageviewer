@@ -360,6 +360,24 @@ pub struct CreativeLutLibrary {
 
 impl CreativeLutLibrary {
     #[cfg(test)]
+    pub(crate) fn controlled_load_for_test(
+        entries: &[CreativeLutEntry],
+    ) -> (
+        Self,
+        mpsc::Sender<Vec<(Uuid, Result<CubeLutParams, String>)>>,
+    ) {
+        let signature = entry_signature(entries);
+        let (tx, rx) = mpsc::channel();
+        (
+            Self {
+                signature: signature.clone(),
+                pending: Some(LoadBatch { signature, rx }),
+                ..Self::default()
+            },
+            tx,
+        )
+    }
+    #[cfg(test)]
     pub(crate) fn from_builtin_for_test(builtin: BuiltinCreativeLut) -> Self {
         Self {
             loaded: Arc::new(HashMap::from([(

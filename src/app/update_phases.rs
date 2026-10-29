@@ -188,7 +188,9 @@ impl App {
             .creative_lut_library
             .poll(&self.settings.creative_luts, ctx)
         {
-            self.clear_all_final_pipeline_caches();
+            self.clear_all_final_pipeline_caches(
+                crate::app::FinalPipelineInvalidation::CreativeLutLoaded,
+            );
             #[cfg(windows)]
             self.sync_native_video_grade();
         }
@@ -528,6 +530,7 @@ impl App {
         self.poll_local_adjust_render(ctx);
         self.poll_local_adjust_layer_bypass_preview(ctx);
         self.poll_local_adjust_prefix_preview(ctx);
+        self.comic_fonts.poll();
         self.poll_all_page_edit_producers(ctx);
         #[cfg(test)]
         super::egui037_connection_tests::observe("media_after", self, ctx);
@@ -1998,8 +2001,10 @@ impl App {
                     self.evict_final_pipeline_cache(fs_idx);
                 }
                 if let Some(other) = spread_other {
+                    self.resolve_prepared_edit_for_display(ctx, other);
                     self.maybe_start_local_adjust_render(other);
                 }
+                self.resolve_prepared_edit_for_display(ctx, fs_idx);
                 self.maybe_start_local_adjust_render(fs_idx);
                 if let Some(keep_set) = continuous_keep_set.as_ref() {
                     self.evict_adjustment_cache_for_keep_set(keep_set);

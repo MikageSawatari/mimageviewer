@@ -233,10 +233,7 @@ impl App {
     /// 編集用追加パックの導入完了直後に呼ばれ、フォント等のキャッシュを無効化する。
     /// 次回ベイク時に追加パックのフォントを含む FontSet が読み直される。
     fn on_editing_addon_installed(&mut self) {
-        self.comic_fonts = None;
-        self.comic_fonts_loaded = false;
-        self.comic_loaded_font_keys.clear();
-        self.comic_font_registry_loaded = false; // 新 pack のフォントを再列挙させる
+        self.invalidate_comic_fonts(crate::app::comic_fonts::FontInvalidation::SourcesChanged);
         // フォントソースが変わったので見本 / オノマトペプレビュー + 焼き済み注釈
         // (comic_cache) も無効化する。bump しないと表示中ページが旧フォントのまま
         // 残る (Codex P2)。

@@ -3,6 +3,11 @@ use super::final_prepare_cpu::{FinalPrepareReservation, FinalPrepareUnit, FinalP
 use super::*;
 use crate::ui_fullscreen::{FinalUnitPosition, NextFinalUnitDemand};
 
+pub(super) fn next_final_prepare_request_id() -> u64 {
+    static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+    NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(super) enum FinalEffectOrigin {
     LegacyDisplay,
     LegacyPrefetch,
@@ -41,16 +46,23 @@ pub(super) enum FinalEffectReceiver {
         rx: mpsc::Receiver<PreparedFinalPixels>,
         _reservation: Arc<FinalPrepareReservation>,
     },
+    Edited {
+        input: Arc<super::prepared_edit::PreparedEditInput>,
+        rx: mpsc::Receiver<super::prepared_edit::PreparedEditPixels>,
+        _reservation: Arc<FinalPrepareReservation>,
+    },
 }
 
 pub(super) enum FinalEffectState {
     Computing(FinalEffectReceiver),
     CpuReady(FinalEffectReady),
+    Registering(super::prepared_edit::PreparedEditRegistration),
 }
 
 pub(super) enum FinalEffectReady {
     Legacy(FinalCompositeResult),
     Prepared(PreparedFinalPixels),
+    Edited(super::prepared_edit::PreparedEditPixels),
 }
 
 pub(super) struct PreparedFinalPixels {
@@ -67,16 +79,46 @@ pub(super) enum PreparedFinalDisplay {
     Handled(Option<egui::TextureHandle>),
 }
 
+/// Mutually exclusive, complete resident inputs. Stage display fallback is not
+/// evidence that all edits have completed, and must never become a final input.
+enum ResidentFinalPrepareInput {
+    AfterAi {
+        key: EditResultKey,
+        pixels: Arc<egui::ColorImage>,
+        source_size: [usize; 2],
+        used_upscale: bool,
+    },
+    ResidentEdited {
+        key: EditResultKey,
+        pixels: Arc<egui::ColorImage>,
+    },
+    Unedited {
+        key: EditResultKey,
+        pixels: Arc<egui::ColorImage>,
+    },
+}
+
 impl FinalEffectState {
+    pub(super) fn edit_input(&self) -> Option<&super::prepared_edit::PreparedEditInput> {
+        match self {
+            Self::Computing(FinalEffectReceiver::Edited { input, .. }) => Some(input),
+            Self::CpuReady(FinalEffectReady::Edited(ready)) => Some(&ready.input),
+            Self::Registering(registration) => Some(&registration.ready.input),
+            _ => None,
+        }
+    }
     /// Receipt changes only the existing owner. It never selects a display source.
     pub(super) fn receive(&mut self) -> Result<(), mpsc::TryRecvError> {
         let ready = match self {
-            Self::CpuReady(_) => return Ok(()),
+            Self::CpuReady(_) | Self::Registering(_) => return Ok(()),
             Self::Computing(FinalEffectReceiver::Legacy(rx)) => {
                 FinalEffectReady::Legacy(rx.try_recv()?)
             }
             Self::Computing(FinalEffectReceiver::Prepared { rx, .. }) => {
                 FinalEffectReady::Prepared(rx.try_recv()?)
+            }
+            Self::Computing(FinalEffectReceiver::Edited { rx, .. }) => {
+                FinalEffectReady::Edited(rx.try_recv()?)
             }
         };
         *self = Self::CpuReady(ready);
@@ -145,7 +187,11 @@ impl App {
         if self.comic_pages.contains(&idx) || self.comic_demo_enabled {
             return None;
         }
-        let (edit_key, pixels) = self.resident_final_prepare_input(idx)?;
+        let (edit_key, pixels) = match self.resident_final_prepare_input(idx)? {
+            ResidentFinalPrepareInput::ResidentEdited { key, pixels }
+            | ResidentFinalPrepareInput::Unedited { key, pixels } => (key, pixels),
+            ResidentFinalPrepareInput::AfterAi { .. } => return None,
+        };
         let params = self.effective_params(idx);
         if !params.is_color_identity()
             || params.effective_smart_sharpen(false) != 0
@@ -174,8 +220,7 @@ impl App {
         }
         // The shared-allocation eligibility is established by this producer;
         // its semantic owner is the accepted edit input, never an ID lookup.
-        let _ = self.shared_source_texture_for_edit(ctx, &edit_key, &pixels)?;
-        self.source_material_for_idx(idx)
+        self.shared_resident_texture_for_edit(ctx, &edit_key, &pixels)
     }
 
     pub(crate) fn resident_final_prepare_texture(
@@ -187,7 +232,7 @@ impl App {
             .map(|resource| resource.source_texture().clone())
     }
 
-    fn final_prepare_wake(&self, ctx: &egui::Context) -> FinalPrepareWake {
+    pub(super) fn final_prepare_wake(&self, ctx: &egui::Context) -> FinalPrepareWake {
         FinalPrepareWake {
             ctx: ctx.clone(),
             viewport: self.page_turn_destination().viewport,
@@ -199,45 +244,131 @@ impl App {
         key: FinalCompositeKey,
         pending: &FinalEffectPending,
     ) -> bool {
-        !pending.cancel.load(Ordering::Relaxed)
-            && pending.items_generation == self.items_generation
-            && self.edit_key_describes_current_page(&key.edit_key, key.edit_key.idx)
-            && key
-                == self.final_composite_key_for_pixels(
-                    self.current_edit_result_key(key.edit_key.idx),
-                    pending.source_size,
-                    self.effective_params(key.edit_key.idx),
-                )
-            && pending.origin.unit().is_none_or(|unit| {
-                // Binding is the payload identity, not its temporary host/viewport.
-                // F12 transfers this owner; fork creates an empty pending map.
-                unit.context == self.projected_viewer_context_id()
-                    && unit.items_generation == self.items_generation
-                    && unit.pages.iter().any(|page| page.idx == key.edit_key.idx)
-            })
+        self.validate_final_prepare_pending(key, pending).is_ok()
+    }
+
+    pub(super) fn validate_final_prepare_identity(
+        &self,
+        key: EditResultKey,
+    ) -> Result<(), PreparedEditReject> {
+        if key.items_generation != self.items_generation {
+            return Err(PreparedEditReject::ItemsGeneration);
+        }
+        if !self.edit_key_describes_current_page(&key, key.idx) {
+            return Err(PreparedEditReject::ItemIdentity);
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_final_prepare_pending(
+        &self,
+        key: FinalCompositeKey,
+        pending: &FinalEffectPending,
+    ) -> Result<(), PreparedEditReject> {
+        if pending.cancel.load(Ordering::Relaxed) {
+            return Err(PreparedEditReject::Cancelled);
+        }
+        if pending.items_generation != self.items_generation {
+            return Err(PreparedEditReject::ItemsGeneration);
+        }
+        if let Some(unit) = pending.origin.unit() {
+            // Binding is payload identity, independent of F12's temporary host.
+            if unit.context != self.projected_viewer_context_id() {
+                return Err(PreparedEditReject::Context);
+            }
+            if unit.items_generation != self.items_generation {
+                return Err(PreparedEditReject::ItemsGeneration);
+            }
+            if !unit.pages.iter().any(|page| page.idx == key.edit_key.idx) {
+                return Err(PreparedEditReject::ItemIdentity);
+            }
+        }
+        if let Some(input) = pending.state.edit_input() {
+            self.validate_prepared_edit_input(input)?;
+            if key != input.key {
+                return Err(PreparedEditReject::CompositeKey);
+            }
+        } else {
+            self.validate_final_prepare_identity(key.edit_key)?;
+        }
+        if key
+            != self.final_composite_key_for_pixels(
+                self.current_edit_result_key(key.edit_key.idx),
+                pending.source_size,
+                self.effective_params(key.edit_key.idx),
+            )
+        {
+            return Err(PreparedEditReject::CompositeKey);
+        }
+        Ok(())
     }
 
     /// No materialization, I/O, texture allocation, mask loading or AI start.
-    fn resident_final_prepare_input(
-        &self,
-        idx: usize,
-    ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
-        if self.fs_entry_is_animated(idx) || self.comic_pages.contains(&idx) {
-            return None;
-        }
-        let key = self.current_edit_result_key(idx);
-        if let Some(edit) = self.edit_result_cache.get(&key) {
-            return Some((key, edit.pixels.clone()));
-        }
-        if self.mask_pages.contains(&idx)
-            || self.local_adjust_pages.contains(&idx)
-            || self.local_adjust_page_layers.contains_key(&idx)
-            || self.conceal_pages.contains(&idx)
+    fn resident_final_prepare_input(&self, idx: usize) -> Option<ResidentFinalPrepareInput> {
+        if self.fs_entry_is_animated(idx)
+            || self.comic_pages.contains(&idx)
+            || self.commit_pending_matches_current_erase_key(idx)
+            || self.current_edit_stage_producer_pending(idx)
         {
             return None;
         }
-        self.current_raw_source_pixels(idx)
-            .map(|pixels| (key, pixels))
+        let key = self.current_edit_result_key(idx);
+        let params = self.effective_params(idx);
+        // An adopted exact AI result already contains its complete adjusted
+        // input. Still wait for any current edit producer, including CpuReady:
+        // its adoption owns invalidation even if it does not advance the key.
+        if let Some((_, ai)) = self.final_ai_cache.iter().find(|(ai_key, ai)| {
+            ai_key.edit_key == key
+                && self.final_ai_key_for_pixels(key, ai.source_size, params) == Some(**ai_key)
+        }) {
+            return Some(ResidentFinalPrepareInput::AfterAi {
+                key,
+                pixels: ai.pixels.clone(),
+                source_size: ai.source_size,
+                used_upscale: ai.used_upscale,
+            });
+        }
+        // Presence-only metadata cannot distinguish inactive layers from a
+        // missing upper stage. Hydration belongs to the existing local owner.
+        if self.local_adjust_pages.contains(&idx)
+            && !self.local_adjust_page_layers.contains_key(&idx)
+        {
+            return None;
+        }
+        if let Some(edit) = self.edit_result_cache.get(&key) {
+            return Some(ResidentFinalPrepareInput::ResidentEdited {
+                key,
+                pixels: edit.pixels.clone(),
+            });
+        }
+        // Each stage is cumulative. Require only the highest active stage,
+        // never its evicted lower inputs, and never fall through a missing
+        // upper stage to a display-only lower fallback.
+        let edited = if self.conceal_pages.contains(&idx)
+            || (self.conceal_mode
+                && self.conceal_preview_active
+                && self.fullscreen_idx == Some(idx))
+        {
+            Some(
+                self.conceal_cache
+                    .get(&idx)
+                    .filter(|entry| entry.generation == self.conceal_generation)?
+                    .pixels
+                    .clone(),
+            )
+        } else if self.has_active_local_adjust_layers(idx) {
+            Some(self.current_local_adjust_pixels(idx)?)
+        } else if self.mask_pages.contains(&idx) {
+            Some(self.current_erase_result_pixels(idx)?)
+        } else {
+            None
+        };
+        if let Some(pixels) = edited {
+            Some(ResidentFinalPrepareInput::ResidentEdited { key, pixels })
+        } else {
+            self.current_raw_source_pixels(idx)
+                .map(|pixels| ResidentFinalPrepareInput::Unedited { key, pixels })
+        }
     }
 
     pub(super) fn final_prepare_plan_from_resident(
@@ -249,26 +380,25 @@ impl App {
         [usize; 2],
         FinalCompositePlan,
     )> {
-        if self.fs_entry_is_animated(idx) || self.comic_pages.contains(&idx) {
-            return None;
-        }
-        let edit_key = self.current_edit_result_key(idx);
         let params = self.effective_params(idx);
         let lut = self.resolved_creative_lut(params);
-        // A completed exact AI result already owns its adjusted input. Neither
-        // hydrate raw/edit material nor apply tone again on the UI thread.
-        if let Some((_, ai)) = self.final_ai_cache.iter().find(|(key, ai)| {
-            key.edit_key == edit_key
-                && self.final_ai_key_for_pixels(edit_key, ai.source_size, params) == Some(**key)
-        }) {
-            return Some((
-                self.final_composite_key_for_pixels(edit_key, ai.source_size, params),
-                ai.pixels.clone(),
-                ai.source_size,
-                build_final_composite_plan_after_ai(params, lut, ai.used_upscale),
-            ));
-        }
-        let (edit_key, pixels) = self.resident_final_prepare_input(idx)?;
+        let (edit_key, pixels) = match self.resident_final_prepare_input(idx)? {
+            ResidentFinalPrepareInput::AfterAi {
+                key,
+                pixels,
+                source_size,
+                used_upscale,
+            } => {
+                return Some((
+                    self.final_composite_key_for_pixels(key, source_size, params),
+                    pixels,
+                    source_size,
+                    build_final_composite_plan_after_ai(params, lut, used_upscale),
+                ));
+            }
+            ResidentFinalPrepareInput::ResidentEdited { key, pixels }
+            | ResidentFinalPrepareInput::Unedited { key, pixels } => (key, pixels),
+        };
         if let Some(ai_key) = self.final_ai_key_for_pixels(edit_key, pixels.size, params) {
             if !self.final_ai_failed.contains(&ai_key) {
                 return None;
@@ -309,9 +439,7 @@ impl App {
             })
             .collect();
         for key in obsolete {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, PreparedEditCancel::DemandObsolete);
         }
         let Some(unit) = demand else {
             return;
@@ -322,6 +450,15 @@ impl App {
         let mut reclaim_attempted = false;
         for page in &unit.pages {
             let idx = page.idx;
+            if self.comic_pages.contains(&idx) {
+                self.request_comic_fonts_for_page(ctx, idx);
+            }
+            if self.prepared_edit_page(idx) {
+                if self.spawn_prepared_edit_job(ctx, idx, unit.clone(), &mut reclaim_attempted) {
+                    return;
+                }
+                continue;
+            }
             if self.exact_complete_final_composite_entry(idx).is_some() {
                 continue;
             }
@@ -452,7 +589,7 @@ impl App {
 
     /// This call performs no adoption/registration or producer work. Only a
     /// reservation-pressure snapshot (at most two units) chooses these owners.
-    fn reclaim_previous_final_results(
+    pub(super) fn reclaim_previous_final_results(
         &mut self,
         units: &[FinalPrepareUnit],
         requester: &FinalPrepareUnit,
@@ -515,6 +652,9 @@ impl App {
                     let location = match &pending.state {
                         FinalEffectState::CpuReady(FinalEffectReady::Prepared(_)) => "cpu_ready",
                         FinalEffectState::Computing(FinalEffectReceiver::Prepared { .. }) => "channel",
+                        FinalEffectState::CpuReady(FinalEffectReady::Edited(_)) => "cpu_ready",
+                        FinalEffectState::Computing(FinalEffectReceiver::Edited { .. }) => "channel",
+                        FinalEffectState::Registering(_) => "registering",
                         _ => continue,
                     };
                     let received = app.final_effect_pending.get_mut(&key).unwrap().state.receive();
@@ -523,9 +663,7 @@ impl App {
                         continue;
                     }
                     // Drop channel, temporary result and pending before retry.
-                    let pending = app.final_effect_pending.remove(&key).unwrap();
-                    pending.cancel.store(true, Ordering::Relaxed);
-                    drop(pending);
+                    app.cancel_final_effect_key(key, PreparedEditCancel::Pressure);
                     app.record_final_cpu_pressure(key, "reclaimed", location, request);
                 }
             });
@@ -573,7 +711,9 @@ impl App {
             .filter_map(|(key, pending)| {
                 (matches!(
                     pending.state,
-                    FinalEffectState::Computing(FinalEffectReceiver::Prepared { .. })
+                    FinalEffectState::Computing(
+                        FinalEffectReceiver::Prepared { .. } | FinalEffectReceiver::Edited { .. }
+                    )
                 ) && matches!(&pending.origin, FinalEffectOrigin::Speculative(unit)
                     if self.final_prepare_unit_position(unit) == Some(FinalUnitPosition::Previous))
                     && self.final_prepare_key_position(*key) == Some(FinalUnitPosition::Previous)
@@ -591,7 +731,7 @@ impl App {
                     .receive(),
                 Err(mpsc::TryRecvError::Empty)
             ) {
-                if let Some(pending) = self.final_effect_pending.remove(&key) {
+                if let Some(pending) = self.final_effect_pending.get(&key) {
                     let request = (
                         pending.gpu_diagnostics.request_id(),
                         pending.gpu_diagnostics.requested_position(),
@@ -599,9 +739,8 @@ impl App {
                     // Publish the cancellation marker before the worker can
                     // observe it and publish actual completion.
                     self.record_final_cpu_pressure(key, "cancelled_for_next", "computing", request);
-                    pending.cancel.store(true, Ordering::Relaxed);
-                    drop(pending); // worker retains permit and its reservation
                 }
+                self.cancel_final_effect_key(key, PreparedEditCancel::NextPriority);
             }
         }
     }
@@ -663,10 +802,10 @@ impl App {
             DISPLAY_IMAGE_TEXTURE_OPTIONS
         };
         if !nearest {
-            if let Some(texture) =
-                self.shared_source_texture_for_edit(ctx, &key.edit_key, &ready.pixels)
+            if let Some(resource) =
+                self.shared_resident_texture_for_edit(ctx, &key.edit_key, &ready.pixels)
             {
-                return Some(texture);
+                return Some(resource.source_texture().clone());
             }
         }
         let edit = self.edit_result_cache.get(&key.edit_key)?;
@@ -764,8 +903,7 @@ impl App {
             }
         };
         let requested_position = requested_position.map_or("unknown", FinalUnitPosition::as_str);
-        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
-        let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        let request_id = next_final_prepare_request_id();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_reservation = reservation.clone();
@@ -936,6 +1074,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> PreparedFinalDisplay {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         let Some(key) = self.final_effect_pending.iter().find_map(|(key, pending)| {
             (key.edit_key.idx == idx
                 && (!pending.origin.is_legacy()
@@ -1000,10 +1139,10 @@ impl App {
                     .get(&key)
                     .map(|entry| entry.texture.clone()),
             );
-        } else if let Some(pending) = self.final_effect_pending.remove(&key) {
+        } else {
             // Receiver removal revokes publication; the worker still owns permit
             // and reservation until it really finishes. Never join on the UI.
-            pending.cancel.store(true, Ordering::Relaxed);
+            self.cancel_final_effect_key(key, PreparedEditCancel::DisplayComputing);
         }
         PreparedFinalDisplay::Continue
     }
@@ -1011,3 +1150,6 @@ impl App {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod resident_edited_tests;

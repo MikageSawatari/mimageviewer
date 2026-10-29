@@ -905,6 +905,14 @@ impl App {
         }
         let mut color_keys = std::collections::HashSet::new();
         let mut adjustment_keys = std::collections::HashSet::new();
+        let diagnostic_frame = self.frame_counter;
+        let diagnostic_pass = if super::prepared_edit::rejection::observing() {
+            self.edit_preview_repaint_ctx
+                .as_ref()
+                .map(egui::Context::current_pass_index)
+        } else {
+            None
+        };
         macro_rules! publish {
             ($state:expr, $default:expr) => {{
                 let state = $state;
@@ -993,6 +1001,19 @@ impl App {
                         });
                     state.final_effect_pending.retain(|key, pending| {
                         if affected.contains(&key.edit_key.idx) {
+                            super::prepared_edit::rejection::record_pending_disposition(
+                                pending,
+                                *key,
+                                PreparedEditDisposition::Cancelled(
+                                    PreparedEditCancel::PipelineInvalidation(
+                                        FinalPipelineInvalidation::AcceptedAdjustment,
+                                    ),
+                                ),
+                                Some(diagnostic_frame),
+                                diagnostic_pass,
+                                std::panic::Location::caller(),
+                                None,
+                            );
                             pending.cancel.store(true, Ordering::Relaxed);
                             false
                         } else {
@@ -2409,6 +2430,7 @@ impl<'a> ContextRef<'a> {
                 similar_panel: &bundle.similar_panel,
                 fs_cache: &bundle.fs_cache,
                 final_composite_cache: &bundle.final_composite_cache,
+                final_effect_pending: &bundle.final_effect_pending,
                 adjustment_cache: &bundle.adjustment_cache,
                 erase_result_cache: &bundle.erase_result_cache,
                 erase_preview_cache: &bundle.erase_preview_cache,
@@ -2722,7 +2744,18 @@ impl ViewerContextBundle {
         if let Some(holdover) = self.fs_holdover_tex.as_mut() {
             holdover.finish_navigation_diagnostic("context_retired");
         }
-        for pending in self.final_effect_pending.values() {
+        for (key, pending) in &self.final_effect_pending {
+            if !pending.cancel.load(Ordering::Relaxed) {
+                super::prepared_edit::rejection::record_pending_disposition(
+                    pending,
+                    *key,
+                    PreparedEditDisposition::Cancelled(PreparedEditCancel::SessionRetired),
+                    None,
+                    None,
+                    std::panic::Location::caller(),
+                    None,
+                );
+            }
             pending.cancel.store(true, Ordering::Relaxed);
         }
 

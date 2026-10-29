@@ -12,6 +12,10 @@ mod cover_tests;
 #[cfg(test)]
 mod coverage_lifecycle_tests;
 #[cfg(test)]
+mod crop_binding_tests;
+#[cfg(all(test, windows))]
+mod crop_order_tests;
+#[cfg(test)]
 mod draw_submit_tests;
 #[cfg(test)]
 mod final_prepare_tests;
@@ -30,6 +34,8 @@ mod nonfinal_tests;
 #[cfg(all(test, windows))]
 mod permission_service_regression_tests;
 #[cfg(test)]
+mod plain_folder_regression_tests;
+#[cfg(test)]
 mod prepare_boundary_tests;
 #[cfg(test)]
 mod roi_tests;
@@ -37,6 +43,8 @@ mod roi_tests;
 mod slideshow_regression_tests;
 #[cfg(test)]
 mod spine_budget_tests;
+#[cfg(test)]
+mod wait_indicator_tests;
 use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
 
 static NEXT_OPERATION_BATCH: AtomicU64 = AtomicU64::new(1);
@@ -270,6 +278,7 @@ pub(crate) fn install(ctx: &egui::Context) {
 
 #[derive(Clone)]
 pub(super) struct PreparedPagedPage {
+    pub(super) crop: Option<crate::export_crop::CropSettings>,
     pub(super) occurrence: SpreadPageOccurrence,
     pub(super) transform: DisplayedImageTransform,
     pub(super) resource: crate::gpu_lanczos::FullscreenPaintPayload,
@@ -787,6 +796,7 @@ struct PaintedUnit {
 /// Quality publication changes source_gen, not the document edits or viewing policy.
 #[derive(Clone, PartialEq)]
 struct PageTurnContent {
+    crop: Option<crate::export_crop::CropSettings>,
     edit: crate::app::EditResultKey,
     params: crate::adjustment::AdjustParams,
     comic_generation: u64,
@@ -888,6 +898,7 @@ impl PaintedUnit {
             && self.pages.len() == other.pages.len()
             && self.pages.iter().zip(&other.pages).all(|(a, b)| {
                 a.occurrence == b.occurrence
+                    && a.crop == b.crop
                     && a.resource.source_texture_id() == b.resource.source_texture_id()
                     && a.resource.paint_texture_id() == b.resource.paint_texture_id()
                     && a.resource.source_generation() == b.resource.source_generation()
@@ -1494,6 +1505,73 @@ impl App {
     /// Existing accepted output, never CPU readiness or a newly registered
     /// texture, authorizes background work for the following unit.
     pub(crate) fn page_turn_current_unit_presented(&self) -> bool {
+        self.page_turn_presented_current_unit().is_some()
+    }
+
+    /// The badge shares this pass's output with the drawn turn/landing, so it
+    /// uses submission identity once motion is Running, or for a flat landing.
+    /// AwaitingAcceptedOutput still holds the old spread at p=0. The navigation
+    /// observer separately requires an accepted canonical flat.
+    pub(super) fn fs_navigation_target_presented_by_page_turn(
+        &self,
+        ctx: &egui::Context,
+        sources: &FsNavigatorTextureSources,
+    ) -> bool {
+        let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+            return false;
+        };
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Turning {
+                incoming,
+                clock: MotionClock::Running { .. },
+                ..
+            }
+            | PresentationState::Completing { incoming, .. } => incoming,
+            // Ordinary flat output belongs to the navigation observer. It
+            // must not conceal a new wait merely because Flat(target) survived.
+            _ => return false,
+        };
+        let SubmittedContentBinding::Presentation(content) = &receipt.binding else {
+            return false;
+        };
+        let Some(FsNavigationSequenceTarget::Display(target)) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| &sequence.target)
+        else {
+            return false;
+        };
+        receipt.frame == ctx.cumulative_frame_nr()
+            && receipt.pass == ctx.cumulative_pass_nr()
+            && receipt.destination == unit.destination
+            && self.page_turn_unit_matches_current(unit)
+            && *content == unit.content
+            && receipt.content_matches(self)
+            && unit.pages.len() == receipt.pages().len()
+            && unit.pages.len() == sources.pages.len()
+            // A running curl may occlude an incoming page. Match the submitted materials,
+            // not canonical visibility/acceptance evidence.
+            && unit.pages.iter().zip(receipt.pages()).zip(&sources.pages).all(
+                |((page, (occurrence, source, paint, _)), selected)| {
+                    page.occurrence == *occurrence
+                        && selected.occurrence == *occurrence
+                        && page.resource.source_texture_id() == *source
+                        && selected.resource.source_texture_id() == *source
+                        && page.resource.paint_texture_id() == *paint
+                        && selected.resource.paint_texture_id() == *paint
+                },
+            )
+            && target.items_generation == self.items_generation
+            && self.fullscreen_idx == Some(target.anchor_idx)
+            && target.pages().iter().all(|idx| {
+                unit.pages.iter().any(|page| {
+                    page.occurrence == SpreadPageOccurrence::navigation(*idx, target.anchor_idx)
+                })
+            })
+    }
+
+    fn page_turn_presented_current_unit(&self) -> Option<&PaintedUnit> {
         let unit = match &self.page_turn_presentation.state {
             PresentationState::Flat(unit) if unit.evidence.was_accepted() => unit,
             PresentationState::Turning {
@@ -1504,8 +1582,12 @@ impl App {
             PresentationState::Completing { incoming, .. } if incoming.evidence.was_accepted() => {
                 incoming
             }
-            _ => return false,
+            _ => return None,
         };
+        self.page_turn_unit_matches_current(unit).then_some(unit)
+    }
+
+    fn page_turn_unit_matches_current(&self, unit: &PaintedUnit) -> bool {
         unit.destination == self.page_turn_destination()
             && unit.items == self.items_generation
             && unit.mode == self.spread_mode
@@ -1845,11 +1927,72 @@ impl App {
         // item identity, effective adjustments and comic content stay binding.
         edit.source_gen = 0;
         PageTurnContent {
+            crop: self.resident_export_crop_for_idx(idx),
             edit,
             params: self.effective_params(idx).clone(),
             comic_generation: self.comic_generation,
             gap: self.settings.spread_page_gap_px,
         }
+    }
+
+    /// The accepted crop owns its legacy resolution, including a basis that is
+    /// still unknown because the raster was too small. Reuse it through normal
+    /// adoption and source-quality publication. Read raw document edits here:
+    /// calling page_turn_content would recursively resolve this same value.
+    pub(crate) fn page_turn_legacy_crop(
+        &self,
+        idx: usize,
+        legacy: crate::export_crop::CropSettings,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let destination = self.page_turn_destination();
+        let matches_unit = |unit: &PaintedUnit| {
+            unit.destination == destination
+                && unit.items == self.items_generation
+                && unit.mode == self.spread_mode
+                && unit.reading_rtl
+                    == (self
+                        .spread_mode
+                        .canonical_reading_direction()
+                        .unwrap_or(self.reading_direction)
+                        == ReadingDirection::Rtl)
+                && unit.slice == self.fullscreen_page_slice
+                && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+        };
+        let content = match &self.page_turn_presentation.state {
+            PresentationState::Offered { outgoing, offer }
+                if matches_unit(outgoing) && offer.fact.destination == destination =>
+            {
+                &offer
+                    .ready_sources
+                    .0
+                    .iter()
+                    .find(|source| source.occurrence.idx == idx)?
+                    .content
+            }
+            PresentationState::Turning { incoming, .. }
+            | PresentationState::Completing { incoming, .. }
+                if matches_unit(incoming) =>
+            {
+                incoming
+                    .pages
+                    .iter()
+                    .zip(&incoming.content)
+                    .find(|(page, _)| page.occurrence.idx == idx)?
+                    .1
+            }
+            _ => return None,
+        };
+        let crop = content.crop?;
+        let mut edit = self.current_edit_result_key(idx);
+        edit.source_gen = 0;
+        (legacy.valid_source_size().is_none()
+            && legacy.rect == crop.rect
+            && legacy.aspect_mode == crop.aspect_mode
+            && content.edit == edit
+            && content.params == *self.effective_params(idx)
+            && content.comic_generation == self.comic_generation
+            && content.gap == self.settings.spread_page_gap_px)
+            .then_some(crop)
     }
 
     /// Resident-only counterpart of ordinary processed + fallback selection.
@@ -1914,6 +2057,20 @@ impl App {
             // Never create the rendition at acceptance.
             self.cached_passthrough_material(idx)
                 .map(|t| (t, "faithful_preview"))
+        } else if let Some(entry) = self.edit_result_cache.get(&edit_key)
+            && let Some(texture) = entry.texture.as_ref()
+        {
+            Some((
+                self.fs_resource_for_accepted_texture(
+                    idx,
+                    texture.clone(),
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    entry.display_basis,
+                ),
+                "edit",
+            ))
+        } else if let Some((material, _, quality)) = self.exact_resident_edit_stage(idx) {
+            Some((material, quality))
         } else {
             self.resolve_original_preview_material(idx)
                 .map(|t| {
@@ -2064,7 +2221,7 @@ impl App {
         ) else {
             return page;
         };
-        if old.occurrence != page.occurrence {
+        if old.occurrence != page.occurrence || old.crop != page.crop {
             return page;
         }
         // Native reuse was already validated by the shared prepare boundary.
@@ -2200,7 +2357,7 @@ impl App {
         let demand =
             composition.presentation_demand(self.spread_mode, crate::page_split::PageSlice::Full);
         if !matches!(
-            self.book_presentation_allowed(&demand),
+            self.book_presentation_target_allowed(&demand),
             crate::book_composition::PresentationDecision::Allowed(allowed)
                 if allowed.len() == demand.len() && allowed.iter().all(|allowed| *allowed)
         ) {
@@ -2436,7 +2593,17 @@ impl App {
         pages: &[PreparedPagedPage],
         white: Option<(egui::Rect, egui::Rect)>,
     ) -> Option<SubmittedUnitReceipt> {
-        self.submit_paged_display_unit_with_clock(ctx, pages, white, presentation_now)
+        self.submit_paged_display_unit_with_flat_crop(ctx, pages, white, FlatCropPaint::WithPage)
+    }
+
+    pub(super) fn submit_paged_display_unit_with_flat_crop(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+        white: Option<(egui::Rect, egui::Rect)>,
+        flat_crop: FlatCropPaint<'_>,
+    ) -> Option<SubmittedUnitReceipt> {
+        self.submit_paged_display_unit_at_crop_phase(ctx, pages, white, flat_crop, presentation_now)
     }
 
     pub(super) fn page_turn_submission_eligible(
@@ -2450,11 +2617,29 @@ impl App {
             && !self.page_turn_loupe_hold(ctx)
     }
 
+    #[cfg(test)]
     fn submit_paged_display_unit_with_clock(
         &mut self,
         ctx: &egui::Context,
         pages: &[PreparedPagedPage],
         white: Option<(egui::Rect, egui::Rect)>,
+        clock: impl FnOnce() -> Instant,
+    ) -> Option<SubmittedUnitReceipt> {
+        self.submit_paged_display_unit_at_crop_phase(
+            ctx,
+            pages,
+            white,
+            FlatCropPaint::WithPage,
+            clock,
+        )
+    }
+
+    fn submit_paged_display_unit_at_crop_phase(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+        white: Option<(egui::Rect, egui::Rect)>,
+        mut flat_crop: FlatCropPaint<'_>,
         clock: impl FnOnce() -> Instant,
     ) -> Option<SubmittedUnitReceipt> {
         if pages.is_empty() {
@@ -2469,7 +2654,7 @@ impl App {
         // OFF does no effect clock, snapshot/inventory work, geometry projection or input diagnostics.
         if !self.settings.page_turn_animation_enabled {
             for page in pages {
-                paint_flat_page(page);
+                paint_flat_page_at_crop_phase(page, &mut flat_crop);
             }
             if let Some((rect, clip)) = white {
                 paint_white_companion(&pages[0].painter, rect, clip);
@@ -2494,7 +2679,7 @@ impl App {
         if !eligible {
             self.page_turn_presentation.cancel("ineligible_view");
             for page in pages {
-                paint_flat_page(page);
+                paint_flat_page_at_crop_phase(page, &mut flat_crop);
             }
             if let Some((rect, clip)) = white {
                 paint_white_companion(&pages[0].painter, rect, clip);
@@ -2574,13 +2759,17 @@ impl App {
                         .0
                         .iter()
                         .zip(&unit.pages)
-                        .all(|(source, p)| {
+                        .zip(&unit.content)
+                        .all(|((source, p), content)| {
                             source.occurrence == p.occurrence
                                 && source.resource.source_texture_id()
                                     == p.resource.source_texture_id()
                                 && source.resource.source_generation()
                                     == p.resource.source_generation()
-                                && source.content == self.page_turn_content(p.occurrence.idx)
+                                // Content was resolved while the presentation owner
+                                // was installed. Do not resolve it again after taking
+                                // that owner out for this transition.
+                                && source.content == *content
                         });
                 if matching {
                     match prepare_leaf(&outgoing, &unit, offer.forward) {
@@ -2890,7 +3079,7 @@ impl App {
         }
         if !curl {
             for page in &unit.pages {
-                paint_flat_page(page);
+                paint_flat_page_at_crop_phase(page, &mut flat_crop);
             }
             if let Some((rect, clip)) = white {
                 paint_white_companion(&unit.pages[0].painter, rect, clip);
@@ -2996,6 +3185,11 @@ impl App {
             || incoming.slice != self.fullscreen_page_slice
             || !Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units)
             || incoming.pages.len() != pages.len()
+            || incoming
+                .pages
+                .iter()
+                .zip(&incoming.content)
+                .any(|(page, content)| *content != self.page_turn_content(page.occurrence.idx))
             || !incoming.pages.iter().zip(pages).all(|(old, new)| {
                 old.occurrence == new.occurrence
                     && old.resource.source_texture_id() == new.resource.source_texture_id()
@@ -3044,7 +3238,95 @@ fn paint_white_companion(painter: &egui::Painter, rect: egui::Rect, clip: egui::
     painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
 }
 
+fn prepared_page_crop(
+    page: &PreparedPagedPage,
+) -> Option<crate::page_turn_animation::PageCropPaint> {
+    page.crop.map(|crop| page_crop_paint(&page.transform, crop))
+}
+
+fn page_crop_paint(
+    transform: &DisplayedImageTransform,
+    crop: crate::export_crop::CropSettings,
+) -> crate::page_turn_animation::PageCropPaint {
+    let size = crop.valid_source_size().unwrap_or([
+        transform.source_size.x.max(1.0) as usize,
+        transform.source_size.y.max(1.0) as usize,
+    ]);
+    let full = crate::ui_crop::crop_corners(
+        transform,
+        size,
+        crate::export_crop::CropRect::full(size[0], size[1]),
+    );
+    let corners =
+        crate::ui_crop::crop_corners(transform, size, crop.rect.sanitized(size[0], size[1]));
+    crate::page_turn_animation::PageCropPaint::from_screen_corners(
+        full,
+        corners,
+        transform.paint_rect,
+    )
+}
+
+/// A flat image and a prepared comparison composite use the same crop owner.
+/// The composite supplies its actual transform, without creating a second page
+/// resource or adding crop to the compared pixels.
+pub(super) fn paint_flat_crop(
+    painter: &egui::Painter,
+    transform: &DisplayedImageTransform,
+    crop: crate::export_crop::CropSettings,
+) {
+    paint_projection_meshes(
+        painter,
+        crate::page_turn_animation::project_flat_crop(
+            transform.paint_rect,
+            painter.clip_rect().intersect(transform.viewport_rect),
+            &transform.paint_quad().positions,
+            page_crop_paint(transform, crop),
+        ),
+    );
+}
+
 pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
+    paint_flat_page_at_crop_phase(page, &mut FlatCropPaint::WithPage);
+}
+
+/// A paint phase, not presentation state: binding/snapshots always retain crop.
+/// Curl projects it on each face; ordinary flat paint composes it after canvas
+/// overlays through the same crop owner.
+pub(super) enum FlatCropPaint<'a> {
+    WithPage,
+    AfterCanvas(&'a mut FlatCrop),
+}
+
+/// Frame-local paint value from the actual bound flat page. It never owns a
+/// resource, request or presentation state, and curl never produces this value.
+#[derive(Default)]
+pub(super) enum FlatCrop {
+    #[default]
+    None,
+    Bound {
+        painter: egui::Painter,
+        transform: DisplayedImageTransform,
+        crop: crate::export_crop::CropSettings,
+    },
+}
+
+impl FlatCrop {
+    pub(super) fn paint(self) {
+        if let Self::Bound {
+            painter,
+            transform,
+            crop,
+        } = self
+        {
+            paint_flat_crop(&painter, &transform, crop);
+        }
+    }
+}
+
+pub(super) fn paint_flat_page_at_crop_phase(
+    page: &PreparedPagedPage,
+    phase: &mut FlatCropPaint<'_>,
+) {
     paint_image_underlay(&page.painter, page.transform.paint_quad(), &page.underlay);
     #[cfg(test)]
     crate::app::paint_record_test_support::record_selected_paint_resource(
@@ -3053,6 +3335,18 @@ pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
     );
     page.resource
         .paint_texture(&page.transform, &page.painter, egui::Color32::WHITE);
+    if let Some(crop) = page.crop {
+        match phase {
+            FlatCropPaint::WithPage => paint_flat_crop(&page.painter, &page.transform, crop),
+            FlatCropPaint::AfterCanvas(output) => {
+                **output = FlatCrop::Bound {
+                    painter: page.painter.clone(),
+                    transform: page.transform,
+                    crop,
+                };
+            }
+        }
+    }
     #[cfg(all(windows, feature = "test-script"))]
     crate::test_script::record_drawn_paint(
         &page.painter,
@@ -3382,6 +3676,7 @@ fn canonical_unit(
                 .intersect(page.transform.viewport_rect),
             material,
             underlay: Some(underlay),
+            crop: prepared_page_crop(page),
         });
     }
     if let Some((rect, clip_rect)) = unit.white {
@@ -3397,6 +3692,7 @@ fn canonical_unit(
                 color: egui::Color32::WHITE,
             },
             underlay: None,
+            crop: None,
         });
         pages.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
     }
@@ -3738,6 +4034,7 @@ mod tests {
             reading_rtl: false,
             slice: crate::page_split::PageSlice::Full,
             pages: vec![PreparedPagedPage {
+                crop: None,
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
                 transform,
                 resource: FullscreenPaintResource::resampleable(
@@ -4809,6 +5106,8 @@ mod tests {
                 None,
                 Some(&mut sources),
                 true,
+                None,
+                crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
             )
             .expect("accepted fit metadata permits ordinary drawing");
         app.fullscreen_page_layout

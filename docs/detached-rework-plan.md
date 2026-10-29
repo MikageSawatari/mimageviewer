@@ -2249,6 +2249,7 @@ R3の非active Select破棄・元一覧維持の契約は継続する。
   続く明示Grid操作を含む。R3の非active Select破棄／元一覧維持の契約は変更しない。
 
 設計書§16に判断と検証範囲を記録し、R5再レビュー待ちで停止。今回も実装・製品起動・コミットなし。
+
 ### 2026-10-12 音楽ベース表示の共通基音推定への移行 (§13、第2段階)
 
 [鍵盤設計 §13.7 P4](music-keyboard-harmnet-plan.md) と利用者の実装指示による。
@@ -5790,6 +5791,7 @@ folder mirrorがなくなったため、migrationによるfolder cache claim・�
 これは利用者指定の機能切り離しと既存保存票の所有境界の補完であり、detached述語・viewport/HWND・
 placement・keep-alive・新状態・時間窓・回復guardを追加しない。実worker完了順とcontext退役のfixturesで確認する。
 本記録は独立レビューや実機観測の完了を主張しない。
+
 ### §11 追補: next-bookとmasterのPDF所有・検索採用の統合（2026-10-12）
 
 利用者指定のmaster統合で、G1〜G4のrecipe/構成/許可/editorと、§1.377のPDF epoch owner、
@@ -6640,3 +6642,61 @@ ClaudeCode の設計と Codex の実装前レビューで、症状パッチで�
 enqueue 完了と present / hidden hold 完了前に EOF / loop が先行しないようにする。これは映像 pipeline の
 共通終端契約で、detached の predicate・状態・時間窓・個別 reset は追加しない。旧世代 ACK の拒否と seek reset も
 headless handler テストで検査し、実機の F12 / 再生 / pause / EOF は未実施として引き継ぐ。
+
+### 2026-10-28: 紙めくり §28 段階 A の編集素材・crop owner
+
+設計担当 ClaudeCode と独立設計レビュー（Sol/xhigh、第3版 ACCEPT）は、既存 D3 owner の
+入力拡張・受付素材選択共通化・prepared paint への crop 所有移動を構造的修正として合意した。
+実装は `AfterAi / ResidentEdited / Unedited` の排他的入力を既存 final-effect owner へ渡し、
+current producer（未採用 ready を含む）との開始競合を共通採用述語で防ぐ。
+新 queue／pending／detached bool は追加せず、F12 移譲・park 中の既存 job 保持と新規開始停止・
+fork の空 owner・兄弟 context の失効隔離を維持する。閲覧用 crop は prepared page／内容 binding／
+capture-time holdover page が所有し、移譲先や idx 再利用先から crop を引き直さない。
+自動検証の結果は `target/pageturn-1461/implementation-report.md` と紙めくり計画 §28.3.1 に記録する。
+
+同日の独立実装レビュー追補では、比較合成にも共通 crop paint を接続し、legacy 基準の純粋解決を
+通常表示と受付で共有する。既存 accepted content の crop を品質更新の間も保持し、item／context／
+layout／編集が異なる場合は再利用しない。新しい保持状態や viewport／host 操作は追加しない。
+これは §28 の同じ所有境界の修正で、比較の解除や失効回避の guard は加えない。
+検証と旧描画経路の到達表は同じ実装報告の E6 再レビュー対応に追記する。
+アプリは起動しない。段階A時点に残った後発local正規化による同key失効は、下記段階Bで扱う。
+
+### 2026-10-28〜29: 紙めくり §28 段階 B の編集準備・一括公開owner（実装済み・検証結果は別記・実機未確認）
+
+設計担当ClaudeCodeと独立設計レビュー（Sol／xhigh、第3版ACCEPT、
+`target/pageturn-1461/design-review-b3.md`）は、既存final-effect ownerによる編集一式の準備と一括公開を構造的修正として合意した。
+設計正本は[紙めくり計画§28.5](page-turn-animation-plan.md)。新しいdetached述語・bool・queue・待機仕様は加えない。
+
+- `app/prepared_edit.rs`はNextの局所補正→隠蔽→final→注釈を一つのworkerで作る。
+  要求時context・item identity・世代・各key・params・入力Arc・canonical寸法を保持し、
+  `final_effect_pending`のComputing／CpuReady／Registeringが要求・結果・登録途中textureを排他的に所有する。
+- 通常updateとdetachedの同等入口は、local producer・final表示引取り・注釈の同期DB読取りより前に
+  `resolve_prepared_edit_for_display`で非blocking受信する。Computingは取消・公開権撤去して通常経路へ戻し、
+  CpuReady／Registeringは表示へ引き取って作成済みhandleを再利用する。BをDisplayPreparedへ昇格しない。
+  Ctrl+Eを含む編集の入場・切替・original待ち再開・ResumeはBを取り消して既存ownerへ渡す。
+- 公開は現在ownerの全照合後に段・edit・final・対応comicを一括採用する。local／concealはCPU-only entryを持てる。
+  層の寸法正規化はpresence・選択・prepared snapshotを同期するだけで、同keyを失効させず兄弟contextへpublicationしない。
+  実編集による既存失効は維持し、resident lookupから生成／uploadを行わない。
+- 新規投機textureはROOT共通枠で1枚ずつ登録し、途中の画像をcacheへ公開しない。
+  `app/vram_accounting.rs`とregistryの全context会計はpending内の非公開textureも数える。
+  CPU結果予約はchannel／CpuReady／Registering／表示引取りから公開・破棄まで保持する。
+  取消・receiver除去でも投機permitと必要なcomic実走行枠はworker実終了まで返さない。
+- parkは新jobを開始しない境界であり、開始済みworker内部の局所補正→隠蔽→final→注釈は完走可能。
+  旧§27.17.3の「次のcomic段を開始しない」は別jobを開始しない意味に読み替える。
+  予約・結果・非公開textureは同ownerに保持し、resume時に入力と需要を再照合する。会計用の一時mountでは開始・登録・公開しない。
+- F12のmount／deposit／promoteは同じownerを移す。forkはpending／receiver／取消tokenを共有しないfresh ownerで、
+  片方の取消・公開・closeが兄弟へ作用しない。retire／close／内容失効は該当ownerの公開権と未公開資源だけを終端する。
+
+modal化やreaderの閉じ直しは、頁送り・F12の既存機能を維持するため採用しない。
+既存のcontext所有と有限なpermit・予約・一括公開で組合せを減らす。品質公開から受理済み素材・held resource・canonical receiptを差し替えない。
+実装差分の独立レビュー・自動検証・性能・実機確認の結果は`target/pageturn-1461/implementation-report-b.md`を参照する。
+この記録は検証成功の宣言ではなく、表示引取り時の残GPU登録コストも計測対象に残す。
+
+#### 段階B独立レビュー後の診断・回帰追補（2026-10-29）
+
+pending除去前の型付き取消／拒否記録を、mounted contextだけでなくat-restの補正採用失効と
+bundle退役にも接続した。記録するcontextは要求に捕捉したownerであり、診断のためのmountや
+兄弟contextの失効を行わない。frame／passを持たない破棄の記録はnullとする。
+`prepared_edit_disposition`の項目と理由型はpage-turn計画§28.5.1に記録した。
+detachedの実表示入口と、通常mounted状態での既存の編集切替・Resumeを、Bの各未公開状態で直接通すheadless回帰を追加した。
+採否やpresentation述語は変更せず、既存所有境界の観測と回帰を足す修正であり、症状パッチではない。

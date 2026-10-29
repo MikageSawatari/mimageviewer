@@ -4219,11 +4219,12 @@ spawn前に対象頁の既知寸法から、正本pixelsとupload用pixelsの最
 | --- | --- | --- | --- |
 | 表示用カラー化／LUTのComputing | cancelせず保持。worker完走を許可 | 最初のlookup前に受信・exact照合・採用 | 該当ownerだけcancelし、公開権を外す |
 | 表示用カラー化／LUTのCpuReady | 保持。parkを理由に再計算しない | 最初のlookup前に表示要求として登録・採用 | 破棄 |
-| 投機Computing | 開始済みworkerの完走を許可。新段・次jobは開始しない | 現需要とkeyを再検証。不要なら破棄 | cancel。実permitは終了まで保持 |
+| 投機Computing | 開始済みworkerの内部各段は完走可能。新jobは開始しない（§28.5 B7） | 現需要とkeyを再検証。不要なら破棄 | cancel。実permitは終了まで保持 |
 | 投機CpuReady | 予約付きで保持可能。圧力時の投機退去対象 | 現需要内なら共通登録枠へ。不要なら破棄 | 破棄・予約解放 |
+| 投機Registering（段階B） | 予約・非公開textureを同じpendingに保持。新規登録・公開は行わない | 全照合後に残りを共通登録枠へ。表示引取りは作成済みhandleを再利用 | 破棄・予約と非公開textureを解放 |
 | 登録済み通常cache／Native | 既存保持・退去方針 | exact key／需要を再検証 | 既存失効。生存batch leaseは最後のdropまで |
 
-投機jobがpark中に完成しても、次のcomic段やNative生成を自動開始しない。結果は同じpending／channel内に有界で残す。単なるmountと表示再開は区別し、会計等の一時mountで投機を再開しない。
+投機jobがpark中に完成しても、別jobとしてのcomic準備やNative生成を自動開始しない。§28.5の段階Bでは、開始済みworker内部の局所補正→隠蔽→final→注釈は完走してよい。旧記述の「次のcomic段を開始しない」は新jobを開始しない意味に読み替える。結果は同じpending／channel内に有界で残す。単なるmountと表示再開は区別し、会計等の一時mountで投機を再開しない。
 
 F12のmount／deposit／promoteは同じcontextのcache・pending・需要を移す。forkはreceiver／cancel／permitを共有しない新owner。Aのclose・採用・取消がBへ作用しない。
 
@@ -6260,3 +6261,496 @@ computer-use で実キーを送った。04 (8000×8192) の idx12 (13|12) から
 - §27.17.19 で止まっていた「F12 の別ウィンドウで前の見開きへ戻る」は、静止の機会があれば滑らかになった。着地した頁は 13|12 → 11|10 → 9|8 → 7|6 → 5|4 → 7|6 → 9|8 で正しい。
 - 準備の時間がないまま戻ると、従来どおり前 unit を同期で作る (設計 §27.17.20 の限界)。この 1 回は F12 の窓作成直後で、新しい窓の大きさに合わせた Native 再生成と 0.4〜0.9 秒の frame 間隔が重なっており、
   §27.17.19 の 164〜176ms との差がこの変更によるものかは**未確認**。
+
+## 28. 通常フォルダのめくり (§1.461) と編集済み頁のめくり素材 (§1.457 / §1.401)（2026-10-28）
+
+正本はこの節。§22.1 の「受付時の素材選択」と §27.17.6 の「編集頁の先回り準備」をこの節で更新する。
+設計は ClaudeCode、独立設計レビューは GPT-6.1 Sol / xhigh の 3 往復 (第 1・2 版 REVISE、第 3 版の段階 A を ACCEPT)。
+記録は `target/pageturn-1461/design-review-{1,2,3}.md`。利用者の判断 (2026-10-28、親セッション経由):
+局所補正・隠蔽・注釈の先回りも今回の版に入れる (段階 B、別に設計・レビューする)。
+
+### 28.1 通常フォルダでめくりが始まらない (§1.461) — 原因
+
+観測 (利用者の開発機の perf ログ `%APPDATA%\mimageviewer\logs\perf_events.3.jsonl`、2026-10-27、v4.9.0 前後):
+通常フォルダ (`E:\share\...\..._files\6.jpg` など、見開き 6|7・8|9) をキーで送った 314 回すべてが
+`cat=page_turn_animation kind=skip reason=book_presentation_not_fully_allowed` で、めくりは 1 回も始まっていない。
+別のログ (perf_events.jsonl / .2) には start / finish が 73 件 / 45 件ある (各ファイル先頭 3 件の start の直前に出ている頁の key は、6 件とも ZIP の頁)。
+
+コード上の経路:
+- めくりの受付 (`page_turn.rs:2196` 付近) は、めくる先の表示単位の presentation demand について
+  `book_presentation_allowed` が全頁 Allowed であることを求める。
+- 通常の画像 (`GridItem::Image`) は本の構成の candidate を持たない (`source_composition_candidate`、
+  `book_composition_permission.rs:498`)。許可の表 `occurrences` には、通常表示が `retain_book_presentation_demand` で
+  **表示中の demand だけ** を `Allowed(None)` として入れる (同 557〜591。表示中以外は retain で消す)。
+- めくる先の demand はまだ表示されていないので表に無い。構成 service がある (製品の通常起動では常にある、
+  `book_composition_runtime.rs:521`) と `decision` (同 376) は表に無い occurrence を `Checking` にするので、受付が毎回 skip する。
+- ZIP / PDF の頁は本の navigation の許可の流れで先に表へ入るので、この skip に当たらない。
+- 既存のめくりテスト (`ready_app` など) は `book_composition_service = None` で、表に無い occurrence を Hidden でない限り
+  許す別の分岐 (同 605〜621) を通るため、通常フォルダと同じ `GridItem::Image` でも始まって終わっていた。
+
+**F1 修正方針。** 「通常の画像は取得すべき構成の許可を持たない」という既存の規則 (retain の挿入時にだけ書かれている) を、
+めくる先の判定でも同じ 1 か所の規則で使う。適用範囲は下の「F1 の適用範囲」。candidate を持つ頁 (ZIP / PDF) で表に無いものは従来どおり `Checking`。
+
+**F2 回帰テスト。** 構成 service がある (製品と同じ) 状態で、通常フォルダ (`load_folder` で開いた実フォルダ、
+`src/app/tests/plain_folder_spread.rs` の `make_folder` / `configure` を流用) の単頁と見開きで、キー送りのめくりが
+受付・開始・完走することを handler-level で確かめる。修正前はこのテストが `book_presentation_not_fully_allowed` で
+落ちることを確認する。ZIP の頁で表に無いものは従来どおり Checking になることも確かめる。
+
+**F1 の適用範囲 (第 3 版で確定)。** 規則 (「`presentation_candidate` を持たない occurrence は、取得すべき構成許可を持たない」) は
+retain と問い合わせが共有する 1 つの helper に書く。問い合わせ側では **めくる先 (target) の判定** にだけ使う:
+めくり受付と次 target の判定 (`fs_page_turn_decision_for_frame_with_perf`、ui_fullscreen.rs:33863)。
+新しい問い合わせは、既存の pending / Unreadable gate と表にある entry (Hidden / Checking / Allowed) をそのまま使い、
+**未登録の occurrence の解決だけ** を変える。既存 entry を candidate なしを理由に上書きしない。
+連結読みのレイアウト (ui_fullscreen.rs:46848〜47000) と表示中 demand の照合は従来の問い合わせのまま。連結は表を「可視 demand の admission」
+として使い、処理範囲を retain 済みに限る設計なので、F1 を広げると非可視頁の同期 metadata 処理 (cold `get_rotation` の DB 読み) が増える (第 2 版レビュー P2)。
+通常フォルダで新しく通る処理: navigation sequence の target 照合と readiness、必要時の target thumbnail / passthrough 要求、入力保持・burst 判定、
+33863 側の target load と prefetch window 更新。めくり専用ではないので ON / OFF の両方で回帰を見る。
+「本として扱う」画像フォルダも `GridItem::Image` のままで構成 candidate を持たない (`book_materialization.rs:24`、book-composition-plan.md:55)ので、
+F1 は有効な構成許可を緩めない。
+
+### 28.2 編集済み頁のめくり (§1.457) — 観測と原因
+
+利用者の報告 (2026-10-28): 消しゴムで編集した頁へめくると、アニメーション中は消しゴム未反映で、着地後に切り替わってちらつく。
+開発側では実機で再現していない。以下はコードの参照による。
+
+| 場所 | 現在の動き |
+| --- | --- |
+| めくり受付の素材選択 `page_turn_resident_source` (page_turn.rs:1857) | RAW 未現像→preview、exact final (+comic)、faithful gate、**source (編集前)**、thumbnail。編集の段を見ない |
+| 通常表示の resident 解決 `resolve_fs_display_material_from_caches` (ui_fullscreen.rs:11670) | comic → final → faithful gate → edit_result → 隠蔽 → 局所補正 → 消しゴム → source → thumbnail |
+| 通常表示の処理経路 `resolve_fs_processed_material_from_caches` (ui_fullscreen.rs:13170) | 段が揃えば final を同期で完成。段が未完成なら source を出す |
+| 消しゴムの段 | 先読みの source 受信時 (`poll_prefetch` → `auto_apply_saved_mask`) に MI-GAN を起動し `erase_result_cache` へ |
+| 局所補正・隠蔽の段 | 表示時と、legacy の AI / カラー化先読みの `ensure_edit_result_pixels_cpu` からだけ起動 |
+| D3 の CPU final 準備 `resident_final_prepare_input` (final_prepare.rs:221) | exact edit_result が無い編集頁は対象外 |
+| 注釈 (comic) | D3 は comic 頁を準備しない。bake は doc の DB 読み・font 列挙/parse を UI で同期実行 |
+| 切り抜き | 単頁の通常表示が暗転・枠を平面 overlay で描く (ui_fullscreen.rs:28606)。めくり中は到着頁の平面 overlay が curl の上に描かれる |
+
+原因: 先読みで消しゴムの段ができていても、めくりは段を見ずに編集前の source を選び、着地後の通常表示が段から final を作って切り替える。
+補正もある頁では D3 が編集頁を対象外にしているので、final も先に用意されない。
+
+### 28.3 段階 A の設計 (第 3 版、ACCEPT)
+
+**E1 受付時の素材選択を通常表示の段の順に揃える。** comic (exact base) → final (exact) → faithful gate → edit_result (exact key・texture あり)
+→ 隠蔽 → 局所補正 → 消しゴム → source → thumbnail。隠蔽 → 局所補正 → 消しゴムの「副作用なし・exact な material 選択」は 1 つの helper にし、
+通常表示と受付で共有する。edit_result は通常表示の緩い一致 (holdover) と受付の exact 一致を分けたまま。各 entry の display_basis を継承する。
+隠蔽の exact は `conceal_cache[idx].generation == conceal_generation` と idx 別の失効 (`clear_conceal_caches(idx)`) の組で、実装時に失効の呼び出し元を列挙して確かめる。
+品質ラベルに `edit` / `conceal` / `local_adjust` / `erase` を足す。producer・decode・upload・DB 読みは呼ばない (§22.1 の契約)。
+
+段が 1 つも resident でない編集頁は source でめくる。これは未 resident 時のちらつきを完全には解消しない。演出 OFF も段の完成前は source を出すが、
+faithful gate・holdover の例外があり、ON は受付素材を canonical 採用まで固定するので、途中で完成した編集の見え始めは OFF より遅れ得る。
+
+**E2 編集結果の texture を最上段の段と共有する。** `shared_source_texture_for_edit` を一般化する。共有条件は同 context・exact key・画素 Arc 同一・寸法一致・
+item identity 一致・texture options が `DISPLAY_IMAGE_TEXTURE_OPTIONS` (LINEAR) と一致。edit_result の LINEAR 契約を維持し、NEAREST の段は共有しない
+(後段フィルタを None に戻したとき NEAREST を通常 final として再利用する退行を防ぐ、第 1 版レビュー P2)。`resident_final_prepare_material` は
+実際に共有した段の material を返す (source を返さない。D3-4 の `resident_canonical_resource` の同一性検査と揃える)。共有を広げる範囲で、
+段 / edit の VRAM 会計の mip を実 options に揃える。ON / OFF 共通で、編集頁の着地時の再 upload が無くなる。
+
+**E3 D3 CPU final の入力を、完成した編集の累積結果へ広げる。** 入力計画は排他的な型 (`AfterAi / ResidentEdited / Unedited` 相当) にする。
+`ResidentEdited` は頁にある**全編集を反映済み**の、exact と証明できる最上位の段に限る (各段は下位を含む累積なので下位 cache は必須にしない。
+active な局所補正・隠蔽が未完成なら、exact な消しゴム段だけから complete final を作らない)。開始条件に「頁にある全段の producer が pending でない」
+(結果受信済み・未採用の ready を含む) を入れる。消しゴムは `commit_pending_matches_current_erase_key`、局所補正・隠蔽は採用側の条件を純粋 helper に抽出する。
+待つ頁は `continue` で相方を進める。要求時の key・入力寸法を固定し、Next / Previous で同じ純粋解決を使う (Previous は producer を起こさない)。
+消しゴムだけ・最終補正なしの頁は CPU 仕事が無く、E2 の共有 texture が material と Native prewarm の対象になる (`final_prepare_plan_from_resident` の早期 return は維持)。
+
+「全段 pending なし」は開始済み producer との競合を避ける条件であり、後発の同 key 失効までは防がない (第 3 版レビュー P3)。確認済みの経路:
+現在頁と相方へは final の有無と独立に local producer を起動し (update_phases.rs:1999)、層が全部無効でもマスク寸法が合わなければ正規化 worker が動き
+(app.rs:83635)、その `LocalInactive` 採用も `clear_conceal_caches` を通して D3 の pending / 登録済み final を消す (app.rs:83961、84295、83332)。
+「実編集」と「同じ入力の再実体化」の失効分離は段階 B で扱う。頻度は未実測。
+
+**E6 切り抜きの暗転・枠を単頁の prepared paint の owner へ移す。** 閲覧用の暗転・枠を、通常 flat・curl の表裏・canonical で同じ owner が同じ投影
+(leaf 座標・分割・表裏変換、flat は可視 polygon で clip) に通して、黒 alpha の別 mesh として面の直後に描く。編集用ハンドル・入力処理は既存 overlay に残し、
+crop 編集時に暗転・枠を二重に描かない。表示条件 (SNS 分割・元画像表示・erase/local/conceal/補正/分析中の抑止、実際の二頁表示での抑止、片頁の見開きでは出す) は今と同じ。
+binding は基準寸法付きの crop 値で、受付はメモリだけを読む pure accessor を使う (`export_crop_for_idx` の legacy 基準寸法の採用・永続化は通常表示に残す)。
+品質 publication の寸法変更を crop 変更と誤認しない。held page を clone する前に crop binding の一致を確かめ、古い crop を引き継がない。
+
+**E7 その他の編集。** SNS 分割中はめくり対象外。90 度単位の回転と表示トリムは受理した transform・UV・clip から canonical へ渡っている。
+自由回転・zoom・比較・編集中表示は既存の除外がある (第 1 版レビューで確認)。
+
+**detached。** 既存 D3 owner の拡張、受付素材選択の共通化、crop 描画 owner の統一は、症状パッチではなく構造的修正として設計担当と独立レビュー担当が合意。
+F12 移譲、park 中の新規開始停止と既存 job 保持、fork の空 owner、兄弟 context 不変を維持し、[detached-rework-plan.md §11](detached-rework-plan.md) に記録する。
+
+### 28.3.1 段階 A の実装記録（2026-10-28、実装済・検証結果は別記・実機未確認）
+
+- F1/F2: `presentation_permission_candidate` と target 専用 query に集約。
+  未登録だけを補完し、通常の可視 demand／連結 admission は変更しない。service 付き実フォルダの
+  handler 回帰で単頁／LTR／RTL・本として扱う ON/OFF と、演出 ON/OFF の target 処理を検証する。
+- E1/E2: `exact_resident_edit_stage` を通常表示と受付が共有する。edit-result の通常 holdover は維持し、
+  受付は exact key のみ。共有は `shared_resident_texture_for_edit` が段の実 material を返し、
+  LINEAR・Arc・寸法・identity を照合する。段の `texture_options` を採用時に固定して会計する。
+- E3: `ResidentFinalPrepareInput` で入力を排他的に表し、全経路で開始済み producer と未採用 ready を待つ。
+  key／入力寸法・既存 D3 owner／予約／投機登録境界は維持する。
+- E6: `PreparedPagedPage.crop` と `PageTurnContent.crop`、保持表示の capture-time crop が内容を所有し、
+  `PageCropPaint` が共通 leaf 投影へ渡す。overlay は編集入力とハンドルだけを描く。
+  legacy は純粋 lookup で resident 原寸から暫定基準を求めるが、DB／sidecar への採用は通常表示に残す。
+  小さすぎる preview では永続採用せず、その frame の基準で paint だけを clamp する。
+
+**隠蔽 exact の失効監査。** `clear_conceal_caches(idx)` の全呼出元を調べた。
+`app.rs` はスロット一括／閲覧適用、erase/conceal マスク削除（閲覧／選択）、
+`bump_local_adjust_generation`、local ready／inactive 採用、active conceal 寸法追従、
+`bump_input_generation`、`bump_erase_mask_generation`、`bump_conceal_mask_generation`。
+`ui_erase.rs` はパネルのマスク取消／削除、preview→commit 昇格、commit worker 採用。
+`ui_conceal.rs` は編集終了、Undo/Redo 復元、スロット読込、全削除、キーでのベクタ削除、nudge、
+brush／polygon、morph、bucket、drag/handle、select、shape commit。
+加えて source 再読込は `bump_input_generation_for_fs_cache_reload` が直接当該 entry を除去し、
+global input／folder／context 置換は cache を除去、全体隠蔽設定は `conceal_generation` を進める。
+この組が入力・局所編集・マスク・全体設定の変更を覆うため、隠蔽 entry に重複 key は追加しなかった。
+後発 local 正規化による同 key 失効は §28.3 の既知残差どおり維持する。
+
+検証コマンド・件数・F2 の修正前 skip 証拠は `target/pageturn-1461/implementation-report.md` に記録する。
+製品起動と commit は実施しない。
+
+### 28.3.2 段階 A 独立実装レビューの E6 修正（2026-10-28）
+
+`402605109` に対する独立レビュー `target/pageturn-1461/impl-a-review-1.md` の P2 2件を修正する。
+比較を解除せず、準備済み比較の CPU／shader 合成直後に通常 flat と共通の crop owner を接続する。
+比較準備待ちは通常 owner、編集 overlay はハンドル／入力だけを維持する。
+
+legacy crop は受付と通常表示が同じ resident-only accessor で解決する。FullSource thumbnail の
+原寸情報と、原寸がない場合の sampler を含め、PDF layout や AI sampler を基準に流用しない。
+受付後は既存の accepted content が crop（未確定の基準を含む）を所有し、品質 publication が
+通常採用の前後どちらに来ても文書編集として扱わない。未確定値を paint 準備で別の基準付き値へ
+書き換えず、clamp は既存 transform に委ねる。通常表示が同じ純粋解決結果の有効基準だけを
+永続採用する。新しい pending／queue／保持 field は追加しない。
+submit の offer 照合には、presentation owner を取り出す前に捕捉した unit.content を使う。
+owner の一時取り出し中に crop を再解決して未確定値を品質更新後の値へ変えない。
+
+共通 owner の比較描画と thumbnail-only 受付→通常採用→初 curl、品質更新、実 crop 変更、
+context／item 不一致の headless 回帰を追加する。旧 overlay の全描画経路の到達表、
+`viewer_context_audit` と指定検証の結果は `target/pageturn-1461/implementation-report.md` に追記する。
+製品ページ `index.html` は利用者指示により変更しない。commit／製品起動／build-dev は実施しない。
+
+### 28.3.3 Z照準／拡大のcrop積層順を復元（2026-10-29）
+
+段階Bの採用／登録ownerを確認した上で、段階A以前（`d4dfc7d9b`）の描画順を復元する。
+旧順は、画像→pixel grid（拡大時）→照準暗転／照準枠（照準時）→canvas overlay→crop暗転→
+crop黒／黄枠→編集handles。crop暗転も照準枠より後であり、枠だけ後へ移す案は採らない。
+
+Zの画像部分はcropなしで準備し、mainは実際に描いたtransformがZである場合に、従来のcrop段で
+共通`paint_flat_crop`へ渡す。単独Z描画のwrapperも同じ薄いrouterを使う。
+既存のprepared material／snapshot crop／非eligibleなZのreceipt契約は維持し、新しい状態やownerは作らない。
+同日の利用者scope訂正に従い、通常flatと準備済み比較も段階A以前のcrop段へ戻す。
+通常は画像→pixel grid→canvas overlay→crop暗転／枠→handles、Wipeはcomposite→操作表示→
+canvas overlay→crop暗転／枠→handles。cropはprepared bindingに残し、実際のflat描画だけが
+採用済みpainter・transform・cropのフレーム内描画値を返す。型は`FlatCropPaint::WithPage | AfterCanvas`。
+新しいApp field／queue／pendingは作らず、curlは後描画値を生成しない。最初のcanonical、
+OFF、非eligible、取消によるflatも同じ境界を通す。捕捉表示はWithPageを維持する。
+curl投影と段階Bの素材準備・公開・取消には変更を加えない。
+
+実fullscreen rendererのheadless回帰でZ照準／拡大／通常、演出ON/OFFと通常のcrop編集を確認する。
+通常grid／text・CPU／shader Wipeの順と、実rendererのcurl→canonical／取消の欠落・二重描画も検査する。
+全経路の旧順との照合と指定検証は
+`target/pageturn-1461/implementation-report.md`の積層順列および追補へ記録する。
+
+### 28.4 段階 B (局所補正・隠蔽・注釈の先回り、§1.401 の残り) — 設計前の論点
+
+利用者の判断で今回の版に入れる (2026-10-28)。段階 A の実装後に別に設計し、独立レビューを受ける。第 1・2 版レビューで次が分かっている。
+- 段の producer を前倒しで起こすだけでは、実走行数の上限 (取消が実終了を待たない)、非表示頁の texture 登録の迂回、UI の重い前処理 (black flatten) が残る。
+- D3 側で編集を実体化すると段 owner との二重所有になり、段完了時の失効 (`clear_conceal_caches` / `clear_edit_result_caches_for_idx`) が D3 の結果を消す、
+  MI-GAN の Remote 排他 (`LocalAiActivityLease`)、Ctrl+E の段 gate (段が無いと再操作が要る) の問題が出る。
+- 注釈は cold な doc / font の worker 化、bake 結果の投機登録、注釈だけ・無変換頁の下地 Arc の受け渡しが要る。
+組み合わせを減らす手 (保存済みの編集一式から 1 つの世代で作る、など) を先に検討する。利用者に見える挙動が変わる案は着手前に相談する。
+
+### 28.5 段階 B の設計 (第 3 版、ACCEPT) — 局所補正・隠蔽・注釈を次 unit で先回りして作る
+
+利用者の判断 (2026-10-28): 今回の版に入れる。独立設計レビュー (GPT-6.1 Sol / xhigh) は第 1・2 版 REVISE、第 3 版 ACCEPT
+(`target/pageturn-1461/design-review-b{1,2,3}.md`)。段階 A の §28.4 の論点はこの節で解消した。
+
+**組み合わせを減らす方針。** 段ごとに作って段ごとに失効させるのをやめ、1 つの key (EditResultKey) の下で編集一式を 1 本の job で作り、
+照合を済ませてから 1 か所で一度に公開する。今の段 producer は下の段の完成ごとに上の段と edit / final を消す (`clear_conceal_caches` →
+`clear_edit_result_caches_for_idx`)。隠蔽 cache は全体世代しか持たず、どの下段の上に作ったかを記録しないので、下段の公開ごとに消すしかない。
+同じ key の下段 → 上段 → final → 注釈を 1 本で作って同時に入れれば、途中の失効そのものが要らない。
+
+**B0 所有と状態。** 既存 `final_effect_pending` の Speculative job が所有し、状態を `Computing → CpuReady → Registering → 公開` の型で排他的に表す。
+新しい map / queue / ready フラグは作らない。Computing は共通投機 permit・(注釈を含むとき) 既存 comic 実走行枠・CPU 結果予約を worker の実終了まで保持する。
+CpuReady は全出力の画素を予約付きで保持する (OverBudget でも消さず、既存の不要化・圧力回収・取消に任せる)。Registering は新しい texture (final、注釈) を
+ROOT 最終 hook の共通登録枠で 1 枚ずつ登録して pending 内に保持し、揃ったら一度だけ公開する。共有 handle は枠を消費しない。非公開の texture も全 context の VRAM 会計に含める。
+登録が残れば次の ROOT frame を要求し、OverBudget では再描画・再計算のループを作らない。
+
+**B1 対象と、今回作る出力。** Next unit の頁だけ (Previous は resident-only のまま)。演出 ON・paged・現 unit 提示後。final AI が必要な頁は対象外
+(AI 結果が cache にあれば after-AI 計画)。下の入力が exact resident であること (消しゴムのある頁は既存 Commit の完成画素、無い頁は raw。消しゴムの Commit が
+pending なら待つ。MI-GAN はこの job に含めない)。その頁の local / conceal / comic producer、利用者の LUT / segmentation producer が動いていないこと。
+待つ頁は continue で相方を進める。今回進められる出力で決める:
+- 局所補正 / 隠蔽の段が未完成 → 段から final まで。注釈がある頁で font が揃い comic 枠が取れれば注釈まで、そうでなければ final で止める。
+- final が complete で注釈だけ不足 → font が揃い comic 枠が取れれば注釈だけ (下地は cache の final 正本 Arc)。そうでなければ spawn しない。
+- 注釈だけ・無変換の頁は、final = edit = raw の Arc を下地とする。
+font の充足: doc が `comic_docs` にある頁は、UI がメモリだけを読む純粋判定 (`comic_overlay.rs:63` の参照 font 列挙を共有、本文と名前プレート)。
+`FontSet::get` の fallback を「ある」に使わない。doc が cold なら worker が読み、font 判定も worker で行う。
+
+**B2 入力と worker。** UI で捕捉するのは Arc・設定・key だけ: 下の入力 Arc、受理済み display basis、context・item identity・世代・EditResultKey・
+LocalAdjustResultKey・隠蔽世代・注釈世代・params、注釈の canonical 座標寸法 (画素寸法・clamp 寸法で代用しない)。局所補正の層は hydrate 済みならその Arc、
+未 hydrate なら DB path + page key。隠蔽マスクは DB path + page key と preset の値。注釈 doc は cached ならその値、cold なら DB path + page key。
+FontSet の Arc と読み込み済み font key の集合は snapshot。worker は `materialize_local_adjust` (層の寸法正規化を含む) → `materialize_conceal` →
+`FinalCompositePlan` (after-AI は結果の `used_upscale`) → final 正本 Arc (clamp 前) を下地に注釈を合成 → final と注釈の upload 画素をそれぞれ同じ Triangle clamp で作る。
+完成済みの消しゴム画素へ black flatten / MI-GAN を再適用しない。raw に投機独自の black flatten を足さない。Remote の adapter は呼ばず、
+`edit_source` / `final_composite` の CPU 処理だけを共有する。cold doc の解決は bake できなくても正常な結果として返す (Disconnected にしない)。
+
+**B3 公開。** 全照合 (items 世代・item identity・各 key・世代・下の入力 Arc・params・現在の doc) と、注釈を除外する条件 (doc 不一致・font 不足) を
+最初の mutation より前に確定する。段・edit・final を一括公開し、段採用用の失効は呼ばない (実編集・source 更新・params 変更の既存失効は弱めない)。
+`local_adjust_cache` / `conceal_cache` には CPU-only entry (texture なし) を入れる。局所補正の層の正規化結果は、層・presence・選択の整合と prepared snapshot 同期だけを行う
+共通 helper で採用する (local 世代を進めない、利用者 producer を取り消さない、兄弟 context へ publication しない)。doc は `comic_docs` に key が無いときだけ入れ、
+既存 doc を上書きしない。現在の doc と異なる bake は公開しない。final cache の正本 Arc と `comic_cache.base` は同じ Arc。画像の無い結果は GPU 登録を待たずに予約を解放する。
+
+**B4 段の「実体化済み」と「描画可能」を分ける。** 実体化済み = exact な画素 + 現在入力に対する層の寸法正規化。producer の起動判定はこちら (texture 不足を再レンダーの理由にしない)。
+描画可能 = 実体化済み + texture。`current_*_material` はこちらで、副作用なし。texture が要る表示 (局所補正・隠蔽の編集モード、final が無いときの段の表示) は、
+明示的な表示 ensure が既存画素を 1 frame 1 枚で upload する (画素・key を変えず、上段を失効させない)。Ctrl+E の段 gate は画素を見るので CPU-only で満たせる。
+CPU-only entry を作るのは B の公開だけ。既存 producer の公開は従来どおり texture 付き。
+
+**B5 表示要求と編集要求。** 表示要求の最初の入口 (通常 update の local producer 呼び出し・detached の同等箇所・final の表示引取り・注釈の同期 DB 読みより前) で、
+その頁の B 由来 job を 1 つの helper で解決する。非 blocking で受信してから状態を見て、CpuReady / Registering なら表示へ引き取り (作成済み handle を再 upload しない)、
+Computing なら取消・公開権撤去して既存の通常経路へ戻す。B 由来 job を DisplayPrepared へ昇格させない。編集要求 (Ctrl+E を含む入場・切替・original 待ちからの再開・
+Resume 経路) は、その頁の B 由来 job を取り消してから既存 owner へ渡し、B の完了から編集 continuation を発火させない。
+したがって、B の準備不足を理由にめくりを待たせたり省いたりせず、編集結果の見え始めも遅らせない。公開を、受理済み素材・held resource・canonical receipt の差し替え理由にしない。
+表示引取り時に残る GPU 登録のコストは未計測で、計測対象に残す。
+
+**B6 CPU 予約。** 画像 allocation 単位の保守的な上限 (checked 演算): 新規の局所補正画素・隠蔽画素、final 正本 (+ 別 allocation なら upload)、注釈正本 (+ 別 allocation なら upload)。
+共有 Arc は重複計上しない。after-AI は AI 結果寸法から求める。1GiB は未採用の画像結果の予約で、総 RAM 上限ではない。
+
+**B7 context。** park は新 job を開始しない。開始済み worker の内部 (局所補正 → 隠蔽 → final → 注釈) は完走してよく、再開時に再照合する (§27.17.3 の「park 中の完了後に次の comic 段を開始しない」は、
+新 job を開始しないという意味に読み替える)。F12 は同じ owner を移し、fork は pending・receiver・取消 token を共有しない。兄弟 context を変えない。
+detached-rework-plan.md §11 に記録する。
+
+**B8 残るもの。** 注釈の font が未準備の頁 (セッションで初めて注釈を表示する前など)、消しゴムの MI-GAN が間に合わない頁、VRAM 予算外、final AI が必要な頁、
+Previous の先回り。これらは段階 A と同じく、resident な最上位でめくる。
+
+### 28.5.1 段階 B の実装記録（2026-10-28〜29、実装済み・検証結果は別記・実機未確認）
+
+設計第3版の独立 ACCEPT は `target/pageturn-1461/design-review-b3.md`。以下は実装境界の記録であり、
+自動検証・独立実装レビュー・性能の成功を示すものではない。結果と残件は `target/pageturn-1461/implementation-report-b.md` を正本とする。
+
+- `app/prepared_edit.rs` が Next の局所補正・隠蔽・final・注釈を一つの入力 snapshot と worker で準備する。
+  既存 `final_effect_pending` の `Computing / CpuReady / Registering` が要求・結果・登録途中textureを排他的に所有する。
+  Previous は resident-only。erase Commit と既存local／conceal／comic／該当LUT／segmentation producerの競合時はその頁を見送り、相方を進める。
+- 完成erase画素を再処理せず、after-AIは結果の`used_upscale`に従う。注釈はclamp前のfinal正本へ合成し、
+  finalと注釈それぞれのupload画素へTriangle clampを適用する。注釈のみならexact complete final（無変換ではedit／raw）を下地とする。
+  下段の実体化入力と最終入力は`PreparedFinalInput::Edit / AfterAi / Completed`で分ける。完成AI／finalがあっても、
+  residentな下段に対するlocalの画素・寸法正規化やconceal画素が不足する場合は同workerで補う。
+  Completedの正本・handle・表示基準は維持し、AfterAiへ補正を二重適用しない。CPU-only段からidentity finalだけが退去した場合も再レンダーせず登録を補う。
+- cold docの読取りはfont不足・空docでも正常に終端し、照合後に`comic_docs`の欠けているkeyだけへ採用する。
+  本文・名前プレートの参照fontをfallbackなしで判定し、既存docを上書きしない。画像のない結果はGPU登録を待たず予約を解放する。
+  既存cacheから作れる出力を再評価し、font不足や空docだけを理由に画像jobを繰り返さない。
+- 最初のmutation前に入力・key・世代・params・doc／fontを照合する。新規textureはROOT共通枠で1枚ずつ登録し、
+  揃うまで画像cacheを部分公開しない。非公開textureも全contextのVRAM会計へ含め、共有handleには追加登録を課さない。
+  登録が残れば次のROOT frameを要求し、OverBudgetは結果を保持して再描画・再計算ループを作らない。
+- 公開ではlocal／concealのCPU-only entry、edit、final、対応comicを一括採用する。final正本と`comic_cache.base`は同じArc。
+  段採用のための上段失効は行わず、実編集時の既存失効を維持する。局所層の寸法正規化は層・presence・選択・prepared snapshotの整合だけを更新し、
+  local世代を進めず、利用者producerや兄弟contextを変更しない。
+  共通helperのpresenceはidx側の実体化状態であり、メモリ内だけの編集を保存済みpage keyへ追加しない。
+  workerが空文書を解決した場合の保存済みpresence除去は、通常のinactive文書採用と同じ公開境界で行う。
+- 段の実体化済み判定はexact画素と寸法正規化、描画可能判定はそれにtextureを加えたものへ分離する。
+  texture不足では再レンダーせず、明示的な表示ensureで既存画素だけを1 frame 1枚uploadする。resident lookupは副作用なしで、Ctrl+Eの段gateも画素で満たす。
+- 表示は非blocking受信後に状態を判定し、Computingなら取消・公開権撤去して通常経路へ戻す。CpuReady／Registeringは表示へ引き取り、
+  作成済みhandleを再利用する。BをDisplayPreparedへ昇格させない。編集の入場・切替・original待ち再開・Resume・Ctrl+EではBを取り消して既存ownerへ渡す。
+- 共通投機permitと必要なcomic実走行枠はworkerの実終了まで保持する。CPU結果予約は共有allocationを重複計上せず、
+  channel・CpuReady・Registering・表示引取りから公開／破棄まで保持する。park／resume／F12／forkの境界は§27.17.3とdetached計画§11に記録した。
+  Nearestの既存CPU executorが作る別allocationも予約する。元NextがPreviousへ移ったBも既存の全Next優先・Previous取消規則へ従う。
+  新Bの登録は同頁の旧Bを退役させる。表示受信・stale採用拒否の取消単位は要求keyとし、旧新世代の一方の取消がもう一方へ作用しない。
+- lowerの表示基準はtexture有無によらずexact entryの受理値を捕捉する。既存finalの基準とは別に保持し、edit結果の公開にも引き継ぐ。
+  Bと従来D3でrequest ID採番を共有し、CPU開始／ready／実終了と各final・comic登録を同IDへ接続する。
+  private登録は`published=false`、表示引取りは`display_takeover`で区別し、残GPU登録時間と段表示ensureのupload時間を既存perfへ記録する。
+
+#### 独立実装レビューへの修正（2026-10-29、843f24c2a後）
+
+- 入力照合は`validate_prepared_edit_input`、外側は`validate_final_prepare_pending`の
+  `Result<(), PreparedEditReject>`を正本にした。既存bool述語は同じ結果の`is_ok()`だけを使う。
+  理由は取消済み・items世代・item identity・編集世代・composite key・context・page identity・params・
+  producer競合・層変更・正規化不足・final下地変更・source欠落・source Arc変更を区別する。
+  注釈の世代／doc／font集合／loaded keyの変更は`ComicExclusion`とし、段・finalの全破棄と分ける。
+- 照合外の取消は`PreparedEditCancel`で、編集入場、Computing表示引取り、需要消滅、keep-set退去、
+  CPU圧力、Next優先、full-resolution作業延期、新要求による置換、worker切断／失敗、context退役を記録する。
+  pipeline失効は`PipelineInvalidation(FinalPipelineInvalidation)`で原因を保持し、
+  `clear_all_final_pipeline_caches`の呼出元もLUTロード完了／LUT設定変更／items変更／段・補正・AI世代変更等を明示する。
+  `CreativeLutLoaded`はkeyが一致していても正当な取消であり、照合拒否とは異なる。
+  pendingを除去する前、既存の要求・資源・状態が残る境界で記録する。新しいpending ownerは追加しない。
+- 製品perfイベントは`fs / prepared_edit_disposition`。既存`request_id`、要求の`context`、path `key`、
+  `idx`、`edit_key`、`composite_key`（bgを含む完全key）、`params_hash`、`state`、`frame`、`pass`、`entry`（caller file:line）、
+  `disposition`（`cancelled`／`comic_excluded`）、型付き`reason`、`proof`を出す。
+  `proof`はsource allocation identity・有無・寸法とmemory層の一致結果だけで、巨大なmask hashや文書全文を作らない。
+  activeなframe／passがないat-rest破棄では該当値をnullにする。perf無効時はJSON・Arc診断・pass取得を行わない。
+  テストだけのopt-in thread-local collectorで、perf無効時にも同じ型付きeventをassertできる。
+- 全update fixtureは設定のLUT署名とlibraryを揃え、起動LUT処理を完了済み／仕事なしへ固定してからBを投入する。
+  別の制御channelで投入後のLUT完了を配送し、`PipelineInvalidation(CreativeLutLoaded)`の取消を直接検査する。
+  過去の1失敗がこの原因だったとの断定はしない。sleep・期待値の削除・製品条件の緩和は行わない。
+- 非一様画像・実効果local・空間maskから、通常CPU経路で独立に作った累積期待値を比較する。
+  concealのみ、成功する注釈のみのraw／完成final入力、font一部不足、comic実走行枠満杯、
+  Computing中の変更、detached実表示、編集切替／ResumeのB固有回帰も補う。
+- `ComicCacheEntry`に採用時の`texture_options`を保持する。B・通常同期producer・通常worker採用の全てが
+  実optionsを保存し、公開後も同じmip有無でVRAMへ計上する。Nearestの架空mipを加算しない。
+
+検証コマンド・件数・独立レビュー結果は上記の実装報告へ追記する。今回の修正では確認用exeを再ビルドしない。
+
+Bの不足を理由とする新しい待機・演出省略は加えない。受理済み素材、held resource、canonical receiptを品質公開で差し替えない。
+表示引取り時に残るGPU登録コストを含む性能確認と利用者実機確認は未完了である。
+
+### 28.6 めくり終盤の「読み込み中」バッジ（§1.601、2026-10-29、実装済み・実機未確認）
+
+- 原因: navigation sequence は全 target 頁の Live な canonical flat 採用まで残る（§16.2）。
+  600ms の演出では 500ms のバッジ遅延を先に超える。ClaudeCode の隔離実機観測（`a41744e6d`）と条件が一致し、v4.7.0 タグにも同じ経路がある。
+- 初回実装（`dd5d00727`）は演出 state の受理済み unit を問い合わせたが、独立レビュー第1回で P2 を2件確認した。
+  自然着地の新 flat evidence は同じ frame 内では未受理なのでバッジが1 frame 再表示される。
+  比較等の描画が残した過去の Flat(A) は A→B→A の新しい Awaiting とも identity が一致し、実際には B の holdover を描く待機を隠せる。
+- 修正: `fs_navigation_target_presented_by_page_turn(ctx, sources)` は、バッジ直前の実描画で得た Paged receipt を正本にする。
+  同じ frame／pass、destination、content binding、現在の Running の Turning／Completing incoming の items 世代・mode・slice・layout・anchor、
+  全 occurrence／source／paint と sequence の全 Navigation 頁を照合する。受理 hook 前の自然着地も、画像とバッジが同じ出力へ入るため対象にする。
+  Turning は `MotionClock::Running` のときだけ数える。`AwaitingAcceptedOutput` は progress 0 で incoming 全頁が隠れる姿勢もあるため、開始待ちとしてバッジを保つ。
+  動き始めた curl は移動先へ向かう提示中とし、可視面積の閾値は導入しない。開始受理は既存の typed clock で区別し、現在の receipt 自体の acceptance は要求しない。
+  Completing は同じ pass の移動先 flat 提出を数え、受理 hook 前の自然着地でも非表示にする。canonical 全可視・採用証拠とは区別する。
+  sequence の完了条件・履歴・類似本確定・継続操作の barrier は変更しない。背景準備の既存 accepted 問い合わせも意味を維持する。
+- Flat は対象外。ON の通常 flat は既存の navigation observer の経路であり、演出の例外へ含めると通常の未提示待ちを隠す余地を作る。
+  通常 flat の全 Live／片頁非 Live の実提出を検査し、片頁不足の既存バッジを維持する。
+  新 state・待機・delay 変更は不要で、frame-local な提出を使う方が単純。モーダル化や操作制限も加えない。
+- 終端: 自然着地・Turning 取消後の Completing は、その pass で incoming に bind された flat を描けば非表示。
+  非 Live で sequence が残っても、この条件を満たす Completing は対象となる。canonical 採用後の sequence 退役は従来どおり。
+  開始待ちの Turning、Offered 取消後の旧 Flat、Inactive、古い frame／pass、binding／素材不一致、LegacyRendered／Unsubmitted は通常の待機判定へ戻る。
+  設定・source・geometry・binding 変更後も、記憶だけでは抑制しない。F12 は共通描画箇所を使い、detached 述語・viewport 経路は未変更。
+- 回帰: 純関数1件＋状態遷移6件。単頁／LTR／RTL の 600ms turn を550msと601msの同じ描画 closure 内で検査し、
+  hook 前の着地でバッジ非表示かつ sequence 未完了、次 frame の採用で完了することを確認する。
+  P2-2 は製品の captured／non-live holdover 描画で B を描き、Flat(A) の残存を fingerprint で確かめ、A の cache 退去後の再待機を検査する。
+  比較 UI 自体を構築する試験ではなく、不適格な通常 fallback と同じ「presentation binding のない receipt、Flat(A) 維持」の経路を使う。
+  古い frame／pass、binding／paint 不一致、片頁不足、取消、設定変更、Inactive、通常 Flat の片頁非 Live も対象。
+- `dd5d00727` の製品コードに新しい着地／往復回帰だけを加えると、2件とも目的のバッジ assertion で失敗した。
+  証跡は `target/pageturn-1601/revise1/dd5d00727-red-confirmed.log`。初回の307件・snapshot213件・lib14,658件成功はこの2経路を見逃しており、今回の修正後の証拠とは分ける。
+- 第1回REVISE対応後の検証（通常 feature／test profile、`dd5d00727` 上の差分、`551289142` までの証拠）:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/page_wait_indicator/)' --no-fail-fast` は12/12成功。
+  `cargo nextest run -p mimageviewer --lib -E 'test(/page_wait|page_turn/)' --no-fail-fast` は初回308成功／既知§1.447の vacant leaf 1失敗（33.322秒）。
+  条件や期待値を変えず同名の exact filter で単独再実行し、1/1成功（2.482秒）。
+  `cargo test --test ui_snapshot` は213/213成功（32.54秒、基準画像更新なし）。
+  最後の `scripts/test-lib-full.ps1` は14,660/14,660成功・既存除外65件（506.285秒、vacant leaf を含め失敗なし）。
+  関連・単独・snapshot・旧コードの失敗証跡は `target/pageturn-1601/revise1/`、全件ログは
+  `target/test-lib-full/runs/20261029T005658157Z-c7fb1a93/`。この時点の独立レビューでは以下の開始待ちを見逃していた。
+  全テストの後に引数なしの `cargo fmt` と `cargo fmt --check` が成功した。
+  今回は利用者指定により build-dev を実行せず、製品起動・実機確認・コミットも行わない。
+
+#### 第2回REVISE対応 — 開始待ちと動作中の区別（2026-10-29）
+
+`551289142` は Turning の clock を問わず、初回の未受理 curl でもバッジを消していた。
+既存の `page_turn_current_unit_presented` と同じ Running 条件を加え、Completing の同じ pass の flat 判定は維持した。
+RTL 前進・gap 0・幅入れ替わりの実 renderer 回帰で、sequence の opened_at は受理時刻のまま、
+初回描画前に TestClock を750msへ進めた。実際の prepared projection で incoming 全頁の可視面積0・旧頁の可視を確認し、
+同じ描画 closure 内で開始待ちのバッジ表示を検査する。受理後の次 frame は Running に移り、頁別の可視閾値なしに非表示となる。
+この可視面積の確認はテストだけに置き、製品判定には持ち込まない。既存の初回 curl の期待値も開始待ち表示へ訂正した。
+`551289142` の製品コードのまま、新回帰は目的のバッジ assertion で失敗した（`target/pageturn-1601/revise2/551289142-red.log`）。
+修正後の自動検証（通常 feature／test profile、`551289142` 上の今回の差分）:
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/page_wait|page_turn/)' --no-fail-fast` は初回309成功／既知§1.447の vacant leaf 1失敗（34.454秒）。新規の開始待ち回帰と既存の動作中・着地回帰は成功。
+- 条件や期待値を変えず同名の exact filter で単独再実行し、1/1成功（2.724秒）。
+- `cargo test --test ui_snapshot` は213/213成功（32.79秒、基準画像更新なし）。
+- 最後の `scripts/test-lib-full.ps1` は14,661/14,661成功・既存除外65件（517.392秒、vacant leaf を含め失敗なし）。
+- 関連・単独・snapshot・旧コードの失敗証跡は `target/pageturn-1601/revise2/`、全件ログは `target/test-lib-full/runs/20261029T012253207Z-66915b4d/`。独立レビューの未解決指摘なし。
+- 全テストの後に引数なしの `cargo fmt` と `cargo fmt --check` が成功した。
+
+今回は利用者指定により build-dev・製品起動・コミットは行わない。実機確認は ClaudeCode へ引き継ぐ。
+
+### 28.7 注釈フォントの先回り準備（§1.602、2026-10-29、設計第 2 版・独立設計レビュー ACCEPT）
+
+**観測と原因。** backlog §1.602 に記録した (観測者: ClaudeCode の隔離実機確認)。起動後に一度も注釈を表示していないと、
+注釈頁へのめくりは注釈なしの絵で動き、着地後に注釈が現れる。注釈用 FontSet は UI スレッドの `ensure_comic_fonts` /
+`ensure_comic_fonts_for` (`src/app.rs` 88830〜88871 行) だけが作り、段階 B は UI のメモリにある snapshot だけを使う
+(§28.5 B1/B2、`prepared_edit.rs` の `fonts_satisfy`)。そのため、表示が一度 font を読むまで、先回りは注釈を作れない。
+
+**方針。** font の準備を、表示とは別に worker でも行える 1 つの所有者にまとめ、段階 B の計画から要求する。
+めくりを待たせる・省く変更、表示の時機の変更は入れない。
+
+**F1 所有者と状態。** font は App 全体の資源で、viewer context の bundle に入っていない (`comic_docs`・`comic_stamp_cache` と同じ)。
+F12 の別ウィンドウも同じ所有者を共有し、context ごとには持たない。context の park でも読み込みを止めない (読み込みは context に依存しない)。
+既存の `comic_fonts` / `comic_fonts_loaded` / `comic_loaded_font_keys` の 3 つの field を、1 つの型 (仮称 `ComicFontOwner`) にまとめる:
+
+- `current`: `Unloaded` か `Ready { set: Option<Arc<FontSet>>, loaded: 読み込めた key, attempted: 要求した key }`。
+  `set: None` は既定の日本語 font が見つからなかった終端 (今の None と同じ意味)。
+- `load`: `Option<受信口>`。要求 key は worker 入力と結果の `attempted` に保持する。所有者が持つ受信口は 1 つだけ (捨てた worker は完走するので、実際に走る数の厳密な上限ではない。仕事は有限で、要求は F4 の終端で有限回に収まる)。
+
+field は非公開にし、変更は所有者のメソッドだけで行う。規則は 1 つ: **`load` の採用以外で `current` を変える操作は、必ず `load` を捨てる**。
+これで、届いた結果は常に要求時の `current` に対するものになり、採用時の照合 (世代番号や Arc の比較) が要らない。
+
+**F2 書き手。** `current` を変えるのは次の 3 つだけ。
+
+1. 同期の読み込み (`ensure_comic_fonts` / `ensure_comic_fonts_for`。表示・テキスト編集・書き出しが呼ぶ)。
+   まず `load` の結果を非 blocking で受け取り、届いていれば採用する。それで足りれば読まずに返す。
+   足りなければ `load` を捨て、今と同じく同期で読み直す (表示を待たせない今の挙動を保つ)。
+2. 非同期の採用 (下の F4 の poll)。
+3. 無効化 helper (1 つ)。今 3 か所に同じ field の書き換えが重複している:
+   追加パックの導入 (`ui_dialogs/editing_addon.rs` 235 行)、削除 (`ui_dialogs/preferences.rs` 3772 行)、
+   利用者のフォント追加 (`ui_text.rs` 4466 行。今は列挙のやり直しだけ)。
+   - 導入・削除: `current` を `Unloaded`、`load` を捨て、列挙を読み直す印を付ける (今と同じ)。
+   - フォント追加: 読み込み済みの `current.set` はそのまま使えるので残す。`load` を捨て、`attempted` を空にし (新しい font を要求し直せるように)、列挙を読み直す印を付ける。
+   - 見本・オノマトペの cache・`mark_comic_dirty` など、既存の付随処理は helper の呼び出し側に残す。
+
+**F3 worker。** 入力は、要求時の `loaded ∪ 新たに要求する key`。worker は自分で列挙し (結果は公開しない。ピッカー用の列挙は今の所有者のまま)、
+既定 font と各 key の読み込み・parse を行い、`(Option<FontSet>, loaded, attempted)` を返す。
+同期の読み込みと同じ組み立てを 1 つの純関数にまとめ、両方から使う (書き方を 2 か所に持たない)。
+取消の token は持たない (列挙と数本の font 読み込みで終わる有限の仕事)。捨てられた後の送信は失敗して終わる。
+完了時に root の再描画を要求する。perf に `comic / font_load` (所要 ms、key 数、結果) を記録する (ui-responsiveness §4)。
+読み込みの失敗はまれな失敗として割り切る: 今と同じく `set: None` かその key の欠落、ログのみ。
+ただし worker の異常終了（切断・spawn失敗）は font 不在の結果として採用しない。`current`を保持して`load`だけを捨て、ログを1回出す。
+独立した`prefetch_failed`の1 bitで無効化まで先回りだけを停止し、`invalidate`で解除する。同期`ensure`はこの記録を見ず、従来の表示用読み込みを維持する。自動再試行・回復処理は足さない（2026-10-29 設計担当の追補）。
+
+**F4 要求と poll。**
+
+- 要求: `prefetch_next_final_unit` の Next unit の頁ループで、`comic_pages` の頁に対し、`spawn_prepared_edit_job` の前に行う (mutable な位置)。
+  必要な key = (`Unloaded` なら既定 font) + (doc が `comic_docs` にあれば、参照 key のうち `loaded` にも `attempted` にも無いもの)。
+  必要な key があり、`load` が無く、先回りの異常終了記録がなければ worker を起動する。`load` が走っていれば何もしない (完了後の評価で残りを要求する)。
+  doc が未読込なら既定 font だけを要求し、doc が段階 B で解決された後の評価で参照 key を要求する。
+- 終端: `attempted` にある key は要求し直さない (パスの無い key で読み込みを繰り返さない)。`set: None` も終端。どちらも無効化 helper でだけ解ける。
+- `attempted` は無効化まで累積する: 非同期の採用でも同期の読み込みでも、新しい `attempted` = 旧 `attempted` ∪ 今回要求した key とし、置き換えない。過去に失敗した key を worker で読み直す必要はなく、採用時の和集合で足りる。(第 1 版は worker の結果で置き換えていたため、見開きの左右がパスの無い別々の key を参照すると、要求が交互に繰り返された。独立設計レビュー第 1 回 P2。)
+- poll: root の update phase で毎 frame 行う (`poll_all_page_edit_producers` の近く。App 全体の poll で、`ContextAsyncOwner` には入れない)。
+- 採用後は、段階 B の計画が毎回状態から判断し直すので、既存の経路で注釈だけの job が出る (新しい記憶や再試行の仕組みは足さない)。
+
+**F5 段階 B との関係 (変えないもの)。** 計画の snapshot (`fonts` Arc と `loaded` key)、`fonts_satisfy`、公開時の `ComicExclusion::FontSetChanged / FontKeysChanged` はそのまま使う。
+採用で Arc が替わると、走行中の B job の注釈は既存規則で除外され、次の評価で作り直される。
+参照 key にパスが無い頁は今と同じく B では焼かれず、表示が fallback で描く (変更なし)。
+
+**F6 状態を減らす検討。** モーダル化の対象ではない (利用者の操作と競合しない背景の読み込み)。
+読み込み中の表示側の待ちを作らず、「同期で読む側が非同期の要求を捨てる」で競合を 1 つの規則に畳んだ。
+世代番号は、F1 の規則で不要になったので持たない。
+
+**採らない案。** 先回りの計画から UI スレッドで同期に読む (UI スレッドの同期 I/O の規則に反する)。
+段階 B の job ごとに worker が font を読む (頁ごとに約 9MB を読み直し、共有資源を job ごとに持つ)。
+起動時に常に読む (注釈を使わない利用者にも費用がかかる)。表示側も非同期にして待つ (初回表示で注釈が遅れて現れる新しい退行になる)。
+
+**テスト。** 所有者の状態遷移 (要求 → 採用、読み込み中の同期読み込みで破棄、読み込み中の無効化で破棄、`attempted` の終端、`set: None` の終端、フォント追加で attempted が解ける)。パスの無い別々の key を参照する 2 頁 (または 2 つの context) を繰り返し評価しても、要求が有限回で止まる回帰。
+段階 B の統合: font 未読込で計画が要求し、採用後に注釈だけの job が出て、めくりの素材に注釈が入る。表示の同期読み込みが走った後に古い結果が採用されない。
+F12 の context から要求しても同じ所有者を使う。テストでは worker の読み込み関数を差し替え、システム font に依存しない。
+
+#### 28.7.1 実装記録（2026-10-29、実装済み・実機未確認）
+
+**実装境界。** 第2版の設計に従い、App共有の`ComicFontOwner`へ3 fieldを統合した。`current`と`load`は非公開。
+採用以外の変更は先に受信口を破棄し、同期・非同期とも`attempted`を累積する。世代番号・取消token・再試行ownerは足さない。
+同期ensureは非blocking採用後、足りればピッカーの列挙もせず返す。不足時だけ既存の同期経路へ進む。
+パス不明keyだけが不足する場合は従来のfallbackを保ち、set／loadedを残してattemptedだけ更新する（先に受信口を破棄）。
+この枝は既定fontの新たな同期再読込を防ぐもので、設計の状態・終端規則の変更ではない。
+FontSet組立てを共通関数へ集約し、workerだけが自分用に列挙する。完了時のroot再描画と`comic / font_load`計測を追加した。
+Next頁ループのB起動前から要求し、root update phaseで毎frame採用する。ContextAsyncOwner／viewer bundleには入れない。
+段階Bのsnapshot、`fonts_satisfy`、`ComicExclusion`の判定内容は維持し、detachedの述語・viewport経路は未変更。
+めくりの待ち・省略・表示時機の変更、新しいUI同期I/O、依存変更はない。
+
+**変更ファイル。**
+
+- 所有者・接続: `src/app/comic_fonts.rs`、`src/app.rs`、`src/app/final_prepare.rs`、`src/app/prepared_edit.rs`、`src/app/update_phases.rs`。
+- 無効化の集約: `src/ui_dialogs/editing_addon.rs`、`src/ui_dialogs/preferences.rs`、`src/ui_text.rs`。既存の見本／オノマトペcache・dirty処理はcallerに残す。
+- 新規回帰: `src/app/comic_fonts/tests.rs`（7件）、`src/app/prepared_edit/font_prefetch_tests.rs`（4件）。workerの読込差し替え、埋込font／font不要の塗りbubbleを用い、システムfontに依存しない。
+- 既存fixtureの直接field書込みをowner helperへ置換: `src/app/composite_pixels_revision_tests.rs`、`src/app/material_demand_revision_tests.rs`、`src/app/prepared_edit/tests.rs`、`src/app/prepared_edit/review_pixel_tests.rs`、`src/app/prepared_edit/review_lifecycle_tests.rs`、`src/app/tests.rs`、`src/ui_fullscreen.rs`、`src/ui_fullscreen/crop_order_tests.rs`、`src/ui_fullscreen/retained_material_entry_tests.rs`。`ui_fullscreen.rs`の追加helperもcfg(test)限定で、正規operation factを通してめくりの保持素材を検査する。
+- 文書: 本節、`docs/next-release-backlog.md` §1.602、`docs/display-pipeline.md`、`docs/ui-responsiveness.md`。公開マニュアル／製品ページは未変更。
+
+**検証（通常feature／test profile、HEAD `730251d4a`上の未コミット差分）。**
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/comic|font|prepared_edit|page_turn/)' --no-fail-fast`: 450件中449成功・既知§1.447のvacant leaf 1失敗（43.346秒）。新規11件は全成功。失敗項目を同じ条件のexact filterで単独再実行し1/1成功（3.265秒）。focused一式を成功扱いにはせず、単独補完と区別する。ログは`target/pageturn-1602/focused-4.log`、`vacant-leaf-alone.log`。
+- 所有者7件で採用、実行中の同期／無効化による破棄、attempted累積・終端、setなしの終端、font追加、パス不明keyの同期I/O回避、共通組立てを検査。統合4件でroot phase採用後の注釈only jobと実際の注釈画素／めくり保持texture、二頁の別々の不足keyの有限終端、同期表示後の旧worker破棄、F12要求→park→root採用→同一Arc共有を検査した。
+- 旧版確認: 製品sourceを`730251d4a`へ一時復元し、旧API用の再現テスト1件だけを追加した。font未準備・final完成済みの頁を4回計画／pollしても注釈only計画が可能にならず、目的のassertで0成功／1失敗（0.327秒）。`target/pageturn-1602/730251d4a-red.log`、手順は`baseline-red.py`。これは旧版専用の再現fixtureであり、新所有者のfake loaderや待機を使う現行11件と同一テストのred→greenではない。実装source16件は実行後に保存済みの全バイトへ復元し、独立レビューも一致を確認した。
+- `cargo test --test ui_snapshot`: 213/213成功・失敗0（40.34秒）。基準画像の更新なし。ログは`target/pageturn-1602/ui-snapshot.log`。
+- 最後の`scripts/test-lib-full.ps1`: 14,672/14,672成功・既存除外65件・失敗0（550.362秒、vacant leafを含む）。自動再試行・条件変更なし。ログ／JUnit／commandは`target/test-lib-full/runs/20261029T041305563Z-e215164c/`、呼出しログは`target/pageturn-1602/lib-full.log`。通常feature／test profile、全件実行時のsource識別子は`c0608adfdb5585ce203a76571b4e24a31f0dede846dd6a358105cf3a0ac1a136`。
+- 独立静的コードレビューはACCEPT、P1／P2／P3の未解決指摘なし。同期経路の不要なregistry列挙、パス不明keyの同期再読込、テスト用importのcfg境界、素材検査helperの正規operation factを確認・修正済み。自動検証は実装担当が所有し、レビュー担当は同じテストを重複実行しない。
+
+全テスト後、引数なしの`cargo fmt`を実施。計画文書はBOMなし＋CRLF、backlogはBOM付き＋CRLFを維持する。
+利用者指定によりbuild-dev・製品起動・コミットは行わない。実機確認はClaudeCodeへ引き継ぐ。
+
+**worker異常終了時の追補（2026-10-29、設計担当の判断、`fc26cb911`上の修正）。**
+切断を`Ready { set: None }`として採用していた経路を廃止し、Unloaded／既存ReadyのArc・loaded・attemptedをそのまま保持する。
+`prefetch_failed`だけを記録して受信口を捨て、先回りは無効化まで停止する。同期ensureは停止記録を見ず、従来どおりfontを読み注釈を表示できる。
+spawn失敗も同じ入口で1回だけ記録し、その後のpollで重複ログを出さない。不要になった`load`の要求keyコピーを撤去した。
+変更は`src/app/comic_fonts.rs`、同`tests.rs`、本節、backlog §1.602。送信側を落とす2件の回帰を追加し、Unloaded／Ready保持、同期での実テキスト描画、反復requestの停止、両invalidate理由による解除をシステムfontなしで検査する。
+
+追補の自動検証（通常feature／test profile、`fc26cb911`上の未コミット差分、ログは`target/pageturn-1602/worker-failure/`）:
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/comic_fonts|font_prefetch/)' --no-fail-fast`: 14/14成功（0.399秒、`focused-owner.log`）。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/comic|font|prepared_edit|page_turn/)' --no-fail-fast`: 452/452成功（38.244秒、`focused-related.log`）。既知vacant leafも成功し、単独補完なし。
+- `cargo test --test ui_snapshot`: 213/213成功（30.98秒、`ui-snapshot.log`）。基準画像の更新なし。
+- 最後の`scripts/test-lib-full.ps1`: 14,674/14,674成功・既存除外65件・失敗0（509.343秒、`lib-full.log`）。ログ／JUnit／commandは`target/test-lib-full/runs/20261029T044527493Z-ea987a18/`、実行時source識別子は`af04a77774644cceb14d1d66f778e04b98c7cb565a2f1367a05894f60f7f182c`。全件・関連とも単独補完や自動再試行なし。
+- 独立静的レビューACCEPT、P1／P2／P3の未解決指摘なし。テストは実装担当のみが実行し、全テスト後に引数なしの`cargo fmt`が成功、`git diff --check`も成功した。利用者指定によりbuild-dev・製品起動・コミットは行わない。

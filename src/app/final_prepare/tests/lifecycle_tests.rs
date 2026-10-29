@@ -1,4 +1,5 @@
 //! Windows context transitions with real D3 workers and their existing owners.
+use super::super::resident_edited_tests::stage as edited_stage;
 use super::*;
 use crate::ui_fullscreen::page_turn_submission_tests::{
     draw_current_without_sources, frame, install_presentation,
@@ -86,6 +87,142 @@ fn reservation_ptr(pending: &FinalEffectPending) -> usize {
             Arc::as_ptr(&ready.reservation) as usize
         }
         _ => panic!("D3 reservation required"),
+    }
+}
+
+#[test]
+fn e3_edited_input_owner_survives_transfer_park_and_sibling_invalidation() {
+    for ready in [false, true] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        let window = 96_301;
+        let id = active_owner(&mut app, &ctx, window);
+        let hold = (!ready).then(WorkerHold::new);
+        let (key, cancel, reservation) = app
+            .with_active_viewer_context(|owner| {
+                edited_stage(owner, &ctx, 1, "erase");
+                assert!(start(owner, &ctx, 1));
+                let key = if ready {
+                    wait_ready(owner, 1)
+                } else {
+                    pending_key(owner, 1)
+                };
+                let cancel = owner.final_effect_pending[&key].cancel.clone();
+                let reservation = reservation_ptr(&owner.final_effect_pending[&key]);
+                (key, cancel, reservation)
+            })
+            .unwrap();
+        if let Some(hold) = &hold {
+            hold.entered();
+        }
+        let budget = app.final_prepare_cpu.snapshot();
+        assert!(app.pause_current_active_viewer_context(&ctx));
+        assert_eq!(
+            app.detached_window_state(window),
+            Some(DetachedWindowState::Parked)
+        );
+        // The mounted main sibling has the same page index, but none of the
+        // edited owner's resources or cancellation authority.
+        app.bump_input_generation(1);
+        begin_registration_frame(&mut app, 201);
+        app.with_viewer_context(id, |owner| owner.observe_live_paged_for_final_prepare())
+            .unwrap();
+        app.finalize_speculative_gpu_output(&ctx, 201, 1);
+        assert_eq!(
+            app.final_prepare_cpu.snapshot(),
+            budget,
+            "park starts no additional job"
+        );
+        app.with_viewer_context(id, |owner| {
+            assert_eq!(owner.final_effect_pending.len(), 1);
+            assert!(Arc::ptr_eq(
+                &owner.final_effect_pending[&key].cancel,
+                &cancel
+            ));
+            assert_eq!(
+                reservation_ptr(&owner.final_effect_pending[&key]),
+                reservation
+            );
+            assert!(
+                owner.edit_result_cache.keys().all(|key| key.idx != 1),
+                "the displayed page 0 may own an edit entry; D3 must not materialize target 1"
+            );
+        })
+        .unwrap();
+        assert!(!cancel.load(Ordering::Relaxed));
+        if let Some(hold) = &hold {
+            hold.release();
+        }
+        wait_idle(&app);
+        assert!(app.activate_detached_image_window_snapshot(&ctx, window));
+        app.with_active_viewer_context(|owner| {
+            assert_eq!(
+                reservation_ptr(&owner.final_effect_pending[&key]),
+                reservation
+            );
+            assert!(owner.ensure_final_composite_texture(&ctx, 1).is_some());
+            assert!(owner.final_composite_cache.contains_key(&key));
+            assert!(
+                owner.edit_result_cache.keys().all(|key| key.idx != 1),
+                "adoption consumes the prepared target before edit-input ensure"
+            );
+            assert_eq!(owner.projected_viewer_context_id(), id);
+        })
+        .unwrap();
+        assert!(app.final_effect_pending.is_empty());
+        assert!(
+            app.final_composite_cache
+                .keys()
+                .all(|key| key.edit_key.idx != 1)
+        );
+        assert_eq!(app.final_prepare_cpu.snapshot().bytes, 0);
+    }
+}
+
+#[test]
+fn e3_edited_input_fork_starts_with_empty_owner_and_preserves_main_job() {
+    for ready in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        edited_stage(&mut app, &ctx, 1, "erase");
+        let main = app.projected_viewer_context_id();
+        let hold = (!ready).then(WorkerHold::new);
+        assert!(start(&mut app, &ctx, 1));
+        let key = if let Some(hold) = &hold {
+            hold.entered();
+            pending_key(&app, 1)
+        } else {
+            wait_ready(&mut app, 1)
+        };
+        let cancel = app.final_effect_pending[&key].cancel.clone();
+        let reservation = reservation_ptr(&app.final_effect_pending[&key]);
+        let before = app.final_prepare_cpu.snapshot();
+        // Physical materialization forks from the main/grid origin. Detached
+        // active-to-park transfer is exercised separately above.
+        let physical = app.tmp.path().join("e3-fork-physical");
+        let fork = app.fork_materialized_still_context(&physical, 0);
+        assert_ne!(fork, main);
+        assert_eq!(app.projected_viewer_context_id(), main);
+        app.with_viewer_context(fork, |owner| {
+            assert!(owner.final_effect_pending.is_empty());
+            assert!(owner.final_composite_cache.is_empty());
+        })
+        .unwrap();
+        app.retire_context(fork, "e3-fork-test", |_| ()).unwrap();
+        assert!(Arc::ptr_eq(&app.final_effect_pending[&key].cancel, &cancel));
+        assert_eq!(
+            reservation_ptr(&app.final_effect_pending[&key]),
+            reservation
+        );
+        assert_eq!(app.final_prepare_cpu.snapshot(), before);
+        assert!(!cancel.load(Ordering::Relaxed));
+        if let Some(hold) = &hold {
+            hold.release();
+        }
+        wait_ready(&mut app, 1);
+        app.cancel_final_effects_for_idx(1);
+        assert_eq!(app.final_prepare_cpu.snapshot().bytes, 0);
     }
 }
 

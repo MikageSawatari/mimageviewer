@@ -2918,7 +2918,9 @@ impl App {
                 }
                 self.creative_lut_library
                     .reload(&self.settings.creative_luts);
-                self.clear_all_final_pipeline_caches();
+                self.clear_all_final_pipeline_caches(
+                    crate::app::FinalPipelineInvalidation::CreativeLutSettingsChanged,
+                );
                 #[cfg(windows)]
                 self.sync_native_video_grade();
             }
@@ -3783,10 +3785,7 @@ impl App {
         let _ = std::fs::remove_file(crate::editing_addon::active_pointer_path());
         // 2. フォント / 被写体マットキャッシュ無効化。
         //    active pointer を外した後なので refresh は None になり、被写体マスク生成が即 disabled になる。
-        self.comic_fonts = None;
-        self.comic_fonts_loaded = false;
-        self.comic_loaded_font_keys.clear();
-        self.comic_font_registry_loaded = false; // pack フォントを一覧から外す
+        self.invalidate_comic_fonts(crate::app::comic_fonts::FontInvalidation::SourcesChanged);
         // フォントソースが変わったので見本 / オノマトペプレビュー + 焼き済み注釈
         // (comic_cache) も無効化する (Codex P2)。
         self.font_sample_cache.clear();

@@ -36,6 +36,8 @@ mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
 #[cfg(test)]
+mod prepared_edit_entry_tests;
+#[cfg(test)]
 mod retained_material_entry_tests;
 #[cfg(test)]
 mod slideshow_settings_tests;
@@ -56,9 +58,13 @@ use eframe::egui;
 #[cfg(test)]
 mod book_composition_tests;
 #[cfg(test)]
+mod compare_crop_tests;
+#[cfg(test)]
 mod coverage_spread_tests;
 #[cfg(test)]
 mod coverage_tests;
+#[cfg(test)]
+mod crop_order_tests;
 #[cfg(test)]
 mod display_basis_tests;
 #[cfg(test)]
@@ -4378,17 +4384,18 @@ fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time
 /// Whether the accepted navigation target has not yet been presented long enough to explain the
 /// visible holdover to the user.
 ///
-/// The navigation sequence is the presentation fact: it is retired only after every page in the
-/// target display unit was painted live. Its own lifetime supplies the UX-delay anchor, independent
-/// of whether decode has completed and presentation is waiting on a later pipeline stage.
+/// The navigation sequence is retired only after every target page was painted live in canonical
+/// flat output. This pass's turn/landing submission can already show that unit while the sequence
+/// remains active. Otherwise its lifetime supplies the UX-delay anchor, independent of decode readiness.
 fn fs_page_wait_indicator_visible(
     processing_status_visible: bool,
+    target_presented_by_page_turn: bool,
     holdover: Option<&FsHoldover>,
     current_idx: usize,
     items_generation: u64,
     now: std::time::Instant,
 ) -> bool {
-    if !processing_status_visible {
+    if !processing_status_visible || target_presented_by_page_turn {
         return false;
     }
     let Some(sequence) = holdover
@@ -11675,6 +11682,45 @@ impl App {
             .map(|material| material.source_texture().clone())
     }
 
+    fn prepare_single_crop_from_frame_state(
+        &mut self,
+        idx: usize,
+        state: &FsFrameState,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let (w, h) = state.image_dims?;
+        let size = [w as usize, h as usize];
+        // This display accessor adopts only the same pure crop resolution as
+        // acceptance. Frame layout or quality dimensions are only paint inputs.
+        let _ = self.export_crop_for_idx(idx, size);
+        self.prepared_single_page_crop(idx, size, state.original_preview_active)
+    }
+
+    fn prepared_single_page_crop(
+        &self,
+        idx: usize,
+        image_size: [usize; 2],
+        original_preview_active: bool,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let earlier_tool = self.erase_mode
+            || self.local_adjust_mode
+            || self.conceal_mode
+            || self.sns_split.is_some()
+            || self.adjustment_mode.is_open()
+            || self.analysis_mode;
+        if original_preview_active || (!self.export_crop_mode && earlier_tool) {
+            return None;
+        }
+        self.resident_export_crop_for_idx(idx).or_else(|| {
+            self.export_crop_mode.then(|| {
+                crate::export_crop::CropSettings::authored(
+                    crate::export_crop::CropRect::full(image_size[0], image_size[1]),
+                    self.export_crop_aspect_mode,
+                    image_size,
+                )
+            })
+        })
+    }
+
     fn resolve_fs_display_material_from_caches(
         &self,
         idx: usize,
@@ -11709,14 +11755,8 @@ impl App {
         if let Some(tex) = self.current_edit_result_material(idx) {
             return Some(tex);
         }
-        if let Some(material) = self.current_conceal_material(idx) {
+        if let Some((material, _, _)) = self.exact_resident_edit_stage(idx) {
             return Some(material);
-        }
-        if let Some(tex) = self.current_local_adjust_material(idx) {
-            return Some(tex);
-        }
-        if let Some(tex) = self.current_erase_result_material(idx) {
-            return Some(tex);
         }
         if let Some(material) = self.source_material_for_idx(idx) {
             return Some(material);
@@ -12188,7 +12228,11 @@ impl App {
             return "edit";
         }
         if self.conceal_cache.get(&idx).is_some_and(|entry| {
-            entry.generation == self.conceal_generation && entry.texture.id() == texture_id
+            entry.generation == self.conceal_generation
+                && entry
+                    .texture
+                    .as_ref()
+                    .is_some_and(|texture| texture.id() == texture_id)
         }) {
             return "conceal";
         }
@@ -12456,6 +12500,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn capture_paged_display_unit_for_snapshot(
         &mut self,
+        ctx: Option<&egui::Context>,
         idx: usize,
     ) -> Option<CapturedPagedDisplayUnit> {
         if let Some(mut unit) = self
@@ -12474,11 +12519,19 @@ impl App {
                 presentation: CapturedPagedDisplayPresentation::Holdover,
             });
         }
-        self.capture_fs_display_unit(idx)
-            .map(|unit| CapturedPagedDisplayUnit {
+        let original_preview =
+            ctx.is_some_and(|ctx| self.original_preview_active_for_frame(ctx, idx));
+        self.capture_fs_display_unit(idx).map(|mut unit| {
+            if original_preview {
+                for page in &mut unit.pages {
+                    page.crop = None;
+                }
+            }
+            CapturedPagedDisplayUnit {
                 unit,
                 presentation: CapturedPagedDisplayPresentation::Live,
-            })
+            }
+        })
     }
 
     /// Resolve the last unit painted by this mounted viewer context. Paged rendering clears and
@@ -12819,6 +12872,13 @@ impl App {
             .map(|entry| entry.load_seq())
             .unwrap_or(0);
         Some(FsDisplayUnitHoldoverPage {
+            crop: self.prepared_single_page_crop(
+                idx,
+                source_size
+                    .map(|v| [v.x.max(1.0) as usize, v.y.max(1.0) as usize])
+                    .unwrap_or(texture.size()),
+                rendition_ctx.is_some_and(|ctx| self.original_preview_active_for_frame(ctx, idx)),
+            ),
             occurrence,
             texture,
             rotation,
@@ -13269,7 +13329,7 @@ impl App {
                     return self.resolve_local_adjust_source_material(ctx, idx);
                 }
                 LocalAdjustPreviewAction::FullComposite => {
-                    if let Some(local_adjust_tex) = self.current_local_adjust_material(idx) {
+                    if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
                         return Some(local_adjust_tex);
                     }
                     return self.resolve_local_adjust_source_material(ctx, idx);
@@ -13278,7 +13338,7 @@ impl App {
         }
 
         if self.conceal_mode && !self.conceal_preview_active {
-            if let Some(local_adjust_tex) = self.current_local_adjust_material(idx) {
+            if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
                 return Some(local_adjust_tex);
             }
             if let Some(erase_result_tex) = self.ensure_erase_result_material(ctx, idx) {
@@ -14733,7 +14793,7 @@ impl App {
         state: &FsFrameState,
         seek_geometry: StillSeekGeometry,
     ) -> Option<DisplayedImageTransform> {
-        self.draw_fs_zoom_mode_with_receipt(
+        let painted = self.draw_fs_zoom_mode_with_receipt(
             ui,
             ctx,
             image_rect,
@@ -14742,7 +14802,28 @@ impl App {
             state,
             seek_geometry,
             None,
-        )
+        );
+        if let Some(transform) = painted.as_ref() {
+            let crop = self.prepare_single_crop_from_frame_state(fs_idx, state);
+            Self::paint_fs_frame_crop(ui, transform, crop);
+        }
+        painted
+    }
+
+    /// Route flat composites to the shared crop owner at the original phase,
+    /// after grid/aim/Wipe and canvas overlays, before crop edit handles.
+    fn paint_fs_frame_crop(
+        ui: &egui::Ui,
+        transform: &DisplayedImageTransform,
+        crop: Option<crate::export_crop::CropSettings>,
+    ) {
+        if let Some(crop) = crop {
+            page_turn::paint_flat_crop(
+                &ui.painter().with_clip_rect(transform.viewport_rect),
+                transform,
+                crop,
+            );
+        }
     }
 
     fn draw_fs_zoom_mode_with_receipt(
@@ -14808,6 +14889,8 @@ impl App {
                 None,
                 submitted,
                 false,
+                None,
+                page_turn::FlatCropPaint::WithPage,
             );
         };
         // 表示トリムが有効ならズーム対象をトリム後 bbox に絞る (切り落とした余白を見せない)。
@@ -14914,6 +14997,11 @@ impl App {
             trim_bbox,
             submitted,
             false,
+            // Z composes its aim/grid overlays before the shared crop owner.
+            // It is not an animated page; ordinary/canonical crop binding stays
+            // with the normal prepared-page path.
+            None,
+            page_turn::FlatCropPaint::WithPage,
         );
         if active {
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
@@ -28303,6 +28391,7 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
+                        let mut flat_crop = page_turn::FlatCrop::None;
                         let mut primary_draw = CompareFramePrimaryDraw::OrdinaryOnly;
                         let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
                             FsNavigatorTextureSources::single(
@@ -28477,6 +28566,7 @@ impl App {
                                                     paint_idx,
                                                     compare_mode,
                                                     zp,
+                                                    None,
                                                 );
                                             if prepared_compare_drawn {
                                                 navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
@@ -28502,6 +28592,7 @@ impl App {
                                                 } else {
                                                     self.view_trim_single_content_bbox(paint_idx)
                                                 };
+                                                let crop = self.prepare_single_crop_from_frame_state(paint_idx, &state);
                                                 let paint_resource =
                                                     self.fullscreen_paint_payload_for_page(
                                                         paint_idx, state.tex.clone(), state.original_preview_active,
@@ -28547,6 +28638,8 @@ impl App {
                                                     content_bbox,
                                                     selected_display_unit.is_current().then_some(&mut navigator_texture_sources),
                                                     self.settings.page_turn_animation_enabled && !state.original_preview_active && self.page_turn_view_eligible(fs_idx),
+                                                    crop,
+                                                    page_turn::FlatCropPaint::AfterCanvas(&mut flat_crop),
                                                 );
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 if painted.is_some() {
@@ -28740,6 +28833,10 @@ impl App {
                                 ctx.request_repaint();
                             }
 
+                            // Only actual flat paint, including the first canonical
+                            // landing, produces this value. Curl owns face-projected
+                            // crop and leaves it empty through its last frame.
+                            flat_crop.paint();
                             let has_crop = self.export_crop_for_idx(paint_idx, image_size).is_some();
                             // crop はパイプライン最後段。crop の枠 / 暗転は「切り取りツール」
                             // または「素の通常表示」でのみ出す。各ツールは自分の手前までの
@@ -28762,6 +28859,17 @@ impl App {
                                             self.export_crop_panel_rect(full_rect).contains(p)
                                         })
                                     });
+                                if matches!(transform.placement, ResolvedDisplayPlacement::Z { .. })
+                                    || primary_draw.draws_prepared_compare()
+                                {
+                                    let crop = self.prepare_single_crop_from_frame_state(paint_idx, &state)
+                                        .map(|crop| if primary_draw.draws_prepared_compare() {
+                                            // Compare's canvas can differ from the source;
+                                            // keep the same coordinates as its crop handles.
+                                            crop.scaled_to(image_size)
+                                        } else { crop });
+                                    Self::paint_fs_frame_crop(ui, transform, crop);
+                                }
                                 let used = self.draw_export_crop_overlay(
                                     ui,
                                     transform,
@@ -28886,11 +28994,12 @@ impl App {
                         // ── 移動先ページ未提示インジケーター ──
                         // NavigationSequence は target display unit の全ページが live に描かれた
                         // frame で上の emit_fs_page_turn_ready_for_display_unit が破棄する。したがって
-                        // sequence 自身の未 retire 時間だけで判定し、decode pending の有無には
-                        // 結び付けない。decode 済みでも upload / presentation 待ちは起こり得る。
+                        // この pass で演出 owner の target unit を描いていれば表示しない。それ以外は
+                        // sequence の未 retire 時間で判定する。decode pending の有無には結び付けない。
                         if similar_preview_presentation.is_none()
                             && fs_page_wait_indicator_visible(
                             self.settings.fullscreen_processing_status_visible,
+                            self.fs_navigation_target_presented_by_page_turn(ctx, &navigator_texture_sources),
                             self.fs_holdover_tex.as_ref(),
                             paint_idx,
                             self.items_generation,
@@ -30745,7 +30854,7 @@ impl App {
         self.service_final_prepare_before_lookup(ctx);
         let demand = self.book_target_presentation_demand(fs_idx);
         if !matches!(
-            self.book_presentation_allowed(&demand),
+            self.book_presentation_target_allowed(&demand),
             crate::book_composition::PresentationDecision::Allowed(_)
         ) {
             return FsPageTurnDecision::normal();
@@ -33997,7 +34106,7 @@ impl App {
             .presentation_demand(self.spread_mode, self.fullscreen_page_slice);
         let target_load_allowed = self.page_overview.session().is_none()
             && !self.continuous_reading_active_for_idx(fs_idx)
-            && matches!(self.book_presentation_allowed(&initial_demand),
+            && matches!(self.book_presentation_target_allowed(&initial_demand),
                 crate::book_composition::PresentationDecision::Allowed(ref allowed)
                     if initial_demand.iter().zip(allowed).any(|(occurrence, allowed)|
                         occurrence.item_index == fs_idx && *allowed));
@@ -44095,6 +44204,8 @@ impl App {
             content_bbox,
             None,
             false,
+            None,
+            page_turn::FlatCropPaint::WithPage,
         )
     }
 
@@ -44128,6 +44239,8 @@ impl App {
         content_bbox: Option<egui::Rect>,
         submitted: Option<&mut FsNavigatorTextureSources>,
         live_eligible: bool,
+        crop: Option<crate::export_crop::CropSettings>,
+        mut flat_crop: page_turn::FlatCropPaint<'_>,
     ) -> Option<DisplayedImageTransform> {
         // Current items resolve the active split here. A captured holdover keeps
         // its capture-time crop even if the replacement item or mode changes.
@@ -44248,6 +44361,7 @@ impl App {
                 self.observe_raw_presentation(page_idx);
             }
             let page = PreparedPagedPage {
+                crop,
                 occurrence: SpreadPageOccurrence {
                     idx: page_idx,
                     role: SpreadPageRole::Navigation,
@@ -44271,8 +44385,12 @@ impl App {
             let img_rect = transform.full_image_rect;
             let total_scale = transform.total_scale;
             if let Some(submitted) = submitted {
-                let receipt =
-                    self.submit_paged_display_unit(ui.ctx(), std::slice::from_ref(&page), white);
+                let receipt = self.submit_paged_display_unit_with_flat_crop(
+                    ui.ctx(),
+                    std::slice::from_ref(&page),
+                    white,
+                    flat_crop,
+                );
                 let presentation = receipt
                     .as_ref()
                     .is_some_and(SubmittedUnitReceipt::has_presentation_binding);
@@ -44306,7 +44424,7 @@ impl App {
                     );
                     white_painter.rect_filled(white_rect, 0.0, egui::Color32::WHITE);
                 }
-                page_turn::paint_flat_page(&page);
+                page_turn::paint_flat_page_at_crop_phase(&page, &mut flat_crop);
             }
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
@@ -45387,7 +45505,7 @@ impl App {
         self.fullscreen_page_layout.begin(previous.layout_kind);
         let bg_style = self.fs_bg_style(ctx);
         for (page, captured) in previous.previous.pages.iter().zip(&previous.transforms) {
-            if let Some(transform) = self.draw_fs_image(
+            if let Some(transform) = self.draw_fs_image_with_receipt(
                 ui,
                 image_rect,
                 page.idx(),
@@ -45400,7 +45518,7 @@ impl App {
                 Some(*captured),
                 None,
                 previous.previous.singleton_placement,
-                Some(&page.texture),
+                Some(&page.texture.clone().into()),
                 None,
                 false,
                 false,
@@ -45414,6 +45532,12 @@ impl App {
                 captured.fit_mode,
                 captured.fit_scale_limits,
                 page.content_bbox,
+                None,
+                false,
+                (previous.previous.pages.len() == 1)
+                    .then_some(page.crop)
+                    .flatten(),
+                page_turn::FlatCropPaint::WithPage,
             ) {
                 self.fullscreen_page_layout
                     .push_occurrence(transform, page.occurrence);
@@ -48152,10 +48276,21 @@ impl App {
         zoom_pan: Option<(f32, egui::Vec2)>,
         fit_scale_limits: FullscreenFitScaleLimits,
     ) -> Option<egui::Rect> {
+        Self::compare_image_transform(full_rect, 0, image_size, zoom_pan, fit_scale_limits)
+            .map(|transform| transform.full_image_rect)
+    }
+
+    fn compare_image_transform(
+        full_rect: egui::Rect,
+        page_idx: usize,
+        image_size: [usize; 2],
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        fit_scale_limits: FullscreenFitScaleLimits,
+    ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
             pixel_fit: RectPixelFit::Texels,
-            page_idx: 0,
+            page_idx,
             viewport_rect: full_rect,
             source_size: tex_size,
             texture_size: tex_size,
@@ -48168,7 +48303,6 @@ impl App {
             pixels_per_point: fit_scale_limits.pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan },
         })
-        .map(|transform| transform.full_image_rect)
     }
 
     #[cfg(windows)]
@@ -48956,10 +49090,20 @@ impl App {
         fs_idx: usize,
         mode: crate::app::CompareViewMode,
         zoom_pan: Option<(f32, egui::Vec2)>,
+        crop: Option<crate::export_crop::CropSettings>,
     ) -> bool {
         if !self.compare_prepared_pair_matches(fs_idx) {
             return false;
         }
+        let transform = self.compare_preparation.prepared_pair().and_then(|pair| {
+            Self::compare_image_transform(
+                image_rect,
+                fs_idx,
+                pair.target_size,
+                zoom_pan,
+                self.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+            )
+        });
         // Do not read `ctx.input().modifiers` here: the fullscreen viewport can retain a stale
         // modifier snapshot while the physical Ctrl state changes during the same drag.
         let ctrl_held =
@@ -49014,11 +49158,14 @@ impl App {
                     affordance,
                 );
             }
+            if let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+                page_turn::paint_flat_crop(ui.painter(), transform, crop);
+            }
             return true;
         }
 
         let fit_scale_limits = self.fullscreen_fit_scale_limits(ctx.pixels_per_point());
-        match mode {
+        let painted = match mode {
             crate::app::CompareViewMode::PinnedNormal => {
                 let tex = self.ensure_compare_prepared_texture(
                     ctx,
@@ -49084,8 +49231,6 @@ impl App {
                     Some(clip),
                     fit_scale_limits,
                 );
-                let affordance = compare_wipe_affordance(ctrl_held);
-                Self::draw_compare_wipe_affordance(ui, ref_rect, fraction, affordance);
                 true
             }
             crate::app::CompareViewMode::Diff => {
@@ -49110,7 +49255,22 @@ impl App {
                 true
             }
             crate::app::CompareViewMode::Off => false,
+        };
+        if painted
+            && let (Some(transform), crate::app::CompareViewMode::Wipe { fraction, .. }) =
+                (transform.as_ref(), mode)
+        {
+            Self::draw_compare_wipe_affordance(
+                ui,
+                transform.full_image_rect,
+                fraction,
+                compare_wipe_affordance(ctrl_held),
+            );
         }
+        if painted && let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+            page_turn::paint_flat_crop(ui.painter(), transform, crop);
+        }
+        painted
     }
 
     fn draw_compare_pinned_image(
@@ -49653,6 +49813,8 @@ impl App {
                         page.content_bbox,
                         Some(&mut sources),
                         false,
+                        page.crop,
+                        page_turn::FlatCropPaint::WithPage,
                     )
                 };
                 if let Some(transform) = transform {
@@ -50760,6 +50922,7 @@ impl App {
                 self.observe_raw_presentation(idx);
             }
             return Some(PreparedPagedPage {
+                crop: None,
                 occurrence: SpreadPageOccurrence {
                     idx,
                     role: SpreadPageRole::Navigation,
@@ -53095,6 +53258,7 @@ impl App {
             let composed = std::sync::Arc::new(pixels);
             let t_up = std::time::Instant::now();
             let upload = crate::app::clamp_for_gpu(&composed).into_owned();
+            let texture_options = self.display_texture_options(i);
             let texture = ctx.load_texture(
                 format!(
                     "comic_{i}_{}_{}_{}",
@@ -53106,7 +53270,7 @@ impl App {
                 // 注釈の焼き込みは同期経路 (`ensure_comic_composite_texture`) と
                 // この worker 完了経路の**2 つ**が上げる。片方だけ直したせいで、
                 // ニアレストが効かない症状が残った (利用者報告 2026-08-13)。
-                self.display_texture_options(i),
+                texture_options,
             );
             let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
@@ -53146,6 +53310,7 @@ impl App {
                     ),
                     pixels: composed,
                     texture,
+                    texture_options,
                     base: p.base,
                     comic_gen: p.comic_gen,
                     dims: p.dims,
@@ -55818,6 +55983,7 @@ impl App {
         indices: &[usize],
     ) -> Result<(), String> {
         for &idx in indices {
+            self.cancel_prepared_edit_for_entry(idx);
             if (self.has_active_local_adjust_layers(idx)
                 && self.current_local_adjust_pixels(idx).is_none())
                 || (self.local_adjust_pages.contains(&idx)
@@ -63315,6 +63481,7 @@ mod tests {
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(!fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -63329,6 +63496,7 @@ mod tests {
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -63348,12 +63516,15 @@ mod tests {
         let now = opened_at + std::time::Duration::from_secs(1);
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&presenting),
             7,
             3,
             now,
         ));
-        assert!(!fs_page_wait_indicator_visible(true, None, 7, 3, now));
+        assert!(!fs_page_wait_indicator_visible(
+            true, false, None, 7, 3, now
+        ));
     }
 
     #[test]
@@ -63367,6 +63538,7 @@ mod tests {
         );
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -63375,11 +63547,30 @@ mod tests {
     }
 
     #[test]
+    fn page_wait_indicator_hides_for_presented_page_turn_target_with_sequence_still_active() {
+        let opened_at = std::time::Instant::now();
+        let holdover = page_wait_navigation_sequence(
+            opened_at,
+            3,
+            vec![7, 8],
+            navigation_presenting(vec![7, 8], FsNavigationPresentation::Materialized),
+        );
+        let now = opened_at + std::time::Duration::from_secs(1);
+        for presented in [false, true] {
+            assert_eq!(
+                fs_page_wait_indicator_visible(true, presented, Some(&holdover), 7, 3, now),
+                !presented,
+            );
+        }
+    }
+
+    #[test]
     fn page_wait_indicator_respects_processing_status_setting() {
         let opened_at = std::time::Instant::now();
         let holdover =
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(!fs_page_wait_indicator_visible(
+            false,
             false,
             Some(&holdover),
             7,
@@ -63393,6 +63584,7 @@ mod tests {
         let opened_at = std::time::Instant::now();
         assert!(!fs_page_wait_indicator_visible(
             true,
+            false,
             None,
             7,
             3,
@@ -66228,6 +66420,7 @@ mod tests {
         texture: egui::TextureHandle,
     ) -> FsDisplayUnitHoldoverPage {
         FsDisplayUnitHoldoverPage {
+            crop: None,
             fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             occurrence: SpreadPageOccurrence::navigation(idx, idx),
@@ -68399,6 +68592,7 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
                 fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -68966,6 +69160,7 @@ mod tests {
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
         let page = PreparedPagedPage {
+            crop: None,
             occurrence: SpreadPageOccurrence::navigation(0, 0),
             transform,
             resource: native.into(),
@@ -69041,6 +69236,7 @@ mod tests {
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
         let page = PreparedPagedPage {
+            crop: None,
             occurrence: SpreadPageOccurrence::navigation(0, 0),
             transform,
             resource: native.into(),
@@ -69112,6 +69308,7 @@ mod tests {
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75)),
                 );
                 Some(PreparedPagedPage {
+                    crop: None,
                     occurrence: SpreadPageOccurrence::navigation(idx, 0),
                     transform: navigator_test_transform(
                         idx,
@@ -69335,6 +69532,8 @@ mod tests {
                                     content_bbox,
                                     None,
                                     true,
+                                    None,
+                                    page_turn::FlatCropPaint::WithPage,
                                 )
                                 .is_some()
                             );
@@ -69515,6 +69714,7 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
                 fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(4, 4),
@@ -76180,6 +76380,7 @@ mod tests {
                     singleton_placement: SingletonSpreadPlacement::Center,
                     layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                     pages: vec![FsDisplayUnitHoldoverPage {
+                        crop: None,
                         fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                         fit_scale_limits: FullscreenFitScaleLimits::default(),
                         occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -76212,6 +76413,7 @@ mod tests {
                 singleton_placement: SingletonSpreadPlacement::Center,
                 layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![FsDisplayUnitHoldoverPage {
+                    crop: None,
                     fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                     fit_scale_limits: FullscreenFitScaleLimits::default(),
                     occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -76502,6 +76704,7 @@ mod tests {
                                     7,
                                     crate::app::CompareViewMode::wipe(0.5),
                                     None,
+                                    None,
                                 );
                             })
                     });
@@ -76554,6 +76757,7 @@ mod tests {
                                     image_rect,
                                     8,
                                     crate::app::CompareViewMode::PinnedNormal,
+                                    None,
                                     None,
                                 );
                             })
@@ -93757,7 +93961,7 @@ mod specified_scale_consumer_tests {
         app.text_selected_ids = vec![1];
         // This fixture exercises input in the real annotation panel, without font loading/baking.
         app.comic_font_registry_loaded = true;
-        app.comic_fonts_loaded = true;
+        app.comic_fonts.seed_for_test(None, Default::default());
         app.comic_presets_loaded = true;
         let page_key = app.page_path_key(0).unwrap();
         app.comic_docs.insert(
@@ -94583,6 +94787,23 @@ pub(crate) mod page_turn_submission_tests {
         }
     }
 
+    pub(crate) fn offer_texture_for_test(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> egui::TextureId {
+        app.page_turn_external_operation(
+            ctx,
+            ViewerOperationId::Slideshow(next_operation_batch()),
+            OperationPhase::Press,
+            "slideshow",
+        );
+        app.offer_page_turn(ctx, idx, true);
+        app.page_turn_held_resource(idx)
+            .expect("incoming page-turn source")
+            .source_texture_id()
+    }
+
     pub(crate) fn ready_app(
         ctx: &egui::Context,
         mode: SpreadMode,
@@ -94684,6 +94905,8 @@ pub(crate) mod page_turn_submission_tests {
                         None,
                         Some(&mut sources),
                         app.settings.page_turn_animation_enabled,
+                        app.prepared_single_page_crop(page.idx, [80, 120], false),
+                        crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
                     )
                     .unwrap();
                 app.fullscreen_page_layout.push_occurrence(transform, *page);
@@ -95471,6 +95694,7 @@ pub(crate) mod page_turn_submission_tests {
                             [40, 60],
                         );
                         PreparedPagedPage {
+                            crop: None,
                             occurrence: displayed.occurrence(),
                             transform: displayed.transform,
                             resource: native.into(),
@@ -95646,6 +95870,7 @@ pub(crate) mod page_turn_submission_tests {
                                 )
                                 .unwrap();
                                 let page = PreparedPagedPage {
+                                    crop: None,
                                     occurrence: SpreadPageOccurrence::navigation(1, 1),
                                     transform,
                                     resource: native.clone().into(),
@@ -95934,6 +96159,7 @@ pub(crate) mod page_turn_submission_tests {
                                                 );
                                                 let idx = slot + if incoming { 2 } else { 0 };
                                                 CanonicalPage {
+                                                    crop: None,
                                                     occurrence: Some(slot as u64),
                                                     rect,
                                                     clip_rect: ui.max_rect(),

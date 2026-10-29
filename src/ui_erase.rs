@@ -3090,7 +3090,7 @@ impl App {
         Some((source, "source"))
     }
 
-    fn commit_pending_matches_current_erase_key(&self, fs_idx: usize) -> bool {
+    pub(crate) fn commit_pending_matches_current_erase_key(&self, fs_idx: usize) -> bool {
         let key = self.current_erase_result_key(fs_idx);
         let pending_key = EraseInpaintPendingKey {
             idx: fs_idx,
@@ -3193,6 +3193,7 @@ impl App {
             self.erase_result_cache.insert(
                 key,
                 crate::app::EraseResultCacheEntry {
+                    texture_options: Self::resident_texture_options(ctx, &texture),
                     display_basis,
                     pixels,
                     texture,
@@ -3797,6 +3798,7 @@ impl App {
             self.erase_result_cache.insert(
                 key,
                 crate::app::EraseResultCacheEntry {
+                    texture_options: Self::resident_texture_options(ctx, &tex),
                     display_basis,
                     pixels,
                     texture: tex,

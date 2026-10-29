@@ -725,8 +725,8 @@ final composite の `params_hash` から `colorize` / `creative_lut` / `post_fil
 | --- | --- | --- |
 | `fs_cache` | `HashMap<idx, FsCacheEntry>` | 生デコード結果。Static / Animated / Failed |
 | `erase_result_cache` | `HashMap<EraseResultKey, EraseResultCacheEntry>` | 消しゴム MI-GAN 確定結果。`idx + input_generation + erase_mask_generation` で識別 |
-| `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成結果。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
-| `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
+| `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成画素と任意のtexture。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
+| `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成画素と任意のtexture。現在の隠蔽世代を照合する |
 | `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
 | `final_ai_cache` | `HashMap<FinalAiKey, FinalAiEntry>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果。`FinalAiEntry` は `pixels` と smart sharpen 判定用の `used_upscale` を持つ |
 | `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI entry。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、PDF retained page cache と合算した枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
@@ -767,6 +767,30 @@ local / conceal の DB load、decode、raster、compose は非同期境界であ
 active local の現在世代 pixels、または必要な conceal result がまだ無ければ `None` を返し、
 未完成の入力から `edit_result_cache` を作らない。`ensure_final_composite_texture` も edit result の
 `None` をそのまま伝播し、不完全な final assembly を開始しない。
+
+**次unitの編集準備とCPU-only段cache（§28段階B、2026-10-28〜29、実装済み・検証結果は別記）**
+
+ON／pagedの現unit提示後、Nextの局所補正・隠蔽・final・注釈を同じkeyの一つのworkerで準備する。
+入力が完成eraseならMI-GAN／黒背景合成を再適用せず、after-AIは結果の`used_upscale`で後段を解く。
+注釈はclamp前のfinal正本を下地にし、finalと注釈それぞれをTriangle clampする。
+全照合後に段・edit・final・対応comicを一括公開し、final正本と`comic_cache.base`は同じArcを持つ。
+font不足・空docのcold読取りも正常結果であり、`comic_docs`の欠けているkeyへだけ採用する。
+既存doc／finalをfont不足だけで上書き・削除せず、画像なし結果は予約を解放する。
+
+Bの公開では`local_adjust_cache`／`conceal_cache`へtextureなしのCPU-only entryを入れられる。
+実体化済みはexact画素と現在入力に対する層の寸法正規化で判定し、texture不足でproducerを再起動しない。
+`current_*_material`はtextureを持つ描画可能な素材だけを副作用なしで返す。
+局所補正／隠蔽の編集表示やfinal不在時に段textureが必要なら、明示的な表示ensureが既存画素だけを1 frame 1枚uploadする。
+このuploadは画素・keyを変えず、上段を失効させない。Ctrl+Eの段gateも画素を見てCPU-onlyで満たせる。
+CPU-only段entryを新規公開するのはBだけで、既存producerは従来どおりtexture付きで公開する。
+
+正規化したlocal層の採用は`adopt_materialized_local_layers`で層・presence・選択・prepared snapshotの整合だけを更新する。
+local世代を進めず、利用者producerを取り消さず、兄弟contextへpublicationしない。
+同じkeyの段の一括採用では既存の上段失効helperを呼ばず、利用者の実編集・source・params変更による失効は維持する。
+表示入口はBを非blocking受信し、Computingなら取消して通常経路へ戻し、CpuReady／Registeringなら作成済みhandleごと引き取る。
+Ctrl+Eを含む編集の入場・切替・original待ち再開・ResumeはBを取り消してから既存ownerへ渡す。
+新しい待機や演出省略は加えない。設計・実装記録は[紙めくり計画§28.5](page-turn-animation-plan.md)、
+検証結果と残件は`target/pageturn-1461/implementation-report-b.md`を参照する。
 
 表示 resolver は pending 中だけ下位レイヤーへフォールバックする。local 編集中は
 `erase_result_cache > fs_cache`、conceal は active local の完成を待ってから合成し、local を飛ばして

@@ -83,7 +83,13 @@ fn wait_pending_composite_pixels(app: &mut App, deadline: std::time::Instant) {
                         .expect("composite worker did not finish"),
                 )
             }
-            FinalEffectState::CpuReady(_) => continue,
+            FinalEffectState::Computing(FinalEffectReceiver::Edited { rx, .. }) => {
+                FinalEffectReady::Edited(
+                    rx.recv_timeout(remaining)
+                        .expect("edit worker did not finish"),
+                )
+            }
+            FinalEffectState::CpuReady(_) | FinalEffectState::Registering(_) => continue,
         };
         pending.state = FinalEffectState::CpuReady(ready);
     }

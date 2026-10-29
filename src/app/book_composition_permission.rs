@@ -373,7 +373,15 @@ impl ViewerPresentationPermission {
             identity: candidate.identity.clone(),
         }
     }
+    #[cfg(test)]
     fn decision(&self, demand: &[PresentationOccurrence]) -> PresentationDecision {
+        self.decision_with_missing(demand, |_| false)
+    }
+    fn decision_with_missing(
+        &self,
+        demand: &[PresentationOccurrence],
+        missing_allowed: impl Fn(&PresentationOccurrence) -> bool,
+    ) -> PresentationDecision {
         let mut allowed = Vec::with_capacity(demand.len());
         for occurrence in demand {
             match self.occurrences.get(occurrence) {
@@ -383,6 +391,7 @@ impl ViewerPresentationPermission {
                 Some(OccurrencePermission::Complete(CandidatePermission::Hidden(_))) => {
                     allowed.push(false)
                 }
+                None if missing_allowed(occurrence) => allowed.push(true),
                 _ => return PresentationDecision::Checking,
             }
         }
@@ -489,6 +498,15 @@ impl App {
         self.source_composition_candidate(idx)
     }
 
+    /// Permission-free pages (including temporarily ignored compositions) need
+    /// no candidate receipt. Visible admission and target queries share this rule.
+    fn presentation_permission_candidate(
+        &self,
+        occurrence: &PresentationOccurrence,
+    ) -> Option<CandidatePage> {
+        self.presentation_candidate(occurrence.item_index)
+    }
+
     /// Source identity is shared with output workers. The temporary viewing
     /// ignore applies only to presentation, never to a new output acceptance.
     pub(crate) fn source_composition_candidate(&self, idx: usize) -> Option<CandidatePage> {
@@ -568,7 +586,7 @@ impl App {
                 continue;
             }
             let state = if let (Some(candidate), Some(service)) = (
-                self.presentation_candidate(occurrence.item_index),
+                self.presentation_permission_candidate(occurrence),
                 self.book_composition_service.as_ref(),
             ) {
                 let correlation = self
@@ -595,6 +613,26 @@ impl App {
         &self,
         demand: &[PresentationOccurrence],
     ) -> PresentationDecision {
+        self.book_presentation_decision(demand, |_| false)
+    }
+
+    /// Targets may not have entered the retained visible episode yet. Only a
+    /// missing permission-free occurrence is allowed here; an existing refusal
+    /// or in-flight request still owns its decision.
+    pub(crate) fn book_presentation_target_allowed(
+        &self,
+        demand: &[PresentationOccurrence],
+    ) -> PresentationDecision {
+        self.book_presentation_decision(demand, |occurrence| {
+            self.presentation_permission_candidate(occurrence).is_none()
+        })
+    }
+
+    fn book_presentation_decision(
+        &self,
+        demand: &[PresentationOccurrence],
+        missing_allowed: impl Fn(&PresentationOccurrence) -> bool,
+    ) -> PresentationDecision {
         if (self.book_composition.is_pending()
             || self.pairing_edit_availability()
                 == crate::spread_shift::PairingEditAvailability::Unreadable)
@@ -620,7 +658,8 @@ impl App {
                 PresentationDecision::Hidden
             };
         }
-        self.book_composition_permission.decision(demand)
+        self.book_composition_permission
+            .decision_with_missing(demand, missing_allowed)
     }
     pub(crate) fn book_presentation_current(
         &self,

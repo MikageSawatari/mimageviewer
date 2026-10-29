@@ -3,6 +3,135 @@
 use super::*;
 
 #[test]
+fn permission_free_target_only_resolves_missing_occurrences() {
+    use crate::app::book_composition_runtime::{BookCompositionSource, ViewerBookComposition};
+    let mut env = crate::app::setup_app_for_test();
+    let (service, owner) =
+        BookCompositionService::spawn_at(env.tmp.path().join("target-permission"), None).unwrap();
+    env.install_book_composition_runtime(service);
+    let pdf = env.tmp.path().join("book.pdf");
+    env.items = vec![
+        crate::grid_item::GridItem::Image(env.tmp.path().join("page.png")),
+        crate::grid_item::GridItem::ZipImage {
+            zip_path: env.tmp.path().join("book.zip"),
+            entry_name: "page.png".into(),
+        },
+        crate::grid_item::GridItem::PdfPage {
+            pdf_path: pdf.clone(),
+            page_num: 0,
+            content_type: None,
+        },
+    ];
+    let image = occurrence(0);
+    for idx in [1, 2] {
+        assert!(env.presentation_candidate(idx).is_some());
+        assert_eq!(
+            env.book_presentation_target_allowed(&[occurrence(idx)]),
+            PresentationDecision::Checking,
+            "unregistered ZIP/PDF pages still need permission"
+        );
+    }
+    assert_eq!(
+        env.book_presentation_target_allowed(&[image]),
+        PresentationDecision::Allowed(vec![true])
+    );
+    assert_eq!(
+        env.book_presentation_allowed(&[image]),
+        PresentationDecision::Checking
+    );
+    assert!(
+        env.book_presentation_demand_snapshot().is_empty(),
+        "target query is pure"
+    );
+    env.book_composition_permission
+        .occurrences
+        .insert(image, OccurrencePermission::Complete(hidden()));
+    assert_eq!(
+        env.book_presentation_target_allowed(&[image]),
+        PresentationDecision::Hidden
+    );
+    let candidate = env.presentation_candidate(2).unwrap();
+    env.bind_book_presentation_demand();
+    let correlation = env
+        .book_composition_permission
+        .correlation(image, &candidate);
+    let (_held, receiver) = mpsc::channel();
+    env.book_composition_permission.occurrences.insert(
+        image,
+        OccurrencePermission::Checking {
+            correlation,
+            candidate,
+            receiver,
+        },
+    );
+    assert_eq!(
+        env.book_presentation_target_allowed(&[image]),
+        PresentationDecision::Checking
+    );
+    env.book_composition_permission.occurrences.insert(
+        image,
+        OccurrencePermission::Complete(CandidatePermission::Allowed(None)),
+    );
+    assert_eq!(
+        env.book_presentation_target_allowed(&[image]),
+        PresentationDecision::Allowed(vec![true])
+    );
+    env.book_composition_permission.occurrences.clear();
+
+    let scope = crate::book_scope::BookScopeKey::document(&pdf).unwrap();
+    env.current_folder = Some(pdf.clone());
+    env.projection_recipe = crate::app::book_materialization::ProjectionRecipe::Book(
+        crate::app::book_materialization::BookScope::Document(pdf),
+    );
+    let (_hold_projection, receiver) = mpsc::channel();
+    env.book_composition = ViewerBookComposition::Preparing {
+        scope: scope.clone(),
+        receiver,
+        origin: Default::default(),
+    };
+    assert_eq!(
+        env.book_presentation_target_allowed(&[image]),
+        PresentationDecision::Checking
+    );
+    env.book_composition = ViewerBookComposition::Blocked {
+        scope: scope.clone(),
+        token: CompositionToken {
+            service_epoch: 1,
+            publication_sequence: 1,
+        },
+        error: "unreadable test".into(),
+    };
+    assert_eq!(
+        env.pairing_edit_availability(),
+        crate::spread_shift::PairingEditAvailability::Unreadable
+    );
+    assert_eq!(
+        env.book_presentation_target_allowed(&[image]),
+        PresentationDecision::Checking
+    );
+    env.book_composition = ViewerBookComposition::Ignored {
+        scope,
+        source: BookCompositionSource::Unavailable,
+        generation: env.items_generation,
+    };
+    assert!(env.presentation_candidate(2).is_none());
+    assert_eq!(
+        env.book_presentation_target_allowed(&[occurrence(2)]),
+        PresentationDecision::Allowed(vec![true])
+    );
+    assert_eq!(
+        env.book_presentation_allowed(&[occurrence(2)]),
+        PresentationDecision::Checking
+    );
+    env.retain_book_presentation_demand(&[occurrence(2)]);
+    assert_eq!(
+        env.book_presentation_current(&[occurrence(2)]),
+        PresentationDecision::Allowed(vec![true])
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
 fn book_structure_waits_for_open_permission_but_not_passive_display_reads_or_adopted_episode() {
     let mut app = crate::app::setup_app_for_test();
     let ctx = egui::Context::default();
@@ -289,6 +418,11 @@ fn assert_image_presentation_does_not_qualify(app: &mut crate::app::App) {
     let sequence = app.book_composition_permission.sequence;
     assert!(app.presentation_candidate(0).is_none());
     let demand = [occurrence(0)];
+    assert_eq!(
+        app.book_presentation_target_allowed(&demand),
+        PresentationDecision::Allowed(vec![true]),
+        "a saved ImageFolder row does not create an image presentation permission"
+    );
     app.retain_book_presentation_demand(&demand);
     assert!(matches!(
         app.book_composition_permission.occurrences.get(&demand[0]),

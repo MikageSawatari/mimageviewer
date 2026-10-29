@@ -708,10 +708,15 @@ pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
 #[cfg(windows)]
 use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerContextRegistry};
+pub(crate) mod comic_fonts;
 pub(crate) mod final_prepare;
 mod final_prepare_budget;
 mod final_prepare_cpu;
+mod prepared_edit;
 use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, FinalEffectState};
+pub(crate) use prepared_edit::{
+    FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
+};
 #[cfg(test)]
 pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
@@ -10295,10 +10300,11 @@ pub(crate) struct LocalAdjustPrefixPreviewKey {
 
 /// 補正レイヤー合成結果の cache entry。
 pub(crate) struct LocalAdjustCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
-    pub texture: egui::TextureHandle,
+    pub texture: Option<egui::TextureHandle>,
 }
 
 /// 隠蔽合成結果のキャッシュエントリ (Phase 4)。
@@ -10307,12 +10313,13 @@ pub(crate) struct LocalAdjustCacheEntry {
 /// `generation` は `App::conceal_generation` のスナップショットで、グローバル
 /// パラメータが変わったあと最初に lookup が走った時点で stale 判定される。
 pub(crate) struct ConcealCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 合成済み RGBA。Phase 5 の `Ctrl+E` エクスポートでこの pixels を JPEG/PNG/WebP に
     /// 書き出すので、現状は描画パスでは未使用だが将来使う前提でフィールドを保持。
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
-    pub texture: egui::TextureHandle,
+    pub texture: Option<egui::TextureHandle>,
     pub generation: u64,
 }
 
@@ -10329,6 +10336,8 @@ pub(crate) struct ComicCacheEntry {
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
+    /// Actual sampler/mipmap options used when this annotation was registered.
+    pub texture_options: egui::TextureOptions,
     /// 下地 final composite pixels の Arc 自体を保持する。`Arc::ptr_eq` で同一性を判定する
     /// ことで、下地が作り直されたら (= 別アロケーション) 再ベイクし、かつ Arc を生かして
     /// おくのでアドレス再利用による ABA を原理的に防ぐ (Codex P2)。下地が変わるのは
@@ -10535,6 +10544,7 @@ pub(crate) struct EraseResultKey {
 
 /// 消しゴム確定結果 (= MI-GAN inpaint 出力) の cache entry。
 pub(crate) struct EraseResultCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
@@ -12008,8 +12018,9 @@ impl LocalAdjustCacheEntry {
     pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
-            texture,
+            texture: Some(texture),
             display_basis,
         }
     }
@@ -12023,8 +12034,9 @@ impl ConcealCacheEntry {
     ) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
-            texture,
+            texture: Some(texture),
             generation,
             display_basis,
         }
@@ -12035,6 +12047,7 @@ impl EraseResultCacheEntry {
     pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
             texture,
             display_basis,
@@ -12308,6 +12321,8 @@ pub(crate) struct CapturedPagedDisplayUnit {
 
 #[derive(Clone)]
 pub(crate) struct FsDisplayUnitHoldoverPage {
+    /// Capture-time crop; the occurrence index may be reused by a new folder.
+    pub(crate) crop: Option<crate::export_crop::CropSettings>,
     /// Capture-time occurrence retained for tracing and `fullscreen_page_layout` identity only.
     /// Geometry must never be re-derived from it because folder navigation can replace items
     /// while the holdover remains visible.
@@ -19221,16 +19236,8 @@ pub struct App {
     /// 注釈編集の世代番号 (Inc 2 以降で編集確定ごとに +1)。`comic_cache` の各 entry は
     /// この値と照合され、不一致なら miss 扱い (conceal_generation と同じ lazy eviction)。
     pub(crate) comic_generation: u64,
-    /// 注釈描画用フォントセット (遅延ロード、Arc 共有)。`comic_fonts_loaded` が false の間
-    /// だけ既定フォント (COMIC_FONT_KEY="ui") をロードする。追加で参照されたフォント
-    /// (pack オノマトペ / ユーザー選択フォント) は `ensure_comic_fonts_for` が
-    /// 必要に応じて差し込み再構築する (Inc 4c)。
-    pub(crate) comic_fonts: Option<Arc<comic_core::FontSet>>,
-    pub(crate) comic_fonts_loaded: bool,
-    /// 現在 `comic_fonts` (FontSet) に parse 済みのフォントキー集合。既定 "ui" 以外で
-    /// 何が読み込み済みかを追跡し、`ensure_comic_fonts_for` が「未ロードの参照フォントが
-    /// あるか」を O(1) で判定して不要な再構築を避ける (Inc 4c)。
-    pub(crate) comic_loaded_font_keys: std::collections::HashSet<String>,
+    /// App-wide annotation fonts and their speculative loader.
+    pub(crate) comic_fonts: comic_fonts::ComicFontOwner,
     /// 注釈フォントの列挙結果 (ピッカー一覧、表示名→パス)。`comic_font_registry_loaded`
     /// が false の間だけ 1 度列挙する。pack 導入 / 削除で invalidate される (Inc 4c)。
     pub(crate) comic_available_fonts: Vec<crate::font_assets::FontAsset>,
@@ -21820,9 +21827,7 @@ impl App {
             comic_bake_pending: std::collections::HashMap::new(),
             comic_bake_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             comic_generation: 0,
-            comic_fonts: None,
-            comic_fonts_loaded: false,
-            comic_loaded_font_keys: std::collections::HashSet::new(),
+            comic_fonts: comic_fonts::ComicFontOwner::default(),
             comic_available_fonts: Vec::new(),
             comic_font_paths: std::collections::HashMap::new(),
             comic_font_registry_loaded: false,
@@ -28865,7 +28870,7 @@ impl App {
         self.fs_upload_backlog.clear();
         self.fs_pending.clear();
         self.input_generation.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.clear_color_filter_for_new_items();
         self.current_color_cache_map = None;
         self.current_color_catalog = None;
@@ -43046,7 +43051,7 @@ impl App {
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.cancel_all_local_adjust_pending();
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
@@ -43060,7 +43065,7 @@ impl App {
         self.erase_result_cache.clear();
         self.input_generation.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.cancel_all_erase_inpaint_pending();
         // 360 度パノラマビュー: フォルダ変更で cache 全体が変わったので世代を一斉 bump
         // (§3.6.2.2)。adjustment_generation / ai_upscale_generation の HashMap
@@ -46026,7 +46031,7 @@ impl App {
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::PageEditsReplaced);
         self.export_crop_mode = false;
         self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.export_crop_spread_ctx = None;
@@ -48766,7 +48771,7 @@ impl App {
             self.cancel_all_local_adjust_pending();
             self.cancel_all_erase_inpaint_pending();
             self.bump_all_adjustment_generations();
-            self.clear_all_final_pipeline_caches();
+            self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::VirtualPagesReprepared);
         }
         if virtual_page_reprepare {
             self.reprepare_page_edits_for_existing_virtual_order();
@@ -67235,8 +67240,10 @@ impl App {
                         app.evict_final_pipeline_cache(fs_idx);
                     }
                     if let Some(other) = spread_other {
+                        app.resolve_prepared_edit_for_display(ctx, other);
                         app.maybe_start_local_adjust_render(other);
                     }
+                    app.resolve_prepared_edit_for_display(ctx, fs_idx);
                     app.maybe_start_local_adjust_render(fs_idx);
                     if let Some(keep_set) = continuous_keep_set.as_ref() {
                         app.evict_adjustment_cache_for_keep_set(keep_set);
@@ -67560,7 +67567,7 @@ impl App {
         let paged_display_unit = self
             .reading_flow
             .is_paged()
-            .then(|| self.capture_paged_display_unit_for_snapshot(idx))
+            .then(|| self.capture_paged_display_unit_for_snapshot(ctx, idx))
             .flatten();
         let last_painted_is_holdover = paged_display_unit.as_ref().is_some_and(|captured| {
             matches!(
@@ -77765,6 +77772,7 @@ impl App {
         entry: OriginalMaterialEntry,
     ) -> bool {
         if entry != OriginalMaterialEntry::MaterialOnly {
+            self.cancel_prepared_edit_for_entry(idx);
             self.cancel_original_material_entry_intents(None);
         }
         if self.current_raw_source_pixels(idx).is_some() {
@@ -77919,6 +77927,7 @@ impl App {
         if entry == OriginalMaterialEntry::MaterialOnly {
             return;
         }
+        self.cancel_prepared_edit_for_entry(idx);
         if let OriginalMaterialEntry::ViewTrim { request } = entry {
             self.resume_view_trim_after_original(ctx, idx, request);
             return;
@@ -82341,7 +82350,7 @@ impl App {
         let annotations = if let Some(objects) = annotation_objects {
             // fullscreen の comic 表示時に解決済みの FontSet を Arc clone する。close / page
             // navigation 境界で新しいフォント列挙やファイル読み込みを同期実行しない。
-            let Some(fonts) = self.comic_fonts.clone() else {
+            let Some(fonts) = self.comic_fonts.fonts().clone() else {
                 // 注釈を欠いたプレビューで旧結果を上書きしない。
                 return Some(EditPreviewCloseUpdate::Skip {
                     observation: EditPreviewCloseObservation {
@@ -83307,6 +83316,15 @@ impl App {
         if let Some(key) = self.page_path_key(idx) {
             self.cancel_superseded_page_edit_producers(&key, &layers, false);
         }
+        self.adopt_materialized_local_layers(idx, layers);
+    }
+
+    /// Adopt normalization/hydration without publishing an edit or cancelling its producers.
+    pub(crate) fn adopt_materialized_local_layers(
+        &mut self,
+        idx: usize,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+    ) {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);
@@ -83493,13 +83511,61 @@ impl App {
         Some(adopted)
     }
 
+    /// Pixel basis available to both crop acceptance and ordinary display.
+    /// Thumbnail layout dimensions (notably a PDF page box) and processed/AI
+    /// sampler sizes are not source coordinates. A whole-source thumbnail with
+    /// no coordinate metadata can still supply the legacy raster fallback.
+    pub(crate) fn resident_export_crop_source_size(&self, idx: usize) -> Option<[usize; 2]> {
+        self.canonical_source_dimensions(idx)
+            .map(|dims| dims.as_size())
+            .or_else(|| self.fs_early_dims.get(&idx).copied())
+            .or_else(|| {
+                self.fs_page_coordinate_source_size(idx)
+                    .map(|size| [size.x.round() as usize, size.y.round() as usize])
+            })
+            .or_else(|| {
+                let resource = self.fs_thumbnail_resource_for_display(idx).ok()?;
+                matches!(
+                    resource.source_coverage(),
+                    crate::source_coverage::SourceCoverage::FullSource
+                )
+                .then(|| resource.source_texture().size())
+            })
+    }
+
+    /// Immutable document crop binding. Unlike export_crop_for_idx, this does
+    /// not adopt legacy dimensions, hydrate metadata, or persist anything.
+    pub(crate) fn resident_export_crop_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let settings = self.export_crop_page_settings.get(&idx).copied()?;
+        if settings.valid_source_size().is_some() {
+            return Some(settings);
+        }
+        if let Some(accepted) = self.page_turn_legacy_crop(idx, settings) {
+            // This also preserves an unresolved legacy value when the accepted
+            // raster was too small. Quality publication is not a crop edit.
+            return Some(accepted);
+        }
+        // Resolve the same memory-only basis as ordinary crop display, including
+        // thumbnail-only pages. Only ordinary display commits its later adoption.
+        let size = self.resident_export_crop_source_size(idx);
+        Some(size.map_or(settings, |size| settings.with_legacy_source_size(size)))
+    }
+
     pub(crate) fn export_crop_for_idx(
         &mut self,
         idx: usize,
         image_size: [usize; 2],
     ) -> Option<crate::export_crop::CropSettings> {
-        self.ensure_export_crop_source_size(idx, image_size)
-            .map(|settings| settings.scaled_to(image_size))
+        let settings = self.resident_export_crop_for_idx(idx)?;
+        if let Some(size) = settings.valid_source_size() {
+            let _ = self.ensure_export_crop_source_size(idx, size);
+        }
+        // Unresolved legacy settings are only clamped for this paint. Layout or
+        // processed-sampler dimensions must not become a persisted reference.
+        Some(settings.scaled_to(image_size))
     }
 
     /// 保存対象画像 (final composite。AI アップスケールで source とサイズが違うことが
@@ -83705,24 +83771,29 @@ impl App {
         }
     }
 
+    #[track_caller]
     fn clear_edit_result_caches_for_idx(&mut self, idx: usize) {
         self.edit_result_cache.retain(|key, _| key.idx != idx);
         self.clear_final_pipeline_caches_for_idx(idx);
     }
 
+    #[track_caller]
     fn clear_edit_result_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
         self.edit_result_cache.retain(|key, _| key.idx != idx);
         self.clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(idx);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize) {
         self.clear_final_pipeline_caches_for_idx_inner(idx, true);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
         self.clear_final_pipeline_caches_for_idx_inner(idx, false);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx_inner(&mut self, idx: usize, clear_retained: bool) {
         self.cancel_final_ai_for_idx(idx);
         self.cancel_final_effects_for_idx(idx);
@@ -83739,14 +83810,15 @@ impl App {
         self.cancel_comic_bake_for_idx(idx);
     }
 
-    pub(crate) fn clear_all_final_pipeline_caches(&mut self) {
+    #[track_caller]
+    pub(crate) fn clear_all_final_pipeline_caches(&mut self, reason: FinalPipelineInvalidation) {
         for pending in self.final_ai_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.final_ai_pending.clear();
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::PipelineInvalidation(reason));
         self.final_composite_cache
             .clear_with_drop_reason("pipeline_invalidate_all");
         self.comic_cache.clear();
@@ -83760,7 +83832,9 @@ impl App {
         }
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::PipelineInvalidation(
+            FinalPipelineInvalidation::SessionClosed,
+        ));
         self.final_composite_cache
             .clear_with_drop_reason("session_close");
         self.comic_cache.clear();
@@ -83834,6 +83908,72 @@ impl App {
         self.local_adjust_cache
             .get(&key)
             .map(|entry| Arc::clone(&entry.pixels))
+    }
+
+    /// Exact CPU completion is independent of whether this stage has been uploaded.
+    pub(crate) fn local_adjust_is_materialized(&self, idx: usize) -> bool {
+        let Some(layers) = self.local_adjust_page_layers.get(&idx) else {
+            return !self.local_adjust_pages.contains(&idx);
+        };
+        if let Some(source) = self.current_local_adjust_source_pixels(idx)
+            && layers
+                .iter()
+                .any(|layer| !layer.masks_match_dims(source.size[0].max(1), source.size[1].max(1)))
+        {
+            return false;
+        }
+        !layers
+            .iter()
+            .any(|layer| layer.enabled && layer.opacity > 0.0)
+            || self.current_local_adjust_pixels(idx).is_some()
+    }
+
+    /// Upload an already materialized stage without changing its key or invalidating later stages.
+    pub(crate) fn ensure_local_adjust_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
+        if !self.local_adjust_is_materialized(idx) {
+            self.maybe_start_local_adjust_render(idx);
+            return None;
+        }
+        let key = self.current_local_adjust_key(idx);
+        let entry = self.local_adjust_cache.get(&key)?;
+        if entry.texture.is_none() {
+            if self.last_edit_materialize_upload_frame == self.frame_counter {
+                ctx.request_repaint();
+                return None;
+            }
+            let pixels = Arc::clone(&entry.pixels);
+            let options = self.display_texture_options(idx);
+            self.speculative_gpu_frame.note_ordinary_upload();
+            let upload_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+            let texture = ctx.load_texture(
+                format!(
+                    "local_adjust_{}_{}_{}_{}",
+                    key.idx, key.input_gen, key.erase_mask_gen, key.local_gen
+                ),
+                final_prepare::final_upload_pixels(&pixels),
+                options,
+            );
+            if let Some(upload_t0) = upload_t0 {
+                emit_edit_materialize_ms(
+                    "upload",
+                    "local",
+                    self.page_path_key(idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
+                );
+            }
+            self.bind_display_texture_identity(&texture, self.item_id(idx));
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+            let entry = self.local_adjust_cache.get_mut(&key)?;
+            entry.texture_options = options;
+            entry.texture = Some(texture);
+        }
+        self.current_local_adjust_material(idx)
     }
 
     pub(crate) fn current_local_adjust_layer_bypass_key(
@@ -83953,6 +84093,9 @@ impl App {
         idx: usize,
         continuation: LocalMaterializeContinuation,
     ) {
+        if continuation != LocalMaterializeContinuation::Display {
+            self.cancel_prepared_edit_for_entry(idx);
+        }
         if !self.local_adjust_pages.contains(&idx)
             && !self.local_adjust_page_layers.contains_key(&idx)
         {
@@ -84045,7 +84188,7 @@ impl App {
         if loaded_layers_are_inactive && !masks_need_resize {
             return;
         }
-        if self.current_local_adjust_texture(idx).is_some() && !masks_need_resize {
+        if self.current_local_adjust_pixels(idx).is_some() && !masks_need_resize {
             return;
         }
         if masks_need_resize {
@@ -84267,6 +84410,31 @@ impl App {
         }
     }
 
+    /// Adoption and resident preparation use the same current-input predicate.
+    /// A received result still belongs to the producer until it is adopted.
+    fn current_edit_materialize_request_matches(
+        &self,
+        idx: usize,
+        request: EditMaterializeRequest,
+    ) -> bool {
+        request.items_generation == self.items_generation
+            && match request.kind {
+                EditMaterializeKind::Local { key, .. } => {
+                    key.idx == idx && key == self.current_local_adjust_key(idx)
+                }
+                EditMaterializeKind::Conceal { key, .. } => {
+                    key.idx == idx && key == self.current_edit_result_key(idx)
+                }
+            }
+    }
+
+    fn current_edit_stage_producer_pending(&self, idx: usize) -> bool {
+        self.local_adjust_pending.get(&idx).is_some_and(|pending| {
+            !pending.cancel.load(Ordering::Relaxed)
+                && self.current_edit_materialize_request_matches(idx, pending.request)
+        })
+    }
+
     fn apply_edit_materialize_result(
         &mut self,
         ctx: &egui::Context,
@@ -84274,18 +84442,7 @@ impl App {
         result: EditMaterializeResult,
         request: EditMaterializeRequest,
     ) -> bool {
-        if request.items_generation != self.items_generation {
-            return false;
-        }
-        let request_is_current = match request.kind {
-            EditMaterializeKind::Local { key, .. } => {
-                key.idx == idx && key == self.current_local_adjust_key(idx)
-            }
-            EditMaterializeKind::Conceal { key, .. } => {
-                key.idx == idx && key == self.current_edit_result_key(idx)
-            }
-        };
-        if !request_is_current {
+        if !self.current_edit_materialize_request_matches(idx, request) {
             return false;
         }
 
@@ -84296,7 +84453,7 @@ impl App {
                         EditMaterializeKind::Local { continuation, .. } => continuation,
                         _ => return false,
                     };
-                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    self.adopt_materialized_local_layers(idx, layers);
                     self.local_adjust_cache.retain(|key, _| key.idx != idx);
                     let key = self.current_local_adjust_key(idx);
                     let pixels = Arc::new(image);
@@ -84320,6 +84477,7 @@ impl App {
                     self.local_adjust_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: Self::resident_texture_options(ctx, &texture),
                             display_basis: self.accept_current_producer_display_basis(
                                 key.idx,
                                 texture.size(),
@@ -84327,7 +84485,7 @@ impl App {
                                 false,
                             ),
                             pixels,
-                            texture,
+                            texture: Some(texture),
                         },
                     );
                     if !matches!(
@@ -84358,7 +84516,7 @@ impl App {
                         _ => return false,
                     };
                     let layers_empty = layers.is_empty();
-                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    self.adopt_materialized_local_layers(idx, layers);
                     if layers_empty && let Some(page_key) = self.page_path_key(idx) {
                         Self::set_page_key_presence(
                             &mut self.local_adjust_page_keys,
@@ -84419,6 +84577,7 @@ impl App {
                     self.conceal_cache.insert(
                         idx,
                         ConcealCacheEntry {
+                            texture_options: Self::resident_texture_options(ctx, &texture),
                             display_basis: self.accept_current_producer_display_basis(
                                 idx,
                                 texture.size(),
@@ -84426,7 +84585,7 @@ impl App {
                                 false,
                             ),
                             pixels,
-                            texture,
+                            texture: Some(texture),
                             generation: key.conceal_gen,
                         },
                     );
@@ -84570,6 +84729,7 @@ impl App {
                 self.local_adjust_layer_bypass_cache.insert(
                     pending.key,
                     LocalAdjustCacheEntry {
+                        texture_options: Self::resident_texture_options(ctx, &texture),
                         display_basis: self.accept_current_producer_display_basis(
                             key.idx,
                             texture.size(),
@@ -84577,7 +84737,7 @@ impl App {
                             false,
                         ),
                         pixels,
-                        texture,
+                        texture: Some(texture),
                     },
                 );
                 ctx.request_repaint();
@@ -84651,6 +84811,7 @@ impl App {
                 self.local_adjust_prefix_preview_cache.insert(
                     pending.key,
                     LocalAdjustCacheEntry {
+                        texture_options: Self::resident_texture_options(ctx, &texture),
                         display_basis: self.accept_current_producer_display_basis(
                             key.idx,
                             texture.size(),
@@ -84658,7 +84819,7 @@ impl App {
                             false,
                         ),
                         pixels,
-                        texture,
+                        texture: Some(texture),
                     },
                 );
                 ctx.request_repaint();
@@ -84939,7 +85100,7 @@ impl App {
         self.conceal_cache.clear();
         self.comic_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::EraseGenerationChanged);
     }
 
     /// 消しゴムマスクが変わったことを idx 単位の世代で表す。
@@ -85180,7 +85341,7 @@ impl App {
         // job が完了して旧結果を再挿入することもない。
         self.clear_retained_final_ai_cache("conceal_generation_change");
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ConcealGenerationChanged);
     }
 
     /// 表示パイプライン用: 該当 idx に隠蔽マスクが保存されていれば、現在の
@@ -85204,6 +85365,17 @@ impl App {
         idx: usize,
         purpose: ConcealMaterializePurpose,
     ) {
+        if !matches!(purpose, ConcealMaterializePurpose::Display) {
+            self.cancel_prepared_edit_for_entry(idx);
+        }
+        if purpose == ConcealMaterializePurpose::Display
+            && self
+                .conceal_cache
+                .get(&idx)
+                .is_some_and(|entry| entry.generation == self.conceal_generation)
+        {
+            return;
+        }
         if self.local_adjust_pages.contains(&idx)
             && !self.local_adjust_page_layers.contains_key(&idx)
         {
@@ -85365,9 +85537,10 @@ impl App {
 
     fn ensure_conceal_texture_impl(
         &mut self,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         if self.erase_mode || (self.conceal_mode && !self.conceal_preview_active) {
             return None;
         }
@@ -85376,10 +85549,42 @@ impl App {
             return None;
         }
         let current_gen = self.conceal_generation;
-        if let Some(entry) = self.conceal_cache.get(&idx) {
-            if entry.generation == current_gen {
-                return Some(entry.texture.clone());
+        if let Some(entry) = self
+            .conceal_cache
+            .get(&idx)
+            .filter(|entry| entry.generation == current_gen)
+        {
+            if let Some(texture) = &entry.texture {
+                return Some(texture.clone());
             }
+            if self.last_edit_materialize_upload_frame == self.frame_counter {
+                ctx.request_repaint();
+                return None;
+            }
+            let pixels = Arc::clone(&entry.pixels);
+            let options = self.display_texture_options(idx);
+            self.speculative_gpu_frame.note_ordinary_upload();
+            let upload_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+            let texture = ctx.load_texture(
+                format!("conceal_{idx}_g{current_gen}"),
+                final_prepare::final_upload_pixels(&pixels),
+                options,
+            );
+            if let Some(upload_t0) = upload_t0 {
+                emit_edit_materialize_ms(
+                    "upload",
+                    "conceal",
+                    self.page_path_key(idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
+                );
+            }
+            self.bind_display_texture_identity(&texture, self.item_id(idx));
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+            let entry = self.conceal_cache.get_mut(&idx)?;
+            entry.texture_options = options;
+            entry.texture = Some(texture.clone());
+            return Some(texture);
         }
         self.maybe_start_conceal_materialize(idx, ConcealMaterializePurpose::Display);
         None
@@ -85424,35 +85629,105 @@ impl App {
         })
     }
 
-    /// Borrow only the current context's immutable, canonical still raster. Sharing
-    /// a handle does not materialize an upload and says nothing about final completeness.
-    fn shared_source_texture_for_edit(
+    pub(crate) fn resident_texture_options(
+        ctx: &egui::Context,
+        texture: &egui::TextureHandle,
+    ) -> egui::TextureOptions {
+        // Copy the immutable metadata before any handle clone can take a write lock.
+        ctx.tex_manager()
+            .read()
+            .meta(texture.id())
+            .expect("owned texture")
+            .options
+    }
+
+    /// Select the highest exact resident cumulative edit stage without starting work.
+    /// This display fallback does not prove that every active edit is complete.
+    pub(crate) fn exact_resident_edit_stage(
+        &self,
+        idx: usize,
+    ) -> Option<(
+        crate::gpu_lanczos::FullscreenPaintResource,
+        Arc<egui::ColorImage>,
+        &'static str,
+    )> {
+        if let Some(material) = self.current_conceal_material(idx) {
+            return Some((
+                material,
+                self.conceal_cache.get(&idx)?.pixels.clone(),
+                "conceal",
+            ));
+        }
+        if let Some(material) = self.current_local_adjust_material(idx) {
+            return Some((
+                material,
+                self.local_adjust_cache
+                    .get(&self.current_local_adjust_key(idx))?
+                    .pixels
+                    .clone(),
+                "local_adjust",
+            ));
+        }
+        self.current_erase_result_material(idx).map(|material| {
+            (
+                material,
+                self.erase_result_cache[&self.current_erase_result_key(idx)]
+                    .pixels
+                    .clone(),
+                "erase",
+            )
+        })
+    }
+
+    /// Borrow this context's actual immutable edit input allocation. The LINEAR
+    /// edit contract must survive changes to the final sampler (including Nearest).
+    fn shared_resident_texture_for_edit(
         &self,
         ctx: &egui::Context,
         key: &EditResultKey,
         edit_pixels: &Arc<egui::ColorImage>,
-    ) -> Option<egui::TextureHandle> {
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if *key != self.current_edit_result_key(key.idx) {
             return None;
         }
-        let FsCacheEntry::Static {
-            tex,
-            pixels,
-            animation: StaticAnimationState::Still,
-            ..
-        } = self.fs_cache.get(&key.idx)?
-        else {
-            return None;
-        };
-        if !Arc::ptr_eq(pixels, edit_pixels) {
-            return None;
-        }
-        // Display allocations never change sampler options in place. Release the
-        // manager read lock before cloning the handle (retain takes a write lock).
+        let candidate = self
+            .exact_resident_edit_stage(key.idx)
+            .filter(|(_, pixels, _)| Arc::ptr_eq(pixels, edit_pixels))
+            .map(|(material, _, _)| material)
+            .or_else(|| {
+                let FsCacheEntry::Static {
+                    pixels,
+                    animation: StaticAnimationState::Still,
+                    ..
+                } = self.fs_cache.get(&key.idx)?
+                else {
+                    return None;
+                };
+                Arc::ptr_eq(pixels, edit_pixels)
+                    .then(|| self.source_material_for_idx(key.idx))
+                    .flatten()
+            })?;
+        let tex = candidate.source_texture();
+        // Release the manager read lock before retaining the allocation.
         let matches = ctx.tex_manager().read().meta(tex.id()).is_some_and(|meta| {
             meta.size == edit_pixels.size && meta.options == DISPLAY_IMAGE_TEXTURE_OPTIONS
         });
-        (matches && self.display_texture_matches_page(tex, key.idx)).then(|| tex.clone())
+        if matches && self.display_texture_matches_page(tex, key.idx) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn shared_source_texture_for_edit(
+        &self,
+        ctx: &egui::Context,
+        key: &EditResultKey,
+        pixels: &Arc<egui::ColorImage>,
+    ) -> Option<egui::TextureHandle> {
+        self.shared_resident_texture_for_edit(ctx, key, pixels)
+            .map(|material| material.source_texture().clone())
     }
 
     /// 表示パイプライン用: 編集結果ピクセル + 表示テクスチャを確保する。先読みで
@@ -85462,6 +85737,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         if self.fs_entry_is_animated(idx) {
             // Animated images are playback-only. Edit/final cache keys are not
             // frame-aware, so caching a derived frame here would freeze playback.
@@ -85473,8 +85749,10 @@ impl App {
                 return Some((key, Arc::clone(&entry.pixels)));
             }
             let pixels = Arc::clone(&entry.pixels);
-            if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels) {
-                self.edit_result_cache.get_mut(&key)?.texture = Some(texture);
+            if let Some(material) = self.shared_resident_texture_for_edit(ctx, &key, &pixels) {
+                let entry = self.edit_result_cache.get_mut(&key)?;
+                entry.display_basis = material.display_basis();
+                entry.texture = Some(material.source_texture().clone());
             } else if self.last_edit_materialize_upload_frame != self.frame_counter {
                 self.last_edit_materialize_upload_frame = self.frame_counter;
                 self.speculative_gpu_frame.note_ordinary_upload();
@@ -85496,9 +85774,25 @@ impl App {
         }
 
         let pixels = self.assemble_edit_result_pixels(ctx, idx)?;
-        let texture = if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels)
-        {
-            Some(texture)
+        let shared = self.shared_resident_texture_for_edit(ctx, &key, &pixels);
+        let display_basis = shared
+            .as_ref()
+            .map(|material| material.display_basis())
+            .or_else(|| {
+                self.exact_resident_edit_stage(idx)
+                    .filter(|(_, stage, _)| Arc::ptr_eq(stage, &pixels))
+                    .map(|(material, _, _)| material.display_basis())
+            })
+            .unwrap_or_else(|| {
+                self.accept_current_producer_display_basis(
+                    idx,
+                    material_sampler_size(pixels.size),
+                    pixels.size,
+                    false,
+                )
+            });
+        let texture = if let Some(material) = shared {
+            Some(material.source_texture().clone())
         } else if self.last_edit_materialize_upload_frame != self.frame_counter {
             self.last_edit_materialize_upload_frame = self.frame_counter;
             self.speculative_gpu_frame.note_ordinary_upload();
@@ -85519,12 +85813,7 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
-                display_basis: self.accept_current_producer_display_basis(
-                    idx,
-                    material_sampler_size(pixels.size),
-                    pixels.size,
-                    false,
-                ),
+                display_basis,
                 pixels: Arc::clone(&pixels),
                 texture,
             },
@@ -85553,12 +85842,18 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
-                display_basis: self.accept_current_producer_display_basis(
-                    idx,
-                    material_sampler_size(pixels.size),
-                    pixels.size,
-                    false,
-                ),
+                display_basis: self
+                    .exact_resident_edit_stage(idx)
+                    .filter(|(_, stage, _)| Arc::ptr_eq(stage, &pixels))
+                    .map(|(material, _, _)| material.display_basis())
+                    .unwrap_or_else(|| {
+                        self.accept_current_producer_display_basis(
+                            idx,
+                            material_sampler_size(pixels.size),
+                            pixels.size,
+                            false,
+                        )
+                    }),
                 pixels: Arc::clone(&pixels),
                 texture: None,
             },
@@ -86874,7 +87169,7 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.final_ai_pending.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::FullResolutionDeferred);
     }
 
     #[cfg(test)]
@@ -87556,7 +87851,16 @@ impl App {
         true
     }
 
+    #[track_caller]
     fn cancel_final_effects_for_idx(&mut self, idx: usize) {
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::EditStagesChanged),
+        );
+    }
+
+    #[track_caller]
+    fn cancel_final_effects_for_idx_with_reason(&mut self, idx: usize, reason: PreparedEditCancel) {
         let keys: Vec<FinalCompositeKey> = self
             .final_effect_pending
             .keys()
@@ -87564,15 +87868,15 @@ impl App {
             .filter(|key| key.edit_key.idx == idx)
             .collect();
         for key in keys {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, reason);
         }
     }
 
-    fn cancel_all_final_effects(&mut self) {
-        for (_, pending) in self.final_effect_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
+    #[track_caller]
+    fn cancel_all_final_effects(&mut self, reason: PreparedEditCancel) {
+        let keys: Vec<_> = self.final_effect_pending.keys().copied().collect();
+        for key in keys {
+            self.cancel_final_effect_key(key, reason);
         }
     }
 
@@ -87636,9 +87940,24 @@ impl App {
             }
         }
         for key in disconnected {
-            self.final_effect_pending.remove(&key);
-            self.final_composite_cache
-                .remove_with_drop_reason(&key, "worker_disconnected");
+            self.record_prepared_edit_disposition(
+                key,
+                PreparedEditDisposition::Cancelled(PreparedEditCancel::WorkerDisconnected),
+            );
+            let edited = self
+                .final_effect_pending
+                .remove(&key)
+                .is_some_and(|pending| pending.state.edit_input().is_some());
+            if !edited {
+                self.final_composite_cache
+                    .remove_with_drop_reason(&key, "worker_disconnected");
+            } else {
+                crate::logger::log(format!(
+                    "[edit-prepare] worker disconnected idx={}",
+                    key.edit_key.idx
+                ));
+                self.show_feedback_toast("編集画像の先読みを完了できませんでした".to_owned());
+            }
         }
         completed
     }
@@ -87668,6 +87987,9 @@ impl App {
         }
         let mut had_updates = false;
         for key in completed {
+            if self.adopt_prepared_edit(ctx, key, phase, false) {
+                continue;
+            }
             let Some(pending) = self.final_effect_pending.get(&key) else {
                 continue;
             };
@@ -87793,6 +88115,7 @@ impl App {
                 _ => None,
             };
             let (result, prepared_upload) = match ready {
+                FinalEffectReady::Edited(_) => unreachable!("edit pipeline adopted by its owner"),
                 FinalEffectReady::Legacy(result) => (result, None),
                 FinalEffectReady::Prepared(ready) => (
                     FinalCompositeResult::Ready {
@@ -88061,6 +88384,7 @@ impl App {
         source_size: [usize; 2],
         output_complete: bool,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, key.edit_key.idx);
         let reuse_prefetch = self
             .final_effect_pending
             .get(&key)
@@ -88084,7 +88408,12 @@ impl App {
         // 再合成中もその texture を返し、完成結果の同一 key insert で原子的に差し替える。
         self.cancel_prefetch_final_effects_except(reuse_prefetch.then_some(key));
         if !reuse_prefetch {
-            self.cancel_final_effects_for_idx(key.edit_key.idx);
+            self.cancel_final_effects_for_idx_with_reason(
+                key.edit_key.idx,
+                PreparedEditCancel::PipelineInvalidation(
+                    FinalPipelineInvalidation::DisplayEffectReplaced,
+                ),
+            );
         }
         if reuse_prefetch {
             if let Some(pending) = self.final_effect_pending.get_mut(&key) {
@@ -88413,6 +88742,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         #[cfg(test)]
         final_prepare_tests::observe_lookup(self);
         self.poll_final_effects(ctx);
@@ -88814,7 +89144,8 @@ impl App {
     /// 触れる前に呼ぶことで、注釈無し画像の通常閲覧をほぼゼロオーバーヘッドに保つ
     /// (Codex P3。comic.db lookup は page_path_key ごとに 1 度だけ、以降はメモリ)。
     /// デモ有効時はシードのため常に true。
-    pub(crate) fn comic_has_objects(&mut self, idx: usize) -> bool {
+    pub(crate) fn comic_has_objects(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         let Some(key) = self.page_path_key(idx) else {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };
@@ -88838,91 +89169,28 @@ impl App {
         self.comic_font_paths = paths;
     }
 
-    /// 既定フォント (COMIC_FONT_KEY="ui") + `extra_keys` + これまでロード済みのキーを
-    /// parse した新しい `FontSet` を構築して `comic_fonts` に差し替える。既定フォントを
-    /// 必ず最初に入れることで `FontSet::default_key` が "ui" になり、未知キーは既定へ
-    /// fallback する (= 既存注釈の互換)。フォント追加は新規参照時のみなので毎フレームでは
-    /// 走らない (Inc 4c)。
-    fn rebuild_comic_fontset(&mut self, extra_keys: &[String]) {
-        self.comic_fonts_loaded = true;
-        // 既定 JP フォント ("ui") を先頭に。見つからなければテキストを焼けない。
-        let Some(mut set) = crate::comic_overlay::load_comic_fonts() else {
-            self.comic_fonts = None;
-            self.comic_loaded_font_keys.clear();
-            crate::logger::log(
-                "[comic] 注釈描画用の日本語フォントが見つかりませんでした".to_string(),
-            );
-            return;
-        };
-        // これまでロード済みのキー ∪ 新規要求キー を parse して差し込む。
-        let mut keys: Vec<String> = self.comic_loaded_font_keys.iter().cloned().collect();
-        for k in extra_keys {
-            if !keys.iter().any(|e| e == k) {
-                keys.push(k.clone());
-            }
-        }
-        let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for key in keys {
-            let Some(path) = self.comic_font_paths.get(&key).cloned() else {
-                continue;
-            };
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            if let Ok(font) = comic_core::LoadedFont::from_bytes(key.clone(), bytes) {
-                set.insert(font);
-                loaded.insert(key);
-            }
-        }
-        self.comic_loaded_font_keys = loaded;
-        self.comic_fonts = Some(Arc::new(set));
-    }
-
-    /// 注釈描画用フォントセットを遅延ロードして返す (既定フォントのみ保証)。フォントが
-    /// 見つからなければ `None` (= テキストを焼けないので comic 合成自体をスキップ)。
-    /// 特定フォントを確実に含めたいベイク経路では [`ensure_comic_fonts_for`] を使う。
+    /// Display/edit/export adopts ready prefetch first, then reads missing fonts synchronously.
     pub(crate) fn ensure_comic_fonts(&mut self) -> Option<Arc<comic_core::FontSet>> {
-        self.ensure_comic_font_registry();
-        if !self.comic_fonts_loaded {
-            self.rebuild_comic_fontset(&[]);
+        self.comic_fonts.poll();
+        if self.comic_fonts.needs_sync(&[]) {
+            self.ensure_comic_font_registry();
+            self.comic_fonts.ensure(&[], &self.comic_font_paths);
         }
-        self.comic_fonts.clone()
+        self.comic_fonts.fonts().clone()
     }
 
-    /// `objects` が参照する全フォントを parse 済みにしてから `FontSet` を返す。未ロードの
-    /// 参照フォント (pack オノマトペ / ユーザー選択フォント) があれば 1 度だけ再構築する。
-    /// 既に全て揃っていればキャッシュ済み Arc をそのまま返す (ベイクの度には走らない)。
+    /// Include font references from both body text and name plates.
     pub(crate) fn ensure_comic_fonts_for(
         &mut self,
         objects: &[comic_core::AnnotationObject],
     ) -> Option<Arc<comic_core::FontSet>> {
-        self.ensure_comic_font_registry();
-        // 参照されていて、まだ未ロードで、パスが分かっているキーだけを集める。
-        // オブジェクト内の **全 TextBlock** を見る (本文 + メッセージウィンドウの名前
-        // プレート)。本文だけだと名前プレートの独自フォントが既定へ落ちる (Codex P2)。
-        let mut needed: Vec<String> = Vec::new();
-        let consider = |k: &str, needed: &mut Vec<String>| {
-            if k.is_empty() || k == crate::comic_overlay::COMIC_FONT_KEY {
-                return; // 既定は base ロードで賄う
-            }
-            if self.comic_loaded_font_keys.contains(k) {
-                return; // parse 済み
-            }
-            if !self.comic_font_paths.contains_key(k) {
-                return; // パス不明 → fallback 描画 (再構築しても無駄)
-            }
-            if !needed.iter().any(|e| e == k) {
-                needed.push(k.to_string());
-            }
-        };
-        for key in crate::comic_overlay::referenced_font_keys(objects) {
-            consider(&key, &mut needed);
+        self.comic_fonts.poll();
+        let keys = crate::comic_overlay::referenced_font_keys(objects);
+        if self.comic_fonts.needs_sync(&keys) {
+            self.ensure_comic_font_registry();
+            self.comic_fonts.ensure(&keys, &self.comic_font_paths);
         }
-        if self.comic_fonts.is_some() && needed.is_empty() {
-            return self.comic_fonts.clone();
-        }
-        self.rebuild_comic_fontset(&needed);
-        self.comic_fonts.clone()
+        self.comic_fonts.fonts().clone()
     }
 
     /// 被写体マット (BiRefNet) モデルパスのキャッシュを再評価する。
@@ -89167,7 +89435,7 @@ impl App {
             });
         }
         // 注釈が無い画像は下地に触れず即 None (通常閲覧はゼロオーバーヘッド、Codex P3)。
-        if !self.comic_has_objects(idx) {
+        if !self.comic_has_objects(ctx, idx) {
             return None;
         }
         // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
@@ -89309,13 +89577,14 @@ impl App {
                 &bake_base, &layers,
             ));
             let upload = clamp_for_gpu(&composed).into_owned();
+            let texture_options = self.display_texture_options(idx);
             let texture = ctx.load_texture(
                 format!(
                     "comic_{idx}_{}_{comic_gen}_{preview_scale}",
                     Arc::as_ptr(&base) as usize
                 ),
                 upload,
-                self.display_texture_options(idx),
+                texture_options,
             );
             self.comic_cache.insert(
                 idx,
@@ -89326,6 +89595,7 @@ impl App {
                     ),
                     pixels: composed,
                     texture: texture.clone(),
+                    texture_options,
                     base: Arc::clone(&base),
                     comic_gen,
                     dims: [w, h],
@@ -89464,7 +89734,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<Arc<egui::ColorImage>> {
-        if !self.comic_has_objects(idx) {
+        if !self.comic_has_objects(ctx, idx) {
             return None;
         }
         let base = self.ensure_final_composite_pixels(ctx, idx)?;
@@ -89618,7 +89888,12 @@ impl App {
                     };
                     if live_pending {
                         self.final_ai_cache.insert(key, entry);
-                        self.cancel_final_effects_for_idx(key.edit_key.idx);
+                        self.cancel_final_effects_for_idx_with_reason(
+                            key.edit_key.idx,
+                            PreparedEditCancel::PipelineInvalidation(
+                                FinalPipelineInvalidation::FinalAiCompleted,
+                            ),
+                        );
                         repaint = true;
                     } else if retained_stored {
                         crate::logger::log(format!(
@@ -89708,9 +89983,7 @@ impl App {
             .filter(|key| !keep_set.contains(&key.edit_key.idx))
             .collect();
         for key in final_effect_evict {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, PreparedEditCancel::KeepSetEviction);
         }
         // comic は final composite を下地にするので keep_set に追従させる (Codex P2:
         // フル解像度 comic を eviction で生き残らせない + 下地と整合)。
@@ -92210,7 +92483,10 @@ impl App {
     pub(crate) fn clear_final_stage_only_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
-        self.cancel_final_effects_for_idx(idx);
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::AdjustmentChanged),
+        );
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
         self.final_composite_cache
@@ -92278,7 +92554,7 @@ impl App {
         self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         self.compare_view_mode.cancel_wipe_drag();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AdjustmentChanged);
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
     }
@@ -92485,7 +92761,12 @@ impl App {
         // 毎回 AI を待たされる退行があった (= 「先読み表示は出ているのに次画像で
         // 一瞬アップスケール前が見えて、AI 処理から再表示」のユーザー報告)。
         let Some(key) = self.metadata_cache_key(idx) else {
-            self.cancel_final_effects_for_idx(idx);
+            self.cancel_final_effects_for_idx_with_reason(
+                idx,
+                PreparedEditCancel::PipelineInvalidation(
+                    FinalPipelineInvalidation::AdjustmentChanged,
+                ),
+            );
             self.final_composite_cache
                 .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
                     cache_key.edit_key.idx != idx
@@ -92495,7 +92776,10 @@ impl App {
         };
         let slot = self.adjustment_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
-        self.cancel_final_effects_for_idx(idx);
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::AdjustmentChanged),
+        );
         self.final_composite_cache
             .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
                 cache_key.edit_key.idx != idx
@@ -92512,7 +92796,7 @@ impl App {
         for v in self.ai_upscale_generation.values_mut() {
             *v = v.saturating_add(1);
         }
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AiGenerationChanged);
     }
 
     /// `adjustment_generation` の全 entry を +1 する (saturating)。
@@ -92522,7 +92806,7 @@ impl App {
         for v in self.adjustment_generation.values_mut() {
             *v = v.saturating_add(1);
         }
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AdjustmentChanged);
     }
 
     /// 指定 source_key の `ai_upscale_generation` を +1 する (saturating)。
@@ -103764,8 +104048,9 @@ mod material_display_owner_tests {
                     app.local_adjust_layer_bypass_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
-                            texture: texture.clone(),
+                            texture: Some(texture.clone()),
                             display_basis: expected,
                         },
                     );
@@ -103775,8 +104060,9 @@ mod material_display_owner_tests {
                     app.local_adjust_prefix_preview_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
-                            texture: texture.clone(),
+                            texture: Some(texture.clone()),
                             display_basis: expected,
                         },
                     );
@@ -104078,12 +104364,15 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        if !self.local_adjust_is_materialized(idx) {
+            return None;
+        }
         let entry = self
             .local_adjust_cache
             .get(&self.current_local_adjust_key(idx))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -104098,7 +104387,7 @@ impl App {
             .get(&self.current_local_adjust_layer_bypass_key(idx, layer_idx))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -104113,7 +104402,7 @@ impl App {
             .get(&self.current_local_adjust_prefix_preview_key(idx, layer_count))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -104154,7 +104443,7 @@ impl App {
             .filter(|entry| entry.generation == self.conceal_generation)?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))

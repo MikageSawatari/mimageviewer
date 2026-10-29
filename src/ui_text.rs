@@ -1986,6 +1986,7 @@ impl App {
         let Some(key) = self.page_path_key(target_idx) else {
             return;
         };
+        self.cancel_prepared_edit_for_entry(target_idx);
         self.cancel_original_material_entry_intents(None);
 
         if let Some(pivot) = pivot {
@@ -2048,6 +2049,7 @@ impl App {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
+        self.cancel_prepared_edit_for_entry(new_idx);
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
@@ -4466,7 +4468,7 @@ impl App {
             return None;
         }
         // 再列挙してこのフォントを一覧に載せる。
-        self.comic_font_registry_loaded = false;
+        self.invalidate_comic_fonts(crate::app::comic_fonts::FontInvalidation::FontAdded);
         self.ensure_comic_font_registry();
         self.font_sample_cache.clear();
         self.font_sample_failed.clear();

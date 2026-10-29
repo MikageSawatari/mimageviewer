@@ -69,6 +69,7 @@ fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage
                 );
             }
             PreparedPagedPage {
+                crop: None,
                 resource: resource.into(),
                 ..page.clone()
             }
@@ -697,6 +698,8 @@ fn draw_with_absent_source(
         None,
         Some(&mut sources),
         live,
+        None,
+        crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
     ) {
         app.fullscreen_page_layout
             .push_occurrence(transform, held[0].occurrence);

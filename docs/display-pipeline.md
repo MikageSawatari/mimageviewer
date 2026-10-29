@@ -139,6 +139,31 @@ edit texture 確保前に再利用する。通常同期 miss、無補正 handle 
 現在は上記 D3-2 と下記 D3-4 の条件を満たす場合だけ先回り準備へ接続する。
 slideshow の still-only unit 計算は表示 cache を置換しない。詳細・検証は page-turn 計画 §27.17.12。
 
+### 次unitの編集素材の一括準備（§28 段階B、2026-10-28〜29、実装済み・検証結果は別記）
+
+段階BはON／pagedの現unit提示後、Nextだけで局所補正→隠蔽→final→注釈を先回りして作る。
+完成erase画素を入力にする場合はMI-GANや黒背景合成を再適用しない。after-AIは`used_upscale`に従い、
+注釈はclamp前のfinal正本へ合成する。finalと注釈のupload画素はそれぞれ通常と同じTriangle clampで作る。
+必要なfontが不足する場合もdoc解決は正常終端し、作れるlocal／conceal／finalは採用できる。
+注釈fontはApp共有の単一ownerが持ち、Nextの注釈頁から既定fontとhot docの不足keyをworkerへ要求する（§1.602）。
+workerは列挙・読取・parseを行い、rootの毎frame pollで採用する。ピッカー用の列挙には公開しない。
+採用後の再評価で注釈だけを準備できる。表示ensureは完了済みの結果を先に採用し、不足なら旧受信口を捨てて従来の同期読み込みを行う。
+失敗keyのattemptedは明示無効化まで累積し、既定fontなしも終端とする。F12／parkでownerや要求を移譲・破棄しない。
+入力・key・世代・params・doc／fontのpreflight後、必要なtextureが揃ってから段・edit・final・対応comicを一括公開する。
+final正本とcomicの下地は同じArcを持ち、段採用だけで上段を失効させない。
+
+local／concealの段cacheはCPU-only entryを持てる。実体化済みはexact画素＋寸法正規化、描画可能はそれにtextureがある状態である。
+resident lookupは副作用なし。表示ensureだけが既存画素を1 frame 1枚uploadし、texture不足を再レンダーやkey変更の理由にしない。
+新規の投機textureはROOT共通枠で1枚ずつ登録し、途中の非公開textureも全contextのVRAM会計へ入れる。
+登録残は次のROOT frameへ進め、OverBudgetでは結果を保持して再描画ループを起こさない。
+
+表示要求は先に非blocking受信する。BのComputingは取消して通常経路へ戻し、CpuReady／Registeringは表示へ引き取って作成済みhandleを再利用する。
+既存legacyカラー化／LUTの表示昇格契約は維持し、BをDisplayPreparedへ昇格させない。
+Ctrl+Eを含む編集入口はBを取り消して既存ownerへ渡す。Bの不足を理由にめくりの受付を待たせたり演出を省いたりしない。
+演出は受理済みのresident素材に固定し、品質公開でheld resource／canonical receiptを差し替えない。
+設計と実装記録は[紙めくり計画§28.5](page-turn-animation-plan.md)、検証結果・未計測の表示引取りGPUコストは
+`target/pageturn-1461/implementation-report-b.md`を参照する。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
@@ -3659,6 +3684,35 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   - 回転変更 → **キャッシュはクリアしない** (GPU 行列で回すため)
 
 #### 無変換の静止画テクスチャ共有（2026-10-17）
+
+2026-10-28（紙めくり計画 §28、段階 A）: exact な隠蔽・局所補正・消しゴムの累積段も
+共有候補に含める。選択は通常表示とめくり受付が同じ resident-only helper を使い、
+受付の edit_result だけは exact key と texture を必要とする（通常表示の holdover 一致は維持）。
+共有には現在 key・画素 Arc・item identity・寸法・実 LINEAR options の一致が必要で、
+NEAREST 段は共有しない。共有元の accepted display_basis を継承し、各段の実 options の
+mip 有無を VRAM 会計へ渡す。Native 先回りも実際に共有可能な段の material を返す。
+
+閲覧用 crop の暗転・枠は、基準寸法付きの crop 値を持つ prepared page が描く。
+通常 flat・curl 表裏・canonical は同じ leaf 投影と可視 polygon を使う。実二頁では抑止し、
+見開き設定中の片頁は描く。crop overlay は編集ハンドルと入力だけを所有する。
+受付はメモリだけを読み、legacy 基準寸法の永続採用は従来の通常表示 owner に残す。
+保持表示は capture-time crop を保持し、別フォルダで同じ idx を使っても新頁の crop を参照しない。
+
+Z照準／拡大は画像・pixel grid・照準暗転／照準枠を先に描き、実際のZ transformを使って
+同じflat crop ownerを呼ぶ。mainでは従来のcrop合成段（canvas overlayの後、crop handlesの前）、
+単独Z描画ではそのcompositeの最後に呼ぶ。crop暗転と枠を照準の下へ移さず、二度描かない。
+通常flatも実際にbindしたprepared pageのcrop／transform／clipをフレーム内の描画値として返し、
+pixel gridとcanvas overlayの後、handlesの前で同じownerが描く。受付・snapshotにはcrop bindingを残す。
+curlはこの後描画値を生成せず、各faceに投影する。canonicalの最初のflatから同じ後描画段を使い、
+演出OFF／非eligible／取消のflatも同じ境界を通す。捕捉表示は従来どおり捕捉cropを面と一緒に描く。
+
+準備済み比較（固定画像・ワイプ・差分）も、合成画像の実 transform で同じ flat crop owner を
+一度だけ呼ぶ。WipeはCPU／shaderともcomposite→操作表示→canvas overlay→crop暗転／枠の旧順。
+比較準備中は通常ページのownerを使い、編集overlayは引き続きハンドルだけを描く。
+legacy crop のメモリ内基準解決は受付と通常表示で共有し、FullSource サムネイルの原寸情報、
+情報がない場合の resident raster も含む。受付後の品質更新では既存の受付内容が crop を保持する。
+矩形が収まらず基準を未確定のまま受け付けた場合もその値を保持し、paint の clamp は transform に
+委ねる。基準が解決できた場合の永続採用は通常表示でだけ行う。
 
 `ensure_edit_result_pixels` は新規組立て時と CPU-only entry の表示昇格時の両方で、
 upload の枚数制限より先に現在 context の `fs_cache` の静止画 source を調べる。

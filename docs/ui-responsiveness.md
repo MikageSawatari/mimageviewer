@@ -471,6 +471,11 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+注釈fontの先回り（§1.602）はNext頁の計画でメモリ上の需要だけを判断し、列挙・font読取・parseを`comic-font-load` workerへ置く。
+App共有ownerの受信口は1つ。root pollは非blockingで採用し、workerの完了時にroot再描画を要求する。
+`comic / font_load`に所要ms・要求key数・読込key数・結果を記録する。同期表示はworkerを待たず、不足時は受信口を捨てて既存の同期経路を維持する。
+ピッカーの列挙所有者や段階Bのsnapshot／font充足判定は変えず、新しいUI同期I/O・待ち・めくり省略を足さない。
+
 紙めくり D3（2026-10-19）は一般 final の CPU 処理と表示 clamp を既存 final-effect worker へ置く。
 投機 CPU permit は実終了まで1件、結果予約は context 1 unit／全体2 unit／1GiB。表示要求は投機枠を
 待たず、検証済み CpuReady の引取りまたは同期 takeover を行う。未実体化の編集・comic は従来経路を維持する。

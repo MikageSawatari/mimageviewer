@@ -98,6 +98,7 @@ impl App {
         if !self.raw_edit_target_entry_allowed(target_idx) {
             return;
         }
+        self.cancel_prepared_edit_for_entry(target_idx);
         self.cancel_original_material_entry_intents(None);
         // A current edit-chain result is already the correct conceal input.
         // Only hydrate the original when neither that result nor the input for
@@ -317,6 +318,7 @@ impl App {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
+        self.cancel_prepared_edit_for_entry(new_idx);
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }

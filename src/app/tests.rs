@@ -52,7 +52,8 @@ mod pdf_render_epoch;
 mod notification_duration;
 
 #[path = "tests/plain_folder_spread.rs"]
-mod plain_folder_spread;
+pub(crate) mod plain_folder_spread;
+mod resident_edit_material;
 
 #[path = "tests/tag_applied_at.rs"]
 mod tag_applied_at;
@@ -6296,7 +6297,7 @@ fn phase_a_missing_comic_fonts_close_preserves_shared_preview() {
             comic_core::TextBlock::default(),
         )],
     );
-    app.comic_fonts = None;
+    app.comic_fonts.seed_for_test(None, Default::default());
     let edit_key = app.current_edit_result_key(0);
     app.edit_result_cache.insert(
         edit_key,
@@ -7942,6 +7943,7 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
             singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
             layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
                 fit_scale_limits:
                     crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                 fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
@@ -54142,6 +54144,7 @@ mod pipeline_cache_refactor_tests {
                     crate::displayed_image_transform::SingletonSpreadPlacement::Center,
                 layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![FsDisplayUnitHoldoverPage {
+                    crop: None,
                     fit_scale_limits:
                         crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                     fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
@@ -82874,7 +82877,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
             let captured_before = app
                 .with_active_viewer_context(|mounted| {
-                    mounted.capture_paged_display_unit_for_snapshot(0)
+                    mounted.capture_paged_display_unit_for_snapshot(None, 0)
                 })
                 .flatten()
                 .expect("mounted Z projection");
@@ -82945,7 +82948,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 assert_eq!(remounted.fs_zoom_active, active);
                 assert_eq!(remounted.fs_zoom_aiming, !active);
                 let captured = remounted
-                    .capture_paged_display_unit_for_snapshot(0)
+                    .capture_paged_display_unit_for_snapshot(None, 0)
                     .expect("remounted Z projection");
                 assert_eq!(captured.unit.pages.len(), 1);
                 assert!(matches!(
@@ -83041,7 +83044,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         }
 
         let captured = app
-            .capture_paged_display_unit_for_snapshot(left)
+            .capture_paged_display_unit_for_snapshot(None, left)
             .expect("Z spread capture");
         assert!(matches!(
             captured.unit.layout_projection,
@@ -83141,6 +83144,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     target_idx: 0,
                     previous: FsDisplayUnitHoldover {
                         pages: vec![FsDisplayUnitHoldoverPage {
+                            crop: None,
                             fit_scale_limits:
                                 crate::displayed_image_transform::FullscreenFitScaleLimits::default(
                                 ),
@@ -83183,7 +83187,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_ne!(old_texture_id, current_texture_id);
         app.with_active_viewer_context(|mounted| {
             let captured = mounted
-                .capture_paged_display_unit_for_snapshot(0)
+                .capture_paged_display_unit_for_snapshot(None, 0)
                 .expect("last-painted holdover capture");
             assert!(matches!(
                 captured.presentation,
@@ -83313,7 +83317,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::ui_fullscreen::SpreadPageOccurrence::navigation(0, 0),
         );
         let captured = app
-            .capture_paged_display_unit_for_snapshot(0)
+            .capture_paged_display_unit_for_snapshot(None, 0)
             .expect("rotated singleton capture");
         assert_eq!(
             captured.unit.pages[0].post_filter,
@@ -89710,7 +89714,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(app.fullscreen_idx, Some(main_idx));
             app.with_active_viewer_context(|parked| {
                 assert_eq!(parked.fullscreen_idx, Some(owner_idx));
-                assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
+                assert_eq!(
+                    parked.conceal_cache[&owner_idx]
+                        .texture
+                        .as_ref()
+                        .unwrap()
+                        .id(),
+                    owner_texture
+                );
             })
             .unwrap();
             rendered.1.drop_without_applying_deltas();
