@@ -45,6 +45,9 @@ mod thumbnail_request_lifecycle;
 #[path = "tests/section1328_session.rs"]
 mod section1328_session;
 
+#[path = "tests/scroll_661.rs"]
+mod scroll_661;
+
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
 
