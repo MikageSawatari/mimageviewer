@@ -13791,6 +13791,9 @@ mod tests {
             Arc::clone(&player.decoder_dropped_full_count),
             Arc::clone(&player.dynamic),
         );
+        // A real decoder uses the same presentation ownership as a normal open,
+        // whether the fixture consumes frames in tick or a simulated presenter.
+        player.video_output = super::VideoOutputState::Presentation;
         let info = player
             .decode
             .info_rx
@@ -14551,6 +14554,8 @@ mod tests {
             #[cfg(not(windows))]
             std::sync::Arc::new(super::decoder::VideoDynamicState::default()),
         );
+        // tick (or the fixture's simulated presenter) consumes this real receiver.
+        player.video_output = super::VideoOutputState::Presentation;
         let info = player
             .decode
             .info_rx
