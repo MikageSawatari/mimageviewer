@@ -163,6 +163,167 @@ fn frame_with_extra_events(
 }
 
 #[test]
+fn conceal_tool_switch_by_key_releases_old_operation_before_eye_preview() {
+    conceal_tool_switch_releases_old_operation(false);
+}
+
+#[test]
+fn conceal_tool_switch_by_panel_releases_old_operation_before_eye_preview() {
+    conceal_tool_switch_releases_old_operation(true);
+}
+
+fn conceal_tool_switch_releases_old_operation(panel: bool) {
+    let _input = crate::key_input::lock_test_input();
+    // Brush, line, shape, move, freehand lasso, polygon, and resize.
+    for kind in 0..7 {
+        let (mut app, ctx) = fixture();
+        app.conceal_tool = match kind {
+            1 => ConcealTool::Line,
+            2 => ConcealTool::Rect,
+            4 => ConcealTool::Lasso,
+            5 => ConcealTool::Polygon,
+            _ => ConcealTool::Brush,
+        };
+        if kind == 3 || kind == 6 {
+            app.conceal_shapes.push(crate::mask_db::Shape::Rect {
+                center: (50.0, 50.0),
+                half_w: 20.0,
+                half_h: 20.0,
+                rotation_rad: 0.0,
+                op: crate::mask_db::ShapeOp::Add,
+            });
+            app.conceal_selected_shape = Some(0);
+        }
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        let start = if kind == 6 {
+            egui::pos2(670.0, 170.0)
+        } else {
+            egui::pos2(650.0, 150.0)
+        };
+        let end = egui::pos2(690.0, 190.0);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((start, Some(true))),
+            None,
+        );
+        frame(&mut app, &ctx, egui::Key::Tab, Some((end, None)), None);
+        match kind {
+            0 => assert!(app.conceal_last_paint_pos.is_some()),
+            1 => assert!(app.conceal_line_start.is_some()),
+            2 => assert!(app.conceal_shape_drag_start.is_some()),
+            3 | 6 => assert!(app.conceal_drag.is_some()),
+            _ => assert!(!app.conceal_lasso_points.is_empty()),
+        }
+        let mask = app.conceal_mask.clone();
+        let shapes = app.conceal_shapes.clone();
+        let selection = app.conceal_selected_shape;
+        let undo_len = app.conceal_undo_stack.len();
+        if panel {
+            // Exercise the panel handler's own cleanup, without a preceding canvas release
+            // clearing the old tool state on its behalf.
+            conceal_panel_pointer_frame(&mut app, &ctx, end, false);
+            let select = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::unique("conceal_select_button_test_rect"))
+                })
+                .unwrap()
+                .center();
+            conceal_panel_pointer_frame(&mut app, &ctx, select, true);
+            conceal_panel_pointer_frame(&mut app, &ctx, select, false);
+        } else {
+            frame_with_extra_events(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((end, None)),
+                None,
+                &[egui::Event::Key {
+                    key: egui::Key::S,
+                    physical_key: Some(egui::Key::S),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert_eq!(
+            app.conceal_tool,
+            ConcealTool::Select,
+            "kind={kind} panel={panel}"
+        );
+        assert!(app.conceal_last_paint_pos.is_none());
+        assert!(app.conceal_line_start.is_none() && app.conceal_line_end.is_none());
+        assert!(app.conceal_shape_drag_start.is_none() && app.conceal_shape_drag_end.is_none());
+        assert!(app.conceal_drag.is_none());
+        assert!(app.conceal_lasso_points.is_empty());
+        assert_eq!(app.conceal_mask, mask, "keep already painted pixels");
+        assert_eq!(
+            app.conceal_shapes, shapes,
+            "keep edits, do not commit pending shapes"
+        );
+        assert_eq!(
+            app.conceal_selected_shape, selection,
+            "keep selection on entry to Select"
+        );
+        assert_eq!(app.conceal_undo_stack.len(), undo_len);
+        if !panel {
+            frame(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((end, Some(false))),
+                None,
+            );
+        }
+        let eye = app.conceal_preview_button_rect.unwrap().center();
+        assert!(
+            frame(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((eye, Some(true))),
+                None
+            ),
+            "eye pipeline blocked after switch: kind={kind} panel={panel}"
+        );
+        assert!(app.conceal_preview_active);
+        assert!(!frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, Some(false))),
+            None
+        ));
+        assert!(!app.conceal_preview_active);
+    }
+}
+
+fn conceal_panel_pointer_frame(app: &mut App, ctx: &egui::Context, pos: egui::Pos2, pressed: bool) {
+    let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(full_rect),
+            focused: true,
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |_ui| app.draw_conceal_panel(ctx, full_rect),
+    )
+    .drop_without_applying_deltas();
+}
+
+#[test]
 fn conceal_preview_eye_crossing_keeps_the_canvas_drag_owner() {
     let _input = crate::key_input::lock_test_input();
     for (tool, handle) in [
