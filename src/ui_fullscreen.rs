@@ -33867,6 +33867,10 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                     #[cfg(any(test, feature = "test-script"))]
                     crate::key_input::SyntheticNavigationKey::G => KeyName::G,
+                    #[cfg(test)]
+                    crate::key_input::SyntheticNavigationKey::Tab => KeyName::Tab,
+                    #[cfg(test)]
+                    crate::key_input::SyntheticNavigationKey::Space => KeyName::Space,
                 };
                 crate::test_script::KeymapLevelObservation {
                     frame_nr: observation.frame_nr,

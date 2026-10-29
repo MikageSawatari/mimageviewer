@@ -163,6 +163,153 @@ fn frame_with_extra_events(
 }
 
 #[test]
+fn conceal_preview_eye_crossing_keeps_the_canvas_drag_owner() {
+    let _input = crate::key_input::lock_test_input();
+    for (tool, handle) in [
+        (ConcealTool::Brush, false),
+        (ConcealTool::Line, false),
+        (ConcealTool::VertLine, false),
+        (ConcealTool::HorizLine, false),
+        (ConcealTool::Rect, false),
+        (ConcealTool::Ellipse, false),
+        (ConcealTool::Lasso, false),
+        (ConcealTool::Select, false),
+        (ConcealTool::Brush, true),
+    ] {
+        let (mut app, ctx) = fixture();
+        app.conceal_tool = tool;
+        if tool == ConcealTool::Select || handle {
+            app.conceal_shapes.push(crate::mask_db::Shape::Rect {
+                center: (50.0, 50.0),
+                half_w: 20.0,
+                half_h: 20.0,
+                rotation_rad: 0.0,
+                op: crate::mask_db::ShapeOp::Add,
+            });
+            if handle {
+                app.conceal_selected_shape = Some(0);
+            }
+        }
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        let eye = app.conceal_preview_button_rect.unwrap().center();
+        let start = if handle {
+            egui::pos2(670.0, 170.0) // Selected rectangle's bottom-right handle.
+        } else {
+            egui::pos2(650.0, 150.0)
+        };
+        let end = egui::pos2(750.0, 250.0);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((start, Some(true))),
+            None,
+        );
+        for pos in [eye, end] {
+            assert!(
+                !frame(&mut app, &ctx, egui::Key::Tab, Some((pos, None)), None),
+                "pipeline preview stole {tool:?}"
+            );
+            assert!(!app.conceal_preview_active, "panel preview stole {tool:?}");
+            assert!(!app.fs_primary_suppression.is_active(), "{tool:?}");
+        }
+        if handle {
+            assert!(app.conceal_drag.is_some());
+            assert!(matches!(
+                app.conceal_shapes[0],
+                crate::mask_db::Shape::Rect {
+                    center: (90.0, 90.0),
+                    half_w: 60.0,
+                    half_h: 60.0,
+                    ..
+                }
+            ));
+        } else {
+            match tool {
+                ConcealTool::Brush => {
+                    assert_eq!(app.conceal_last_paint_pos, Some(end));
+                    assert!(app.conceal_mask.as_ref().unwrap()[150 * 200 + 150]);
+                }
+                ConcealTool::Line | ConcealTool::VertLine | ConcealTool::HorizLine => {
+                    assert_eq!(app.conceal_line_end, Some((150.0, 150.0)));
+                }
+                ConcealTool::Rect | ConcealTool::Ellipse => {
+                    assert_eq!(app.conceal_shape_drag_end, Some((150.0, 150.0)));
+                }
+                ConcealTool::Lasso => {
+                    assert_eq!(app.conceal_lasso_points.last(), Some(&(150.0, 150.0)));
+                }
+                ConcealTool::Select => assert!(matches!(
+                    app.conceal_shapes[0],
+                    crate::mask_db::Shape::Rect {
+                        center: (150.0, 150.0),
+                        ..
+                    }
+                )),
+                _ => unreachable!(),
+            }
+        }
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((end, Some(false))),
+            None,
+        );
+        assert!(!app.conceal_preview_active);
+        assert!(app.conceal_last_paint_pos.is_none());
+        assert!(app.conceal_line_start.is_none());
+        assert!(app.conceal_shape_drag_start.is_none());
+        assert!(app.conceal_drag.is_none());
+        assert!(app.conceal_lasso_points.is_empty());
+    }
+}
+
+#[test]
+fn conceal_preview_eye_press_and_release_work_without_a_canvas_owner() {
+    let _input = crate::key_input::lock_test_input();
+    for polygon_waiting in [false, true] {
+        let (mut app, ctx) = fixture();
+        if polygon_waiting {
+            app.conceal_tool = ConcealTool::Polygon;
+            // Pending vertices span separate presses; they do not own this press.
+            app.conceal_lasso_points = vec![(10.0, 10.0), (30.0, 10.0)];
+        }
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        let eye = app.conceal_preview_button_rect.unwrap().center();
+        assert!(frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, Some(true))),
+            None
+        ));
+        assert!(app.conceal_preview_active);
+        assert!(frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, None)),
+            None
+        ));
+        assert!(!frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, Some(false))),
+            None
+        ));
+        assert!(!app.conceal_preview_active);
+        assert!(!app.conceal_mask.as_ref().unwrap().iter().any(|p| *p));
+        if polygon_waiting {
+            assert_eq!(app.conceal_lasso_points, vec![(10.0, 10.0), (30.0, 10.0)]);
+        }
+    }
+}
+
+#[test]
 fn conceal_preview_hold_release_and_eye_share_preview_without_invalidating_cache() {
     let _input = crate::key_input::lock_test_input();
     let (mut app, ctx) = fixture();

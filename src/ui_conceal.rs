@@ -1326,11 +1326,16 @@ impl App {
     // ── 入力処理 ──────────────────────────────────────────────────
 
     fn conceal_drawing_in_progress(&self) -> bool {
+        self.conceal_pointer_operation_in_progress() || !self.conceal_lasso_points.is_empty()
+    }
+
+    /// 継続中の左ドラッグの所有者。多角形の頂点待ちは次の押下を所有しない。
+    fn conceal_pointer_operation_in_progress(&self) -> bool {
         self.conceal_last_paint_pos.is_some()
             || self.conceal_line_start.is_some()
             || self.conceal_shape_drag_start.is_some()
             || self.conceal_drag.is_some()
-            || !self.conceal_lasso_points.is_empty()
+            || (self.conceal_tool == ConcealTool::Lasso && !self.conceal_lasso_points.is_empty())
     }
 
     /// ドラッグ入力を処理する (ツール別 dispatch)。
@@ -2001,12 +2006,15 @@ impl App {
         // press already has its canonical owner from the previous pass; do not reinterpret
         // that overflow press as an eye-button hold after entering conceal mode by key.
         let primary_down = primary_down && !self.fs_front_pointer.owns_primary_in(viewport_id);
-        let pointer_active = conceal_preview_pointer_active(
-            self.conceal_mode,
-            self.conceal_preview_button_rect,
-            pointer_pos,
-            primary_down,
-        );
+        // An editing drag keeps its owner while crossing the panel. Do not let the
+        // geometric eye pre-read turn that stream into preview suppression.
+        let pointer_active = !self.conceal_pointer_operation_in_progress()
+            && conceal_preview_pointer_active(
+                self.conceal_mode,
+                self.conceal_preview_button_rect,
+                pointer_pos,
+                primary_down,
+            );
         // キー受付は所有 viewport の canvas が担当する。ROOT の入力で読み直さず、
         // 前 pass で受付済みの保持を目ボタンと合成して pipeline の前に確定する。
         self.conceal_preview_active =
