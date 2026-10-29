@@ -2,6 +2,9 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[path = "tests/ai_crash_655.rs"]
+mod ai_crash_655;
+
 /// Preserve the headless renderer's logical client dimensions while fixtures
 /// use the same physical outer placement as a decorated native window.
 #[cfg(windows)]
