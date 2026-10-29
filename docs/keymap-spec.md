@@ -1,5 +1,48 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+## 左右ドラッグによる連続ズーム
+
+既定は Ctrl+Space を押しながら primary pointer（ペン／マウス左ボタン）で左右ドラッグ。
+右で拡大、左で縮小し、押下位置を固定したまま開始時の倍率と pan から毎回計算する。
+100 px で2倍／半分、開始しきい値は中ボタンドラッグと同じ4 px。
+しきい値内では書き戻さず、直前の倍率と pan を保つ。通常・編集は0.1～50倍、
+Z ズームは既存の0.05～16倍を維持する。360では入力だけを所有し視点は変更しない。
+
+| Action | Context | Trigger | 既定 |
+| --- | --- | --- | --- |
+| `FsScrubZoomHold` | FsImage | KeyHold | Ctrl+Space |
+| `EraseScrubZoomHold` | Erase | KeyHold | Ctrl+Space |
+| `ConcealScrubZoomHold` | Conceal | KeyHold | Ctrl+Space |
+| `CropScrubZoomHold` | Crop | KeyHold | Ctrl+Space |
+| `TextScrubZoomHold` | Text | KeyHold | Ctrl+Space |
+| `LaScrubZoomHold` | LocalAdjust | KeyHold | Ctrl+Space |
+
+この6操作だけ `FullChord` policy を使い、通常キーと修飾キーの組合せを許可する。
+従来の KeyHold は `SinglePlainKey` のまま。修飾は完全一致で、Ctrl+Space は
+`FsSpaceCheck` を発火させない。Crop の Ctrl 併用パンも含め、共通 helper でズームを優先する。
+描画・選択等のドラッグ中は開始しない。パネル上で開始せず、開始後はパネルを横切っても続く。
+各モードの入力経路は共通 helper をパネル上の通常操作を拒否する判定より先に呼ぶ。
+パネルの許可は `can_start` にだけ渡し、開始済みの Space パン／scrubby の継続・解放を遮断しない。
+chord または primary を離すと倍率変更を終了し、通常・編集の PDF は最終倍率で再描画する。
+chord を先に離した場合も primary を離すまで同じ押下を所有し、描画・クリックへ流さない。
+通常閲覧は単ページ・見開き・縦横連結の静止画キャンバスが対象で、分析・動画・音声・音楽・ページ一覧は対象外。
+分析モードはガイド操作との組合せを増やさず、従来のホイール／中ボタンズームを使う。
+TextEdit／IME／modal／非アクティブ窓の既存入力所有を優先し、detached の配送経路は変更しない。
+距離の単位は egui の論理座標 (UI 倍率 100% で画面 px と一致)。
+実機確認 (観測者: ClaudeCode、2026-10-29、利用者の許可を得て操作。`--data-dir` で隔離したデータ、
+keyzoom-1470 の dev-runtime ビルド 05:32): 閲覧中に押した点を固定したまま右で拡大・戻すと縮小し、
+離した後のページ送りは起きなかった。消しゴムモードで左右ドラッグが縮小・拡大になり描画されず、
+Space だけではパン。消しゴムの `ErasePreviewHold` は押している間だけ結果が出て、描画途中の押下は無効、
+プレビュー中のドラッグは描かれなかった。ほかの 4 編集モード・切り抜きのパネル越し・見開き / 連結・
+分析モードでの非動作・中ボタンの感触・キー変更は未確認。
+
+右 Ctrl+Space では従来の `FsOriginalPreviewHold` も成立し、元画像表示を併用する。
+入力方式によっては Ctrl+Space が入力の切り替えに使われるため、その場合は操作カスタマイズで別のキーへ変更する。
+中ボタンと scrubby は種類・開始した面（閲覧／編集）・開始時の持ち主を持つ一つのドラッグ状態を共有し、同時開始しない。
+閲覧と編集の入力処理は自分の面で開始した scrubby だけを継続・終了する。
+面または `fs_zoom_owner()` が変わったら、値を書き戻さずに状態を破棄する。終了した primary は解放まで既存の抑止へ渡す。
+組合せを減らすため、chord 解放後の再開・パンへの切替は設けず、同じ primary の終端まで所有する。
+
 ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
 動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
 受理済み移動が未提示の間はanimationのON／OFFにかかわらずOによる新規入場を受け付けない。
@@ -713,6 +756,7 @@ Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持�
 | 入力 | 動作 |
 |---|---|
 | <kbd>Space</kbd>+左ドラッグ | 一時パン。進行中の描画 / 図形 / crop / 注釈ドラッグは途中でパンへ切り替えず、現在の操作を完結させる |
+| <kbd>Ctrl</kbd>+<kbd>Space</kbd>+左右ドラッグ | 押した位置を中心に右で拡大・左で縮小。描画・選択等のドラッグ中は開始しない |
 | マウスホイール | 画像上ではズーム。スクロール可能なツールパネル上ではパネルスクロールを優先 |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | ホイール押し込み+上下ドラッグ | 中ボタンドラッグズーム。パネル上で開始した場合は無視 |
@@ -755,6 +799,67 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | フォルダツリー表示中の方向パッド / 左スティック / <kbd>A</kbd> | ツリーカーソルを上下左右に移動し、<kbd>A</kbd> で選択フォルダを開く。決定後はツリーを自動で閉じ、グリッドへ戻る |
 | <kbd>Y</kbd>+方向パッド左右 (動画) | J / K キーと同じ前 / 次のチャプター・ブックマーク・ピン移動 |
 | <kbd>Start</kbd> | お気に入り／スマートフォルダ一覧を開く。左右でタブを切り替え、上下で選んで <kbd>A</kbd> で移動する。現在スマートフォルダを表示中ならそのタブから開き、件数が多い場合はスクロールバーで続きが分かる |
+
+## キーによる段階ズーム（§1.470）
+
+`FsZoomIn`（画像を拡大する）/ `FsZoomOut`（画像を縮小する）は `FsImage` / `Press`。
+既定の拡大は `Shift+Semicolon`、`Semicolon`、`NumpadAdd`、縮小は `Minus`、`NumpadSubtract`。
+物理 KeySlot / Win32 VK が正本で、JIS / US とも VK_OEM_PLUS（0xBB、`Semicolon`）の
+Shift 押しを `+` とする。修飾なしは JIS の `;` / US の `=`。下段テンキーの +/- も使える。
+VK_OEM_MINUS（0xBD、`Minus`）は修飾なし。表示専用の `display_name` は
+`Shift+Semicolon` → `+`、`Ctrl+Shift+Semicolon` → `Ctrl++` とする。
+settings.db / JSON の `settings_name` は既存の `Shift+;`（Ctrl 付きは `Ctrl+Shift+;`）を維持する。
+chord 解析は既存の `Shift+;` / `Shift+Semicolon` に加え、表示形の `+` を受理する。
+`Ctrl++` / `Alt++` / `Ctrl+Alt++` 等の末尾 `++` は、その修飾 + Shift + Semicolon として読む。
+通常の `Ctrl+A` 等の区切りは維持し、編集欄の初期表示・「押して入力」の表示形も保存できる。
+既定 chord 全件の表示往復に合わせ、右修飾キーの表示名（`右Ctrl` / `右Shift` / `右Alt`）も解析で受理する。
+ini テンプレート / 参照ファイルの生成だけは、`;` / `#` を含む表記をコメント記号と衝突しない
+KeySlot の別名へ置き換える。拡大は `Shift+Semicolon` / `Semicolon` と書き、旧 ini 取り込みでも
+その別名を読む。現行キーでこの変換が必要なのは `Semicolon` だけで、`#` を出すキーはない。
+修飾なしの JSON 保存表記も既存の `;` / `-` を維持する。表示形を入力しても保存・ini 出力表記は変えない。
+修飾なし `Semicolon` の表示は従来の `;` を維持する。
+
+1 回につき ×1.25 / ÷1.25。OS リピートを受け付け、同一フレームは各操作1回
+（`SinglePerFrame`）へまとめる。マウス位置を使わず、画面の中央を基準にする。
+書き先は既存 `fs_zoom_owner()` に従う。
+
+| owner | 適用 |
+| --- | --- |
+| Image | `apply_touch_zoom_factor_about_pivot(factor, center, center)` で `fs_zoom` / `fs_pan`。`ZOOM_MIN`〜`ZOOM_MAX` と `set_fs_pan_from_input` の制約を共有。単ページ / 見開き / 縦横連結に適用 |
+| Analysis | 同じ関数で `analysis_zoom` / `analysis_pan`。分析画像の表示中央を固定 |
+| Panorama | `apply_panorama_touch_zoom` で FOV を変更 |
+| ZoomMode | 照準中 / 確定中とも `adjust_fs_zoom_factor(±1.0)` で専用倍率だけを変更 |
+
+Image / Analysis で変化したらそれぞれの倍率を `maybe_rerender_pdf` へ渡す。
+上下限で変化しなければ何もしない。変化時だけ repaint を要求する。
+Image / Analysis とも中心・pivot に同じ点（原点）を渡すと pan は倍率比で拡縮される。
+ページ単位表示ではこれで表示中央が固定され、矩形の位置 / 寸法は計算に不要となる。
+キー段では表示矩形・seek geometry を計算せず、root から配送された入力でも同じ結果となる。
+設計の簡素化: キー段で完結させ、フレーム間 pending や専用の viewport 配送を増やさない。
+
+連結読みの主軸位置は `fs_vertical_scroll` が所有するため、`fs_pan` だけを拡縮する現在の
+キー / Ctrl+ホイール / ピンチでは表示中央がずれ得る。全ズーム入力に共通する既存課題として
+今回の修正対象から外し、主軸位置・スクロール所有は変更しない。
+
+動画 / 音声 / 音楽ビューでは consume しない。消しゴム / 隠蔽 / 切り取り / SNS 分割 /
+テキスト注釈 / 補正レイヤーでは既存 `FsFitModeCycle` と同じ early return に従い実行しない。
+比較表示は `FsFitModeCycle` と同様に通常キー段へ到達するので適用する。
+ページ一覧中は実行可能集合に含めない。TextEdit / IME / modal / popup / 非アクティブ窓は
+既存 helper の入力所有に従い、F12 / 複数窓も既存 viewer context の状態だけを変更する。
+修飾キー長押しのルーペは Shift のレベルを別に読むため、`+` 中も既存の `Shift+S` 等と同様に反応する。
+
+今回はキーボード専用。ヘルプと操作カスタマイズは全 Action の一覧から自動表示し、リング /
+ジェスチャ / マウスボタン / ゲームパッド、HUD / フィット popup ボタンは追加しない。
+保存済み設定で新 Action の override がなければ既定が有効になる（`FsPageOverviewToggle` と同じ）。
+他操作の保存済み割当を移動・削除せず、重複は既存の競合表示と handler の消費順に従う。
+移行処理は追加しない。明示的な再割当 / `none` による解除は通常の置換規則を使う。
+
+実機確認 (観測者: ClaudeCode、2026-10-29、利用者の許可を得て操作。`--data-dir` で隔離したデータ、
+keyzoom-1470 の dev-runtime ビルド、JIS 配列): 1200×900 の PNG を画面に合わせた表示から開き、
+スクリプトから送ったキーで画面の白枠の幅を測った。`;` 2 回で画面中央を軸に 1.25 倍ずつ拡大、`-` で 1 段縮小、
+テンキーの + / - も同じ (1800 → 2250 → 1800 px)。テンキーの - 6 回で 471 px (0.8^6 倍) まで縮み、
+下限は Ctrl+ホイールと同じ `ZOOM_MIN`。長押し・ZIP / PDF・見開き / 連結・編集モードと動画での非消費・
+割り当て変更・US 配列は未確認。
 
 ## 画像 フルスクリーン
 
@@ -839,6 +944,21 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 
 ## 消しゴムモード
 
+結果プレビューは `ErasePreviewHold`（Erase / KeyHold、既定 Tab）と目のボタンを OR で合成し、
+既存の false → true 遷移で保存なし補完を 1 回だけ投入する。両方押しても再投入せず、両方離すと終了する。
+キーの保持判定はパネル描画の外、キャンバスのドラッグ解放処理より前に行い、
+`focused_key_state_permit` / keymap の TextEdit・IME・modal・非アクティブ窓の入力所有に従う。
+legacy keymap helper は Modal を呼出元で止める契約なので、このキャンバス側のキー受付も
+cached `KeyboardOwner::Modal` では保持・解放を観測しない。
+筆・囲み・多角形・線・図形作成・ハンドル編集の進行中に押したキーは保持受付を拒否し、
+描画終了後も押したままなら開始しない。Shift 等の修飾変更や入力所有の喪失を解放とみなさず、
+permit のあるフレームで割当キー自体の解放を確認してから押し直す。キーを押すのと同時に描き始めた場合も描画を優先する。
+プレビュー中は新しい描画・選択・図形操作を始められない。Space パンと Ctrl+Space の左右ドラッグズームは使える。
+プレビュー中に押し始めた左ボタンでは、プレビューを解除しても描画を始めず、一度離して押し直す。
+保持受付は Released / Held / BlockedUntilRelease の一つの状態とし、入場・退出で初期化する。
+設計の簡素化: キーとボタンに別々の補完要求や worker を設けず、既存のプレビュー遷移を共用する。
+目のボタンの hover、`?` ヘルプ、操作カスタマイズは実割り当てを表示する。隠蔽加工には追加しない。
+
 | 入力 | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | 消しゴムモードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いの操作は別枠で表示する |
@@ -846,6 +966,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>S</kbd> / <kbd>B</kbd> / <kbd>K</kbd> / <kbd>L</kbd> / <kbd>P</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd> | 選択 / 筆 / バケツ / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円ツール |
 | <kbd>D</kbd> / <kbd>F</kbd> | 描画 / 消去モード切替 |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
+| <kbd>Tab</kbd>（押している間） | 消しゴム適用後の結果プレビュー（モザイクは除外）。Action: `ErasePreviewHold`。操作カスタマイズで変更・解除できる。描画ドラッグ中の押下は無効なので、終了後に押し直す |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | マウスホイール | 画像上ではズーム。ツールパネル上ではパネルスクロール |
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | マスクまたは選択オブジェクトを 1px / 10px 移動 |
@@ -923,7 +1044,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | ドラッグ中も現在の切り取り範囲を先に確定・保存し、現在の表示結果を別ファイルへエクスポートする。Action: `CropExecute` |
 | <kbd>Esc</kbd> | ドラッグ中は開始前の切り取り設定（crop なしも含む）へ戻し、保存せずドラッグだけを取り消す。モードは維持する。ドラッグしていなければ切り取りモードを終了する固定操作 |
 | <kbd>Ctrl</kbd>+左ドラッグ | 既存の切り取り枠やハンドル上からでも、新しい切り取り範囲を作成する。Action: `CropForceCreateHold`。既定は <kbd>Ctrl</kbd> で、操作カスタマイズから変更・無効化できる |
-| <kbd>Space</kbd>+左ドラッグ | 一時パン。`CropSpacePan` と `CropForceCreateHold` を同時に押した場合もパンを優先する。開始後に修飾キーを押す、または離しても、同じ左ドラッグを切り取り操作へ切り替えない |
+| <kbd>Space</kbd>+左ドラッグ | 一時パン。`CropSpacePan` と `CropForceCreateHold` を同時に押した場合もパンを優先するが、`CropScrubZoomHold` が成立すると左右ドラッグズームを優先する。開始後に修飾キーを押す、または離しても、同じ左ドラッグを切り取り操作へ切り替えない |
 | マウスドラッグ | 切り取り範囲を作成、移動、またはリサイズする。アスペクト固定時は、辺なら反対辺、角なら反対角を固定して拡大縮小する |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | マウスホイール | 画像上ではズーム。ツールパネル上ではパネルスクロール |

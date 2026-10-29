@@ -2297,6 +2297,44 @@ fullscreen の close はその context の状態を Idle にし、retire は bun
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、
 `FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
+Ctrl+Space＋primary 左右ドラッグの連続ズームは中ボタンドラッグと同じ `MiddleZoomDrag` を所有する。
+入力種類・開始した面（閲覧／編集）・開始時の `FsZoomOwner`・pivot・zoom・pan・rect center を固定し、共通の
+`zoom_at` で中ボタンは `2^(-dy/100)`、scrubby は `2^(dx/100)` を計算する。
+4 px のしきい値と `zoom_preserve_pivot` を共用し、通常・分析・編集は `ZOOM_MIN..ZOOM_MAX`、
+Z は既存の0.05～16に制限する。360は入力のみ消費する。終了時だけ各 owner の倍率で PDF を再描画する。
+4 px 未満では直前値を維持して書き戻さない。面／現在の `fs_zoom_owner()` が開始時と異なれば書き込まず終了する。
+閲覧処理は編集で開始した scrubby に触れず、編集 helper も閲覧で開始した状態に触れない。
+scrubby は分析モードでは開始せず、ガイド入力と組み合わせない。従来の分析ホイール／中ボタンは維持する。
+編集5モードは既存の Space パン helper を共用し、通常閲覧では touch／gesture／click／pan より先に primary を所有する。
+編集側はパネル上の開始拒否より先に共通 helper を駆動する。切り取りの `pointer_allowed` も開始許可として渡し、
+crop 枠の入力受付はその後で判定する。パネルを横切った Space パン／scrubby の継続と解放は共通 owner が処理する。
+chord 解放後は倍率変更を終了し、primary 解放まで同じ typed state に保持して他の操作へ流さない。
+入力所有・対象 context の詳細は [キー仕様](keymap-spec.md#左右ドラッグによる連続ズーム)。
+
+キーの段階ズーム（`FsZoomIn` / `FsZoomOut`、既定 `+` / `;`（US は `=`）/ テンキー `+` と
+`-` / テンキー `-`）は画面中央を基準に ×1.25 / ÷1.25。
+`fs_zoom_owner()` に従い、通常画像（単ページ / 見開き / 縦横連結）は `fs_zoom` / `fs_pan`、
+分析は `analysis_zoom` / `analysis_pan`、360 は FOV、Z 照準 / 確定中は `fs_zoom_factor` を変更する。
+通常 / 分析はピンチの倍率・pivot 関数、360 はピンチの FOV 関数、Z はホイール刻みを共用し、
+通常 / 分析の変化時だけ各倍率で PDF 再描画を要求する。既存の clamp / pan 制約を維持する。
+Image / Analysis は pivot と中心に同じ点を渡して pan を倍率比で拡縮するため、キー段で
+表示矩形 / seek geometry を計算しない。ページ単位表示の中央固定計算はキー段で完結し、viewer 配送や pending は増やさない。
+連結読みでは主軸位置を `fs_vertical_scroll` が持つため、キー / Ctrl+ホイール / ピンチの
+いずれも現在の `fs_pan` の拡縮だけでは中央がずれ得る。この共通課題は今回変更しない。
+動画 / 音声 / 編集モード / ページ一覧は対象外。比較では通常の画像キーと同様に有効。
+長押しリピートは同一フレームで各操作1回にまとめる。入力所有と詳細は [キー仕様](keymap-spec.md#キーによる段階ズーム1470)。
+
+通常表示への変換受け渡し `fs_zoom_pan()` は `zoom_differs_from_fit(fs_zoom)`
+または有意な pan がある場合に `Some` を返す。拡大・縮小を上下対称に扱い、1.0 付近の
+丸め誤差（0.99999 等）かつ pan なしだけを無変換にする。これにより fit から中央基準で
+縮小したキー / ゲームパッド LT / 中央での Ctrl+ホイールも `DisplayedImageTransform` へ倍率が届く。
+単ページ・白い相方付き単独配置・見開き・比較・類似プレビュー・snapshot の geometry は同じ値を使う。
+ページめくりアニメーションの既存 `fs_zoom_pan().is_none()` 条件も縮小中は不成立になる
+（無変換ページだけをめくる方針を維持）。入力所有・detached の述語 / viewport 経路は変更しない。
+ダブルクリックのリセット可否も同じ `zoom_differs_from_fit(zoom)` を使い、縮小中もリセットできる。
+この helper は `abs(zoom - 1.0) > ZOOM_NEAR_ONE - 1.0` を一か所で定義する。
+ゲームパッド pan、ピクセルグリッド、単クリック所有は「拡大中か」を問う既存上側閾値を維持する。
+
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
 **解決後の `DisplayedImageTransform` と描画は共用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
 keymap カスタマイズ可) のホールドで動き、

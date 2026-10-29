@@ -19161,11 +19161,13 @@ pub struct App {
     /// 隠蔽マスクの世代番号。mask / shape の保存・削除で idx 単位に +1 する。
     pub(crate) conceal_mask_generation: std::collections::HashMap<usize, u64>,
 
-    /// 消しゴム編集モード中の「プレビューボタン押下」状態。
-    /// パネル右上の目アイコンを押している間 true。表示パイプラインは
+    /// 消しゴム編集モード中の「プレビューボタンまたはキー押下」状態。
+    /// パネル右上の目アイコンまたはプレビューキーを押している間 true。表示パイプラインは
     /// false のとき `erase_base_cache` (pre-inpaint) を、true のとき通常パイプライン
     /// (= inpaint 反映後の fs_cache、隠蔽合成は省略) を出力する。
     pub(crate) erase_preview_active: bool,
+    /// プレビューキーの保持受付。描画中の押下は解放まで受け付けない。
+    pub(crate) erase_preview_hold: crate::ui_erase::ErasePreviewHoldState,
     /// 隠蔽編集モード中の「プレビューボタン押下」状態。
     /// 押している間 true で、`ensure_conceal_texture` が conceal_mode でも合成を実行する。
     pub(crate) conceal_preview_active: bool,
@@ -21883,6 +21885,7 @@ impl App {
             comic_undo_key: None,
             comic_tail_stash: std::collections::HashMap::new(),
             erase_preview_active: false,
+            erase_preview_hold: Default::default(),
             conceal_preview_active: false,
             conceal_preview_button_rect: None,
             erase_base_tex_cache: std::collections::HashMap::new(),
