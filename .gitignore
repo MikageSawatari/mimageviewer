@@ -29,6 +29,7 @@ bench_thumbs.tsv
 /dev/
 # Keep local test data ignored while tracking the small smoke fixtures.
 /testdata/*
+!/testdata/video-deinterlace/
 !/testdata/rating-sort/
 !/testdata/audio-tracks/
 !/testdata/audio-tail/

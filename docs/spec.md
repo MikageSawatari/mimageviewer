@@ -1376,10 +1376,15 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - 動画メタ情報パネルにはデコード backend / フレーム表示経路 / デインターレース状態を
   併記する。「GPU経路」は ファイル open 時の能力フラグ (= GPU video device
   が使えるか)、「フレーム表示」は per-frame の実プレゼン経路 (`d3d11_shared` →
-  GPU、`cpu_upload` → CPU)、「デインターレース」は Settings モード (Auto / On / Off) と
+  GPU、`cpu_upload` → CPU)、「デインターレース」は現在の player のモード (Auto / On / Off) と
   bwdif フィルタの動的状態 (適用中 / プログレッシブ / 待機中 / 失敗) の組み合わせ表示。
   HW デコード + デインターレース ON 時は decoder backend が HW のまま、フレーム表示は
   CPU (= D3D11 → CPU 転送 + bwdif + swscale + CPU upload) になる。
+- 通常動画の上部バーの「…」からデインターレース (自動 / 常に有効 / 無効) をその動画を
+  開いている間だけ変更できる。全体設定・ファイル別保存は変更せず、閉じて次に開くと環境設定値から始まる。
+  情報表示は open 時の値と異なるとき「手動: 」を付ける。再生 intent を維持した現在位置の seek で
+  更新し、EOF 停止中は seek せず次の再生位置から適用する。bwdif 有効時の frame-step は出力側で
+  選別し、demux 終端の codec / filter drain により最後のフレームも出力する。
 - 動画音量は既定 0dB。下部 HUD / Shift+↑↓ / 環境設定から -∞dB〜+18dB の
   dB フェーダーで手動調整でき、音量バーの右クリックまたはダブルクリックで 0dB に戻せる。
   0dB 超の boost 部分は HUD で黄色表示する。音声ポンプ側の最終 safety limiter は

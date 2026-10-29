@@ -5527,6 +5527,7 @@ impl App {
             | Ev::ToggleVst3Gui
             | Ev::ToggleAudioMode
             | Ev::SelectAudioTrack { .. }
+            | Ev::SetDeinterlaceMode { .. }
             | Ev::CloseFullscreen { .. }
             | Ev::ToggleWindowMode
             | Ev::SetVst3VideoCompact { .. }
@@ -5953,6 +5954,16 @@ impl App {
             }
         }
         match event {
+            crate::video::NativeVideoOutputEvent::SetDeinterlaceMode { mode } => {
+                let changed = self.fs_cache.get(&fs_idx).is_some_and(|entry| {
+                    matches!(entry, FsCacheEntry::Video { player, .. }
+                        if player.set_deinterlace_mode(mode))
+                });
+                if changed {
+                    self.sync_native_video_metadata(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
             crate::video::NativeVideoOutputEvent::SelectAudioTrack { stream_index } => {
                 let valid = self.fs_cache.get(&fs_idx).is_some_and(|entry| {
                     matches!(entry,
@@ -9489,7 +9500,8 @@ impl App {
                 hw_decode_active: info.hw_decode_active,
                 gpu_path_active: info.gpu_path_active,
                 d3d11va_supported: info.d3d11va_supported,
-                deinterlace_mode: info.effective_deinterlace_mode,
+                deinterlace_mode: player.deinterlace_mode(),
+                deinterlace_manual: player.deinterlace_manual(),
                 last_present_path,
                 deinterlace_status,
                 interlace_detected,
@@ -9527,7 +9539,8 @@ impl App {
                 hw_decode_active: false,
                 gpu_path_active: false,
                 d3d11va_supported: false,
-                deinterlace_mode: self.settings.video_deinterlace,
+                deinterlace_mode: player.deinterlace_mode(),
+                deinterlace_manual: player.deinterlace_manual(),
                 last_present_path: crate::video::decoder::PresentPathSnapshot::Pending,
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
@@ -16236,6 +16249,25 @@ impl App {
             player.request_native_overlay_render();
         }
         ctx.request_repaint();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod deinterlace_routing_tests {
+    use super::App;
+    use crate::settings::VideoDeinterlaceMode;
+    use crate::video::NativeVideoOutputEvent;
+
+    #[test]
+    fn deinterlace_is_video_only_while_audio_track_selection_remains_allowed() {
+        assert!(!App::native_event_allowed_in_music_shell(
+            &NativeVideoOutputEvent::SetDeinterlaceMode {
+                mode: VideoDeinterlaceMode::On
+            }
+        ));
+        assert!(App::native_event_allowed_in_music_shell(
+            &NativeVideoOutputEvent::SelectAudioTrack { stream_index: 1 }
+        ));
     }
 }
 

@@ -66977,6 +66977,113 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn native_deinterlace_event_checks_owner_epoch_and_preserves_settings_and_sibling() {
+        use crate::settings::VideoDeinterlaceMode as Mode;
+        use crate::video::NativeVideoOutputEvent as Ev;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.video_deinterlace = Mode::Auto;
+        for idx in 0..2 {
+            let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                app.tmp.path().join(format!("deinterlace-{idx}.mkv")),
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(0);
+        let mode = |app: &App, idx| match app.fs_cache.get(&idx).unwrap() {
+            FsCacheEntry::Video { player, .. } => player.deinterlace_mode(),
+            _ => unreachable!(),
+        };
+        let initial = mode(&app, 0);
+        let event = || Ev::SetDeinterlaceMode { mode: Mode::On };
+        app.handle_native_video_output_event(&ctx, 1, 0, event());
+        app.handle_native_video_output_event(&ctx, 0, 99, event());
+        assert_eq!(mode(&app, 0), initial);
+        assert_eq!(mode(&app, 1), initial);
+        app.handle_native_video_output_event(&ctx, 0, 0, event());
+        assert_eq!(mode(&app, 0), Mode::On);
+        assert_eq!(mode(&app, 1), initial);
+        assert_eq!(app.settings.video_deinterlace, Mode::Auto);
+
+        // A parked HUD click activates its owner, even with an old source epoch,
+        // without applying the command to that source.
+        app.native_video_parked_live_input_window_id = Some(92);
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            99,
+            Ev::SetDeinterlaceMode { mode: Mode::Off },
+        );
+        assert_eq!(app.native_video_parked_live_activation_requests, vec![92]);
+        assert_eq!(mode(&app, 0), Mode::On);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_deinterlace_event_uses_mounted_viewer_player_only() {
+        use crate::settings::VideoDeinterlaceMode as Mode;
+        use crate::video::NativeVideoOutputEvent as Ev;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("deinterlace-main.mkv");
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                ),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        let original = match app.fs_cache.get(&idx).unwrap() {
+            FsCacheEntry::Video { player, .. } => player.deinterlace_mode(),
+            _ => unreachable!(),
+        };
+        let detached_path = app.tmp.path().join("deinterlace-detached.mkv");
+        let other = app.build_window_context_for_test(903, |mounted| {
+            let path = detached_path;
+            let idx = push_video(mounted, path.to_str().unwrap());
+            mounted.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(
+                        crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                    ),
+                    load_seq: 0,
+                },
+            );
+            mounted.fullscreen_idx = Some(idx);
+        });
+        app.with_viewer_context(other, |mounted| {
+            let idx = mounted.fullscreen_idx.unwrap();
+            mounted.handle_native_video_output_event(
+                &ctx,
+                idx,
+                0,
+                Ev::SetDeinterlaceMode { mode: Mode::On },
+            );
+            let FsCacheEntry::Video { player, .. } = mounted.fs_cache.get(&idx).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(player.deinterlace_mode(), Mode::On);
+        })
+        .unwrap();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&idx).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(player.deinterlace_mode(), original);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn native_audio_track_event_checks_owner_epoch_and_track_then_uses_norm_owner() {
         use crate::video::NativeVideoOutputEvent as Ev;
         let mut app = setup_app();
