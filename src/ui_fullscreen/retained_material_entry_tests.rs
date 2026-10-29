@@ -371,6 +371,7 @@ fn retained_material_entry_comparison_and_rotation_keep_completed_pixels() {
     let mut app = final_only_page(&ctx);
     let pinned = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::BLUE));
     app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+        original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
         pixels: Arc::clone(&pinned),
         indicator_pixels: pinned,
         indicator_texture: None,

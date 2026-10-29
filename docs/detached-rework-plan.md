@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-28 §1.79 比較元画像版の worker 所有（実装・独立レビュー済み）
+
+ClaudeCode の `target/fsview-work/design-1079.md` 第3版（独立設計レビュー2回済み）に従い、
+比較の元画像 worker を `PreparingOriginal { pair, pending }` が所有する。Codex の前提確認でも、
+これは症状の guard / delay ではなく、加工版と元画像版の単一 worker 所有を型で表す構造修正と判断した。
+park の既存 `reset_detached_pause_foreground_modes` → `deactivate_compare_view` 経路は維持し、
+比較 owner の共通 `invalidate()` で pending を Draining へ移して回収する。
+detached の述語・viewport / HWND / placement の所有・park / mount 機構は変更しない。
+キーの focus 条件も既存の判定を共有し、比較状態を passive snapshot へ複製しない。
+§2 (憲法) を読んだうえで、実装後の独立レビュー (Codex gpt-6.1-sol xhigh、2026-10-28) と ClaudeCode (Opus 5.5) の検収の双方が、
+「共通 owner の失効境界を正す構造的修正であり、症状パッチではない」ことに合意した。新しい detached 用フラグ・placement の保存先・時間窓は足していない。
+
 ### 2026-10-27 §1.429 描画先の設定取得の失敗を、初回 root だけ起動失敗として扱う (実装・自動検証済み)
 
 vendor `egui-wgpu` の `get_default_config(...).expect(...)` (描画先 surface の設定取得) を、**初回の root 初期化に限って** Err にし、
@@ -6600,3 +6612,13 @@ per-viewport opt-out、detached述語・状態・placement保存先・同期経�
 egui viewportの影だけで説明できない。v4.7.1..masterのowner・前面移譲と§1.387 A1〜A3も照合し、動画の原因は未特定として残す。
 presenter/host/HUDと点滅対策は変更しない。調査の詳細は backlog §1.426 に記録した (v4.8.1 で出荷後に削除。全文は commit `94017f82e` の `docs/next-release-backlog.md`)。
 利用者が確認用ビルドで、静止画・動画・F12 の有無・複数ウィンドウとも解消を確認した (2026-10-24)。動画で効いた仕組みは未解明。
+
+### §11 追補: §1.458 見開き編集対象の既定値の導出（2026-10-28）
+
+ClaudeCode指定設計とCodexのコード確認に基づき、既定の側を複数時点で保存する状態を廃止する構造修正を行う。
+`App` と `ViewerContextBundle` の既存 `adjust_spread_target` を `Option<AdjustSpreadTarget>` にそろえ、
+Noneは現在表示される同じ役割付きページ列から導出、Someは利用者の画面上の左右の明示選択とする。
+既存のcapture / mount / swapによるcontext所有は維持し、永続化・IPC・detached述語・HWND・viewport配送は変更しない。
+連続読みの通常のseek・再アンカーでは、実ページが変わる場合も明示選択を保持する。
+再計算の時点・非同期要求・回復状態を増やす症状パッチではなく、読む側の共通解決へ集約して保存状態を減らす。
+§2 (憲法) を読んだうえで、ClaudeCode (Opus 5.5) と独立レビュー (Codex gpt-6.1-sol xhigh、2026-10-28) の双方が「症状パッチではなく構造的修正である」ことに合意した。新しい detached 用フラグ・placement の保存先・時間窓は足していない。

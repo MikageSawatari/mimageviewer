@@ -1972,7 +1972,7 @@ fn annotation_dialog_contents_ui(
 impl App {
     // ── モード入退場 ────────────────────────────────────────────────
 
-    /// テキスト編集モードに入る。見開き中は左ページへ Single ピボットする
+    /// テキスト編集モードに入る。見開き中は読む順の最初のページへ Single ピボットする
     /// (消しゴム / 隠蔽の enter と同じ作法)。`comic_docs` に作業セットをロードする。
     pub(crate) fn enter_text_mode(&mut self, fs_idx: usize) {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {

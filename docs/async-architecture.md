@@ -27,6 +27,14 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 「どの処理がどのスレッド/プロセスで走るか」「どうやってキャンセルするか」「キャッシュ競合をどう避けるか」
 の一覧。並列処理を追加・変更するときの設計テンプレートとして使う。
 
+比較元画像ホールド（§1.79）は加工版と同じ単一 worker owner を使う。
+`ComparePreparationState::PreparingOriginal { pair, pending }` は加工版 pair を描画可能なまま
+元画像の再標本化・crop・回転・配置を worker で行う。完成状態だけを pair 内へ保持し、
+全失効経路の `invalidate()` が pending を `Draining` へ移す。回収前に次の比較 worker を開始しない。
+キー解放や PinnedNormal 非表示は worker を取り消さず、完成結果を同じ pair へ採用する。
+元画素補充には既存の MaterialOnly ロードを使い、完成加工版を失効させない。
+失敗はログ・通知1回で閉じ、同じ pair では再試行しない。詳細は [表示パイプライン](display-pipeline.md)。
+
 ---
 
 ## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）

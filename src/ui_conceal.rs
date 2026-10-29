@@ -98,10 +98,6 @@ impl App {
         if !self.raw_edit_target_entry_allowed(target_idx) {
             return;
         }
-        let target_idx = match self.resolve_visible_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
-            crate::ui_fullscreen::SpreadPair::Single => fs_idx,
-        };
         self.cancel_original_material_entry_intents(None);
         // A current edit-chain result is already the correct conceal input.
         // Only hydrate the original when neither that result nor the input for
@@ -160,12 +156,9 @@ impl App {
         if !self.raw_edit_target_entry_allowed(target_idx) {
             return false;
         }
-        let current_target =
-            self.fullscreen_idx
-                .map(|idx| match self.resolve_visible_spread_pair(idx) {
-                    crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
-                    crate::ui_fullscreen::SpreadPair::Single => idx,
-                });
+        let current_target = self
+            .fullscreen_idx
+            .map(|idx| self.plan_page_edit_pivot(idx).0);
         if current_target != Some(target_idx) {
             return false;
         }

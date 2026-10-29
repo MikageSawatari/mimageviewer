@@ -1653,6 +1653,10 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 5. フォールバック: サムネイル (低解像度)
 ```
 
+元画像ホールドのキー・フォーカス・モーダル・ナビゲーション抑止は共通のフレーム観測で解決する。
+通常経路の元画像表示と final pipeline bypass は比較 Off のときだけ有効にする。
+比較中は通常経路を迂回せず、準備済み pair の両側の元画像版を選択する（下の比較規則を参照）。
+
 AI 待ちの `complete=false` final composite も表示専用の候補である。final AI が到着しても
 同一 `FinalCompositeKey` の entry は消さず、AI 後の final-effect worker が完成するまで
 カラー化済みの暫定 texture を表示し続ける。完成結果の `insert` が同じ key を上書きするため、
@@ -1872,7 +1876,7 @@ D2の演出由来payloadだけはsourceを所有しない。全景coverageを既
 するため、callbackごとに異なるuniformとbind groupは`CompareShaderSlot::{Main, Navigator}`ごとに
 保持し、後のprepareが先の描画状態を上書きしない。
 本文の primary 描画は `CompareFramePrimaryDraw` が排他的に所有する。現在ページに一致する
-`ComparePreparationState::Ready` があるフレームは準備済み比較だけを描き、`Unprepared` /
+`ComparePreparationState::Ready` または `PreparingOriginal` の pair があるフレームは準備済み比較だけを描き、`Unprepared` /
 `WaitingForSource` / `Preparing` / `Draining` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
 texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / source-reload holdover を
 重ねない。
@@ -1895,6 +1899,49 @@ layout結果ではなく表示モードで拒否する。ページ移動や表�
 待たずに完了を回収する。PinnedNormalはcurrentの完成寸法だけをworker開始前に使い、不要なcurrent RGBAを
 生成しない。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
 pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed textureはCPU fallbackのDiff時だけ作る。
+
+比較中の元画像ホールド（`FsOriginalPreviewHold`）は Wipe / Diff / PinnedNormal で共通とする。
+pin 時に `PinnedOriginalSource::Raw` として元画素の Arc、加工版 source 寸法、crop、rotation を保存し、
+外部 pin は `SameAsProcessed`、元画素が無ければ `Unavailable` とする。current 側の幾何も加工版
+job の作成時に pair へ保存する。ホールド時は worker 内で元画素を加工版 source 寸法へ Lanczos3
+再標本化し、同じ crop / rotation と同じ比較配置処理を pair の `target_size` で行う。補正・AI・
+カラー化・消しゴム・補正レイヤー・隠蔽・注釈を含めず、両版の寸法と配置を一致させる。
+元画素は通常の元画像表示と同じ fs_cache のラスタ（縮小済み／RAW 現像済みを含む）を使い、
+加工版 pair が Ready にならないアニメーションは対象外とする。
+
+完成状態は pair 内の `CompareOriginalVariant::{Absent, Ready, Failed}` が持ち、実行中 worker は
+外側の `ComparePreparationState::PreparingOriginal { pair, pending }` だけが所有する。
+加工版と元画像版の worker を合わせて常に1本にし、pair を捨てる全経路は `invalidate()` を通して
+pending があれば `Draining` にする。結果は pair key・request・寸法・payload の一致を確認して採用する。
+PinnedNormal の非表示は pair と worker を保持し、比較 Off でも結果を回収する。
+通常の fullscreen close も既存どおり加工版 pair・比較モード・pin を保持し、元画像版にも同じ寿命を適用する。
+close に伴う元画素cacheの破棄や入力世代更新だけでは、この保持済み pair を失効させない。
+「加工版 pair と同じ入力世代に属する」とは、加工版 pair を失効させる操作で元画像版も一緒に失効することを指す。
+PreparingOriginal の完了は close 後も pair identity が合えば回収する。
+再openでは、ページに入るたびの既存の `invalidate_compare_prepared_for_idx` に従い、
+加工版 pair と元画像版が一緒に失効する。PreparingOriginal 中なら共通遷移で Draining に移り、
+旧結果を回収してから次の加工版 worker を開始する。同一 pair の再入場を識別する条件や再利用規則は追加しない。
+current の元画素補充は既存の `MaterialOnly` / `preserve_completed` 経路を使い、完成済み加工版を保持する。
+再open後も、新しい加工版 pair が Ready / 元画像版が Absent のときにホールドすれば、
+必要に応じて同じ補充経路を使ってから元画像 worker を開始する。
+Unavailable と worker 失敗はログと通知1回で Failed にし、同じ pair では再試行しない。
+
+元画像版の準備中は加工版を表示し続け、完成後にホールド中だけ元画像版を描く。離すと即座に加工版へ戻り、
+再ホールドは保存済みの元画像版を再利用する。本文・ナビゲータ・CPU fallback・「元画像表示中」は
+`compare_original_for_frame` の同じ選択を使う。ワイプの位置・ドラッグ状態・Ctrl による線の表示規則は共通。
+compare_wgpu は pair の owner key ごとに加工版／元画像版の最大2組を持ち、各組が Main / Navigator の
+uniform と bind group を持つ。元画像版の texture key は共通採番器から発行し、ホールドの切替で再 upload しない。
+CPU fallback の managed texture も版ごとに pair 内へ保持する。
+編集overlay・そのポインタ入力・インジケータには `original_preview_visual_active_for_frame` を使う。
+通常表示の元画像フラグと、実際に primary に描いた比較元画像版を合わせた値であり、
+比較元画像に編集マスクを再び重ねない。通常pipelineの bypass 判定にはこの値を渡さない。
+ルーペは従来どおり current ページを `fullscreen_page_layout` の transform と正規化座標で拡大し、
+比較キャンバスや pinned 側の合成を拡大しない。比較中の current の素材だけは同じ
+`compare_original_for_frame` の結果で選び、元画像版のフレームは読み取り専用の
+`resolve_original_preview_material`、加工版のフレームは従来の加工payloadを使う。
+比較中は通常の元画像bypassを呼ばず、元素材が退去済みなら既存のthumbnail fallbackに任せて
+ルーペからMaterialOnlyロードや再試行を始めない。current以外の採取対象ページと比較Offは従来どおり。
+実アプリでの確認 (§1.79、2026-10-28、観測者 ClaudeCode。隔離データ・dev-runtime ビルドを computer-use で操作): ワイプ比較と差分強調で、押している間に両側が元画像になり、ワイプ位置は変わらず、離すと加工版へ戻った。PinnedNormal・ルーペ・ナビゲータは実アプリでは未確認 (自動テストのみ)。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が

@@ -549,7 +549,7 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 補足: 画像分析モード起動の既定 <kbd>Shift</kbd>+<kbd>Z</kbd> は `FsImageAnalysis`、ルーペの
 <kbd>Shift</kbd> 押しっぱなしは `FsLoupeHold`、元画像表示の右 <kbd>Ctrl</kbd> 押しっぱなしは
-`FsOriginalPreviewHold`、360 度パノラマ / 通常動画拡大の切替に使う <kbd>V</kbd> は
+`FsOriginalPreviewHold`（比較中は両側を元画像へ切り替え、離すと加工版へ戻す）、360 度パノラマ / 通常動画拡大の切替に使う <kbd>V</kbd> は
 `FsPanorama`、360 の投影方式の
 順送り <kbd>Shift</kbd>+<kbd>V</kbd> は `FsPanoramaProjection` として `KeyAction` 化済み。
 これらは固定入力ではなく、操作カスタマイズで変更または解除できる。

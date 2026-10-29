@@ -35,7 +35,6 @@ use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
 };
 use crate::local_adjust_effect_ui::draw_effect_params;
-use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 64.0;
 const TAB_ROW_H: f32 = 24.0;
@@ -11391,19 +11390,8 @@ impl App {
         egui::Rect::from_min_size(panel_pos, egui::vec2(LOCAL_ADJUST_TOOL_PANEL_W, h))
     }
 
-    fn current_local_adjust_edit_idx(&mut self) -> Option<usize> {
-        let fs_root_idx = self.fullscreen_idx?;
-        let (fs_idx, _) = match self.resolve_visible_spread_pair(fs_root_idx) {
-            SpreadPair::Double { left, right } => {
-                let target = match self.adjust_spread_target {
-                    AdjustSpreadTarget::Left => left,
-                    AdjustSpreadTarget::Right => right,
-                };
-                (target, Some((left, right)))
-            }
-            SpreadPair::Single => (fs_root_idx, None),
-        };
-        Some(fs_idx)
+    pub(crate) fn current_local_adjust_edit_idx(&mut self) -> Option<usize> {
+        self.current_adjust_target_idx()
     }
 
     pub(crate) fn selected_local_adjust_layer_idx(&self, fs_idx: usize) -> Option<usize> {
@@ -15343,16 +15331,12 @@ impl App {
         let spread_lr_from_pivot = self.page_edit_spread_pair();
         // クロージャから `self` を触れないので、押されたページを持ち帰って後で適用する。
         let mut switch_target_to: Option<usize> = None;
-        let spread_pair = self.resolve_visible_spread_pair(fs_root_idx);
-        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
-            SpreadPair::Double { left, right } => {
-                let target = match self.adjust_spread_target {
-                    AdjustSpreadTarget::Left => left,
-                    AdjustSpreadTarget::Right => right,
-                };
-                (target, Some((left, right)))
+        let (fs_idx, spread_lr) = match self.resolve_visible_spread_edit_pages(fs_root_idx) {
+            Some(pages) => {
+                let target = self.adjust_spread_target.unwrap_or(pages.reading_start);
+                (pages.target_idx(target), Some(pages.pair))
             }
-            SpreadPair::Single => (fs_root_idx, spread_lr_from_pivot),
+            None => (fs_root_idx, spread_lr_from_pivot),
         };
 
         self.maybe_start_local_adjust_render(fs_idx);
@@ -16359,16 +16343,12 @@ impl App {
         // 見開き Double 表示中は adjust_spread_target に応じて左/右ページを編集対象に。
         // Single では fs_root_idx をそのまま使う。以降の `fs_idx` は編集対象 idx を指し、
         // 補正値読み書きパスは単ページ経路と同一。
-        let spread_pair = self.resolve_visible_spread_pair(fs_root_idx);
-        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
-            SpreadPair::Double { left, right } => {
-                let target = match self.adjust_spread_target {
-                    AdjustSpreadTarget::Left => left,
-                    AdjustSpreadTarget::Right => right,
-                };
-                (target, Some((left, right)))
+        let (fs_idx, spread_lr) = match self.resolve_visible_spread_edit_pages(fs_root_idx) {
+            Some(pages) => {
+                let target = self.adjust_spread_target.unwrap_or(pages.reading_start);
+                (pages.target_idx(target), Some(pages.pair))
             }
-            SpreadPair::Single => (fs_root_idx, None),
+            None => (fs_root_idx, None),
         };
 
         // 選択はページごとの一時 UI 状態。ページ移動・見開き L/R 切替で対象 idx が
@@ -16808,6 +16788,8 @@ impl App {
         }
 
         if selected_tab == crate::settings::FullscreenLeftPanelTab::ViewTrim {
+            // 表示トリムは実際に表示された範囲を扱う。補正対象の側の解決とは独立。
+            let spread_pair = self.resolve_visible_spread_pair(fs_root_idx);
             let ctx = child.ctx().clone();
             body_child.allocate_ui_with_layout(
                 egui::vec2(body_width, body_height),
@@ -16915,9 +16897,9 @@ impl App {
                         if let Some((left, right)) = spread_lr {
                             let same = self.effective_params(left) == self.effective_params(right);
                             ui.horizontal(|ui| {
-                                let is_left = self.adjust_spread_target == AdjustSpreadTarget::Left;
+                                let is_left = fs_idx == left;
                                 if ui.add_enabled(self.raw_edit_target_gate(left), egui::Button::selectable(is_left, "左ページ")).clicked() {
-                                    self.adjust_spread_target = AdjustSpreadTarget::Left;
+                                    self.adjust_spread_target = Some(AdjustSpreadTarget::Left);
                                 }
                                 let copy_l = ui
                                     .add_enabled(!same, egui::Button::new("←").small())
@@ -16940,7 +16922,7 @@ impl App {
                                     self.copy_spread_adjust(left, right);
                                 }
                                 if ui.add_enabled(self.raw_edit_target_gate(right), egui::Button::selectable(!is_left, "右ページ")).clicked() {
-                                    self.adjust_spread_target = AdjustSpreadTarget::Right;
+                                    self.adjust_spread_target = Some(AdjustSpreadTarget::Right);
                                 }
                             });
                             ui.add_space(2.0);
