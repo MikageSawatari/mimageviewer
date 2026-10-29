@@ -106,3 +106,34 @@ CLAUDE.md「設計の簡素化」の観点 (扱う状態の組み合わせを減
   (閉じると環境設定の値に戻る) を書く。情報表示の「デインターレース」行に「手動」表示を足す。版番号・実装用語を書かない。
 - `docs/next-release-backlog.md`: §1.105 を「実装済み・実機確認待ち」に更新し、デインターレースの手動切り替えを §1.660 として起票 (同じく実装済み・実機確認待ち)。
 - UI 文言を変えたら `python scripts/check_ui_glyphs.py`。
+
+## 9. 実装前の設計レビュー (Codex gpt-6.1-sol / xhigh、2026-10-29、REVISE → 以下で確定)
+
+レビューは live 差し替えの方向性を妥当と判断 (開き直しでしか扱えないモード依存状態は無い。開き直しても同じ decoder 経路なので §9.3 の問題は解消しない)。指摘への対応:
+
+1. **seek の API・位置・再生意図** (P2、採用): App で位置と seek を別々に扱わない。player の `set_deinterlace_mode(mode)` が
+   値の変更と再描画の seek をまとめて行う。位置は音声トラック変更と同じ解決 (`audio_track_seek_base_secs()` を共通の位置解決として
+   名前を一般化して再利用: 保留中・未表示の seek target を優先、frame-step 中は表示済み PTS)。seek は
+   `seek_with_play_state(pos, <再生意図>, SeekOrigin::Internal(..))` で、再生意図は `is_playing()` ではなく
+   intent (Seeking 中も保たれる値) を使う。`seek()` (再生を始める) は使わない。
+2. **EOF 停止** (P2、設計担当が決定): EOF で止まっている間は **値だけ変え、seek しない** (音声トラック変更が EOF 中の適用を保留するのと同じ考え方)。
+   EOF の状態と「次の再生で先頭から」の既存挙動を変えない。新しい値は次に decode するフレーム (= 次の再生・seek) から効く。
+   メニューの現在値と情報表示は直ちに新しい値を示す。
+3. **bwdif の先読みと frame-step・終端** (P2、採用。§1.661 として起票): bwdif (send_frame) は 1 枚目で出力せず、次の入力か EOF で出力する。
+   現行 decoder は frame-step で「選んだフレーム以外を bwdif の手前で捨てる」ため、bwdif が有効だと送りが進まない。また EOF で filter を
+   drain しないので最後の 1 枚が出ない。これは全体設定「常に有効」でも起きる既存の不具合で、今回の切り替えで到達しやすくなる。
+   修正方針: bwdif が有効なとき、frame-step の選別は **filter の出力側** (出力フレームの PTS) で行い、入力側では捨てない。
+   decoder の EOF (demux 終端) で bwdif に EOF を送り、残りを drain して通常のフレームとして出す。seek / SW 再オープン / モード変更での
+   filter 破棄は従来どおり (破棄時に drain はしない)。実フレーム (インターレースの小さな動画を生成するか testdata の素材) で、
+   「常に有効」で frame-step が進むこと・最後のフレームが出ることの回帰テストを足す。
+4. **ParkedLive の stale イベント** (P2、不採用): ParkedLive の HUD クリックは、イベントの中身や epoch に関係なく
+   「その窓を利用者がクリックした」ものとして窓の活性化要求に変換され、source の状態には一切作用しない
+   (`native_video_output_event_is_parked_live_hud_click_activation`, src/app/native_video.rs)。新しい variant もこの既存の扱いに載せるだけで、
+   epoch が古くても設定値は変わらない。窓が前面に出るのは利用者がその窓をクリックした結果として正しい。受付境界の変更は既存の全 HUD コマンドに
+   波及する別件で、今回の範囲に入れない。
+5. **鍵ボタン位置** (P2、採用): 鍵の位置計算は「…」を出すかどうか (通常動画 / 音声シェル) を受け取る共通の配置計算にする。
+   音声シェル・タイル・移動プレビューの既存の control extent テストを保つ。
+6. **戻る値の説明** (P3、採用): 補足文は値を出さず「この動画を閉じると環境設定の値に戻ります」とする。
+
+detached: 制御を player に置き、既存の per-context 経路 (所有 context の `fs_cache` を mount して処理) に variant を足すだけなので構造的変更。
+範囲と判断は `docs/detached-rework-plan.md` §11 に記録する。
