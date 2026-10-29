@@ -706,9 +706,12 @@ final composite の `params_hash` から `colorize` / `creative_lut` / `post_fil
   (色調補正と同じ扱い)。legacy `adjustment_cache` には焼き込まず、消しゴム / MI-GAN /
   補正レイヤーの入力は source 解像度の edit pipeline から取るので、シャープ結果が
   編集系の入力へ混入することはない。
-- **コピー / 書き出し**: `prepare_capture_pixel_job` が final composite pixels を取得して
+- **キャプチャ (Ctrl+S / カメラボタン)**: `prepare_capture_pixel_job` が final composite pixels を取得して
   `capture::run_pixel_job` へ渡すため、表示どおりに反映される。capture worker は
   AdjustParams / AI / final filter を再実行せず、出力専用の conceal / crop / rotation のみを扱う。
+- **Ctrl+E / 編集を反映した画像をコピー**: source と編集 snapshot を worker で再合成し、
+  選択した段が `DisplayAdjust` のときに共通 compositor がスマートシャープを適用する。
+  表示 cache は使わない。既存の「画像をクリップボードにコピー」は向きと回転のみのまま。
 - **alpha**: unmultiplied RGBA に展開して RGB のみ強調 → 再 premultiply。透明部に
   hidden RGB を作らない (`adjustment::apply_final_smart_sharpen`)。
 - **360 パノラマ settle**: settle 再レンダリングはシャープ化を再現しないため、
@@ -1114,6 +1117,16 @@ failed / pending をクリアする。これがないと
 
 ---
 
+### 4.2 編集を反映した画像のクリップボードコピー
+
+「編集を反映した画像をコピー」は `Settings::bake_stage_clipboard`（既定 `DisplayAdjust`）までを、
+Ctrl+E と同じ `CompositeSource` + `BakedEditSnapshot` → `books::compose_export_entry` で worker 合成する。
+表示済みページは canonical 寸法を含む snapshot を使い、未表示の一覧ページは一括書き出しと同じ snapshot を使う。
+見開きはページごとに合成してから結合し、倍率による拡大縮小をせず `jpeg_matte` で透過を平らにする。
+worker 用 snapshot の `crop_legacy_writeback` は `None` とし、コピー完了が編集 DB・sidecar を更新しない。
+既存の「画像をクリップボードにコピー」（向きと回転のみ）と、表示画素を使うキャプチャコピーは別経路のまま残す。
+詳細は [clipboard-edited-copy-plan.md](clipboard-edited-copy-plan.md)。
+
 ## 5. 消しゴム (Erase) との関係
 
 製本追加の headless bake (`BookPageSource::Composited` / `BakedEditSnapshot`) も同じ早期
@@ -1142,7 +1155,7 @@ local_adjust_cache ─▶ conceal_cache ─▶ edit_result_cache
                                       Creative LUT ─▶ post_filter ─▶ final_composite_cache ─▶ 画面
                                                                        │
                                                                        ▼
-                                     (Ctrl+S / Ctrl+E) crop で切り出し ─▶ 保存
+                                     (Ctrl+S) crop で切り出し ─▶ 保存
                                            │
                                            └─ (編集 preview) 下地／注釈へ crop
                                                                   ├─▶ 下地 WebP
@@ -1150,7 +1163,9 @@ local_adjust_cache ─▶ conceal_cache ─▶ edit_result_cache
 ```
 
 crop はフルスクリーン通常表示には反映されず (crop 外を暗くする overlay のみ)、保存 / 書き出し時に
-final composite を切り出す最終段として働く。編集プレビューでは edit-result と各注釈レイヤーを同じ
+出力画素を切り出す最終段として働く。Ctrl+E と編集反映コピーは上図の表示 cache を使わず、
+source + 編集 snapshot を worker で再合成して最後に crop を適用する (§4.2)。
+編集プレビューでは edit-result と各注釈レイヤーを同じ
 矩形で切り出すため、一覧のサムネイルとアスペクト比には反映される。
 
 `fs_cache` は raw decode 専用で、消しゴム確定結果を書き戻さない。マスクが存在する画像は

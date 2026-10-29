@@ -316,6 +316,7 @@ preferences_policy! {
         bake_stage_export: crate::bake_stage::BakeStage => ("書き出しの焼き込み", |_, _| true, plain, plain);
         bake_stage_export_batch: crate::bake_stage::BakeStage => ("一括書き出しの焼き込み", |_, _| true, plain, plain);
         bake_stage_external_tool: crate::bake_stage::BakeStage => ("外部ツールへの焼き込み", |_, _| true, plain, plain);
+        bake_stage_clipboard: crate::bake_stage::BakeStage => ("クリップボードへの焼き込み", |_, _| true, plain, plain);
         archive_file_handling: ArchiveFileHandling => ("アーカイブファイルの扱い", |v, _raw| matches!(v, ArchiveFileHandling::Ask | ArchiveFileHandling::Convert | ArchiveFileHandling::Ignore), archive, archive);
         epub_file_handling: EpubFileHandling => ("EPUBファイルの扱い", |_, _| true, plain, plain);
         show_hidden_files: bool => ("隠しファイルを表示", |_, _| true, plain, plain);
@@ -1154,6 +1155,14 @@ mod tests {
             ],
         );
         settings.clipboard_capture_min_short_side_px = 240;
+        settings.bake_stage_clipboard = different_enum(
+            &settings.bake_stage_clipboard,
+            &[
+                crate::bake_stage::BakeStage::Edits,
+                crate::bake_stage::BakeStage::Ai,
+                crate::bake_stage::BakeStage::DisplayAdjust,
+            ],
+        );
         settings.archive_file_handling = different_enum(
             &settings.archive_file_handling,
             &[
@@ -1975,13 +1984,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 478);
+        assert_eq!(entries.len(), 479);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            152
+            153
         );
         assert_eq!(
             entries
@@ -2011,7 +2020,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 150);
+        assert_eq!(wire.len(), 151);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2130,6 +2139,34 @@ mod tests {
             .apply_to(&mut destination);
             assert!(report.issues.is_empty());
             assert_eq!(destination.page_turn_animation_duration_ms, duration);
+        }
+    }
+
+    #[test]
+    fn clipboard_bake_stage_transfer_roundtrips_and_preserves_on_missing_or_invalid() {
+        use crate::bake_stage::BakeStage;
+
+        for stage in BakeStage::ALL {
+            let source = Settings {
+                bake_stage_clipboard: stage,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut destination = Settings::default();
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.bake_stage_clipboard, stage);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.bake_stage_clipboard, stage);
+            let report = parse_preferences(&document(json!({"bake_stage_clipboard": "Unknown"})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1);
+            assert_eq!(destination.bake_stage_clipboard, stage);
         }
     }
 

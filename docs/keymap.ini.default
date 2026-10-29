@@ -411,6 +411,7 @@
 # FsAddToActiveBook = Ctrl+B ; 現在のページを追加先の本へ追加する
 # FsAddToCollectionTarget = none ; 現在の実画像を追加先のコレクションへ追加する
 # FsExport = Ctrl+E ; 現在の表示結果を別ファイルへ書き出す
+# FsCopyEditedImage = none ; 編集を反映した画像をコピー
 # FsCompareToggle = X ; 現在の画像を比較スロットに固定または解除する
 # FsCompareCycle = C ; 比較スロットのピン画像と現在画像を切り替えて表示する
 # FsCompareWipe = Shift+C ; ワイプ比較を切り替える

@@ -642,6 +642,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsOriginalPreviewHold `RightCtrl` (MH。Windows は右側限定、egui fallback は Ctrl に縮退)
 - FsEraseMode `E` ★ / FsLocalAdjustMode `Ctrl+G` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
 - FsExport `Ctrl+E` ★ / FsCapture `Ctrl+S` ★
+- FsCopyEditedImage (P、既定未割り当て): フルスクリーンの「編集を反映した画像をコピー」と共通の受付。
+  Ctrl+E と同じページ／見開き対象に、`bake_stage_clipboard` の段までを原寸で反映する。
 - FsCompareToggle `X` ★ / FsCompareCycle `C` ★ / FsCompareWipe `Shift+C` ★ / FsCompareDiff `Alt+C` ★
 - FsSpreadSingle/L/LCover/R/RCover `1`..`5` (P) ★
 - FsReadingFlowCycle `6` (P) ★ / FsReadingDirectionToggle `7` (P) ★ / FsFitModeCycle `0` (P) ★

@@ -151,6 +151,7 @@ mod edit_bundle_app;
 mod edit_bundle_bulk;
 pub mod edit_preview_cache;
 mod edit_source;
+mod edited_clipboard_copy;
 pub mod editing_addon;
 pub mod editing_addon_download;
 #[cfg(windows)]

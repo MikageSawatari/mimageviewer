@@ -35509,6 +35509,12 @@ impl App {
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
+        let key_copy_edited = !is_video_fs
+            && !fs_music_view_active
+            && self.fs_context_menu_idx.is_none()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::FsCopyEditedImage);
         let key_sns_split = !is_video_fs
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
@@ -36527,6 +36533,10 @@ impl App {
             )
         {
             self.open_export_dialog_for_current(ctx, fs_idx);
+        }
+
+        if key_copy_edited {
+            self.request_edited_clipboard_copy(ctx, fs_idx, true);
         }
 
         // S: スライドショー開始/停止トグル (旧 P、左手で押しやすいよう S へ移行)
@@ -55110,33 +55120,105 @@ impl App {
         })
     }
 
+    /// All materialized outputs use the same source mapping, including the current PDF password.
+    fn composite_source_for_idx(&self, idx: usize) -> Option<crate::books::CompositeSource> {
+        match self.items.get(idx)? {
+            GridItem::Image(path) => {
+                Some(crate::books::CompositeSource::File { path: path.clone() })
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => Some(crate::books::CompositeSource::ZipEntry {
+                zip_path: zip_path.clone(),
+                entry_name: entry_name.clone(),
+            }),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => Some(crate::books::CompositeSource::PdfPage {
+                pdf_path: pdf_path.clone(),
+                page_num: *page_num,
+                password: self.pdf_current_password.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Snapshot only: no decode, rendering, or worker-side persistence for clipboard output.
+    fn edited_clipboard_page_for_idx(
+        &mut self,
+        idx: usize,
+    ) -> Result<crate::edited_clipboard_copy::EditedClipboardPage, String> {
+        let source = self
+            .composite_source_for_idx(idx)
+            .ok_or_else(|| "このアイテムは画像としてコピーできません".to_string())?;
+        let key = self
+            .page_path_key(idx)
+            .ok_or_else(|| "このアイテムは画像としてコピーできません".to_string())?;
+        let params = self.effective_params(idx).clone();
+        let rotation = self.get_rotation(idx);
+        let mut edits = self.book_baked_edit_snapshot(
+            &key,
+            Some(idx),
+            params,
+            rotation,
+            self.settings.bake_stage_clipboard,
+        )?;
+        // A delayed clipboard job must never write an old crop over a newer edit.
+        edits.crop_legacy_writeback = None;
+        Ok(crate::edited_clipboard_copy::EditedClipboardPage { source, edits })
+    }
+
+    pub(crate) fn prepare_edited_clipboard_pages(
+        &mut self,
+        idx: usize,
+        fullscreen: bool,
+    ) -> Result<crate::edited_clipboard_copy::EditedClipboardPages, String> {
+        use crate::edited_clipboard_copy::EditedClipboardPages;
+        if fullscreen
+            && (self.is_overlay_edit_mode_active()
+                || self.adjustment_mode.is_open()
+                || self.analysis_mode)
+        {
+            return Err("編集モードや補正・解析パネルを閉じてからコピーしてください".to_string());
+        }
+        let pair = if fullscreen {
+            self.resolve_visible_spread_output_pair(idx)
+        } else {
+            SpreadPair::Single
+        };
+        let indices = match pair {
+            SpreadPair::Single => vec![idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        if self.erase_inpaint_pending.keys().any(|key| {
+            indices.contains(&key.idx)
+                && matches!(key.kind, crate::ui_erase::EraseInpaintKind::Commit)
+        }) {
+            return Err("消しゴム補完の完了後にコピーしてください".to_string());
+        }
+        match pair {
+            SpreadPair::Single => self
+                .edited_clipboard_page_for_idx(idx)
+                .map(Box::new)
+                .map(EditedClipboardPages::Single),
+            SpreadPair::Double { left, right } => Ok(EditedClipboardPages::Spread {
+                left: Box::new(self.edited_clipboard_page_for_idx(left)?),
+                right: Box::new(self.edited_clipboard_page_for_idx(right)?),
+            }),
+        }
+    }
+
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
     fn batch_export_item_for_idx(
         &mut self,
         idx: usize,
     ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
-        let item = self
-            .items
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| "このアイテムは書き出せません".to_string())?;
-        let source = match &item {
-            GridItem::Image(path) => crate::books::CompositeSource::File { path: path.clone() },
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => crate::books::CompositeSource::ZipEntry {
-                zip_path: zip_path.clone(),
-                entry_name: entry_name.clone(),
-            },
-            GridItem::PdfPage {
-                pdf_path, page_num, ..
-            } => crate::books::CompositeSource::PdfPage {
-                pdf_path: pdf_path.clone(),
-                page_num: *page_num,
-                password: self.pdf_current_password.clone(),
-            },
-            _ => return Ok(None),
+        if self.items.get(idx).is_none() {
+            return Err("このアイテムは書き出せません".to_string());
+        }
+        let Some(source) = self.composite_source_for_idx(idx) else {
+            return Ok(None);
         };
         let filename = self
             .capture_basename_for_idx(idx)
@@ -55552,35 +55634,18 @@ impl App {
     ) -> Result<crate::export_dialog::ExportPageComposite, String> {
         // source と編集 snapshot だけを UI スレッドで固定する。decode と、選択された段までの
         // 合成は worker が行う。注釈は共通 compositor が AI / 表示用補正の後に焼く。
-        let item = self
-            .items
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        if self.items.get(idx).is_none() {
+            return Err("このアイテムはエクスポートできません".to_string());
+        }
         // 再生中の表示フレームは source file の decode からは復元できない。worker に
         // file だけを渡すと第 1 フレームを黙って保存するため、表示フレームを snapshot
         // できるようになるまでは従来どおり入口で拒否する。
         if self.fs_entry_is_animated(idx) {
             return Err("アニメーション画像はエクスポートできません".to_string());
         }
-        let source = match item {
-            GridItem::Image(path) => crate::books::CompositeSource::File { path },
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => crate::books::CompositeSource::ZipEntry {
-                zip_path,
-                entry_name,
-            },
-            GridItem::PdfPage {
-                pdf_path, page_num, ..
-            } => crate::books::CompositeSource::PdfPage {
-                pdf_path,
-                page_num,
-                password: self.pdf_current_password.clone(),
-            },
-            _ => return Err("このアイテムはエクスポートできません".to_string()),
-        };
+        let source = self
+            .composite_source_for_idx(idx)
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
         // プリセット出力 (_1〜_4) も同じ snapshot を使い、隠蔽 preset だけを worker 側で
         // 差し替える。`_0` は override を付けず、snapshot が持つ現在値を 1 回だけ適用する。
         let key = self
