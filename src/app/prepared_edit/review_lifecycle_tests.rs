@@ -42,8 +42,10 @@ fn annotation(app: &mut App, idx: usize) {
             },
         )],
     );
-    app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
-    app.comic_fonts_loaded = true;
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(comic_core::FontSet::new())),
+        Default::default(),
+    );
     app.comic_font_registry_loaded = true;
 }
 

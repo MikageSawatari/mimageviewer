@@ -530,6 +530,7 @@ impl App {
         self.poll_local_adjust_render(ctx);
         self.poll_local_adjust_layer_bypass_preview(ctx);
         self.poll_local_adjust_prefix_preview(ctx);
+        self.comic_fonts.poll();
         self.poll_all_page_edit_producers(ctx);
         #[cfg(test)]
         super::egui037_connection_tests::observe("media_after", self, ctx);

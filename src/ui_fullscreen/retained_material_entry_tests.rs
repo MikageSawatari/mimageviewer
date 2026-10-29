@@ -244,8 +244,10 @@ fn final_only_page(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
         .insert(0, crate::rotation_db::Rotation::None);
     // Avoid font discovery and optional add-on prompts in entry-only tests.
     app.comic_font_registry_loaded = true;
-    app.comic_fonts_loaded = true;
-    app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(comic_core::FontSet::new())),
+        Default::default(),
+    );
     app.editing_addon_declined_session = true;
     app.show_whats_new = false;
     app.show_mouse_nav_migration_prompt = false;

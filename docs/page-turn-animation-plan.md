@@ -6706,3 +6706,35 @@ field は非公開にし、変更は所有者のメソッドだけで行う。�
 **テスト。** 所有者の状態遷移 (要求 → 採用、読み込み中の同期読み込みで破棄、読み込み中の無効化で破棄、`attempted` の終端、`set: None` の終端、フォント追加で attempted が解ける)。パスの無い別々の key を参照する 2 頁 (または 2 つの context) を繰り返し評価しても、要求が有限回で止まる回帰。
 段階 B の統合: font 未読込で計画が要求し、採用後に注釈だけの job が出て、めくりの素材に注釈が入る。表示の同期読み込みが走った後に古い結果が採用されない。
 F12 の context から要求しても同じ所有者を使う。テストでは worker の読み込み関数を差し替え、システム font に依存しない。
+
+#### 28.7.1 実装記録（2026-10-29、実装済み・実機未確認）
+
+**実装境界。** 第2版の設計に従い、App共有の`ComicFontOwner`へ3 fieldを統合した。`current`と`load`は非公開。
+採用以外の変更は先に受信口を破棄し、同期・非同期とも`attempted`を累積する。世代番号・取消token・再試行ownerは足さない。
+同期ensureは非blocking採用後、足りればピッカーの列挙もせず返す。不足時だけ既存の同期経路へ進む。
+パス不明keyだけが不足する場合は従来のfallbackを保ち、set／loadedを残してattemptedだけ更新する（先に受信口を破棄）。
+この枝は既定fontの新たな同期再読込を防ぐもので、設計の状態・終端規則の変更ではない。
+FontSet組立てを共通関数へ集約し、workerだけが自分用に列挙する。完了時のroot再描画と`comic / font_load`計測を追加した。
+Next頁ループのB起動前から要求し、root update phaseで毎frame採用する。ContextAsyncOwner／viewer bundleには入れない。
+段階Bのsnapshot、`fonts_satisfy`、`ComicExclusion`の判定内容は維持し、detachedの述語・viewport経路は未変更。
+めくりの待ち・省略・表示時機の変更、新しいUI同期I/O、依存変更はない。
+
+**変更ファイル。**
+
+- 所有者・接続: `src/app/comic_fonts.rs`、`src/app.rs`、`src/app/final_prepare.rs`、`src/app/prepared_edit.rs`、`src/app/update_phases.rs`。
+- 無効化の集約: `src/ui_dialogs/editing_addon.rs`、`src/ui_dialogs/preferences.rs`、`src/ui_text.rs`。既存の見本／オノマトペcache・dirty処理はcallerに残す。
+- 新規回帰: `src/app/comic_fonts/tests.rs`（7件）、`src/app/prepared_edit/font_prefetch_tests.rs`（4件）。workerの読込差し替え、埋込font／font不要の塗りbubbleを用い、システムfontに依存しない。
+- 既存fixtureの直接field書込みをowner helperへ置換: `src/app/composite_pixels_revision_tests.rs`、`src/app/material_demand_revision_tests.rs`、`src/app/prepared_edit/tests.rs`、`src/app/prepared_edit/review_pixel_tests.rs`、`src/app/prepared_edit/review_lifecycle_tests.rs`、`src/app/tests.rs`、`src/ui_fullscreen.rs`、`src/ui_fullscreen/crop_order_tests.rs`、`src/ui_fullscreen/retained_material_entry_tests.rs`。`ui_fullscreen.rs`の追加helperもcfg(test)限定で、正規operation factを通してめくりの保持素材を検査する。
+- 文書: 本節、`docs/next-release-backlog.md` §1.602、`docs/display-pipeline.md`、`docs/ui-responsiveness.md`。公開マニュアル／製品ページは未変更。
+
+**検証（通常feature／test profile、HEAD `730251d4a`上の未コミット差分）。**
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/comic|font|prepared_edit|page_turn/)' --no-fail-fast`: 450件中449成功・既知§1.447のvacant leaf 1失敗（43.346秒）。新規11件は全成功。失敗項目を同じ条件のexact filterで単独再実行し1/1成功（3.265秒）。focused一式を成功扱いにはせず、単独補完と区別する。ログは`target/pageturn-1602/focused-4.log`、`vacant-leaf-alone.log`。
+- 所有者7件で採用、実行中の同期／無効化による破棄、attempted累積・終端、setなしの終端、font追加、パス不明keyの同期I/O回避、共通組立てを検査。統合4件でroot phase採用後の注釈only jobと実際の注釈画素／めくり保持texture、二頁の別々の不足keyの有限終端、同期表示後の旧worker破棄、F12要求→park→root採用→同一Arc共有を検査した。
+- 旧版確認: 製品sourceを`730251d4a`へ一時復元し、旧API用の再現テスト1件だけを追加した。font未準備・final完成済みの頁を4回計画／pollしても注釈only計画が可能にならず、目的のassertで0成功／1失敗（0.327秒）。`target/pageturn-1602/730251d4a-red.log`、手順は`baseline-red.py`。これは旧版専用の再現fixtureであり、新所有者のfake loaderや待機を使う現行11件と同一テストのred→greenではない。実装source16件は実行後に保存済みの全バイトへ復元し、独立レビューも一致を確認した。
+- `cargo test --test ui_snapshot`: 213/213成功・失敗0（40.34秒）。基準画像の更新なし。ログは`target/pageturn-1602/ui-snapshot.log`。
+- 最後の`scripts/test-lib-full.ps1`: 14,672/14,672成功・既存除外65件・失敗0（550.362秒、vacant leafを含む）。自動再試行・条件変更なし。ログ／JUnit／commandは`target/test-lib-full/runs/20261029T041305563Z-e215164c/`、呼出しログは`target/pageturn-1602/lib-full.log`。通常feature／test profile、全件実行時のsource識別子は`c0608adfdb5585ce203a76571b4e24a31f0dede846dd6a358105cf3a0ac1a136`。
+- 独立静的コードレビューはACCEPT、P1／P2／P3の未解決指摘なし。同期経路の不要なregistry列挙、パス不明keyの同期再読込、テスト用importのcfg境界、素材検査helperの正規operation factを確認・修正済み。自動検証は実装担当が所有し、レビュー担当は同じテストを重複実行しない。
+
+全テスト後、引数なしの`cargo fmt`を実施。計画文書はBOMなし＋CRLF、backlogはBOM付き＋CRLFを維持する。
+利用者指定によりbuild-dev・製品起動・コミットは行わない。実機確認はClaudeCodeへ引き継ぐ。

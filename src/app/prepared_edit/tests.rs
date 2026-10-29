@@ -90,14 +90,16 @@ fn missing_font_doc() -> Vec<comic_core::AnnotationObject> {
     )]
 }
 
-fn annotation(app: &mut App, idx: usize) {
+pub(super) fn annotation(app: &mut App, idx: usize) {
     app.comic_pages.insert(idx);
     app.comic_docs
         .insert(app.page_path_key(idx).unwrap(), bubble());
     // Same font-free filled-bubble fixture as composite_pixels_revision_tests:
     // the real compositor runs without loading system fonts or editing settings.
-    app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
-    app.comic_fonts_loaded = true;
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(comic_core::FontSet::new())),
+        Default::default(),
+    );
     app.comic_font_registry_loaded = true;
 }
 
@@ -666,11 +668,12 @@ fn font_requirements_include_name_plate_and_recheck_when_loaded_keys_change() {
     let mut app = app(&ctx);
     app.ensure_final_composite_texture(&ctx, 1).unwrap();
     app.comic_pages.insert(1);
-    app.comic_fonts = fonts;
+    app.comic_fonts
+        .seed_for_test(fonts.clone(), Default::default());
     let page_key = app.page_path_key(1).unwrap();
     app.comic_docs.insert(page_key, doc);
     assert!(app.prepared_edit_input(1).is_none());
-    app.comic_loaded_font_keys = keys;
+    app.comic_fonts.seed_for_test(fonts, keys);
     assert!(app.prepared_edit_input(1).is_some());
 }
 
@@ -783,7 +786,7 @@ fn overbudget_retains_the_result_and_private_handle_without_partial_publication(
 }
 
 #[cfg(windows)]
-fn seed_context(owner: &mut App, ctx: &egui::Context) {
+pub(super) fn seed_context(owner: &mut App, ctx: &egui::Context) {
     owner.items = (0..4)
         .map(|idx| GridItem::Image(PathBuf::from(format!("C:/b-owner/{idx}.png"))))
         .collect();

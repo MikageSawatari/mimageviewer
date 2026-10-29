@@ -91886,7 +91886,7 @@ mod specified_scale_consumer_tests {
         app.text_selected_ids = vec![1];
         // This fixture exercises input in the real annotation panel, without font loading/baking.
         app.comic_font_registry_loaded = true;
-        app.comic_fonts_loaded = true;
+        app.comic_fonts.seed_for_test(None, Default::default());
         app.comic_presets_loaded = true;
         let page_key = app.page_path_key(0).unwrap();
         app.comic_docs.insert(
@@ -92710,6 +92710,23 @@ pub(crate) mod page_turn_submission_tests {
                 }
             }
         }
+    }
+
+    pub(crate) fn offer_texture_for_test(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> egui::TextureId {
+        app.page_turn_external_operation(
+            ctx,
+            ViewerOperationId::Slideshow(next_operation_batch()),
+            OperationPhase::Press,
+            "slideshow",
+        );
+        app.offer_page_turn(ctx, idx, true);
+        app.page_turn_held_resource(idx)
+            .expect("incoming page-turn source")
+            .source_texture_id()
     }
 
     pub(crate) fn ready_app(

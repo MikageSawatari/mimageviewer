@@ -18,6 +18,8 @@ pub(crate) use rejection::{
 };
 
 #[cfg(test)]
+mod font_prefetch_tests;
+#[cfg(test)]
 mod review_lifecycle_tests;
 #[cfg(test)]
 mod review_pixel_tests;
@@ -546,14 +548,14 @@ impl App {
         {
             return Err(ComicExclusion::DocumentChanged);
         }
-        if !match (&comic.fonts, &self.comic_fonts) {
+        if !match (&comic.fonts, self.comic_fonts.fonts()) {
             (Some(old), Some(current)) => Arc::ptr_eq(old, current),
             (None, None) => true,
             _ => false,
         } {
             return Err(ComicExclusion::FontSetChanged);
         }
-        if comic.loaded_keys != self.comic_loaded_font_keys {
+        if &comic.loaded_keys != self.comic_fonts.loaded_keys() {
             return Err(ComicExclusion::FontKeysChanged);
         }
         Ok(())
@@ -1168,7 +1170,11 @@ impl App {
             if completed
                 || doc.as_ref().is_some_and(|doc| {
                     doc.is_empty()
-                        || !fonts_satisfy(doc, &self.comic_fonts, &self.comic_loaded_font_keys)
+                        || !fonts_satisfy(
+                            doc,
+                            self.comic_fonts.fonts(),
+                            self.comic_fonts.loaded_keys(),
+                        )
                 })
                 || self.comic_bake_inflight.load(Ordering::Relaxed) >= 2
             {
@@ -1178,8 +1184,8 @@ impl App {
                     doc,
                     path: crate::comic_db::ComicDb::db_path(),
                     generation: self.comic_generation,
-                    fonts: self.comic_fonts.clone(),
-                    loaded_keys: self.comic_loaded_font_keys.clone(),
+                    fonts: self.comic_fonts.fonts().clone(),
+                    loaded_keys: self.comic_fonts.loaded_keys().clone(),
                     canonical_size: [w as usize, h as usize],
                     stamps: self.comic_stamp_cache.clone(),
                 })

@@ -124,8 +124,10 @@ fn bubble() -> Vec<comic_core::AnnotationObject> {
 fn annotation(app: &mut App, doc: Vec<comic_core::AnnotationObject>) {
     app.comic_pages.insert(1);
     app.comic_docs.insert(app.page_path_key(1).unwrap(), doc);
-    app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
-    app.comic_fonts_loaded = true;
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(comic_core::FontSet::new())),
+        Default::default(),
+    );
     app.comic_font_registry_loaded = true;
 }
 
@@ -445,8 +447,10 @@ fn partially_loaded_fonts(app: &mut App) -> Vec<comic_core::AnnotationObject> {
         comic_core::LoadedFont::from_bytes("available", font.font.as_ref().as_ref().to_vec())
             .unwrap(),
     );
-    app.comic_fonts = Some(Arc::new(fonts));
-    app.comic_loaded_font_keys.insert("available".to_owned());
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(fonts)),
+        HashSet::from(["available".to_owned()]),
+    );
     ["available", "missing"]
         .into_iter()
         .enumerate()
@@ -492,13 +496,13 @@ fn cold_doc_with_one_missing_font_is_hydrated_once_without_publishing_partial_an
     let doc = partially_loaded_fonts(&mut app);
     assert!(!fonts_satisfy(
         &doc,
-        &app.comic_fonts,
-        &app.comic_loaded_font_keys
+        app.comic_fonts.fonts(),
+        app.comic_fonts.loaded_keys()
     ));
     assert!(fonts_satisfy(
         &doc[..1],
-        &app.comic_fonts,
-        &app.comic_loaded_font_keys
+        app.comic_fonts.fonts(),
+        app.comic_fonts.loaded_keys()
     ));
     let mut input = app.prepared_edit_input(1).unwrap();
     cold_document(&app, &mut input, &doc);

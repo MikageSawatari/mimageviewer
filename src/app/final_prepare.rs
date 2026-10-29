@@ -450,6 +450,9 @@ impl App {
         let mut reclaim_attempted = false;
         for page in &unit.pages {
             let idx = page.idx;
+            if self.comic_pages.contains(&idx) {
+                self.request_comic_fonts_for_page(ctx, idx);
+            }
             if self.prepared_edit_page(idx) {
                 if self.spawn_prepared_edit_job(ctx, idx, unit.clone(), &mut reclaim_attempted) {
                     return;

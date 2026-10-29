@@ -38,7 +38,7 @@ fn check_crop_order(view: View, editing: bool) {
         if matches!(view, View::Text) {
             app.text_mode = true;
             app.comic_font_registry_loaded = true;
-            app.comic_fonts_loaded = true;
+            app.comic_fonts.seed_for_test(None, Default::default());
             app.comic_presets_loaded = true;
             app.text_smart_guides.vertical = Some(35.0);
             app.text_smart_guides.horizontal = Some(50.0);

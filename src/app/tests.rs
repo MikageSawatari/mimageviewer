@@ -6294,7 +6294,7 @@ fn phase_a_missing_comic_fonts_close_preserves_shared_preview() {
             comic_core::TextBlock::default(),
         )],
     );
-    app.comic_fonts = None;
+    app.comic_fonts.seed_for_test(None, Default::default());
     let edit_key = app.current_edit_result_key(0);
     app.edit_result_cache.insert(
         edit_key,

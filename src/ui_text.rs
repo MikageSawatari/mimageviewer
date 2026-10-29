@@ -4463,7 +4463,7 @@ impl App {
             return None;
         }
         // 再列挙してこのフォントを一覧に載せる。
-        self.comic_font_registry_loaded = false;
+        self.invalidate_comic_fonts(crate::app::comic_fonts::FontInvalidation::FontAdded);
         self.ensure_comic_font_registry();
         self.font_sample_cache.clear();
         self.font_sample_failed.clear();

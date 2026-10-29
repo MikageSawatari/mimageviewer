@@ -145,6 +145,10 @@ slideshow の still-only unit 計算は表示 cache を置換しない。詳細�
 完成erase画素を入力にする場合はMI-GANや黒背景合成を再適用しない。after-AIは`used_upscale`に従い、
 注釈はclamp前のfinal正本へ合成する。finalと注釈のupload画素はそれぞれ通常と同じTriangle clampで作る。
 必要なfontが不足する場合もdoc解決は正常終端し、作れるlocal／conceal／finalは採用できる。
+注釈fontはApp共有の単一ownerが持ち、Nextの注釈頁から既定fontとhot docの不足keyをworkerへ要求する（§1.602）。
+workerは列挙・読取・parseを行い、rootの毎frame pollで採用する。ピッカー用の列挙には公開しない。
+採用後の再評価で注釈だけを準備できる。表示ensureは完了済みの結果を先に採用し、不足なら旧受信口を捨てて従来の同期読み込みを行う。
+失敗keyのattemptedは明示無効化まで累積し、既定fontなしも終端とする。F12／parkでownerや要求を移譲・破棄しない。
 入力・key・世代・params・doc／fontのpreflight後、必要なtextureが揃ってから段・edit・final・対応comicを一括公開する。
 final正本とcomicの下地は同じArcを持ち、段採用だけで上段を失効させない。
 
