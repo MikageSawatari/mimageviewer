@@ -71840,7 +71840,12 @@ mod tests {
     #[test]
     fn key_zoom_handler_coalesces_frame_repeats_and_accepts_next_frame() {
         let _input_guard = crate::key_input::lock_test_input();
-        for (virtual_key, shift, factor) in [(0xBB, true, 1.25), (0xBD, false, 1.0 / 1.25)] {
+        for (virtual_key, shift, factor) in [
+            (0xBE, false, 1.25),
+            (0xBC, false, 1.0 / 1.25),
+            (0x6B, false, 1.25),
+            (0x6D, false, 1.0 / 1.25),
+        ] {
             let (mut app, _, idx) = setup_flat_navigator_input_test();
             let ctx = egui::Context::default();
             let mut expected_zoom = app.fs_zoom;

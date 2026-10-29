@@ -497,7 +497,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
 
 §1.470: `FsZoomIn` / `FsZoomOut` は `FsImage` / `Press` のキーボード専用操作。
-既定は拡大 `Shift+Semicolon` / `Semicolon` / `NumpadAdd`、縮小 `Minus` / `NumpadSubtract`。
+既定は拡大 `Period`（`.`）/ `NumpadAdd`、縮小 `Comma`（`,`）/ `NumpadSubtract`。
 表示の `+` は settings.db / JSON 保存時には既存の `Shift+;` を維持する。chord 解析は既存の
 `Shift+;` / `Shift+Semicolon` に加えて表示形の `+` / `Ctrl++` 等も受理する。
 末尾の `++` は通常の `+` 区切りと区別して Shift+Semicolon のキーを表し、編集欄初期値・

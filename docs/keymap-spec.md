@@ -803,10 +803,13 @@ snapshot として一方向 publish し、App から presenter Context を直接
 ## キーによる段階ズーム（§1.470）
 
 `FsZoomIn`（画像を拡大する）/ `FsZoomOut`（画像を縮小する）は `FsImage` / `Press`。
-既定の拡大は `Shift+Semicolon`、`Semicolon`、`NumpadAdd`、縮小は `Minus`、`NumpadSubtract`。
-物理 KeySlot / Win32 VK が正本で、JIS / US とも VK_OEM_PLUS（0xBB、`Semicolon`）の
-Shift 押しを `+` とする。修飾なしは JIS の `;` / US の `=`。下段テンキーの +/- も使える。
-VK_OEM_MINUS（0xBD、`Minus`）は修飾なし。表示専用の `display_name` は
+既定の拡大は `Period`（`.`）、`NumpadAdd`、縮小は `Comma`（`,`）、`NumpadSubtract`。
+JIS / US とも隣り合う `,` / `.`（`<` / `>` のキー）を修飾なしで使う。テンキーの +/- も使える。
+物理 KeySlot / Win32 VK が正本で、`Comma` は VK_OEM_COMMA（0xBC）、`Period` は VK_OEM_PERIOD（0xBE）。
+2026-10-29 利用者の判断で `,` / `.` に変更（日本語配列で `;` と `-` が離れているため）。未出荷のため移行処理は追加しない。
+
+利用者が `+` を割り当てる場合、JIS / US とも VK_OEM_PLUS（0xBB、`Semicolon`）の
+Shift 押しを使う。修飾なしは JIS の `;` / US の `=`。表示専用の `display_name` は
 `Shift+Semicolon` → `+`、`Ctrl+Shift+Semicolon` → `Ctrl++` とする。
 settings.db / JSON の `settings_name` は既存の `Shift+;`（Ctrl 付きは `Ctrl+Shift+;`）を維持する。
 chord 解析は既存の `Shift+;` / `Shift+Semicolon` に加え、表示形の `+` を受理する。
@@ -814,7 +817,7 @@ chord 解析は既存の `Shift+;` / `Shift+Semicolon` に加え、表示形の 
 通常の `Ctrl+A` 等の区切りは維持し、編集欄の初期表示・「押して入力」の表示形も保存できる。
 既定 chord 全件の表示往復に合わせ、右修飾キーの表示名（`右Ctrl` / `右Shift` / `右Alt`）も解析で受理する。
 ini テンプレート / 参照ファイルの生成だけは、`;` / `#` を含む表記をコメント記号と衝突しない
-KeySlot の別名へ置き換える。拡大は `Shift+Semicolon` / `Semicolon` と書き、旧 ini 取り込みでも
+KeySlot の別名へ置き換える。`+` / `;` を割り当てた場合は `Shift+Semicolon` / `Semicolon` と書き、旧 ini 取り込みでも
 その別名を読む。現行キーでこの変換が必要なのは `Semicolon` だけで、`#` を出すキーはない。
 修飾なしの JSON 保存表記も既存の `;` / `-` を維持する。表示形を入力しても保存・ini 出力表記は変えない。
 修飾なし `Semicolon` の表示は従来の `;` を維持する。
@@ -846,7 +849,7 @@ Image / Analysis とも中心・pivot に同じ点（原点）を渡すと pan �
 比較表示は `FsFitModeCycle` と同様に通常キー段へ到達するので適用する。
 ページ一覧中は実行可能集合に含めない。TextEdit / IME / modal / popup / 非アクティブ窓は
 既存 helper の入力所有に従い、F12 / 複数窓も既存 viewer context の状態だけを変更する。
-修飾キー長押しのルーペは Shift のレベルを別に読むため、`+` 中も既存の `Shift+S` 等と同様に反応する。
+修飾キー長押しのルーペは Shift のレベルを別に読むため、`+` を割り当てた場合は押下中も既存の `Shift+S` 等と同様に反応する。
 
 今回はキーボード専用。ヘルプと操作カスタマイズは全 Action の一覧から自動表示し、リング /
 ジェスチャ / マウスボタン / ゲームパッド、HUD / フィット popup ボタンは追加しない。
@@ -854,7 +857,7 @@ Image / Analysis とも中心・pivot に同じ点（原点）を渡すと pan �
 他操作の保存済み割当を移動・削除せず、重複は既存の競合表示と handler の消費順に従う。
 移行処理は追加しない。明示的な再割当 / `none` による解除は通常の置換規則を使う。
 
-実機確認 (観測者: ClaudeCode、2026-10-29、利用者の許可を得て操作。`--data-dir` で隔離したデータ、
+実機確認 (当時の既定 `;` / `-`。観測者: ClaudeCode、2026-10-29、利用者の許可を得て操作。`--data-dir` で隔離したデータ、
 keyzoom-1470 の dev-runtime ビルド、JIS 配列): 1200×900 の PNG を画面に合わせた表示から開き、
 スクリプトから送ったキーで画面の白枠の幅を測った。`;` 2 回で画面中央を軸に 1.25 倍ずつ拡大、`-` で 1 段縮小、
 テンキーの + / - も同じ (1800 → 2250 → 1800 px)。テンキーの - 6 回で 471 px (0.8^6 倍) まで縮み、

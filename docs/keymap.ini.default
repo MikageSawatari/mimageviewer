@@ -458,10 +458,9 @@
 # FsReadingDirectionToggle.2 = Numpad7 ; 横方向の読み進み方向を切り替える
 # FsFitModeCycle.1 = 0 ; ズーム/フィット方式を切り替える
 # FsFitModeCycle.2 = Numpad0 ; ズーム/フィット方式を切り替える
-# FsZoomIn.1 = Shift+Semicolon ; 画像を拡大する
-# FsZoomIn.2 = Semicolon ; 画像を拡大する
-# FsZoomIn.3 = NumpadAdd ; 画像を拡大する
-# FsZoomOut.1 = - ; 画像を縮小する
+# FsZoomIn.1 = . ; 画像を拡大する
+# FsZoomIn.2 = NumpadAdd ; 画像を拡大する
+# FsZoomOut.1 = , ; 画像を縮小する
 # FsZoomOut.2 = NumpadSubtract ; 画像を縮小する
 # FsAiModelNext = U ; AIモデルを次へ切り替える
 # FsAiModelPrev = Shift+U ; AIモデルを前へ切り替える

@@ -12486,7 +12486,9 @@ mod tests {
     #[test]
     fn zoom_key_editor_keeps_plus_when_only_another_row_changes() {
         let mut state = zoom_key_editor_state();
-        let keymap = crate::keymap::Keymap::empty();
+        let keymap = crate::keymap::Keymap::from_ini_str(
+            "[FsImage]\nFsZoomIn.1 = +\nFsZoomIn.2 = Semicolon\nFsZoomIn.3 = NumpadAdd\n",
+        );
         let action = KeyAction::FsZoomIn;
         open_operation_assignment_editor(
             &mut state,

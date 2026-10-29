@@ -6941,12 +6941,8 @@ impl KeyAction {
             FsReadingFlowCycle => digit_pair(Num6, Numpad6),
             FsReadingDirectionToggle => digit_pair(Num7, Numpad7),
             FsFitModeCycle => digit_pair(Num0, Numpad0),
-            FsZoomIn => ChordList::three(
-                Chord::shift(Semicolon),
-                Chord::key(Semicolon),
-                Chord::key(NumpadAdd),
-            ),
-            FsZoomOut => ChordList::two(Chord::key(Minus), Chord::key(NumpadSubtract)),
+            FsZoomIn => ChordList::two(Chord::key(Period), Chord::key(NumpadAdd)),
+            FsZoomOut => ChordList::two(Chord::key(Comma), Chord::key(NumpadSubtract)),
             FsAiModelNext => ChordList::one(Chord::key(U)),
             FsAiModelPrev => ChordList::one(Chord::shift(U)),
             FsAiModelReset => ChordList::one(Chord::alt(U)),
@@ -15967,16 +15963,12 @@ mod tests {
         for (action, expected) in [
             (
                 KeyAction::FsZoomIn,
-                vec![
-                    Chord::shift(KeySlot::Semicolon),
-                    Chord::key(KeySlot::Semicolon),
-                    Chord::key(KeySlot::NumpadAdd),
-                ],
+                vec![Chord::key(KeySlot::Period), Chord::key(KeySlot::NumpadAdd)],
             ),
             (
                 KeyAction::FsZoomOut,
                 vec![
-                    Chord::key(KeySlot::Minus),
+                    Chord::key(KeySlot::Comma),
                     Chord::key(KeySlot::NumpadSubtract),
                 ],
             ),
@@ -15991,6 +15983,13 @@ mod tests {
             );
             assert!(action.is_user_facing());
             assert_eq!(action.default_chords().iter().collect::<Vec<_>>(), expected);
+            for removed in [
+                Chord::key(KeySlot::Semicolon),
+                Chord::key(KeySlot::Minus),
+                Chord::shift(KeySlot::Semicolon),
+            ] {
+                assert!(!action.default_chords().iter().any(|chord| chord == removed));
+            }
             assert!(!page_overview_action_allowed(action));
             assert!(
                 Keymap::empty()
@@ -16053,7 +16052,7 @@ mod tests {
     #[test]
     fn key_zoom_missing_saved_overrides_inherit_defaults_like_page_overview() {
         let keymap = Keymap::from_ini_str(
-            "[FsImage]\nFsCapture = Semicolon\nFsRotateCw = Minus\nFsZoomOut = none\n[FsCommon]\nFsClose = O\n",
+            "[FsImage]\nFsCapture = Period\nFsRotateCw = Minus\nFsZoomOut = none\n[FsCommon]\nFsClose = O\n",
         );
         let restored = Keymap::from_settings(&KeymapSettings::from_keymap(&keymap));
         assert_eq!(
@@ -16082,7 +16081,7 @@ mod tests {
         );
         assert_eq!(
             restored.effective_chords(KeyAction::FsCapture),
-            vec![Chord::key(KeySlot::Semicolon)]
+            vec![Chord::key(KeySlot::Period)]
         );
     }
 
@@ -16097,9 +16096,9 @@ mod tests {
             ctx.begin_pass(Default::default());
             cache_test_keyboard_owner(&ctx);
             let mut edge = ctrl_down_edge(repeat);
-            edge.virtual_key = 0xBB;
+            edge.virtual_key = 0xBE;
             edge.ctrl = false;
-            edge.shift = true;
+            edge.shift = false;
             crate::key_input::set_test_frame(vec![edge, edge, edge]);
             assert_eq!(
                 keymap.consume_action_press_count(&ctx, KeyAction::FsZoomIn),
@@ -16229,16 +16228,16 @@ mod tests {
                         .then_some(line)
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(lines.len(), 5);
+            assert_eq!(lines.len(), 4);
             assert!(
                 lines
                     .iter()
-                    .any(|line| line.starts_with("FsZoomIn.1 = Shift+Semicolon ;"))
+                    .any(|line| line.starts_with("FsZoomIn.1 = . ;"))
             );
             assert!(
                 lines
                     .iter()
-                    .any(|line| line.starts_with("FsZoomIn.2 = Semicolon ;"))
+                    .any(|line| line.starts_with("FsZoomOut.1 = , ;"))
             );
             let parsed = Keymap::from_ini_str(&format!("[FsImage]\n{}\n", lines.join("\n")));
             assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
