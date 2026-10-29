@@ -12866,12 +12866,16 @@ impl VideoPlayer {
             break;
         }
 
-        if complete_video_output_tail(
-            &self.clock,
-            &self.decode.video_rx,
-            self.future_frames.len(),
-            latest_renderable.is_some(),
-        ) {
+        // Only the presentation fallback consumes this receiver here. RemoteHeadless
+        // owns the real receiver on its worker; our empty dummy cannot prove its tail.
+        if matches!(&self.video_output, VideoOutputState::Presentation)
+            && complete_video_output_tail(
+                &self.clock,
+                &self.decode.video_rx,
+                self.future_frames.len(),
+                latest_renderable.is_some(),
+            )
+        {
             self.ui_wake.wake();
         }
 
@@ -16055,6 +16059,67 @@ mod tests {
         assert_eq!(displayed.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 
+    #[test]
+    fn headless_video_tail_tick_cannot_ack_while_real_consumer_is_held() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let mut player = super::VideoPlayer::disconnected_for_test("headless-eos.mp4".into(), 0.0);
+        let (video_tx, video_rx) = crossbeam_channel::bounded(1);
+        // Hold the actual headless consumer before it receives the final frame.
+        // Dropping the release sender also unblocks the worker if an assertion fails.
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let clock = Arc::clone(&player.clock);
+        let events = player.engine_event_tx.clone();
+        let displayed = Arc::clone(&player.displayed_frame_seq);
+        let last_pts = Arc::clone(&player.last_displayed_pts_bits);
+        let worker = std::thread::spawn(move || {
+            if release_rx.recv().is_ok() {
+                super::run_headless_video_output(
+                    video_rx,
+                    worker_stop,
+                    Arc::new(AtomicBool::new(false)),
+                    clock,
+                    events,
+                    displayed,
+                    last_pts,
+                );
+            }
+        });
+        player.decode.video_rx = super::dummy_video_rx();
+        player.video_output = super::VideoOutputState::RemoteHeadless(super::HeadlessVideoOutput {
+            stop,
+            worker: Some(worker),
+        });
+        video_tx.send(test_video_frame(0, 1.0)).unwrap();
+        player.clock.note_video_decoded_eos(0);
+
+        player.tick(&egui::Context::default());
+        assert!(player.decode.video_rx.is_empty());
+        assert_eq!(
+            video_tx.len(),
+            1,
+            "real consumer still owns the final frame"
+        );
+        assert_eq!(player.displayed_frame_seq.load(Ordering::Acquire), 0);
+        assert!(!player.clock.video_tail_complete());
+
+        release_tx.send_timeout((), Duration::from_secs(5)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !player.clock.video_tail_complete() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(player.clock.video_tail_complete());
+        assert_eq!(player.displayed_frame_seq.load(Ordering::Acquire), 1);
+        assert_eq!(
+            player.last_displayed_pts_bits.load(Ordering::Acquire),
+            1.0_f64.to_bits()
+        );
+    }
+
     fn test_video_frame(epoch: u64, pts: f64) -> super::VideoFrame {
         super::VideoFrame {
             width: 1,
@@ -17338,6 +17403,7 @@ mod tests {
                 player.info.as_mut().unwrap().has_audio = false;
                 if !native {
                     player.native_output = None;
+                    player.video_output = super::VideoOutputState::Presentation;
                 }
                 player.set_loop_enabled(looping);
                 let serial = player.current_seek_serial();

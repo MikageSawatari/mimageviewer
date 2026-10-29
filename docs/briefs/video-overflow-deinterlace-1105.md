@@ -163,5 +163,6 @@ detached: 制御を player に置き、既存の per-context 経路 (所有 cont
   ACK する。native / hidden / headless / 非 native は同じ契約を使い、player の EOF / loop は Complete を待つ。
   seek は世代更新と同じ所有境界で reset し、旧 ACK を拒否する。`demux_exhausted` の意味と既存の
   音声 tail / 出力 quiet 条件は維持し、待ち時間延長・新しいポーリング・回復機構は追加しない。
+- 独立レビュー P2 追補: tick の映像 tail ACK は既存 `VideoOutputState::Presentation` の自前消費時だけに限定し、RemoteHeadless の dummy channel からは確定しない。実 consumer を保留した tick と、解放後の worker 完了を回帰検査する。
 - detached は既存の context mount と `fs_cache` の所有境界へ variant を追加する。
   `ParkedLive` の受付順・stale epoch の活性化規則は変更しない（§9.4）。
