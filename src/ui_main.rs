@@ -24,6 +24,67 @@ use crate::settings::{
     GridClickSelectionMode, GridViewMode,
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
+
+// Headless pointer entry shared by the rating/list-order investigation tests.
+#[cfg(test)]
+pub(crate) fn ratingnav649_double_click_for_test(app: &mut App, idx: usize) -> AddressBarNav {
+    let ctx = egui::Context::default();
+    let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 120.0));
+    let pos = rect.center();
+    let mut nav = None;
+    for (frame, pressed) in [None, Some(true), Some(false), Some(true), Some(false)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if let Some(pressed) = pressed {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(460.0, 200.0),
+            )),
+            time: Some(frame as f64 * 0.02),
+            events,
+            ..Default::default()
+        });
+        app.begin_grid_click_input_frame(&ctx);
+        let suppress = app.begin_grid_right_drag_primary_frame(&ctx);
+        let pairing = app.begin_grid_primary_click_frame(
+            &ctx,
+            !suppress && ctx.input(|input| input.pointer.primary_clicked()),
+        );
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                if let Some(request) = app.handle_cell_interaction(
+                    ui,
+                    &ctx,
+                    rect,
+                    idx,
+                    &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
+                    false,
+                    suppress,
+                    pairing,
+                    None,
+                ) {
+                    assert!(nav.is_none(), "one double-click must produce one open");
+                    nav = Some(request);
+                }
+            });
+        });
+        ctx.end_pass().drop_without_applying_deltas();
+        if frame < 4 {
+            assert!(nav.is_none(), "selection/press alone must not open");
+        }
+    }
+    nav.expect("physical double-click must reach the grid open handler")
+}
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
 use crate::wheel_input::consume_wheel_input;
 

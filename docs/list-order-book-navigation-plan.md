@@ -526,3 +526,137 @@ B_book.zip・A_book) を「日付↓」で並べ、F から Ctrl+Shift+↓ / ↑
 - ↑: A → B → D、D から ↑ で F (E を飛ばす) → 「一覧の先頭です」で停止。
 - 既存の Ctrl+↓ は木の順のまま (D → E_zipsonly\inner.zip)。そこから Ctrl+Shift+↓ で D (中の書庫に着いていても一覧の位置は E の行)。
 - 未確認: ゲームパッドでの決定・動画への着地中の押下・detached / F12 linked での通知・EPUB / 変換書庫・評価一覧経由 (自動テストのみ)。
+
+## 12. 5ch >>649 評価フィルタと一覧順移動の調査 (2026-10-29)
+
+対象: `ratingnav-649`、基点 `f9156a375`。Codexによるソース調査と非対話テスト。
+製品コードの修正・製品バイナリの起動・commitは行わない。
+報告者の観測は「移動前に★一時解除中になる」までであり、絞り込み対象外の本への
+実移動を観測したかは不明。以下の開発側の結果と区別する。
+
+### 検証経路
+
+使い捨ての `AppTestEnv` と一時フォルダに、実PNGが2ページ入ったA/B/CのZIP、
+または画像だけのA/B/Cフォルダを作る。本の評価は5/1/5、ページは未評価。
+`rating_db`へfixtureの評価を保存し、`load_folder`と既存のidentity準備helperで
+通常の親一覧を作る。★5に絞った一覧の取得順を期待値として手で代入しない。
+
+- Enter: 合成Enterイベント → `handle_keyboard`。
+- ダブルクリック: 合成pointerの2回の押下/解放 → `handle_cell_interaction`。
+- ゲームパッド: 既存の決定handler `handle_gamepad_grid_accept`。
+- いずれも通常の `grid_physical_navigation` → 一覧記録 → 起点に対応する
+  `MainFrameNavigation` のlane → `post_render_main_navigation` → 実際のopen/adoption。
+- 本の移動は `handle_fullscreen_list_order_nav_context_with_operation` → 実worker →
+  `poll_folder_nav` → `apply_folder_nav_result` → 分類・ZIP列挙・hydration・再open。
+  workerが返した論理パスと採用後の `effective_folder()` の両方を検査する。
+- 親への復帰はfullscreenを閉じ、既存の `handle_grid_parent_folder_action` →
+  通常dispatcher → 親一覧の採用。保存設定は一時profileへsave/loadして検査する。
+
+名前順は `[A,C]` でA→C→A。更新日時はA<B<Cとし、日付降順は `[C,A]` でC→A→C。
+各経路は自動ページ表示ON/OFFの両方を試す。OFFはページ一覧からEnterでページを開く。
+通常フォルダのEnterではONでもページ一覧に止まる別不具合を検出したため、
+移動対象の検査はそのページ一覧からEnterでページを開いて続行し、自動表示の失敗は専用回帰へ分離した。
+採用後の未評価ページの可視集合とfullscreenのopenまでが検査範囲であり、
+実ウィンドウ・実ゲームパッド・GPU描画・表示完了ACKは検査しない。
+次の本移動前には既存workerテストと同じ `release_fs_nav_lock` のheadless seamを使う。
+開いた後のフィルタ変更への追従、★固定、別窓、PDF/変換書庫/ZIP内部階層は今回の範囲外。
+
+### ソース上の確認
+
+- 一時解除helperは `settings.rating_filter` を変更せず、anchorだけを設定する。
+  `effective_rating_filter()` は解除中だけ全ONを返す。helper自体は可視一覧を作り直さない。
+- フォルダのdouble-click/gamepadは解除設定→一覧記録、EnterとZIPは一覧記録→採用の順。
+  この順の相違だけでは、記録される列が広がる根拠にはならない。
+- `capture_main_folder_list_order` は既存の `current_grid_order()` をコピーし、
+  workerの `navigate_list_order` はその列以外を候補にしない。
+- v4.9.0とHEADで、`list_order_navigation.rs`・`collection_grid.rs`の全体、
+  `effective_rating_filter`から復元helper群まで、一覧順のoperation付きhandler、
+  `handle_gamepad_grid_accept`の本体、Enterのcontainer受付部分が一致することを
+  `git show` のテキスト比較で確認した。
+  後続機能も入った現在の作業ツリーでのテストであり、v4.9.0の別buildでの実行ではない。
+
+### 実行結果と引き継ぎ
+
+追加test: `src/app/list_order_ratingnav649_tests.rs` の `ratingnav649_` 14件。
+移動の12件は `ratingnav649_{zip,folder}_{enter,double_click,gamepad}_{name,date_desc}` の全組合せ。
+これとは別にEnterの自動表示を検査する2件を追加した (下記の失敗名)。
+pointer用helperは `ui_main.rs` の `#[cfg(test)]` のみで、製品buildには入らない。
+ログは `target/ratingnav649/`。ビルド・テストには `MSBUILDDISABLENODEREUSE=1` を指定する。
+初回のcold buildは既存のネイティブ依存ビルド方針に従って `CARGO_BUILD_JOBS=1`。
+
+**結果: 評価の一時解除によって一覧順移動の対象が広がる現象は、今回の範囲では再現しなかった。**
+移動の12件は成功し、各件でON/OFFの計24シナリオ・48回の本移動を検査した。
+Enterの通常フォルダは上記の追加ページEnterが必要だった。
+
+| 本の種類・開く入口 | 名前順の記録と移動 | 日付降順の記録と移動 | 自動ページ表示ON時の初回open |
+| --- | --- | --- | --- |
+| ZIP / Enter | `[A.zip,C.zip]`、A→C→A | `[C.zip,A.zip]`、C→A→C | ページ表示 |
+| ZIP / ダブルクリック | 同上 | 同上 | ページ表示 |
+| ZIP / ゲームパッド | 同上 | 同上 | ページ表示 |
+| 画像フォルダ / Enter | `[A,C]`、A→C→A | `[C,A]`、C→A→C | **ページ一覧で停止**。ページEnter後に移動を検査 |
+| 画像フォルダ / ダブルクリック | 同上 | 同上 | ページ表示 |
+| 画像フォルダ / ゲームパッド | 同上 | 同上 | ページ表示 |
+
+名前順での状態推移 (日付降順はAとCを交換):
+
+| 段階 | 記録列 | 解除anchor | 実効評価条件 |
+| --- | --- | --- | --- |
+| 親一覧の★5絞り込み後 | なし | なし | ★5のみ |
+| ZIP全入口 / フォルダEnterのopen受付直後 | `[A,C]` | なし | ★5のみ |
+| フォルダdouble-click/gamepadのopen受付直後 | `[A,C]` | A | 全ON。ただし可視一覧はA・Cのまま |
+| Aの採用後 | `[A,C]` | A | 全ON。未評価2ページを採用・open可能 |
+| ↓のworker決定・C採用後 | `[A,C]` | C | 全ON。決定先も採用先もC |
+| ↑のworker決定・A採用後 | `[A,C]` | A | 全ON。決定先も採用先もA |
+| 親への復帰後 | `[A,C]` (同じArcを保持) | なし | ★5のみ。親一覧はA・Cのみ |
+
+保存した `settings.rating_filter` は全段階で★5のみ、DB評価はA=5/B=1/C=5、
+ページ評価は0のまま。Bは記録列にもworkerの決定先にも採用先にも入らなかった。
+
+### 別途確認した不具合: 通常フォルダをEnterで開いたときの自動表示予約漏れ
+
+専用の `ratingnav649_folder_enter_auto_open_with_rating_filter` と
+`ratingnav649_folder_enter_auto_open_without_rating_filter` は、期待どおり**失敗状態で残す**。
+両方とも `should_auto_fullscreen_grid_container(0)=true` なのに、受付後の
+`pending_auto_fs_open=false`、画像フォルダ採用後の `fullscreen_idx=None`。
+評価OFFでも同じため、これを>>649の評価フィルタによる移動対象拡大の原因とは断定しない。
+
+具体的な経路と原因 (行番号は今回の作業ツリー):
+
+- `src/app.rs:58155`: Enterは `auto_fs` を求めて `grid_physical_navigation` を返すが、
+  通常フォルダ用の自動表示予約を設定しない。
+- `src/app/collection_grid.rs:1373` / `:1420`: 共通受付は列を記録するが、FolderのDirect要求では
+  `auto_fullscreen` を実際の表示予約へ反映せず、`StartupListIntent` だけへ渡す。
+- `src/app.rs:31505`: folderの準備は既存の `pending_auto_fs_open` がtrueの場合に限り
+  `auto_open_image_folder` を作り、`:31798` で `AutoFullscreenFolder` をhydrationへ渡す。
+  Enterではこの条件を通らない。
+- `src/ui_main.rs:17025` / `src/app/gamepad_input.rs:9598`: double-click/gamepadは、
+  共通受付より前に既存の予約を設定するのでページ表示へ進める。
+
+修正方針は、通常フォルダのopen受付の共通境界で既存の自動表示意図を一度だけ反映し、
+各入力入口の重複処理を揃えること。新たなbool/pending、待ち・guard、評価解除の廃止は不要。
+一覧記録・ページ用の一時解除・保存評価・帰路を保持し、今回の2件と移動12件で検証する。
+共通受付と3入口の整合を取る局所的な規模と見込む。製品修正は今回の依頼範囲外のため未実施。
+
+### コマンドと結果
+
+各コマンドの前にPowerShellで `$env:MSBUILDDISABLENODEREUSE='1'` を設定した。
+`--lib`、通常feature、test profile、非対話実行のみ。
+
+| コマンド (`cargo nextest run -p mimageviewer --lib -E` に続くfilter) | 結果 / exit code | ログ |
+| --- | --- | --- |
+| `'test(/list_order_capture_intersects_ctrl_f_facet_name_and_rating_filters/)'` | 1/1成功 / 0。初回cold compile 26分43秒 | `baseline.log` |
+| `'test(/ratingnav649_zip_/)' --no-fail-fast --success-output immediate --failure-output immediate` | 最終6/6成功 / 0、1.184秒 | `zip-final.log` |
+| `'test(/ratingnav649_folder_/)' --no-fail-fast --success-output immediate --failure-output immediate` | 最終6成功・自動表示2失敗 / 100、1.220秒 | `folder-final.log` |
+| `'test(/app::list_order_tests::/) and not test(/ratingnav649/) and not test(/list_order_capture_intersects_ctrl_f_facet_name_and_rating_filters/)' --no-fail-fast` | 既存残り14/14成功 / 0、1.234秒。baselineの1件と合わせて既存15件成功 | `existing.log` |
+| `cargo fmt --check` / `git diff --check` | ともに成功 / 0 | `fmt-final.log` / tool出力 |
+
+初回ZIPは6成功 (`zip.log`)。初回folderは移動テスト内の自動表示assertでEnter2件が失敗、
+double-click/gamepad4件は成功 (`folder.log`)。失敗を緩和せず専用2件へ分離し、
+移動テストは実際に見えるページ一覧から既存Enterを通して残りの検査を完了した。
+製品修正の成功証明としては扱わない。lib全件/full gate・実UIは未実施。
+製品コードを変更していない調査・testのみのため、ユーザー確認用の製品buildは行っていない。
+各段階の `649` 行と最終summaryを抜き出した記録は `state-traces.log` にも保存した。
+
+>>649の残る不明点は、表示への違和感か、実際に対象外の本へ移動したか。
+追加確認を求めるなら、その区別と、実移動がある場合だけ「元→先の本の種類・評価」を1例に絞る。
+現時点で一覧順移動や評価一時解除を変更する根拠はなく、別の自動表示不具合とは切り分けて扱う。
