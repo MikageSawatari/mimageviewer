@@ -746,6 +746,8 @@ pub use grid_paint::draw_audio_thumbnail_indicator_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_collection_placeholder_snapshot_fixture;
 #[doc(hidden)]
+pub use grid_paint::draw_thumbnail_name_style_snapshot_fixture;
+#[doc(hidden)]
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
     ThumbnailHitAreas, draw_cell, draw_cell_with_hit_areas, draw_cut_badge,
@@ -13745,6 +13747,8 @@ pub(crate) enum GridSortLockReason {
     PageOrderFixed,
     /// この一覧は固有の順序を持ち、一覧 sort は適用されない。
     FixedOrder,
+    /// タグビューでは通常ソートでなく、専用の並べ替えを使う。
+    TagViewOrder,
     /// 詳細一覧の列ヘッダが並びを所有している。
     DetailsHeaderSort,
     /// 手動順のコレクションでは列ヘッダが順序を上書きできない。
@@ -13771,6 +13775,7 @@ impl GridSortLockReason {
         match self {
             Self::PageOrderFixed => "固定",
             Self::FixedOrder => "並べ替え固定",
+            Self::TagViewOrder => "タグ専用",
             Self::DetailsHeaderSort => "列ヘッダ",
             Self::CollectionManualOrder => "手動順",
             Self::CollectionShuffleOrder => "シャッフル",
@@ -13790,6 +13795,7 @@ impl GridSortLockReason {
                 "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。"
             }
             Self::FixedOrder => "この一覧は並べ替え固定です。",
+            Self::TagViewOrder => "タグビューの並べ替えはツールバーで選べます。",
             Self::DetailsHeaderSort => {
                 "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
             }
@@ -16673,6 +16679,8 @@ pub struct App {
     pub(crate) empty_items_reason: Option<(u64, crate::empty_items_reason::EmptyItemsReason)>,
     /// 現在の `items` がタグビュー (Ctrl+T) の一時結果一覧かを示す。
     pub(crate) items_are_tag_view: bool,
+    /// 検索結果を採用した時点の、一致したタグの付与時刻 (ミリ秒)。一覧contextが所有する。
+    pub(crate) tag_view_applied_times: std::collections::HashMap<String, i64>,
     /// 現在の `items` が閲覧履歴の仮想ビューかを示す。
     pub(crate) items_are_reading_history_view: bool,
     /// 現在の `items` がブックマーク一覧の仮想ビューかを示す。
@@ -20884,6 +20892,7 @@ impl App {
             items_are_global_search_view: false,
             empty_items_reason: None,
             items_are_tag_view: false,
+            tag_view_applied_times: Default::default(),
             items_are_reading_history_view: false,
             items_are_bookmark_view: false,
             items_are_rating_view: false,
@@ -33434,6 +33443,7 @@ impl App {
         }
         let fallback_origin = self.current_folder.clone();
         let transferred_origin = self.take_origin_for_search_entry(SearchMode::TagView);
+        self.reset_details_sort_to_toolbar();
         self.tag_view.active = true;
         self.tag_view.focus_request = focus_request;
         if let Some(origin) = transferred_origin {
@@ -33716,6 +33726,8 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
+        self.tag_view_applied_times.clear();
+        self.reset_details_sort_if_hidden();
         let path = self.tag_view.saved_folder.take();
         let subfolder_restore = self.tag_view_subfolder_restore.take();
         let canonical = self.top_level_grid_view.take_return_origin();
@@ -33812,11 +33824,13 @@ impl App {
     }
 
     pub(crate) fn execute_tag_view(&mut self) {
-        if self.tag_view.query != self.tag_view.last_executed
-            || self.tag_view.kind_filter != self.tag_view.last_executed_kind_filter
-        {
-            self.retire_main_list_requests_for_surface_switch();
+        if !self.items_are_tag_view {
+            // 子フォルダからの戻りや履歴経由の再入場も、専用の並びを優先する。
+            self.reset_details_sort_to_toolbar();
         }
+        // 同じ検索語でのソート変更・再検索も、新しい結果一覧への明示要求。
+        // 子を開く準備と同じ置換境界を通し、先に受理した要求を退役させる。
+        self.retire_main_list_requests_for_surface_switch();
         self.tag_view.last_executed = self.tag_view.query.clone();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.reject_message = None;
@@ -33865,6 +33879,21 @@ impl App {
     }
 
     fn apply_tag_view_result(&mut self, mut result: crate::tag_view::TagViewResult) {
+        if !self.items_are_tag_view {
+            self.reset_details_sort_to_toolbar();
+        }
+        let retained_applied_at_sort = (self.items_are_tag_view
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::AppliedAt)
+            .then_some(self.settings.details_sort_ascending);
+        let applied_times = result
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .applied_at_ms
+                    .map(|time| (crate::tags_db::item_key_for_path(&entry.path), time))
+            })
+            .collect();
         self.video_thumb_overrides = std::mem::take(&mut result.video_thumb_overrides);
         result.entries.retain(|entry| {
             entry.kind != crate::tag_view::TagViewItemKind::PdfFile
@@ -33960,19 +33989,104 @@ impl App {
         {
             self.tag_view_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_extracted_items(
-            book_materialization::ExtractedSurface::Search(
-                top_level_grid_view::TopLevelSearchView::Tag,
-            ),
-            search_results_synthetic_path(),
-            items,
-            image_metas,
-            existing_keys,
-            video_items,
-            None,
-        );
+        if self.items_are_tag_view {
+            // 同じ検索surfaceの再検索はsource-openではない。★一覧と同じ既存の
+            // identity転送で、待っている間に開いた画像・動画・音声も新しい位置へ渡す。
+            self.finish_rating_membership_edit_boundary();
+            let viewer = self.prepare_rating_membership_items_swap(&items);
+            let selected_key = self
+                .selected
+                .and_then(|idx| self.items.get(idx))
+                .map(GridItem::perf_key);
+            self.save_departing_session_grid_positions();
+            self.clear_page_edit_state();
+            self.bump_render_epoch_only();
+            self.install_new_items(items, image_metas);
+            self.items_are_tag_view = true;
+            self.projection_recipe = book_materialization::ProjectionRecipe::ExtractedResult(
+                book_materialization::ExtractedSurface::Search(
+                    top_level_grid_view::TopLevelSearchView::Tag,
+                ),
+            );
+            self.invalidate_idx_state_and_queues();
+            self.restart_thumbnail_workers_after_metadata_pin_refresh();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            if let Some(pending) = self.search_pending.take() {
+                pending.cancel();
+            }
+            if let Some(pending) = self.metadata_pending.take() {
+                pending.cancel();
+            }
+            self.clear_tags_cache();
+            let selected = selected_key
+                .and_then(|key| self.items.iter().position(|item| item.perf_key() == key));
+            self.move_grid_cursor(selected, GridCursorIntent::Automatic);
+            self.prewarm_rating_cache();
+            self.prewarm_grid_tags();
+            // 動画は通常thumbnail queueの対象外。旧世代のworker結果を待たず、
+            // 従来の明示更新と同じく、全動画を既存workerへ新世代で渡す。
+            if !video_items.is_empty() {
+                let pin_blobs = self
+                    .video_pin_db
+                    .as_ref()
+                    .map(|db| db.lookup_webps_many(video_items.iter().map(|(_, path, _)| path)))
+                    .unwrap_or_default();
+                self.spawn_video_thread(
+                    self.tx.clone(),
+                    Arc::clone(&self.cancel_token),
+                    video_items,
+                    self.video_thumb_overrides.clone(),
+                    Arc::new(pin_blobs),
+                );
+            }
+            self.prepare_current_listing_page_identity_index(
+                self.settings.file_type_visibility.clone(),
+                None,
+            );
+            self.prepare_page_edits_for_current_virtual_items();
+            self.finish_rating_membership_viewer_swap(viewer);
+        } else {
+            self.start_loading_extracted_items(
+                book_materialization::ExtractedSurface::Search(
+                    top_level_grid_view::TopLevelSearchView::Tag,
+                ),
+                search_results_synthetic_path(),
+                items,
+                image_metas,
+                existing_keys,
+                video_items,
+                None,
+            );
+        }
         self.items_are_tag_view = true;
+        self.tag_view_applied_times = applied_times;
+        self.rebuild_visible_indices();
+        if let Some(ascending) = retained_applied_at_sort {
+            self.settings.details_sort_key = crate::settings::DetailsSortKey::AppliedAt;
+            self.settings.details_sort_ascending = ascending;
+        }
+        self.rebuild_details_order();
         self.address = format!("タグビュー: {}", self.tag_view.query.trim());
+    }
+
+    pub(crate) fn set_tag_view_sort(&mut self, sort: crate::tag_view::TagViewSort) {
+        if !self.items_are_tag_view || self.settings.tag_view_sort == sort {
+            return;
+        }
+        self.settings.tag_view_sort = sort;
+        self.settings.save();
+        self.execute_tag_view();
+    }
+
+    pub(crate) fn tag_view_applied_at_ms(&self, idx: usize) -> Option<i64> {
+        if !self.items_are_tag_view {
+            return None;
+        }
+        let path = self.items.get(idx)?.drag_source_path()?;
+        self.tag_view_applied_times
+            .get(&crate::tags_db::item_key_for_path(path))
+            .copied()
     }
 
     /// 検索コンテキスト中の Ctrl+↑↓ ナビゲーション。
@@ -35019,6 +35133,11 @@ impl App {
         }
         self.cancel_unresolved_open_for_navigation(explicit_request);
         self.retire_close_returns_for_main_admission();
+        // タグ結果の再検索中に子の open 等を受理したら、遅着した root 結果で
+        // 新しい行き先を上書きしない。タグ自身の採用時は poll が既に take 済み。
+        if let Some(pending) = self.tag_view_pending.take() {
+            pending.cancel();
+        }
         if retained != Some(MainListRequestOwner::Classification) {
             self.top_level_grid_view.set_open_path_classification(None);
         }
@@ -43791,6 +43910,7 @@ impl App {
         }
         self.persist_pending_view_trim_state();
         self.items = items;
+        self.tag_view_applied_times.clear();
         self.projection_recipe = Default::default();
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
@@ -47658,6 +47778,8 @@ impl App {
         self.retain_tags_cache(|key| !matches_key(key));
         self.folder_pin_map.retain(|key, _| !matches_key(key));
         self.rating_view_rows.retain(|row| !matches_key(&row.key));
+        self.tag_view_applied_times
+            .retain(|key, _| !matches_key(key));
         if self
             .fullscreen_video_marker_cache
             .as_ref()
@@ -71249,6 +71371,7 @@ impl App {
                 &self.settings,
                 column,
                 self.items_are_rating_view,
+                self.items_are_tag_view,
             )
     }
 
@@ -73700,11 +73823,17 @@ impl App {
         use top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
         if matches!(
             self.top_level_grid_view.surface(),
-            TopLevelGridSurface::Search(TopLevelSearchView::Favorite | TopLevelSearchView::Tag)
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite)
                 | TopLevelGridSurface::ReadingHistory
                 | TopLevelGridSurface::Snapshot
                 | TopLevelGridSurface::DriveList
-        ) {
+        ) || (matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag)
+        ) && !self.items_are_tag_view)
+        {
+            // タグから入った子フォルダには専用ソートを適用しない。
+            // 共通ソートも従来どおり無効にし、結果一覧だけの3択に限定する。
             return Some(GridSortLockReason::FixedOrder);
         }
         if let Some(order) = self.collection_grid_root_order() {
@@ -73758,6 +73887,9 @@ impl App {
             DetailsSortKey::Rating => self.settings.details_show_rating,
             DetailsSortKey::RatedAt => {
                 self.items_are_rating_view && self.settings.details_show_rated_at
+            }
+            DetailsSortKey::AppliedAt => {
+                self.items_are_tag_view && self.settings.details_show_applied_at
             }
             DetailsSortKey::Tags => self.settings.details_show_tags,
             DetailsSortKey::Kind => self.settings.details_show_kind,
@@ -73890,6 +74022,7 @@ impl App {
             DetailsSortKey::RatedAt => {
                 DetailsSortPrimary::I64(self.rating_view_row(idx).and_then(|row| row.rated_at_ms))
             }
+            DetailsSortKey::AppliedAt => DetailsSortPrimary::I64(self.tag_view_applied_at_ms(idx)),
             DetailsSortKey::Tags => DetailsSortPrimary::Text(self.cell_tag_list(idx).join(" ")),
             DetailsSortKey::Kind => DetailsSortPrimary::Text(self.details_kind_sort_key(idx)),
             DetailsSortKey::PageCount => {
@@ -73945,7 +74078,8 @@ impl App {
             DetailsSortKey::Size
             | DetailsSortKey::Modified
             | DetailsSortKey::Created
-            | DetailsSortKey::RatedAt => {
+            | DetailsSortKey::RatedAt
+            | DetailsSortKey::AppliedAt => {
                 // ★設定時刻を含む optional 時刻は、NULL を空欄として扱い、昇順・降順の
                 // どちらでも末尾へ置く。下の反転対象からも外してこの規約を維持する。
                 let DetailsSortPrimary::I64(av) = &a.primary else {
@@ -73976,6 +74110,7 @@ impl App {
             | DetailsSortKey::Modified
             | DetailsSortKey::Created
             | DetailsSortKey::RatedAt
+            | DetailsSortKey::AppliedAt
             | DetailsSortKey::PageCount
             | DetailsSortKey::ImageDimensions
             | DetailsSortKey::VideoDuration
@@ -73986,6 +74121,11 @@ impl App {
 
         if primary != Ordering::Equal {
             return primary;
+        }
+        if key == DetailsSortKey::AppliedAt {
+            // 元のタグ結果はどの専用ソートでも、同時刻内を実パス順にしている。
+            // ファイル名だけの自然順へ変えず、その順を昇順・降順とも保持する。
+            return a.idx.cmp(&b.idx);
         }
         Self::compare_details_sort_names(a, b).then_with(|| a.idx.cmp(&b.idx))
     }

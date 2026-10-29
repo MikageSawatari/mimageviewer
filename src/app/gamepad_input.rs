@@ -4980,7 +4980,13 @@ impl App {
             crate::settings::MIN_GRID_COLS,
             crate::settings::MAX_GRID_COLS,
         );
-        let grid_sort_target = if context == RingShortcutContext::Grid {
+        let grid_sort_target = if context == RingShortcutContext::Grid && self.items_are_tag_view {
+            // このピッカーは通常ソートだけを持つ。タグ専用の3択はツールバーが所有する。
+            RingPickerGridSortTarget::Locked(
+                self.grid_sort_lock_reason()
+                    .unwrap_or(super::GridSortLockReason::TagViewOrder),
+            )
+        } else if context == RingShortcutContext::Grid {
             match self.collection_grid_root_order() {
                 Some(Ok(target)) => self
                     .grid_sort_lock_reason()

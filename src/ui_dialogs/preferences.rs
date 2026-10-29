@@ -5430,6 +5430,62 @@ mod tests {
     }
 
     #[test]
+    fn thumb_name_preferences_combobox_ok_save_reload_and_cancel() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        let scale = harness.state().settings.ui_scale_factor;
+        harness.get_by_label("名前の文字サイズ:").click();
+        harness.run_steps(3);
+        harness.get_by_label("175%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").click();
+        harness.run_steps(3);
+        harness.get_by_label("4 行").click();
+        harness.run_steps(3);
+        assert!(harness.state().preferences_dialog_has_unsaved_changes());
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 100);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 1);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 175);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 4);
+        assert_eq!(harness.state().settings.ui_scale_factor, scale);
+
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        let persisted = db.load_into_settings().unwrap();
+        assert_eq!(persisted.thumb_name_font_scale_percent, 175);
+        assert_eq!(persisted.thumb_name_max_lines, 4);
+        assert_eq!(persisted.ui_scale_factor, scale);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        harness.get_by_label("名前の文字サイズ:").click();
+        harness.run_steps(3);
+        harness.get_by_label("125%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").click();
+        harness.run_steps(3);
+        harness.get_by_label("2 行").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        assert!(harness.state().show_preferences_discard_confirm);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 175);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 4);
+        let after_cancel = db.load_into_settings().unwrap();
+        assert_eq!(after_cancel.thumb_name_font_scale_percent, 175);
+        assert_eq!(after_cancel.thumb_name_max_lines, 4);
+    }
+
+    #[test]
     fn resume_meter_preferences_toggle_requeues_media_metadata_with_duration_badge_off() {
         use crate::app::LazyColumnState;
         use crate::grid_item::GridItem;

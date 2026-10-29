@@ -514,6 +514,7 @@ fn section1328_session_search_pending_saves_latest_reading_and_subfolder_rows() 
                     kind_filter: crate::tag_view::TagViewKindFilter::All,
                     summaries: vec![],
                     entries: vec![crate::tag_view::TagViewEntry {
+                        applied_at_ms: None,
                         path: result_path,
                         kind: crate::tag_view::TagViewItemKind::Image,
                         mtime: 0,

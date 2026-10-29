@@ -1407,6 +1407,47 @@ fn favorite_standard_settings_notice(ui: &mut egui::Ui, state: &PreferencesState
 }
 
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("名前の文字サイズ:");
+            egui::ComboBox::from_id_salt("thumb_name_font_scale_percent")
+                .selected_text(format!("{}%", state.settings.thumb_name_font_scale_percent))
+                .show_ui(ui, |ui| {
+                    for percent in settings::THUMB_NAME_FONT_SCALE_PERCENT_OPTIONS {
+                        ui.selectable_value(
+                            &mut state.settings.thumb_name_font_scale_percent,
+                            percent,
+                            format!("{percent}%"),
+                        );
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+        });
+        ui.small("全体の「スケーリング」とは別に、サムネイル一覧のファイル名・フォルダ名だけを大きくします。");
+    });
+    anchored(ui, state, "thumbnail/name-max-lines", |ui, state| {
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("名前の最大行数:");
+            egui::ComboBox::from_id_salt("thumb_name_max_lines")
+                .selected_text(format!("{} 行", state.settings.thumb_name_max_lines))
+                .show_ui(ui, |ui| {
+                    for lines in
+                        settings::THUMB_NAME_MAX_LINES_MIN..=settings::THUMB_NAME_MAX_LINES_MAX
+                    {
+                        ui.selectable_value(
+                            &mut state.settings.thumb_name_max_lines,
+                            lines,
+                            format!("{lines} 行"),
+                        );
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+        });
+        ui.small("行数を増やすと長い名前を折り返して表示します。収まらない部分は省略します。");
+    });
+    ui.add_space(12.0);
     anchored(ui, state, "thumbnail/favorite-view-state", |ui, state| {
         ui.checkbox(
             &mut state.settings.remember_favorite_view_state,

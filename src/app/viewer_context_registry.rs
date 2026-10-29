@@ -1741,6 +1741,7 @@ pub(in crate::app) struct ViewerContextBundle {
     favsearch_subfolder_restore: Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
+    tag_view_applied_times: std::collections::HashMap<String, i64>,
     items_are_reading_history_view: bool,
     items_are_bookmark_view: bool,
     items_are_rating_view: bool,
@@ -2974,6 +2975,7 @@ impl ViewerContextBundle {
             favsearch_subfolder_restore: None,
             items_are_global_search_view: false,
             items_are_tag_view: false,
+            tag_view_applied_times: Default::default(),
             items_are_reading_history_view: false,
             items_are_bookmark_view: false,
             items_are_rating_view: false,
@@ -3402,6 +3404,7 @@ impl App {
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
+            tag_view_applied_times,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
@@ -3737,6 +3740,7 @@ impl App {
         swap_field!(favsearch_subfolder_restore);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
+        swap_field!(tag_view_applied_times);
         swap_field!(items_are_reading_history_view);
         swap_field!(items_are_bookmark_view);
         swap_field!(items_are_rating_view);
@@ -4119,6 +4123,7 @@ impl App {
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
+            tag_view_applied_times,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
@@ -4313,6 +4318,7 @@ impl App {
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
+            tag_view_applied_times,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
@@ -6050,6 +6056,29 @@ mod tests {
             &other_snapshot
         ));
         assert_eq!(app.list_order_position().unwrap().1, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tag_applied_at_registry_swap_and_clear_preserve_the_sibling_context() {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("tag-context.jpg");
+        let key = crate::tags_db::item_key_for_path(&path);
+        app.items = vec![GridItem::Image(path.clone())];
+        app.items_are_tag_view = true;
+        app.tag_view_applied_times.insert(key.clone(), 10_000);
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image(path)];
+        bundle.items_are_tag_view = true;
+        bundle.tag_view_applied_times.insert(key.clone(), 20_000);
+
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert_eq!(app.tag_view_applied_at_ms(0), Some(20_000));
+        assert_eq!(bundle.tag_view_applied_times.get(&key), Some(&10_000));
+        app.tag_view_applied_times.clear();
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert_eq!(app.tag_view_applied_at_ms(0), Some(10_000));
+        assert!(bundle.tag_view_applied_times.is_empty());
     }
 
     #[cfg(windows)]

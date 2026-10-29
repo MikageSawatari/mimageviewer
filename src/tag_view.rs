@@ -18,6 +18,45 @@ pub(crate) const TAG_VIEW_FILTERED_KEY_SCAN_LIMIT: usize = 50_000;
 const TAG_VIEW_RECENT_LIMIT: usize = 20;
 const TAG_VIEW_POPULAR_LIMIT: usize = 20;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TagViewSort {
+    #[default]
+    PathOrder,
+    AppliedAtDesc,
+    AppliedAtAsc,
+}
+
+impl TagViewSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PathOrder => "パス順",
+            Self::AppliedAtDesc => "タグ付与時刻（新しい順）",
+            Self::AppliedAtAsc => "タグ付与時刻（古い順）",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::PathOrder => "パス順",
+            Self::AppliedAtDesc => "タグ時刻↓",
+            Self::AppliedAtAsc => "タグ時刻↑",
+        }
+    }
+
+    pub fn arranges_by_category(self) -> bool {
+        // 従来のパス順も、カテゴリで再配置しない固定順。
+        false
+    }
+
+    fn query_order(self) -> crate::tags_db::TagViewQueryOrder {
+        match self {
+            Self::PathOrder => crate::tags_db::TagViewQueryOrder::Path,
+            Self::AppliedAtDesc => crate::tags_db::TagViewQueryOrder::AppliedAtDesc,
+            Self::AppliedAtAsc => crate::tags_db::TagViewQueryOrder::AppliedAtAsc,
+        }
+    }
+}
+
 /// PC and Remote inspect the same bounded candidate set when policy projection can remove
 /// rows. The visible response cap is applied after classification and filtering.
 pub(crate) fn key_scan_limit_for_projection(
@@ -244,6 +283,9 @@ pub(crate) struct TagViewEntry {
     pub kind: TagViewItemKind,
     pub mtime: i64,
     pub file_size: i64,
+    /// Query-matching tag rows' MAX timestamp, converted from DB seconds to ms.
+    /// Shared classification by itself leaves this unset.
+    pub applied_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,6 +315,7 @@ pub(crate) fn spawn_tag_view_search(
                 &data_dir,
                 &query,
                 kind_filter,
+                settings.tag_view_sort,
                 &settings.file_type_visibility,
                 &cancel_worker,
             )
@@ -326,6 +369,7 @@ fn run_tag_view_search(
         data_dir,
         query,
         kind_filter,
+        TagViewSort::PathOrder,
         &crate::file_type_visibility::FileTypeVisibility::default(),
         cancel,
     )
@@ -335,6 +379,7 @@ fn run_tag_view_search_with_visibility(
     data_dir: &Path,
     query: &str,
     kind_filter: TagViewKindFilter,
+    sort: TagViewSort,
     visibility: &crate::file_type_visibility::FileTypeVisibility,
     cancel: &AtomicBool,
 ) -> Result<TagViewResult, String> {
@@ -356,11 +401,11 @@ fn run_tag_view_search_with_visibility(
 
     let scan_limit =
         key_scan_limit_for_projection(kind_filter == TagViewKindFilter::All, visibility);
-    let keys = select_tag_view_item_keys(&db, trimmed, scan_limit + 1);
-    let scan_truncated = keys.len() > scan_limit;
+    let matches = select_tag_view_matches(&db, trimmed, sort, scan_limit + 1);
+    let scan_truncated = matches.len() > scan_limit;
     let mut truncated = false;
-    let mut entries = Vec::with_capacity(keys.len().min(TAG_VIEW_RESULT_LIMIT));
-    for key in keys.into_iter().take(scan_limit) {
+    let mut entries = Vec::with_capacity(matches.len().min(TAG_VIEW_RESULT_LIMIT));
+    for matched in matches.into_iter().take(scan_limit) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(TagViewResult {
                 query: query.to_string(),
@@ -371,10 +416,11 @@ fn run_tag_view_search_with_visibility(
                 video_thumb_overrides: Default::default(),
             });
         }
-        let path = PathBuf::from(&key);
+        let path = PathBuf::from(&matched.item_key);
         match classify_tag_view_path(path) {
             ClassifiedTagViewPath::Existing(classified) => {
-                let entry = classified.entry;
+                let mut entry = classified.entry;
+                entry.applied_at_ms = matched.applied_at.checked_mul(1000);
                 // Classification already owns the stat result. A directory named *.zip is
                 // a structural row, even if the ZIP file category is disabled.
                 if (classified.is_directory || visibility.allows_physical_file(&entry.path))
@@ -395,7 +441,17 @@ fn run_tag_view_search_with_visibility(
     if scan_truncated {
         truncated = true;
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_by(|a, b| {
+        let time_order = match (sort, a.applied_at_ms, b.applied_at_ms) {
+            (TagViewSort::PathOrder, _, _) => std::cmp::Ordering::Equal,
+            (TagViewSort::AppliedAtDesc, Some(a), Some(b)) => b.cmp(&a),
+            (TagViewSort::AppliedAtAsc, Some(a), Some(b)) => a.cmp(&b),
+            (_, Some(_), None) => std::cmp::Ordering::Less,
+            (_, None, Some(_)) => std::cmp::Ordering::Greater,
+            (_, None, None) => std::cmp::Ordering::Equal,
+        };
+        time_order.then_with(|| a.path.cmp(&b.path))
+    });
     Ok(TagViewResult {
         query: query.to_string(),
         kind_filter,
@@ -404,6 +460,24 @@ fn run_tag_view_search_with_visibility(
         truncated,
         video_thumb_overrides: Default::default(),
     })
+}
+
+fn select_tag_view_matches(
+    db: &crate::tags_db::TagsDb,
+    query: &str,
+    sort: TagViewSort,
+    limit: usize,
+) -> Vec<crate::tags_db::TagViewMatch> {
+    let terms = parse_tag_view_query_terms(query);
+    let order = sort.query_order();
+    let exact = db.tag_view_matches_exact(query, order, limit);
+    if terms.len() > 1 && exact.is_empty() {
+        db.tag_view_matches_terms_and(&terms, order, limit)
+    } else if exact.is_empty() {
+        db.tag_view_matches_prefix(query, order, limit)
+    } else {
+        exact
+    }
 }
 
 /// 本体タグビューとリモート閲覧で共有する item_key 選択規則の正本。
@@ -496,6 +570,7 @@ fn existing_tag_view_entry(path: PathBuf, meta: std::fs::Metadata) -> Classified
             kind,
             mtime,
             file_size,
+            applied_at_ms: None,
         },
         is_directory,
     })
@@ -574,6 +649,7 @@ mod tests {
             temp.path(),
             "visibility",
             TagViewKindFilter::All,
+            TagViewSort::PathOrder,
             &visibility,
             &AtomicBool::new(false),
         )
@@ -733,6 +809,157 @@ mod tests {
             parse_tag_view_query_terms("cat cat #dog"),
             vec!["cat".to_string(), "dog".to_string()]
         );
+    }
+
+    #[test]
+    fn timestamp_queries_preserve_shared_remote_key_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db")).unwrap();
+        for (item, tags) in [
+            ("a", vec!["cat", "dog"]),
+            ("b", vec!["cat", "dognap"]),
+            ("c", vec!["catnap"]),
+            ("d", vec!["unrelated"]),
+        ] {
+            db.set_item_tags(item, tags, "test").unwrap();
+        }
+        for query in ["#cat", "#cat #dog", "#cat #do", "#ca", "#missing"] {
+            let remote_keys = select_tag_view_item_keys(&db, query, 20);
+            let path_keys = select_tag_view_matches(&db, query, TagViewSort::PathOrder, 20)
+                .into_iter()
+                .map(|row| row.item_key)
+                .collect::<Vec<_>>();
+            assert_eq!(path_keys, remote_keys, "{query}");
+            for sort in [TagViewSort::AppliedAtDesc, TagViewSort::AppliedAtAsc] {
+                let mut time_keys = select_tag_view_matches(&db, query, sort, 20)
+                    .into_iter()
+                    .map(|row| row.item_key)
+                    .collect::<Vec<_>>();
+                time_keys.sort();
+                assert_eq!(time_keys, remote_keys, "{query}");
+            }
+            assert_eq!(select_tag_view_item_keys(&db, query, 20), remote_keys);
+        }
+        assert_eq!(select_tag_view_item_keys(&db, "#cat", 1), ["a"]);
+    }
+
+    #[test]
+    fn tag_view_worker_converts_seconds_and_preserves_time_order_across_categories() {
+        use crate::grid_item::{GridItem, materialize_view_rows};
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("z-image.jpg");
+        let zip = temp.path().join("a-book.zip");
+        let folder = temp.path().join("b-folder");
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::write(&zip, b"zip").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let db_path = temp.path().join("tags.db");
+        let mut db = crate::tags_db::TagsDb::open_at(&db_path).unwrap();
+        for path in [&image, &zip, &folder] {
+            db.set_item_tags(
+                &crate::tags_db::item_key_for_path(path),
+                ["cat", "unrelated"],
+                "test",
+            )
+            .unwrap();
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE item_tags SET applied_at = 999 WHERE tag_key = 'unrelated'",
+            [],
+        )
+        .unwrap();
+        for (path, seconds) in [(&image, 30), (&zip, 10), (&folder, 10)] {
+            conn.execute(
+                "UPDATE item_tags SET applied_at = ?2 WHERE item_key = ?1 AND tag_key = 'cat'",
+                rusqlite::params![crate::tags_db::item_key_for_path(path), seconds],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let visibility = crate::file_type_visibility::FileTypeVisibility::default();
+        for (sort, expected) in [
+            (
+                TagViewSort::PathOrder,
+                vec![zip.clone(), folder.clone(), image.clone()],
+            ),
+            (
+                TagViewSort::AppliedAtDesc,
+                vec![image.clone(), zip.clone(), folder.clone()],
+            ),
+            (
+                TagViewSort::AppliedAtAsc,
+                vec![zip.clone(), folder.clone(), image.clone()],
+            ),
+        ] {
+            let result = run_tag_view_search_with_visibility(
+                temp.path(),
+                "cat",
+                TagViewKindFilter::All,
+                sort,
+                &visibility,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .find(|e| e.path == image)
+                    .unwrap()
+                    .applied_at_ms,
+                Some(30_000)
+            );
+            let mut rows = result
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    let item = match entry.kind {
+                        TagViewItemKind::Image => GridItem::Image(entry.path.clone()),
+                        TagViewItemKind::ZipFile => GridItem::ZipFile(entry.path.clone()),
+                        TagViewItemKind::Folder => GridItem::Folder(entry.path.clone()),
+                        _ => unreachable!(),
+                    };
+                    (entry, item)
+                })
+                .collect::<Vec<_>>();
+            let (items, metas) = materialize_view_rows(
+                &mut rows,
+                &crate::settings::GridDisplayOrder::default(),
+                sort.arranges_by_category(),
+                |row| &row.1,
+                |row| Some((row.0.mtime, row.0.file_size)),
+            );
+            assert_eq!(items.len(), metas.len());
+            if sort != TagViewSort::PathOrder {
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.0.path.clone())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+                    rows.iter().map(|row| row.1.perf_key()).collect::<Vec<_>>()
+                );
+            }
+        }
+        let ClassifiedTagViewPath::Existing(classified) = classify_tag_view_path(image) else {
+            panic!("fixture exists");
+        };
+        assert_eq!(classified.entry.applied_at_ms, None);
+        assert_eq!(TagViewSort::default(), TagViewSort::PathOrder);
+        assert_eq!(TagViewSort::PathOrder.label(), "パス順");
+        assert!(!TagViewSort::PathOrder.arranges_by_category());
     }
 
     #[test]

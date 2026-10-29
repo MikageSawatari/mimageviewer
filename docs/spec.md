@@ -2391,6 +2391,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_background_double_click_parent` | bool | false | サムネイルの画像・ラベル・アイコン・バッジ以外の余白と、詳細一覧の最終行より下をダブルクリック／double tapして既存の親操作へ戻る。既定OFF。serde default付きで設定転送対象。未公開の旧enumは移行せず、このfieldがなければOFF |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
+| `thumb_name_font_scale_percent` | u32 | 100 | サムネイル一覧のファイル名・フォルダ名専用の文字サイズ倍率。100/125/150/175/200%を選び、読込時は100〜200へclamp。既存のfont sizeとpaddingに掛け、全体スケーリングと併用する。他のバッジとセル寸法は変えない。serde/DB欠落時も100 |
+| `thumb_name_max_lines` | u32 | 1 | 名前の最大行数1〜4（読込時clamp、serde/DB欠落時1）。1行は従来の幅省略とファイル名18文字上限を維持。2行以上は18文字上限を外し、元のLFと幅による折り返しで行数を数える。途中の空行は各1行、末尾LFはすべて無視。最終行に残りがあればLFを含めず省略する。下端固定、上側表示や2行以上でのセル外配置では行数を減らす。1行の試行の配置は従来のblocked_by_topを維持。設定が1行なら元のLFも含め従来のfit_textを使い、複数行設定から1行へ減らす場合は最初の区間だけを省略して1行に収める |
 | `thumb_show_media_duration` | bool | true | 動画・音声のサムネイル右下に長さを表示する。1 時間未満は `m:ss`、1 時間以上は `h:mm:ss`。フィルタ一致数と既存バッジを優先し、衝突時は上へ移し、空きがなければ非表示。可視 + 先読みだけ既存遅延メタ worker で取得する。設定項目がない既存 JSON / settings.db も true になる |
 | `thumb_show_resume_meter` | bool | true | フォルダ・ZIP・PDF・RAR/CBR・7z/CB7・LZH/LHA の読書位置（変換キャッシュ削除後も保持）と、動画・音声の再生位置をサムネイル下端に常に左から右へ表示する。ONでは位置なし・画像・その他を含む全セルに固定下端9 logical pt帯を予約し、左右の下端ラベルと検索/コレクションのcaptionを一律13pt上げる (ただし代表画像なし・未ロードの階層パス caption は上端を維持し、下端だけ13pt縮めて再配置する。省略は親階層から行い末端名を残す)。帯はセルの左右4pt内側の全幅・下端から4ptで固定。バーの有無・媒体種別ではgeometryを変えず、OFFで予約なしの従来位置へ戻す。動画・音声は最後まで視聴した記録があれば長さ未取得でも満タンとし、途中位置は既存の保存済み位置/取得済み長さから比率を求め、長さバッジOFFでも既存の可視+近傍取得を行う。watchedも途中位置もないものにはtrack/fillを表示せず、ONなら空きだけを残す。途中位置は長さ未確定/不正・位置超過・source不一致では表示しない。EOF/末尾5秒以内で新たに保存した媒体はwatchedに記録し、再開位置は従来どおり消す。以前に消えた記録は補完しない。本の読み方向や `fullscreen_seek_direction` には連動しない。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続く。本はONに戻すと追加読み取りなしに表示でき、動画・音声は取得済みの長さがあれば表示し、未取得なら既存workerで取得する。欠落した JSON / settings.db 設定と既定設定も true |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
@@ -2443,7 +2445,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `notification_duration` | NotificationDuration | Standard | 全体設定「通知の表示時間」: Short / Standard / Long。情報・成功は基本時間×0.6 / 1 / 1.5。警告・エラーは×1 / 1 / 1.5。本文長方式は20文字以下1.2秒、超過1文字0.12秒、上限5.5秒（fade込み）を標準として維持。既存KVの項目欠落はStandardへ加算的移行。秒数指定/nativeと例外の一覧は [通知時間ポリシー](notification-duration-policy.md) |
 | `text_contrast` | TextContrast | Standard | 通常文字・薄い補足文字・widget 状態色のコントラスト（Standard / Strong）。Light / Dark の両 Style、暗色固定 popup / Window、native 動画 HUD へ同じ値を適用する。背景色は変更しない |
 | `ui_scale_factor` | f32 | 1.0 | アプリ内 UI 表示倍率。設定メニュー「スケーリング」から 0.5〜2.0 を 0.1 刻みで選ぶ。main egui Context の `zoom_factor` が正本で、メイン UI・静止画フルスクリーン・native 動画 overlay に反映する。物理 window geometry は倍率に依存しない。active viewer は倍率変更時に閉じ、再 open で新倍率を適用する。VST plugin GUI の別 HWND は対象外 |
-| `ui_font` | UiFontSettings | 既定 / 0.0pt | v2.7.0 UI フォント。`selection` は既定、または font file path + TTC/OTC face index + 表示名を保存する。`vertical_adjust` は実メトリクスから導出したツールバー縦位置へ加える -4.0〜4.0 logical pt の微調整。環境設定「表示 → フォント」では日本語を持つ正立 face のみ選べ、Italic / Oblique と日本語なし face は候補外（保存値から渡されても既定へ fallback）。同一ファミリーは正確な weight 名で区別し、可変フォントは `Variable` と表示する。保存済み face の同一性は表示名ではなく path + face index で判定する。変更時は font atlas を full-resync し、active viewer / native presenter は閉じて再表示時に同じ設定を使う。動画・音声 HUD の固定サイズ control label は位置・幅を保つため既定 HUD font family を使う。文字サイズは独立設定を持たず、既存の `ui_scale_factor` で UI 全体とともに変更する |
+| `ui_font` | UiFontSettings | 既定 / 0.0pt | v2.7.0 UI フォント。`selection` は既定、または font file path + TTC/OTC face index + 表示名を保存する。`vertical_adjust` は実メトリクスから導出したツールバー縦位置へ加える -4.0〜4.0 logical pt の微調整。環境設定「表示 → フォント」では日本語を持つ正立 face のみ選べ、Italic / Oblique と日本語なし face は候補外（保存値から渡されても既定へ fallback）。同一ファミリーは正確な weight 名で区別し、可変フォントは `Variable` と表示する。保存済み face の同一性は表示名ではなく path + face index で判定する。変更時は font atlas を full-resync し、active viewer / native presenter は閉じて再表示時に同じ設定を使う。動画・音声 HUD の固定サイズ control label は位置・幅を保つため既定 HUD font family を使う。文字サイズは既存の `ui_scale_factor` で UI 全体とともに変更する。サムネイル一覧の名前だけは専用倍率 `thumb_name_font_scale_percent` をさらに掛ける |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
 | `detached_viewer_open_images_in_window` | bool | false | 環境設定「ビューワモード」の複数ウィンドウ。ON のとき通常画像 / ZIP 内画像 / PDF ページを開くたびに新しい別ウィンドウで開き、動画 / 音声は 1 つのメディア別ウィンドウを再利用する。画像編集機能は複数ウィンドウ側では無効。ON の間は ZIP/PDF/対応アーカイブの直開き実効値も true になるが、`auto_fullscreen_zip_pdf` の保存値は変更しない。フル機能ウィンドウ用の「ページを開く」/「一覧を開く」コマンドは、どの入力経路でも理由をトースト表示して副作用なしの no-op にする |
 | `auto_fullscreen_zip_pdf` | bool | false | フル機能ウィンドウモードで、ZIP/PDF/対応アーカイブを一覧、起動引数、SendTo、外部ファイラ経由で明示的に開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する保存値。複数ウィンドウモードではこの保存値に関わらず実効的に ON として扱う。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
@@ -2722,6 +2724,16 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 | Ctrl+F | 現在地フィルタ | **現グリッドの表示中アイテムのみ** (非再帰・索引なし) | worker 上のオンデマンド判定 | 構造アイテム (フォルダ / ZIP / PDF) もファイル名で一貫して絞り込む。画像 / 動画は PNG tEXt / JPEG EXIF UserComment の AI 生成メタ + EXIF + XMP + 動画メタ + 外部メタデータサイドカー、PDF はファイル名 + document info。mIV タグは Ctrl+F の検索本文へ混ぜず、タグビューまたはスマートフィルタのタグ欄で探す。検索中は item 単位の処理済み数 / 総数を表示する。フィルタ元フォルダでは BS / Alt+↑ / ⬆ による親移動を止めるが、結果から子フォルダへ入った後の BS は通常どおり戻れる。PDF ページ表示中は無効、ZIP 表示中はファイル名フィルタに固定 |
 | Ctrl+G | アイテム検索 | **お気に入り全体 (`auto_index_metadata=true`) の画像 / PDF / 動画 / 音声** | アイテム索引 (Tantivy bigram) で候補絞り込み → STORED 原文を `matches()` で phrase/NOT/AND 正確判定 (streaming) | ZIP はコンテナなので対象外。音声はファイル名のみ (ID3 等の埋め込みメタデータは対象外)、動画は `video_meta_text`、PDF は `pdf_meta_text`、画像と同名 JSON/TXT は `sidecar_text` (値のみの自由語検索、mIV タグとは別系統) に分けて検索対象フィルタから選べる。mIV タグは Ctrl+G の検索本文へ混ぜず、タグ候補チップからタグビューへ誘導する。結果は一覧 / 集約の 2 ビューを切替でき、ヒットが多いと自動で集約に寄る。検索中はアドレス欄と空グリッド中央に確認済み候補数とヒット数を表示し、0 件確定と区別する。検索バーは狭い幅では折り返し、Ctrl+G のドロップダウン操作中は背後のグリッドをホイールスクロールしない |
 | Ctrl+T | タグビュー | **`tags.db` でタグ付けしたフォルダ / 画像 / 動画 / 音声 / ZIP / PDF / 対応アーカイブ** | タグ DB の候補を worker で実パス分類してグリッド化 | 「すべての種類」ドロップダウンから各種類へ絞れる。音声は動画やフォルダへ混ぜず、音声セルから音楽ビューで再生する |
+
+PC のタグビューは `TagViewSort::PathOrder` (既定・従来の固定パス順) / `AppliedAtDesc` /
+`AppliedAtAsc` の専用3択で並べる。`tag_view_sort` の新しい設定キーへ保存し、一覧共通の
+`sort_order` は変更しない。検索に一致したタグ行の `MAX(item_tags.applied_at)` (秒) を使い、
+時刻順は SQL の LIMIT 前に適用する。「タグ付与時刻」詳細列と列ヘッダソート、列設定に従う
+ツールチップ・下部情報バーはタグビュー限定。列の表示・幅は専用の新キーへ保存し、既存キーへ
+新しい enum variant を書かない。タグ編集後の検索結果と時刻は再検索まで保持する。
+同じタグ結果の再検索は、検索中に開いた項目が新しい結果にもあれば閲覧を維持する。
+★固定への遷移ではタグ検索要求と専用列・時刻の表示状態を終了し、固定一覧を検索結果で差し替えない。
+Remote の選択規則と順序は変更しない。
 
 mIV Remote のホーム「検索」タブは Ctrl+S と同じコンテナ索引を読み取り専用で使い、
 お気に入り全体のフォルダ / ZIP / PDF を名前と種類で検索する。画像単体・動画は対象外。
