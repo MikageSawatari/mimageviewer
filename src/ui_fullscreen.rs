@@ -97830,3 +97830,6 @@ mod music_overflow_tests {
 #[cfg(test)]
 #[path = "ui_fullscreen/manual_nav_wrap_tests.rs"]
 mod manual_nav_wrap_tests;
+
+#[cfg(all(test, windows))]
+mod conceal_preview_tests;

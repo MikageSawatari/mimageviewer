@@ -212,11 +212,16 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 
 ### 4.2 隠蔽加工モード中
 
+2026-10-29 §1.652: `ConcealPreviewHold`（既定 Tab）で、目のボタンと同じ結果プレビューを保持できる。
+消しゴムと共通の保持受付／描画抑止を使う。pipeline 前に受付済み保持と目のボタンを合成し、
+切替自体で cache／世代を失効させない。入力所有・描画中の拒否は [キー仕様](keymap-spec.md#隠蔽加工モード) を参照。
+
 | キー | 動作 |
 | --- | --- |
 | `Esc` | モード終了 (マスク保持、DB 書込) |
 | `S` / `B` / `K` / `L` / `P` / `I` / `V` / `H` / `R` / `O` | ツール切替 (選択 / 筆 / バケツ / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円) — 消しゴムと完全同一 |
 | `D` / `F` | 描画 / 消去 |
+| `Tab` (保持) | 隠蔽加工後の結果プレビュー (操作カスタマイズで変更・解除可) |
 | `1` / `2` / `3` / `4` | パラメータプリセット 1〜4 を適用 |
 | `T` | 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …) |
 | Ctrl+wheel | (Mosaic 時) タイル倍率 ±0.25x / (Blur 時) ぼかし半径 ±5px / (Fill 時) 不透明度 ±5% |
@@ -912,6 +917,10 @@ GPU texture を即時 evict して、次のプレビュー lookup で必ず再�
 `prepare_fullscreen_state` より前に `conceal_preview_active` を同期する。これにより短い押下でも
 設定変更後の `conceal_generation` を同じフレームから参照し、パネルを閉じるまで旧境界処理が
 残る描画順依存を防ぐ。
+
+キー保持の受付は消しゴムと共通の `edit_preview::EditPreviewHoldState` が所有する。
+所有 viewport のキャンバスで受け付け、パネルで目のボタンと合成した保持状態を次の
+pipeline 前同期でも使う。プレビューを押す／離すだけでは世代更新や cache 失効を発行しない。
 
 `bump_conceal_generation()` は live の `edit_result` / final pipeline だけでなく、
 ページ移動・再オープン用の `retained_final_ai_cache` も全失効する。retained final AI の安定キーは

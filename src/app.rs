@@ -19182,10 +19182,11 @@ pub struct App {
     /// (= inpaint 反映後の fs_cache、隠蔽合成は省略) を出力する。
     pub(crate) erase_preview_active: bool,
     /// プレビューキーの保持受付。描画中の押下は解放まで受け付けない。
-    pub(crate) erase_preview_hold: crate::ui_erase::ErasePreviewHoldState,
+    pub(crate) erase_preview_hold: crate::edit_preview::EditPreviewHoldState,
     /// 隠蔽編集モード中の「プレビューボタン押下」状態。
     /// 押している間 true で、`ensure_conceal_texture` が conceal_mode でも合成を実行する。
     pub(crate) conceal_preview_active: bool,
+    pub(crate) conceal_preview_hold: crate::edit_preview::EditPreviewHoldState,
     /// 前フレームで確定した隠蔽プレビュー目アイコンの矩形。
     ///
     /// 画像テクスチャの解決はパネル描画より先に行われるため、当該フレームの pointer
@@ -21892,6 +21893,7 @@ impl App {
             erase_preview_active: false,
             erase_preview_hold: Default::default(),
             conceal_preview_active: false,
+            conceal_preview_hold: Default::default(),
             conceal_preview_button_rect: None,
             erase_base_tex_cache: std::collections::HashMap::new(),
             fs_nav_locked_gen: None,
