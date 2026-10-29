@@ -80,6 +80,13 @@
 - 方針 (調査の推奨案): (a) 次回起動時に「前回の正常終了を確認できませんでした」と、終了前に観測できた情報 (エラーの種類・直前の VRAM 使用量と予算・表示ページと実行中の AI ジョブ・画像寸法) を出し、報告用の文をコピーできるようにする。(c) 直前の状態を小さく常時記録し、fatal 時に重い処理をせずに残す。あわせて、捕まえられる ORT の失敗はその場で通知する。パス・ファイル名はコピー文に入れない。回復処理 (device 再作成・再推論・AI 無効化) は含めない。
 - 設計の正本: ブランチ `ai-crash-655` (`1ed0635fd`) の `docs/ai-crash-655-investigation.md` の「追加調査: GPU / VRAM と終了理由の表示」。着手時は設計の独立レビューから始める。規模: Medium (数日)。
 
+### 1.483 ReleaseChecks の first-ai が、全画面を開いた後にメイン窓へ focus して全画面を閉じてしまう (2026-10-30)
+
+- 状態: **未着手** (v4.10.0 の ReleaseChecks で判明。製品の不具合ではなくテスト台本の不具合)。
+- 内容: `ui-smoke.ps1 -Scenario ReleaseChecks -IncludeFirstAi` の first-ai case で、台本が全画面を開いた後に AI モデル切替の action (`FsAiModelRealEsrGeneralV3`) を `owner=root` (メイン窓) へ focus して送る。既存の main focus guard (`should_close_fullscreen_from_main_focus`、2026-07 から) が全画面を閉じ、AI ジョブが取り消されて「actual isolated AI inference did not complete」で FAIL になる。証跡: run `release-checks-20261029-161208-c3ed5627/first-ai/mimageviewer.log` の 2.081s `fullscreen: main focus guard closing session`。first-ai は 2026-10-09 の追加以降、実 suite で PASS した記録がない。
+- 直し方: AI action を全画面の viewport (表示中の viewer の入力所有者) へ送る。製品の main focus guard は変えない。直したら AI / GPU 経路を変える次の版で `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。
+- 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`src/test_script.rs` の `release_check_first_ai`。規模: Small。
+
 ### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
 
 - 状態: **未着手・修正対象として採用 (2026-10-29)**。修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。
