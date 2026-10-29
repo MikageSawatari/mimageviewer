@@ -16,7 +16,6 @@ enum Current {
 
 struct Load {
     rx: mpsc::Receiver<FontLoadResult>,
-    keys: HashSet<String>,
 }
 
 pub(super) struct FontLoadResult {
@@ -53,6 +52,8 @@ type TestLoader = Arc<dyn Fn(&HashSet<String>) -> FontLoadResult + Send + Sync>;
 pub(crate) struct ComicFontOwner {
     current: Current,
     load: Option<Load>,
+    /// Stop speculative work after an abnormal exit; display remains independent.
+    prefetch_failed: bool,
     #[cfg(test)]
     test_loader: Option<TestLoader>,
 }
@@ -113,12 +114,8 @@ impl ComicFontOwner {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                crate::logger::log("[comic] font worker disconnected".to_owned());
-                FontLoadResult {
-                    set: None,
-                    loaded: HashSet::new(),
-                    attempted: load.keys.clone(),
-                }
+                self.fail_prefetch("[comic] font worker disconnected".to_owned());
+                return;
             }
         };
         self.load = None;
@@ -126,7 +123,7 @@ impl ComicFontOwner {
     }
 
     pub(crate) fn request(&mut self, ctx: &egui::Context, keys: &[String]) {
-        if self.load.is_some() {
+        if self.load.is_some() || self.prefetch_failed {
             return;
         }
         let Some(mut requested) = self.needed(keys) else {
@@ -134,10 +131,7 @@ impl ComicFontOwner {
         };
         requested.extend(self.loaded_keys().iter().cloned());
         let (tx, rx) = mpsc::channel();
-        self.load = Some(Load {
-            rx,
-            keys: requested.clone(),
-        });
+        self.load = Some(Load { rx });
         let ctx = ctx.clone();
         #[cfg(test)]
         let test_loader = self.test_loader.clone();
@@ -181,8 +175,14 @@ impl ComicFontOwner {
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
             });
         if let Err(error) = spawn {
-            crate::logger::log(format!("[comic] font worker spawn: {error}"));
+            self.fail_prefetch(format!("[comic] font worker spawn: {error}"));
         }
+    }
+
+    fn fail_prefetch(&mut self, message: String) {
+        self.load = None;
+        self.prefetch_failed = true;
+        crate::logger::log(message);
     }
 
     // Display never waits for a worker: consume a ready result, or remove its
@@ -221,6 +221,7 @@ impl ComicFontOwner {
 
     pub(crate) fn invalidate(&mut self, reason: FontInvalidation) {
         self.load = None;
+        self.prefetch_failed = false;
         match reason {
             FontInvalidation::SourcesChanged => self.current = Current::Unloaded,
             FontInvalidation::FontAdded => {

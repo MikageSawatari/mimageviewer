@@ -8,13 +8,10 @@ fn available(requested: &HashSet<String>) -> FontLoadResult {
     assemble_fontset(requested, Some(comic_core::FontSet::new()), |_| None)
 }
 
-fn pending(owner: &mut ComicFontOwner, requested: &[&str]) -> mpsc::Sender<FontLoadResult> {
+fn pending(owner: &mut ComicFontOwner) -> mpsc::Sender<FontLoadResult> {
     assert!(owner.load.is_none());
     let (tx, rx) = mpsc::channel();
-    owner.load = Some(Load {
-        rx,
-        keys: keys(requested),
-    });
+    owner.load = Some(Load { rx });
     tx
 }
 
@@ -23,12 +20,12 @@ fn font_request_adoption_is_nonblocking_and_accumulates_attempted() {
     let ctx = egui::Context::default();
     let mut owner = ComicFontOwner::default();
     owner.loader_for_test(Arc::new(available));
-    let tx = pending(&mut owner, &["missing-a"]);
+    let tx = pending(&mut owner);
     owner.poll();
     assert!(matches!(owner.current, Current::Unloaded));
     // Requests while busy do not replace the receiver or add a second job.
     owner.request(&ctx, &["missing-b".to_owned()]);
-    assert_eq!(owner.load.as_ref().unwrap().keys, keys(&["missing-a"]));
+    assert!(owner.load.is_some());
     tx.send(available(&keys(&["missing-a"]))).ok().unwrap();
     owner.poll();
     assert!(owner.fonts().is_some());
@@ -49,7 +46,7 @@ fn font_sync_takeover_discards_inflight_and_accumulates_attempts() {
     let mut owner = ComicFontOwner::default();
     owner.loader_for_test(Arc::new(available));
     owner.ensure(&["missing-a".to_owned()], &HashMap::new());
-    let tx = pending(&mut owner, &["stale"]);
+    let tx = pending(&mut owner);
     owner.ensure(&["missing-b".to_owned()], &HashMap::new());
     let current = owner.fonts().clone().unwrap();
     assert!(tx.send(available(&keys(&["stale"]))).is_err());
@@ -65,7 +62,7 @@ fn font_sync_takeover_discards_inflight_and_accumulates_attempts() {
 fn font_sync_consumes_ready_result_without_reading_again() {
     let mut owner = ComicFontOwner::default();
     owner.loader_for_test(Arc::new(|_| panic!("ready fonts must be reused")));
-    let tx = pending(&mut owner, &["missing"]);
+    let tx = pending(&mut owner);
     tx.send(available(&keys(&["missing"]))).ok().unwrap();
     owner.ensure(&["missing".to_owned()], &HashMap::new());
     assert!(owner.fonts().is_some());
@@ -80,7 +77,7 @@ fn font_sync_unknown_paths_keep_existing_fallback_without_io() {
     owner.loader_for_test(Arc::new(|_| {
         panic!("unknown paths must not reread the default font")
     }));
-    let tx = pending(&mut owner, &["stale"]);
+    let tx = pending(&mut owner);
     owner.ensure(&["no-path".to_owned()], &HashMap::new());
     assert!(tx.send(available(&keys(&["stale"]))).is_err());
     assert!(Arc::ptr_eq(&current, owner.fonts().as_ref().unwrap()));
@@ -100,7 +97,7 @@ fn font_invalidation_discards_inflight_and_addition_keeps_set_and_loaded_keys() 
             loaded.insert("loaded".to_owned());
         }
         let current = owner.fonts().clone().unwrap();
-        let tx = pending(&mut owner, &["stale"]);
+        let tx = pending(&mut owner);
         owner.invalidate(reason);
         assert!(tx.send(available(&keys(&["stale"]))).is_err());
         owner.poll();
@@ -164,4 +161,136 @@ fn font_assembly_parses_requested_bytes_and_preserves_default_fallback() {
     assert_eq!(result.attempted, keys(&["good", "bad", "absent"]));
     let set = result.set.unwrap();
     assert_eq!(set.get("unknown").unwrap().key, "ui");
+}
+
+fn drawable(requested: &HashSet<String>) -> FontLoadResult {
+    let definitions = egui::FontDefinitions::default();
+    let bytes = definitions
+        .font_data
+        .values()
+        .next()
+        .unwrap()
+        .font
+        .as_ref()
+        .as_ref()
+        .to_vec();
+    let mut set = comic_core::FontSet::new();
+    set.insert(comic_core::LoadedFont::from_bytes("ui", bytes.clone()).unwrap());
+    assemble_fontset(requested, Some(set), |_| Some(bytes.clone()))
+}
+
+fn assert_drawable(owner: &ComicFontOwner) {
+    let fonts = owner.fonts().as_ref().expect("synchronous display fonts");
+    let doc = vec![comic_core::AnnotationObject::new_text(
+        1,
+        (10.0, 30.0),
+        comic_core::TextBlock {
+            text: "A".to_owned(),
+            font_key: "ui".to_owned(),
+            color: comic_core::Rgba::new(220, 0, 0, 255),
+            ..Default::default()
+        },
+    )];
+    let base = egui::ColorImage::filled([100, 80], egui::Color32::WHITE);
+    let layers =
+        comic_core::bake_annotation_layers(&doc, 100, 80, fonts, &comic_core::StampImages::new());
+    let output = crate::comic_overlay::composite_annotation_layers(&base, &layers);
+    assert_ne!(
+        output.pixels, base.pixels,
+        "display fonts must render annotation text"
+    );
+}
+
+#[test]
+fn font_disconnection_preserves_current_and_only_stops_prefetch_until_invalidation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for ready in [false, true] {
+        for reason in [
+            FontInvalidation::SourcesChanged,
+            FontInvalidation::FontAdded,
+        ] {
+            let ctx = egui::Context::default();
+            let mut owner = ComicFontOwner::default();
+            if ready {
+                owner.adopt(drawable(&keys(&["loaded"])));
+                owner.ensure(&["past-missing".to_owned()], &HashMap::new());
+            }
+            let before = owner.fonts().clone();
+            let loaded = owner.loaded_keys().clone();
+            let attempted = match &owner.current {
+                Current::Unloaded => HashSet::new(),
+                Current::Ready { attempted, .. } => attempted.clone(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            owner.loader_for_test(Arc::new(move |requested| {
+                count.fetch_add(1, Ordering::Relaxed);
+                drawable(requested)
+            }));
+            drop(pending(&mut owner));
+            owner.poll();
+            assert!(owner.load.is_none());
+            assert!(owner.prefetch_failed);
+            match (&owner.current, before) {
+                (Current::Unloaded, None) => {}
+                (
+                    Current::Ready {
+                        set: Some(set),
+                        attempted: current,
+                        ..
+                    },
+                    Some(before),
+                ) => {
+                    assert!(Arc::ptr_eq(set, &before));
+                    assert_eq!(current, &attempted);
+                }
+                _ => panic!("disconnect changed current"),
+            }
+            assert_eq!(owner.loaded_keys(), &loaded);
+            for _ in 0..16 {
+                owner.poll();
+                owner.request(&ctx, &["new".to_owned()]);
+            }
+            assert!(owner.load.is_none());
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            let paths = HashMap::from([("new".to_owned(), PathBuf::from("fake.ttf"))]);
+            owner.ensure(&["new".to_owned()], &paths);
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                1,
+                "display still reads synchronously"
+            );
+            assert_drawable(&owner);
+            assert!(
+                owner.prefetch_failed,
+                "sync display must not enable speculation again"
+            );
+            for _ in 0..16 {
+                owner.request(&ctx, &["after-invalidate".to_owned()]);
+            }
+            assert!(owner.load.is_none());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            owner.invalidate(reason);
+            owner.request(&ctx, &["after-invalidate".to_owned()]);
+            assert!(owner.load.is_some());
+            owner.wait_for_test();
+            owner.poll();
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert!(!owner.prefetch_failed);
+            assert_drawable(&owner);
+        }
+    }
+}
+
+#[test]
+fn font_sync_ensure_consumes_disconnection_then_loads_for_display() {
+    let mut owner = ComicFontOwner::default();
+    owner.loader_for_test(Arc::new(drawable));
+    drop(pending(&mut owner));
+    owner.ensure(&[], &HashMap::new());
+    assert!(owner.prefetch_failed);
+    assert!(owner.load.is_none());
+    assert_drawable(&owner);
+    owner.request(&egui::Context::default(), &["new".to_owned()]);
+    assert!(owner.load.is_none());
 }

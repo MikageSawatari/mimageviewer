@@ -6655,7 +6655,7 @@ F12 の別ウィンドウも同じ所有者を共有し、context ごとには�
 
 - `current`: `Unloaded` か `Ready { set: Option<Arc<FontSet>>, loaded: 読み込めた key, attempted: 要求した key }`。
   `set: None` は既定の日本語 font が見つからなかった終端 (今の None と同じ意味)。
-- `load`: `Option<受信口 + 要求した key>`。所有者が持つ受信口は 1 つだけ (捨てた worker は完走するので、実際に走る数の厳密な上限ではない。仕事は有限で、要求は F4 の終端で有限回に収まる)。
+- `load`: `Option<受信口>`。要求 key は worker 入力と結果の `attempted` に保持する。所有者が持つ受信口は 1 つだけ (捨てた worker は完走するので、実際に走る数の厳密な上限ではない。仕事は有限で、要求は F4 の終端で有限回に収まる)。
 
 field は非公開にし、変更は所有者のメソッドだけで行う。規則は 1 つ: **`load` の採用以外で `current` を変える操作は、必ず `load` を捨てる**。
 これで、届いた結果は常に要求時の `current` に対するものになり、採用時の照合 (世代番号や Arc の比較) が要らない。
@@ -6679,12 +6679,14 @@ field は非公開にし、変更は所有者のメソッドだけで行う。�
 取消の token は持たない (列挙と数本の font 読み込みで終わる有限の仕事)。捨てられた後の送信は失敗して終わる。
 完了時に root の再描画を要求する。perf に `comic / font_load` (所要 ms、key 数、結果) を記録する (ui-responsiveness §4)。
 読み込みの失敗はまれな失敗として割り切る: 今と同じく `set: None` かその key の欠落、ログのみ。
+ただし worker の異常終了（切断・spawn失敗）は font 不在の結果として採用しない。`current`を保持して`load`だけを捨て、ログを1回出す。
+独立した`prefetch_failed`の1 bitで無効化まで先回りだけを停止し、`invalidate`で解除する。同期`ensure`はこの記録を見ず、従来の表示用読み込みを維持する。自動再試行・回復処理は足さない（2026-10-29 設計担当の追補）。
 
 **F4 要求と poll。**
 
 - 要求: `prefetch_next_final_unit` の Next unit の頁ループで、`comic_pages` の頁に対し、`spawn_prepared_edit_job` の前に行う (mutable な位置)。
   必要な key = (`Unloaded` なら既定 font) + (doc が `comic_docs` にあれば、参照 key のうち `loaded` にも `attempted` にも無いもの)。
-  必要な key があり、`load` が無ければ worker を起動する。`load` が走っていれば何もしない (完了後の評価で残りを要求する)。
+  必要な key があり、`load` が無く、先回りの異常終了記録がなければ worker を起動する。`load` が走っていれば何もしない (完了後の評価で残りを要求する)。
   doc が未読込なら既定 font だけを要求し、doc が段階 B で解決された後の評価で参照 key を要求する。
 - 終端: `attempted` にある key は要求し直さない (パスの無い key で読み込みを繰り返さない)。`set: None` も終端。どちらも無効化 helper でだけ解ける。
 - `attempted` は無効化まで累積する: 非同期の採用でも同期の読み込みでも、新しい `attempted` = 旧 `attempted` ∪ 今回要求した key とし、置き換えない。過去に失敗した key を worker で読み直す必要はなく、採用時の和集合で足りる。(第 1 版は worker の結果で置き換えていたため、見開きの左右がパスの無い別々の key を参照すると、要求が交互に繰り返された。独立設計レビュー第 1 回 P2。)
@@ -6738,3 +6740,17 @@ Next頁ループのB起動前から要求し、root update phaseで毎frame採�
 
 全テスト後、引数なしの`cargo fmt`を実施。計画文書はBOMなし＋CRLF、backlogはBOM付き＋CRLFを維持する。
 利用者指定によりbuild-dev・製品起動・コミットは行わない。実機確認はClaudeCodeへ引き継ぐ。
+
+**worker異常終了時の追補（2026-10-29、設計担当の判断、`fc26cb911`上の修正）。**
+切断を`Ready { set: None }`として採用していた経路を廃止し、Unloaded／既存ReadyのArc・loaded・attemptedをそのまま保持する。
+`prefetch_failed`だけを記録して受信口を捨て、先回りは無効化まで停止する。同期ensureは停止記録を見ず、従来どおりfontを読み注釈を表示できる。
+spawn失敗も同じ入口で1回だけ記録し、その後のpollで重複ログを出さない。不要になった`load`の要求keyコピーを撤去した。
+変更は`src/app/comic_fonts.rs`、同`tests.rs`、本節、backlog §1.602。送信側を落とす2件の回帰を追加し、Unloaded／Ready保持、同期での実テキスト描画、反復requestの停止、両invalidate理由による解除をシステムfontなしで検査する。
+
+追補の自動検証（通常feature／test profile、`fc26cb911`上の未コミット差分、ログは`target/pageturn-1602/worker-failure/`）:
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/comic_fonts|font_prefetch/)' --no-fail-fast`: 14/14成功（0.399秒、`focused-owner.log`）。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/comic|font|prepared_edit|page_turn/)' --no-fail-fast`: 452/452成功（38.244秒、`focused-related.log`）。既知vacant leafも成功し、単独補完なし。
+- `cargo test --test ui_snapshot`: 213/213成功（30.98秒、`ui-snapshot.log`）。基準画像の更新なし。
+- 最後の`scripts/test-lib-full.ps1`: 14,674/14,674成功・既存除外65件・失敗0（509.343秒、`lib-full.log`）。ログ／JUnit／commandは`target/test-lib-full/runs/20261029T044527493Z-ea987a18/`、実行時source識別子は`af04a77774644cceb14d1d66f778e04b98c7cb565a2f1367a05894f60f7f182c`。全件・関連とも単独補完や自動再試行なし。
+- 独立静的レビューACCEPT、P1／P2／P3の未解決指摘なし。テストは実装担当のみが実行し、全テスト後に引数なしの`cargo fmt`が成功、`git diff --check`も成功した。利用者指定によりbuild-dev・製品起動・コミットは行わない。
