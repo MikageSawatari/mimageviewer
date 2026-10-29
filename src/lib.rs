@@ -377,6 +377,7 @@ pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixt
 pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_video_thumbnail_indicator_settings_snapshot_fixture;
+mod edit_preview;
 mod ui_erase;
 mod ui_folder_pane;
 #[doc(hidden)]

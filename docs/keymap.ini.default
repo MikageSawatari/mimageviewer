@@ -691,6 +691,7 @@
 # ConcealToolEllipse = O ; 楕円ツールに切り替える
 # ConcealSpacePan = Space ; 押している間だけ画像をパン操作する
 # ConcealScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
+# ConcealPreviewHold = Tab ; 押している間だけ隠蔽加工の結果をプレビューする
 
 [Crop] ; 切り取りモード
 # CropForceCreateHold = Ctrl ; 押している間、ドラッグで新しい切り取り枠を作る
