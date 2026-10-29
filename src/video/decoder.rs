@@ -504,10 +504,8 @@ enum VideoPacketMsg {
         serial: u64,
         packet: ffmpeg_the_third::Packet,
     },
-    /// EOF 到達通知。video decode thread は何もせずに次の `Packet` か `Flush`
-    /// か channel disconnect を待つ (旧 `run_decoder` の挙動と同じく、内部
-    /// 残フレームは EOF で失われる)。
-    Eof,
+    /// Drain the codec and temporal filter for this generation, then wait for seek/cancel.
+    Eof { serial: u64 },
 }
 
 /// seek Flush は packet queue とは別の control channel で送る。
@@ -1141,9 +1139,8 @@ impl BwdifFilter {
         &mut self,
         frame: &ffmpeg_the_third::util::frame::video::Video,
     ) -> Result<Option<ffmpeg_the_third::util::frame::video::Video>, String> {
-        use ffmpeg_the_third as ffmpeg;
-
-        let input = frame.clone();
+        let mut input = frame.clone();
+        input.set_pts(video_frame_timestamp(frame));
         {
             let mut src_ctx = self
                 .graph
@@ -1156,14 +1153,51 @@ impl BwdifFilter {
         }
         drop(input);
 
+        self.receive()
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.graph
+            .get("in")
+            .ok_or_else(|| "bwdif source context missing".to_string())?
+            .source()
+            .flush()
+            .map_err(|e| format!("bwdif source EOF: {e}"))
+    }
+
+    fn receive(&mut self) -> Result<Option<ffmpeg_the_third::util::frame::video::Video>, String> {
+        use ffmpeg_the_third as ffmpeg;
         let mut output = ffmpeg::util::frame::video::Video::empty();
         {
             let mut sink_ctx = self
                 .graph
                 .get("out")
                 .ok_or_else(|| "bwdif sink context missing".to_string())?;
+            let output_tb = unsafe { ffmpeg::ffi::av_buffersink_get_time_base(sink_ctx.as_ptr()) };
             match sink_ctx.sink().frame(&mut output) {
-                Ok(()) => Ok(Some(output)),
+                Ok(()) => {
+                    // bwdif halves the link time base even in send_frame mode. Keep
+                    // all downstream selection/pacing in the decoder's input units.
+                    if let Some(pts) = output.pts() {
+                        let pts = unsafe {
+                            ffmpeg::ffi::av_rescale_q(
+                                pts,
+                                output_tb,
+                                ffmpeg::ffi::AVRational {
+                                    num: self.key.time_base_num,
+                                    den: self.key.time_base_den,
+                                },
+                            )
+                        };
+                        output.set_pts(Some(pts));
+                        // Filter outputs can retain the input best-effort timestamp;
+                        // the output PTS is authoritative after temporal filtering.
+                        unsafe {
+                            (*output.as_mut_ptr()).best_effort_timestamp = pts;
+                        }
+                    }
+                    Ok(Some(output))
+                }
                 Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN_ERRNO => Ok(None),
                 Err(ffmpeg::Error::Eof) => Ok(None),
                 Err(e) => Err(format!("bwdif sink frame: {e}")),
@@ -1222,15 +1256,35 @@ fn should_try_deinterlace(
         && (mode.force_all_frames() || frame_interlaced || stream_interlaced)
 }
 
+/// Changing a mode invalidates both temporal history and a previous failure latch.
+/// Generic history permits a pure transition regression without an FFmpeg graph.
+fn reconcile_deinterlace_mode<T>(
+    previous: &mut crate::settings::VideoDeinterlaceMode,
+    current: crate::settings::VideoDeinterlaceMode,
+    filter: &mut Option<T>,
+    failure_logged: &mut bool,
+) -> Option<u8> {
+    if *previous == current {
+        return None;
+    }
+    *previous = current;
+    *filter = None;
+    *failure_logged = false;
+    Some(if current.is_enabled() {
+        DEINT_STATUS_PENDING
+    } else {
+        DEINT_STATUS_INACTIVE
+    })
+}
+
 fn bwdif_force_all_frames(
     mode: crate::settings::VideoDeinterlaceMode,
-    frame_interlaced: bool,
     stream_interlaced: bool,
 ) -> bool {
+    // A stream interlace hint applies to every frame. Keep graph policy stable
+    // when individual frame flags are missing or mixed, preserving bwdif history.
     mode.force_all_frames()
-        || (mode == crate::settings::VideoDeinterlaceMode::Auto
-            && stream_interlaced
-            && !frame_interlaced)
+        || (mode == crate::settings::VideoDeinterlaceMode::Auto && stream_interlaced)
 }
 
 fn drain_pending_video_packets(
@@ -1749,10 +1803,6 @@ pub struct VideoInfo {
     /// 第 1 フレーム到着時に確定。`false` の間は CPU readback 経路。
     /// **per-frame の実プレゼン経路は `dynamic.present_path` を参照**。
     pub gpu_path_active: bool,
-    /// open 時に確定した実効デインターレースモード。Settings の動的変更には
-    /// 追従しない (decoder は open 時のモードで動き続けるため、UI も open 時
-    /// の値で表示する)。
-    pub effective_deinterlace_mode: crate::settings::VideoDeinterlaceMode,
     /// decoder/presenter スレッドと共有する動的状態。
     pub dynamic: Arc<VideoDynamicState>,
     /// 動画ファイルに埋め込まれた標準メタデータ (Phase 5.4)。
@@ -1926,7 +1976,7 @@ pub(crate) fn spawn(
         cancel,
         target_audio_sample_rate,
         hw_decode,
-        deinterlace,
+        Arc::new(super::DeinterlaceControl::new(deinterlace)),
         #[cfg(windows)]
         gpu_video_device,
         engine_state,
@@ -1943,7 +1993,7 @@ pub(crate) fn spawn_with_initial_audio_track(
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
     hw_decode: bool,
-    deinterlace: crate::settings::VideoDeinterlaceMode,
+    deinterlace_control: Arc<super::DeinterlaceControl>,
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
@@ -1998,7 +2048,7 @@ pub(crate) fn spawn_with_initial_audio_track(
                     cancel,
                     target_audio_sample_rate,
                     hw_decode,
-                    deinterlace,
+                    deinterlace_control,
                     #[cfg(windows)]
                     gpu_video_device,
                     engine_state,
@@ -2270,7 +2320,7 @@ fn run_decoder(
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
     hw_decode_requested: bool,
-    deinterlace: crate::settings::VideoDeinterlaceMode,
+    deinterlace_control: Arc<super::DeinterlaceControl>,
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
@@ -2754,7 +2804,6 @@ fn run_decoder(
         has_video,
         hw_decode_active: vi_hw_active,
         gpu_path_active,
-        effective_deinterlace_mode: deinterlace,
         dynamic: Arc::clone(&dynamic),
         title,
         album,
@@ -3082,7 +3131,7 @@ fn run_decoder(
                         video_sar_den,
                         video_orientation,
                         hw_active_initially,
-                        deinterlace,
+                        deinterlace_control,
                         video_stream_interlaced,
                         dynamic_v,
                     )
@@ -3817,13 +3866,14 @@ fn run_decoder(
                     AUDIO_PACKET_QUEUE_CAP,
                 );
             }
-            // Phase B: video decode thread にも Eof を通知。動画は内部残フレームを
-            // 失っても許容なので drain しないが、Eof 自体は送って状態を伝える。
+            // Drain video codec and bwdif through their normal output path.
             // audio-only では video thread が無い (rx は drop 済み) ので送らない。
             if video_stream_idx.is_some() {
                 let _ = send_demux_msg_cancel_aware(
                     &video_pkt_tx,
-                    VideoPacketMsg::Eof,
+                    VideoPacketMsg::Eof {
+                        serial: demux_serial.packet_serial(&clock),
+                    },
                     &cancel,
                     "video",
                     "eof",
@@ -3917,8 +3967,8 @@ fn run_decoder(
 /// frame はすべて drop する。frame-step seek では `drop_before_secs` を使わず、
 /// decoded PTS を見ながら base の直前または直後の 1 枚だけを送出する。
 ///
-/// EOF 時は `VideoPacketMsg::Eof` を受け取るが、動画は内部残フレームを失っても
-/// 許容なので drain せず何もしない (旧 `run_decoder` の挙動と同じ)。
+/// EOF drains the codec followed by bwdif. Both use the ordinary selection,
+/// pacing and enqueue path, so the temporal filter's last frame is presented too.
 #[allow(clippy::too_many_arguments)]
 fn run_video_decode(
     // **Drop order 注意** (Codex P1 2026-05-16): `gpu_video_device` を **最初** に宣言し、
@@ -3968,7 +4018,7 @@ fn run_video_decode(
     video_sar_den: u32,
     video_orientation: VideoOrientation,
     hw_active_initially: bool,
-    deinterlace: crate::settings::VideoDeinterlaceMode,
+    deinterlace_control: Arc<super::DeinterlaceControl>,
     stream_interlaced: bool,
     dynamic: Arc<VideoDynamicState>,
 ) {
@@ -3985,6 +4035,7 @@ fn run_video_decode(
 
     let mut scaler: Option<ScaleContext> = None;
     let mut scaler_key: Option<(Pixel, u32, u32)> = None;
+    let mut deinterlace = deinterlace_control.mode();
     let mut deinterlacer: Option<BwdifFilter> = None;
     let mut deinterlace_failure_logged = false;
     let mut deinterlace_cpu_fallback_logged = false;
@@ -4052,6 +4103,18 @@ fn run_video_decode(
     let mut consecutive_resource_pressure: u32 = 0;
 
     'outer: loop {
+        if let Some(status) = reconcile_deinterlace_mode(
+            &mut deinterlace,
+            deinterlace_control.mode(),
+            &mut deinterlacer,
+            &mut deinterlace_failure_logged,
+        ) {
+            dynamic.deinterlace_status.store(status, Ordering::Release);
+            crate::logger::log(format!(
+                "video deinterlace: mode changed to {:?}",
+                deinterlace
+            ));
+        }
         if cancel.load(Ordering::Acquire) {
             break;
         }
@@ -4113,7 +4176,7 @@ fn run_video_decode(
                 // pending は take() で既に破棄済。continue で recv 経路に流れて Flush を処理。
                 continue;
             }
-            p
+            Some(p)
         } else {
             // recv は timeout 付きで呼ぶ。timeout で抜けた場合は watchdog + cancel チェックの
             // ために 'outer の頭に戻る (= packet 待ちで永久ブロックさせない)。
@@ -4209,16 +4272,14 @@ fn run_video_decode(
                         drop_before_secs.is_none() && frame_step_decode.is_none();
                     continue;
                 }
-                VideoDecodeInput::Packet(VideoPacketMsg::Eof) => {
-                    // 動画は EOF で内部 frame を失っても許容 (旧 run_decoder と同じ挙動)。
-                    // 何もせず次の Packet/Flush/disconnect を待つ。
+                VideoDecodeInput::Packet(VideoPacketMsg::Eof { serial }) => {
+                    if !packet_matches_seek(serial, current_seek_serial, &clock) {
+                        continue;
+                    }
                     crate::logger::log(format!(
-                        "[video-decode] eof received: serial={current_seek_serial} pkt_rx_len={} video_tx_len={} engine_state={}",
-                        video_pkt_rx.len(),
-                        video_tx.len(),
-                        engine_state_code_name(engine_state.load(Ordering::Acquire))
+                        "[video-decode] EOF drain: serial={current_seek_serial}"
                     ));
-                    continue;
+                    None
                 }
                 VideoDecodeInput::Packet(VideoPacketMsg::Packet { serial, packet }) => {
                     let live_seek_serial = clock.current_seek_serial();
@@ -4293,256 +4354,261 @@ fn run_video_decode(
                         }
                         first_packet_logged_for_serial = Some(serial);
                     }
-                    packet
+                    Some(packet)
                 }
             }
         };
 
         let send_t0 = std::time::Instant::now();
-        if let Err(e) = video_decoder.send_packet(&packet) {
-            // EAGAIN は致命ではない — decoder 内部の output buffer が満杯で
-            // 「先に receive_frame で drain しろ」の意味 (Codex P1 2026-05-15)。
-            // packet を `pending_resend_packet` に保持して、この iteration で
-            // receive_frame ループに進んで drain し、次 iteration の頭で再送する。
-            let is_eagain = matches!(
-                &e,
-                ffmpeg::Error::Other { errno } if *errno == EAGAIN_ERRNO
-            );
-            if is_eagain {
-                // serial を attach して保存。次 iteration の頭で seek mismatch check が
-                // 入り、stale な再送を防ぐ (Codex P1 2026-05-15)。
-                pending_resend_packet = Some((current_seek_serial, packet));
-                if crate::perf::is_enabled() {
-                    crate::perf::event(
-                        "video_decode",
-                        "send_packet_eagain",
-                        None,
-                        current_seek_serial,
-                        &[],
-                    );
-                }
-                // 致命系カウンタは触らない。受信ループに進む (drain) — `packet` を
-                // 使わないので borrow は終わっている。
-            } else {
-                if hw_device.is_some()
-                    && should_retry_sw_after_hw_format_refusal(
-                        hw_active_initially,
-                        first_frame_delivered,
-                        hw_format_sw_fallback_attempted,
-                        hw_format_probe.as_deref(),
-                    )
-                {
-                    hw_format_sw_fallback_attempted = true;
-                    let (callbacks, d3d11_offered, d3d11_refused) =
-                        hw_format_probe.as_deref().map_or((0, 0, 0), |probe| {
-                            (
-                                probe.callback_count(),
-                                probe.d3d11_offered_count(),
-                                probe.d3d11_refused_count(),
-                            )
-                        });
-                    crate::logger::log(format!(
-                        "[video-decode] get_format did not offer D3D11 before first frame; reopening SW decoder: codec={} send_packet_err={e} callbacks={callbacks} d3d11_offered={d3d11_offered} d3d11_refused={d3d11_refused}",
-                        codec_id.name()
-                    ));
+        let draining_eof = packet.is_none();
+        let mut codec_eof_sent = false;
+        if let Some(packet) = packet {
+            if let Err(e) = video_decoder.send_packet(&packet) {
+                // EAGAIN は致命ではない — decoder 内部の output buffer が満杯で
+                // 「先に receive_frame で drain しろ」の意味 (Codex P1 2026-05-15)。
+                // packet を `pending_resend_packet` に保持して、この iteration で
+                // receive_frame ループに進んで drain し、次 iteration の頭で再送する。
+                let is_eagain = matches!(
+                    &e,
+                    ffmpeg::Error::Other { errno } if *errno == EAGAIN_ERRNO
+                );
+                if is_eagain {
+                    // serial を attach して保存。次 iteration の頭で seek mismatch check が
+                    // 入り、stale な再送を防ぐ (Codex P1 2026-05-15)。
+                    pending_resend_packet = Some((current_seek_serial, packet));
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "video_decode",
-                            "hw_format_sw_retry",
+                            "send_packet_eagain",
                             None,
                             current_seek_serial,
-                            &[
-                                ("codec", serde_json::Value::from(codec_id.name())),
-                                ("callbacks", serde_json::Value::from(callbacks as i64)),
-                                (
-                                    "d3d11_offered",
-                                    serde_json::Value::from(d3d11_offered as i64),
-                                ),
-                                (
-                                    "d3d11_refused",
-                                    serde_json::Value::from(d3d11_refused as i64),
-                                ),
-                            ],
+                            &[],
                         );
                     }
-                    let reopened_result = {
-                        #[cfg(windows)]
-                        {
-                            open_video_decoder_with_candidates(
-                                &video_params,
-                                codec_id,
-                                false,
-                                gpu_video_device.as_ref(),
-                            )
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            open_video_decoder_with_candidates(&video_params, codec_id, false)
-                        }
-                    };
-                    match reopened_result {
-                        Ok(reopened) => {
-                            let decoder_name = reopened.decoder_name.clone();
-                            let new_hw_probe = reopened.hw_probe.clone();
-                            // Drop the old decoder while the old get_format probe and HW
-                            // device reference are still alive, then release the HW side.
-                            video_decoder = reopened.decoder;
-                            hw_format_probe = reopened.hw_format_probe;
-                            hw_device = reopened.hw_device;
-                            hw_format_sw_fallback_active = true;
-                            consecutive_send_packet_errors = 0;
-                            watchdog_start = std::time::Instant::now();
-                            pending_resend_packet = Some((current_seek_serial, packet));
-                            crate::logger::log(format!(
-                                "[video-decode] SW decoder reopened after get_format refusal: codec={} decoder={decoder_name} d3d11va_supported={} d3d11va_config={}",
-                                codec_id.name(),
-                                new_hw_probe.d3d11va_supported,
-                                new_hw_probe.d3d11va_config
-                            ));
-                            continue;
-                        }
-                        Err(open_err) => {
-                            crate::logger::log(format!(
-                                "[video-decode] SW decoder reopen failed after get_format refusal: codec={} err={open_err}",
-                                codec_id.name()
-                            ));
-                        }
-                    }
-                }
-                let recoverable_invalid_data =
-                    is_recoverable_send_packet_invalid_data(&e, first_frame_delivered);
-                if recoverable_invalid_data
-                    && hw_device.is_some()
-                    && !hw_invalid_data_sw_fallback_attempted
-                {
-                    hw_invalid_data_sw_fallback_attempted = true;
-                    crate::logger::log(format!(
-                        "[video-decode] HW send_packet returned InvalidData after first frame; reopening SW decoder: codec={}",
-                        codec_id.name()
-                    ));
-                    if crate::perf::is_enabled() {
-                        crate::perf::event(
-                            "video_decode",
-                            "hw_invalid_data_sw_retry",
-                            None,
-                            current_seek_serial,
-                            &[("codec", serde_json::Value::from(codec_id.name()))],
-                        );
-                    }
-                    let reopened_result = {
-                        #[cfg(windows)]
-                        {
-                            open_video_decoder_with_candidates(
-                                &video_params,
-                                codec_id,
-                                false,
-                                gpu_video_device.as_ref(),
-                            )
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            open_video_decoder_with_candidates(&video_params, codec_id, false)
-                        }
-                    };
-                    match reopened_result {
-                        Ok(reopened) => {
-                            let decoder_name = reopened.decoder_name.clone();
-                            let new_hw_probe = reopened.hw_probe.clone();
-                            video_decoder = reopened.decoder;
-                            hw_format_probe = reopened.hw_format_probe;
-                            hw_device = reopened.hw_device;
-                            hw_format_sw_fallback_active = true;
-                            consecutive_send_packet_errors = 0;
-                            recoverable_invalid_data_packets = 0;
-                            watchdog_start = std::time::Instant::now();
-                            pending_resend_packet = Some((current_seek_serial, packet));
-                            scaler = None;
-                            scaler_key = None;
-                            deinterlacer = None;
-                            crate::logger::log(format!(
-                                "[video-decode] SW decoder reopened after runtime InvalidData: codec={} decoder={decoder_name} d3d11va_supported={} d3d11va_config={}",
-                                codec_id.name(),
-                                new_hw_probe.d3d11va_supported,
-                                new_hw_probe.d3d11va_config
-                            ));
-                            continue;
-                        }
-                        Err(open_err) => {
-                            crate::logger::log(format!(
-                                "[video-decode] SW decoder reopen failed after runtime InvalidData: codec={} err={open_err}",
-                                codec_id.name()
-                            ));
-                        }
-                    }
-                }
-                if recoverable_invalid_data {
-                    recoverable_invalid_data_packets =
-                        recoverable_invalid_data_packets.saturating_add(1);
-                    if recoverable_invalid_data_packets <= 5
-                        || recoverable_invalid_data_packets % 100 == 0
+                    // 致命系カウンタは触らない。受信ループに進む (drain) — `packet` を
+                    // 使わないので borrow は終わっている。
+                } else {
+                    if hw_device.is_some()
+                        && should_retry_sw_after_hw_format_refusal(
+                            hw_active_initially,
+                            first_frame_delivered,
+                            hw_format_sw_fallback_attempted,
+                            hw_format_probe.as_deref(),
+                        )
                     {
+                        hw_format_sw_fallback_attempted = true;
+                        let (callbacks, d3d11_offered, d3d11_refused) =
+                            hw_format_probe.as_deref().map_or((0, 0, 0), |probe| {
+                                (
+                                    probe.callback_count(),
+                                    probe.d3d11_offered_count(),
+                                    probe.d3d11_refused_count(),
+                                )
+                            });
                         crate::logger::log(format!(
-                            "[video-decode] skipped InvalidData packet after first frame: count={recoverable_invalid_data_packets} pkt_rx_len={} video_tx_len={}",
-                            video_pkt_rx.len(),
-                            video_tx.len()
+                            "[video-decode] get_format did not offer D3D11 before first frame; reopening SW decoder: codec={} send_packet_err={e} callbacks={callbacks} d3d11_offered={d3d11_offered} d3d11_refused={d3d11_refused}",
+                            codec_id.name()
                         ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video_decode",
+                                "hw_format_sw_retry",
+                                None,
+                                current_seek_serial,
+                                &[
+                                    ("codec", serde_json::Value::from(codec_id.name())),
+                                    ("callbacks", serde_json::Value::from(callbacks as i64)),
+                                    (
+                                        "d3d11_offered",
+                                        serde_json::Value::from(d3d11_offered as i64),
+                                    ),
+                                    (
+                                        "d3d11_refused",
+                                        serde_json::Value::from(d3d11_refused as i64),
+                                    ),
+                                ],
+                            );
+                        }
+                        let reopened_result = {
+                            #[cfg(windows)]
+                            {
+                                open_video_decoder_with_candidates(
+                                    &video_params,
+                                    codec_id,
+                                    false,
+                                    gpu_video_device.as_ref(),
+                                )
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                open_video_decoder_with_candidates(&video_params, codec_id, false)
+                            }
+                        };
+                        match reopened_result {
+                            Ok(reopened) => {
+                                let decoder_name = reopened.decoder_name.clone();
+                                let new_hw_probe = reopened.hw_probe.clone();
+                                // Drop the old decoder while the old get_format probe and HW
+                                // device reference are still alive, then release the HW side.
+                                video_decoder = reopened.decoder;
+                                hw_format_probe = reopened.hw_format_probe;
+                                hw_device = reopened.hw_device;
+                                hw_format_sw_fallback_active = true;
+                                consecutive_send_packet_errors = 0;
+                                watchdog_start = std::time::Instant::now();
+                                pending_resend_packet = Some((current_seek_serial, packet));
+                                crate::logger::log(format!(
+                                    "[video-decode] SW decoder reopened after get_format refusal: codec={} decoder={decoder_name} d3d11va_supported={} d3d11va_config={}",
+                                    codec_id.name(),
+                                    new_hw_probe.d3d11va_supported,
+                                    new_hw_probe.d3d11va_config
+                                ));
+                                continue;
+                            }
+                            Err(open_err) => {
+                                crate::logger::log(format!(
+                                    "[video-decode] SW decoder reopen failed after get_format refusal: codec={} err={open_err}",
+                                    codec_id.name()
+                                ));
+                            }
+                        }
                     }
-                    if crate::perf::is_enabled()
-                        && (recoverable_invalid_data_packets <= 5
-                            || recoverable_invalid_data_packets % 100 == 0)
+                    let recoverable_invalid_data =
+                        is_recoverable_send_packet_invalid_data(&e, first_frame_delivered);
+                    if recoverable_invalid_data
+                        && hw_device.is_some()
+                        && !hw_invalid_data_sw_fallback_attempted
                     {
-                        crate::perf::event(
-                            "video_decode",
-                            "invalid_data_packet_skipped",
-                            None,
-                            current_seek_serial,
-                            &[(
-                                "count",
-                                serde_json::Value::from(recoverable_invalid_data_packets as i64),
-                            )],
-                        );
+                        hw_invalid_data_sw_fallback_attempted = true;
+                        crate::logger::log(format!(
+                            "[video-decode] HW send_packet returned InvalidData after first frame; reopening SW decoder: codec={}",
+                            codec_id.name()
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video_decode",
+                                "hw_invalid_data_sw_retry",
+                                None,
+                                current_seek_serial,
+                                &[("codec", serde_json::Value::from(codec_id.name()))],
+                            );
+                        }
+                        let reopened_result = {
+                            #[cfg(windows)]
+                            {
+                                open_video_decoder_with_candidates(
+                                    &video_params,
+                                    codec_id,
+                                    false,
+                                    gpu_video_device.as_ref(),
+                                )
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                open_video_decoder_with_candidates(&video_params, codec_id, false)
+                            }
+                        };
+                        match reopened_result {
+                            Ok(reopened) => {
+                                let decoder_name = reopened.decoder_name.clone();
+                                let new_hw_probe = reopened.hw_probe.clone();
+                                video_decoder = reopened.decoder;
+                                hw_format_probe = reopened.hw_format_probe;
+                                hw_device = reopened.hw_device;
+                                hw_format_sw_fallback_active = true;
+                                consecutive_send_packet_errors = 0;
+                                recoverable_invalid_data_packets = 0;
+                                watchdog_start = std::time::Instant::now();
+                                pending_resend_packet = Some((current_seek_serial, packet));
+                                scaler = None;
+                                scaler_key = None;
+                                deinterlacer = None;
+                                crate::logger::log(format!(
+                                    "[video-decode] SW decoder reopened after runtime InvalidData: codec={} decoder={decoder_name} d3d11va_supported={} d3d11va_config={}",
+                                    codec_id.name(),
+                                    new_hw_probe.d3d11va_supported,
+                                    new_hw_probe.d3d11va_config
+                                ));
+                                continue;
+                            }
+                            Err(open_err) => {
+                                crate::logger::log(format!(
+                                    "[video-decode] SW decoder reopen failed after runtime InvalidData: codec={} err={open_err}",
+                                    codec_id.name()
+                                ));
+                            }
+                        }
+                    }
+                    if recoverable_invalid_data {
+                        recoverable_invalid_data_packets =
+                            recoverable_invalid_data_packets.saturating_add(1);
+                        if recoverable_invalid_data_packets <= 5
+                            || recoverable_invalid_data_packets % 100 == 0
+                        {
+                            crate::logger::log(format!(
+                                "[video-decode] skipped InvalidData packet after first frame: count={recoverable_invalid_data_packets} pkt_rx_len={} video_tx_len={}",
+                                video_pkt_rx.len(),
+                                video_tx.len()
+                            ));
+                        }
+                        if crate::perf::is_enabled()
+                            && (recoverable_invalid_data_packets <= 5
+                                || recoverable_invalid_data_packets % 100 == 0)
+                        {
+                            crate::perf::event(
+                                "video_decode",
+                                "invalid_data_packet_skipped",
+                                None,
+                                current_seek_serial,
+                                &[(
+                                    "count",
+                                    serde_json::Value::from(
+                                        recoverable_invalid_data_packets as i64,
+                                    ),
+                                )],
+                            );
+                        }
+                        continue;
+                    }
+                    // 致命系: ENOSYS / EINVAL / External 等。連続失敗で thread を exit。
+                    consecutive_send_packet_errors += 1;
+                    crate::logger::log(format!(
+                        "video send_packet: {e} (consecutive_errors={consecutive_send_packet_errors})"
+                    ));
+                    if consecutive_send_packet_errors >= MAX_CONSECUTIVE_SEND_PACKET_ERRORS {
+                        // HW decode が runtime に壊れている (D3D11 は候補に出たが GPU resource
+                        // pressure で内部 surface 取得が連続失敗、等) と判断して decode thread
+                        // を exit させる。ここでは SW フォールバックしない (ユーザーポリシー)。
+                        // 上位は frame が来ないので「準備中」のままになるが、`LIVE_VIDEO_DECODE_THREADS` の
+                        // カウンタが減るので throttle が正しく機能し、他動画への navigation は
+                        // 通る (= UI 全体は固まらない、Codex 解析 2026-05-15 反映)。
+                        // `AvClock::set_decode_failed(true)` で上位 UI に伝える (Codex P2)。
+                        crate::logger::log(format!(
+                            "[video-decode] send_packet exhausted: {consecutive_send_packet_errors} consecutive errors, exiting thread"
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video_decode",
+                                "send_packet_exhausted",
+                                None,
+                                current_seek_serial,
+                                &[(
+                                    "consecutive_errors",
+                                    serde_json::Value::from(consecutive_send_packet_errors as i64),
+                                )],
+                            );
+                        }
+                        clock.set_decode_failed(true);
+                        engine_event_tx.wake_ui();
+                        break 'outer;
                     }
                     continue;
                 }
-                // 致命系: ENOSYS / EINVAL / External 等。連続失敗で thread を exit。
-                consecutive_send_packet_errors += 1;
-                crate::logger::log(format!(
-                    "video send_packet: {e} (consecutive_errors={consecutive_send_packet_errors})"
-                ));
-                if consecutive_send_packet_errors >= MAX_CONSECUTIVE_SEND_PACKET_ERRORS {
-                    // HW decode が runtime に壊れている (D3D11 は候補に出たが GPU resource
-                    // pressure で内部 surface 取得が連続失敗、等) と判断して decode thread
-                    // を exit させる。ここでは SW フォールバックしない (ユーザーポリシー)。
-                    // 上位は frame が来ないので「準備中」のままになるが、`LIVE_VIDEO_DECODE_THREADS` の
-                    // カウンタが減るので throttle が正しく機能し、他動画への navigation は
-                    // 通る (= UI 全体は固まらない、Codex 解析 2026-05-15 反映)。
-                    // `AvClock::set_decode_failed(true)` で上位 UI に伝える (Codex P2)。
-                    crate::logger::log(format!(
-                        "[video-decode] send_packet exhausted: {consecutive_send_packet_errors} consecutive errors, exiting thread"
-                    ));
-                    if crate::perf::is_enabled() {
-                        crate::perf::event(
-                            "video_decode",
-                            "send_packet_exhausted",
-                            None,
-                            current_seek_serial,
-                            &[(
-                                "consecutive_errors",
-                                serde_json::Value::from(consecutive_send_packet_errors as i64),
-                            )],
-                        );
-                    }
-                    clock.set_decode_failed(true);
-                    engine_event_tx.wake_ui();
-                    break 'outer;
-                }
-                continue;
+            } else {
+                // packet 投入成功 → 致命系 counter リセット (EAGAIN は前段で別管理)。
+                consecutive_send_packet_errors = 0;
+                recoverable_invalid_data_packets = 0;
             }
-        } else {
-            // packet 投入成功 → 致命系 counter リセット (EAGAIN は前段で別管理)。
-            consecutive_send_packet_errors = 0;
-            recoverable_invalid_data_packets = 0;
-        }
         // EAGAIN 経路または送信成功時は receive_frame ループに進む。
         // 1 枚でも取れたら error カウンタは更にリセット (= 後段の receive ループ内で行う)。
         // `avcodec_send_packet` は HW decode 経路で D3D11 device context を内部使用する。
@@ -4552,6 +4618,13 @@ fn run_video_decode(
         // られるよう、20ms 超の send_packet は perf event で記録 (Codex 助言)。
         // 健全な HW decode は通常 < 5ms なので、20ms 超は contention の兆候。
         // 100ms 超は従来通り logger にも 1 行警告を残す (運用時の grep 用)。
+        } else {
+            match video_decoder.send_eof() {
+                Ok(()) | Err(ffmpeg::Error::Eof) => codec_eof_sent = true,
+                Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN_ERRNO => {}
+                Err(error) => crate::logger::log(format!("video decoder EOF: {error}")),
+            }
+        }
         let send_packet_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
         if send_packet_ms > 20.0 && crate::perf::is_enabled() {
             crate::perf::event(
@@ -4587,8 +4660,82 @@ fn run_video_decode(
                 LIVE_VIDEO_DECODE_THREADS.load(Ordering::Acquire),
             ));
         }
-        let mut frame = Video::empty();
-        while video_decoder.receive_frame(&mut frame).is_ok() {
+        let mut draining_filter = false;
+        loop {
+            let mut frame = Video::empty();
+            let filter_output = if draining_filter {
+                match deinterlacer.as_mut().map(BwdifFilter::receive) {
+                    Some(Ok(Some(output))) => {
+                        frame = output;
+                        true
+                    }
+                    Some(Err(error)) => {
+                        crate::logger::log(format!("video deinterlace: EOF drain failed: {error}"));
+                        dynamic
+                            .deinterlace_status
+                            .store(DEINT_STATUS_FAILED, Ordering::Release);
+                        deinterlace_failure_logged = true;
+                        break;
+                    }
+                    _ => break,
+                }
+            } else {
+                if video_decoder.receive_frame(&mut frame).is_err() {
+                    if draining_eof {
+                        if !codec_eof_sent {
+                            // EOF can be refused with EAGAIN until available codec
+                            // output is consumed. Retry only at that boundary.
+                            match video_decoder.send_eof() {
+                                Ok(()) | Err(ffmpeg::Error::Eof) => {
+                                    codec_eof_sent = true;
+                                    continue;
+                                }
+                                Err(error) => crate::logger::log(format!(
+                                    "video decoder EOF after drain: {error}"
+                                )),
+                            }
+                        }
+                        if let Some(filter) = deinterlacer.as_mut() {
+                            if let Err(error) = filter.flush() {
+                                crate::logger::log(format!(
+                                    "video deinterlace: EOF flush failed: {error}"
+                                ));
+                                dynamic
+                                    .deinterlace_status
+                                    .store(DEINT_STATUS_FAILED, Ordering::Release);
+                                deinterlace_failure_logged = true;
+                                break;
+                            }
+                            draining_filter = true;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                false
+            };
+            if let Some(status) = reconcile_deinterlace_mode(
+                &mut deinterlace,
+                deinterlace_control.mode(),
+                &mut deinterlacer,
+                &mut deinterlace_failure_logged,
+            ) {
+                dynamic.deinterlace_status.store(status, Ordering::Release);
+                crate::logger::log(format!(
+                    "video deinterlace: mode changed to {:?}",
+                    deinterlace
+                ));
+            }
+            // Temporal filtering needs every input, including the preroll and frames
+            // before a frame-step target. Only its outputs may be selected/dropped.
+            let select_after_filter = !filter_output
+                && (deinterlacer.is_some()
+                    || should_try_deinterlace(
+                        deinterlace,
+                        frame.is_interlaced(),
+                        stream_interlaced,
+                        deinterlace_failure_logged,
+                    ));
             if cancel.load(Ordering::Acquire) {
                 break 'outer;
             }
@@ -4619,7 +4766,7 @@ fn run_video_decode(
                 frame_step_selected_pending_clear = false;
             }
             let mut frame_step_selected_this_frame = false;
-            if let Some(step) = frame_step_decode.as_mut() {
+            if !select_after_filter && let Some(step) = frame_step_decode.as_mut() {
                 match step.select(&mut frame, pts_secs) {
                     FrameStepSelection::Selected(selected_pts) => {
                         pts_secs = selected_pts;
@@ -4637,7 +4784,7 @@ fn run_video_decode(
                 }
             }
             // post-seek preroll: target 前のフレームは描画しない
-            if let Some(min) = drop_before_secs {
+            if !select_after_filter && let Some(min) = drop_before_secs {
                 if pts_secs + VIDEO_PREROLL_TRIM_TOLERANCE_SECS < min {
                     preroll_drop_count = preroll_drop_count.saturating_add(1);
                     if crate::perf::is_enabled()
@@ -4712,7 +4859,9 @@ fn run_video_decode(
             // SW frames use a shallow AVFrame ref. Stream-resolution swscale and encoding remain
             // in `stream::video_tap::VideoStreamEncoder`. With no active tap this returns before
             // cloning, readback, or allocation and the existing presentation path is intact.
-            video_tap.try_publish(&frame, pts_secs, current_seek_serial);
+            if !filter_output && (!select_after_filter || frame_step_decode.is_none()) {
+                video_tap.try_publish(&frame, pts_secs, current_seek_serial);
+            }
 
             // ── GPU 経路 (HW デコード + 共有 D3D11 device) ──
             // frame.format() == AV_PIX_FMT_D3D11 かつ mIV 側で GpuVideoDevice が
@@ -4760,12 +4909,13 @@ fn run_video_decode(
                         );
                     }
                 }
-                let deinterlace_wants_cpu = should_try_deinterlace(
-                    deinterlace,
-                    frame.is_interlaced(),
-                    stream_interlaced,
-                    deinterlace_failure_logged,
-                );
+                let deinterlace_wants_cpu = deinterlacer.is_some()
+                    || should_try_deinterlace(
+                        deinterlace,
+                        frame.is_interlaced(),
+                        stream_interlaced,
+                        deinterlace_failure_logged,
+                    );
                 if deinterlace_wants_cpu {
                     if !deinterlace_cpu_fallback_logged {
                         crate::logger::log(
@@ -5299,6 +5449,15 @@ fn run_video_decode(
                             }
                             continue;
                         }
+                        // Transfer copies pixels only. bwdif also needs the source
+                        // timestamp and interlace/field flags for temporal selection.
+                        let ret = ffmpeg::ffi::av_frame_copy_props(sw.as_mut_ptr(), frame.as_ptr());
+                        if ret < 0 {
+                            crate::logger::log(format!(
+                                "av_frame_copy_props after HW transfer failed: {ret}"
+                            ));
+                            continue;
+                        }
                     }
                     sw_owned = Some(sw);
                     sw_owned.as_ref().unwrap()
@@ -5309,21 +5468,23 @@ fn run_video_decode(
 
             let mut filtered_owned: Option<Video> = None;
             let mut pts_secs_for_output = pts_secs;
-            let frame_interlaced = frame_for_scaler.is_interlaced();
+            let frame_interlaced = frame.is_interlaced();
             // インターレース検出 (latched true)。すでに true なら store スキップで
             // ホットパスの atomic 書き込みを最小化。
             if frame_interlaced && !dynamic.interlace_detected.load(Ordering::Relaxed) {
                 dynamic.interlace_detected.store(true, Ordering::Release);
             }
-            if should_try_deinterlace(
-                deinterlace,
-                frame_interlaced,
-                stream_interlaced,
-                deinterlace_failure_logged,
-            ) {
+            if !filter_output
+                && (deinterlacer.is_some()
+                    || should_try_deinterlace(
+                        deinterlace,
+                        frame_interlaced,
+                        stream_interlaced,
+                        deinterlace_failure_logged,
+                    ))
+            {
                 let key = bwdif_filter_key(frame_for_scaler, video_tb_num_i32, video_tb_den_i32);
-                let force_all_frames =
-                    bwdif_force_all_frames(deinterlace, frame_interlaced, stream_interlaced);
+                let force_all_frames = bwdif_force_all_frames(deinterlace, stream_interlaced);
                 let needs_new_graph = deinterlacer
                     .as_ref()
                     .is_none_or(|f| !f.matches(key, force_all_frames));
@@ -5351,6 +5512,7 @@ fn run_video_decode(
                                 "video deinterlace: bwdif init failed, continuing without deinterlace: {e}"
                             ));
                             deinterlace_failure_logged = true;
+                            deinterlacer = None;
                             dynamic
                                 .deinterlace_status
                                 .store(DEINT_STATUS_FAILED, Ordering::Release);
@@ -5366,32 +5528,20 @@ fn run_video_decode(
                             }
                             filtered_owned = Some(filtered);
                         }
-                        Ok(None) => {
-                            if frame_step_selected_this_frame {
-                                abort_frame_step_output(
-                                    &clock,
-                                    current_seek_serial,
-                                    pts_secs,
-                                    "deinterlace_no_output",
-                                );
-                                frame_step_abort_discard_serial = Some(current_seek_serial);
-                                frame_step_selected_pending_clear = false;
-                                post_seek_frame_sent = true;
-                            }
-                            continue;
-                        }
+                        Ok(None) => continue,
                         Err(e) => {
                             crate::logger::log(format!(
                                 "video deinterlace: bwdif failed, continuing without deinterlace: {e}"
                             ));
                             deinterlace_failure_logged = true;
+                            deinterlacer = None;
                             dynamic
                                 .deinterlace_status
                                 .store(DEINT_STATUS_FAILED, Ordering::Release);
                         }
                     }
                 }
-            } else if deinterlace.is_enabled() && !deinterlace_failure_logged {
+            } else if !filter_output && deinterlace.is_enabled() && !deinterlace_failure_logged {
                 // 設定上は ON だが、現在のフレームに bwdif が要らない (= プログレッシブ
                 // 判定)。Auto モードの「プログレッシブ素材」ケース。`Failed` はそのまま
                 // 維持し、それ以外は Inactive に遷移させる。
@@ -5402,8 +5552,40 @@ fn run_video_decode(
                         .store(DEINT_STATUS_INACTIVE, Ordering::Release);
                 }
             }
-            let frame_for_scaler = filtered_owned.as_ref().unwrap_or(frame_for_scaler);
+            if select_after_filter {
+                if let Some(step) = frame_step_decode.as_mut() {
+                    let selected_frame = filtered_owned.as_mut().unwrap_or_else(|| {
+                        // Only reached if graph initialization failed: preserve the
+                        // existing unfiltered fallback and its selected frame owner.
+                        sw_owned.as_mut().unwrap_or(&mut frame)
+                    });
+                    match step.select(selected_frame, pts_secs_for_output) {
+                        FrameStepSelection::Selected(selected_pts) => {
+                            pts_secs_for_output = selected_pts;
+                            frame_step_decode = None;
+                            frame_step_selected_pending_clear = true;
+                            frame_step_selected_this_frame = true;
+                            crate::logger::log(format!(
+                                "[video-decode] frame-step selected after bwdif: serial={current_seek_serial} pts={selected_pts:.6}"
+                            ));
+                        }
+                        FrameStepSelection::Skip => continue,
+                    }
+                }
+                if drop_before_secs.is_some_and(|min| {
+                    pts_secs_for_output + VIDEO_PREROLL_TRIM_TOLERANCE_SECS < min
+                }) {
+                    continue;
+                }
+            }
+            let frame_for_scaler = filtered_owned
+                .as_ref()
+                .or(sw_owned.as_ref())
+                .unwrap_or(&frame);
             let pts_secs = pts_secs_for_output;
+            if frame_step_selected_this_frame && (select_after_filter || filter_output) {
+                video_tap.try_publish(frame_for_scaler, pts_secs, current_seek_serial);
+            }
 
             // scaler の lazy 構築 / 入力 (フォーマット|寸法) 変化時の再構築。
             let cur_fmt = frame_for_scaler.format();
@@ -5809,6 +5991,10 @@ fn run_video_decode(
             if new_seek_pending {
                 continue 'outer;
             }
+        }
+        if draining_eof && !cancel.load(Ordering::Acquire) {
+            clock.note_video_decoded_eos(current_seek_serial);
+            engine_event_tx.wake_ui();
         }
     }
 
@@ -9676,7 +9862,9 @@ mod audio_track_fixture_tests {
             cancel,
             48_000,
             false,
-            crate::settings::VideoDeinterlaceMode::Off,
+            Arc::new(super::super::DeinterlaceControl::new(
+                crate::settings::VideoDeinterlaceMode::Off,
+            )),
             #[cfg(windows)]
             None,
             Arc::new(AtomicU8::new(state_code::LOADING)),
@@ -11272,6 +11460,246 @@ mod demux_serial_tests {
 }
 
 #[cfg(test)]
+mod deinterlace_fixture_tests {
+    use super::*;
+    use crate::settings::VideoDeinterlaceMode;
+    use crate::video::engine::actor::state_code;
+    use crate::video::{EngineEventSender, VideoUiWake};
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn start(step: Option<(f64, i32)>) -> (DecodeHandles, Arc<AvClock>, CancelOnDrop) {
+        ffmpeg_the_third::init().unwrap();
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        clock.set_playing(true);
+        // Keep this noninteractive decoder test independent of wall-clock pacing.
+        clock.set_audio_pts_jump(3.0);
+        if let Some((base, direction)) = step {
+            clock.request_frame_step_seek(0.0, base, direction);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = bounded(64);
+        let handles = spawn(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/video-deinterlace/interlaced-six.mkv"),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            48_000,
+            false,
+            VideoDeinterlaceMode::On,
+            #[cfg(windows)]
+            None,
+            Arc::new(AtomicU8::new(if step.is_some() {
+                state_code::SEEKING
+            } else {
+                state_code::PLAYING
+            })),
+            EngineEventSender::new(tx, Arc::new(VideoUiWake::default())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(info.has_video);
+        assert!(!info.has_audio);
+        assert!(info.dynamic.interlace_detected.load(Ordering::Acquire));
+        (handles, clock, CancelOnDrop(cancel))
+    }
+
+    #[test]
+    fn auto_bwdif_mixed_frame_flags_keep_graph_history_pts_and_frame_step() {
+        use ffmpeg::util::frame::video::Video;
+        use ffmpeg_the_third as ffmpeg;
+        ffmpeg::init().unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/video-deinterlace/interlaced-six.mkv");
+        let mut input = ffmpeg::format::input(&path).unwrap();
+        let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+        let stream_index = stream.index();
+        let tb = stream.time_base();
+        let mut decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .unwrap()
+            .decoder()
+            .video()
+            .unwrap();
+        let mut frames = Vec::new();
+        fn collect(decoder: &mut ffmpeg::decoder::Video, frames: &mut Vec<Video>) {
+            loop {
+                let mut frame = Video::empty();
+                if decoder.receive_frame(&mut frame).is_err() {
+                    break;
+                }
+                frames.push(frame);
+            }
+        }
+        for packet in input.packets() {
+            let (stream, packet) = packet.unwrap();
+            if stream.index() == stream_index {
+                decoder.send_packet(&packet).unwrap();
+                collect(&mut decoder, &mut frames);
+            }
+        }
+        decoder.send_eof().unwrap();
+        collect(&mut decoder, &mut frames);
+        assert_eq!(frames.len(), 6);
+        for stream_interlaced in [true, false] {
+            let mut filter: Option<BwdifFilter> = None;
+            let mut outputs = Vec::new();
+            let mut graph_creations = 0;
+            for (index, source) in frames.iter().enumerate() {
+                let mut frame = source.clone();
+                let interlaced = index % 2 == 0;
+                // Set both the compatibility fields read by ffmpeg-the-third and
+                // the modern AVFrame flags consumed by libavfilter.
+                unsafe {
+                    let raw = &mut *frame.as_mut_ptr();
+                    raw.interlaced_frame = i32::from(interlaced);
+                    raw.top_field_first = i32::from(interlaced);
+                    raw.flags &= !(ffmpeg::ffi::AV_FRAME_FLAG_INTERLACED as i32
+                        | ffmpeg::ffi::AV_FRAME_FLAG_TOP_FIELD_FIRST as i32);
+                    if interlaced {
+                        raw.flags |= ffmpeg::ffi::AV_FRAME_FLAG_INTERLACED as i32
+                            | ffmpeg::ffi::AV_FRAME_FLAG_TOP_FIELD_FIRST as i32;
+                    }
+                }
+                assert_eq!(frame.is_interlaced(), interlaced);
+                // This is the production admission rule: once started, even a
+                // progressive input supplies the filter's temporal lookahead.
+                assert!(
+                    filter.is_some()
+                        || should_try_deinterlace(
+                            VideoDeinterlaceMode::Auto,
+                            frame.is_interlaced(),
+                            stream_interlaced,
+                            false,
+                        )
+                );
+                let key = bwdif_filter_key(&frame, tb.numerator(), tb.denominator());
+                let force_all =
+                    bwdif_force_all_frames(VideoDeinterlaceMode::Auto, stream_interlaced);
+                if let Some(graph) = filter.as_ref() {
+                    assert!(
+                        graph.matches(key, force_all),
+                        "mixed frame flags discarded temporal history"
+                    );
+                } else {
+                    filter = Some(BwdifFilter::new(key, force_all).unwrap());
+                    graph_creations += 1;
+                }
+                outputs.extend(filter.as_mut().unwrap().filter_one(&frame).unwrap());
+            }
+            let filter = filter.as_mut().unwrap();
+            filter.flush().unwrap();
+            while let Some(frame) = filter.receive().unwrap() {
+                outputs.push(frame);
+            }
+            assert_eq!(graph_creations, 1);
+            assert_eq!(outputs.len(), 6, "mixed flags lost a temporal output");
+            let mut forward = FrameStepDecodeState::new(FrameStepDecodeSpec {
+                base_secs: 0.2,
+                direction: 1,
+            });
+            let mut backward = FrameStepDecodeState::new(FrameStepDecodeSpec {
+                base_secs: 0.6,
+                direction: -1,
+            });
+            let mut selected_forward = None;
+            let mut selected_backward = None;
+            for (index, frame) in outputs.iter().enumerate() {
+                let pts_secs = video_frame_timestamp(frame).unwrap() as f64 * tb.numerator() as f64
+                    / tb.denominator() as f64;
+                assert!((pts_secs - index as f64 * 0.2).abs() < 0.001);
+                if selected_forward.is_none() {
+                    if let FrameStepSelection::Selected(pts) =
+                        forward.select(&mut frame.clone(), pts_secs)
+                    {
+                        selected_forward = Some(pts);
+                    }
+                }
+                if selected_backward.is_none() {
+                    if let FrameStepSelection::Selected(pts) =
+                        backward.select(&mut frame.clone(), pts_secs)
+                    {
+                        selected_backward = Some(pts);
+                    }
+                }
+            }
+            assert!((selected_forward.unwrap() - 0.4).abs() < 0.001);
+            assert!((selected_backward.unwrap() - 0.4).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn bwdif_real_decode_drains_codec_and_filter_last_frame() {
+        let (handles, clock, _cancel) = start(None);
+        for index in 0..6 {
+            let frame = handles
+                .video_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| panic!("missing real bwdif output {index}: {error}"));
+            assert_eq!(frame.seek_serial, 0);
+            assert!(
+                (frame.pts_secs - index as f64 * 0.2).abs() < 0.001,
+                "frame {index} PTS {}",
+                frame.pts_secs
+            );
+            assert!(matches!(frame.data, VideoFrameData::Cpu(_)));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.video_decoded_eos(0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "video EOF drain was not acknowledged"
+            );
+            match handles.video_rx.recv_timeout(Duration::from_millis(10)) {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Ok(frame) => panic!(
+                    "unexpected output after the six real frames: {}",
+                    frame.pts_secs
+                ),
+                Err(error) => panic!("video output disconnected before drain ACK: {error}"),
+            }
+        }
+        assert!(
+            !clock.video_tail_complete(),
+            "decoder cannot acknowledge output consumption"
+        );
+    }
+
+    #[test]
+    fn bwdif_real_decode_frame_step_uses_filtered_pts_and_reaches_last_frame() {
+        for (base, direction, expected) in
+            [(0.0, 1, 0.2), (0.2, 1, 0.4), (0.6, -1, 0.4), (0.8, 1, 1.0)]
+        {
+            let (handles, clock, _cancel) = start(Some((base, direction)));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let selected = loop {
+                let frame = handles.video_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or_else(|error| panic!("bwdif step from {base} direction {direction} produced no output: {error}"));
+                if frame.seek_serial == clock.current_seek_serial() {
+                    break frame;
+                }
+            };
+            assert!(
+                (selected.pts_secs - expected).abs() < 0.001,
+                "step from {base} direction {direction}: {} != {expected}",
+                selected.pts_secs
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod decoder_candidate_tests {
     use super::{
         AudioControlMsg, AudioDecodeInput, AudioPacketMsg, BwdifFilterKey, DecoderChoice,
@@ -11291,6 +11719,49 @@ mod decoder_candidate_tests {
     use ffmpeg_the_third::codec::Id;
     use ffmpeg_the_third::format::Pixel;
     use ffmpeg_the_third::util::frame::video::Video;
+
+    #[test]
+    fn deinterlace_mode_change_discards_history_and_retries_failed_filter() {
+        use VideoDeinterlaceMode::{Auto, Off, On};
+        for previous in [Auto, On, Off] {
+            for current in [Auto, On, Off] {
+                let mut observed = previous;
+                let mut filter = Some(());
+                let mut failed = true;
+                let status = super::reconcile_deinterlace_mode(
+                    &mut observed,
+                    current,
+                    &mut filter,
+                    &mut failed,
+                );
+                if previous == current {
+                    assert_eq!(status, None);
+                    assert!(filter.is_some());
+                    assert!(failed);
+                } else {
+                    assert_eq!(
+                        status,
+                        Some(if current == Off {
+                            super::DEINT_STATUS_INACTIVE
+                        } else {
+                            super::DEINT_STATUS_PENDING
+                        })
+                    );
+                    assert!(filter.is_none());
+                    assert!(!failed);
+                    assert_eq!(observed, current);
+                    assert_eq!(
+                        should_try_deinterlace(observed, false, false, failed),
+                        current == On
+                    );
+                    assert_eq!(
+                        should_try_deinterlace(observed, true, false, failed),
+                        current != Off
+                    );
+                }
+            }
+        }
+    }
 
     fn select_frame_step_pts(state: &mut FrameStepDecodeState, pts_secs: f64) -> Option<f64> {
         let mut frame = Video::empty();
@@ -11681,26 +12152,18 @@ mod decoder_candidate_tests {
             true,
             false
         ));
-        assert!(bwdif_force_all_frames(
-            VideoDeinterlaceMode::Auto,
-            false,
-            true
-        ));
+        assert!(bwdif_force_all_frames(VideoDeinterlaceMode::Auto, true));
     }
 
     #[test]
-    fn auto_deinterlace_keeps_frame_flag_mode_when_available() {
+    fn auto_deinterlace_graph_policy_uses_only_the_stream_hint() {
         assert!(should_try_deinterlace(
             VideoDeinterlaceMode::Auto,
             true,
             false,
             false
         ));
-        assert!(!bwdif_force_all_frames(
-            VideoDeinterlaceMode::Auto,
-            true,
-            false
-        ));
+        assert!(!bwdif_force_all_frames(VideoDeinterlaceMode::Auto, false));
     }
 
     #[test]

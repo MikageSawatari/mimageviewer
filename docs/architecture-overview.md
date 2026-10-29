@@ -500,6 +500,12 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `folder_tree.rs` | 深さ優先前順トラバーサル (Ctrl+↑↓ 用) |
 | `panorama.rs` / `panorama_wgpu.rs` | 360 度パノラマビュー (Phase 1 + 1.5 + 2a)。`panorama.rs` は state / GPano XMP 検出 / 解像度ゲート / settle policy / CPU bilinear sampler / `render_settle_overlay`、`panorama_wgpu.rs` は equirect WGSL シェーダ + 8K base アップロード + settle overlay の alpha blend pipeline。詳細は [`docs/panorama-360-view-plan.md`](panorama-360-view-plan.md) |
 
+動画のデインターレースは通常動画 HUD 上部の「…」から再生中にも変更できる (§1.660)。
+`VideoPlayer` が open 時の値と decoder と共有する atomic 現在値を所有し、手動状態は両者の差から導出する。
+全体設定へは保存せず、player の再作成で環境設定値へ戻る。setter が音声トラック変更と共通の
+位置解決・再生 intent を使って seek し、EOF 停止中は値だけ変更する。App は既存の per-context
+`fs_cache` と source epoch の経路で処理し、detached 固有の状態や受付境界を追加しない。
+
 ### 音楽ビュー / 音声再生 (v2.3.0)
 
 音声ファイル (`GridItem::Audio`) は「映像なし動画」として `FsCacheEntry::Video` の headless

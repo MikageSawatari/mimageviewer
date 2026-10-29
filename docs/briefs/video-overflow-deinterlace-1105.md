@@ -137,3 +137,31 @@ CLAUDE.md「設計の簡素化」の観点 (扱う状態の組み合わせを減
 
 detached: 制御を player に置き、既存の per-context 経路 (所有 context の `fs_cache` を mount して処理) に variant を足すだけなので構造的変更。
 範囲と判断は `docs/detached-rework-plan.md` §11 に記録する。
+
+## 10. 実装時の前提確認・補足（2026-10-29）
+
+- 音声トラック選択の位置解決は `configuration_seek_base_secs` に一般化し、モード変更も同じ
+  未表示 seek target / frame-step 表示 PTS と再生 intent を使う。App は setter の呼び出しと metadata / HUD 同期だけを行う。
+  完成レビューの P2 対応で、DSP 所有権取得中の内部 pause に埋もれた元の再生要求・要求位置も
+  `configuration_seek_position_and_intent` で共通解決する。音声トラック選択とモード変更の両方に適用する。
+- `VideoInfo.effective_deinterlace_mode` は削除し、info 到着前後とも player の現在値だけから表示する。
+  Remote の既存 `decoder::spawn` は open 値から control を作る wrapper とし、手動 UI の対象を広げない。
+- §1.661 の前提確認で bwdif 出力 link の time base が入力の半分になる既存の PTS 解釈不整合も
+  見つかった。出力 PTS を入力 time base へ換算し、filter 出力側の選別・pacing を同じ時間単位に揃える。
+  filter へ最後の入力を渡すため、demux 終端は codec を先に drain してから filter を drain する。
+- HW download は pixels のほか PTS・field flags も copy し、bwdif の入力情報を保持する。
+  完成レビューの P2 対応で、Auto + stream interlaced hint は frame flag に依存しない
+  `deint=all` graph に固定する。混在 flag のたびの graph 再生成で先読みを捨てないようにし、
+  stream hint 有無の実フレーム・隣接 PTS・前後 step の回帰を追加する。
+- 実フレームの回帰 fixture は合成した6枚のインターレース MPEG-2 動画 (B-frame あり) を同梱し、
+  実 demux / codec / bwdif / frame-step / CPU 出力を検査する。テスト実行時の外部 FFmpeg 実行体は不要。
+  製品バイナリの起動による実機確認は行わない。
+- 独立レビュー担当との追加照合で、既存 EOF 判定が demux 終端と空 channel だけを見て、
+  decode/filter 処理中や native source queue の残りを見ない前提を確認した。§1.661 の末尾保証に
+  必要な構造修正として、clock ごとに seek 世代付き `VideoEos` (Decoding / Decoded / Complete) を追加。
+  worker は全出力の enqueue 後、consumer は channel・手持ち queue・当 pass の present / hold 完了後に
+  ACK する。native / hidden / headless / 非 native は同じ契約を使い、player の EOF / loop は Complete を待つ。
+  seek は世代更新と同じ所有境界で reset し、旧 ACK を拒否する。`demux_exhausted` の意味と既存の
+  音声 tail / 出力 quiet 条件は維持し、待ち時間延長・新しいポーリング・回復機構は追加しない。
+- detached は既存の context mount と `fs_cache` の所有境界へ variant を追加する。
+  `ParkedLive` の受付順・stale epoch の活性化規則は変更しない（§9.4）。

@@ -2853,6 +2853,7 @@ struct NativeEguiOverlayState {
     seek_status_visible: bool,
     video_speed_popup_open: bool,
     panorama_projection_popup_open: bool,
+    more_popup_open: bool,
     /// 右下のストリップボタンのメニューが開いているか。
     seek_strip_menu_open: bool,
     audio_track_menu_open: bool,
@@ -2918,6 +2919,7 @@ struct NativeEguiOverlayState {
     /// HUD HWND の入力 region に同じ矩形を登録し、行クリックが背面の 360 見回し
     /// ドラッグへ抜けないようにする。
     last_drawn_panorama_projection_popup_rect: Option<egui::Rect>,
+    last_drawn_more_popup_rect: Option<egui::Rect>,
     /// 直近 egui run で描画したブックマーク名編集ダイアログの actual rect。
     /// 中央モーダルだが、配置は `pos.y = (H - dialog_h) * 0.5` (dialog_h はレイアウト
     /// 用の過大見積もり) で、実コンテンツ高さとの差でダイアログ中心が画面中心より
@@ -3380,8 +3382,10 @@ pub struct NativeOverlayMetadata {
     pub hw_decode_active: bool,
     pub gpu_path_active: bool,
     pub d3d11va_supported: bool,
-    /// open 時に確定したデインターレースモード (Auto/On/Off)。
+    /// player の現在のデインターレースモード (Auto/On/Off)。
     pub deinterlace_mode: crate::settings::VideoDeinterlaceMode,
+    /// 現在値が open 時の設定と異なるか。player から導出する。
+    pub deinterlace_manual: bool,
     /// 直近フレームのプレゼン経路 (動的)。
     pub last_present_path: crate::video::decoder::PresentPathSnapshot,
     /// bwdif フィルタの現在状態 (動的)。
@@ -3854,6 +3858,7 @@ fn record_native_overlay_drawn_rects<C: DiagnosticClock, S: DiagnosticSink>(
                 "projection_popup",
                 state.last_drawn_panorama_projection_popup_rect,
             ),
+            ("more_popup", state.last_drawn_more_popup_rect),
             ("bookmark_editor", state.last_drawn_bookmark_editor_rect),
             ("bulk_bookmark", state.last_drawn_bulk_bookmark_dialog_rect),
             ("shortcut_help", state.last_drawn_shortcut_help_rect),
@@ -4786,6 +4791,9 @@ fn native_video_fullscreen_shortcut_key(
 
 #[derive(Clone, Debug)]
 pub enum NativeOverlayCommand {
+    SetDeinterlaceMode {
+        mode: crate::settings::VideoDeinterlaceMode,
+    },
     SelectAudioTrack {
         stream_index: usize,
     },
@@ -9556,6 +9564,7 @@ impl NativeEguiOverlayState {
             seek_status_visible: false,
             video_speed_popup_open: false,
             panorama_projection_popup_open: false,
+            more_popup_open: false,
             seek_strip_menu_open: false,
             audio_track_menu_open: false,
             frame_step_hold: None,
@@ -9595,6 +9604,7 @@ impl NativeEguiOverlayState {
             last_drawn_seek_strip_menu_rect: None,
             last_drawn_audio_track_menu_rect: None,
             last_drawn_panorama_projection_popup_rect: None,
+            last_drawn_more_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
             last_drawn_shortcut_help_rect: None,
@@ -10962,6 +10972,8 @@ impl NativeEguiOverlayState {
         if self.video_metadata.as_ref().map(|old| &old.item_key)
             != metadata.as_ref().map(|new| &new.item_key)
         {
+            self.more_popup_open = false;
+            self.last_drawn_more_popup_rect = None;
             reset_native_audio_track_menu_for_source_change(
                 &self.egui_ctx,
                 &mut self.audio_track_menu_open,
@@ -11135,6 +11147,10 @@ impl NativeEguiOverlayState {
     }
 
     fn reset_side_panel_session(&mut self) {
+        // A fast source swap reuses the presenter, but this menu belongs to the old video.
+        self.dirty |= self.more_popup_open;
+        self.more_popup_open = false;
+        self.last_drawn_more_popup_rect = None;
         let touch_reset = self.native_touch.reset_for_source_swap();
         let touch_changed = touch_reset.changed;
         self.enqueue_native_pointer_events(touch_reset.egui_events, touch_reset.termination);
@@ -11247,6 +11263,11 @@ impl NativeEguiOverlayState {
     }
 
     fn set_audio_only(&mut self, audio_only: bool) {
+        if audio_only {
+            self.dirty |= self.more_popup_open;
+            self.more_popup_open = false;
+            self.last_drawn_more_popup_rect = None;
+        }
         let popup_closed = close_panorama_projection_popup_for_context(
             &mut self.panorama_projection_popup_open,
             self.panorama_pose.is_some(),
@@ -11422,6 +11443,8 @@ impl NativeEguiOverlayState {
             self.tile_textures.clear();
         } else {
             self.clear_seek_preview();
+            self.more_popup_open = false;
+            self.last_drawn_more_popup_rect = None;
         }
         self.tile_overlay = tile_overlay;
         self.dirty = true;
@@ -11528,6 +11551,10 @@ impl NativeEguiOverlayState {
             self.navigation_preview_texture = None;
         } else {
             self.clear_seek_preview();
+        }
+        if preview.is_some() {
+            self.more_popup_open = false;
+            self.last_drawn_more_popup_rect = None;
         }
         self.navigation_preview = preview;
         self.dirty = true;
@@ -12181,10 +12208,19 @@ impl NativeEguiOverlayState {
             }
         }
 
-        if let Some(rect) = native_panorama_projection_popup_hud_rect(
-            self.panorama_projection_popup_open,
-            self.last_drawn_panorama_projection_popup_rect,
-        ) {
+        for rect in [
+            native_panorama_projection_popup_hud_rect(
+                self.panorama_projection_popup_open,
+                self.last_drawn_panorama_projection_popup_rect,
+            ),
+            native_panorama_projection_popup_hud_rect(
+                self.more_popup_open,
+                self.last_drawn_more_popup_rect,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let rect_px = rect_to_px(rect);
             if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
                 regions.push(rect_px);
@@ -12457,7 +12493,8 @@ impl NativeEguiOverlayState {
     }
 
     fn top_bar_visible(&self) -> bool {
-        self.panorama_projection_popup_open
+        self.more_popup_open
+            || self.panorama_projection_popup_open
             || Self::native_hud_top_visible_from_hover(
                 self.visibility_hover_pos(),
                 self.top_bar_visible,
@@ -13131,6 +13168,7 @@ impl NativeEguiOverlayState {
         let mut hover_preview_anchor_x = self.hover_preview_anchor_x;
         let mut video_speed_popup_open = self.video_speed_popup_open;
         let mut panorama_projection_popup_open = self.panorama_projection_popup_open;
+        let mut more_popup_open = self.more_popup_open;
         let mut seek_strip_menu_open = self.seek_strip_menu_open;
         let mut seek_strip_menu_button_rect = None;
         let mut seek_strip_menu_rect = None;
@@ -13153,6 +13191,7 @@ impl NativeEguiOverlayState {
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_panorama_projection_popup_rect: Option<egui::Rect> = None;
+        let mut last_drawn_more_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
         let mut last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect> = None;
         let mut last_drawn_shortcut_help_rect: Option<egui::Rect> = None;
@@ -13384,6 +13423,8 @@ impl NativeEguiOverlayState {
                     video_zoom_scale,
                     &mut panorama_projection_popup_open,
                     &mut last_drawn_panorama_projection_popup_rect,
+                    &mut more_popup_open,
+                    &mut last_drawn_more_popup_rect,
                     &fallback_file_name,
                     perf_visible,
                     vst3_available,
@@ -14342,6 +14383,7 @@ impl NativeEguiOverlayState {
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
         self.last_drawn_panorama_projection_popup_rect = last_drawn_panorama_projection_popup_rect;
+        self.last_drawn_more_popup_rect = last_drawn_more_popup_rect;
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
         self.last_drawn_bulk_bookmark_dialog_rect = last_drawn_bulk_bookmark_dialog_rect;
         self.last_drawn_shortcut_help_rect = last_drawn_shortcut_help_rect;
@@ -14365,6 +14407,7 @@ impl NativeEguiOverlayState {
         self.audio_track_menu_open = audio_track_menu_open;
         self.last_drawn_audio_track_menu_rect = audio_track_menu_rect;
         self.panorama_projection_popup_open = panorama_projection_popup_open;
+        self.more_popup_open = more_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
         self.seek_strip_drag = seek_strip_drag;
@@ -15984,6 +16027,7 @@ fn native_hud_multitrack_fixture_metadata() -> NativeOverlayMetadata {
         gpu_path_active: true,
         d3d11va_supported: true,
         deinterlace_mode: crate::settings::VideoDeinterlaceMode::Auto,
+        deinterlace_manual: false,
         last_present_path: crate::video::decoder::PresentPathSnapshot::Gpu,
         deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Inactive,
         interlace_detected: false,
@@ -19405,6 +19449,210 @@ mod chrome_suppression_interaction_tests {
                 "release after cleanup cannot resurrect or commit the old owner"
             );
         }
+    }
+
+    #[test]
+    fn native_more_popup_button_selection_and_lock_hit_regions_match_drawn_controls() {
+        use super::super::overlay_draw::{
+            native_top_bar_lock_button_rect, native_top_bar_more_button_rect,
+        };
+        use crate::settings::VideoDeinterlaceMode as M;
+        for audio_only in [false, true] {
+            let (mut overlay, _) = fixture(false);
+            overlay.set_audio_only(audio_only);
+            pointer(&mut overlay, egui::pos2(800.0, 20.0));
+            for _ in 0..4 {
+                frame(&mut overlay);
+            }
+            let lock = overlay
+                .egui_ctx
+                .read_response(egui::Id::unique("native_top_bar_lock"))
+                .unwrap();
+            assert_eq!(
+                lock.rect,
+                native_top_bar_lock_button_rect(1280.0, !audio_only)
+            );
+            let pos = lock.rect.center();
+            pointer(&mut overlay, pos);
+            frame(&mut overlay);
+            button(&mut overlay, pos, true);
+            frame(&mut overlay);
+            button(&mut overlay, pos, false);
+            let output = frame(&mut overlay);
+            assert_eq!(
+                output
+                    .commands
+                    .iter()
+                    .filter(|command| matches!(
+                        command,
+                        NativeOverlayCommand::ToggleBarLock {
+                            bar: crate::video::NativeVideoBar::Top
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            if audio_only {
+                assert!(
+                    overlay
+                        .egui_ctx
+                        .read_response(egui::Id::unique("native_top_more"))
+                        .is_none()
+                );
+            }
+        }
+        for (row, &mode) in M::all().iter().enumerate() {
+            let (mut overlay, _) = fixture(false);
+            let mut metadata = native_hud_multitrack_fixture_metadata();
+            metadata.deinterlace_mode = M::On;
+            metadata.deinterlace_manual = true;
+            overlay.set_metadata(Some(metadata));
+            open_more_popup(&mut overlay);
+            assert_eq!(
+                overlay
+                    .egui_ctx
+                    .read_response(egui::Id::unique("native_top_more"))
+                    .unwrap()
+                    .rect,
+                native_top_bar_more_button_rect(1280.0),
+            );
+            let item = overlay
+                .egui_ctx
+                .read_response(egui::Id::unique(("native_video_deinterlace_mode", row)))
+                .unwrap();
+            assert!(
+                overlay
+                    .last_drawn_more_popup_rect
+                    .unwrap()
+                    .contains_rect(item.rect)
+            );
+            let pos = item.rect.center();
+            pointer(&mut overlay, pos);
+            frame(&mut overlay);
+            button(&mut overlay, pos, true);
+            frame(&mut overlay);
+            button(&mut overlay, pos, false);
+            let output = frame(&mut overlay);
+            assert_eq!(output.commands.iter().filter(|command| matches!(command,
+                NativeOverlayCommand::SetDeinterlaceMode { mode: selected } if *selected == mode
+            )).count(), 1);
+            assert!(!overlay.more_popup_open);
+            assert!(overlay.last_drawn_more_popup_rect.is_none());
+        }
+    }
+
+    fn open_more_popup(overlay: &mut NativeEguiOverlayState) {
+        let pos = super::super::overlay_draw::native_top_bar_more_button_rect(
+            overlay.width as f32 / overlay.pixels_per_point,
+        )
+        .center();
+        pointer(overlay, pos);
+        for _ in 0..4 {
+            frame(overlay);
+        }
+        button(overlay, pos, true);
+        frame(overlay);
+        button(overlay, pos, false);
+        for _ in 0..4 {
+            frame(overlay);
+        }
+        assert!(overlay.more_popup_open);
+        assert!(overlay.last_drawn_more_popup_rect.is_some());
+    }
+
+    #[test]
+    fn native_more_popup_keeps_top_visible_and_captures_actual_rect_until_outside_click() {
+        let (mut overlay, _) = fixture(false);
+        open_more_popup(&mut overlay);
+        overlay.push_native_event(NativeVideoWindowEvent::MouseLeave);
+        frame(&mut overlay);
+        assert!(overlay.top_bar_drawn_visible);
+        for width in [1280, 420, 300] {
+            overlay.resize_dimensions(width, 720);
+            for _ in 0..4 {
+                frame(&mut overlay);
+            }
+            let popup = overlay.last_drawn_more_popup_rect.unwrap();
+            let screen =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, 720.0));
+            assert!(
+                screen.contains_rect(popup),
+                "popup fits resized {width}pt viewport"
+            );
+            let capture = popup.expand(4.0);
+            assert!(overlay.compute_hud_regions().iter().any(|rect| rect.left
+                == capture.min.x.round() as i32
+                && rect.right == capture.max.x.round() as i32
+                && rect.top == capture.min.y.round() as i32
+                && rect.bottom == capture.max.y.round() as i32));
+        }
+        let outside = egui::pos2(150.0, 360.0);
+        button(&mut overlay, outside, true);
+        frame(&mut overlay);
+        button(&mut overlay, outside, false);
+        frame(&mut overlay);
+        assert!(!overlay.more_popup_open);
+        assert!(overlay.last_drawn_more_popup_rect.is_none());
+        frame(&mut overlay);
+        assert!(!overlay.top_bar_drawn_visible);
+    }
+
+    #[test]
+    fn native_more_popup_closes_at_every_video_context_boundary() {
+        for transition in 0..5 {
+            let (mut overlay, _) = fixture(false);
+            overlay.set_metadata(Some(native_hud_multitrack_fixture_metadata()));
+            open_more_popup(&mut overlay);
+            let mut current = native_hud_multitrack_fixture_metadata();
+            current.deinterlace_mode = crate::settings::VideoDeinterlaceMode::Off;
+            current.deinterlace_manual = true;
+            overlay.set_metadata(Some(current));
+            assert!(
+                overlay.more_popup_open,
+                "same-source metadata refresh preserves the menu"
+            );
+            match transition {
+                0 => overlay.reset_side_panel_session(),
+                1 => {
+                    let mut metadata = native_hud_multitrack_fixture_metadata();
+                    metadata.item_key = "next-video".into();
+                    overlay.set_metadata(Some(metadata));
+                }
+                2 => overlay.set_tile_overlay(Some(NativeOverlayTileOverlay::preparing())),
+                3 => overlay.set_navigation_preview(Some(NativeOverlayNavigationPreview {
+                    file_name: "next.mp4".into(),
+                    subtitle: String::new(),
+                    thumbnail: None,
+                })),
+                4 => overlay.set_audio_only(true),
+                _ => unreachable!(),
+            }
+            assert!(!overlay.more_popup_open, "transition={transition}");
+            assert!(overlay.last_drawn_more_popup_rect.is_none());
+            frame(&mut overlay);
+            assert!(overlay.last_drawn_more_popup_rect.is_none());
+        }
+    }
+
+    #[test]
+    fn native_more_popup_preserves_projection_popup_escape_routing() {
+        let mut escape = native_clipboard_key(0x1B, false);
+        escape.shift = false;
+        escape.ctrl = false;
+        let key = NativeVideoWindowEvent::KeyDown(escape);
+        let (mut overlay, _) = fixture(false);
+        open_more_popup(&mut overlay);
+        let more_routing = overlay.input_routing().should_forward_to_ui(&key);
+        overlay.more_popup_open = false;
+        overlay.panorama_projection_popup_open = true;
+        assert_eq!(
+            overlay.input_routing().should_forward_to_ui(&key),
+            more_routing
+        );
+        assert!(
+            more_routing,
+            "Escape continues to App's existing video action owner"
+        );
     }
 
     #[test]
@@ -26777,7 +27025,7 @@ let ctx = &root_ui.ctx().clone();
             egui::pos2(0.0, height - HUD_BOTTOM_HEIGHT),
             egui::pos2(width, height),
         );
-        let top_lock = native_top_bar_lock_button_rect(width);
+        let top_lock = native_top_bar_lock_button_rect(width, true);
         let seek_lock = native_seek_bar_lock_button_rect(width, height, HUD_BOTTOM_HEIGHT);
         let seek_strip_selector =
             native_seek_strip_selector_button_rect(width, height, HUD_BOTTOM_HEIGHT);

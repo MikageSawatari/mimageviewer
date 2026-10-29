@@ -6600,3 +6600,21 @@ per-viewport opt-out、detached述語・状態・placement保存先・同期経�
 egui viewportの影だけで説明できない。v4.7.1..masterのowner・前面移譲と§1.387 A1〜A3も照合し、動画の原因は未特定として残す。
 presenter/host/HUDと点滅対策は変更しない。調査の詳細は backlog §1.426 に記録した (v4.8.1 で出荷後に削除。全文は commit `94017f82e` の `docs/next-release-backlog.md`)。
 利用者が確認用ビルドで、静止画・動画・F12 の有無・複数ウィンドウとも解消を確認した (2026-10-24)。動画で効いた仕組みは未解明。
+
+### §11 追補: 動画「…」と player 所有のデインターレース切り替え（2026-10-29、実機確認待ち）
+
+ClaudeCode の設計と Codex の実装前レビューで、症状パッチではなく player の所有境界に
+操作を追加する構造的変更であることに合意した。範囲は
+[brief §9](briefs/video-overflow-deinterlace-1105.md)。
+`video/native_presenter` の共通上部バー・popup / HUD region と `NativeOverlayCommand` →
+`NativeVideoOutputEvent::SetDeinterlaceMode` → `app/native_video` の既存 per-context dispatch を使う。
+`poll_video` は従来どおり所有 context の `fs_cache` を mount して処理し、source epoch を検査した
+該当 player だけを更新する。現在値・open 値は player が所有し、App に detached 用フラグや
+別の保存先・同期経路・受付 guard を追加しない。ParkedLive は既存 HUD クリックの活性化要求へ
+載せるだけで、stale epoch を含め source 状態を変えない。音声のみシェルは動画専用操作として拒否する。
+共通位置解決と再生 intent を使う seek、decoder のモード変更 / bwdif 出力選別 / EOF drain は
+全 placement に適用する。mounted context と sibling player の非変更・stale epoch・ParkedLive を
+検査するほか、clock 所有の seek 世代付き `VideoEos` を全出力 consumer で共有し、decode/filter の
+enqueue 完了と present / hidden hold 完了前に EOF / loop が先行しないようにする。これは映像 pipeline の
+共通終端契約で、detached の predicate・状態・時間窓・個別 reset は追加しない。旧世代 ACK の拒否と seek reset も
+headless handler テストで検査し、実機の F12 / 再生 / pause / EOF は未実施として引き継ぐ。
