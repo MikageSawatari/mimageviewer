@@ -6638,3 +6638,70 @@ RTL 前進・gap 0・幅入れ替わりの実 renderer 回帰で、sequence の 
 - 全テストの後に引数なしの `cargo fmt` と `cargo fmt --check` が成功した。
 
 今回は利用者指定により build-dev・製品起動・コミットは行わない。実機確認は ClaudeCode へ引き継ぐ。
+
+### 28.7 注釈フォントの先回り準備（§1.602、2026-10-29、設計第 1 版・未レビュー）
+
+**観測と原因。** backlog §1.602 に記録した (観測者: ClaudeCode の隔離実機確認)。起動後に一度も注釈を表示していないと、
+注釈頁へのめくりは注釈なしの絵で動き、着地後に注釈が現れる。注釈用 FontSet は UI スレッドの `ensure_comic_fonts` /
+`ensure_comic_fonts_for` (`src/app.rs` 88830〜88871 行) だけが作り、段階 B は UI のメモリにある snapshot だけを使う
+(§28.5 B1/B2、`prepared_edit.rs` の `fonts_satisfy`)。そのため、表示が一度 font を読むまで、先回りは注釈を作れない。
+
+**方針。** font の準備を、表示とは別に worker でも行える 1 つの所有者にまとめ、段階 B の計画から要求する。
+めくりを待たせる・省く変更、表示の時機の変更は入れない。
+
+**F1 所有者と状態。** font は App 全体の資源で、viewer context の bundle に入っていない (`comic_docs`・`comic_stamp_cache` と同じ)。
+F12 の別ウィンドウも同じ所有者を共有し、context ごとには持たない。context の park でも読み込みを止めない (読み込みは context に依存しない)。
+既存の `comic_fonts` / `comic_fonts_loaded` / `comic_loaded_font_keys` の 3 つの field を、1 つの型 (仮称 `ComicFontOwner`) にまとめる:
+
+- `current`: `Unloaded` か `Ready { set: Option<Arc<FontSet>>, loaded: 読み込めた key, attempted: 要求した key }`。
+  `set: None` は既定の日本語 font が見つからなかった終端 (今の None と同じ意味)。
+- `load`: `Option<受信口 + 要求した key>`。同時に走るのは 1 本だけ。
+
+field は非公開にし、変更は所有者のメソッドだけで行う。規則は 1 つ: **`load` の採用以外で `current` を変える操作は、必ず `load` を捨てる**。
+これで、届いた結果は常に要求時の `current` に対するものになり、採用時の照合 (世代番号や Arc の比較) が要らない。
+
+**F2 書き手。** `current` を変えるのは次の 3 つだけ。
+
+1. 同期の読み込み (`ensure_comic_fonts` / `ensure_comic_fonts_for`。表示・テキスト編集・書き出しが呼ぶ)。
+   まず `load` の結果を非 blocking で受け取り、届いていれば採用する。それで足りれば読まずに返す。
+   足りなければ `load` を捨て、今と同じく同期で読み直す (表示を待たせない今の挙動を保つ)。
+2. 非同期の採用 (下の F4 の poll)。
+3. 無効化 helper (1 つ)。今 3 か所に同じ field の書き換えが重複している:
+   追加パックの導入 (`ui_dialogs/editing_addon.rs` 235 行)、削除 (`ui_dialogs/preferences.rs` 3772 行)、
+   利用者のフォント追加 (`ui_text.rs` 4466 行。今は列挙のやり直しだけ)。
+   - 導入・削除: `current` を `Unloaded`、`load` を捨て、列挙を読み直す印を付ける (今と同じ)。
+   - フォント追加: 読み込み済みの `current.set` はそのまま使えるので残す。`load` を捨て、`attempted` を空にし (新しい font を要求し直せるように)、列挙を読み直す印を付ける。
+   - 見本・オノマトペの cache・`mark_comic_dirty` など、既存の付随処理は helper の呼び出し側に残す。
+
+**F3 worker。** 入力は、要求時の `loaded ∪ 新たに要求する key`。worker は自分で列挙し (結果は公開しない。ピッカー用の列挙は今の所有者のまま)、
+既定 font と各 key の読み込み・parse を行い、`(Option<FontSet>, loaded, attempted)` を返す。
+同期の読み込みと同じ組み立てを 1 つの純関数にまとめ、両方から使う (書き方を 2 か所に持たない)。
+取消の token は持たない (列挙と数本の font 読み込みで終わる有限の仕事)。捨てられた後の送信は失敗して終わる。
+完了時に root の再描画を要求する。perf に `comic / font_load` (所要 ms、key 数、結果) を記録する (ui-responsiveness §4)。
+読み込みの失敗はまれな失敗として割り切る: 今と同じく `set: None` かその key の欠落、ログのみ。
+
+**F4 要求と poll。**
+
+- 要求: `prefetch_next_final_unit` の Next unit の頁ループで、`comic_pages` の頁に対し、`spawn_prepared_edit_job` の前に行う (mutable な位置)。
+  必要な key = (`Unloaded` なら既定 font) + (doc が `comic_docs` にあれば、参照 key のうち `loaded` にも `attempted` にも無いもの)。
+  必要な key があり、`load` が無ければ worker を起動する。`load` が走っていれば何もしない (完了後の評価で残りを要求する)。
+  doc が未読込なら既定 font だけを要求し、doc が段階 B で解決された後の評価で参照 key を要求する。
+- 終端: `attempted` にある key は同じ `current` の間は要求し直さない (パスの無い key で読み込みを繰り返さない)。`set: None` も終端。どちらも無効化 helper でだけ解ける。
+- poll: root の update phase で毎 frame 行う (`poll_all_page_edit_producers` の近く。App 全体の poll で、`ContextAsyncOwner` には入れない)。
+- 採用後は、段階 B の計画が毎回状態から判断し直すので、既存の経路で注釈だけの job が出る (新しい記憶や再試行の仕組みは足さない)。
+
+**F5 段階 B との関係 (変えないもの)。** 計画の snapshot (`fonts` Arc と `loaded` key)、`fonts_satisfy`、公開時の `ComicExclusion::FontSetChanged / FontKeysChanged` はそのまま使う。
+採用で Arc が替わると、走行中の B job の注釈は既存規則で除外され、次の評価で作り直される。
+参照 key にパスが無い頁は今と同じく B では焼かれず、表示が fallback で描く (変更なし)。
+
+**F6 状態を減らす検討。** モーダル化の対象ではない (利用者の操作と競合しない背景の読み込み)。
+読み込み中の表示側の待ちを作らず、「同期で読む側が非同期の要求を捨てる」で競合を 1 つの規則に畳んだ。
+世代番号は、F1 の規則で不要になったので持たない。
+
+**採らない案。** 先回りの計画から UI スレッドで同期に読む (UI スレッドの同期 I/O の規則に反する)。
+段階 B の job ごとに worker が font を読む (頁ごとに約 9MB を読み直し、共有資源を job ごとに持つ)。
+起動時に常に読む (注釈を使わない利用者にも費用がかかる)。表示側も非同期にして待つ (初回表示で注釈が遅れて現れる新しい退行になる)。
+
+**テスト。** 所有者の状態遷移 (要求 → 採用、読み込み中の同期読み込みで破棄、読み込み中の無効化で破棄、`attempted` の終端、`set: None` の終端、フォント追加で attempted が解ける)。
+段階 B の統合: font 未読込で計画が要求し、採用後に注釈だけの job が出て、めくりの素材に注釈が入る。表示の同期読み込みが走った後に古い結果が採用されない。
+F12 の context から要求しても同じ所有者を使う。テストでは worker の読み込み関数を差し替え、システム font に依存しない。
