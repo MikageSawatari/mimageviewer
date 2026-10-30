@@ -143,13 +143,22 @@ ClaudeCode が別途承認を得た場合の確認枠:
 
 ## 修正の設計
 
-### 位置づけと採用案（2026-10-30、設計レビュー前）
+### 位置づけと採用案（2026-10-30、独立レビュー後の改訂第2版）
 
 利用者判断により次版 **v4.11.0 予定**で修正する。上記の「v4.10.0 に取り込まない」は調査時の判断として保持する。v4.10.0 は公開済み。本節の確認基点は master 取り込み後の `bf6431c09feab234f3d41cee3fd45e9354ed41fe`、前回調査の記録は `01af22d76`。本節は source inspection による設計であり、新しい実行結果ではない。
 
 **採用案: App の一覧スクロール状態を一つの owner にまとめ、vendored egui に現在の content 高さと位置更新の意味を同時に渡す、縦一覧限定の opt-in API を追加する。** physics の式・既定動作は変えない。App から egui の private state を直接編集する案は採らない。現在の geometry を渡すだけでは旧速度が残り、速度を消すだけでは旧 bounds が新たなばね速度を生成するため、この二つを同じ境界で扱う。
 
-今回は本書だけを変更する。ClaudeCode の確認と、別コンテキストの GPT-6.1 Sol / xhigh による独立設計レビュー後に実装する。以下の型・API 名は提案名であり、存在する API と混同しない。独立レビューは今回まだ実施していない。
+初版 `7cfc089ab` に対する独立 GPT-6.1 Sol / xhigh review は **REVISE（P2×4、P1/P3なし）**。現在 geometry・意味付き位置更新・context 所有をまとめる構造的修正の方針には同意を得た。本改訂は4件を反映した設計案であり、再レビューによる ACCEPT は未取得。以下の型・API 名は提案名で、まだ存在しない。今回も本書だけを変更し、ClaudeCode の確認と再レビュー後に実装する。
+
+| 指摘 | 改訂内容・受入条件の所在 |
+| --- | --- |
+| P2-1: ID交代で切替 frame の新規 press が失われる | §3「切替 frame の press と capture」。表示面の interaction ID を安定させ、press ごとの所属を一つの capture owner が持つ。§9 R1で押し直し不要を検査 |
+| P2-2: touch recognizer が旧接点からコマンドを出す | §4「MainGrid の recognizer」。transport correlation を保ったまま recognizer とコマンド受理を session に接続。§9 R2で実コマンド列を検査 |
+| P2-3: row anchor は refresh / resume にも使う | §2を用途に依存しない `RowAnchor` に訂正し、既存 producer を移管。§9 R3で reload / 自動 rescan / resume を検査 |
+| P2-4: App の先行 clamp が `Sync` に隠れる | §2・§3の frame-local 解決結果で `Set` の意味を保持。§9 R4で先行 clamp と非ゼロ速度 / target の結合を検査 |
+
+実装は§10の3段を同じブランチ内で進め、最終段の受入まで次版へ出荷しない。入力寿命の片側だけを有効化する中間状態を作らない。
 
 ### 1. 不変条件と現在の違反箇所
 
@@ -166,13 +175,15 @@ ClaudeCode が別途承認を得た場合の確認枠:
 
 ### 2. App 側の単一 owner と明示更新
 
-`GridScrollState` を App 投影と `ViewerContextBundle` に一つずつ保持する。既存の `scroll_offset_y`、`scroll_to_selected`、`pending_grid_scroll`、起動時の `scroll_selected_to_rows_above` の責任をここへ移す。互換用の旧 field を併存させず、位置の読み手は owner の canonical accessor を使う。履歴・session snapshot の保存形式は従来の数値・選択のままとし、gesture identity や egui State を保存しない。
+`GridScrollState` を App 投影と `ViewerContextBundle` に一つずつ保持する。既存の `scroll_offset_y`、`scroll_to_selected`、`pending_grid_scroll`、`scroll_selected_to_rows_above` の責任をここへ移す。最後の field は名前にかかわらず **起動専用ではなく、refresh / resume の選択行位置にも使う**。互換用の旧 field を併存させず、位置の読み手は owner の canonical accessor を使う。履歴・session snapshot の保存形式は従来の数値・選択のままとし、gesture identity や egui State を保存しない。
 
-- canonical offset と、一回だけ解決する `GridScrollRequest` を同じ owner に置く。request は `Keep` / `Position { placement }` / `RevealSelection` / `StartupRowAnchor` / `Edge(Top|Bottom)` の排他的な型とする。`placement` は `KeepPosition | RevealSelection | StartupRowAnchor(rows_above)`。復元位置を受け取る操作は canonical を更新して `Position { KeepPosition }` にする。復元は同値でも旧慣性を終える意味を持つ。
-- `RevealSelection` は既存の `current_grid_order` と `apply_scroll_to_selected` の計算を使い、既に見えていれば位置を変えない。`StartupRowAnchor` は現在の「選択項目を上から何行目へ」の規則を保つ。起動 owner だけがその要求を発行し、fork へ未消費の起動要求を複製しない。
+- canonical offset と、一回だけ解決する `GridScrollRequest` を同じ owner に置く。request は `Keep` / `Position { placement }` / `RevealSelection` / `RowAnchor(rows_above)` / `Edge(Top|Bottom)` の排他的な型とする。`placement` は `KeepPosition | RevealSelection | RowAnchor(rows_above)`。復元位置を受け取る操作は canonical を更新して `Position { KeepPosition }` にする。復元は同値でも旧慣性を終える意味を持つ。
+- `RevealSelection` は既存の `current_grid_order` と `apply_scroll_to_selected` の計算を使い、既に見えていれば位置を変えない。`RowAnchor(rows_above)` は「選択項目を上から何行目へ」の共通要求。`startup_list_restore.rs::current_list_refresh_intent` → cursor 捕捉（:147付近）、`finish_main_list_open` の `ResumeList` / `RefreshList`（:531付近）、`resume_loading_items_after_sidecar` の refresh cursor 採用（`app.rs:43598`付近）を含め、旧 field の全 producer を移す。通常 reload / 自動観測 rescan でも行位置を保持し、単なる ensure-visible へ格下げしない。
+- fork へ process 起動時の未消費要求を複製しない規則は、起動 intent の fork / constructor policy として維持する。`RowAnchor` という要求種類自体を「main 起動だけ」に限定しない。context に所属する refresh / resume の要求はその bundle と一緒に move / swap し、fork の既存 copy policy と未採用要求の非継承を監査する。
 - `Edge` は選択・チェック・最後の画像を変更しない。現行どおり、同じ描画境界で競合する ensure より edge を優先する。復元後の reveal は `Position` の placement を更新して合成し、見えているため reveal が無移動でも復元の `Set` 権限を失わない。未消費の edge がある間の ensure / 同一覧の位置更新は edge を取り消さず、同一覧で新しい edge が来れば最後の edge を採る。別一覧の採用では旧一覧の request を移さず、宛先の restore / initial request に置換する。要求登録・合成の順序を単体テストで固定する。
 - wheel / gamepad 連続スクロールなど App が直接位置を動かす入口も owner の位置操作へ通す。egui の readback を行境界へ採用する操作は、新しい明示要求を発行しない。これを区別しないと毎フレーム native 慣性を切ってしまう。
 - request は現在 geometry が決まった時点で一度 take する。描画後のリング等が積んだ要求は翌描画へ残す。旧一覧の readback は、背景操作で一覧を交換する前に完了させる現在の順序を保つ。
+- geometry 解決は変更前の canonical と snap / clamp 後の canonical を同じ呼出し内で比較し、frame-local な `ResolvedGridScroll` として `Sync` / `Set` / `AppGesture` まで決める。**clamp で位置が変われば必ず `Set`** とし、その後に有効範囲内の値になったことを理由に `Sync` へ戻さない。行高変更による snap 補正も同様。永続 flag は追加しない。App touch の進行中は `AppGesture` が同じ終端権限を含み、clamp 後の anchor / remainder を渡す。egui readback の通常の行丸めは新要求を発行する操作と区別する。
 
 これらは新たな復元 bool / pending / guard の追加ではなく、既存の分散した要求の置換である。新しい async owner・待ち・channel は作らない。保存復元値の取得、worker 完了の採否・世代検査は各既存 owner に残す。
 
@@ -201,23 +212,39 @@ frame-local な値を次の一組として渡す:
 ExternalVerticalScroll {
     content_height,       // 実際に確保する全高。content margin 込み
     interaction_session,  // context / 描画surface / GridScrollSessionId から作る ID
+    interaction_id,       // 実 viewport の Grid 縦一覧に安定した transport ID
     position: Sync(offset) | Set(offset) | AppGesture(display_offset)
 }
 ```
 
-`Sync` は通常の canonical 同期であり、同じ入力セッションの native 速度・drag を保存する。`Set` は復元・edge・実際に位置が動く reveal / App の明示位置操作で、旧速度と旧 animation target を終了する。`AppGesture` は既存 touch recognizer / snap glide が位置を所有する描画で、端数込みの表示位置をそのまま渡し、native Y の速度・target を終了して drag / coast と二重適用しない。touch owner が所有する合成 pointer の bar 操作も重ねず、既存の touch / mouse 入力分類・readback 抑止を維持する。App の touch の判定を egui が推測しない。新しい永続 pending は不要である。
+`Sync` は通常の canonical 同期であり、同じ入力セッションの native 速度・drag を保存する。`Set` は復元・edge・実際に位置が動く reveal / App の明示位置操作に加え、**App が現在 geometry で位置を clamp / snap 補正した結果**にも使い、旧速度と旧 animation target を終了する。`AppGesture` は既存 touch recognizer / snap glide が位置を所有する描画で、端数込みの表示位置をそのまま渡し、native Y の速度・target を終了して drag / coast と二重適用しない。touch owner が所有する合成 pointer の bar 操作も重ねず、既存の touch / mouse 入力分類・readback 抑止を維持する。App の touch の判定を egui が推測しない。新しい永続 pending は不要である。
 
 `ScrollArea::begin` の手順を、このモードに限って以下へ揃える:
 
 1. 既存の outer size、bar 占有、min size から **現在の `inner_size`** を決める。
-2. 渡された `content_height - inner_size.y` で現在 Y bounds と `content_is_too_large.y` を確定する。前回の `max_offset.y` を physics の入力に使わない。セッション変更時は、この State の Y 速度・Y target・bar grab anchor・momentum bounce・旧 interact rect の継続を終了する。offset や履歴を既定値へ戻す reset ではない。
-3. `Sync` / `Set` / `AppGesture` の位置を現在 bounds で適用する。`Set` はセッションが同じでも Y 速度・Y target を 0 / None にする。レイアウト縮小で有効範囲外になった注入値は、ばねを起動せず現在範囲へ clamp し、その不正範囲へ向かう旧 coast を持ち越さない。
+2. 渡された `content_height - inner_size.y` で現在 Y bounds と `content_is_too_large.y` を確定する。前回の `max_offset.y` を physics の入力に使わない。セッション変更時は、この State の Y 速度・Y target・bar grab anchor・momentum bounce の継続を終了する。background の interaction rect は現在の inner rect を使い、新セッションで旧 rect を消したため新規 press の Response までなくなる状態を作らない。offset や履歴を既定値へ戻す reset ではない。
+3. `Sync` / `Set` / `AppGesture` の位置を現在 bounds で適用する。`Set` はセッションが同じでも Y 速度・Y target を 0 / None にする。App の先行 clamp があれば、有効値でも既に `Set` として届く。さらに API に範囲外値が来た場合も現在範囲へ clamp して旧 coast / target を終えるが、この検査だけを App の clamp 検出の代わりにしない。
 4. **その確定した位置から**現在 bounds の `AxisPhysics` で通常の drag / step を行い、その結果を使って content UI の origin / viewport を作る。現行のように physics 前の位置で viewport を作ったまま、返却状態だけ変更する順序にはしない。`AppGesture` では前述の native Y 処理を重ねない。
 5. `Prepared::end` の新しい wheel・scroll target・scrollbar の処理も同じ現在 bounds を使い、実測 content と現在の viewport で State を保存する。新 API の既知高さと実測高さの一致は回帰テストと debug assertion で検査する。二回描画・discard 強制・次 frame への補正で吸収しない。
 
-`Set` の優先権は **過去から残った physics / animation に対する優先権**である。同じ一覧で現に掴んでいる scrollbar や現在 frame の新規 drag / wheel は既存順序どおり処理できる。`Set` のたびにその pointer capture を奪ったり、bar grab anchor を消したりしない。別一覧へ入った場合は下記の別 interaction ID により旧 capture が新一覧へ作用しない。これにより、毎フレーム位置を同期しても正当な scrollbar / details drag は維持する。
+`Set` の優先権は **過去から残った physics / animation に対する優先権**である。同じ一覧で現に掴んでいる scrollbar や現在 frame の新規 drag / wheel は既存順序どおり処理できる。`Set` のたびにその pointer capture を奪ったり、bar grab anchor を消したりしない。別一覧での旧 capture の拒否は、下記の press 所属によって行う。
 
-State の保存 ID は、App 側で `(ViewerContextId, 描画surface, 縦一覧)` を明示し、同じ context のフォルダ移動・再走査では安定させる（path / items generation を含めない）。これにより共有 egui Context 上でも兄弟の State を上書きしない。その ID と別に、background drag と縦 scrollbar の **interaction ID だけ**をセッションで分ける。`State` 内の関連付けは `Native | ExternalVertical(session)` の型で表し、新セッションと既存セッションを区別する（runtime identity は serde 保存しない）。これは egui の入力継続の所有情報であり、復元待ち状態ではない。旧 widget capture があるままの held pointer は、新 ID に自動的に引き継がせない。Context 全体の pointer / wheel / widget data を消さない。兄弟 ScrollArea と横方向の状態も消さない。
+State の保存 ID は、App 側で `(ViewerContextId, 描画形式, 縦一覧)` を明示し、同じ context のフォルダ移動・再走査では安定させる（path / items generation を含めない）。これにより共有 egui Context 上でも兄弟の geometry / velocity State を上書きしない。`State` の関連付けは `Native | ExternalVertical(session)` の型とし、新セッションと既存セッションを区別する（runtime identity は serde 保存しない）。**interaction ID をセッションで変える初版案は撤回する。** geometry State と、実表示面の pointer capture の所属は次のように寿命を分ける。
+
+#### 切替 frame の press と capture（P2-1）
+
+egui は `context.rs:533` 付近の begin-pass で前 pass の widget を hit-test し、`interaction.rs::interact` が capture を決める。App の描画後に ID を替えてもこの判定はやり直されない。そこで `interaction_id` は **実 viewport の同じ Grid 縦一覧**に安定させ、background / 縦 bar の子 ID はここから派生させる。Folder・A/B・viewer context・詳細↔サムネイルの交代で変えない。geometry State の ID からは派生させず、別 viewport / 独立した panel とは共有しない。
+
+vendor の opt-in 経路内に、この transport ID に属する一つの typed な `ExternalScrollCapture` を置く。Context の temp data に安定 ID で保持し、`Idle | Sequence { press_stamp, session, role, button, phase }`（role は Background / VerticalBar、phase は Held / Released）とする。egui 本来の capture を複製して配送する仕組みではなく、返された Response をどの論理一覧が消費できるかの唯一の所属記録である。geometry State 側に同じ capture 所属を二重保存しない。
+
+1. egui の順序付き `PointerEvent` と Response を使う。**その連続押下の開始となる新規 press**があり、当該安定 ID の `is_pointer_button_down_on` / click / drag の情報が egui による当該 widget への配送を証明するときだけ、その描画時点の `interaction_session` に新しい Sequence を結び付ける。単に pointer が rect 内、`drag_started` が true、別 button が追加押下された、という理由では結び直さない。押下区間はイベント列と button-down の前後から求め、OS polling や時間閾値を使わない。
+2. `press_stamp` は egui の同一 frame 内で安定した frame 番号と入力列の press ordinal とする。同じ入力を replay する discard / 後続 pass では同じ stamp に同じ所属を保つ。session が途中で替わっても同じ press を宛先へ再所属させない。release を受けた stamp も当該 replay 区間では保持し、同じ press/release の再消費を防ぐ。
+3. 後続 move、bar の絶対位置更新、`drag_stopped` による release velocity は、Sequence の session が描画中 session と一致する場合だけ既存計算を行う。開始時点で既に held だった旧所属、または所属記録のない held は宛先で使わない。release はその Sequence を終端するが、旧 release が宛先の coast を作ることはない。Response と widget は通常どおり登録し、Context の capture 全体は reset しない。
+4. **宛先採用後の最初の描画と同じ frame に来た新規 press**は、前 pass と同じ transport ID に届くため、そこで宛先の Sequence を作れる。現在 geometry の handle を基準に grab anchor を初期化し、後続 frame の move / release も同じ所属で扱う。追加の押し直しは不要。反対に、その frame の入力を旧一覧で既に消費してから描画後に宛先を採用した場合は、同じイベントを宛先で再実行しない。
+
+現在の rect / clip / enabled と egui の配送先の両方を尊重し、overlay・cell・他 bar に届いた press を raw 座標だけで横取りしない。別 geometry で初めて現れた widget の hit-test 規則を一般変更するものではない。受入 R1 は切替の前から存在する background / bar の実 ID で配送を確認し、両 renderer・context 交代でも検査する。
+
+この方式なら `context.rs` / `interaction.rs` / `InputState` に capture 移送・再 hit-test・合成 press・新しい公開 API を追加せず、**`scroll_area.rs` の opt-in 適用境界とローカル所属記録だけ**で済む。同じ一覧の正当な drag は所属が一致し、通常の経路のまま継続する。単なる ID 交換、全入力の release 待ち、global pointer reset は採らない。
 
 `AxisPhysics` は現在 bounds を受ける既存の純粋計算として維持する。`scroll_physics.rs` は原則変更不要で、必要なら純粋テストだけを追加する。通常の rubber-band を全体で無効化したり、係数を変更したりしない。
 
@@ -238,19 +265,33 @@ canonical = 行境界上の 0..M
 touch の描画位置 = canonical + 既存の一時 remainder
 ```
 
-位置要求は同 frame の行高で snap / clamp してから渡す。egui は履歴・canonical の所有者にはならず、native 入力の候補 offset を返す。App は既存の details 半行 / thumbnail `should_sync_grid_scrollbar` の読戻し閾値と丸めを保持し、丸め後も現在の snapped max に収める。touch 端数は canonical や履歴へ保存せず、現在の方向 settle・130 ms snap 補間・prefetch / keep 範囲の扱いを保つ。
+位置要求は同 frame の行高で snap / clamp し、**その補正の意味も一緒に**渡す。例えば旧 canonical 840、縮小後 max 560 なら解決結果は `Set(560)` であって `Sync(560)` ではない。egui が受け取る数値が有効でも、旧 velocity / target を終えてから描画 origin / viewport を決める。`Set` はこの解決 frame の結果であり、以後の readback を毎 frame Set にするものではない。egui は履歴・canonical の所有者にはならず、native 入力の候補 offset を返す。App は既存の details 半行 / thumbnail `should_sync_grid_scrollbar` の読戻し閾値と丸めを保持し、丸め後も現在の snapped max に収める。touch 端数は canonical や履歴へ保存せず、現在の方向 settle・130 ms snap 補間・prefetch / keep 範囲の扱いを保つ。
 
 既存 `GridTouchScrollState` の anchor / row / items generation 検査は、不適合な端数を再利用しない既存契約として維持する。一時状態のキーは `(viewport, ViewerContextId)`、その既存 state の適合検査に同じ scroll owner の session を含める。同一 path・同じ offset の所有者交代でも端数・glide を引き継がせず、session ごとの第二 map を作らない。ROOT の keep 範囲を読む既存 helper は main の context / session を指定し、一時投影した detached を ROOT の owner と扱わない。これは一時描画状態の scope の修正であり、別の pending や寿命 owner を追加するものではない。逆に touch の generation 検査から native ScrollArea のセッション更新を導出しない。詳細の native drag / coast が持つ一時的な連続値も、今と同じ読戻し規則を通す。仕様を「行境界が不要」に緩めたり、読戻しを禁止したりしない。
+
+#### MainGrid の recognizer とコマンド受理（P2-2）
+
+端数の失効だけでは不十分である。`touch_correlation.rs::state_id`（:597付近）は現在 `(viewport, TouchSurface)`、その `TouchCorrelationState.recognizer` が旧接点を保持し、`touch_input.rs::handle_move`（:408付近）はそのまま `ScrollGrid` を出す。**MainGrid の driver に、同じ `GridScrollSessionId` と ViewerContextId を明示して渡す。** StillFullscreen の操作仕様・recognizer はこの変更の対象にしない。
+
+- `TouchCorrelationState` 内の MainGrid recognizer を `MainGrid { session, recognizer }` として既存 owner にまとめる。session 不一致なら、コマンドを作る前に旧 recognizer の contacts・pinch・scroll owner を終了し、現在 session の fresh recognizer に置換する。旧接点を新 recognizer の Start として再生しない。追加の「復元待ち」「全接点 release 待ち」flag や stale 接点集合は作らない。
+- 一方、`pointer_touch` と `PendingSignature` は egui-winit の synthetic pointer の相関を追う **transport の状態**なので一括 reset しない。旧 pending のコマンド権限だけを終了し、所属 session を付けた `Retired` の相関として exact な後続 signature を追う。これにより旧 touch の End に対応する primary release が、無関係なマウス click に化けない。`CorrelatedPrimary` の分類は `Current(session) | Retired` とし、Retired は tap / click / native drag を許可しない。相関が成立しない本物のマウス入力まで抑止しない。
+- 新 recognizer が Start を受け取っていない TouchId の Move / End / Cancel は、transport 相関だけを進め、recognizer へ渡さない。特に現 `handle_sample` の Cancel は全接点を消すため、**旧接点の Cancel を現在の新接点へ作用させない**。`TouchFrame.touch_cancelled` も現在 session の Cancel だけを意味し、旧 Cancel で現在の fraction / pinch を終了しない。旧 End から `ScrollGridEnd` / settle を発行しない。既存 contact 検索を受理境界へ使い、別の旧接点 map は持たない。
+- 現在 session の新しい Start は、旧接点がまだ離れていなくてもその場で受理する。新しい接点だけで GridScroll / Pinch を認識し、旧接点との二本指にはしない。synthetic pointer の gate が旧接点で占有されている間も、有効な新 raw touch の `ScrollGrid` 等は既存の raw command 経路で受理する。タップ等の pointer 経路は既存の exact-correlation 規則に従い、新しい合成 pointer を発行しない。
+- `TouchFrame` / pending command の所属にも session を持たせ、`ui_main.rs` の `into_commands` 適用境界で現在 owner と照合する。driver 後に一覧が替わっていれば旧 batch は宛先へ適用しない。これは別の寿命判定ではなく、同じ session で生成元と消費先を結ぶ契約である。
+- `DrivenSurface` と replay result の既存フレーム印にも MainGrid の所属を含める。同じ frame の後続 pass で session が替わっても、既に駆動したイベントを新規 Start として再駆動しない。コマンドは再配送せず、Retired の相関・抑止情報を保つ。描画前に採用した宛先へ初めて drive する場合は、その frame の新 Start を宛先で受理する。
+
+入力のない A→B→A や同一 path の A/B でも session 自体が変わるため、この境界を通る。一時 mount / deposit で session は変えない。実 park では既存 lifecycle が MainGrid recognizer の実行権限を終了し、復帰で old contacts を再利用しない。MainGrid を描画しない区間に raw tail が配送される場合も、当該 viewport の frame 終端に、MainGrid の通常 drive がなかった場合だけ同じ transport tracker を観測継続する（コマンド生成はしない）。既存 frame 印を `Driven(owner) | TransportOnly` の一つの処理結果へ拡張し、観測・通常 drive・replay で同じイベントを二度相関させる別 queue / bool を作らない。transport-only の後に discard で表示先が変わっても、その frame の入力を新たな Start として再実行しない。StillFullscreen の command 駆動印を transport-only 観測で上書きせず、同 tracker の処理済み情報として記録する。StillFullscreen や兄弟 viewport の入力を消費・reset しないことも R2 の対照に含める。
 
 ### 5. 比較した別案と簡素化
 
 | 案 | 利点 | 採否・欠点 |
 | --- | --- | --- |
-| **現在 geometry + 意味付き位置更新を ScrollArea の適用境界へ渡す（採用）** | private physics state を egui が所有したまま、初回描画から正しい bounds と優先権を使える。式・通常 UI・default API の変更を避けられる | 小さい opt-in API、セッション付き interaction ID、App 2 renderer の接続が必要。既知高さと実測高さの一致を caller が保証する |
+| **現在 geometry + 意味付き位置更新を ScrollArea の適用境界へ渡す（採用）** | private physics state を egui が所有したまま、初回描画から正しい bounds と優先権を使える。式・通常 UI・default API の変更を避けられる | 小さい opt-in API、安定 transport ID に対する capture 所属、App 2 renderer の接続が必要。既知高さと実測高さの一致を caller が保証する |
 | App が `State::load/store` で offset / max / vel をまとめて変更 | builder の変更を少なく見せられ、現在の注入処理に置ける | 現 public API には max / vel / target / grab の setter がない。追加すると App が egui の内部 field と widget ID の作り方を知る。min height / bar / margin 計算も二重化する。velocity だけ消しても旧上限のばねが再生成し、max だけ直しても旧 velocity / capture が残る。全部を正しく encapsulate した API は採用案と同じ責務になり、App 直接編集の利点がない |
 | すべての ScrollArea の physics を content 測定後へ移す | 未知の content 高にも一般的に対応できる | `show_viewport` の可視行・入力 hit-test を決めるため、offset は測定前に必要。二度の layout や全 UI の physics 順序変更となり、最小 vendor 差分を超える。今回の全高既知の一覧には不要 |
 | `vertical_scroll_offset(Some)` は常に速度を消す / step しない | vendor の差分が短い | mIV は毎フレーム注入するため同じ一覧の native coast を消す。bar / drag と明示更新を識別できず、出荷済み機能を制限するため不採用 |
 | path で ScrollArea ID を分ける / generation ごとに State を初期化 | フォルダ往復の一部で再現しなくなる | 同 path 再入場に旧慣性が残る。resize / filter の旧 geometry は解決せず、再走査で正当な drag も切る。保存位置と入力寿命を混同するため不採用 |
+| interaction ID を session で交換 / 新 press を別 ID へ移送 | 一見簡単に旧 capture を分離できる | 初版の交換案は事前 hit-test 済みの新 press も失うため撤回。移送案は potential click / drag・snapshot・複数 pass の整合まで変更する必要がある。安定 ID と局所的な所属により、egui 全体の capture 再配送を不要にする |
 | hydration 完了を最初の描画後へ遅延 / 復元を毎 frame 再注入 | 観測順序を合わせやすい | 完了順序の組み合わせを温存し、新 pending や入力との競合を増やす。禁止された症状隠しなので不採用 |
 | フォルダ移動・詳細取得をモーダル化 / 一覧を閉じて開き直す | 非同期の組み合わせを減らせる | 普通の閲覧を待たせ、選択・scrollbar 操作を中断する。現在 geometry と位置更新を一つの同期境界へ揃えれば順序差そのものが問題にならず、閲覧の制限は不要 |
 
@@ -262,11 +303,12 @@ touch の描画位置 = canonical + 既存の一時 remainder
 | --- | --- |
 | ツリー / address / favorite / D&D / DFS からの通常 Folder 採用 | `start_loading_items`、物理 listing install、ready 採用の共通境界で session / request を確定。source ごとの reset を追加しない |
 | Back / Forward / BS、ZIP 内階層、PDF / EPUB・変換書庫の採用 | 保存値の owner と論理 source key は変更せず、可視採用・復元から同じ scroll owner を使う。未採用・Cancel・late result は新 session / 位置を発行しない |
-| 起動復元 / フルスクリーンから Grid 復帰 / 選択行の可視化 | `StartupRowAnchor` / `RevealSelection` で同じ適用境界へ合流。startup の相対行位置、現在の「最小限見せる」を保つ |
+| 起動復元 / refresh / resume / フルスクリーンから Grid 復帰 / 選択行の可視化 | `RowAnchor(rows_above)` / `RevealSelection` で同じ適用境界へ合流。捕捉済み相対行位置と「最小限見せる」を用途ごとに保つ。起動要求の fork policy は別に扱う |
 | 検索（Ctrl+S/G/T、Everything、Ctrl+F の再適用）、タグ・お気に入り、Rating、Collection / Smart の root と子、閲覧履歴、サブ展開、ブックマーク、Snapshot | 共通 `items` を表示する限り両 renderer と同じ契約。各 session / return snapshot の canonical 保存先は増やさない。root と子を同じ synthetic path だけで区別しない。検索・filter の既存先頭復帰仕様も変更しない |
 | filter / sort / F5 / 自動観測の再走査、削除、同一覧 streaming、遅延列完了による下部バー消失 | 現在の extent を毎描画更新。同一論理一覧の既存位置規則を保つ。再生成の generation を理由に native 入力を一律終了しない |
 | Home / End（選択移動）、リング / mouse gesture / gamepad の `GridScrollTop/Bottom`、gamepad 連続 scroll | 前者は cursor owner → reveal、後者は選択を変えない edge。既存 KeyAction と入力 router を保ち、scroll 要求だけ一元化 |
 | A/B、main / active detached の bundle 投影・fork / park / promote | offset・request・session を同じ bundle で move / swap。fork の位置継承 policy は既存どおり、入力 session は新規。実 park の当該入力だけ終端。兄弟の canonical / generation / velocity / jobs は変更しない |
+| MainGrid の raw touch / synthetic primary / recognizer / command batch / fraction | 同じ session の生成・受理を一貫させる。recognizer の旧接点終了と transport 相関の保持を分ける。unknown Move / End / Cancel、replay、未描画区間の tail まで§4の境界を適用 |
 | 詳細の外側横 ScrollArea、F12 の独立した本ページ一覧・pan / 連結読み、音楽 timeline、side panel / popup | canonical 縦一覧とは別 owner。新 API を勝手に適用せず既存契約を保持。opt-in なしの動作を vendor 対照テストで確認する |
 | 製本 / Collection 並べ替え（`ui_main.rs:9774`、`ui_dialogs/collections.rs:4854`）、整理・設定・metadata の明示 offset | source 検索で別の `vertical_scroll_offset` caller がある。各ダイアログ固有位置であり main の folder restore へ接続しない。今回 default semantics を変えないため動作維持を確認し、独自の動的 extent / 明示移動を同じ controlled 契約へ移す作業は別 chunk とする。本修正で全 egui caller の未知高問題を解決したとは報告しない |
 
@@ -278,20 +320,21 @@ touch の描画位置 = canonical + 既存の一時 remainder
 
 これは `detached-rework-plan.md` §2 の BA-7（分散状態）と同じ所有原則に従う構造修正である。新しい detached bool、geometry による host 判定、recreate、時間窓、repaint、兄弟への reset は不要。park による入力停止は既存 lifecycle owner に集約し、描画中の `is_detached` 分岐で補修しない。単なる一時 mount / read-only open を park と読み替えない。
 
-この構造判断への ClaudeCode / Codex 双方の合意は **未取得**。設計確認後、実装で触る bundle / park 範囲と上記理由を同 plan §11 に記録することを着手条件とする。今回は依頼どおり本節のみを追記し、§11 に合意済みとは記録しない。実装中に viewport / predicate の追加変更が必要になれば、その範囲を設計担当へ戻す。
+ClaudeCode の設計コミットと今回の独立 review により、**症状パッチではなく構造的修正である方向への同意は確認済み**。初版の「未取得」という記述は更新する。ただし4件の P2 を反映した本改訂全体の再 ACCEPT とは区別する。実装着手前に、確認済みの判断と実際に触る bundle / park / touch 入力寿命の範囲を同 plan §11 に記録する。今回は依頼どおり本節だけを改訂し、§11 は変更しない。viewport / predicate や、MainGrid 以外の gesture の仕様変更が必要になれば設計担当へ戻す。
 
 ### 8. 出荷済み挙動への影響
 
 | 変わる点 | 利用者への意味 |
 | --- | --- |
 | 長い一覧の復元を、直前の短い一覧の bounds で押し戻さなくなる | 選択・保存した位置を初回描画から保持する。バックアップ ON/OFF・素材・完了順序に依存しない |
-| 別一覧への移動・再入場に旧 drag / bar grab / coast が流入しなくなる | 元一覧で始めた操作は元一覧で終了。移動先での新規入力は即受理し、release 待ちの時間窓を作らない |
+| 別一覧への移動・再入場に旧 drag / bar grab / coast / raw touch gesture が流入しなくなる | 元一覧で始めた操作は元一覧で終了。宛先の初回描画 frame の新 press は安定 ID で受理し、後続 move / release も押し直しなし。新 raw touch Start は旧接点の release を待たず受理する |
+| refresh / resume の行 anchor を共通要求へ移す | 起動以外でも選択行の画面内位置を維持する。出荷済みの行 anchor 機能を削らない |
 | 明示移動と layout clamp が過去の native velocity / animation に勝つ | Home/End・edge・復元・App wheel の結果が残った速度で流れ続けない。同じ一覧で保持中の正当な pointer 操作は維持する |
 | viewport / content 確定と可視行の算出が一致する | resize や下部バー出入りでも旧高に対する不要なばねを作らない。64 pt min・margin・横バー・行末余白の見た目は現行寸法を維持する |
 
 新しい待機・手順・機能削除は予定しない。通常閲覧の速度、wheel 行数、bar 操作、details drag / coast、touch の方向 settle / snap glide、選択・チェック・保存位置・履歴・A/B の意味は維持する。**通常の使い方を不便にする変更は本案では予定していない。** 同一一覧の慣性廃止、drag の release まで他操作を拒否、復元機能や入力経路の制限が必要だと判明した場合は実装を止め、出荷済み挙動と費用を示して ClaudeCode から利用者へ相談する。
 
-DB / sidecar / archive / 設定の schema・保存値の意味は変更せず migration は不要。main の位置修正を理由に thumbnail cache、PDF epoch、worker / context generation を更新しない。追加処理は既存 layout に対する定数時間の算術・identity 照合で、再走査・decode・GPU upload を増やさない。
+DB / sidecar / archive / 設定の schema・保存値の意味は変更せず migration は不要。main の位置修正を理由に thumbnail cache、PDF epoch、worker / context generation を更新しない。layout の追加処理は定数時間の算術・identity 照合、入力所属は既存イベント列に対する処理で、再走査・decode・GPU upload を増やさない。
 
 ### 9. テスト計画と受入条件
 
@@ -300,26 +343,57 @@ DB / sidecar / archive / 設定の schema・保存値の意味は変更せず mi
 1. **既存 `scroll_661::` 9 件をすべて成功へ**。自然順 200→100→200 の両表示、ON / 逆向き / JPG、fast hydration、fresh surface / spring-off 対照を残す。egui 最小再現には採用 API で現在高と明示更新を渡すよう caller を適応するが、旧上限・新上限・要求位置・期待値・ばね有効条件は維持する。API 導入前の red 証跡を保存し、旧 API を無断で一般修正した結果とは扱わない。
 2. fast hydration をサムネイルにも追加し、最初の宛先描画の前 / 後に実復元が終わる両順序を制御する。件数200/100の比較だけでなく、短い / 空 / 大きい同一 source の範囲変化、最終項目以外の保存位置も検査する。自然順の偶然の成功だけでは受入不可。
 3. egui の固定時刻・実 `Context` 試験: 既知高の増減、viewport の増減、初回描画、非ゼロ旧 velocity / 旧 target を伴う Set、新セッションへ held background / bar pointer、A→B→A、同じ session の drag / bar の継続と release coast、同じ frame の新規入力。位置だけでなく描画 viewport / content origin・State bounds・velocity・bar の到達点を検査する。`Sync` が毎 frame coast を消す変異、bounds 更新だけ / 速度終端だけを戻す変異で回帰を検出できることを確認する。
-4. App の request / geometry 単体試験: ensure と edge の優先順位、startup row anchor、復元と reveal の合成、描画後に積んだ要求の寿命、readback が明示更新を再発行しないこと。0件・1行・端数 viewport・64 pt 未満・倍率1/1.5/2・詳細横バーと進捗バーの出入り・サムネイル列数 / Auto 比率変更で行倍数・max・宣言高と実測高を検査する。
+4. App の request / geometry 単体試験: ensure と edge の優先順位、用途共通の row anchor、復元と reveal の合成、描画後に積んだ要求の寿命、readback が明示更新を再発行しないこと。0件・1行・端数 viewport・64 pt 未満・倍率1/1.5/2・詳細横バーと進捗バーの出入り・サムネイル列数 / Auto 比率変更で行倍数・max・宣言高と実測高を検査する。
 5. Full-frame 入力回帰: wheel / popup 消費、scrollbar の press→move→release、details drag / coast、Home/End の選択移動と ring / gamepad edge の選択不変。touch の fractional drag / 方向 settle / 130 ms 補間・pinch、keep 範囲 / prefetch の既存試験も再利用する。filter / sort / F5 / 詳細完了時の現在 extent と既存の位置方針を検査する。
 6. 履歴 / BS / 検索復帰 / Rating・Collection / 閲覧履歴・サブ展開 / Snapshot / A/B の既存 position suite を通す。cancel・失敗・stale completion は可視 owner と位置を変えず、可視 shell 経由は新規入力寿命になることを検査する。keyboard / ring / gamepad は既存 handler まで通す。
 7. 複数 context の非対話回帰: 片方に非ゼロ速度・位置・touch 端数を持たせ、もう片方の長短一覧移動・open / close・fork / park / resume / promote 後も兄弟の canonical・session・egui State・items generation / jobs が不変であることを確認する。同じ path の A/B、描画を挟まない往復、一時 mount / deposit も含める。実 HWND / GPU 提示の検証を headless 成功で代用しない。
 8. vendor は新 API の opt-in 有無を分けて試験し、既存 native ScrollArea（nested / both axes / stick-to-end / scroll-to / wheel chaining）を退行させない。実 discard / multipass でも request が二重発火せず、最終描画と正本が一致することを確認する。App の UI snapshot は位置・最終行・バー周辺の既存 coverage を更新 / 補完するが、snapshot だけで physics を検証しない。
 
+#### 再レビュー4件に対応する必須回帰
+
+**R1（P2-1、段Cの受入）**: 実 `Context` を前 frame から走らせ、background / bar の transport widget を登録する。宛先を採用する frame に実 `PointerButton::Pressed` を与え、その frame の egui capture が安定 ID に配送されたことを確認する。**切替＋press → 次 frame の move → release**を通し、宛先で drag / bar が動き、押し直しなしで完了することを両 renderer で検査する。対照として、旧一覧で既に press → 切替＋move → release では宛先の位置・release velocity が変わらないことを検査する。同 context の Folder、同 path A/B、同 viewport の context 交代、詳細↔サムネイルで実施する。同一一覧の drag 継続、追加 button の press で旧所属を再取得しないこと、同 frame の release→新 press、他 widget / popup への press 非横取り、discard で同じ press を宛先へ再所属させないことも含める。ID だけを差し替える変異で新 press ケースが失敗し、所属検査を外す変異で旧 held ケースが失敗することを確認する。
+
+**R2（P2-2、段Cの受入）**: `TouchRecognizer` だけへの偽 command 注入ではなく、実 `Touch` と egui-winit と同じ synthetic pointer 列 → `drive_egui_touch_input` → MainGrid command 消費 → 実 layout を通す。旧 Start / Move で GridScroll（別ケースで Pinch）を成立させ、一覧切替後の旧 Move / End / Cancel が `ScrollGrid` / `ScrollGridEnd` / `Zoom` / tap を宛先へ出さず、canonical・端数・列数を変えないことを確認する。旧接点がまだ down の間に別 TouchId の新 Start / Move を入れ、新 session の scroll が実際に動くこと、旧 Cancel がこの新接点を消さないことも検査する。同一 path の A/B、描画を挟まない A→B→A、driver 後に採用される旧 batch、切替 frame の新 Start、後続 pass の replay を含める。未描画 / park 区間で旧 tail を観測してから復帰し、新 Start が相関できること、旧 synthetic release が mouse click / native coast に化けないことを確認する。StillFullscreen・別 viewport・実 mouse の既存試験を対照とし、fraction の session 検査だけを残して recognizer 境界を戻す変異を検出する。
+
+**R3（P2-3、段Aから保持し段B/Cでも再利用）**: 起動復元に加え、通常 reload / F5、自動観測 rescan、`ResumeList` / `RefreshList` の採用と hydration を実際に通す。最下行以外を選択して `rows_above > 0` を捕捉し、再採用後に同じ安定キーの選択項目が同じ画面内行位置へ来ることを両 renderer で検査する。選択項目より前に行が増減するケースも含め、旧 index / 絶対 offset だけの比較にしない。snapshot / context の move・fork、および操作由来の選択が復元に優先する既存規則も対照にする。refresh の `RowAnchor` を通常 reveal に置換する変異を検出できることを確認する。
+
+**R4（P2-4、段Bの受入）**: App の実 geometry resolver に canonical 840 と縮小後 max 560 を与え、**先に App が clamp して `Set(560)` を作る**ところから、非ゼロ native velocity と旧 target を持った実 ScrollArea に接続する。速度だけ / target だけ / 両方の状態、縮小した content と拡大した viewport の両方で試す。新規入力なしで canonical / 返却 offset が560、velocity が0、旧 target が終了し、**最初の描画の content origin / viewport も560に一致**すること、次 frame に旧 target へ戻らないことを検査する。有効な `Sync(560)` に置き換える変異で失敗することを確認する。位置が変わらない `Sync` の正当な coast / target、および Set 後の新入力・同一一覧で保持中の bar は別対照として残す。
+
 狭い試験から始め、関連 history / touch / context suite、fmt / core check、最後に共有 vendor を含む `scripts/test-full.ps1` の gate へ進む。vendor 差分は `vendor/egui/PATCHES.md` の末尾へ本件・opt-in 契約・変更ファイル・既定動作保持・回帰・証跡の所在を追記し、`Cargo.toml.orig` / provenance を原本として保持する。未実行・内部確認・独立受入を区別する。
 
 実装完了後は自動 gate と通常の検証 build を用意するが、製品を agent が起動しない。実画面は本書の使い捨て portable / 専用 data の手順に、実 scrollbar drag・details drag・touch / DPI・F12 の context 往復を加え、ClaudeCode が具体的な範囲と時間を提示して別途承認を得る。Windows 10 / 11 の双方を候補とし、未確認側は未確認と記録する。
 
-### 10. 規模と引き継ぎ
+### 10. 実装の段、規模、引き継ぎ
 
-**中規模。実装・非対話回帰・レビュー修正を合わせて約4〜7人日相当**を目安とする（長い build / 全体 gate / 承認後の実機待ちは別）。API 文字数より、既存の直接 field 更新と各一覧採用の分類監査が費用の中心になる。独立レビューで境界が変われば再見積もりする。
+#### レビュー単位と受入ゲート
 
-| 塊 | 主な変更対象と成果物 |
+同じブランチ上で以下の順に、コンパイル可能な一貫した塊として実装・レビューする。各段の完了は次段への技術的な checkpoint で、独立した出荷候補ではない。legacy field と新 owner を併存させる二重正本、session の片側だけ有効な gesture、機能を一時無効化する切替 flag は作らない。
+
+| 段 | 実装範囲 | 受入条件・>>661 の状態 |
+| --- | --- | --- |
+| **A: 挙動不変の所有者集約** | canonical / reveal / edge / 汎用 RowAnchor を `GridScrollState` へ移し、全 producer と bundle の move / swap / fork policy を移管。renderer は既存の offset 注入・読戻しのまま。新 physics / capture / recognizer の振舞いはまだ有効にしない | 既存 request の優先順位、history / A/B / context・touch の既存挙動、R3が保持される。core check・focused suite・fmt成功。**>>661 の決定的再現は従来どおり red**、対照は維持。自然順の偶然の pass を修正済みと扱わず、期待する既知 red は別記録。テストを ignore / 弱体化して gate を偽らない |
+| **B: egui 契約と2 rendererの接続（>>661 本体）** | opt-in API の現在 geometry と `Sync/Set/AppGesture` 適用境界を実装。2 renderer が同じ geometry 解決結果を注入し、clamp の Set を含めて readback まで接続。この段は既存 interaction ID / capture / raw touch の受理挙動を維持し、session による新しい入力終端はまだ導入しない。最終 API の session / capture 部分は段Cで一括接続する | **既存9件を caller 適応だけで全 green**、追加 fast hydration両順序、R4、現在geometry・同一覧drag / coast / bar / touch・R3・関連history試験成功。vendor既定APIの対照も成功。ここで >>661 の旧boundsによるばねを解消した証拠が揃うが、入力寿命の全要件を満たした最終版とは扱わない |
+| **C: 入力寿命・contextの統合確認** | session発行を可視採用 / 実parkへ接続し、安定transport IDとcapture所属、MainGrid recognizer / command受理・fraction、contextの保存IDを同じ塊で導入する。touchのtransport観測 / replayも接続し、片側だけの失効を残さない | **R1/R2を含む全受入成功、R3/R4と>>661の全greenを保持**。同path A/B、無描画往復、fork / park / resume / promote・兄弟不変・入力router / snapshot / vendor対照を確認。最後に共有vendorを含む `test-full.ps1`、独立completion review、文書・証跡、検証buildを揃える |
+
+段Aは既存挙動と既知不具合を保つ refactor、段Bはその不具合だけを直す coherent chunk、段Cは契約全体を完成させる chunk とする。**次版への統合・出荷は段Cの完了と設計担当の検収後だけ**。段Bを先に公開したり、段Cの難点を理由に「旧操作を無効化した中間版」を出したりしない。段の途中の依存変更を単独 cherry-pick しない。実装範囲がこの区切りで一貫しなくなったら設計担当へ戻し、段を再分割する。
+
+#### 最小 vendor 差分と再見積もり
+
+P2-1の方式は **安定 interaction ID＋局所capture所属**に確定する。vendorの製品変更は原則 `vendor/egui/src/containers/scroll_area.rs` 内の opt-in builder / State関連付け / begin-end / private capture owner に限定し、回帰と `PATCHES.md` を伴う。`context.rs`・`interaction.rs`・`InputState`・egui-winit / eframe に汎用capture移送APIを増設しない。`scroll_physics.rs` の数式・係数は変更しない。新capture ownerは固定数のtransport単位であり、イベントqueue・sessionごとの履歴mapを保持しない。
+
+App側で増える範囲は `touch_correlation.rs` のMainGrid sessionと既存transport / replayの分離、`touch_input.rs` のcontact所属を確認する小さな入口、`ui_main.rs` の生成・消費境界と既存viewport入力観測への接続である。一般のtouch操作やnative pointer生成の変更は含めない。既存 `app.rs` / 共通scroll owner / `viewer_context_registry.rs` の採用・移譲と合わせて監査する。
+
+**中規模、約5〜8人日相当へ再見積もりする**（初版4〜7日を置換）。長い build / 全体gateの待ちと承認後の実機待ちは別。安定ID方式でvendorの基盤変更は抑えられる一方、press所属・transport相関を含む実入力列の回帰と、refresh / resume producerの移管検証を追加した分を見込む。
+
+| 工程 | 目安 |
 | --- | --- |
-| egui 契約（約1〜2日） | `scroll_area.rs` の opt-in API・begin / end の適用境界・interaction ID とテスト、`PATCHES.md`。`scroll_physics.rs` の数式変更なし |
-| App 接続（約1〜2日） | 共通 scroll owner（小モジュール化を想定）、`app.rs` の既存 producer、`ui_main.rs` の2 renderer、`viewer_context_registry.rs` の移譲・fork / park。無関係な UI 全体の書換えを含めない |
-| 回帰・検収用証跡（約2〜3日） | 前回 red の green、geometry / gesture / history / context 回帰、vendor / App gate、独立レビュー指摘対応、関連文書の更新 |
+| 段Aと既存producer / R3の検証 | 1〜1.5日 |
+| 段B、既存redのgreen、R4 / geometry回帰 | 1〜2日 |
+| 段C、capture / recognizer / context統合とR1/R2 | 2〜3日 |
+| 各段の独立review指摘対応・最終証跡 / 文書 | 1〜1.5日 |
+
+実装の主要な不確定要素は、受理方式そのものではなく既存callerの網羅と実イベント回帰fixtureの整備である。局所方式では足りずContextのcapture再配送や通常入力の制限が必要と判明した場合は、この見積もりのまま拡張せず設計担当へ戻す。
 
 実装時の文書更新先は本書の実装・検証台帳、`coding-conventions.md`（App 正本と egui 入力候補の契約）、`details-view-and-filter-plan.md`、`touch-support-plan.md`、`folder-history-location-plan.md` / `top-level-grid-view.md`、前述の detached §11 と vendor 台帳。公開向けには内部型名を出さず、復元位置の不具合修正を通常の変更履歴へ記す。
 
-今回の成果物はこの設計節のみ。製品コード・既存の失敗テスト・vendor は未変更、commit / build / 製品起動 / デスクトップ操作なし。実装着手可という判定や独立レビュー済みという記録は、ClaudeCode と次の reviewer へ引き継ぐ。
+今回の成果物はこの設計節の改訂のみ。製品コード・既存の失敗テスト・vendor は未変更、commit / build / test / 製品起動 / デスクトップ操作なし。4件の指摘とsourceの照合・文書の整合確認を行った。通常の使い方を不便にする仕様変更は追加していない。本改訂の再レビューと実装着手可の判定は、ClaudeCode と次の reviewer へ引き継ぐ。
