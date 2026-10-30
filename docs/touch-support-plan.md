@@ -15,6 +15,14 @@ recognizerはMainGrid sessionで区切るが、egui-winitのpointer gateとexact
 同frameの後続mouse edgeは順序付き相関で区別し、同座標でも旧touchの抑止を本物mouseへ広げない。
 MainGridの混在入力中断はrecognizerだけを終え、backendのgateを勝手に解放しない。
 
+実装レビュー後の再修正では、gate／cursor／既存pendingを同じtransport ownerにまとめた。
+Endのsynthetic releaseはraw End座標ではなくbackendの最後のcursor位置で厳密に照合し、
+cursorなしではGoneだけを待つ。旧scopeの正常なtailで現在接点を取り消さない。
+セルのclick／double-clickも実TouchFrameのrelease所属へ接続する。後続pressで変わるResponse座標に依存せず、
+frame-localなprimary-release ordinalで最後のclick-bearing releaseへ対応させ、
+曖昧Currentが除去されてもRetiredの序数を維持する。Stillの非click drag終端は最後のterminal releaseへ対応する。
+検証と制限は [再修正台帳](scroll-661-investigation.md#implementation-review-revise) を参照。
+
 通常drive・StillFullscreen・transport-only・replayは当該viewportの `ctx.cumulative_frame_nr()` を使う。
 MainGrid非描画時は共通end-pass observerがtransportだけ観測し、discard後の再生ではcommandsを再配送しない。
 Appの更新counterをviewport frameの代用にしない。既存の方向settle・130 ms glide・列数pinchは維持する。
@@ -341,14 +349,16 @@ gate が真なら phase ごとのミラー遷移と合成列は次のとおり�
 | --- | --- | --- |
 | `Start` | `Some(id)` にする | `PointerMoved` → primary press |
 | `Move` | 変更しない | `PointerMoved` |
-| `End` | `None` にする | primary release → `PointerGone` |
+| `End` | `None` にする | cursorありなら最後のcursor位置でprimary release → `PointerGone`。cursorなしは `PointerGone` だけ |
 | `Cancel` | `None` にする | `PointerGone` のみ。primary release は出ない |
 
 したがって 2 本目の `Start` は、1 本目が `pointer_touch_id` を保持している間は合成 pointer を
 伴わない。一方、pointer 接点だった指が先に `End` すると id が `None` になって gate が再び開く。
 その後も画面上に残っている 2 本目の `Move` は `PointerMoved` を出し、続く `End` は、その接点が
-primary press を一度も出していなくても primary release → `PointerGone` を出す。mIV の相関層は
-この再開放を含めて gate と 1 対 1 でミラーし、release を正当な期待列として相関する。
+primary press を一度も出していなくても、cursorがあれば primary release → `PointerGone` を出す。
+End自体はcursorを更新しないため、raw End(q)と最後のcursor(p)が異なってもrelease(p)が正常列である。
+実mouseのPointerMovedもcursorを更新し、PointerGoneは消去する。mIVの相関層は現行vendored egui-winitでも
+このgateとcursorを同じtransportでミラーし、位置の近さを許容するのではなくbackendの実際の位置で照合する。
 
 `drive_egui_touch_input(..., enabled)` の `enabled` は、**入力を観測するかではなく、
 認識結果を実行してよいか**を表す。通常の呼び出しでは値にかかわらず raw Touch を処理し、

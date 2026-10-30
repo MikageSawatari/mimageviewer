@@ -868,7 +868,9 @@ struct ExternalPress {
 struct ExternalCaptureInput {
     background_delta: Option<Vec2>,
     background_released: bool,
-    bar_position: Option<Pos2>,
+    // The stamp identifies whether this is an earlier owner's release or the
+    // final held interval, relative to a completed short click in the batch.
+    bar_position: Option<ExternalPress>,
     new_press: Option<(ExternalCaptureRole, ExternalPress)>,
     short_press: Option<ExternalPress>,
     replay: bool,
@@ -1036,6 +1038,7 @@ fn external_capture_input(
             }
             PointerEvent::Released { button, .. } => {
                 if let ExternalScrollCapture::Sequence {
+                    press_stamp,
                     session,
                     role,
                     button: owner_button,
@@ -1051,7 +1054,11 @@ fn external_capture_input(
                         && *role == ExternalCaptureRole::VerticalBar
                         && let ExternalCapturePhase::Held { position, .. } = *phase
                     {
-                        result.bar_position = Some(position);
+                        result.bar_position = Some(ExternalPress {
+                            stamp: *press_stamp,
+                            position,
+                            button,
+                        });
                     }
                     result.background_delta = None;
                     *phase = ExternalCapturePhase::Released {
@@ -1078,6 +1085,7 @@ fn external_capture_input(
     match &mut capture {
         ExternalScrollCapture::Idle { frame: processed } => *processed = Some(processed_frame),
         ExternalScrollCapture::Sequence {
+            press_stamp,
             session,
             role,
             button,
@@ -1093,7 +1101,11 @@ fn external_capture_input(
                     if *role == ExternalCaptureRole::Background {
                         result.background_delta.get_or_insert(Vec2::ZERO);
                     } else {
-                        result.bar_position = Some(*position);
+                        result.bar_position = Some(ExternalPress {
+                            stamp: *press_stamp,
+                            position: *position,
+                            button: *button,
+                        });
                     }
                 }
             }
@@ -1119,6 +1131,16 @@ fn finish_external_bar_press(
         session: external.interaction_session,
     };
     ctx.data_mut(|data| {
+        // A completed interval can precede the final held press in this same
+        // batch. Publishing its terminal phase must not replace that owner.
+        if let Some(ExternalScrollCapture::Sequence { press_stamp, .. }) =
+            data.get_temp(external_capture_id(external.interaction_id))
+            && (press_stamp.frame > press.stamp.frame
+                || (press_stamp.frame == press.stamp.frame
+                    && press_stamp.ordinal > press.stamp.ordinal))
+        {
+            return;
+        }
         data.insert_temp(
             external_capture_id(external.interaction_id),
             ExternalScrollCapture::Sequence {
@@ -1535,6 +1557,17 @@ impl ScrollArea {
                         state.offset_target[d] = None;
                     }
                 }
+            }
+        }
+
+        if external_vertical_scroll.is_some() && !rubber_banding.y {
+            // AxisPhysics leaves non-rubber edge correction to its caller.
+            // The opt-in contract places content now, so finalize that result
+            // before deriving either the viewport or the content origin.
+            let unbounded_offset = state.offset.y;
+            state.offset.y = axis_physics[1].clamp(unbounded_offset);
+            if state.offset.y != unbounded_offset {
+                state.vel.y = 0.0;
             }
         }
 
@@ -2091,10 +2124,27 @@ impl Prepared {
                 }
             };
 
-            let handle_rect = calculate_handle_rect(d, &state.offset);
-
             state.scroll_bar_interaction[d] = response.hovered() || response.dragged();
 
+            let external_short_bar_press = if d == 1 {
+                external_vertical_scroll.and_then(|external| {
+                    external_capture_input
+                        .short_press
+                        .filter(|press| {
+                            response.clicked_by(press.button)
+                                && scroll_source.scroll_bar
+                                && ui.is_enabled()
+                                && external_press_in_rect(ui, max_bar_rect, press.position)
+                        })
+                        .inspect(|press| {
+                            finish_external_bar_press(ui.ctx(), external, *press);
+                            state.vel.y = 0.0;
+                            state.offset_target[1] = None;
+                        })
+                })
+            } else {
+                None
+            };
             let external_bar_position = if d == 1 {
                 external_vertical_scroll.and_then(|external| {
                     if let Some((ExternalCaptureRole::VerticalBar, press)) =
@@ -2106,18 +2156,6 @@ impl Prepared {
                         finish_external_bar_press(ui.ctx(), external, press);
                         return None;
                     }
-                    if let Some(press) = external_capture_input.short_press
-                        && response.clicked_by(press.button)
-                        && scroll_source.scroll_bar
-                        && ui.is_enabled()
-                        && external_press_in_rect(ui, max_bar_rect, press.position)
-                    {
-                        finish_external_bar_press(ui.ctx(), external, press);
-                        state.vel.y = 0.0;
-                        state.offset_target[1] = None;
-                        state.scroll_start_offset_from_top_left[1] = None;
-                        return Some(press.position);
-                    }
                     (scroll_source.scroll_bar && ui.is_enabled())
                         .then_some(external_capture_input.bar_position)
                         .flatten()
@@ -2125,49 +2163,71 @@ impl Prepared {
             } else {
                 None
             };
-            let pointer_pos = if d == 1 && external_vertical_scroll.is_some() {
-                external_bar_position
+            // The owner position can be its old release or the final held
+            // interval. Its press stamp orders it relative to a completed click,
+            // so each new grab uses the handle after all earlier input.
+            let pointer_positions = if d == 1 && external_vertical_scroll.is_some() {
+                let mut intervals = [
+                    external_short_bar_press.map(|press| (press, Some(press))),
+                    external_bar_position.map(|press| {
+                        (
+                            press,
+                            external_capture_input.new_press.and_then(|(role, press)| {
+                                (role == ExternalCaptureRole::VerticalBar).then_some(press)
+                            }),
+                        )
+                    }),
+                ];
+                intervals.sort_by_key(|interval| {
+                    interval.map(|(press, _)| (press.stamp.frame, press.stamp.ordinal))
+                });
+                intervals.map(|interval| interval.map(|(press, grab)| (press.position, grab)))
             } else {
-                response.interact_pointer_pos()
+                [
+                    None,
+                    response
+                        .interact_pointer_pos()
+                        .map(|position| (position, None)),
+                ]
             };
             if skip_native_y && d == 1 {
                 // Application gestures and replayed input are already applied.
                 // Keep the transport and grab anchor without moving it twice.
-            } else if let Some(pointer_pos) = pointer_pos {
-                let grab_position = if let Some((ExternalCaptureRole::VerticalBar, press)) =
-                    external_capture_input.new_press
-                {
-                    press.position
-                } else {
-                    pointer_pos
-                };
-                let scroll_start_offset_from_top_left = state.scroll_start_offset_from_top_left[d]
-                    .get_or_insert_with(|| {
-                        if handle_rect.contains(grab_position) {
-                            grab_position[d] - handle_rect.min[d]
-                        } else {
-                            let handle_top_pos_at_bottom =
-                                scroll_bar_rect.max[d] - handle_rect.size()[d];
-                            // Calculate the new handle top position, centering the handle on the mouse.
-                            let new_handle_top_pos = (grab_position[d]
-                                - handle_rect.size()[d] * 0.5)
-                                .clamp(scroll_bar_rect.min[d], handle_top_pos_at_bottom);
-                            grab_position[d] - new_handle_top_pos
-                        }
+            } else if pointer_positions.iter().any(Option::is_some) {
+                for (pointer_pos, press) in pointer_positions.into_iter().flatten() {
+                    let handle_rect = calculate_handle_rect(d, &state.offset);
+                    let grab_position = press.map_or(pointer_pos, |press| {
+                        state.scroll_start_offset_from_top_left[d] = None;
+                        press.position
                     });
+                    let scroll_start_offset_from_top_left =
+                        state.scroll_start_offset_from_top_left[d].get_or_insert_with(|| {
+                            if handle_rect.contains(grab_position) {
+                                grab_position[d] - handle_rect.min[d]
+                            } else {
+                                let handle_top_pos_at_bottom =
+                                    scroll_bar_rect.max[d] - handle_rect.size()[d];
+                                // Calculate the new handle top position, centering the handle on the mouse.
+                                let new_handle_top_pos = (grab_position[d]
+                                    - handle_rect.size()[d] * 0.5)
+                                    .clamp(scroll_bar_rect.min[d], handle_top_pos_at_bottom);
+                                grab_position[d] - new_handle_top_pos
+                            }
+                        });
 
-                let new_handle_top = pointer_pos[d] - *scroll_start_offset_from_top_left;
-                let handle_travel =
-                    scroll_bar_rect.min[d]..=(scroll_bar_rect.max[d] - handle_rect.size()[d]);
-                state.offset[d] = if handle_travel.start() == handle_travel.end() {
-                    0.0
-                } else {
-                    remap(new_handle_top, handle_travel, 0.0..=max_offset[d])
-                };
+                    let new_handle_top = pointer_pos[d] - *scroll_start_offset_from_top_left;
+                    let handle_travel =
+                        scroll_bar_rect.min[d]..=(scroll_bar_rect.max[d] - handle_rect.size()[d]);
+                    state.offset[d] = if handle_travel.start() == handle_travel.end() {
+                        0.0
+                    } else {
+                        remap(new_handle_top, handle_travel, 0.0..=max_offset[d])
+                    };
 
-                // some manual action taken, scroll not stuck
-                state.scroll_stuck_to_end[d] = false;
-                state.offset_target[d] = None;
+                    // some manual action taken, scroll not stuck
+                    state.scroll_stuck_to_end[d] = false;
+                    state.offset_target[d] = None;
+                }
             } else {
                 state.scroll_start_offset_from_top_left[d] = None;
             }
@@ -2468,6 +2528,7 @@ mod tests {
                 ctx.root_ui(|ui| {
                     crate::CentralPanel::default().show(ui, |ui| {
                         ui.spacing_mut().scroll = crate::style::ScrollStyle::solid();
+                        ui.spacing_mut().scroll.kinetic = ctx.global_style().spacing.scroll.kinetic;
                         let mut area = ScrollArea::vertical()
                             .id_salt(geometry)
                             .auto_shrink([false, false])
@@ -2948,6 +3009,269 @@ mod tests {
             )))
         })
         .expect("transport was observed")
+    }
+
+    #[test]
+    fn external_capture_old_bar_release_then_short_click_keeps_input_order() {
+        let ctx = Context::default();
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let start = pos2(first.inner_rect.right() + 3.0, first.inner_rect.top() + 8.0);
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![pointer_button(start, true)],
+        );
+        let old_position = start + Vec2::new(0.0, 30.0);
+        let dragged = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![crate::Event::PointerMoved(old_position)],
+        );
+        assert!(dragged.state.offset.y > 100.0);
+        assert!(dragged.state.scroll_start_offset_from_top_left[1].is_some());
+        assert!(matches!(
+            capture(&ctx),
+            ExternalScrollCapture::Sequence {
+                phase: ExternalCapturePhase::Held { .. },
+                ..
+            }
+        ));
+        let click = pos2(start.x, first.inner_rect.top() + 120.0);
+        let frame = ctx.cumulative_frame_nr();
+        let clicked = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(dragged.state.offset.y),
+            vec![
+                pointer_button(old_position, false),
+                pointer_button(click, true),
+                pointer_button(click, false),
+            ],
+        );
+        assert!(
+            ctx.read_response(Id::unique("external-test-transport").with(1_usize))
+                .unwrap()
+                .clicked()
+        );
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+        assert!(matches!(capture(&ctx), ExternalScrollCapture::Sequence {
+            press_stamp: ExternalPressStamp { frame: stamp_frame, ordinal: 0 },
+            phase: ExternalCapturePhase::Released { .. }, ..
+        } if stamp_frame == frame));
+        let next = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(clicked.state.offset.y),
+            vec![],
+        );
+        assert!(
+            (clicked.state.offset.y - 620.0).abs() < 0.001,
+            "new completed click must follow old release: {}",
+            clicked.state.offset.y
+        );
+        assert_eq!(clicked.state.vel.y, 0.0);
+        assert!((next.state.offset.y - 620.0).abs() < 0.001);
+        assert_draw_position(&next, next.state.offset.y);
+    }
+
+    #[test]
+    fn external_capture_completed_bar_click_then_held_press_keeps_latest_sequence() {
+        let ctx = Context::default();
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let click = pos2(
+            first.inner_rect.right() + 3.0,
+            first.inner_rect.top() + 80.0,
+        );
+        let held = click + Vec2::new(0.0, 40.0);
+        let stamp_frame = ctx.cumulative_frame_nr();
+        let pressed = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![
+                pointer_button(click, true),
+                pointer_button(click, false),
+                pointer_button(held, true),
+            ],
+        );
+        assert!(
+            ctx.read_response(Id::unique("external-test-transport").with(1_usize))
+                .unwrap()
+                .clicked()
+        );
+        assert_eq!(
+            ctx.memory(|m| m.interaction().potential_drag_id),
+            Some(Id::unique("external-test-transport").with(1_usize))
+        );
+        let new_capture = capture(&ctx);
+        let moved = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(pressed.state.offset.y),
+            vec![crate::Event::PointerMoved(held + Vec2::new(0.0, 25.0))],
+        );
+        let move_capture = capture(&ctx);
+        let released = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(moved.state.offset.y),
+            vec![pointer_button(held + Vec2::new(0.0, 25.0), false)],
+        );
+        assert!(
+            matches!(new_capture, ExternalScrollCapture::Sequence {
+            press_stamp: ExternalPressStamp { frame, ordinal: 1 },
+            role: ExternalCaptureRole::VerticalBar,
+            phase: ExternalCapturePhase::Held { position, .. }, ..
+        } if frame == stamp_frame && position == held),
+            "latest press must own capture: {new_capture:?}"
+        );
+        assert!(matches!(
+            move_capture,
+            ExternalScrollCapture::Sequence {
+                phase: ExternalCapturePhase::Held { .. },
+                ..
+            }
+        ));
+        assert!(
+            pressed.state.offset.y > 0.0,
+            "completed click must still move the bar"
+        );
+        assert!(
+            (pressed.state.offset.y - 620.0).abs() < 0.001,
+            "completed click then new track press must apply in input order"
+        );
+        assert!(pressed.state.scroll_start_offset_from_top_left[1].is_some());
+        assert!(
+            moved.state.offset.y > pressed.state.offset.y + 100.0,
+            "held drag must continue: {} -> {}",
+            pressed.state.offset.y,
+            moved.state.offset.y
+        );
+        assert!((released.state.offset.y - moved.state.offset.y).abs() < 0.001);
+        assert_eq!(released.state.vel.y, 0.0);
+        assert!(matches!(capture(&ctx), ExternalScrollCapture::Sequence {
+            press_stamp: ExternalPressStamp { frame, ordinal: 1 },
+            phase: ExternalCapturePhase::Released { .. }, ..
+        } if frame == stamp_frame));
+    }
+
+    #[test]
+    fn external_vertical_edge_crossing_draws_final_drag_and_coast_position() {
+        for rubber_band in [false, true] {
+            for drag in [false, true] {
+                let ctx = Context::default();
+                ctx.global_style_mut(|style| {
+                    style.spacing.scroll.kinetic.rubber_band = rubber_band
+                });
+                let first = external_frame(
+                    &ctx,
+                    1200.0,
+                    200.0,
+                    ExternalScrollPosition::Sync(990.0),
+                    vec![],
+                );
+                let start = first.inner_rect.center();
+                if drag {
+                    external_frame(
+                        &ctx,
+                        1200.0,
+                        200.0,
+                        ExternalScrollPosition::Sync(990.0),
+                        vec![pointer_button(start, true)],
+                    );
+                } else {
+                    let mut state = first.state;
+                    state.vel.y = 2400.0;
+                    state.store(&ctx, first.id);
+                }
+                let moved = external_frame(
+                    &ctx,
+                    1200.0,
+                    200.0,
+                    ExternalScrollPosition::Sync(990.0),
+                    if drag {
+                        vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 40.0))]
+                    } else {
+                        vec![]
+                    },
+                );
+                assert_eq!(moved.state.max_offset.y, 1000.0);
+                if rubber_band {
+                    assert!(
+                        moved.state.offset.y > 1000.0,
+                        "legal rubber-band must remain"
+                    );
+                } else {
+                    assert_eq!(moved.state.offset.y, 1000.0);
+                    assert_eq!(moved.state.vel.y, 0.0);
+                }
+                assert_draw_position(&moved, moved.state.offset.y);
+            }
+        }
+    }
+
+    #[test]
+    fn external_vertical_extent_shrink_to_fitting_content_draws_clamped_coast() {
+        for rubber_band in [false, true] {
+            let ctx = Context::default();
+            ctx.global_style_mut(|style| style.spacing.scroll.kinetic.rubber_band = rubber_band);
+            let first = external_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                ExternalScrollPosition::Sync(0.0),
+                vec![],
+            );
+            let mut state = first.state;
+            state.vel.y = 2400.0;
+            state.store(&ctx, first.id);
+            let shrunk = external_frame(
+                &ctx,
+                100.0,
+                200.0,
+                ExternalScrollPosition::Sync(0.0),
+                vec![],
+            );
+            assert_eq!(shrunk.state.max_offset.y, -100.0);
+            assert_eq!(shrunk.state.offset.y, 0.0);
+            assert_eq!(shrunk.state.vel.y, 0.0);
+            assert_draw_position(&shrunk, 0.0);
+        }
     }
 
     #[test]

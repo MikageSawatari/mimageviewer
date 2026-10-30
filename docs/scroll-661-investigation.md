@@ -932,3 +932,94 @@ F12／複数窓の変更範囲と構造上の理由はdetached計画§11へ追�
 実機確認は利用者の事前承認を得る別枠で、今後は専用dataと200／100の有効ZIPによるツリー往復、
 Collectionの本からの各帰還、両renderer・通常wheel／drag・A/B／F12を確認する。予定は1枠約10〜15分＋準備。
 今回、実画面で確認済み／報告者のWindows10で改善済みとは報告しない。
+
+<a id="implementation-review-revise"></a>
+
+### 6c4369e3e の実装独立レビュー後の再修正（2026-10-30）
+
+ClaudeCodeが前節までを `6c4369e3e` へコミットし、独立実装レビューでP2四件のREVISEとなった。
+構造的修正の方向は合意済みだが、前節のR1／R2等の完了記録だけでは以下の未達を検出できていなかった。
+その記録を当時の結果として保持し、四件を回帰へ追加して再確認した。開始時の作業ツリーはclean。
+
+| 指摘 | 確認した違反と修正した所有境界 |
+| --- | --- |
+| 1: barのpress→release→press Held | 完了clickをendで処理すると、古いReleasedが新Heldとgrabを上書きした。`finish_external_bar_press` は既存press stampを後退させず、frame-localなbar位置にも既存 `ExternalPress` のstampを渡す。完了click／bar位置の最大2区間をstamp順で適用し、新Heldのgrabを維持する |
+| 2: non-rubber位置と描画の不一致 | `AxisPhysics::drag/step` は非rubberのclampをcallerへ委ねるため、opt-in配置前に現在boundsへ確定し、実際に越境をclampしたときはY速度も終端する。正当なrubber-bandを維持し、viewport／origin／返却Stateの位置を一致させる。既定APIの配置順・physics式は変更しない |
+| 3: 旧touch releaseによる宛先cellの操作 | 両rendererが実 `TouchFrame` を共通 `handle_cell_interaction` へ渡し、primary click／double-clickの適用だけをrelease所属で拒否する。press、right-drag抑止、native D&Dの既存受理は分けて維持し、旧release後の新Heldを奪わない |
+| 4: raw End(q)とbackend release(p)の誤照合 | backendのgate／cursor／既存pendingを `PointerTransport` へ集約。実PointerMoved／Goneでcursorを観測し、Endは最後のcursor位置でreleaseを照合する。cursorなしならGoneのみを待つ。scope交代でbackendの状態を消さず、旧Endの正常なtailで現在recognizerを取り消さない |
+
+`TouchFrame::should_suppress_response` は、後続pressで変わるaggregateなresponse座標に依存せず、
+既存API `released_buttons_with_click_counts()` の最後のclick-bearing primary releaseへ対応させる。
+派生情報のprimary-release ordinalを相関結果に保持し、曖昧なCurrentイベントがfinishで除去されても
+Retiredの序数を詰めない。clickがない場合は最後のterminal releaseへ対応し、Stillのdrag終端抑止も保つ。
+このcounterはframe-localであり、新しい永続bool／pending枠／queueは加えていない。
+EndGoneは既存pending enum内で未確認のterminal commandを運び、Goneの確認前に実行せず、scope退役で破棄する。
+
+#### 先行REDと修正後の回帰
+
+- vendorの元3回帰は **0 PASS / 3 FAIL**（exit100）を先行確認した。
+  `external_capture_completed_bar_click_then_held_press_keeps_latest_sequence` は
+  press→release→press Held→次frame Move→releaseを実Contextへ渡す。
+  `external_vertical_edge_crossing_draws_final_drag_and_coast_position` と
+  `external_vertical_extent_shrink_to_fitting_content_draws_clamped_coast` は、rubber有効／無効、drag／coast、
+  scroll不要へ縮小したSyncを通し、viewport／origin／返却Stateを検査する。
+  ログとsource前後SHAは `target/scroll661-revise-vendor-{red,green}.{log,json}`。
+- vendor途中の独立レビューで、逆向きの「前frame Held→旧release→新short click/release」も必要と判明した。
+  旧releaseのbar位置を新clickより後に適用する逆転を、期待620／実127.99998のREDで確認した。
+  `external_capture_old_bar_release_then_short_click_keeps_input_order` を追加し、上記stamp順へ修正した。
+  正当なbar releaseの浮動小数差だけは0.001pt許容とし、入力順の位置期待は維持した。
+  最終 **165 PASS / 0 FAIL**（1.088s、compile込み5.36s、exit0）。
+  run `0eeb7c0e-f5d9-427d-8554-bdf8e188047e`、
+  `target/scroll661-revise-vendor-order-{red,green}.{log,json}`。
+  vendor source SHA-256は前後一致の `465e6febc5054cc2ee2bdc2a7618d88058761106f9d96575acd30c58fb9b40e8`。
+- 指摘4の2回帰は、旧Move(p)→scope交代→新接点2 scroll→旧End(q)/release(p)で、
+  曖昧扱い・現在接点の取消になるREDを確認した。
+  ログは `target/scroll661-revise-app-red.log`。修正後は同pass／分割tailの双方で接点2が継続する。
+  cursorなしEnd、EndGoneの分割／退役、後続の同座標mouse、除去されたCurrentと後続nonclick release、
+  Stillのnonclick drag終端を含む計6回帰を `touch_correlation.rs` へ追加した。
+  既存3fixtureはrelease座標／Goneのみの列をbackendの実生成規則へ訂正し、現接点保持のassertは維持した。
+- 指摘3の最初のFolder-only fixtureは、旧Endでegui clickが出る前提を満たさず、原因再現とは数えなかった。
+  実cell Responseのtest-only witnessでcaptureとtap候補を確認し、非モーダルな同path A/B採用を追加した。
+  実 `activate_quick_folder_slot` によるsession交代、同じcell ID、実egui clickを確認したうえで、
+  両rendererの旧releaseが選択None→Some(1)へ変える **4件の有効RED**を得た。
+  `target/scroll661-revise-app-red-3.log` はtouch全43件PASS／cell4件FAIL。
+  通常Folder採用の対照も残し、両renderer×Explorer／Check、旧End直後の同frame新mouse Held→次framerelease、
+  新しいtouch tapを正の対照にした。宛先のchecked={4}も旧releaseで消去・変更されないことを検査する。
+  新しい正対照で誤認した「Checkのplain clickでチェックも付く」という期待は、製品sourceを照合して
+  「選択更新・既存チェック保持」へ訂正した。旧capture／egui click、旧release後の選択・集合不変assertは維持した。
+  診断用SnapshotのDebug指定とmouse専用helperの新引数追従漏れによるcompile試行はテスト結果に数えない。
+
+最終focusedは **90 PASS / 0 FAIL**（13.950s、exit0）、run `46047350-dbff-4de8-8ef2-8939216efd71`。
+`target/scroll661-revise-app-green-3.log` に、追加回帰、元>>661、R1〜R4、Collection20件、
+実pinch／tapとtouch全件の成功を記録した。独立機能再レビューはACCEPT・追加指摘なし。
+
+#### 再修正の最終検証
+
+全Cargoは `MSBUILDDISABLENODEREUSE=1`。製品／test sourceを固定して検証し、結果確定後は文書だけを更新した。
+
+| コマンド・検証 | 結果 | 証跡 |
+| --- | --- | --- |
+| `cargo fmt`（引数なし）／`git diff --check` | 成功 | 最終sourceへ適用／差分確認 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | exit0、89.20s（compile込み） | `target/scroll661-revise-final-feature_check.log` |
+| `cargo nextest run --offline --manifest-path vendor/egui/Cargo.toml --target-dir vendor/egui/target --lib --no-fail-fast --retries 0 --ignore-default-filter` | 165 PASS、exit0 | `target/scroll661-revise-vendor-order-green.log`／同stem JSON |
+| `scripts/test-focused.ps1` | exit2、vendorを含む共有変更のためfullを選択 | `target/scroll661-revise-test-focused.log` |
+| `scripts/test-lib-full.ps1` | **15,003 PASS / 0 FAIL / 66 skipped**、551.869s、exit0 | `target/scroll661-revise-test-lib-full.log` |
+| `cargo test --test ui_snapshot` | **214 PASS**、35.96s（compile込み189.62s）、exit0、PNG差分なし | `target/scroll661-revise-final-ui_snapshot.log` |
+| `cargo run --locked -p viewer_context_audit` | **exit0・違反0**、80.88s | `target/scroll661-revise-final-viewer_context_audit.log` |
+
+full runは `ddcdd013-a87f-426d-8041-1fca13068bda`、
+source IDは `4de51cc21fa0a101185cb63544d63b2ec187fcd8f33ed19542b354a222c45514`。
+receiptは `target/test-lib-full/a4ad199e1391d6f35716f219b6c182a3d8d21369df92446ac1aeb9aaeb9f4097.json`、
+JUnit／詳細ログは `target/test-lib-full/runs/20261030T070743911Z-f9054bb1/`。
+元の再現期待値・Collection20件・startup73件は維持し、§1.487の既存ignoreも除外範囲を広げず保持した。
+最終各gateの実command／exitは `target/scroll661-revise-final-gates.json`、recorderは
+`target/scroll661-revise-run-final-gates.py`。recorderのexit0は採取完了であり、各テストのexitと区別する。
+
+vendor変更は `scroll_area.rs` のopt-in／同file testsと `PATCHES.md` に限定した。
+新しい公開fnはなく、登録表の追加は不要。`context.rs`／`interaction.rs`／`scroll_physics.rs`／egui-winitは無変更。
+default ScrollArea、physics式、F12／contextのmove／swap／fork／parkの規則は変更していない。
+共通workspace fullは前節のrelease内包exe3点不足が未解消で、引き続き未完了。
+製品起動・desktop操作・実profile使用・確認用build・commitは行っていない。
+最終の文書・証跡照合もSol / xhigh独立レビューでACCEPTとなった。
+reviewerは各結果と、変更した四つのRust sourceのSHAがfull検証時のものと一致することを確認し、
+Cargoや製品実行を重複していない。追加の未解決指摘はない。

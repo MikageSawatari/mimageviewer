@@ -25,6 +25,9 @@
   Set／AppGesture／session交代は明示位置を優先する。pointer・touchとも旧入力を宛先へ再所属させない。
   旧touch由来Moveと新mouse captureを混在させる既存経路は、基点比較後の設計担当判断で
   §1.487へ分離した。新契約では同frame描画にもその誤採用が出る差がある。範囲と完了状況は調査書を参照する。
+  セルのrelease受理も実TouchFrameへ接続し、後続pressのaggregate座標で旧clickの所属を上書きしない。
+  backend Endはraw Touch座標ではなく最後のcursor位置で相関する。barの完了click／保持区間はpress stamp順、
+  non-rubber位置はopt-inのcontent配置前に確定する。[再修正・検証](scroll-661-investigation.md#implementation-review-revise)を参照。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
 - **Popup / menu wheel passthrough**: `menu_button` / `ComboBox` / popup 内に
   `ScrollArea` を置く場合、popup が開いている frame では `raw_scroll_delta` /

@@ -1583,3 +1583,210 @@ fn retired_secondary_touch_move_cannot_drive_a_new_mouse_capture() {
         driver.tick_events(&mut env, None, vec![pointer_button(moved_mouse, false)]);
     }
 }
+
+fn cell_input_response(app: &App, ctx: &egui::Context, idx: usize) -> egui::Response {
+    ctx.data(|data| {
+        data.get_temp(egui::Id::unique((
+            "grid_cell_input_response",
+            app.grid_scroll_context_id(),
+            idx,
+        )))
+    })
+    .expect("the actual renderer must register the visible cell")
+}
+
+fn retired_cell_tap_after_adoption(details: bool, new_press_on_release: bool) {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for quick_slot in [true, false] {
+        for mode in [
+            crate::settings::GridClickSelectionMode::Explorer,
+            crate::settings::GridClickSelectionMode::Check,
+        ] {
+            let (mut env, mut driver, folder_destination) = input_fixture(details);
+            let destination = if quick_slot {
+                let source = env.current_folder.clone().unwrap();
+                env.set_quick_folder_slot_target(QuickFolderSlotId::A, source.clone());
+                env.set_quick_folder_slot_target(QuickFolderSlotId::B, source.clone());
+                env.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+                source
+            } else {
+                folder_destination
+            };
+            env.settings.grid_click_selection_mode = mode;
+            env.grid_scroll.request_edge(GridScrollIntent::Top);
+            driver.tick(&mut env, None);
+            let response = cell_input_response(&env, &driver.ctx, 1);
+            let point = response.interact_rect.center();
+            driver.tick_events(
+                &mut env,
+                None,
+                vec![
+                    raw_touch(1, egui::TouchPhase::Start, point),
+                    egui::Event::PointerMoved(point),
+                    pointer_button(point, true),
+                ],
+            );
+            let held = cell_input_response(&env, &driver.ctx, 1);
+            assert_eq!(held.id, response.id);
+            assert!(
+                held.is_pointer_button_down_on(),
+                "the old cell must actually own the touch press"
+            );
+            assert!(
+                driver
+                    .ctx
+                    .input(|input| input.pointer.could_any_button_be_click()),
+                "the old press must still be a tap candidate: {held:?}"
+            );
+            assert!(!env.native_drag_just_finished);
+            if quick_slot {
+                let scope = env.grid_scroll_scope();
+                assert!(matches!(
+                    env.activate_quick_folder_slot(QuickFolderSlotId::B),
+                    QuickFolderSwitchTarget::Current
+                ));
+                assert_ne!(env.grid_scroll_scope(), scope);
+            } else {
+                adopt_input_destination_before_first_layout(&mut env, &destination);
+            }
+            // A destination may already have checks. The retired release may
+            // neither select its row nor clear this new list's checked set.
+            env.checked.insert(4);
+            let selected = env.selected;
+            let checked = env.checked.clone();
+            let generation = env.items_generation;
+            let next_press = point + egui::vec2(1.0, 0.0);
+            let mut events = vec![
+                raw_touch(1, egui::TouchPhase::End, point),
+                pointer_button(point, false),
+                egui::Event::PointerGone,
+            ];
+            if new_press_on_release {
+                events.extend([
+                    egui::Event::PointerMoved(next_press),
+                    pointer_button(next_press, true),
+                ]);
+            }
+            driver.tick_events(&mut env, None, events);
+            let released = cell_input_response(&env, &driver.ctx, 1);
+            assert_eq!(
+                released.id, response.id,
+                "exercise the same egui cell ID across list admission"
+            );
+            if quick_slot {
+                assert!(
+                    released.clicked_by(egui::PointerButton::Primary),
+                    "egui must produce the old captured click before mIV rejects it: response={released:?}, clicks={:?}, interaction={:?}, native_drag={}, modal={}",
+                    driver.ctx.input(|input| input
+                        .pointer
+                        .released_buttons_with_click_counts()
+                        .collect::<Vec<_>>()),
+                    driver.ctx.interaction_snapshot(|snapshot| (
+                        snapshot.clicked,
+                        snapshot.dragged,
+                        snapshot.drag_started,
+                        snapshot.drag_stopped
+                    )),
+                    env.native_drag_just_finished,
+                    env.sidecar_restore_active()
+                );
+            }
+            assert_eq!(
+                env.selected, selected,
+                "a retired release must not select a destination row"
+            );
+            assert_eq!(
+                env.checked, checked,
+                "a retired release must not toggle destination checks"
+            );
+            assert_eq!(env.items_generation, generation);
+            assert_eq!(env.current_folder.as_ref(), Some(&destination));
+            assert!(env.fullscreen_idx.is_none());
+            if new_press_on_release {
+                driver.tick_events(&mut env, None, vec![pointer_button(next_press, false)]);
+            } else {
+                driver.tick_events(
+                    &mut env,
+                    None,
+                    vec![
+                        egui::Event::PointerMoved(next_press),
+                        pointer_button(next_press, true),
+                    ],
+                );
+                driver.tick_events(&mut env, None, vec![pointer_button(next_press, false)]);
+            }
+            assert_eq!(
+                env.selected,
+                Some(1),
+                "the subsequent real mouse must work without an extra press"
+            );
+            if mode == crate::settings::GridClickSelectionMode::Check {
+                assert_eq!(
+                    env.checked, checked,
+                    "plain Check clicks preserve existing checks"
+                );
+            } else {
+                assert!(env.checked.is_empty(), "plain Explorer clicks clear checks");
+            }
+            // A fresh contact is also accepted; isolating the old release must not
+            // turn off current touch taps or rely on suppressing a whole frame.
+            let current = cell_input_response(&env, &driver.ctx, 2)
+                .interact_rect
+                .center();
+            driver.tick_events(
+                &mut env,
+                None,
+                vec![
+                    raw_touch(2, egui::TouchPhase::Start, current),
+                    egui::Event::PointerMoved(current),
+                    pointer_button(current, true),
+                ],
+            );
+            assert!(cell_input_response(&env, &driver.ctx, 2).is_pointer_button_down_on());
+            driver.tick_events(
+                &mut env,
+                None,
+                vec![
+                    raw_touch(2, egui::TouchPhase::End, current),
+                    pointer_button(current, false),
+                    egui::Event::PointerGone,
+                ],
+            );
+            assert_eq!(
+                env.selected,
+                Some(2),
+                "current touch taps must retain cell semantics"
+            );
+            if mode == crate::settings::GridClickSelectionMode::Check {
+                assert_eq!(
+                    env.checked, checked,
+                    "current touch retains plain Check semantics"
+                );
+            } else {
+                assert!(env.checked.is_empty());
+            }
+            assert_eq!(env.current_folder.as_ref(), Some(&destination));
+            assert!(env.fullscreen_idx.is_none());
+        }
+    }
+}
+
+#[test]
+fn retired_touch_release_cannot_click_destination_thumbnail_cell() {
+    retired_cell_tap_after_adoption(false, false);
+}
+#[test]
+fn retired_touch_release_cannot_click_destination_details_cell() {
+    retired_cell_tap_after_adoption(true, false);
+}
+#[test]
+fn retired_thumbnail_cell_release_does_not_consume_later_mouse_hold() {
+    retired_cell_tap_after_adoption(false, true);
+}
+#[test]
+fn retired_details_cell_release_does_not_consume_later_mouse_hold() {
+    retired_cell_tap_after_adoption(true, true);
+}

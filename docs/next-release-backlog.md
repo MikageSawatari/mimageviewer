@@ -90,7 +90,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 原因: 保存位置と選択は正しく復元されるが、同じegui ScrollAreaに残る旧一覧のmaxでphysicsが復元位置をoverscrollと判定し、上へ押し戻す。詳細／サムネイル共通。非同期の復元が最初の描画より早く終わる場合に決定的に再現する。
 - 修正: canonical位置・一回要求・未消費RowAnchor・描画geometryをcontextのscroll ownerへ集約。現在extentと明示更新の意味をphysics前、描画のviewport／originをその後の位置で確定するopt-in契約を両rendererへ接続した。可視一覧と入力の寿命を分け、旧一覧の慣性・capture・touch commandを引き継がず、同一覧の正当な操作とcontextのmove／swapを保つ。遅延や毎frameの強制復元は使わない。
 - **あわせて直した既存の不具合**: 詳細表示の再読み込み・自動再走査・resumeで、保存する行位置が以前のサムネイル列数を使い、選択行の画面内位置がずれる。実列数1・行高・body viewportを同じownerへ記録して保存／復元／revealで共有した。
-- 自動検証: 元の4再現、R1〜R4、入力／contextの回帰とCollection **20件すべて成功**。最終本体全件14,993件、UI snapshot214件、vendor egui161件成功。core／test-script check成功、audit違反0。共通workspace full gateはrelease内包exe3点未配置でビルド停止し未完了。出荷前に整った環境で完走する。[検証台帳](scroll-661-investigation.md#stage-c-final-verification)を参照。
+- 自動検証: 実装レビューのP2四件を再修正し、barの両方向の区間順、non-rubber描画、旧cell tap、異座標Endの回帰を追加。元の4再現、R1〜R4、Collection **20件すべて成功**。最終本体全件15,003件、UI snapshot214件、vendor egui165件成功。test-script check成功、audit違反0。共通workspace full gateはrelease内包exe3点未配置で未完了。出荷前に整った環境で完走する。[再修正台帳](scroll-661-investigation.md#implementation-review-revise)を参照。
 - 別件: touchとmouseを同時に使う旧第二指のsynthetic Move誤採用は基点からの既存不具合として§1.487へ分離し、理由付きignoreで保持した。新契約では同frameの描画にも出る差がある。Windows実機・報告者環境の製品確認は未実施。
 - 根拠: [>>661調査・設計・実装記録](scroll-661-investigation.md)、[Collection帰還の調査](collection-return-investigation.md)。DB/schema変更なし。F12／兄弟contextの所有境界は[detached §11](detached-rework-plan.md#11-リワーク外からの変更記録)に記録。規模: Medium。
 

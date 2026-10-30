@@ -90,6 +90,7 @@ pub(crate) fn ratingnav649_pointer_open_for_test(
                     &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
                     false,
                     suppress,
+                    &crate::touch_correlation::TouchFrame::default(),
                     pairing,
                     None,
                 ) {
@@ -16726,6 +16727,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
         touch_derived_pointer_activity: bool,
         suppress_primary_pointer: bool,
+        touch_frame: &crate::touch_correlation::TouchFrame,
         previous_grid_click_pairing: GridClickPairingState,
         primary_hit_areas: Option<&crate::app::ThumbnailHitAreas>,
     ) -> Option<AddressBarNav> {
@@ -16736,6 +16738,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ui.scope_id().with(idx),
             egui::Sense::click_and_drag(),
         );
+        #[cfg(test)]
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique((
+                    "grid_cell_input_response",
+                    self.grid_scroll_context_id(),
+                    idx,
+                )),
+                response.clone(),
+            );
+        });
         if !self.grid_item_input_allowed() {
             return None;
         }
@@ -16850,7 +16863,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 .interact_pointer_pos()
                 .is_some_and(|pos| areas.contains(pos))
         });
-        let primary_clicked = !suppress_primary_pointer
+        // Release ownership is independent of a later press in this batch.
+        // Keep that new press and native drag ownership intact while refusing
+        // a click produced by a retired list's touch release.
+        let suppress_primary_release =
+            suppress_primary_pointer || touch_frame.should_suppress_response(&response);
+        let primary_clicked = !suppress_primary_release
             && response.clicked_by(egui::PointerButton::Primary)
             && released_on_item
             && (primary_hit_areas.is_none()
@@ -16859,7 +16877,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     cell_context,
                     idx,
                 ));
-        let primary_double_clicked = !suppress_primary_pointer
+        let primary_double_clicked = !suppress_primary_release
             && response.double_clicked_by(egui::PointerButton::Primary)
             && (primary_hit_areas.is_none() || primary_clicked);
         if primary_clicked || primary_double_clicked || response.secondary_clicked() {
@@ -17762,6 +17780,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 &no_thumbnail_overlays,
                                 false,
                                 suppress_primary_pointer,
+                                touch_frame,
                                 previous_grid_click_pairing,
                                 None,
                             ) {
@@ -20402,6 +20421,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     &overlay_layout,
                                     touch_derived_pointer_activity,
                                     suppress_primary_pointer,
+                                    &touch_frame,
                                     previous_grid_click_pairing,
                                     hit_areas.as_ref(),
                                 ) {
@@ -28545,6 +28565,7 @@ mod grid_reclick_open_tests {
                                     state.touch_derived_pointer_activity
                                         || touch_frame.has_touch_derived_pointer_activity(),
                                     suppress_primary_pointer,
+                                    &touch_frame,
                                     previous_grid_click_pairing,
                                     None,
                                 )
@@ -29751,6 +29772,7 @@ mod grid_reclick_open_tests {
                                     &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
                                     false,
                                     false,
+                                    &crate::touch_correlation::TouchFrame::default(),
                                     previous,
                                     None,
                                 );

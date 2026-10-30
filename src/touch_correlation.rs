@@ -192,35 +192,59 @@ impl TouchFrame {
         })
     }
 
-    /// Convenience query for an egui response's primary release.
-    ///
-    /// The position equality is intentional: the egui-winit signature copies
-    /// the same logical-point position into the touch and synthetic pointer
-    /// events. Ambiguous or merely nearby pointer input remains on the existing
-    /// mouse path.
+    /// Follow the release that supplied egui's click, even if a later press
+    /// changed the response's aggregate pointer position. Release ordinals
+    /// preserve this association when ambiguous current events were discarded.
+    /// With no click, retain terminal-release suppression for viewer drags.
     pub(crate) fn should_suppress_response(&self, response: &Response) -> bool {
-        response
-            .interact_pointer_pos()
-            .is_some_and(|pos| self.should_suppress_primary(pos, false))
+        let release_ordinal = response.ctx.input(|input| {
+            let mut last_release = None;
+            let mut last_click = None;
+            for (ordinal, (_, click)) in input
+                .pointer
+                .released_buttons_with_click_counts()
+                .filter(|(button, _)| *button == PointerButton::Primary)
+                .enumerate()
+            {
+                last_release = Some(ordinal);
+                if click.is_some() {
+                    last_click = Some(ordinal);
+                }
+            }
+            last_click.or(last_release)
+        });
+        release_ordinal.is_some_and(|ordinal| {
+            self.primary_events.iter().any(|event| {
+                event.phase == PrimaryPhase::Button(false)
+                    && event.release_ordinal == ordinal
+                    && (event.should_suppress || event.ownership == PrimaryOwnership::Retired)
+            })
+        })
     }
 }
 
 impl TouchCorrelationState {
-    fn advance_pending(&mut self, event: &Event, frame: &mut FrameBuilder) -> bool {
-        let pending = self.pending.take().unwrap();
-        self.advance_pending_tail(pending, event, frame)
+    fn advance_pending(
+        &mut self,
+        event: &Event,
+        release_ordinal: usize,
+        frame: &mut FrameBuilder,
+    ) -> bool {
+        let pending = self.transport.pending.take().unwrap();
+        self.advance_pending_tail(pending, event, release_ordinal, frame)
     }
 
     fn advance_pending_tail(
         &mut self,
         pending: PendingSignature,
         event: &Event,
+        release_ordinal: usize,
         frame: &mut FrameBuilder,
     ) -> bool {
         match pending {
             PendingSignature::StartMoved(touch) => {
                 if matches!(event, Event::PointerMoved(pos) if *pos == touch.pos) {
-                    self.pending = Some(PendingSignature::StartButton(touch));
+                    self.transport.pending = Some(PendingSignature::StartButton(touch));
                     true
                 } else {
                     false
@@ -232,6 +256,7 @@ impl TouchCorrelationState {
                 }
                 frame.primary_events.push(CorrelatedPrimary {
                     pos: touch.pos,
+                    release_ordinal,
                     phase: PrimaryPhase::Button(true),
                     ownership: touch.ownership,
                     should_suppress: touch.should_suppress,
@@ -244,6 +269,7 @@ impl TouchCorrelationState {
                 if matches!(event, Event::PointerMoved(pos) if *pos == touch.pos) {
                     frame.primary_events.push(CorrelatedPrimary {
                         pos: touch.pos,
+                        release_ordinal,
                         phase: PrimaryPhase::Moved,
                         ownership: touch.ownership,
                         should_suppress: touch.should_suppress,
@@ -261,16 +287,24 @@ impl TouchCorrelationState {
                 }
                 frame.primary_events.push(CorrelatedPrimary {
                     pos: touch.pos,
+                    release_ordinal,
                     phase: PrimaryPhase::Button(false),
                     ownership: touch.ownership,
                     should_suppress: touch.should_suppress,
                     accepted_grid_tap: touch.accepted_grid_tap,
                 });
                 frame.commands.extend(touch.commands);
-                self.pending = Some(PendingSignature::EndGone);
+                self.transport.pending = Some(PendingSignature::EndGone(Vec::new()));
                 true
             }
-            PendingSignature::EndGone => matches!(event, Event::PointerGone),
+            PendingSignature::EndGone(commands) => {
+                if matches!(event, Event::PointerGone) {
+                    frame.commands.extend(commands);
+                    true
+                } else {
+                    false
+                }
+            }
             PendingSignature::CancelGone => matches!(event, Event::PointerGone),
         }
     }
@@ -280,9 +314,9 @@ impl TouchCorrelationState {
         // egui-winit's independent touch gate. MainGrid keeps that transport
         // mirror until the backend's matching End/Cancel actually releases it.
         if self.recognition.scope() == CommandScope::Unscoped {
-            self.pointer_touch = None;
+            self.transport.touch_id = None;
         }
-        self.pending = None;
+        self.transport.pending = None;
         let _ = self.recognition.recognizer_mut().handle_sample(
             geometry,
             TouchSample {
@@ -298,6 +332,9 @@ impl TouchCorrelationState {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CorrelatedPrimary {
     pos: Pos2,
+    /// Raw primary-release order, including current events later discarded as
+    /// ambiguous. Only meaningful for `Button(false)`.
+    release_ordinal: usize,
     phase: PrimaryPhase,
     ownership: PrimaryOwnership,
     should_suppress: bool,
@@ -323,7 +360,7 @@ enum PendingSignature {
     /// that primary event. Keep this tail state across passes so a leading
     /// `PointerGone` in the next pass is still consumed as part of the same
     /// egui-winit sequence.
-    EndGone,
+    EndGone(Vec<TouchCommand>),
     /// egui-winit emits only `PointerGone` after a gated touch cancellation;
     /// unlike `End`, there is no synthetic primary release.
     CancelGone,
@@ -335,7 +372,7 @@ fn pending_signature_name(pending: Option<&PendingSignature>) -> &'static str {
         Some(PendingSignature::StartButton(_)) => "StartButton",
         Some(PendingSignature::MoveMoved(_)) => "MoveMoved",
         Some(PendingSignature::EndButton(_)) => "EndButton",
-        Some(PendingSignature::EndGone) => "EndGone",
+        Some(PendingSignature::EndGone(_)) => "EndGone",
         Some(PendingSignature::CancelGone) => "CancelGone",
         None => "None",
     }
@@ -352,8 +389,8 @@ struct CorrelationStateSnapshot {
 impl CorrelationStateSnapshot {
     fn capture(state: &TouchCorrelationState) -> Self {
         Self {
-            pending: pending_signature_name(state.pending.as_ref()),
-            pointer_touch: state.pointer_touch.is_some(),
+            pending: pending_signature_name(state.transport.pending.as_ref()),
+            pointer_touch: state.transport.touch_id.is_some(),
             owner: state.recognizer().owner(),
             contacts: state.recognizer().contact_count(),
         }
@@ -441,13 +478,20 @@ impl Recognition {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct PointerTransport {
+    /// Mirrors egui-winit's `pointer_touch_id` independently of gesture scope.
+    touch_id: Option<TouchId>,
+    /// End releases at the last cursor position, not the raw Touch End point.
+    /// CursorLeft/End/Cancel clear it through their PointerGone event.
+    cursor_pos: Option<Pos2>,
+    pending: Option<PendingSignature>,
+}
+
 #[derive(Clone, Debug)]
 struct TouchCorrelationState {
     recognition: Recognition,
-    /// Mirrors egui-winit's `pointer_touch_id`. Its gate is open when this is
-    /// `None` or when the incoming touch id matches the stored id.
-    pointer_touch: Option<TouchId>,
-    pending: Option<PendingSignature>,
+    transport: PointerTransport,
     /// Replay-safe result for later egui passes in the same app frame.
     /// Commands are deliberately removed before this value is stored.
     repeatable_frame: TouchFrame,
@@ -460,8 +504,7 @@ impl Default for TouchCorrelationState {
     fn default() -> Self {
         Self {
             recognition: Recognition::Unscoped(TouchRecognizer::new()),
-            pointer_touch: None,
-            pending: None,
+            transport: PointerTransport::default(),
             repeatable_frame: TouchFrame::default(),
             repeatable_diagnostics: None,
         }
@@ -559,7 +602,7 @@ impl TouchCorrelationState {
             },
             CommandScope::Retired => Recognition::Retired(TouchRecognizer::new()),
         };
-        if let Some(pending) = &mut self.pending {
+        if let Some(pending) = &mut self.transport.pending {
             match pending {
                 PendingSignature::StartMoved(touch)
                 | PendingSignature::StartButton(touch)
@@ -569,7 +612,8 @@ impl TouchCorrelationState {
                     touch.ownership = PrimaryOwnership::Retired;
                     touch.accepted_grid_tap = false;
                 }
-                PendingSignature::EndGone | PendingSignature::CancelGone => {}
+                PendingSignature::EndGone(commands) => commands.clear(),
+                PendingSignature::CancelGone => {}
             }
         }
         self.repeatable_frame.retire();
@@ -595,8 +639,19 @@ impl TouchCorrelationState {
         diagnostics_enabled: bool,
     ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
         let mut frame = FrameBuilder::new(self, diagnostics_enabled);
+        let mut release_ordinal = 0;
         for event in events {
-            self.process_event(geometry, event, now_ms, &mut frame);
+            self.process_event(geometry, event, release_ordinal, now_ms, &mut frame);
+            if matches!(
+                event,
+                Event::PointerButton {
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    ..
+                }
+            ) {
+                release_ordinal += 1;
+            }
         }
         let (mut touch_frame, diagnostics) = frame.finish(
             self.recognition.scope(),
@@ -629,15 +684,23 @@ impl TouchCorrelationState {
         &mut self,
         geometry: &TapZoneGeometry,
         event: &Event,
+        release_ordinal: usize,
         now_ms: u64,
         frame: &mut FrameBuilder,
     ) {
-        if self.pending.is_some() {
+        // Observe every actual cursor event, including ordinary mouse moves.
+        // Gesture cancellation and scope changes must not rewrite backend state.
+        match event {
+            Event::PointerMoved(pos) => self.transport.cursor_pos = Some(*pos),
+            Event::PointerGone => self.transport.cursor_pos = None,
+            _ => {}
+        }
+        if self.transport.pending.is_some() {
             let pending = frame
                 .diagnostics
                 .as_ref()
-                .map(|_| pending_signature_name(self.pending.as_ref()));
-            if self.advance_pending(event, frame) {
+                .map(|_| pending_signature_name(self.transport.pending.as_ref()));
+            if self.advance_pending(event, release_ordinal, frame) {
                 return;
             }
 
@@ -669,6 +732,7 @@ impl TouchCorrelationState {
                 self.cancel_stream(geometry, now_ms);
                 frame.primary_events.push(CorrelatedPrimary {
                     pos: *pos,
+                    release_ordinal,
                     phase: PrimaryPhase::Button(*pressed),
                     ownership: PrimaryOwnership::Mouse,
                     should_suppress: false,
@@ -677,6 +741,7 @@ impl TouchCorrelationState {
             }
             Event::PointerMoved(pos) => frame.primary_events.push(CorrelatedPrimary {
                 pos: *pos,
+                release_ordinal,
                 phase: PrimaryPhase::Moved,
                 ownership: PrimaryOwnership::Mouse,
                 should_suppress: false,
@@ -713,7 +778,7 @@ impl TouchCorrelationState {
         // In particular, after the stored contact ends the gate reopens for
         // Move/End events from another contact that is still down.
         let receives_synthetic_pointer =
-            self.pointer_touch.is_none() || self.pointer_touch == Some(id);
+            self.transport.touch_id.is_none() || self.transport.touch_id == Some(id);
         let scope = self.recognition.scope();
         let accepted = match scope {
             CommandScope::Unscoped => true,
@@ -761,19 +826,25 @@ impl TouchCorrelationState {
 
         match phase {
             TouchPhase::Start => {
-                self.pointer_touch = Some(id);
-                self.pending = Some(PendingSignature::StartMoved(pending));
+                self.transport.touch_id = Some(id);
+                self.transport.pending = Some(PendingSignature::StartMoved(pending));
             }
             TouchPhase::Move => {
-                self.pending = Some(PendingSignature::MoveMoved(pending));
+                self.transport.pending = Some(PendingSignature::MoveMoved(pending));
             }
             TouchPhase::End => {
-                self.pointer_touch = None;
-                self.pending = Some(PendingSignature::EndButton(pending));
+                self.transport.touch_id = None;
+                self.transport.pending = Some(if let Some(pos) = self.transport.cursor_pos {
+                    PendingSignature::EndButton(PendingTouch { pos, ..pending })
+                } else {
+                    // on_mouse_button_input has no position to release after
+                    // PointerGone, so egui-winit emits only the Gone tail.
+                    PendingSignature::EndGone(pending.commands)
+                });
             }
             TouchPhase::Cancel => {
-                self.pointer_touch = None;
-                self.pending = Some(PendingSignature::CancelGone);
+                self.transport.touch_id = None;
+                self.transport.pending = Some(PendingSignature::CancelGone);
             }
         }
     }
@@ -1623,6 +1694,7 @@ mod tests {
         assert!(state.recognizer().should_suppress_primary());
 
         let stray = [
+            Event::PointerMoved(pos),
             touch(2, egui::TouchPhase::End, pos),
             primary(pos, false),
             Event::PointerGone,
@@ -1707,8 +1779,8 @@ mod tests {
                 .iter()
                 .all(|event| event.ownership == PrimaryOwnership::Mouse)
         );
-        assert!(cancelled.pointer_touch.is_none());
-        assert!(cancelled.pending.is_none());
+        assert!(cancelled.transport.touch_id.is_none());
+        assert!(cancelled.transport.pending.is_none());
 
         let mut invalid_cancel = TouchCorrelationState::default();
         let _ = process(&mut invalid_cancel, &cancel_start, 300);
@@ -1799,13 +1871,16 @@ mod tests {
         ];
         let first_frame = process(&mut state, &first, 100);
         assert_eq!(first_frame.commands(), &[TouchCommand::ToggleChrome]);
-        assert!(matches!(state.pending, Some(PendingSignature::EndGone)));
+        assert!(matches!(
+            state.transport.pending,
+            Some(PendingSignature::EndGone(_))
+        ));
 
         let mut second = vec![Event::PointerGone];
         second.extend(tap_events(2, pos));
         let second_frame = process(&mut state, &second, 200);
         assert_eq!(second_frame.commands(), &[TouchCommand::ToggleChrome]);
-        assert!(state.pending.is_none());
+        assert!(state.transport.pending.is_none());
     }
 
     #[test]
@@ -1858,8 +1933,8 @@ mod tests {
         assert!(disabled_start.has_touch_derived_pointer_activity());
         assert!(state.recognizer().is_active());
         assert_eq!(state.recognizer().contact_count(), 1);
-        assert_eq!(state.pointer_touch, Some(TouchId(1)));
-        assert!(state.pending.is_none());
+        assert_eq!(state.transport.touch_id, Some(TouchId(1)));
+        assert!(state.transport.pending.is_none());
 
         // Re-enable after the Start was observed while execution was blocked.
         // The matching End must close the same mirrored stream, not a reset or
@@ -1874,8 +1949,8 @@ mod tests {
         assert!(reenabled_end.should_suppress_primary(pos, false));
         assert!(!state.recognizer().is_active());
         assert_eq!(state.recognizer().contact_count(), 0);
-        assert!(state.pointer_touch.is_none());
-        assert!(state.pending.is_none());
+        assert!(state.transport.touch_id.is_none());
+        assert!(state.transport.pending.is_none());
 
         let next = state.process_frame(&geometry(), &tap_events(2, pos), 300, true);
         assert_eq!(next.commands(), &[TouchCommand::ToggleChrome]);
@@ -1904,8 +1979,8 @@ mod tests {
         );
         assert!(frame.touch_cancelled());
         assert!(!state.recognizer().is_active());
-        assert!(state.pointer_touch.is_none());
-        assert!(state.pending.is_none());
+        assert!(state.transport.touch_id.is_none());
+        assert!(state.transport.pending.is_none());
     }
 
     #[test]
@@ -1919,7 +1994,7 @@ mod tests {
         ];
         let _ = process(&mut state, &start, 100);
         assert!(state.recognizer().is_active());
-        assert!(state.pointer_touch.is_some());
+        assert!(state.transport.touch_id.is_some());
 
         let cancel = [touch(1, egui::TouchPhase::Cancel, pos), Event::PointerGone];
         let frame = process(&mut state, &cancel, 200);
@@ -1933,8 +2008,8 @@ mod tests {
         assert!(!state.recognizer().is_active());
         assert_eq!(state.recognizer().owner(), TouchOwner::Cancelled);
         assert!(frame.touch_cancelled());
-        assert!(state.pointer_touch.is_none());
-        assert!(state.pending.is_none());
+        assert!(state.transport.touch_id.is_none());
+        assert!(state.transport.pending.is_none());
     }
 
     #[test]
@@ -2030,7 +2105,7 @@ mod tests {
             ))
             .unwrap()
         });
-        assert_eq!(disabled_state.pointer_touch, Some(TouchId(1)));
+        assert_eq!(disabled_state.transport.touch_id, Some(TouchId(1)));
         assert_eq!(disabled_state.recognizer().contact_count(), 1);
 
         let mut enabled_frame = None;
@@ -2066,9 +2141,9 @@ mod tests {
             ))
             .unwrap()
         });
-        assert!(enabled_state.pointer_touch.is_none());
+        assert!(enabled_state.transport.touch_id.is_none());
         assert_eq!(enabled_state.recognizer().contact_count(), 0);
-        assert!(enabled_state.pending.is_none());
+        assert!(enabled_state.transport.pending.is_none());
     }
 
     #[test]
@@ -2140,8 +2215,8 @@ mod tests {
         assert_eq!(frame.commands().last(), Some(&TouchCommand::PinchEnd));
         assert!(frame.should_suppress_primary(first, false));
         assert!(!state.recognizer().is_active());
-        assert!(state.pending.is_none());
-        assert!(state.pointer_touch.is_none());
+        assert!(state.transport.pending.is_none());
+        assert!(state.transport.touch_id.is_none());
     }
 
     #[test]
@@ -2184,8 +2259,8 @@ mod tests {
         assert!(frame.should_suppress_primary(first, false));
         assert!(frame.should_suppress_primary(remaining, false));
         assert!(!state.recognizer().is_active());
-        assert!(state.pending.is_none());
-        assert!(state.pointer_touch.is_none());
+        assert!(state.transport.pending.is_none());
+        assert!(state.transport.touch_id.is_none());
     }
 
     #[test]
@@ -2212,7 +2287,7 @@ mod tests {
                 .any(|command| matches!(command, TouchCommand::Zoom { .. }))
         );
         assert!(state.recognizer().is_active());
-        assert!(state.pointer_touch.is_none());
+        assert!(state.transport.touch_id.is_none());
 
         let remaining = pos2(900.0, 400.0);
         let next_first = pos2(250.0, 400.0);
@@ -2250,8 +2325,8 @@ mod tests {
         );
         assert_eq!(state.recognizer().owner(), TouchOwner::Pinch);
         assert!(state.recognizer().is_active());
-        assert_eq!(state.pointer_touch, Some(TouchId(3)));
-        assert!(state.pending.is_none());
+        assert_eq!(state.transport.touch_id, Some(TouchId(3)));
+        assert!(state.transport.pending.is_none());
     }
 
     fn grid_geometry() -> TapZoneGeometry {
@@ -2543,8 +2618,8 @@ mod tests {
                 data.get_temp::<TouchCorrelationState>(state_id(root, TouchSurface::MainGrid))
             })
             .unwrap();
-        assert!(retired.pointer_touch.is_none());
-        assert!(retired.pending.is_none());
+        assert!(retired.transport.touch_id.is_none());
+        assert!(retired.transport.pending.is_none());
         assert_eq!(ctx.cumulative_frame_nr_for(child), 1);
         grid_viewport_frame(
             &ctx,
@@ -2722,15 +2797,339 @@ mod tests {
             scope,
             vec![
                 touch(1, egui::TouchPhase::End, old),
-                primary(old, false),
+                primary(pos2(600.0, 350.0), false),
                 Event::PointerGone,
             ],
             0.5,
         );
         assert!(retired_end.grid_commands(scope).is_empty());
-        assert!(retired_end.should_suppress_primary(old, false));
-        assert!(!retired_end.accepts_grid_tap_release(old));
+        assert!(retired_end.should_suppress_primary(pos2(600.0, 350.0), false));
+        assert!(!retired_end.accepts_grid_tap_release(pos2(600.0, 350.0)));
         assert!(retired_end.is_active());
+    }
+
+    #[test]
+    fn grid_retired_end_at_different_raw_position_preserves_current_contact() {
+        for split_tail in [false, true] {
+            let mut state = TouchCorrelationState::default();
+            let old_scope = egui::Id::unique("different-end-old");
+            let scope = egui::Id::unique("different-end-new");
+            let old_start = pos2(200.0, 400.0);
+            let old_pointer = pos2(200.0, 370.0);
+            let old_end = pos2(200.5, 369.5);
+            let new_start = pos2(600.0, 400.0);
+            let new_moved = pos2(600.0, 375.0);
+            state.select_scope(CommandScope::MainGrid(old_scope));
+            let _ = state.process_frame(&grid_geometry(), &grid_start(1, old_start), 100, true);
+            let _ = state.process_frame(
+                &grid_geometry(),
+                &[
+                    touch(1, egui::TouchPhase::Move, old_pointer),
+                    Event::PointerMoved(old_pointer),
+                ],
+                200,
+                true,
+            );
+            state.select_scope(CommandScope::MainGrid(scope));
+            let current = state.process_frame(
+                &grid_geometry(),
+                &[
+                    touch(2, egui::TouchPhase::Start, new_start),
+                    touch(2, egui::TouchPhase::Move, new_moved),
+                ],
+                300,
+                true,
+            );
+            assert_eq!(
+                current.grid_commands(scope),
+                &[TouchCommand::ScrollGrid { delta_y: -25.0 }]
+            );
+
+            // on_touch(Ended) releases at its last cursor position; unlike
+            // Start/Move it does not move the cursor to the raw End position.
+            let mut events = vec![touch(1, egui::TouchPhase::End, old_end)];
+            if split_tail {
+                let raw_end = state.process_frame(&grid_geometry(), &events, 400, true);
+                assert!(raw_end.is_active());
+                events.clear();
+            }
+            events.extend([primary(old_pointer, false), Event::PointerGone]);
+            let (retired, diagnostics) =
+                state.process_frame_with_diagnostics(&grid_geometry(), &events, 401, true, true);
+            let diagnostics = diagnostics.unwrap();
+            assert!(!diagnostics.ambiguous());
+            assert_eq!(diagnostics.cancel_stream_calls, 0);
+            assert!(retired.grid_commands(scope).is_empty());
+            assert!(retired.should_suppress_primary(old_pointer, false));
+            assert!(!retired.should_suppress_primary(old_end, false));
+            assert!(!retired.accepts_grid_tap_release(old_pointer));
+            assert!(retired.is_active());
+            assert!(state.recognizer().has_contact(2));
+            let continued = state.process_frame(
+                &grid_geometry(),
+                &[
+                    touch(2, egui::TouchPhase::Move, pos2(600.0, 350.0)),
+                    Event::PointerMoved(pos2(600.0, 350.0)),
+                ],
+                500,
+                true,
+            );
+            assert_eq!(
+                continued.grid_commands(scope),
+                &[TouchCommand::ScrollGrid { delta_y: -25.0 }]
+            );
+        }
+    }
+
+    #[test]
+    fn grid_retired_different_end_keeps_later_same_position_mouse_edge_independent() {
+        let mut state = TouchCorrelationState::default();
+        let old_scope = egui::Id::unique("different-end-mouse-old");
+        let scope = egui::Id::unique("different-end-mouse-new");
+        let old_pointer = pos2(200.0, 400.0);
+        let old_end = pos2(200.5, 399.5);
+        state.select_scope(CommandScope::MainGrid(old_scope));
+        let _ = state.process_frame(&grid_geometry(), &grid_start(1, old_pointer), 100, true);
+        state.select_scope(CommandScope::MainGrid(scope));
+        let _ = state.process_frame(
+            &grid_geometry(),
+            &[
+                touch(2, egui::TouchPhase::Start, pos2(600.0, 400.0)),
+                touch(2, egui::TouchPhase::Move, pos2(600.0, 375.0)),
+            ],
+            200,
+            true,
+        );
+        let mut events = vec![
+            touch(1, egui::TouchPhase::End, old_end),
+            primary(old_pointer, false),
+            Event::PointerGone,
+        ];
+        events.extend(mouse_click(old_pointer));
+        let (mixed, diagnostics) =
+            state.process_frame_with_diagnostics(&grid_geometry(), &events, 300, true, true);
+        let diagnostics = diagnostics.unwrap();
+        assert!(
+            diagnostics
+                .ambiguity_causes
+                .iter()
+                .all(|cause| matches!(cause.kind, AmbiguityCauseKind::UnmatchedPrimary))
+        );
+        assert_eq!(diagnostics.cancel_stream_calls, 2);
+        assert!(mixed.is_mouse_primary(old_pointer, true));
+        assert!(mixed.is_mouse_primary(old_pointer, false));
+        assert!(!mixed.should_suppress_primary(old_pointer, false));
+        assert!(
+            !mixed.is_active(),
+            "real mouse input still cancels gesture execution"
+        );
+        assert!(mixed.commands().is_empty());
+    }
+
+    #[test]
+    fn response_release_ordinal_survives_removed_current_and_later_nonclick_release() {
+        for nonclick_tail in [false, true] {
+            let ctx = egui::Context::default();
+            let mut state = TouchCorrelationState::default();
+            state.select_scope(CommandScope::MainGrid(egui::Id::unique("release-ordinal")));
+            let current = pos2(200.0, 400.0);
+            let retired = pos2(600.0, 400.0);
+            let mut events = tap_events(1, current);
+            events.extend([
+                Event::PointerMoved(retired),
+                primary(retired, true),
+                touch(2, egui::TouchPhase::End, retired + egui::vec2(0.5, 0.5)),
+                primary(retired, false),
+                Event::PointerGone,
+            ]);
+            if nonclick_tail {
+                // Return to the same release point after a real drag. The
+                // latest position/phase match is Mouse but did not click.
+                events.extend([
+                    Event::PointerMoved(retired),
+                    primary(retired, true),
+                    Event::PointerMoved(retired + egui::vec2(100.0, 0.0)),
+                    Event::PointerMoved(retired),
+                    primary(retired, false),
+                ]);
+            }
+            let frame = state.process_frame(&grid_geometry(), &events, 100, true);
+            assert!(
+                !frame
+                    .primary_events
+                    .iter()
+                    .any(|event| matches!(event.ownership, PrimaryOwnership::Current(_)))
+            );
+            assert!(frame.primary_events.iter().any(|event| {
+                event.phase == PrimaryPhase::Button(false)
+                    && event.release_ordinal == 1
+                    && event.ownership == PrimaryOwnership::Retired
+            }));
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(grid_geometry().surface),
+                    time: Some(0.1),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    let releases = ctx.input(|input| {
+                        input
+                            .pointer
+                            .released_buttons_with_click_counts()
+                            .collect::<Vec<_>>()
+                    });
+                    assert!(releases[0].1.is_some());
+                    assert!(releases[1].1.is_some());
+                    if nonclick_tail {
+                        assert!(releases[2].1.is_none());
+                    }
+                    ctx.root_ui(|ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
+                        assert!(frame.should_suppress_response(&response));
+                        assert!(
+                            frame
+                                .replay_for_later_passes()
+                                .should_suppress_response(&response)
+                        );
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn grid_retired_end_without_backend_cursor_preserves_current_contact() {
+        let mut state = TouchCorrelationState::default();
+        let old_scope = egui::Id::unique("cursor-gone-old");
+        let scope = egui::Id::unique("cursor-gone-new");
+        let old = pos2(200.0, 400.0);
+        let new = pos2(600.0, 400.0);
+        state.select_scope(CommandScope::MainGrid(old_scope));
+        let _ = state.process_frame(&grid_geometry(), &grid_start(1, old), 100, true);
+        state.select_scope(CommandScope::MainGrid(scope));
+        let _ = state.process_frame(
+            &grid_geometry(),
+            &[
+                touch(2, egui::TouchPhase::Start, new),
+                touch(2, egui::TouchPhase::Move, new - egui::vec2(0.0, 25.0)),
+                Event::PointerGone, // CursorLeft clears the backend position, not its gate.
+            ],
+            200,
+            true,
+        );
+        let (ended, diagnostics) = state.process_frame_with_diagnostics(
+            &grid_geometry(),
+            &[
+                touch(1, egui::TouchPhase::End, old + egui::vec2(0.5, 0.5)),
+                Event::PointerGone,
+            ],
+            300,
+            true,
+            true,
+        );
+        assert!(!diagnostics.unwrap().ambiguous());
+        assert!(ended.is_active());
+        assert!(ended.commands().is_empty());
+        assert!(!ended.accepts_grid_tap_release(old));
+        assert_eq!(ended.correlated_primary_release_positions().count(), 0);
+        assert!(state.transport.pending.is_none());
+        let continued = state.process_frame(
+            &grid_geometry(),
+            &[
+                touch(2, egui::TouchPhase::Move, new - egui::vec2(0.0, 50.0)),
+                Event::PointerMoved(new - egui::vec2(0.0, 50.0)),
+            ],
+            400,
+            true,
+        );
+        assert_eq!(
+            continued.grid_commands(scope),
+            &[TouchCommand::ScrollGrid { delta_y: -25.0 }]
+        );
+    }
+
+    #[test]
+    fn end_without_cursor_defers_commands_until_gone_and_scope_retirement_discards_them() {
+        for retire in [false, true] {
+            let mut state = TouchCorrelationState::default();
+            let scope = egui::Id::unique("end-gone-commands");
+            let first = pos2(200.0, 400.0);
+            let second = pos2(800.0, 400.0);
+            state.select_scope(CommandScope::MainGrid(scope));
+            let mut events = grid_start(1, first);
+            events.extend([
+                touch(2, egui::TouchPhase::Start, second),
+                touch(1, egui::TouchPhase::End, first),
+                primary(first, false),
+                Event::PointerGone,
+                touch(2, egui::TouchPhase::End, second),
+            ]);
+            let raw_end = state.process_frame(&grid_geometry(), &events, 100, true);
+            assert!(!raw_end.commands().contains(&TouchCommand::PinchEnd));
+            assert!(matches!(
+                state.transport.pending,
+                Some(PendingSignature::EndGone(_))
+            ));
+            if retire {
+                state.select_scope(CommandScope::Retired);
+            }
+            let terminal = state.process_frame(&grid_geometry(), &[Event::PointerGone], 200, true);
+            assert_eq!(
+                terminal.commands().contains(&TouchCommand::PinchEnd),
+                !retire
+            );
+            assert!(state.transport.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn response_still_suppresses_correlated_nonclick_drag_release() {
+        let ctx = egui::Context::default();
+        let mut state = TouchCorrelationState::default();
+        let start = pos2(500.0, 400.0);
+        let moved = pos2(500.0, 300.0);
+        for (index, events) in [
+            grid_start(1, start),
+            vec![
+                touch(1, egui::TouchPhase::Move, moved),
+                Event::PointerMoved(moved),
+                touch(1, egui::TouchPhase::End, moved + egui::vec2(0.5, 0.5)),
+                primary(moved, false),
+                Event::PointerGone,
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let frame =
+                state.process_frame(&grid_geometry(), &events, 100 + index as u64 * 100, true);
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(grid_geometry().surface),
+                    time: Some(0.1 + index as f64 * 0.1),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    if index == 1 {
+                        assert!(ctx.input(|input| {
+                            input
+                                .pointer
+                                .released_buttons_with_click_counts()
+                                .all(|(_, click)| click.is_none())
+                        }));
+                        ctx.root_ui(|ui| {
+                            let response =
+                                ui.allocate_rect(ui.max_rect(), egui::Sense::click_and_drag());
+                            assert!(frame.should_suppress_response(&response));
+                        });
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+        }
     }
 
     #[test]
@@ -2762,7 +3161,6 @@ mod tests {
                 primary(first, false),
                 Event::PointerGone,
                 touch(2, egui::TouchPhase::End, second),
-                primary(second, false),
                 Event::PointerGone,
             ],
             0.2,
@@ -2770,7 +3168,8 @@ mod tests {
         assert!(retired.commands().is_empty());
         assert!(!retired.is_active());
         assert!(retired.should_suppress_primary(first, false));
-        assert!(retired.should_suppress_primary(second, false));
+        assert!(!retired.is_touch_primary(second, false));
+        assert!(!retired.accepts_grid_tap_release(second));
     }
 
     #[test]
@@ -2797,8 +3196,8 @@ mod tests {
         assert!(tail.grid_commands(scope).is_empty());
         assert!(tail.should_suppress_primary(pos, false));
         assert!(!tail.accepts_grid_tap_release(pos));
-        assert!(state.pending.is_none());
-        assert!(state.pointer_touch.is_none());
+        assert!(state.transport.pending.is_none());
+        assert!(state.transport.touch_id.is_none());
     }
 
     #[test]
@@ -2897,8 +3296,8 @@ mod tests {
             .unwrap()
         });
         assert_eq!(state.recognition.scope(), CommandScope::Retired);
-        assert!(state.pointer_touch.is_none());
-        assert!(state.pending.is_none());
+        assert!(state.transport.touch_id.is_none());
+        assert!(state.transport.pending.is_none());
         let mut events = grid_start(2, pos);
         events.extend([
             touch(2, egui::TouchPhase::Move, pos2(500.0, 370.0)),
@@ -3043,8 +3442,8 @@ mod tests {
             ))
             .unwrap()
         });
-        assert_eq!(state.pointer_touch, Some(TouchId(1)));
-        assert!(state.pending.is_none());
+        assert_eq!(state.transport.touch_id, Some(TouchId(1)));
+        assert!(state.transport.pending.is_none());
         assert!(state.recognizer().has_contact(2));
         let next = scoped_grid_frame(
             &ctx,

@@ -357,3 +357,75 @@ and tests received independent ACCEPT. Latest standalone egui lib nextest:
 161 passed / 0 failed / 0 skipped, with `MSBUILDDISABLENODEREUSE=1` and no product
 launch; the run after restoring the mutation probe is recorded in
 `target/scroll661-stage-c-vendor-final.log` (1.735 s) in the repository root.
+
+## Scroll #661: Stage C review corrections (2026-10-30)
+
+Two opt-in boundary defects identified during independent review are corrected
+in `src/containers/scroll_area.rs`; the same file contains their regressions.
+
+- A completed short bar click followed by a new held press in one input batch
+  now applies the click before initializing/updating the final held grab. The
+  handle geometry is recomputed between these ordered inputs. Publishing the
+  earlier click's Released phase cannot replace a later press stamp in the
+  transport owner. The actual-Context regression sends press/release/press,
+  confirms native click evidence and final bar holding, then moves and releases
+  the second press. It checks the final Held/Released stamp, grab anchor and
+  ordered track position. No capture field, queue or history map was added.
+- AxisPhysics deliberately leaves non-rubber drag/coast edge correction to its
+  caller. The opt-in path now finalizes that correction and ends out-of-range
+  velocity before constructing content origin and viewport. This uses the
+  existing rubber-band classification and preserves legitimate overscroll.
+  Actual-Context tests cover drag and coast crossing the current maximum with
+  rubber-banding off/on, and same-session extent shrink to fitting content
+  with old coast and Sync(0), including returned State/viewport/origin agreement.
+- Default callers retain their original placement and single-position bar
+  calculation. No change was made to Context, interaction, InputState,
+  scroll_physics, egui-winit/eframe, Cargo.toml.orig or upstream provenance.
+
+The three new regressions were first run against unchanged production code:
+0 passed / 3 failed (exit 100), run
+`170da53b-59f1-4ded-bdac-099bac239ec5`. The click test observed the older ordinal
+0 Released owner instead of ordinal 1 Held; the geometry tests observed drawn
+Y 1029.3407 versus returned 1000 and drawn 39.3407 versus returned 0.
+The first fixture compile used retired Context style API names and was corrected
+before this RED run. A subsequent focused run passed 24/25; the remaining
+release comparison differed by 0.000061 pt through remapping and now uses a
+0.001 pt tolerance while retaining the concrete ordered-position assertion.
+
+Final standalone egui lib nextest: **164 passed / 0 failed / 0 skipped**, run
+`90002ec4-c515-49d6-89ab-325fd1a1adbe`, test duration 0.858 s (3.61 s including
+compile), exit 0. Command: `cargo nextest run --offline --manifest-path
+vendor/egui/Cargo.toml --target-dir vendor/egui/target --lib --no-fail-fast
+--retries 0 --ignore-default-filter`. Both runs used
+`MSBUILDDISABLENODEREUSE=1` and froze source while Cargo was running; SHA-256
+before/after matches are in the evidence JSON. Direct rustfmt check and
+`git diff --check` passed. Logs/evidence are repository-root
+`target/scroll661-revise-vendor-{red,green}.{log,json}`. Product launch, desktop
+input, real-profile access and commits were not performed. Application checks
+and independent acceptance are recorded separately in the main investigation.
+
+Follow-up review found the opposite interval order: a prior-frame bar owner can
+release before a new completed short click, leaving no final held press. The
+first correction incorrectly treated that older release position as later than
+the click. A fourth actual-Context regression now covers established bar
+hold/drag -> release -> short press/release -> next frame. Native click evidence,
+final button-up and the new Released stamp are verified before checking position.
+Against the first correction it failed at **127.99998 versus expected 620**,
+run `cf3c14a9-6ea5-4333-a342-bbd7845e31b0`, exit 100.
+
+The existing frame-local `bar_position` now carries the owning `ExternalPress`
+stamp instead of a bare position. The two bounded interval results (owner
+continuation/release and completed click) are applied in press-stamp order, so
+both old-release -> new-click and click -> final-held preserve event order and
+initialize each new grab after the earlier handle movement. This adds no
+persistent state, flag, queue or history. Default native input remains one
+position through the same calculation. The original three regressions remain.
+
+Latest standalone full egui lib nextest supersedes the 164-test checkpoint:
+**165 passed / 0 failed / 0 skipped**, run
+`0eeb7c0e-f5d9-427d-8554-bdf8e188047e`, duration 1.088 s (5.36 s including
+compile), exit 0, using the same command/environment as above. Source remained
+frozen during both runs; final SHA-256 is
+`465e6febc5054cc2ee2bdc2a7618d88058761106f9d96575acd30c58fb9b40e8`.
+Evidence is `target/scroll661-revise-vendor-order-{red,green}.{log,json}`.
+Direct rustfmt and diff checks passed. No product or desktop session was started.

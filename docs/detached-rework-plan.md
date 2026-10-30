@@ -6787,3 +6787,10 @@ API適合漏れで、ownerへ実際に模したgeometryを記録する6setupへ�
 当該73件と本体fullの再実行は全成功。製品のdetachedロジックやviewport述語を追加変更していない。
 共通workspace fullはランチャー内包release exe3点不足でテスト開始前に停止し、出荷判定は保留。
 全command・source・ログは [>>661最終台帳](scroll-661-investigation.md#stage-c-final-verification) を正本とする。
+
+実装独立レビューP2四件の再修正では、bar入力区間の順序・non-rubberの配置前確定と、
+旧touch releaseのセル受理／backend cursorに沿うtransport終端を所有境界内で修正した。
+新しいdetached状態や述語、HWND／viewport生成・閉鎖・focusは変更せず、既存のcontext移譲規則も維持する。
+同一path A/Bの実cell captureから旧tapを拒否し、後続mouse保持／新touchを受理する回帰を両rendererへ追加した。
+本体15,003件・vendor165件・snapshot214件とaudit違反0。共通workspace fullの前提不足は継続している。
+理由・先行RED・最終証跡は [再修正台帳](scroll-661-investigation.md#implementation-review-revise) に記録した。
