@@ -112,12 +112,15 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
 
-- 状態: **未着手・修正対象として採用 (2026-10-29)**。修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。
-- 調査結果: `src/ui_folder_pane.rs::render_folder_pane` は、保存比率と現在の画面幅から初期幅を求める一方、描画後の実幅 / 現在の画面幅を毎回設定へ書き戻す。egui の `PanelState` は初回の幅を保持し、その後の `.default_size` より優先するため、初回描画後に画面幅が増えると、ツリーの実幅が変わらないまま保存比率だけが小さくなる。
-- 非対話試験: 同じ Panel と幅計算を使い、毎回新しい egui Context で画面幅 1280 → 1920 の起動を繰り返すと、保存比率 0.35 からツリー幅が 448 → 299 → 199 → 180px と縮み、比率下限 0.12 で止まった。1920 → 1920 の対照条件では 672px / 0.35 を維持した。**相当する描画処理での再現であり、mIV 実画面や報告者と同じ条件での再現ではない。**
-- 起動経路の候補: `src/lib.rs` と `src/app.rs` は通常サイズで生成後、DPI・作業領域に合わせたサイズ補正や表示後の最大化を行う。ツリーの初回描画とそのサイズ変更の順序を確認する。白い画面のちらつきを防ぐ既存の起動手順を取り除く修正にはしない。
-- 方針: ユーザーが選んだ幅と、起動途中・制約下の描画幅を区別し、画面サイズの変化だけで保存する希望値が書き換わらないようにする。比率 / 実幅のどちらを設定として持つか、手動リサイズと上下限の扱いを設計時に確定する。遅延や強制リセットで症状だけを抑えない。
-- 検証: 起動と終了を繰り返す幅復元、通常 → 最大化、同一サイズの対照、手動リサイズ、DPI / 作業領域の変更、最小・最大幅を回帰する。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)、`vendor/egui/src/containers/panel.rs::outer_size`。規模 / 優先度: Small〜Medium の暫定見積り / P2。
+- 状態: **実装済み・実機未確認 (2026-10-30、v4.10.1 対象)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。製品起動・報告者環境での確認は未実施。
+- 原因: `render_folder_pane` が描画後の実幅 / 画面幅を毎回設定へ書き戻していた。egui の `PanelState` は初回の幅を保持するため、その後の画面拡大で実幅は変わらず保存比率だけが縮む。新しい Context で 1280 → 1920 の起動を繰り返す非対話試験でも幅 448 → 299 → 199 → 180、比率 0.35 → 0.12 を再現した。1920 → 1920 の対照は672 / 0.35を維持。**実画面・報告者環境での再現ではない。**
+- 修正: 本体とテスト共通の `show_folder_pane_panel` で、境界ハンドルのドラッグ中・終了時、または AccessKit の Increment / Decrement / 数値 SetValue があるときだけ保存比率を更新する。P2対応で支援技術による既存操作の保存を維持し、相殺する増減・無効な値・別ノード・リサイズ禁止中の要求は保存しない。ハンドル ID は既存の親 scope + panel salt + `__resize` 規則を使う。vendor・保存形式・幅 / 比率の上下限・起動手順は変更せず、新しい永続状態や時間条件もない。
+- 変わる挙動: 起動中のサイズ補正・最大化・ウィンドウのリサイズや上下限制約だけでは保存比率を更新しない。同一起動中は egui が保持する実幅を使い、次回起動時は保存比率 × 初回描画時の画面幅から始める。
+- 回帰テスト: 初回は RED 2成功・4失敗 → 修正後6成功（起動幅変化・対照・上下限・ドラッグ / release・境界以外の入力）。P2では実際の AccessKit tree の Splitter へ要求する5件を追加し、保存・再起動復元の3件で RED、無効要求・リサイズ禁止の2件は成功。P2修正後の `cargo test -p mimageviewer --lib section1472 -- --nocapture` は **11件成功**。fmt / fmt --check / `cargo check -p mimageviewer --lib --tests --features test-script` も成功。P2ログは `target/section1472/accesskit-{red,green,fmt,check}.log`。
+- P2全件検証: focused exit 2 → lib全件 **15,074成功・1失敗・66除外（exit 100）**。関連16件と紙めくり同名testは成功。失敗は `app::tests::scroll_661::row_anchor_observation_keeps_middle_selected_row_in_both_renderers` の `scroll_661.rs:569`（must adopt changed rows）で、単独再実行は1成功。原因未確定、該当ソースは無変更、全件成功とは扱わない。ログ / JUnit: `target/test-lib-full/runs/20261030T121214134Z-fb7e36dc/`、単独: `target/section1472/accesskit-scroll-rerun.log`。
+- 紙めくりの切り分け: 初回の `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` 失敗（§1.447と同名）の記録は `b153c4b32` に保持。設計担当のmaster単独試験は成功との報告。今回4環境変数を外すと TurboJPEG の CMake/MSBuild exit 1 で **テスト実行前に停止**。通常環境での成否・環境差の影響は未確認。`git diff b153c4b32^ -- src/ui_fullscreen` は空（exit 0）。stash・親commit展開・紙めくり変更なし。ログ: `target/section1472/page-turn-default-env.log`。
+- 確認用build: P2後も `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` 成功（通常profile、core / Remote / EPUB worker・依存DLL検査）。未起動・実機未確認。初回のUI snapshot214成功・PNG差分なし等の証拠は `b153c4b32` の記録を維持し、今回は表示変更がなく再実行していない。仕様 §2.4もAccessKit操作へ合わせた。
+- 検証環境: `MSBUILDDISABLENODEREUSE=1`。既存の事前ビルド済み同一 TurboJPEG archiveを `TURBOJPEG_SOURCE=explicit` で再利用し、LibRawのinclude pathを `CXXFLAGS` で補う（製品のbuild設定は無変更）。環境指定は `target/section1472/test-env.ps1`、P2のREDは同directoryの `accesskit-red.log`。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)。規模 / 優先度: Small / P2。
 
 ### 1.486 Snapshot（★固定）の固定ownerとcanonical origin / routeの単一所有
 
