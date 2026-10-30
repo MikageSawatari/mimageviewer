@@ -107,6 +107,7 @@
 | [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md) | リモートの動画 / 音声。PC 側トランスコード + HLS 配信、画質 mode、seek と再接続 |
 | [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
+| [mcp-integration-plan.md](mcp-integration-plan.md) | **設計検討中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性、公開文書への影響、tool の段階分けと試験実装 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
 | [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |
