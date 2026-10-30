@@ -581,7 +581,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 確認された前提: Remote の通常データ要求は操作権必須、指定した reader は worker から使える、
 純粋な読み取りを全 Remote phase で受けても cache 整合を壊さない、data dir はプロセス内で固定。
 
-## 14. 段階 0 の実装記録 (2026-10-30、round 2 `28664e3dd`・round 3 修正)
+## 14. 段階 0 の実装記録 (2026-10-30、round 3 `ee59d0cb9`・round 4 修正)
 
 作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。製品 core・launcher・インストール版は起動せず、
 通常の APPDATA をテストに使わない。MCP adapter だけは、設計担当の明示判断に従い使い捨て fixture
@@ -799,7 +799,7 @@ P2 3件・P3 2件を設計担当がすべて受理した。
 差分を確認し、初期化中 ping の版メタ情報迂回を追加指摘した。両 legacy 版の回帰テストと条件修正後、
 追加の P1/P2 はなし。実 pipe の full-trust 検証を source review で代替しない。
 
-### Round 3 の sandbox 内検証 (実装担当実行、未コミット差分)
+### Round 3 の sandbox 内検証 (実装担当実行、のちに `ee59d0cb9` として commit)
 
 | コマンド | 実 exit code / 結果 | ログ |
 |---|---|---|
@@ -827,7 +827,8 @@ fixture pipe の作成で OS 5 となり、adapter の起動には到達して�
 応答 queue 中の取消、受付前の取消 FIFO、古い権限 poll の破棄、idle 中の権限通知も成功した。
 実 pipe の新しい取消検査は、stdout を止めたまま fixture が実際の Cancel frame を受け取ることを要求する。
 DACL・integrity level の緩和、skip/ignore、製品 core/launcher 起動、通常 APPDATA 使用、snapshot 更新、
-test-full、commit は行っていない。今回の full-trust 結果は未受領。
+test-full、commit は行っていない。この実行時点では full-trust 結果は未受領だった。
+その後 ClaudeCode から受領した結果は下記の round 3 sandbox 外検証を参照。
 実 pipe gate が未成立のため `build-dev.ps1` は実行していない。
 
 ### Round 3 の sandbox 外再検証コマンド (ClaudeCode 担当)
@@ -841,3 +842,65 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
 通常ユーザーの full-trust context で上記全体を実行し、新規 blocked-stdout 実 Cancel を含む4件の
 実 pipe 経路も確認する。core/launcher の製品バイナリは起動しない。stdio 結合検査は許可済みの
 MCP adapter と使い捨て fixture のみを起動する。
+
+### Round 3 の sandbox 外検証 (ClaudeCode 実行、基点 `ee59d0cb9`)
+
+以下は ClaudeCode が full-trust context で実行し、round 4 の依頼で報告した結果。
+実装担当による sandbox 内の観測ではない。
+
+- `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored`
+  → **exit 0、IPC 6件 + MCP 29件成功**。
+- 上記の core 焦点 nextest → **exit 100、16成功/2失敗**。
+  `tags_use_the_projection_and_real_rating_database` と
+  `tag_and_collection_pages_continue_past_200_and_validate_cursors` が
+  `create_collection(...).recv().unwrap()` で `Err(Starting)` となった。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc::tests::tag/)'` を3回実行すると、
+  **1/2成功、1/2成功、0/2成功**。各回の exit code は報告に含まれていないため記録しない。
+  actor 起動完了前に fixture が request を発行するタイミング依存の失敗だった。
+
+### Round 4 の修正
+
+- 共通 `Fixture::new` は actor の `CollectionRuntimeEvent::Ready` を受信してから利用を開始する。
+  runtime のイベント channel に test 専用の bounded-time 受信口を設け、sleep・poll・再試行は使わない。
+  `Ready` は受付状態を Running に変更した後に送られるため、タグ・collection ページ・stdio 結合検査の
+  fixture が actor 準備前に書き込み要求を出す組み合わせを除ける。
+- 製品の `list_collections` は `list_catalog` / `load_collection` の受付・応答における
+  `CollectionStoreError::Starting` を `NotReady` / 「コレクションを準備しています…」へ変換する。
+  その他の actor error と channel 切断は従来の Internal を維持する。Starting と永続化失敗の
+  mapping を検査する unit test を追加した。
+- 待機口は `cfg(test)` のみ。製品側に同期待機・再試行や UI thread の変更を加えていない。
+
+### Round 4 の sandbox 内検証 (実装担当実行、未コミット差分)
+
+| コマンド | 実 exit code / 結果 | ログ |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-r4-core-check.log` |
+| `cargo check -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-r4-mcp-check.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc::tests::tag/) or test(=agent_ipc::tests::collection_starting_maps_to_not_ready)'` | 0。3/3成功 | `target/mcp-r4-targeted.log` |
+| 上記の core 焦点 nextest | 100。19実行、17成功/2失敗 | `target/mcp-r4-focused.log` |
+| `cargo fmt` → `cargo fmt --check` | 各0。全 workspace | `target/mcp-r4-fmt-check.log` / tool 実行記録 |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 各0 | tool 実行記録 |
+
+MCP / agent-ipc crate は今回変更していないため、上記の ClaudeCode full-trust 実行の
+exit 0 (6 + 29件成功) を再利用し、sandbox 内では crate tests を再実行していない。
+
+core 焦点 nextest でも報告されたタグ2件と新規 mapping 検査は成功。失敗は次の既知の
+restricted-token 環境の実 pipe 2件で、いずれも OS 5。stdio 結合検査は fixture pipe 作成時の拒否で、
+adapter 起動まで到達していない。skip/ignore や DACL の緩和は行っていない。
+
+- `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+
+`build-dev.ps1` は実 pipe gate 未成立のため実行していない。製品 core/launcher の起動、通常 APPDATA
+での実行、snapshot 更新、test-full、commit も行っていない。新たな設計矛盾はない。
+
+### Round 4 の sandbox 外再検証コマンド (ClaudeCode 担当)
+
+```powershell
+Set-Location G:\home\mimageviewer-mcp
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(=remote_ipc::pipe::tests::remote_pipe_dacl_has_one_current_user_ace)'
+```
+
+19件全体を通常ユーザーの full-trust context で実行する。報告されたタグ2件、新規 mapping、
+idle reader shutdown、実 core handler を使う fixture への stdio adapter 接続を含む。
+今回変更のない crate tests は ClaudeCode の round 3 full-trust 成功を再利用できる。

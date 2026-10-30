@@ -19,6 +19,13 @@ impl Fixture {
             dir.path().join("collection.db"),
         )
         .unwrap();
+        match runtime
+            .recv_event_timeout_for_test(Duration::from_secs(10))
+            .expect("collection runtime startup event")
+        {
+            crate::collection_store::CollectionRuntimeEvent::Ready(_) => {}
+            event => panic!("collection runtime did not start: {event:?}"),
+        }
         let handlers = Arc::new(Handlers {
             readers: crate::remote_ipc::SharedReaders::open(&settings).unwrap(),
             producer: Some(
@@ -110,6 +117,18 @@ impl Drop for Fixture {
         self.handlers.producer.as_ref().unwrap().close_and_drain();
         self.runtime.take().unwrap().shutdown_and_join();
     }
+}
+
+#[test]
+fn collection_starting_maps_to_not_ready() {
+    let starting = collection_error(crate::collection_store::CollectionStoreError::Starting);
+    assert_eq!(starting.code, ErrorCode::NotReady);
+    assert_eq!(starting.message, "コレクションを準備しています…");
+    let failure = collection_error(crate::collection_store::CollectionStoreError::Persistence(
+        "fixture failure".into(),
+    ));
+    assert_eq!(failure.code, ErrorCode::Internal);
+    assert_eq!(failure.message, "読み取りに失敗しました");
 }
 
 #[test]

@@ -124,6 +124,14 @@ fn error(code: ErrorCode, message: &str) -> AgentError {
 fn internal() -> AgentError {
     error(ErrorCode::Internal, "読み取りに失敗しました")
 }
+fn collection_error(cause: crate::collection_store::CollectionStoreError) -> AgentError {
+    match cause {
+        crate::collection_store::CollectionStoreError::Starting => {
+            error(ErrorCode::NotReady, "コレクションを準備しています…")
+        }
+        _ => internal(),
+    }
+}
 fn cancelled() -> AgentError {
     error(ErrorCode::Cancelled, "取り消しました")
 }
@@ -450,10 +458,10 @@ impl Handlers {
         let catalog = lease
             .client()
             .list_catalog()
-            .map_err(|_| internal())?
+            .map_err(collection_error)?
             .recv()
             .map_err(|_| internal())?
-            .map_err(|_| internal())?;
+            .map_err(collection_error)?;
         let more = catalog.definitions.len() > offset + limit;
         let mut collections = Vec::new();
         for definition in catalog.definitions.iter().skip(offset).take(limit) {
@@ -463,10 +471,10 @@ impl Handlers {
             let snapshot = lease
                 .client()
                 .load_collection(definition.id)
-                .map_err(|_| internal())?
+                .map_err(collection_error)?
                 .recv()
                 .map_err(|_| internal())?
-                .map_err(|_| internal())?;
+                .map_err(collection_error)?;
             collections.push(Collection {
                 name: definition.name.clone(),
                 count: snapshot.entries.len() as u64,
