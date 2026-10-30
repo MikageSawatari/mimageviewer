@@ -2376,6 +2376,13 @@ impl ContextAsyncOwner {
 
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
+    pub(in crate::app) fn grid_scroll(self) -> &'a super::GridScrollState {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.grid_scroll,
+            ContextRefSource::AtRest(bundle) => &bundle.grid_scroll,
+        }
+    }
+
     /// Passive surfaces share the immutable projection and never create an overview owner.
     pub(in crate::app) fn page_overview_view(
         self,
@@ -3170,6 +3177,7 @@ impl ViewerContextBundle {
 impl App {
     #[cfg(windows)]
     pub(in crate::app) fn pause_mounted_background_work_keep_current_frame(&mut self) {
+        self.grid_scroll.renew_session();
         if let Some(holdover) = self.fs_holdover_tex.as_mut() {
             holdover.finish_navigation_diagnostic("context_parked");
         }
@@ -6067,6 +6075,8 @@ mod tests {
         app.visible_indices = (0..app.items.len()).collect();
         app.details_order = app.visible_indices.clone();
         app.selected = Some(10);
+        app.grid_scroll
+            .record_geometry(super::GridScrollGeometry::new(1, 28.0, 600.0, 560.0));
         app.grid_scroll.set_position(offset);
         app.grid_scroll.set_row_anchor(Some(rows_above));
         app.grid_scroll.set_reveal_requested(reveal);
@@ -6155,7 +6165,14 @@ mod tests {
             assert_eq!(app.grid_scroll, main_scroll);
             let fork_scroll = main_scroll.fork();
             app.with_viewer_context_state(child, |owner| {
-                assert_eq!(owner.grid_scroll, fork_scroll);
+                assert_ne!(owner.grid_scroll.session(), main_scroll.session());
+                assert_eq!(owner.grid_scroll.offset(), fork_scroll.offset());
+                assert_eq!(owner.grid_scroll.geometry(), fork_scroll.geometry());
+                assert_eq!(
+                    owner.grid_scroll.reveal_requested(),
+                    fork_scroll.reveal_requested()
+                );
+                assert_eq!(owner.grid_scroll.pending_edge(), fork_scroll.pending_edge());
                 assert_eq!(owner.grid_scroll.row_anchor(), None);
                 assert!(owner.grid_scroll.reveal_requested());
                 assert_eq!(
@@ -6178,6 +6195,43 @@ mod tests {
             assert_eq!(app.grid_scroll, main_scroll);
             assert_eq!(app.grid_scroll.row_anchor(), Some(3));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn grid_scroll_registry_park_renews_only_parked_owner_and_mount_keeps_it() {
+        let mut app = crate::app::setup_app_for_test();
+        seed_grid_scroll_owner_for_test(&mut app, 84.0, 1, true, GridScrollIntent::Top);
+        let main = app.grid_scroll.clone();
+        let sibling = app.build_window_context_for_test(96613, |owner| {
+            seed_grid_scroll_owner_for_test(owner, 196.0, 4, false, GridScrollIntent::Bottom);
+        });
+        let parked = app.build_window_context_for_test(96614, |owner| {
+            seed_grid_scroll_owner_for_test(owner, 140.0, 2, true, GridScrollIntent::Bottom);
+        });
+        let sibling_scroll = app
+            .with_viewer_context_state(sibling, |owner| owner.grid_scroll.clone())
+            .unwrap();
+        let parked_scroll = app
+            .with_viewer_context(parked, |owner| {
+                let before = owner.grid_scroll.clone();
+                owner.pause_mounted_background_work_keep_current_frame();
+                assert_ne!(owner.grid_scroll.session(), before.session());
+                assert_eq!(owner.grid_scroll.offset(), before.offset());
+                assert_eq!(owner.grid_scroll.geometry(), before.geometry());
+                assert_eq!(owner.grid_scroll.row_anchor(), before.row_anchor());
+                assert_eq!(owner.grid_scroll.pending_edge(), before.pending_edge());
+                owner.grid_scroll.clone()
+            })
+            .unwrap();
+        assert_eq!(app.grid_scroll, main);
+        app.with_viewer_context_state(sibling, |owner| {
+            assert_eq!(owner.grid_scroll, sibling_scroll)
+        })
+        .unwrap();
+        app.with_viewer_context_state(parked, |owner| assert_eq!(owner.grid_scroll, parked_scroll))
+            .unwrap();
+        assert_eq!(app.grid_scroll, main);
     }
 
     #[cfg(windows)]

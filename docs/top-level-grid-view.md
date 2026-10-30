@@ -1,5 +1,13 @@
 # 最上位一覧ビューの ownership とスマートフォルダ scope
 
+## 一覧スクロールのowner（5ch >>661）
+
+位置・一回要求（復元／reveal／Edge）と未消費RowAnchor、描画geometryは `GridScrollState` に置く。
+App投影、ViewerContextBundle、SmartRootの退避／復帰はownerをまとめてmove／swapする。
+一回要求とRowAnchorは寿命が異なり、Edgeだけで未消費anchorを捨てない。
+保存データは従来の位置・選択の数値／キーのままで、eguiのgeometryや慣性を永続化しない。
+現在extent・位置更新・入力寿命の契約と段ごとの検証は [調査書](scroll-661-investigation.md#修正の設計) を参照。
+
 ## Everything 検索のsourceと物理child（§1.374、未リリース）
 
 Everythingは新しい最上位surfaceを増やさず `TopLevelGridView::Search` を共有する。

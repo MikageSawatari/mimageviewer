@@ -1,5 +1,28 @@
 # タブレット PC タッチ操作対応 — 調査と設計方針
 
+## 5ch >>661: MainGrid入力の寿命（2026-10-30）
+
+一覧のcanonical位置はcontextの `GridScrollState` が行境界で保持し、端数・glide・pinchは
+`(viewport, ViewerContextId)` の一時状態を同じ一覧sessionと照合する。可視一覧の採用や実parkで旧入力を終え、
+同じ一覧のresize／filter／sort／再走査、bundleの一時mount／depositでは入力寿命を変えない。
+サムネイルのScrollGrid・glideに加え、Pinch中とZoom／PinchEndを適用するframeもAppが位置を所有し、
+native Yのdrag／coastを重ねない。現在scopeのtap候補もStartからterminal frameまで同じ所有とし、
+閾値未満の移動をnative Yへ漏らさない。接点終了後は通常マウスを受理する。詳細のnative touch dragは維持する。
+
+recognizerはMainGrid sessionで区切るが、egui-winitのpointer gateとexact signatureのtransport相関は保持する。
+旧Move／End／CancelはRetiredとして宛先のScrollGrid／Zoom／tapを発行せず、旧Cancelで新接点を消さない。
+旧接点held中の新raw Startも受理する。TouchFrameの生成とcommand消費は同じscopeを照合する。
+同frameの後続mouse edgeは順序付き相関で区別し、同座標でも旧touchの抑止を本物mouseへ広げない。
+MainGridの混在入力中断はrecognizerだけを終え、backendのgateを勝手に解放しない。
+
+通常drive・StillFullscreen・transport-only・replayは当該viewportの `ctx.cumulative_frame_nr()` を使う。
+MainGrid非描画時は共通end-pass observerがtransportだけ観測し、discard後の再生ではcommandsを再配送しない。
+Appの更新counterをviewport frameの代用にしない。既存の方向settle・130 ms glide・列数pinchは維持する。
+自動回帰・独立レビュー・実機未確認の区別は [調査書](scroll-661-investigation.md) を参照。
+段Cは未完了。旧主接点のEnd後、新mouse captureへ旧第二接点のsynthetic Moveが流れる経路を
+実rendererの自動回帰で確認し、入力provenanceをnative消費境界へ渡す設計補足待ちで停止している。
+上記recognizer／commandの隔離だけでnative pointerの隔離も完了したとは扱わない。
+
 > 状態: **調査完了 / 仕様確定 / Phase 1 Step 3b / 3c まで実装済み**。2026-08-08。
 > Step 0 診断プローブ、Step 1 純ロジック認識器、Step 2 egui 入力源相関、
 > Step 3 静止画フルスクリーンの左右タップ / 中央クローム / ピンチズーム・パン / 相関済みクリック抑止、

@@ -33042,6 +33042,8 @@ fn bookmark_return_keeps_opened_row_visible_when_rows_changed() {
 
     assert_eq!(app.selected, Some(3));
     assert!(app.grid_scroll.reveal_requested());
+    app.grid_scroll
+        .record_geometry(GridScrollGeometry::new(1, 100.0, 200.0, 400.0));
     app.apply_scroll_to_selected(1, 100.0);
     assert_eq!(app.grid_scroll.offset(), 200.0);
 }
@@ -37951,6 +37953,8 @@ mod favorite_adjustment_defaults_tests {
         // 一番上を 2 行目にする → 2 * 150。**保存した pt (600) をそのまま使うと違う行になる。**
         app.grid_scroll.set_position(0.0);
         app.grid_scroll.set_row_anchor(Some(rows_above));
+        app.grid_scroll
+            .record_geometry(GridScrollGeometry::new(5, 150.0, 600.0, 1200.0));
         app.apply_scroll_to_selected(5, 150.0);
         assert_eq!(app.grid_scroll.offset(), 300.0);
         assert!(
@@ -37961,6 +37965,8 @@ mod favorite_adjustment_defaults_tests {
         // 使い切った後は従来どおり「見える最小限だけ動かす」に戻る。
         app.last_viewport_h = 600.0;
         app.grid_scroll.set_position(0.0);
+        app.grid_scroll
+            .record_geometry(GridScrollGeometry::new(5, 150.0, 600.0, 1200.0));
         app.apply_scroll_to_selected(5, 150.0);
         assert_eq!(
             app.grid_scroll.offset(),
@@ -100521,6 +100527,13 @@ mod smart_folder_transition_tests {
         );
 
         app.last_viewport_h = viewport_h;
+        let natural_h = app.current_grid_order().len().div_ceil(changed_cols) as f32 * cell_h;
+        app.grid_scroll.record_geometry(GridScrollGeometry::new(
+            changed_cols,
+            cell_h,
+            viewport_h,
+            natural_h,
+        ));
         app.apply_scroll_to_selected(changed_cols, cell_h);
         let selected_position = app
             .current_grid_order()

@@ -8546,6 +8546,7 @@ impl App {
         self.grid_click_selection_anchor = grid_click_selection_anchor_index
             .map(|index| super::GridClickSelectionAnchor::new(index, self.items_generation));
         self.grid_scroll = grid_scroll;
+        self.grid_scroll.renew_session();
         if layout_changed {
             self.grid_scroll.set_reveal_requested(true);
         }
@@ -11910,7 +11911,10 @@ mod tests {
         let root_scroll = app.grid_scroll.clone();
         let grid = app.take_visible_smart_folder_grid();
         assert_eq!(grid.layout.grid_scroll, root_scroll);
-        assert_eq!(app.grid_scroll, super::super::GridScrollState::default());
+        assert_eq!(app.grid_scroll.offset(), 0.0);
+        assert_eq!(app.grid_scroll.row_anchor(), None);
+        assert!(!app.grid_scroll.reveal_requested());
+        assert_eq!(app.grid_scroll.pending_edge(), None);
         park_smart_identity_test_root(&mut app, grid);
         app.grid_scroll.set_position(77.0);
         app.grid_scroll.set_row_anchor(Some(5));
@@ -11923,7 +11927,9 @@ mod tests {
         );
         assert_eq!(app.grid_scroll.row_anchor(), Some(5));
         assert!(app.restore_prepared_smart_folder_session(definition_id, None));
-        assert_eq!(app.grid_scroll, root_scroll);
+        assert_ne!(app.grid_scroll.session(), root_scroll.session());
+        assert_eq!(app.grid_scroll.offset(), root_scroll.offset());
+        assert_eq!(app.grid_scroll.geometry(), root_scroll.geometry());
         assert_eq!(app.grid_scroll.row_anchor(), Some(2));
         assert!(app.grid_scroll.reveal_requested());
         assert_eq!(

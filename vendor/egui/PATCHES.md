@@ -246,3 +246,113 @@ That change and its additional Escape cleanup have been withdrawn.
   panels/handlers for scope, preferences navigation/draft budget and erase input.
 
 Evidence: [docs/section445-stepped-slider-input.md](../../docs/section445-stepped-slider-input.md).
+
+## Scroll #661: external vertical geometry and position, Stage B (2026-10-30)
+
+Implementation checkpoint for the accepted design in
+[docs/scroll-661-investigation.md](../../docs/scroll-661-investigation.md).
+Stage C input-session/capture ownership and final application acceptance are
+still pending; this checkpoint is not a release candidate.
+
+- `src/containers/scroll_area.rs` adds the opt-in
+  `external_vertical_scroll(ExternalVerticalScroll { content_height, position })`
+  builder and `ExternalScrollPosition::{Sync, Set, AppGesture}`. The caller owns
+  canonical position and supplies the same current height used to allocate content.
+  Current Y bounds are available before native physics, and opt-in content origin
+  and viewport use the position after physics. Measured height is debug-checked
+  against the declaration, including margins; callers use an explicit shared
+  minimum viewport height and margin policy.
+- Sync preserves native motion. Set ends previous Y velocity/animation even for
+  an equal value or an already valid application-clamped value. Out-of-range
+  external values also clamp and terminate previous motion. AppGesture owns Y
+  motion and avoids double application through native drag/coast/target/bar paths.
+  A Set still allows current native input and preserves a held bar grab anchor.
+- Ordinary ScrollArea callers retain their original pre-physics placement and
+  native input/physics paths. No interaction ID/session policy, capture transfer,
+  Context/Interaction/InputState, egui-winit/eframe, or scroll_physics changes are
+  part of Stage B. Cargo.toml.orig and upstream provenance remain unchanged.
+- Ten additional same-file real-Context tests cover current growth/shrink/minimum
+  geometry, content origin/viewport, Set with velocity/target/both and equal
+  positions, Sync motion retention, range correction, AppGesture background/bar
+  ownership, held-bar Set, and native coast/nested/both-axes/stick/scroll-to/wheel
+  chaining controls. The first background fixture lacked a previous registered
+  background widget; a warm-up frame restored the retained Stage B capture
+  precondition. A wheel fixture initially omitted the current event phase/source
+  fields; the fixture compile error was corrected.
+
+Implementer verification (Windows, `MSBUILDDISABLENODEREUSE=1`, offline standalone
+graph, target `vendor/egui/target`): focused `containers::scroll_area::tests`
+11 passed; full egui lib nextest 150 passed / 0 skipped / 0 failed
+(run `d5f03cea-ba7d-47fa-83de-03c21601c043`), with the repository nextest config,
+default profile, retries 0, ignore-default-filter, and no-fail-fast. Direct
+`rustfmt --edition 2024 --check src/containers/scroll_area.rs` passed. Full App
+regressions, shared graphs, independent review and verification-build evidence
+belong to the application investigation ledger; no product was launched here.
+
+## Scroll #661: stable transport and input lifetime, Stage C (2026-10-30)
+
+The same opt-in builder now requires `interaction_session: Id` (logical input
+lifetime) and `interaction_id: Id` (stable viewport transport). App-owned geometry
+State IDs remain independent. This record supersedes Stage B's pending vendor
+capture work; full App integration and independent acceptance remain separate.
+
+- State keeps a serde-skipped `Native | ExternalVertical(session)` association.
+  An association change ends only its Y velocity/target/grab/momentum bounce;
+  canonical position and sibling geometry are preserved. External backgrounds
+  register the current inner rectangle. Background and Y-bar IDs derive from
+  the stable transport, so switching geometry/session does not invalidate a
+  press already delivered by egui begin-pass hit testing.
+- One private temp-data capture owner per transport records an Idle result or
+  a Sequence with viewport-frame/press-ordinal stamp, session, role, button and
+  Held/Released phase. The phase also records the processed viewport frame and
+  last held position. Ordered PointerEvents delimit the final unfinished press;
+  only actual Memory::interaction potential click/drag holding authorizes its
+  role. Response flags do not prove a new press. Existing clipped-rectangle hit
+  radius is retained, and coordinates alone never take another widget's press.
+- Old held input cannot move the destination or inject release velocity. A
+  release followed by a new same-ID press initializes a new sequence without
+  old delta/velocity or bar grab anchor. Current-session continuation and normal
+  release/coast remain active; a held bar survives ordinary Set. An additional
+  button or duplicate down cannot reassign the previous sequence. Lost egui
+  capture retires its authority. Completed short bar clicks use native click
+  evidence instead of pretending that final held evidence exists.
+- The same `ctx.cumulative_frame_nr()` result prevents replayed input and native
+  Y motion from applying twice during discard, including session changes between
+  passes, while retaining bar grab anchors. There is no event queue, history map,
+  synthetic input, capture setter/transfer, or modification to Context,
+  interaction, InputState, egui-winit/eframe, or scroll_physics.
+- Nine additional real-Context tests cover first-destination press and normal
+  drag/release/coast, old drag -> switch/release/new same-ID press with missing
+  aggregate Response flags, bar re-press, two geometry sizes and State IDs,
+  stale held/extra-button/duplicate-down/escape, short bar click, another widget,
+  session physics and sibling isolation, and actual discard with a session change.
+  Stage B tests remain intact. During fixture construction, strict rectangle
+  containment rejected a valid near-bar native hit; the receiver now matches
+  egui's clipped hit radius. An end-pass fixture doing widget registration hit
+  the callback's reentrant plugin mutex; registration was moved into the normal
+  test UI body without changing production callback behavior.
+
+First Stage C checkpoint verification: `MSBUILDDISABLENODEREUSE=1`, offline standalone
+graph, target `vendor/egui/target`; focused scroll-area tests 20 passed, full egui
+lib nextest 159 passed / 0 skipped / 0 failed
+(run `7b6af0b8-d691-40a4-9e73-d98460a9a91b`, same config/profile/retry policy as
+Stage B), and direct rustfmt check passed. No product was launched. App R1/R2,
+other shared graphs and independent completion review are tracked in the main
+investigation ledger and are not claimed by these vendor results.
+
+Independent-review follow-up: the existing processed-frame stamp now includes
+the displayed session, separately from the press owner. A same-owner Sync retry
+retains the first pass's native offset even when App's half-row readback threshold
+kept its canonical value unchanged. Set, AppGesture and a new association retain
+their explicit position priority. Changed bounds clamp the retained result; same
+bounds preserve legitimate rubber-band displacement, including the existing
+end-of-area rubber-band classification. No extra pending field or flag was added.
+
+Two further real-Context regressions check App-style canonical 280 with a sub-row
+drag/coast/target, final viewport and rounded content origin, explicit-position and
+new-session controls, rubber-band retention and extent shrink during discard.
+The first origin assertion was corrected to use the existing physical-pixel/UI
+rounding contract for fractional native motion. The revised production boundary
+and tests received independent ACCEPT. Latest standalone egui lib nextest:
+161 passed / 0 failed / 0 skipped, with `MSBUILDDISABLENODEREUSE=1` and no product
+launch; log `target/scroll661-stage-c-vendor-full.log` in the repository root.

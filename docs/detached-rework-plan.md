@@ -6752,3 +6752,24 @@ core check・context audit（違反0）は成功した。row hintはmoveで保�
 一方、R3の詳細表示で既存の `last_grid_cols` 捕捉不整合を検出したため、設計担当判断へ返して停止。
 段Aの受入は未完了で、B/Cのvendor / session / capture / recognizer / 実park接続には未着手。
 viewport / HWND / native表示・入力の操作は行っていない。詳細とログは同じ調査書の再開後台帳を参照。
+
+設計担当が詳細の実列数1の記録を段Bのgeometry契約に含め、R3の受入を段Bへ移した。
+段Aは挙動不変（R3を除く）として `a930891dd` にコミット済み。段Bを再開する。
+比率変更でcanonicalを先に変換する既存経路も、描画のcontext / 世代 / 列数の証明とgeometryを
+同じscroll ownerへ集約し、兄弟や未描画のgeometryを使わない。構造上の理由と検証は調査書へ記録する。
+
+段Cではscroll ownerのsessionを、成功した実pauseとlive-media parkの当該ownerで更新する。
+mainへ戻った一時投影から兄弟を更新せず、forkはfresh、move／swap／一時mount／depositは位置とownerを移す。
+ROOTのkeep／prefetchが読む端数は、read-only Main ContextRefのscroll ownerを明示して取得する。
+detachedを一時投影しているからという理由でROOTの端数をdetachedへ付け替えない。
+egui Stateの保存IDはcontext＋renderer、captureのtransport IDはphysical viewportで分ける。
+MainGrid recognizerとcommand batchは同じsessionへ結び、非描画区間も共通end-passでtransportだけ観測する。
+HWNDのowner／focus／z-order、viewport生成／閉鎖、detachedの表示述語は変更していない。
+これは一覧のgeometry・位置・入力所属を本来のownerへ揃える修正で、症状guardや兄弟resetではない。
+実施した自動回帰と未実施の実画面確認は調査書の段C台帳に記録する。
+
+段Bの元4再現・R3を含む15件と関連520件は成功した。段Cでは旧主接点Endでbackendの
+pointer gateが空いた後、新mouse captureへ残る旧第二接点のsynthetic Moveが入る設計上の不足を
+実App／egui Context試験で確認し、追加の製品変更を停止した。viewer contextのsessionが正しくても、
+native pointerの各eventの由来が消費境界へ届かない問題であり、HWND／focus／viewport述語の
+条件追加では直さない。設計補足待ちで段C未受入・出荷不可。詳細は調査書の同日停止記録を参照。

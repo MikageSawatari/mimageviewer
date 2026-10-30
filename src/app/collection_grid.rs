@@ -1991,6 +1991,7 @@ impl App {
                 .as_ref()
                 .and_then(|cache| cache.cached(collection_id));
             self.install_collection_grid_items(Vec::new(), Vec::new(), None, collection_seed);
+            self.grid_scroll.renew_session();
         }
         // A header choice belongs to the prior root. A collection open, including history and
         // same-root reopen, starts from its installed collection order.
@@ -5905,7 +5906,7 @@ mod tests {
         app.settings.grid_cols -= 1;
         let owner = app.projected_viewer_context_id();
         if let super::super::GridAspectLayout::Thumbnail { context_id, .. } =
-            &mut app.grid_aspect_layout
+            app.grid_scroll.aspect_layout_mut_for_test()
         {
             *context_id = super::super::ViewerContextId::for_test(u64::MAX);
         }
@@ -5916,7 +5917,7 @@ mod tests {
             "another context does not own this anchor"
         );
         if let super::super::GridAspectLayout::Thumbnail { context_id, .. } =
-            &mut app.grid_aspect_layout
+            app.grid_scroll.aspect_layout_mut_for_test()
         {
             *context_id = owner;
         }

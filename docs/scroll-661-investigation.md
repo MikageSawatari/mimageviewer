@@ -211,6 +211,24 @@ ClaudeCode が別途承認を得た場合の確認枠:
 
 これらは新たな復元 bool / pending / guard の追加ではなく、既存の分散した要求の置換である。新しい async owner・待ち・channel は作らない。保存復元値の取得、worker 完了の採否・世代検査は各既存 owner に残す。
 
+#### 設計担当補足: 最終描画geometryとR3の受入段（2026-10-30）
+
+段Aで確認した詳細一覧の行位置捕捉不整合は、今回の修正対象に含める。
+最終描画の実列数・行高・viewportを一つのgeometry ownerが記録し、行位置の保存・復元・revealが
+同じ記録を使うことは段Bのgeometry契約に属する。詳細では実列数1を記録する。
+これは詳細表示で再読込・自動再走査後に選択行の画面内位置がずれる出荷済み不具合の修正でもある。
+fixtureの列数や期待値で隠さず、R3の両rendererによるreload / observation / resumeを段Bの受入とする。
+段Aの受入は「挙動不変（R3を除く）」とし、既知red4件とR3の失敗を記録したまま完了とする。
+段B末尾で元の再現4件とR3をgreenにしてから段Cへ進む。通常の使用手順・選択維持の仕様は変えない。
+
+段Bの独立実装レビューで、既存の比率変更が次の描画より先にcanonicalを変換する経路も確認した。
+最終描画のgeometryと、その描画が現在context / items世代 / 列数に属する証明を同じownerへ集約する。
+証明済みの比率変更ではcanonicalとgeometryを同時に変換し、保存・revealの単位を一致させる。
+geometryは「最終描画、またはその証明に基づく明示的な比率変換後」の記録とする。
+viewportは保持し、content / maxは実際の行数と新行高から再計算する。未描画・兄弟・別世代・列数違い・
+詳細表示では既存の変換制約を保つ。これはsingle-owner契約の実装不足を補うもので、
+独立reviewerも新たな設計前提相違ではないと確認した。予測値による無条件の上書きはしない。
+
 #### 論理一覧と入力セッション
 
 同じ owner が `GridScrollSessionId` を保持する。これは入力継続の identity であって、path、items generation、履歴キーの代用品ではない。context 内の値移譲は identity を維持し、新しい fork は fresh identity とする。
@@ -383,7 +401,7 @@ DB / sidecar / archive / 設定の schema・保存値の意味は変更せず mi
 
 R2には第2版のP3に対する **実Appのdiscard回帰**も必須とする。固定frame番号を渡す局所試験だけで済ませず、Full-frame headlessの実App update / renderから `ctx.request_discard` を通す。同一viewportの複数passでAppの `frame_counter` が進んでも `ctx.cumulative_frame_nr()` は同じであること、通常drive / transport-only / replayが同じ番号を読み、同じraw入力からのcommand生成・適用が一度だけであることを検査する。pass間にsession / 表示先を変えたケースでも旧入力を新規Startとして再認識せず、相関・Retired抑止を維持する。次のviewport frameの新しい入力は受理する。別viewportの独立したframe番号・処理を混同しない対照も含める。touchの番号だけを `self.frame_counter` に戻す変異で、実Appの二重駆動または誤った再受理を検出する。
 
-**R3（P2-3、段Aから保持し段B/Cでも再利用）**: 起動復元に加え、通常 reload / F5、自動観測 rescan、`ResumeList` / `RefreshList` の採用と hydration を実際に通す。最下行以外を選択して `rows_above > 0` を捕捉し、再採用後に同じ安定キーの選択項目が同じ画面内行位置へ来ることを両 renderer で検査する。選択項目より前に行が増減するケースも含め、旧 index / 絶対 offset だけの比較にしない。snapshot / context の move・fork、および操作由来の選択が復元に優先する既存規則も対照にする。refresh の `RowAnchor` を通常 reveal に置換する変異を検出できることを確認する。
+**R3（P2-3、段Bで受入し段Cでも再利用）**: 起動復元に加え、通常 reload / F5、自動観測 rescan、`ResumeList` / `RefreshList` の採用と hydration を実際に通す。最下行以外を選択して `rows_above > 0` を捕捉し、再採用後に同じ安定キーの選択項目が同じ画面内行位置へ来ることを両 renderer で検査する。選択項目より前に行が増減するケースも含め、旧 index / 絶対 offset だけの比較にしない。snapshot / context の move・fork、および操作由来の選択が復元に優先する既存規則も対照にする。refresh の `RowAnchor` を通常 reveal に置換する変異を検出できることを確認する。
 
 **R4（P2-4、段Bの受入）**: App の実 geometry resolver に canonical 840 と縮小後 max 560 を与え、**先に App が clamp して `Set(560)` を作る**ところから、非ゼロ native velocity と旧 target を持った実 ScrollArea に接続する。速度だけ / target だけ / 両方の状態、縮小した content と拡大した viewport の両方で試す。新規入力なしで canonical / 返却 offset が560、velocity が0、旧 target が終了し、**最初の描画の content origin / viewport も560に一致**すること、次 frame に旧 target へ戻らないことを検査する。有効な `Sync(560)` に置き換える変異で失敗することを確認する。位置が変わらない `Sync` の正当な coast / target、および Set 後の新入力・同一一覧で保持中の bar は別対照として残す。
 
@@ -399,7 +417,7 @@ R2には第2版のP3に対する **実Appのdiscard回帰**も必須とする。
 
 | 段 | 実装範囲 | 受入条件・>>661 の状態 |
 | --- | --- | --- |
-| **A: 挙動不変の所有者集約** | canonical / reveal / edge / 汎用 RowAnchor を `GridScrollState` へ移し、全 producer と bundle の move / swap / fork policy を移管。renderer は既存の offset 注入・読戻しのまま。新 physics / capture / recognizer の振舞いはまだ有効にしない | 既存 request の優先順位、history / A/B / context・touch の既存挙動、R3が保持される。core check・focused suite・fmt成功。**>>661 の決定的再現は従来どおり red**、対照は維持。自然順の偶然の pass を修正済みと扱わず、期待する既知 red は別記録。テストを ignore / 弱体化して gate を偽らない |
+| **A: 挙動不変の所有者集約** | canonical / reveal / edge / 汎用 RowAnchor を `GridScrollState` へ移し、全 producer と bundle の move / swap / fork policy を移管。renderer は既存の offset 注入・読戻しのまま。新 physics / capture / recognizer の振舞いはまだ有効にしない | 既存 request の優先順位、history / A/B / context・touch の既存挙動（R3を除く）が保持される。core check・focused suite・fmt成功。**>>661 の決定的再現は従来どおり red**、対照は維持。自然順の偶然の pass を修正済みと扱わず、期待する既知 red は別記録。テストを ignore / 弱体化して gate を偽らない |
 | **B: egui 契約と2 rendererの接続（>>661 本体）** | opt-in API の現在 geometry と `Sync/Set/AppGesture` 適用境界を実装。2 renderer が同じ geometry 解決結果を注入し、clamp の Set を含めて readback まで接続。この段は既存 interaction ID / capture / raw touch の受理挙動を維持し、session による新しい入力終端はまだ導入しない。最終 API の session / capture 部分は段Cで一括接続する | **既存9件を caller 適応だけで全 green**、追加 fast hydration両順序、R4、現在geometry・同一覧drag / coast / bar / touch・R3・関連history試験成功。vendor既定APIの対照も成功。ここで >>661 の旧boundsによるばねを解消した証拠が揃うが、入力寿命の全要件を満たした最終版とは扱わない |
 | **C: 入力寿命・contextの統合確認** | session発行を可視採用 / 実parkへ接続し、安定transport IDとcapture所属、MainGrid recognizer / command受理・fraction、contextの保存IDを同じ塊で導入する。touchのtransport観測 / replayも接続し、片側だけの失効を残さない | **R1/R2を含む全受入成功、R3/R4と>>661の全greenを保持**。同path A/B、無描画往復、fork / park / resume / promote・兄弟不変・入力router / snapshot / vendor対照を確認。最後に共有vendorを含む `test-full.ps1`、独立completion review、文書・証跡、検証buildを揃える |
 
@@ -565,3 +583,173 @@ fixtureに `last_grid_cols=1` を仕込む、期待値2を0へ変える、詳細
 作業差分は未コミットで保持する。製品binary / desktop操作 / 通常profileへのアクセスは行っていない。
 利用者指示により確認用buildも不要。未完成のためbacklogへ「実装済み」は追加しない。
 テスト・ビルドログはPowerShellのUTF-16 BOM付き出力で、機械読取時はBOMを尊重する。
+
+### 詳細geometryの修正承認と段B再開（2026-10-30）
+
+ClaudeCodeが段Aを `a930891dd`（`wip(grid): 5ch 661 stage A`）としてコミットした。
+直前の停止記録は当時の判断として保持する。設計担当は上記の出荷済み不整合を段Bの対象に含め、
+R3の受入を段Bへ移すと決定した。段Aは既存458件とowner5件・core check・auditの成功をもって
+挙動不変（R3を除く）のcheckpointを満たす。段B開始時の作業ツリーはclean。
+最終描画geometryの共有、旧boundsの排除、clampのSet伝達を実装し、元の4再現とR3を検査する。
+製品の起動・デスクトップ操作・確認用buildは依頼により行わない。
+
+### 段B: 現在geometryと位置更新契約の接続（受入済み）
+
+`GridScrollState` に最終geometryと描画proofを集約し、両rendererが同じresolverから
+content高・max・`Sync / Set / AppGesture`を取得する。詳細では列数1、実body高を記録する。
+Appでの先行clamp / snapもSetへ解決し、readbackは現在行高で丸めてmaxへ収め、再要求を出さない。
+eguiの変更は `scroll_area.rs` のopt-inと同ファイル内のテストに限定し、現在boundsをphysics前、
+その結果によるcontent origin / viewportをphysics後へ移した。既定APIとphysics式は維持する。
+
+独立コードレビューのP2二件（比率変換直後の保存geometryの不整合、revealなしframeのO(N)選択探索）を
+修正し、限定再確認でACCEPT・未解決指摘なしとなった。これは自動実行の受入とは区別する。
+初回lib-test compileのheader fixture借用エラーはlocal変数へ取り出して解消した。
+
+vendor単体はfocused 11件、全lib nextest **150件PASS**（run `d5f03cea-ba7d-47fa-83de-03c21601c043`）。
+Appは元の4再現・R3に、fast hydrationサムネイル、中間位置と完了順序、
+実resolverのclampから実native coast / targetと最初の描画位置へ接続するR4を追加して検証中。
+R4はclampの意味をSyncへ置き換える対照も持つ。詳細は実行完了後に本台帳へ追記する。
+
+段Bの途中証跡（最終受入とは区別）:
+
+- `cargo fmt`（引数なし）実行済み。core checkはPASS（2m13s）、auditはexit 0・違反0。
+- lib-testの初回二回はfixtureの借用とUIからのprivate registry accessor参照でcompile失敗。
+  前者はlocal化、後者はApp内のgeometry記録入口へ集約して公開範囲を広げず修正した。
+- `cargo test -p mimageviewer --lib scroll_661:: -- --test-threads=1` の第三回はcompile 8m11s、
+  **11 PASS / 4 FAIL**（実行42.06s）。元の再現4件とR4はgreen。R3三件と追加中間位置fixtureに失敗が残った。
+  ログは `target/scroll661-stage-b-reproduction{-2,-3}.log`（初回はsuffixなし）。
+- 既にコンパイルした同じtest binaryでowner・aspect・late reveal・既存保持二件をfilterして
+  **14 PASS**（3.22s）。`target/scroll661-stage-b-state-regression.log`。これらの関数はfixture修正で変更しない。
+- R3は従来失敗していた初期詳細配置を通過した。その後のfixtureは、hydrationまで完了させるhelperの直後に
+  activeを期待していたこと、App側completionをdrainしないrescan待機、物理slotと表示順の混同を確認した。
+  画面内位置2行・安定選択・実worker／hydrationの条件を維持してfixtureの駆動境界を修正する。
+- 追加中間位置の既定サムネイルはviewportが2.5行しかなく、上から2行のanchorでは選択行下端が見えず、
+  復帰時の通常revealが合法に1行動かした。追加caseだけ10列／Auto OFFで三行以上を確保する。
+  元の報告手順の既定設定と既存assertは変更していない。
+
+fixture修正の独立レビューもACCEPT（期待値弱体化・製品不具合の隠蔽なし）。第四回の同コマンドは
+compile 6m27s、実行62.82sで **15 PASS / 0 FAIL**。
+元の再現4件、R3三件（両rendererの通常reload・観測rescan・ResumeList、前方追加／削除）、R4、
+fast hydrationサムネイルと両順序／中間位置の対照がすべて通った。
+ログは `target/scroll661-stage-b-reproduction-4.log`。関連nextest回帰を確認してから段Cへ進む。
+
+関連nextestはrun `bd6db056-2bc8-43e8-8f17-86a4d2f02100`、**520 PASS / 0 FAIL**（50.870s）。
+owner / 比率 / startup / history / Snapshot / Smart / viewer context / touchを含み、既に成功した
+`scroll_661::` 15件は再実行せず除外した。ログは `target/scroll661-stage-b-regression.log`。
+
+| 段 | checkpointの作業ツリー・受入 |
+| --- | --- |
+| A | `a930891dd`にコミット済み。挙動不変（R3を除く）として受入 |
+| B | HEADはAのまま、Bの製品・vendor・test・文書差分は未コミットで保持。元4再現＋R3＋R4を含む15件、関連520件、owner等14件、vendor150件、fmt・core check・auditが成功。コード／fixture独立レビューACCEPT。ここで>>661本体と詳細の行位置捕捉不具合の自動修正証拠が揃った |
+| C | B受入後に着手。入力寿命とcontextの統合が完了するまで出荷・単独cherry-pickしない |
+
+全Cargo実行は `MSBUILDDISABLENODEREUSE=1`。製品binary・desktop・実profileを使用せず、
+確認用buildとcommitも行っていない。段Cの最終gateは別途記録する。
+
+### 段C: 入力寿命とcontextの統合（検証中）
+
+一覧sessionをtypedな可視採用・成功したA/B交代・実parkへ接続し、forkはfresh、
+move／swap／一時mountは維持する。ZIP／PDFのshellとその完了は一つの入場とし、
+同一覧refresh／resume／resize／filter／sortのたびに寿命を更新しない。
+検索は初回可視rowsとroot／drill採用、Snapshotは実rows差替え、Smartはowner復帰後に更新する。
+ROOTの端数参照はread-only Main ContextRefへ集約した。
+
+MainGridのrecognizerとcommand batchをscopeへ接続し、transportのexact correlationは保持した。
+旧接点のMove／End／CancelはRetiredとして扱い、新接点を取消さない。
+同座標の後続mouseを逆順のedge照合で区別し、MainGridの混在入力中断でもbackendのpointer gateを保持する。
+このtouch境界は独立レビューでACCEPT。新規press、旧held、release→新pressを実両rendererへ通すR1と、
+実App discard・接点切替・pinchのR2を追加している。
+
+vendorの独立レビューで、Appが半行未満のreadbackを採らない場合のSync再passが
+最初のnative移動を消すP2を確認・修正した。既存処理済frame印にsession所属を含め、
+同ownerのSync再passではnative結果を保持する。Set／AppGesture／新sessionは位置更新を優先する。
+同boundsのrubber-bandも既存physicsの判定をendへ伝え、描画と返却Stateを一致させた。
+subrow drag／coast／target・明示位置・session交代・rubber／extent縮小の実Context回帰を追加し、
+独立再確認はACCEPT。Sync再注入を戻す変異は期待どおり280と290の不一致で失敗し、sourceを完全復元した。
+復元後のvendor全lib nextestは **161 PASS / 0 FAIL / 0 skipped**（1.735s）。
+ログは `target/scroll661-stage-c-vendor-{replay-4,replay-mutation,final}.log`。
+
+App側レビューでPinch中のnative Y二重所有も修正した。active PinchとZoom／PinchEnd発行frameを
+AppGestureへ接続し、接点終了後の通常マウスを保持する。実背景／bar captureと実Appの切替回帰を追加した。
+初期統合checkの失敗は、scopeを持つ一時状態をDefault不要のremoveへ変更し、test側のGuiRounding importを補った。
+続いてtap閾値未満のUndecided入力でもcanonical＋fractionと異なるnative描画が生じることを、
+実背景／barの3pt移動回帰で確認した（canonical 2808、viewport 2809.65）。現在scopeのtap候補を
+StartからterminalまでApp所有Yへ含め、widgetのtapは維持した。終了後のidle／Retiredだけのframeは
+所有せず、通常mouseを止めない。Pinchとtap候補の実renderer試験は修正後成功した。
+
+### 段Cの設計前提の相違と停止（2026-10-30）
+
+**段Cは未完了。追加の製品変更を停止し、失敗回帰をignoreせず残す。**
+これは>>661の旧bounds修正とは別の、同じ入力寿命契約に含まれるnative pointer消費境界の不足である。
+容量上限による中断から再開後、Sol / highのApp実装とSol / xhighの独立レビューを分離して進め、
+独立reviewerも以下がbackendで表現可能な混在入力で、設計担当へ返す必要があると確認した。
+Windows実機でのイベント配送・製品画面の観測を得たとは扱わない。
+
+#### 具体的な経路と観測値
+
+回帰 `retired_secondary_touch_move_cannot_drive_a_new_mouse_capture`
+（`src/app/tests/scroll_661.rs:1469`付近）は一時data_dirと素材を使い、実フォルダ採用・hydration・
+実renderer・egui Contextを通す。旧touchなしの対照を先に実行し、新mouseの継続移動量とも比較する。
+
+1. 旧一覧で二指をStart。主接点1がsynthetic pointer、第二接点2はraw touchだけになる。
+2. 別フォルダを実採用し、旧接点をRetiredへ移す。旧主接点1をEndし、backendの現在pointer位置で
+   releaseとGoneを渡す。第二接点2はまだheldで、backendのpointer gateは空になる。
+3. 新一覧の実背景で本物のmouseをpressし、安定background IDのcaptureが成立することを検査する。
+4. 旧第二接点2のMoveと、backendが生成する対応PointerMovedを渡す。
+   recognizerは宛先コマンドを生成せず、App touchのY所有もfalseだが、native背景captureがこのMoveを採る。
+
+viewportは **756 → 800**、content originは **-580 → -624**。現在maxは前後とも756、
+一覧scope・mouse captureは同じで、変更前のviewportとcanonicalも一致する。
+現在extentをphysics前に確定する段Bの契約は成立しており、旧maxへの復元という元の原因ではない。
+新mouseの押し直し不要・旧touchの宛先操作禁止の両方を、現在のAPIだけでは同時に満たせていない。
+
+sourceのproducer／consumer（行番号はこの未コミット差分時点）:
+
+- `vendor/egui-winit/src/lib.rs::on_touch:891`、gate条件`:915`、Endでの解放`:932`。
+  主接点が終わりgateが空くと、まだheldの第二接点のMoveもsynthetic pointerへ出る。
+  Endのrelease座標はraw touch座標ではなく現在pointer位置なので、fixtureもその順序と座標に合わせた。
+- `src/touch_correlation.rs::TouchFrame::grid_owns_native_y:94` はRetiredだけのframeをApp所有にしない。
+  新mouseの正当なdrag／coastを終わらせないため、この判断自体を一律反転できない。
+- `vendor/egui/src/containers/scroll_area.rs::external_capture_input:891` の
+  `PointerEvent::Moved`（`:1016`以降）は現在captureのsessionとbuttonを照合するが、
+  eventごとの由来がないため旧touch由来Moveも新mouseのdeltaとprevious位置へ加える。
+  `ExternalVerticalScroll:403` のgeometry／position／session／transport IDは、この由来を渡せない。
+
+設計担当へ返す論点は、**順序付きeventのprovenanceをどの所有境界でnative pointerの受理へ接続するか**。
+新mouseのcapture・速度・target・previous位置を保ったまま旧touch由来eventだけを隔離する必要がある。
+AppGestureの一律適用、session／captureの一律reset、全接点release待ちは通常mouse操作を変えるため採らない。
+App側のegui入力前routingを含めて境界を決める必要があり、特定vendorファイルの変更が必須とまでは
+結論していない。承認済みAPIを黙って拡張せず、`context.rs`／`interaction.rs`／`scroll_physics.rs`／
+egui-winitは無変更。まれな失敗の回復処理でもない。
+
+#### 停止時の検証記録
+
+全Cargo実行は `MSBUILDDISABLENODEREUSE=1`。以下のcheck／audit成功は段C全体の受入を意味しない。
+
+| コマンド・対象 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo fmt`（引数なし） | 実行済み | sourceへ適用 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | PASS、2m26s | `target/scroll661-stage-c-core-check.log` |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | 第四回PASS、2m29s。先行の一時状態remove／import／旧style APIのcompileエラーは修正済み | `target/scroll661-stage-c-feature-check-4.log` |
+| `cargo run --locked -p viewer_context_audit` | exit 0、違反0 | `target/scroll661-stage-c-audit-final.log` |
+| vendor eguiの全lib nextest | 161 PASS、1.735s。source復元後の最終実行 | `target/scroll661-stage-c-vendor-final.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(scroll_661::)' --no-fail-fast --retries 0 --no-tests fail` | 21 PASS / 1 FAIL、8.554s。唯一の失敗は上記混在入力回帰 | `target/scroll661-stage-c-checkpoint-4.log` |
+| 下記の停止時関連nextest | 509 PASS / 1 FAIL、38.283s、exit 100。唯一の失敗は同じ混在入力回帰 | `target/scroll661-stage-c-stop-checkpoint.log` |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/details_header_sort_reveal|grid_cursor_rating_grid_move|paired_identity_remap|startup_restore::|section1328_session|phase_c_folder_nav_history_tests::|snapshot_ops::|viewer_context_registry::|smart_folder::|touch_correlation::|touch_input::|grid_scroll_ring|grid_scroll::|scroll_661::|grid_pinch_actual_renderer|grid_tap_candidate_actual_renderer/)' --no-fail-fast --retries 0 --no-tests fail
+```
+
+この21件に元4再現、R3、R4、R1の切替＋新press／旧background dragのrelease→新press、
+実App discardと非描画往復のR2を含む。R1専用fixtureは遅延metadataの25pt status barで
+press対象が移動しないよう任意詳細列をOFFにした。既定列・ZIP詳細取得を通す元報告fixture、
+期待値、capture成立・viewport／originのassertは弱めていない。
+先行checkpointのfixture失敗や未完了metadataをpollだけで待つ試行は成功証拠へ数えない。
+
+core／feature check以降の変更はtest fixtureと文書に限る。
+最終の `test-focused.ps1`（exit 2時の `test-lib-full.ps1`）、共有変更のfull gate、必要時のUI snapshotは
+段Cの設計不足で完成条件を満たせないため未実施。製品起動・desktop操作・実profile使用・
+確認用build・commitは行わず、未コミットのB/C差分を保持する。
+`git diff --check` は成功し、vendorの変更ファイルは許可された `scroll_area.rs` と `PATCHES.md` だけである。
+backlogへの「実装済み・実機未確認」追記も未完了のため行っていない。
+再開時は設計補足を確認して当該redを通し、段C全体と最終gateを完了してから出荷可能とする。

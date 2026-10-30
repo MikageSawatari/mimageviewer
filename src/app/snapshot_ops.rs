@@ -1087,6 +1087,7 @@ impl App {
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
         let saved_visible_indices =
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
+        self.grid_scroll.renew_session();
         let saved_scroll_offset_y = self.grid_scroll.offset();
         self.grid_scroll.set_position(0.0);
         let saved_selected = std::mem::replace(&mut self.selected, new_selected);
@@ -1476,6 +1477,7 @@ impl App {
                     }
                 }
             }
+            self.grid_scroll.renew_session();
             self.items = snap.saved_items;
             self.page_identity_index = snap.saved_page_identity_index;
             self.projection_recipe = snap.saved_projection_recipe;
@@ -1608,6 +1610,7 @@ impl App {
             crate::zip_loader::clear_nested_cache();
         }
         // items 入れ替え (= 保存したサムネ付き state を復帰)
+        self.grid_scroll.renew_session();
         self.items = list_items;
         self.page_identity_index = list_identity_index;
         self.projection_recipe = list_recipe;
@@ -3396,6 +3399,47 @@ mod tests {
             );
             assert_eq!(app.items, old_items);
             assert_eq!(app.fullscreen_idx, Some(0));
+        }
+    }
+
+    #[test]
+    fn grid_scroll_session_snapshot_entry_exit_are_fresh_without_changing_saved_offset() {
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        let session = app.grid_scroll.session();
+        app.grid_scroll.set_position(140.0);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_ne!(app.grid_scroll.session(), session);
+        let snapshot_session = app.grid_scroll.session();
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        assert_ne!(app.grid_scroll.session(), snapshot_session);
+        assert_ne!(app.grid_scroll.session(), session);
+        assert_eq!(app.grid_scroll.offset(), 140.0);
+    }
+
+    #[test]
+    fn grid_scroll_session_snapshot_dismiss_and_child_unfix_keep_visible_rows_lifetime() {
+        for dismiss in [false, true] {
+            let mut app =
+                test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\a.png"))]);
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert!(app.is_snapshot_active());
+            app.current_folder = Some(PathBuf::from(r"E:\test\child"));
+            app.items = vec![GridItem::Image(PathBuf::from(r"E:\test\child\b.png"))];
+            let child = app.grid_scroll.session();
+            let rows = app.items.clone();
+            if dismiss {
+                assert!(app.dismiss_snapshot_with_origin().is_some());
+            } else {
+                app.deactivate_snapshot();
+            }
+            assert!(!app.is_snapshot_active());
+            assert_eq!(app.grid_scroll.session(), child);
+            assert_eq!(app.items, rows);
         }
     }
 

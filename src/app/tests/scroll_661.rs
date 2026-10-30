@@ -1,6 +1,7 @@
 //! Headless investigation of 5ch #661. No native windows or real profile data.
 use super::phase_c_support::{AppTestEnv, setup_app};
 use super::*;
+use egui::emath::GuiRounding as _;
 use std::io::{Cursor, Write};
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,10 @@ impl Driver {
     }
 
     fn tick(&mut self, app: &mut App, pane: Option<PathBuf>) {
+        self.tick_events(app, pane, Vec::new());
+    }
+
+    fn tick_events(&mut self, app: &mut App, pane: Option<PathBuf>, events: Vec<egui::Event>) {
         self.frame += 1;
         let generation_before = app.items_generation;
         if let Some(path) = pane {
@@ -119,6 +124,7 @@ impl Driver {
                 egui::vec2(1280.0, 800.0),
             )),
             time: Some(self.frame as f64 / 60.0),
+            events,
             focused: false,
             ..Default::default()
         };
@@ -233,6 +239,26 @@ fn roundtrip_ordered(
     early: bool,
     fresh_surface: bool,
 ) {
+    roundtrip_at(
+        backup,
+        source_count,
+        zip,
+        details,
+        early,
+        fresh_surface,
+        false,
+    );
+}
+
+fn roundtrip_at(
+    backup: bool,
+    source_count: usize,
+    zip: bool,
+    details: bool,
+    early: bool,
+    fresh_surface: bool,
+    middle: bool,
+) {
     #[cfg(windows)]
     let _native_input = crate::key_input::lock_test_input();
     #[cfg(windows)]
@@ -254,6 +280,13 @@ fn roundtrip_ordered(
         true,
     );
     env.settings.sidecar_backup_enabled = backup;
+    // The middle-position case needs room for the selected row below its two-row
+    // anchor; the default four columns show fewer than three complete thumbnail rows.
+    // Keep all original reporter/default-size cases unchanged.
+    if middle {
+        env.settings.grid_cols = 10;
+        env.settings.thumb_aspect_auto = false;
+    }
     env.settings.folder_tree_pane_visible = true;
     env.settings.grid_view_mode = if details {
         crate::settings::GridViewMode::Details
@@ -262,10 +295,18 @@ fn roundtrip_ordered(
     };
     let mut driver = Driver::new();
     driver.open(&mut env, &source);
-    let last = env.items.len() - 1;
+    let last = if middle {
+        env.items.len() / 2
+    } else {
+        env.items.len() - 1
+    };
     env.move_grid_cursor(Some(last), GridCursorIntent::Automatic);
     env.grid_scroll.set_reveal_requested(true);
-    env.grid_scroll.request_edge(GridScrollIntent::Bottom);
+    if middle {
+        env.grid_scroll.set_row_anchor(Some(2));
+    } else {
+        env.grid_scroll.request_edge(GridScrollIntent::Bottom);
+    }
     driver.settled(&mut env);
     if zip && details {
         assert_eq!(
@@ -293,7 +334,7 @@ fn roundtrip_ordered(
     assert_eq!(
         env.grid_scroll.offset(),
         saved,
-        "return must preserve the bottom scroll position"
+        "return must preserve the saved scroll position"
     );
 }
 
@@ -348,7 +389,12 @@ fn egui_offset_after_growth(no_spring: bool) -> (f32, f32) {
                     let output = egui::ScrollArea::vertical()
                         .id_salt("scroll661-growth")
                         .auto_shrink([false, false])
-                        .vertical_scroll_offset(requested)
+                        .external_vertical_scroll(egui::scroll_area::ExternalVerticalScroll {
+                            content_height: total_h,
+                            interaction_id: egui::Id::unique("scroll661-growth-transport"),
+                            interaction_session: egui::Id::unique("scroll661-growth-session"),
+                            position: egui::scroll_area::ExternalScrollPosition::Set(requested),
+                        })
                         .show_viewport(ui, |ui, _| {
                             ui.allocate_exact_size(egui::vec2(300.0, total_h), egui::Sense::hover());
                         });
@@ -378,7 +424,7 @@ fn egui_explicit_offset_without_spring_control() {
     assert_eq!(actual, requested);
 }
 
-// Stage A's anchor contract is separate from the known old-bounds physics failure.
+// RowAnchor acceptance belongs to Stage B: the final painted geometry is its source.
 // Use a middle row with ample room on both sides, and change earlier stable keys so
 // preserving an old index/absolute offset or merely revealing the row cannot pass.
 fn row_anchor_after_list_adoption(route: &str) {
@@ -399,6 +445,10 @@ fn row_anchor_after_list_adoption(route: &str) {
         env.settings.tag_sidecar_backup_enabled = false;
         env.settings.grid_cols = 10;
         env.settings.thumb_aspect_auto = false;
+        env.settings.sort_order = crate::settings::SortOrder::FileName;
+        env.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        env.settings.details_sort_ascending = true;
+        env.settings.auto_fullscreen_image_folders = false;
         env.settings.grid_view_mode = if details {
             crate::settings::GridViewMode::Details
         } else {
@@ -419,9 +469,14 @@ fn row_anchor_after_list_adoption(route: &str) {
         assert_eq!(env.selected_rows_below_view_top(selected), 2);
         assert_eq!(env.grid_scroll.row_anchor(), None);
         let initial_offset = env.grid_scroll.offset();
+        let initial_position = env
+            .current_grid_order()
+            .iter()
+            .position(|&index| env.items[index].name() == "0100.jpg")
+            .unwrap();
         let image = std::fs::read(source.join("0000.jpg")).unwrap();
         let inserted: Vec<_> = (0..20)
-            .map(|i| source.join(format!("-before-{i:02}.jpg")))
+            .map(|i| source.join(format!("0000-before-{i:02}.jpg")))
             .collect();
         for remove in [false, true] {
             // Capture before mutation via the real cursor producer, not a test-only hint.
@@ -446,7 +501,23 @@ fn row_anchor_after_list_adoption(route: &str) {
             match route {
                 "reload" => {
                     env.reload_current_folder_preserving_override();
-                    super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
+                    assert!(
+                        env.top_level_grid_view
+                            .history_navigation_transition()
+                            .is_some()
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    // The usual finish_staged helper also drains hydration. Stop at actual
+                    // adoption instead, so this test can inspect that real owner before paint.
+                    while env.items_generation == generation {
+                        env.poll_open_path_classification(&driver.ctx);
+                        env.poll_collection_history_transition(&driver.ctx);
+                        assert!(
+                            Instant::now() < deadline,
+                            "real reload preflight did not adopt"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                 }
                 "observation" => {
                     env.start_external_rescan(
@@ -455,15 +526,35 @@ fn row_anchor_after_list_adoption(route: &str) {
                         std::time::SystemTime::now(),
                     );
                     assert!(env.external_rescan_pending.is_some());
+                    // Hold only the actual worker reply, while full App frames drain
+                    // unrelated completion consumers. A tight poll-only loop is not the
+                    // application execution model and can strand its other worker owners.
+                    let (delivery, held_rx) = std::sync::mpsc::channel();
+                    let worker_rx = std::mem::replace(
+                        &mut env.external_rescan_pending.as_mut().unwrap().rx,
+                        held_rx,
+                    );
                     let deadline = Instant::now() + Duration::from_secs(15);
-                    while env.external_rescan_pending.is_some() {
-                        env.poll_external_rescan(&driver.ctx);
+                    let reply = loop {
+                        match worker_rx.try_recv() {
+                            Ok(reply) => break reply,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            Err(error) => panic!("real observation worker disconnected: {error}"),
+                        }
                         assert!(
                             Instant::now() < deadline,
                             "real observation worker did not finish"
                         );
-                        std::thread::yield_now();
-                    }
+                        driver.tick(&mut env, None);
+                        assert_eq!(
+                            env.items_generation, generation,
+                            "the held real reply must own the next adoption"
+                        );
+                        std::thread::sleep(Duration::from_millis(16));
+                    };
+                    assert!(reply.is_some(), "real observation scan must succeed");
+                    assert!(delivery.send(reply).is_ok());
+                    env.poll_external_rescan(&driver.ctx);
                 }
                 "resume" => {
                     assert!(env.load_folder_with_scan_owned(
@@ -489,7 +580,22 @@ fn row_anchor_after_list_adoption(route: &str) {
             let selected = env.selected.unwrap();
             assert_eq!(env.items[selected].name(), "0100.jpg");
             assert_eq!(env.grid_scroll.row_anchor(), Some(2));
-            assert_eq!(selected, if remove { 100 } else { 120 });
+            // Item slots can remain stable while details display order changes.
+            // Verify the semantic visible position rather than assuming physical storage order.
+            let position = env
+                .current_grid_order()
+                .iter()
+                .position(|&index| index == selected)
+                .unwrap();
+            assert_eq!(
+                position,
+                if remove {
+                    initial_position
+                } else {
+                    initial_position + inserted.len()
+                },
+                "new stable keys must change the selected display position before row restoration"
+            );
             driver.settled(&mut env);
             assert_eq!(env.items[env.selected.unwrap()].name(), "0100.jpg");
             assert_eq!(
@@ -520,4 +626,959 @@ fn row_anchor_observation_keeps_middle_selected_row_in_both_renderers() {
 #[test]
 fn row_anchor_resume_keeps_middle_selected_row_in_both_renderers() {
     row_anchor_after_list_adoption("resume");
+}
+
+#[test]
+fn zip_200_to_100_fast_hydration_thumbnail() {
+    roundtrip_ordered(false, 200, true, false, true, false);
+}
+
+#[test]
+fn zip_middle_position_survives_both_hydration_orders_and_renderers() {
+    for details in [true, false] {
+        for early in [true, false] {
+            roundtrip_at(false, 200, true, details, early, false, true);
+        }
+    }
+}
+
+// The App resolver must carry the meaning of an already-clamped offset through
+// the real ScrollArea boundary; testing Set(560) alone would miss Sync(560).
+#[test]
+fn app_geometry_clamp_stops_real_native_coast_and_target_before_paint() {
+    use crate::app::grid_scroll::{GridScrollGeometry, GridScrollState};
+    use egui::scroll_area::{ExternalScrollPosition, ExternalVerticalScroll};
+    for (coast, target) in [(true, false), (false, true), (true, true)] {
+        for grow_viewport in [false, true] {
+            for preserve_clamp_meaning in [true, false] {
+                let ctx = egui::Context::default();
+                let seed_extent = if grow_viewport { 840.0 } else { 1120.0 };
+                let mut canonical = GridScrollState::default();
+                canonical.adopt_offset(840.0);
+                let mut output = None;
+                let mut drawn_viewport = egui::Rect::NOTHING;
+                let mut drawn_origin = egui::Pos2::ZERO;
+                let mut sequence = 0;
+                let mut draw =
+                    |height: f32, extent: f32, position, events, request_target: bool| {
+                        sequence += 1;
+                        ctx.run_pass(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(500.0, height),
+                                )),
+                                time: Some(sequence as f64 / 60.0),
+                                events,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                ctx.root_ui(|root| {
+                                    egui::CentralPanel::default().show(root, |ui| {
+                                        let content_h = ui.available_height() + extent;
+                                        output = Some(
+                                            egui::ScrollArea::vertical()
+                                                .scroll_source(egui::scroll_area::ScrollSource {
+                                                    drag: egui::scroll_area::DragScroll::Always,
+                                                    ..Default::default()
+                                                })
+                                                .id_salt("scroll661-app-clamp")
+                                                .auto_shrink([false, false])
+                                                .content_margin(egui::Margin::ZERO)
+                                                .external_vertical_scroll(ExternalVerticalScroll {
+                                                    content_height: content_h,
+                                                    interaction_id: egui::Id::unique(
+                                                        "scroll661-clamp-transport",
+                                                    ),
+                                                    interaction_session: egui::Id::unique(
+                                                        "scroll661-clamp-session",
+                                                    ),
+                                                    position,
+                                                })
+                                                .show_viewport(ui, |ui, viewport| {
+                                                    drawn_viewport = viewport;
+                                                    drawn_origin = ui.max_rect().min;
+                                                    if request_target {
+                                                        ui.scroll_to_rect_animation(
+                                                            egui::Rect::from_min_size(
+                                                                ui.max_rect().min
+                                                                    + egui::vec2(0.0, 200.0),
+                                                                egui::vec2(10.0, 28.0),
+                                                            ),
+                                                            Some(egui::Align::Min),
+                                                            egui::style::ScrollAnimation::duration(
+                                                                1.0,
+                                                            ),
+                                                        );
+                                                    }
+                                                    ui.allocate_exact_size(
+                                                        egui::vec2(300.0, content_h),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                }),
+                                        );
+                                    });
+                                });
+                            },
+                        )
+                        .drop_without_applying_deltas();
+                        (
+                            output.as_ref().unwrap().state,
+                            output.as_ref().unwrap().inner_rect,
+                            drawn_viewport,
+                            drawn_origin,
+                        )
+                    };
+                let button = |pressed, y| egui::Event::PointerButton {
+                    pos: egui::pos2(100.0, y),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                draw(
+                    400.0,
+                    seed_extent,
+                    ExternalScrollPosition::Set(840.0),
+                    vec![],
+                    false,
+                );
+                draw(
+                    400.0,
+                    seed_extent,
+                    ExternalScrollPosition::Sync(840.0),
+                    vec![],
+                    false,
+                );
+                if coast {
+                    draw(
+                        400.0,
+                        seed_extent,
+                        ExternalScrollPosition::Sync(840.0),
+                        vec![
+                            egui::Event::PointerMoved(egui::pos2(100.0, 220.0)),
+                            button(true, 220.0),
+                        ],
+                        false,
+                    );
+                    draw(
+                        400.0,
+                        seed_extent,
+                        ExternalScrollPosition::Sync(840.0),
+                        vec![egui::Event::PointerMoved(egui::pos2(100.0, 140.0))],
+                        false,
+                    );
+                }
+                let seeded = draw(
+                    400.0,
+                    seed_extent,
+                    ExternalScrollPosition::Sync(840.0),
+                    if coast {
+                        vec![button(false, 140.0)]
+                    } else {
+                        vec![]
+                    },
+                    target,
+                )
+                .0;
+                if coast {
+                    assert_ne!(seeded.velocity().y, 0.0, "must seed a real release coast");
+                }
+                if target {
+                    assert!(
+                        format!("{seeded:?}").contains("Some(ScrollingToTarget"),
+                        "must seed a real native target: {seeded:?}"
+                    );
+                }
+                let viewport_h = if grow_viewport { 664.0 } else { 384.0 };
+                let geometry = GridScrollGeometry::new(1, 28.0, viewport_h, viewport_h + 560.0);
+                let resolved = canonical.resolve_layout(geometry, false, None, false);
+                assert!(matches!(
+                    resolved.position,
+                    ExternalScrollPosition::Set(560.0)
+                ));
+                let delivered = if preserve_clamp_meaning {
+                    resolved.position
+                } else {
+                    ExternalScrollPosition::Sync(560.0)
+                };
+                let (state, inner, viewport, origin) =
+                    draw(viewport_h + 16.0, 560.0, delivered, vec![], false);
+                if !preserve_clamp_meaning {
+                    assert!(
+                        state.velocity().y != 0.0
+                            || state.unclamped_offset().y != 560.0
+                            || format!("{state:?}").contains("Some(ScrollingToTarget"),
+                        "the Sync mutation must retain old motion/target and fail the Set contract"
+                    );
+                    continue;
+                }
+                assert_eq!(canonical.offset(), 560.0);
+                assert_eq!(state.clamped_offset().y, 560.0);
+                assert_eq!(state.velocity().y, 0.0);
+                assert_eq!(viewport.min.y, 560.0);
+                assert!((inner.min.y - origin.y - 560.0).abs() < 0.01);
+                assert!(!format!("{state:?}").contains("Some(ScrollingToTarget"));
+                let next = draw(
+                    viewport_h + 16.0,
+                    560.0,
+                    ExternalScrollPosition::Sync(560.0),
+                    vec![],
+                    false,
+                )
+                .0;
+                assert_eq!(next.clamped_offset().y, 560.0);
+            }
+        }
+    }
+}
+
+// Input lifetime cases keep optional metadata chrome from moving the receiver
+// between hit testing and the first destination layout. Default-column async
+// schedules are covered independently by all original reporter cases above.
+fn configure_pointer_fixture_columns(app: &mut App) {
+    if app.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+        app.settings.details_show_page_count = false;
+        app.settings.details_show_created = false;
+        app.settings.details_show_image_dimensions = false;
+        app.settings.details_show_video_duration = false;
+        app.settings.details_show_video_dimensions = false;
+        app.settings.details_show_video_codec = false;
+        app.invalidate_details_meta_requirements();
+    }
+}
+
+fn input_fixture(details: bool) -> (AppTestEnv, Driver, PathBuf) {
+    let mut env = setup_app();
+    env.initialized = true;
+    env.settings.update_check_enabled = false;
+    env.settings.minimize_to_tray_on_close = false;
+    env.indexer_init = IndexerInit::Unavailable;
+    env.last_main_focused = false;
+    env.settings.creative_luts.clear();
+    env.creative_lut_library = crate::creative_lut::CreativeLutLibrary::default();
+    env.settings.sidecar_backup_enabled = false;
+    env.settings.tag_sidecar_backup_enabled = false;
+    env.settings.grid_cols = 10;
+    env.settings.thumb_aspect_auto = false;
+    env.settings.auto_fullscreen_image_folders = false;
+    env.settings.grid_view_mode = if details {
+        crate::settings::GridViewMode::Details
+    } else {
+        crate::settings::GridViewMode::Thumbnail
+    };
+    let source = fixtures(env.tmp.path(), 200, false);
+    let other = fixtures(env.tmp.path(), 100, false);
+    let mut driver = Driver::new();
+    driver.open(&mut env, &source);
+    configure_pointer_fixture_columns(&mut env);
+    env.selected = None;
+    env.grid_scroll.request_edge(GridScrollIntent::Bottom);
+    driver.settled(&mut env);
+    (env, driver, other)
+}
+
+fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn adopt_input_destination_before_first_layout(env: &mut App, destination: &std::path::Path) {
+    let previous = env.grid_scroll.session();
+    // Real navigation, preparation and hydration, with no destination layout yet.
+    // The previous pass's stable transport widgets still own egui hit testing.
+    env.load_folder(destination.to_path_buf());
+    super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(env);
+    env.finish_page_identity_preparation_for_test();
+    configure_pointer_fixture_columns(env);
+    assert_eq!(env.current_folder.as_deref(), Some(destination));
+    assert_ne!(env.grid_scroll.session(), previous);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PointerAdmissionCase {
+    NewPress,
+    OldHeld,
+    ReleaseThenPress,
+}
+
+fn pointer_admission_in_actual_renderers(case: PointerAdmissionCase) {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for details in [true, false] {
+        for bar in [false, true] {
+            let (mut env, mut driver, destination) = input_fixture(details);
+            let transport = App::grid_scroll_transport_id(&driver.ctx);
+            let widget = if bar {
+                transport.with(1_usize)
+            } else {
+                transport.with("area")
+            };
+            let rect = driver
+                .ctx
+                .read_response(widget)
+                .expect("the actual renderer must register its stable transport")
+                .rect;
+            let point = if bar {
+                rect.center()
+            } else {
+                // A snapped bottom extent leaves a fractional blank tail. This is a
+                // genuine background target, outside thumbnail/file-D&D row widgets.
+                let geometry = env.grid_scroll.geometry();
+                let rows = env.current_grid_order().len().div_ceil(geometry.cols);
+                let blank_tail = geometry.content_h - rows as f32 * geometry.row_h;
+                assert!(
+                    blank_tail > 1.0,
+                    "fixture needs real blank background: {geometry:?}"
+                );
+                egui::pos2(rect.center().x, rect.bottom() - blank_tail * 0.5)
+            };
+            let old_move = point - egui::vec2(0.0, 12.0);
+            if !matches!(case, PointerAdmissionCase::NewPress) {
+                driver.tick_events(
+                    &mut env,
+                    None,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        pointer_button(point, true),
+                    ],
+                );
+                driver.tick_events(&mut env, None, vec![egui::Event::PointerMoved(old_move)]);
+                assert_eq!(
+                    driver.ctx.dragged_id(),
+                    Some(widget),
+                    "must establish a real old drag, details={details} bar={bar}"
+                );
+            }
+            adopt_input_destination_before_first_layout(&mut env, &destination);
+            let restored = env.grid_scroll.offset();
+            match case {
+                PointerAdmissionCase::NewPress => driver.tick_events(
+                    &mut env,
+                    None,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        pointer_button(point, true),
+                    ],
+                ),
+                PointerAdmissionCase::ReleaseThenPress => driver.tick_events(
+                    &mut env,
+                    None,
+                    vec![
+                        pointer_button(old_move, false),
+                        egui::Event::PointerMoved(point),
+                        pointer_button(point, true),
+                    ],
+                ),
+                PointerAdmissionCase::OldHeld => driver.tick_events(
+                    &mut env,
+                    None,
+                    vec![egui::Event::PointerMoved(point - egui::vec2(0.0, 180.0))],
+                ),
+            }
+            assert!(
+                driver
+                    .ctx
+                    .read_response(widget)
+                    .unwrap()
+                    .interact_rect
+                    .contains(point),
+                "new-press target must remain inside the destination's actual clip"
+            );
+            if matches!(case, PointerAdmissionCase::OldHeld) {
+                assert_eq!(
+                    env.grid_scroll.offset(),
+                    restored,
+                    "old capture must not move the destination, details={details} bar={bar}"
+                );
+                driver.tick_events(
+                    &mut env,
+                    None,
+                    vec![pointer_button(point - egui::vec2(0.0, 180.0), false)],
+                );
+                for _ in 0..3 {
+                    driver.tick(&mut env, None);
+                }
+                assert_eq!(
+                    env.grid_scroll.offset(),
+                    restored,
+                    "old release must not start destination coast"
+                );
+            } else {
+                let after_press = env.grid_scroll.offset();
+                if !bar {
+                    assert_eq!(
+                        after_press, restored,
+                        "pre-press frame delta must not enter the new drag"
+                    );
+                }
+                let moved = point - egui::vec2(0.0, 210.0);
+                driver.tick_events(&mut env, None, vec![egui::Event::PointerMoved(moved)]);
+                assert_eq!(driver.ctx.dragged_id(), Some(widget));
+                assert_ne!(
+                    env.grid_scroll.offset(),
+                    after_press,
+                    "new sequence must move without another press, details={details} bar={bar} case={case:?}"
+                );
+                driver.tick_events(&mut env, None, vec![pointer_button(moved, false)]);
+            }
+            assert_eq!(env.current_folder.as_deref(), Some(destination.as_path()));
+        }
+    }
+}
+
+#[test]
+fn new_press_on_switch_frame_operates_both_actual_renderers_without_repress() {
+    pointer_admission_in_actual_renderers(PointerAdmissionCase::NewPress);
+}
+#[test]
+fn held_capture_from_old_list_cannot_move_or_coast_either_destination_renderer() {
+    pointer_admission_in_actual_renderers(PointerAdmissionCase::OldHeld);
+}
+#[test]
+fn old_background_or_bar_drag_release_then_new_press_on_switch_frame_needs_no_repress() {
+    pointer_admission_in_actual_renderers(PointerAdmissionCase::ReleaseThenPress);
+}
+
+fn grid_fraction(app: &App, ctx: &egui::Context) -> f32 {
+    crate::ui_main::grid_touch_scroll_remainder(
+        ctx,
+        app.projected_viewer_context_id(),
+        app.grid_scroll_scope(),
+        app.grid_scroll.offset(),
+        app.grid_scroll.geometry().row_h,
+        app.items_generation,
+    )
+}
+
+fn raw_touch(id: u64, phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+    egui::Event::Touch {
+        device_id: egui::TouchDeviceId(1),
+        id: egui::TouchId(id),
+        phase,
+        pos,
+        force: None,
+    }
+}
+
+#[test]
+fn real_grid_touch_old_tail_is_retired_and_new_contact_works_while_old_is_held() {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for no_draw_roundtrip in [false, true] {
+        let (mut env, mut driver, destination) = input_fixture(false);
+        let source = env.current_folder.clone().unwrap();
+        let row_h = env.grid_scroll.geometry().row_h;
+        env.grid_scroll.set_position(row_h * 2.0);
+        driver.tick(&mut env, None);
+        let start = egui::pos2(700.0, 500.0);
+        let moved = start - egui::vec2(0.0, 50.0);
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(1, egui::TouchPhase::Start, start),
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+            ],
+        );
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(1, egui::TouchPhase::Move, moved),
+                egui::Event::PointerMoved(moved),
+            ],
+        );
+        assert!(
+            grid_fraction(&env, &driver.ctx) > 0.0,
+            "must establish a real fractional gesture"
+        );
+        let old_scope = env.grid_scroll_scope();
+        adopt_input_destination_before_first_layout(&mut env, &destination);
+        if no_draw_roundtrip {
+            adopt_input_destination_before_first_layout(&mut env, &source);
+        }
+        assert_ne!(env.grid_scroll_scope(), old_scope);
+        let restored = env.grid_scroll.offset();
+        let old_tail = moved - egui::vec2(0.0, 40.0);
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(1, egui::TouchPhase::Move, old_tail),
+                egui::Event::PointerMoved(old_tail),
+            ],
+        );
+        assert_eq!(env.grid_scroll.offset(), restored);
+        assert_eq!(grid_fraction(&env, &driver.ctx), 0.0);
+        let cols = env.settings.grid_cols;
+        // egui-winit's pointer gate is still occupied by contact 1, so these
+        // current contact samples intentionally have no synthetic pointer tail.
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![raw_touch(2, egui::TouchPhase::Start, start)],
+        );
+        let new_move = start - egui::vec2(0.0, 110.0);
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![raw_touch(2, egui::TouchPhase::Move, new_move)],
+        );
+        let before_cancel = env.grid_scroll.offset() + grid_fraction(&env, &driver.ctx);
+        assert!(
+            before_cancel > restored,
+            "new raw contact must operate without releasing old contact"
+        );
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(1, egui::TouchPhase::Cancel, old_tail),
+                egui::Event::PointerGone,
+            ],
+        );
+        assert_eq!(
+            env.grid_scroll.offset() + grid_fraction(&env, &driver.ctx),
+            before_cancel,
+            "retired Cancel must not settle or cancel the current contact"
+        );
+        let next_move = new_move - egui::vec2(0.0, 50.0);
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(2, egui::TouchPhase::Move, next_move),
+                egui::Event::PointerMoved(next_move),
+            ],
+        );
+        assert!(env.grid_scroll.offset() + grid_fraction(&env, &driver.ctx) > before_cancel);
+        assert_eq!(
+            env.settings.grid_cols, cols,
+            "old contact must not join a new pinch"
+        );
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(2, egui::TouchPhase::End, next_move),
+                pointer_button(next_move, false),
+                egui::Event::PointerGone,
+            ],
+        );
+        assert_eq!(
+            env.current_folder.as_ref(),
+            Some(if no_draw_roundtrip {
+                &source
+            } else {
+                &destination
+            })
+        );
+    }
+}
+
+struct RetryingGridApp<'a> {
+    app: &'a mut App,
+    renew_after_first_pass: bool,
+    observations: Vec<(u64, u64, egui::Id, f32)>,
+}
+
+impl eframe::App for RetryingGridApp<'_> {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        eframe::App::raw_input_hook(self.app, ctx, input);
+    }
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        eframe::App::logic(self.app, ctx, frame);
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        eframe::App::ui(self.app, ui, frame);
+        let ctx = ui.ctx();
+        self.observations.push((
+            self.app.frame_counter,
+            ctx.cumulative_frame_nr(),
+            self.app.grid_scroll_scope(),
+            self.app.grid_scroll.offset() + grid_fraction(self.app, ctx),
+        ));
+        if ctx.current_pass_index() == 0 {
+            if self.renew_after_first_pass {
+                self.app.grid_scroll.renew_session();
+            }
+            ctx.request_discard("scroll661 actual App touch replay");
+        }
+    }
+}
+
+#[test]
+fn actual_app_discard_uses_viewport_frame_and_does_not_replay_touch_into_new_scope() {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for renew in [false, true] {
+        let (mut env, mut driver, _) = input_fixture(false);
+        let row_h = env.grid_scroll.geometry().row_h;
+        let initial = row_h * 2.0;
+        env.grid_scroll.set_position(initial);
+        driver.tick(&mut env, None);
+        let start = egui::pos2(700.0, 500.0);
+        let moved = start - egui::vec2(0.0, 50.0);
+        let before_frame = driver.ctx.cumulative_frame_nr();
+        let mut retry = RetryingGridApp {
+            app: &mut env,
+            renew_after_first_pass: renew,
+            observations: Vec::new(),
+        };
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            focused: false,
+            events: vec![
+                raw_touch(77, egui::TouchPhase::Start, start),
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+                raw_touch(77, egui::TouchPhase::Move, moved),
+                egui::Event::PointerMoved(moved),
+            ],
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(false);
+        let output = driver.backend.update(&mut retry, input);
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            retry.observations.len(),
+            2,
+            "must run real App UI twice through egui discard"
+        );
+        let first = retry.observations[0];
+        let second = retry.observations[1];
+        assert!(
+            second.0 > first.0,
+            "App update counter must advance across passes"
+        );
+        assert_eq!(first.1, before_frame);
+        assert_eq!(
+            second.1, before_frame,
+            "the viewport frame must remain constant"
+        );
+        assert!(
+            (first.3 - (initial + 50.0)).abs() < 0.1,
+            "the first real command must be applied once: {first:?}"
+        );
+        if renew {
+            assert_ne!(first.2, second.2);
+            assert_eq!(
+                second.3, initial,
+                "old raw Start/Move must not be recognized again in a fresh scope on the retry"
+            );
+        } else {
+            assert_eq!(first.2, second.2);
+            assert_eq!(
+                second.3, first.3,
+                "same-scope replay must not apply commands twice"
+            );
+        }
+        drop(retry);
+        assert_eq!(driver.ctx.cumulative_frame_nr(), before_frame + 1);
+        if renew {
+            // Next viewport frame accepts a genuinely new contact even though the
+            // old synthetic pointer contact still occupies egui-winit's gate.
+            driver.tick_events(
+                &mut env,
+                None,
+                vec![
+                    raw_touch(78, egui::TouchPhase::Start, start),
+                    raw_touch(78, egui::TouchPhase::Move, moved),
+                ],
+            );
+            assert!(env.grid_scroll.offset() + grid_fraction(&env, &driver.ctx) > initial);
+        }
+    }
+}
+
+fn assert_grid_paint_has_no_native_pan(app: &App, ctx: &egui::Context) {
+    let witness =
+        crate::ui_main::grid_scroll_render_witness(ctx, app.grid_scroll_context_id()).unwrap();
+    let expected = app.grid_scroll.offset() + grid_fraction(app, ctx);
+    assert_eq!(
+        witness.viewport_y, expected,
+        "viewport must belong to App's gesture: {witness:?}"
+    );
+    assert_eq!(witness.state.unclamped_offset().y, expected);
+    assert_eq!(witness.state.velocity().y, 0.0);
+    let expected_top = egui::pos2(0.0, witness.inner_rect.top() - expected)
+        .round_to_pixels(ctx.pixels_per_point())
+        .round_ui()
+        .y;
+    assert!(
+        (witness.content_top - expected_top).abs() < 0.01,
+        "content must use the same rounded origin: {witness:?}"
+    );
+}
+
+#[test]
+fn real_background_pinch_has_no_native_pan_and_old_zoom_end_cannot_cross_folder_adoption() {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    let (mut env, mut driver, destination) = input_fixture(false);
+    let transport = App::grid_scroll_transport_id(&driver.ctx);
+    let background = transport.with("area");
+    let rect = driver.ctx.read_response(background).unwrap().rect;
+    let geometry = env.grid_scroll.geometry();
+    let blank = geometry.content_h
+        - env.current_grid_order().len().div_ceil(geometry.cols) as f32 * geometry.row_h;
+    assert!(blank > 1.0);
+    let first = egui::pos2(rect.center().x, rect.bottom() - blank * 0.5);
+    let second = first + egui::vec2(80.0, 0.0);
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(1, egui::TouchPhase::Start, first),
+            egui::Event::PointerMoved(first),
+            pointer_button(first, true),
+        ],
+    );
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![raw_touch(2, egui::TouchPhase::Start, second)],
+    );
+    let before = env.grid_scroll.offset();
+    let cols = env.settings.grid_cols;
+    let translated_first = first - egui::vec2(0.0, 20.0);
+    let translated_second = second - egui::vec2(0.0, 20.0);
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(1, egui::TouchPhase::Move, translated_first),
+            egui::Event::PointerMoved(translated_first),
+            raw_touch(2, egui::TouchPhase::Move, translated_second),
+        ],
+    );
+    assert_eq!(
+        driver.ctx.dragged_id(),
+        Some(background),
+        "must exercise a real background capture under Pinch"
+    );
+    assert_eq!(
+        env.settings.grid_cols, cols,
+        "centroid translation must not zoom"
+    );
+    assert_eq!(env.grid_scroll.offset(), before);
+    assert_eq!(grid_fraction(&env, &driver.ctx), 0.0);
+    assert!(
+        crate::ui_main::grid_scroll_render_witness(&driver.ctx, env.grid_scroll_context_id())
+            .unwrap()
+            .pinch_owns_scroll
+    );
+    assert_grid_paint_has_no_native_pan(&env, &driver.ctx);
+    adopt_input_destination_before_first_layout(&mut env, &destination);
+    let restored = env.grid_scroll.offset();
+    let far_second = translated_second + egui::vec2(100.0, 0.0);
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(1, egui::TouchPhase::Move, translated_first),
+            egui::Event::PointerMoved(translated_first),
+            raw_touch(2, egui::TouchPhase::Move, far_second),
+        ],
+    );
+    assert_eq!(
+        env.settings.grid_cols, cols,
+        "retired pinch must not generate Zoom in the destination"
+    );
+    assert_eq!(env.grid_scroll.offset(), restored);
+    assert_grid_paint_has_no_native_pan(&env, &driver.ctx);
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(1, egui::TouchPhase::End, translated_first),
+            pointer_button(translated_first, false),
+            egui::Event::PointerGone,
+            raw_touch(2, egui::TouchPhase::End, far_second),
+            egui::Event::PointerGone,
+        ],
+    );
+    for _ in 0..3 {
+        driver.tick(&mut env, None);
+    }
+    assert_eq!(env.settings.grid_cols, cols);
+    assert_eq!(
+        env.grid_scroll.offset(),
+        restored,
+        "old PinchEnd/release must not start native coast"
+    );
+    assert_grid_paint_has_no_native_pan(&env, &driver.ctx);
+    // A genuinely new pinch is still functional after retiring the old one.
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(3, egui::TouchPhase::Start, first),
+            egui::Event::PointerMoved(first),
+            pointer_button(first, true),
+            raw_touch(4, egui::TouchPhase::Start, second),
+        ],
+    );
+    let expanded = second + egui::vec2(100.0, 0.0);
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![raw_touch(4, egui::TouchPhase::Move, expanded)],
+    );
+    assert_ne!(
+        env.settings.grid_cols, cols,
+        "fresh pinch must still change columns"
+    );
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(3, egui::TouchPhase::End, first),
+            pointer_button(first, false),
+            egui::Event::PointerGone,
+            raw_touch(4, egui::TouchPhase::Move, expanded),
+            egui::Event::PointerMoved(expanded),
+            raw_touch(4, egui::TouchPhase::End, expanded),
+            pointer_button(expanded, false),
+            egui::Event::PointerGone,
+        ],
+    );
+}
+
+#[test]
+fn retired_secondary_touch_move_cannot_drive_a_new_mouse_capture() {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    let mut mouse_only_delta = None;
+    for include_retired_tail in [false, true] {
+        let (mut env, mut driver, destination) = input_fixture(false);
+        let background = App::grid_scroll_transport_id(&driver.ctx).with("area");
+        let first = egui::pos2(600.0, 500.0);
+        let second = first + egui::vec2(80.0, 0.0);
+        // The backend gives the synthetic pointer to contact 1; contact 2 is raw only.
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(1, egui::TouchPhase::Start, first),
+                egui::Event::PointerMoved(first),
+                pointer_button(first, true),
+                raw_touch(2, egui::TouchPhase::Start, second),
+            ],
+        );
+        adopt_input_destination_before_first_layout(&mut env, &destination);
+        // Ending the old primary frees egui-winit's gate. Contact 2 remains down.
+        // No intervening cursor movement: the backend release uses pointer_pos=first.
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                raw_touch(1, egui::TouchPhase::End, first),
+                pointer_button(first, false),
+                egui::Event::PointerGone,
+            ],
+        );
+        env.grid_scroll.request_edge(GridScrollIntent::Bottom);
+        driver.tick(&mut env, None);
+        let rect = driver.ctx.read_response(background).unwrap().interact_rect;
+        let geometry = env.grid_scroll.geometry();
+        let blank = geometry.content_h
+            - env.current_grid_order().len().div_ceil(geometry.cols) as f32 * geometry.row_h;
+        assert!(blank > 1.0);
+        let mouse = egui::pos2(rect.center().x, rect.bottom() - blank * 0.5);
+        driver.tick_events(
+            &mut env,
+            None,
+            vec![
+                egui::Event::PointerMoved(mouse),
+                pointer_button(mouse, true),
+            ],
+        );
+        assert_eq!(
+            driver.ctx.dragged_id(),
+            Some(background),
+            "must establish a genuine new mouse capture"
+        );
+        let scope = env.grid_scroll_scope();
+        let before =
+            crate::ui_main::grid_scroll_render_witness(&driver.ctx, env.grid_scroll_context_id())
+                .unwrap();
+        assert!(!before.touch_owns_native_y);
+        assert_eq!(before.viewport_y, env.grid_scroll.offset());
+        // With pointer_touch_id=None, the actual egui-winit gate now emits a
+        // synthetic PointerMoved even for this still-held retired secondary id.
+        let old_move = mouse - egui::vec2(0.0, 80.0);
+        driver.tick_events(
+            &mut env,
+            None,
+            if include_retired_tail {
+                vec![
+                    raw_touch(2, egui::TouchPhase::Move, old_move),
+                    egui::Event::PointerMoved(old_move),
+                ]
+            } else {
+                vec![]
+            },
+        );
+        let after =
+            crate::ui_main::grid_scroll_render_witness(&driver.ctx, env.grid_scroll_context_id())
+                .unwrap();
+        assert_eq!(driver.ctx.dragged_id(), Some(background));
+        assert_eq!(
+            env.grid_scroll_scope(),
+            scope,
+            "no new list/input admission occurred"
+        );
+        assert!(
+            !after.touch_owns_native_y,
+            "retired transport cannot claim current App contact ownership"
+        );
+        assert_eq!(
+            after.viewport_y, before.viewport_y,
+            "retired touch must not become the new mouse capture's native Y delta: before={before:?} after={after:?}"
+        );
+        assert_eq!(
+            after.state.unclamped_offset().y,
+            before.state.unclamped_offset().y
+        );
+        // The genuine mouse sequence must remain usable without another press.
+        let moved_mouse = mouse + egui::vec2(0.0, 100.0);
+        driver.tick_events(&mut env, None, vec![egui::Event::PointerMoved(moved_mouse)]);
+        let resumed =
+            crate::ui_main::grid_scroll_render_witness(&driver.ctx, env.grid_scroll_context_id())
+                .unwrap();
+        assert!(resumed.viewport_y < before.viewport_y);
+        let delta = resumed.viewport_y - before.viewport_y;
+        if let Some(expected_delta) = mouse_only_delta {
+            assert_eq!(
+                delta, expected_delta,
+                "retiring touch must not pollute the real mouse sequence's previous position"
+            );
+        } else {
+            mouse_only_delta = Some(delta);
+        }
+        driver.tick_events(&mut env, None, vec![pointer_button(moved_mouse, false)]);
+    }
 }
